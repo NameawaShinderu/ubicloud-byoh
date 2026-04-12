@@ -65,6 +65,25 @@ if [ "$EIP_COUNT" -gt "$POOL_SIZE" ]; then
   exit 1
 fi
 
+# Ubuntu 24.04 no longer ships awscli via apt. Install AWS CLI v2
+# from the official bundle if missing. Idempotent — skips if already
+# installed.
+if ! command -v aws >/dev/null 2>&1; then
+  echo "==> installing aws-cli v2 from official bundle (Ubuntu 24.04 dropped the apt package)..."
+  TMPD=$(mktemp -d)
+  (cd "$TMPD" && \
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip && \
+    unzip -q awscliv2.zip && \
+    sudo ./aws/install)
+  rm -rf "$TMPD"
+fi
+
+# jq is required for the JSON parsing in step 4
+if ! command -v jq >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get install -y jq
+fi
+
 export AWS_DEFAULT_REGION="$AWS_REGION"
 
 step() { echo ""; echo "=====  $*  ====="; }
