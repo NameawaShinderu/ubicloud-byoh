@@ -65,8 +65,9 @@ abort("! at least one --cidrs entry is required") if options[:cidrs].empty?
 
 require_relative "../../loader"
 
-vmh = VmHost.from_ubid(options[:ubid])
+vmh = UBID.decode(options[:ubid])
 abort("! no VmHost with ubid #{options[:ubid]}") if vmh.nil?
+abort("! ubid #{options[:ubid]} resolved to #{vmh.class} not VmHost") unless vmh.is_a?(VmHost)
 
 puts "=" * 60
 puts "target host: #{vmh.ubid}  (id=#{vmh.id})"
