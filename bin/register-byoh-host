@@ -1,0 +1,161 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Admin CLI for registering a "bring your own hardware" (BYOH) host with
+# the Ubicloud control plane. Thin OptionParser front-end around
+# lib/byoh_registration.rb. Must be run on a control-plane node with DB
+# access; creates the Sshable/VmHost/HostProvider/Address/Strand rows that
+# drive Prog::Vm::HostNexus bootstrap.
+#
+# Example:
+#
+#   bundle exec bin/register-byoh-host \
+#     --main-ip 192.168.1.10 \
+#     --routed-network 10.99.0.0/29 \
+#     --routed-network fd00:feed::/64 \
+#     --location homelab-rack-A \
+#     --bmc-endpoint https://192.168.1.11 \
+#     --bmc-user admin \
+#     --bmc-pass-env HOMELAB_BMC_PASS \
+#     --bmc-system-id 1
+#
+# Uses RACK_ENV from the environment (defaults to "development"). Run with
+# RACK_ENV=test against a test database for smoke-testing.
+
+require "optparse"
+
+unless ENV["RACK_ENV"]
+  ENV["RACK_ENV"] = "development"
+end
+
+ENV["SKIP_LIT_REQUIRE_FROZEN"] = "1"
+require "bundler"
+if ENV["RACK_ENV"] == "production"
+  Bundler.setup(:default)
+else
+  Bundler.setup(:default, :development)
+end
+
+require "logger"
+require_relative "../db"
+require_relative "../loader"
+
+options = {
+  routed_networks: [],
+  ssh_key_source: :generate,
+  location_label: "byoh",
+  assume_yes: false,
+  bmc: nil
+}
+
+def ensure_bmc(opts)
+  opts[:bmc] ||= {"protocol" => "redfish"}
+end
+
+parser = OptionParser.new do |o|
+  o.banner = "Usage: bin/register-byoh-host [options]"
+  o.separator ""
+  o.separator "Required:"
+  o.on("--main-ip IP", "Management IPv4 address (control plane will SSH here)") { |v| options[:main_ip] = v }
+  o.separator ""
+  o.separator "Networks (repeatable):"
+  o.on("--routed-network CIDR", "IPv4 or IPv6 CIDR routed to this host (v4 → VM pool; first v6 /64 → net6)") do |v|
+    options[:routed_networks] << v
+  end
+  o.separator ""
+  o.separator "SSH key:"
+  o.on("--ssh-key PATH", "Use an existing Ed25519 private key file (default: generate a new one)") do |v|
+    options[:ssh_key_source] = v
+  end
+  o.separator ""
+  o.separator "Optional:"
+  o.on("--location LABEL", "Location label (default: byoh)") { |v| options[:location_label] = v }
+  o.on("--server-identifier ID", "Operator-assigned identifier (default: byoh-<random>)") do |v|
+    options[:server_identifier] = v
+  end
+  o.on("--yes", "Skip interactive confirmation") { options[:assume_yes] = true }
+  o.separator ""
+  o.separator "BMC (optional — enables Ubicloud to power-cycle this host via Redfish):"
+  o.on("--bmc-endpoint URL", "Redfish base URL (e.g. https://192.168.1.11)") do |v|
+    ensure_bmc(options)["endpoint"] = v
+  end
+  o.on("--bmc-user USERNAME", "BMC username") { |v| ensure_bmc(options)["username"] = v }
+  o.on("--bmc-pass-env VAR", "Env var holding the BMC password (preferred over --bmc-password)") do |v|
+    ensure_bmc(options)["password_env"] = v
+  end
+  o.on("--bmc-password PASSWORD", "BMC password (inline; prefer --bmc-pass-env)") do |v|
+    ensure_bmc(options)["password"] = v
+  end
+  o.on("--bmc-system-id ID", "Explicit Redfish SystemId (needed for chassis BMCs)") do |v|
+    ensure_bmc(options)["system_id"] = v
+  end
+  o.on("--bmc-verify-ssl", "Enable TLS verification (default: disabled — BMC certs are usually self-signed)") do
+    ensure_bmc(options)["verify_ssl"] = true
+  end
+  o.on("--bmc-reset-type TYPE", "Redfish ResetType (default: ForceRestart)") do |v|
+    ensure_bmc(options)["reset_type"] = v
+  end
+  o.separator ""
+  o.on("-h", "--help", "Show this help") { puts o; exit 0 }
+end
+parser.parse!
+
+unless options[:main_ip]
+  warn parser
+  abort "! --main-ip is required"
+end
+
+if options[:bmc] && !options[:bmc]["verify_ssl"]
+  options[:bmc]["verify_ssl"] = false
+end
+
+registration = ByohRegistration.new(
+  main_ip: options[:main_ip],
+  routed_networks: options[:routed_networks],
+  ssh_key_source: options[:ssh_key_source],
+  location_label: options[:location_label],
+  server_identifier: options[:server_identifier],
+  bmc_config: options[:bmc]
+)
+
+begin
+  registration.validate!
+rescue ByohRegistration::ValidationError => e
+  abort "! validation failed: #{e.message}"
+end
+
+puts "ubicloud byoh host registration"
+puts "────────────────────────────────"
+puts
+puts "Step 1/2 — Install the control-plane SSH public key on the host"
+puts "────────────────────────────────"
+puts registration.install_instructions
+unless options[:assume_yes]
+  print "Press ENTER once the public key is installed, or Ctrl-C to abort: "
+  $stdin.readline
+end
+
+puts
+puts "Step 2/2 — Registering host with control plane"
+puts "────────────────────────────────"
+cfg = registration.provider_config
+puts "Provider         generic"
+puts "Management IP    #{cfg["main_ip4"]}"
+puts "Location label   #{cfg["location_label"]}"
+puts "Routed networks  " + cfg["routed_networks"].map { |n| n["cidr"] }.join("\n                 ")
+if cfg["bmc"]
+  bmc = cfg["bmc"]
+  puts "BMC              #{bmc["endpoint"]} (protocol=#{bmc["protocol"] || "redfish"}, system_id=#{bmc["system_id"] || "auto"})"
+end
+puts
+
+strand = registration.register!
+vm_host = VmHost[strand.id]
+
+puts "Host registered."
+puts "  VmHost UBID:  #{vm_host.ubid}"
+puts "  Strand UBID:  #{strand.ubid}"
+puts
+puts "The dispatcher will pick up the strand and drive bootstrap automatically."
+puts "Monitor progress via the admin console, or query the DB directly:"
+puts "  SELECT label, stack FROM strand WHERE id = '#{strand.id}';"

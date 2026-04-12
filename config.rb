@@ -104,6 +104,12 @@ module Config
   optional :hetzner_user, string, clear: true
   optional :hetzner_password, string, clear: true
   override :hetzner_connection_string, "https://robot-ws.your-server.de", string
+  # Generic / BYOH provider has no remote API; config values exist only so
+  # that HostProvider::PROVIDER_METHODS delegation doesn't NoMethodError when
+  # callers introspect a generic host_provider row.
+  override :generic_connection_string, "", string
+  override :generic_user, "", string
+  override :generic_password, "", string
   override :managed_service, false, bool
   override :sanctioned_countries, "CU,IR,KP,SY", array(string)
   override :hetzner_ssh_public_key, nil, string

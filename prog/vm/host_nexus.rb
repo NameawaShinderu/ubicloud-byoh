@@ -3,21 +3,49 @@
 class Prog::Vm::HostNexus < Prog::Base
   subject_is :sshable, :vm_host
 
-  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [])
+  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [])
     DB.transaction do
       unless Location[location_id]
         raise "No existing Location"
       end
 
+      # BYOH hosts cannot rely on Prog::LearnNetwork because a typical
+      # self-hosted server has no globally-routed IPv6 to auto-discover.
+      # The operator declares the /64 (ULA is fine) in provider_config and
+      # we pass it through as the net6 kwarg so LearnNetwork is skipped.
+      if provider_name == HostProvider::GENERIC_PROVIDER_NAME && net6.nil? && provider_config
+        declared = Array(provider_config["routed_networks"]).find { |n| n["cidr"]&.include?(":") }
+        net6 = declared["cidr"] if declared
+      end
+
       id = VmHost.generate_uuid
-      Sshable.create_with_id(id, host: sshable_hostname)
+      # Preloading raw_private_key_1 at creation time is the supported path
+      # for BYOH hosts: the operator installs the matching public key on the
+      # host out-of-band, the CLI passes the private key here, and
+      # setup_ssh_keys later sees raw_private_key_1 is already set and skips
+      # generation. Without this, there'd be a race between strand dispatch
+      # and the CLI storing the key.
+      sshable_args = {host: sshable_hostname}
+      sshable_args[:raw_private_key_1] = ssh_private_key if ssh_private_key
+      Sshable.create_with_id(id, **sshable_args)
       vmh = VmHost.create_with_id(id, location_id:, family:, net6:, ndp_needed:)
 
-      if provider_name == HostProvider::HETZNER_PROVIDER_NAME || provider_name == HostProvider::LEASEWEB_PROVIDER_NAME
+      creates_host_provider = [
+        HostProvider::HETZNER_PROVIDER_NAME,
+        HostProvider::LEASEWEB_PROVIDER_NAME,
+        HostProvider::GENERIC_PROVIDER_NAME
+      ].include?(provider_name)
+
+      if creates_host_provider
+        effective_server_identifier = server_identifier
+        if provider_name == HostProvider::GENERIC_PROVIDER_NAME
+          effective_server_identifier ||= "byoh-#{id}"
+        end
         HostProvider.create do |hp|
           hp.id = id
           hp.provider_name = provider_name
-          hp.server_identifier = server_identifier
+          hp.server_identifier = effective_server_identifier
+          hp.config = provider_config if provider_config
         end
       end
 
@@ -26,6 +54,12 @@ class Prog::Vm::HostNexus < Prog::Base
         vmh.set_data_center
         # Avoid overriding custom server names for development hosts.
         vmh.set_server_name unless Config.development?
+      elsif provider_name == HostProvider::GENERIC_PROVIDER_NAME
+        # Same pattern as Hetzner: GenericApis#pull_ips returns the declared
+        # routed v4 blocks (auto-prepended with the management /32), and
+        # create_addresses turns them into Address + ipv4_address rows that
+        # the allocator can assign to VMs.
+        vmh.create_addresses
       else
         Address.create_with_id(id, cidr: sshable_hostname, routed_to_host_id: id)
         AssignedHostAddress.create(ip: sshable_hostname, address_id: id, host_id: id)
@@ -46,7 +80,18 @@ class Prog::Vm::HostNexus < Prog::Base
     # Generate a new SSH key if one is not set.
     sshable.update(raw_private_key_1: SshKey.generate.keypair) unless sshable.raw_private_key_1
 
-    if Config.hetzner_ssh_private_key
+    # The root-key bootstrap exists so that a fresh Hetzner host, which
+    # comes up with Hetzner's preshared SSH key in /root/.ssh/authorized_keys,
+    # can have it overwritten with our generated sshable key. It only makes
+    # sense for Hetzner hosts — BYOH ("generic") hosts don't have Hetzner's
+    # preshared key, and in a mixed Hetzner+BYOH deployment where
+    # hetzner_ssh_private_key is set globally, trying to use it against a
+    # BYOH host would fail. A nil provider_name is treated as the legacy
+    # dev/test path so existing specs keep working unchanged.
+    provider_allows_hetzner_bootstrap =
+      vm_host.provider_name.nil? || vm_host.provider_name == HostProvider::HETZNER_PROVIDER_NAME
+
+    if provider_allows_hetzner_bootstrap && Config.hetzner_ssh_private_key
       root_key = Net::SSH::Authentication::ED25519::PrivKey.read(Config.hetzner_ssh_private_key, Config.hetzner_ssh_private_key_passphrase).sign_key
       root_ssh_key = SshKey.from_binary(root_key.keypair)
 

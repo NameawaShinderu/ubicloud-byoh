@@ -74,6 +74,100 @@ RSpec.describe Prog::Vm::HostNexus do
       st = described_class.assemble("1.2.3.4")
       expect(st.stack.first["vhost_block_backend_version"]).to eq(Config.vhost_block_backend_version)
     end
+
+    describe "generic (BYOH) provider" do
+      let(:provider_config) do
+        {
+          "main_ip4" => "203.0.113.42",
+          "location_label" => "homelab-rack-A",
+          "routed_networks" => [
+            {"cidr" => "10.99.0.0/29"},
+            {"cidr" => "fd00:feed::/64"}
+          ]
+        }
+      end
+
+      it "creates a HostProvider row with the operator config" do
+        st = described_class.assemble("203.0.113.42",
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config: provider_config)
+
+        hp = st.subject.provider
+        expect(hp.provider_name).to eq("generic")
+        expect(hp.server_identifier).to start_with("byoh-")
+        expect(hp.config["location_label"]).to eq("homelab-rack-A")
+      end
+
+      it "extracts the declared IPv6 /64 into vm_host.net6 (so LearnNetwork is skipped)" do
+        st = described_class.assemble("203.0.113.42",
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config: provider_config)
+
+        expect(st.subject.net6.to_s).to eq("fd00:feed::/64")
+      end
+
+      it "creates Address rows for declared v4 networks and auto-prepends the management /32" do
+        st = described_class.assemble("203.0.113.42",
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config: provider_config)
+
+        cidrs = st.subject.assigned_subnets.map { it.cidr.to_s }.sort
+        expect(cidrs).to eq(["10.99.0.0/29", "203.0.113.42/32"].sort)
+      end
+
+      it "does not auto-prepend the management /32 when it's inside a declared block" do
+        cfg = provider_config.merge(
+          "routed_networks" => [{"cidr" => "203.0.113.40/29"}, {"cidr" => "fd00:feed::/64"}]
+        )
+        st = described_class.assemble("203.0.113.42",
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config: cfg)
+
+        cidrs = st.subject.assigned_subnets.map { it.cidr.to_s }.sort
+        expect(cidrs).to eq(["203.0.113.40/29"])
+      end
+
+      it "populates ipv4_address rows from declared v4 blocks (skipping the mgmt /32)" do
+        described_class.assemble("203.0.113.42",
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config: provider_config)
+
+        # 10.99.0.0/29 has 8 addresses → 8 ipv4_address rows.
+        # The 203.0.113.42/32 Address is skipped by populate_ipv4_addresses
+        # because its network address equals the sshable host.
+        expect(DB[:ipv4_address].where(cidr: "10.99.0.0/29").count).to eq(8)
+        expect(DB[:ipv4_address].where(cidr: "203.0.113.42/32").count).to eq(0)
+      end
+
+      it "allocates a VM v4 IP from the declared pool via ip4_random_vm_network" do
+        st = described_class.assemble("203.0.113.42",
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config: provider_config)
+
+        ip, address = st.subject.ip4_random_vm_network
+        expect(ip).not_to be_nil
+        expect(address.cidr.to_s).to eq("10.99.0.0/29")
+      end
+
+      it "allocates a VM v6 /79 slice from the declared net6" do
+        st = described_class.assemble("203.0.113.42",
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config: provider_config)
+
+        slice = st.subject.ip6_random_vm_network
+        expect(slice).not_to be_nil
+        expect(slice.netmask.prefix_len).to eq(79)
+      end
+
+      it "uses an operator-supplied server_identifier when one is passed" do
+        st = described_class.assemble("203.0.113.42",
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          server_identifier: "homelab-r1-01",
+          provider_config: provider_config)
+
+        expect(st.subject.provider.server_identifier).to eq("homelab-r1-01")
+      end
+    end
   end
 
   describe "#start" do
@@ -134,6 +228,47 @@ RSpec.describe Prog::Vm::HostNexus do
       session = Net::SSH::Connection::Session.allocate
       expect(Net::SSH).to receive(:start).and_yield(session)
       expect(session).to receive(:_exec!).with("echo #{test_public_keys.gsub(" ", "\\ ").gsub("\n", "'\n'")} > ~/.ssh/authorized_keys").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
+
+      expect { nx.setup_ssh_keys }.to hop("bootstrap_rhizome")
+    end
+
+    it "runs the hetzner bootstrap when the host is a hetzner provider host" do
+      vmhost_key = SshKey.generate
+      sshable.update(raw_private_key_1: vmhost_key.keypair)
+      HostProvider.create do |hp|
+        hp.id = vm_host.id
+        hp.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+        hp.server_identifier = "hetzner-1"
+      end
+      vm_host.reload
+
+      root_key = SshKey.generate
+      expect(Config).to receive(:hetzner_ssh_private_key).at_least(:once).and_return(root_key.private_key)
+      expect(Config).to receive(:operator_ssh_public_keys).and_return(nil)
+      session = Net::SSH::Connection::Session.allocate
+      expect(Net::SSH).to receive(:start).and_yield(session)
+      expect(session).to receive(:_exec!).and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
+
+      expect { nx.setup_ssh_keys }.to hop("bootstrap_rhizome")
+    end
+
+    it "skips the hetzner bootstrap for BYOH generic hosts even when hetzner_ssh_private_key is set" do
+      # Scenario: mixed Hetzner+BYOH deployment. Global Config.hetzner_ssh_private_key
+      # is set (for Hetzner hosts), but a BYOH generic host must NOT be bootstrapped
+      # with Hetzner's preshared root key (it doesn't have that key in authorized_keys).
+      vmhost_key = SshKey.generate
+      sshable.update(raw_private_key_1: vmhost_key.keypair)
+      HostProvider.create do |hp|
+        hp.id = vm_host.id
+        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+        hp.server_identifier = "byoh-1"
+        hp.config = {"main_ip4" => sshable.host, "routed_networks" => []}
+      end
+      vm_host.reload
+
+      allow(Config).to receive(:hetzner_ssh_private_key).and_return(SshKey.generate.private_key)
+      expect(Net::SSH).not_to receive(:start)
+      expect(Util).not_to receive(:rootish_ssh)
 
       expect { nx.setup_ssh_keys }.to hop("bootstrap_rhizome")
     end
