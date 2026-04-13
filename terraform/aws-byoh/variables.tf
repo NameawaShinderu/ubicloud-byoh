@@ -13,13 +13,13 @@ variable "availability_zone" {
 variable "vpc_cidr" {
   description = "CIDR for the dedicated BYOH test VPC. Must not overlap with any existing VPC in your account."
   type        = string
-  default     = "10.99.0.0/16"
+  default     = "10.98.0.0/16"
 }
 
 variable "subnet_cidr" {
   description = "CIDR for the public subnet inside the VPC."
   type        = string
-  default     = "10.99.1.0/24"
+  default     = "10.98.1.0/24"
 }
 
 variable "operator_ssh_cidr" {
@@ -56,8 +56,8 @@ variable "byoh_secondary_private_ips" {
   description = "Pool of secondary private IPs assigned to the data plane ENI. Each IP becomes a slot in Ubicloud's routed_network pool. One EIP is allocated + associated with each, so each slot can host a publicly-reachable VM. Pool size = max concurrent VMs publicly reachable from the internet."
   type        = list(string)
   default = [
-    "10.99.1.128",
-    "10.99.1.129",
-    "10.99.1.130",
+    "10.98.1.128",
+    "10.98.1.129",
+    "10.98.1.130",
   ]
 }

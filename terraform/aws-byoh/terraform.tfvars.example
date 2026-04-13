@@ -16,9 +16,9 @@ availability_zone = "ap-south-1a"
 operator_ssh_cidr = "0.0.0.0/0"
 
 # The VPC CIDR. Make sure this doesn't overlap with any existing
-# VPC in your account. Default 10.99.0.0/16 is chosen to be unusual.
-vpc_cidr    = "10.99.0.0/16"
-subnet_cidr = "10.99.1.0/24"
+# VPC in your account. Default 10.98.0.0/16 is chosen to be unusual.
+vpc_cidr    = "10.98.0.0/16"
+subnet_cidr = "10.98.1.0/24"
 
 # Control plane instance — any Ubuntu-compatible type works.
 # t3.medium is cheap and has enough RAM for postgres + clover.
@@ -40,7 +40,7 @@ data_root_size_gb        = 120
 # Pool of secondary private IPs. One EIP gets attached to each.
 # Each slot = one concurrent publicly-reachable VM.
 byoh_secondary_private_ips = [
-  "10.99.1.128",
-  "10.99.1.129",
-  "10.99.1.130",
+  "10.98.1.128",
+  "10.98.1.129",
+  "10.98.1.130",
 ]
