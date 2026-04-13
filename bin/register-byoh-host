@@ -45,7 +45,8 @@ options = {
   ssh_key_source: :generate,
   location_label: "byoh",
   assume_yes: false,
-  bmc: nil
+  bmc: nil,
+  default_boot_images: []
 }
 
 def ensure_bmc(opts)
@@ -74,6 +75,9 @@ parser = OptionParser.new do |o|
     options[:server_identifier] = v
   end
   o.on("--yes", "Skip interactive confirmation") { options[:assume_yes] = true }
+  o.on("--default-boot-image NAME", "Boot image name to download on this host at registration time (repeatable; e.g. 'ubuntu-noble', 'ubuntu-jammy'). Without this the boot_image table stays empty and the VM allocator will fail with 'no space left on any eligible host' when a user tries to create a VM.") do |v|
+    options[:default_boot_images] << v
+  end
   o.separator ""
   o.separator "BMC (optional — enables Ubicloud to power-cycle this host via Redfish):"
   o.on("--bmc-endpoint URL", "Redfish base URL (e.g. https://192.168.1.11)") do |v|
@@ -115,7 +119,8 @@ registration = ByohRegistration.new(
   ssh_key_source: options[:ssh_key_source],
   location_label: options[:location_label],
   server_identifier: options[:server_identifier],
-  bmc_config: options[:bmc]
+  bmc_config: options[:bmc],
+  default_boot_images: options[:default_boot_images]
 )
 
 begin

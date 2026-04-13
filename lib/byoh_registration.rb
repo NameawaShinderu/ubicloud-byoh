@@ -13,7 +13,7 @@ class ByohRegistration
   class ValidationError < StandardError; end
 
   attr_reader :main_ip, :routed_networks, :location_label, :server_identifier,
-    :bmc_config, :ssh_key_source
+    :bmc_config, :ssh_key_source, :default_boot_images
 
   # @param main_ip [String] management IPv4 address of the host (what the
   #   control plane will SSH to; becomes the sshable.host).
@@ -31,14 +31,21 @@ class ByohRegistration
   # @param server_identifier [String, nil] operator-chosen HostProvider
   #   identifier. Defaults to a generated `byoh-<random>` if nil.
   # @param bmc_config [Hash, nil] optional BMC section (see #validate_bmc!).
+  # @param default_boot_images [Array<String>] optional list of Ubicloud boot
+  #   image names to download on the host at registration time (e.g.
+  #   ["ubuntu-noble"]). Without this the host comes up with an empty
+  #   boot_image table and the VM allocator can't match anything,
+  #   causing "no space left on any eligible host" at first VM create.
   def initialize(main_ip:, routed_networks: [], ssh_key_source: :generate,
-    location_label: "byoh", server_identifier: nil, bmc_config: nil)
+    location_label: "byoh", server_identifier: nil, bmc_config: nil,
+    default_boot_images: [])
     @main_ip = main_ip
     @routed_networks = Array(routed_networks)
     @ssh_key_source = ssh_key_source
     @location_label = location_label
     @server_identifier = server_identifier
     @bmc_config = bmc_config
+    @default_boot_images = Array(default_boot_images)
   end
 
   def validate!
@@ -105,6 +112,7 @@ class ByohRegistration
       ssh_private_key: keypair
     }
     kwargs[:location_id] = location_id if location_id
+    kwargs[:default_boot_images] = @default_boot_images unless @default_boot_images.empty?
 
     Prog::Vm::HostNexus.assemble(@main_ip, **kwargs)
   end

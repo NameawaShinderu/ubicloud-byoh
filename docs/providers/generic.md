@@ -122,6 +122,39 @@ first and allocate from AWS's IPv6 pool. For the homelab and Hetzner
 cases, ULA `fd00::/8` blocks are fine because IPv6 overlay traffic
 stays within the host anyway.
 
+### Known limitation: storage device discovery on multi-NVMe hosts
+
+On a fresh BYOH host, `Prog::LearnStorage` scans the host via
+`lsblk`/`smartctl` and registers what it finds as `storage_device`
+rows. In our AWS m5d.metal validation we observed that only **the
+root EBS disk** got registered as `DEFAULT` — the four 838 GB NVMe
+instance-store devices (`nvme0n1`-`nvme3n1`) were not picked up, so
+SPDK served VM disks from a file on the 80 GB root ext4 instead of
+binding raw NVMe via VFIO.
+
+Symptom: second VM creation fails with
+`no space left on any eligible host` even though the instance has
+3.2 TB of fast local NVMe sitting idle.
+
+Workarounds until this is properly patched upstream:
+
+1. **Bigger root EBS disk** — set `data_root_size_gb = 500` in
+   `terraform/aws-byoh/terraform.tfvars` before `terraform apply`.
+   SPDK serves VM disks from the (now-huge) root disk. Simple; wastes
+   the fast instance-store NVMe but gives you enough capacity for
+   5-10 concurrent VMs.
+2. **Manually register the instance-store NVMes** as additional
+   `storage_device` rows after host registration (via a Ruby script
+   that calls `SpdkSetup.prep` + `StorageDevice.create` for each
+   NVMe). A proper patch would extend `LearnStorage` to enumerate
+   all NVMe controllers, not just the root.
+3. **Skip AWS**: on Hetzner/OVH/Equinix + most homelab hosts the
+   single-disk model is the common case and this limitation doesn't
+   bite — one disk, one storage_device, all good.
+
+The fix is a Phase 8 item. None of the BYOH code changes that got
+us this far depend on it.
+
 ### Out-of-scope (and why)
 
 The BYOH driver does NOT:

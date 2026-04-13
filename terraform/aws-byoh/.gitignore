@@ -1,0 +1,17 @@
+# Terraform state — contains resource IDs, sometimes sensitive attributes
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# Variable overrides (may contain secrets if user inlines credentials)
+terraform.tfvars
+*.auto.tfvars
+
+# Generated SSH keypair — saved locally, NEVER commit
+.generated/
+
+# Plan artifacts
+*.tfplan
+crash.log

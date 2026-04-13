@@ -189,6 +189,18 @@ RSpec.describe ByohRegistration do
       expect(vm_host.provider.config["bmc"]["endpoint"]).to eq("https://192.168.1.11")
     end
 
+    it "passes default_boot_images through to the strand stack so respirate downloads them during prep" do
+      reg = described_class.new(**base_args, default_boot_images: ["ubuntu-noble", "ubuntu-jammy"])
+      strand = reg.register!
+      expect(strand.stack.first["default_boot_images"]).to eq(["ubuntu-noble", "ubuntu-jammy"])
+    end
+
+    it "omits default_boot_images from the stack when the kwarg is empty" do
+      reg = described_class.new(**base_args)
+      strand = reg.register!
+      expect(strand.stack.first["default_boot_images"]).to eq([])
+    end
+
     it "honors an operator-supplied server_identifier" do
       reg = described_class.new(**base_args.merge(server_identifier: "homelab-r1-01"))
       strand = reg.register!
