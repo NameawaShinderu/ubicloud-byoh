@@ -1,5 +1,10 @@
 # Ubicloud BYOH — AWS Console Setup (zero-tooling edition)
 
+> **Not using AWS?** If you have a Proxmox host at home, read
+> [`SETUP_PROXMOX.md`](SETUP_PROXMOX.md) instead — same end state,
+> no cloud account needed, free to run. This doc is for people who
+> already have an AWS account and want the fastest on-ramp there.
+
 **Audience**: you have an AWS account and a web browser. That's it.
 You don't need Terraform, an SSH client, a "bastion" machine, a laptop
 with keys on it, or any CLI tools at all. Everything happens inside
