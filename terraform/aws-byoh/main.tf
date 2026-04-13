@@ -122,20 +122,17 @@ resource "aws_security_group" "byoh" {
   vpc_id      = aws_vpc.byoh.id
   tags        = merge(local.base_tags, { Name = "ubi-byoh-test-sg" })
 
+  # NOTE: operator SSH and VM-via-EIP SSH share the same port 22. If you
+  # want to split them, tighten operator_ssh_cidr to your /32 and add a
+  # separate ingress for VM SSH from 0.0.0.0/0 on a different rule
+  # description. AWS rejects duplicate (port, protocol, cidr) tuples so
+  # they can't both be 0.0.0.0/0 on 22.
   ingress {
-    description = "SSH from operator"
+    description = "SSH (operator AND for VMs via individual EIPs)"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
     cidr_blocks = [var.operator_ssh_cidr]
-  }
-
-  ingress {
-    description = "SSH for VMs (open — VMs get individual EIPs)"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
@@ -155,7 +152,7 @@ resource "aws_security_group" "byoh" {
   }
 
   ingress {
-    description = "Intra-SG all traffic (ctrl→data comms + VM-to-VM)"
+    description = "Intra-SG all traffic (ctrl to data + VM-to-VM)"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
