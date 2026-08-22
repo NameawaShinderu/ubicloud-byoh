@@ -260,6 +260,36 @@ RSpec.describe VmSetup do
       config = YAML.safe_load(vps.writes["network-config"])
       expect(config["ethernets"].keys).to contain_exactly("enx3ebda596f7b9", "enxfb55ddba210a")
     end
+
+    it "queries one upstream per family when the VM has a public IPv4" do
+      vs.cloudinit("user", ["key"], "fddf:53d2:4c89:2305:46a0::/79", nics, nil, "ubuntu-noble", "10.0.0.2", ipv6_disabled: false, ip4: "123.123.123.123/32")
+      dnsmasq_conf = vps.writes["dnsmasq.conf"]
+      expect(dnsmasq_conf).to include("all-servers\nserver=8.8.8.8\nserver=2606:4700:4700::1111")
+      expect(dnsmasq_conf).not_to include("strict-order")
+      expect(dnsmasq_conf).not_to include("server=2001:4860:4860::8888")
+    end
+
+    it "queries two IPv6 upstreams when the VM has no public IPv4" do
+      vs.cloudinit("user", ["key"], "fddf:53d2:4c89:2305:46a0::/79", nics, nil, "ubuntu-noble", "10.0.0.2", ipv6_disabled: false, ip4: "")
+      dnsmasq_conf = vps.writes["dnsmasq.conf"]
+      expect(dnsmasq_conf).to include("all-servers\nserver=2001:4860:4860::8888\nserver=2606:4700:4700::1111")
+      expect(dnsmasq_conf).not_to include("server=8.8.8.8")
+    end
+
+    it "queries two IPv6 upstreams when the ip4 kwarg is omitted" do
+      vs.cloudinit("user", ["key"], "fddf:53d2:4c89:2305:46a0::/79", nics, nil, "ubuntu-noble", "10.0.0.2", ipv6_disabled: false)
+      dnsmasq_conf = vps.writes["dnsmasq.conf"]
+      expect(dnsmasq_conf).to include("all-servers\nserver=2001:4860:4860::8888\nserver=2606:4700:4700::1111")
+      expect(dnsmasq_conf).not_to include("server=8.8.8.8")
+    end
+
+    it "lists no upstreams when IPv6 is disabled" do
+      vs.cloudinit("user", ["key"], "fddf:53d2:4c89:2305:46a0::/79", nics, nil, "ubuntu-noble", "10.0.0.2", ipv6_disabled: true)
+      dnsmasq_conf = vps.writes["dnsmasq.conf"]
+      expect(dnsmasq_conf).to include("dhcp-option=6,8.8.8.8")
+      expect(dnsmasq_conf).not_to include("server=")
+      expect(dnsmasq_conf).not_to include("all-servers")
+    end
   end
 
   describe "#purge_storage" do
@@ -605,7 +635,7 @@ RSpec.describe VmSetup do
       }
       expect(vs).to receive(:setup_taps_6).with(gua, [], "10.0.0.2")
       expect(vs).to receive(:routes4).with(ip4, "local_ip4", [])
-      expect(vs).to receive(:write_nftables_conf).with(ip4, gua, [])
+      expect(vs).to receive(:write_nftables_conf).with(ip4, "local_ip4", gua, [])
       expect(vs).to receive(:forwarding)
 
       expect(vps).to receive(:write_guest_ephemeral).with(guest_ephemeral.to_s)
@@ -681,6 +711,8 @@ table ip nat {
     type nat hook postrouting priority srcnat; policy accept;
     ip saddr 192.168.5.50 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to 123.123.123.123
     ip saddr 192.168.5.50 ip daddr 192.168.5.50 snat to 123.123.123.123
+    ip saddr 169.254.0.11 udp dport 53 snat to 123.123.123.123
+    ip saddr 169.254.0.11 tcp dport 53 snat to 123.123.123.123
   }
 }
 
@@ -693,7 +725,7 @@ table inet fw_table {
 }
 NFTABLES_CONF
       expect(vs).to receive(:apply_nftables)
-      vs.write_nftables_conf(ip4, gua, nics)
+      vs.write_nftables_conf(ip4, "169.254.0.10/32", gua, nics)
     end
   end
 
