@@ -158,6 +158,7 @@ class Prog::Vm::HostNexus < Prog::Base
             spdk: cpu < vm_host.spdk_cpu_count,
           )
         end
+        vm_host.update(used_cores: vm_host.spdk_cpu_count * total_cores / total_cpus)
       end
     end
 
