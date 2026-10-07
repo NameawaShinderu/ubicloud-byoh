@@ -72,7 +72,7 @@ RSpec.describe Al do
 
     it "fails if no valid allocation is found" do
       expect(Al::Allocation).to receive(:best_allocation).and_return(nil)
-      expect { described_class.allocate(vm, storage_volumes) }.to raise_error RuntimeError, "Vm[\"#{vm.ubid}\"] no space left on any eligible host"
+      expect { described_class.allocate(vm, storage_volumes) }.to raise_error Scheduling::Allocator::NoSpaceLeft, "Vm[\"#{vm.ubid}\"] no space left on any eligible host"
     end
 
     it "persists valid allocation" do
@@ -89,7 +89,7 @@ RSpec.describe Al do
 
     it "handles non-existing family" do
       vm.family = "non-existing-family"
-      expect { described_class.allocate(vm, storage_volumes) }.to raise_error RuntimeError, /no space left on any eligible host/
+      expect { described_class.allocate(vm, storage_volumes) }.to raise_error Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/
     end
 
     it "uses premium host target utilization if it's enabled" do
@@ -843,7 +843,7 @@ RSpec.describe Al do
 
       expect {
         described_class.allocate(vm, vol, gpu_count: 2)
-      }.to raise_error(RuntimeError, /no space left on any eligible host/)
+      }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/)
 
       described_class.allocate(vm, vol, gpu_count: 1)
       vmh.reload
@@ -851,7 +851,7 @@ RSpec.describe Al do
 
       expect {
         described_class.allocate(vm, vol, gpu_count: 4)
-      }.to raise_error(RuntimeError, /no space left on any eligible host/)
+      }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/)
     end
 
     it "allows concurrent allocations" do
@@ -980,7 +980,7 @@ RSpec.describe Al do
     it "fails allocation when track_written is set but no host has vhost block backend v0.4.0+" do
       vm = create_vm
       vol = [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false, "track_written" => true}]
-      expect { described_class.allocate(vm, vol) }.to raise_error(RuntimeError, /no space left on any eligible host/)
+      expect { described_class.allocate(vm, vol) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/)
     end
 
     it "allocates without boot image filter when using machine_image_version_id" do
@@ -1002,7 +1002,7 @@ RSpec.describe Al do
       vm = create_vm
       miv = create_machine_image_version_metal
       vol = [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => true, "machine_image_version_id" => miv.id}]
-      expect { described_class.allocate(vm, vol) }.to raise_error(RuntimeError, /no space left on any eligible host/)
+      expect { described_class.allocate(vm, vol) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/)
     end
 
     it "creates volume with no rate limits" do
@@ -1073,7 +1073,7 @@ RSpec.describe Al do
       vm = create_vm
       expect {
         described_class.allocate(vm, [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => true}])
-      }.to raise_error(RuntimeError, /no space left on any eligible host/)
+      }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/)
     end
 
     it "allocates the latest active image for read-only volumes" do
@@ -1174,7 +1174,7 @@ RSpec.describe Al do
       expect {
         described_class.allocate(vm, [{"size_gib" => 85, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false},
           {"size_gib" => 95, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false}])
-      }.to raise_error(RuntimeError, /no space left on any eligible host/)
+      }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/)
     end
   end
 
