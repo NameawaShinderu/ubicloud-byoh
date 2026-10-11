@@ -39,7 +39,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
     tls = {
       source  = "hashicorp/tls"
@@ -140,7 +140,7 @@ resource "aws_security_group" "byoh" {
     from_port   = 3000
     to_port     = 3000
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.web_ui_cidr]
   }
 
   ingress {
@@ -148,7 +148,7 @@ resource "aws_security_group" "byoh" {
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = [var.web_ui_cidr]
   }
 
   ingress {
@@ -173,19 +173,19 @@ resource "tls_private_key" "ssh" {
 }
 
 resource "aws_key_pair" "byoh" {
-  key_name   = "ubi-byoh-test-key"
+  key_name   = "ubi-byoh-test-key-${terraform.workspace}"
   public_key = tls_private_key.ssh.public_key_openssh
   tags       = merge(local.base_tags, { Name = "ubi-byoh-test-key" })
 }
 
 resource "local_sensitive_file" "ssh_private" {
-  filename        = "${path.module}/.generated/byoh_ssh_key"
+  filename        = "${path.module}/.generated/${terraform.workspace}/byoh_ssh_key"
   content         = tls_private_key.ssh.private_key_openssh
   file_permission = "0600"
 }
 
 resource "local_file" "ssh_public" {
-  filename        = "${path.module}/.generated/byoh_ssh_key.pub"
+  filename        = "${path.module}/.generated/${terraform.workspace}/byoh_ssh_key.pub"
   content         = tls_private_key.ssh.public_key_openssh
   file_permission = "0644"
 }
@@ -207,6 +207,10 @@ resource "aws_instance" "ctrl" {
   }
 
   user_data = file("${path.module}/user-data-ctrl.sh")
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 
   tags = merge(local.base_tags, {
     Name = "ubi-byoh-ctrl"
@@ -239,6 +243,15 @@ resource "aws_instance" "data" {
   # VM's netns.
   secondary_private_ips = var.byoh_secondary_private_ips
 
+  # Non-metal 8th-gen Intel types (m8i/c8i/r8i…) can expose VT-x to
+  # the guest. Required when data_plane_instance_type is not .metal.
+  dynamic "cpu_options" {
+    for_each = var.data_plane_nested_virtualization ? [1] : []
+    content {
+      nested_virtualization = "enabled"
+    }
+  }
+
   root_block_device {
     volume_size           = var.data_root_size_gb
     volume_type           = "gp3"
@@ -246,6 +259,12 @@ resource "aws_instance" "data" {
   }
 
   user_data = file("${path.module}/user-data-data.sh")
+
+  # user-data only runs on first boot; editing it must not stop/start a
+  # registered host (which would wipe hugepage-backed VMs).
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 
   tags = merge(local.base_tags, {
     Name = "ubi-byoh-data"

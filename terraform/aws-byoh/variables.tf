@@ -61,3 +61,15 @@ variable "byoh_secondary_private_ips" {
     "10.98.1.130",
   ]
 }
+
+variable "web_ui_cidr" {
+  description = "CIDR allowed to reach ports 3000 (web UI) and 443 on the instances. Tighten to your /32, or keep the UI private behind a tunnel."
+  type        = string
+  default     = "0.0.0.0/0"
+}
+
+variable "data_plane_nested_virtualization" {
+  description = "Enable nested virtualization on the data plane. Needed for non-.metal 8th-gen Intel types (m8i, c8i, r8i) so /dev/kvm exists inside the instance."
+  type        = bool
+  default     = false
+}

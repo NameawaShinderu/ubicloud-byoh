@@ -46,6 +46,28 @@ fi
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 systemctl reload ssh
 
+# --- keep the BYOH pool IPs OFF the host NIC --------------------
+# cloud-init's EC2 datasource configures every secondary private IP
+# of the ENI as a local address of the host (50-cloud-init.yaml).
+# The kernel then answers for the pool IPs itself, so traffic for a
+# VM's IP never reaches the VM (and wait_sshable passes against the
+# host's own sshd). Disable that for future boots and drop whatever
+# cloud-init already applied on this first boot.
+cat > /etc/cloud/cloud.cfg.d/99-ubi-byoh-no-secondary-ips.cfg <<'CLOUDCFG'
+datasource:
+  Ec2:
+    apply_full_imds_network_config: false
+CLOUDCFG
+primary_ip=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)" http://169.254.169.254/latest/meta-data/local-ipv4)
+for f in /etc/netplan/50-cloud-init.yaml; do
+  [ -f "$f" ] && sed -i '/^      addresses:/,/^      [a-z]/{/^      addresses:/d;/^      - /d}' "$f"
+done
+dev=$(ip -4 -o addr show | awk -v p="$primary_ip" '$4 ~ "^"p"/" {print $2; exit}')
+sysctl -w "net.ipv4.conf.${dev}.promote_secondaries=1"
+ip -4 -o addr show dev "$dev" | awk '{print $4}' | grep -v "^${primary_ip}/" | sort -r | while read -r cidr; do
+  ip addr del "$cidr" dev "$dev"
+done
+
 # --- kernel forwarding + proxy_arp ------------------------------
 cat > /etc/sysctl.d/99-ubi-byoh-forwarding.conf <<'SYSCTL'
 net.ipv4.ip_forward=1
