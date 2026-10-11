@@ -19,6 +19,8 @@ require_relative "toml"
 require_relative "vhost_block_backend"
 
 class StorageVolume
+  class NoPersistentDeviceId < RuntimeError; end
+
   include KekPipe
   include Toml
 
@@ -255,10 +257,21 @@ class StorageVolume
               IOWriteBandwidthMax: @max_write_mbytes_per_sec}.compact
     return "" if limits.empty?
 
-    dev = persistent_device_id(storage_dir)
+    dev = io_limit_device(storage_dir)
     limits
       .map { |(key, mb)| "#{key}=#{dev} #{mb * 1024 * 1024}" }
       .join("\n")
+  end
+
+  # Disks on cloud and virtualized hosts (AWS EBS, virtio without a serial,
+  # SCSI without a WWN) expose no globally unique by-id link. systemd also
+  # accepts a filesystem path for IO*BandwidthMax and resolves it to the
+  # backing whole disk when the unit starts, so the storage path is a stable
+  # fallback there.
+  def io_limit_device(path)
+    persistent_device_id(path)
+  rescue NoPersistentDeviceId
+    path
   end
 
   def persistent_device_id(path)
@@ -283,7 +296,7 @@ class StorageVolume
       next
     end
 
-    raise "No persistent device ID found for storage path: #{path}"
+    raise NoPersistentDeviceId, "No persistent device ID found for storage path: #{path}"
   end
 
   def wrap_key_b64(storage_key_encryption, key)

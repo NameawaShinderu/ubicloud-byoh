@@ -598,6 +598,23 @@ RSpec.describe StorageVolume do
       .strip)
     end
 
+    it "falls back to the storage path when the disk has no persistent id" do
+      sv = described_class.new("test", {
+        "disk_index" => 1,
+        "device_id" => "xyz01",
+        "encrypted" => true,
+        "max_read_mbytes_per_sec" => 200,
+        "max_write_mbytes_per_sec" => 300,
+      })
+      expect(sv).to receive(:persistent_device_id).with("/var/storage/test/1")
+        .and_raise(StorageVolume::NoPersistentDeviceId, "No persistent device ID found for storage path: /var/storage/test/1")
+      expect(sv.systemd_io_rate_limits).to eq(<<~RESULT
+        IOReadBandwidthMax=/var/storage/test/1 209715200
+        IOWriteBandwidthMax=/var/storage/test/1 314572800
+      RESULT
+      .strip)
+    end
+
     it "returns empty string if no rate limits are set" do
       sv = described_class.new("test", {
         "disk_index" => 1,
@@ -660,7 +677,16 @@ RSpec.describe StorageVolume do
     it "raises an error if no matching device is found" do
       expect(Dir).to receive(:[]).with("/dev/disk/by-id/*").and_return([])
       expect(File).to receive(:stat).with("storage_path").and_return(instance_double(File::Stat, dev_major: 8, dev_minor: 0))
-      expect { encrypted_sv.persistent_device_id("storage_path") }.to raise_error RuntimeError, "No persistent device ID found for storage path: storage_path"
+      expect { encrypted_sv.persistent_device_id("storage_path") }.to raise_error StorageVolume::NoPersistentDeviceId, "No persistent device ID found for storage path: storage_path"
+    end
+
+    it "raises for an NVMe disk with only a vendor serial link (AWS EBS)" do
+      paths = ["/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol0195a0bee2e784577-part1"]
+      expect(Dir).to receive(:[]).with("/dev/disk/by-id/*").and_return(paths)
+      expect(File).to receive(:realpath).with(paths[0]).and_return("/dev/nvme0n1p1")
+      expect(File).to receive(:stat).with("/dev/nvme0n1p1").and_return(instance_double(File::Stat, rdev_major: 259, rdev_minor: 1))
+      expect(File).to receive(:stat).with("storage_path").and_return(instance_double(File::Stat, dev_major: 259, dev_minor: 1))
+      expect { encrypted_sv.persistent_device_id("storage_path") }.to raise_error StorageVolume::NoPersistentDeviceId
     end
   end
 
