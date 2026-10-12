@@ -20,7 +20,8 @@ RSpec.describe ByohLocationCli do
   end
 
   def write_rates(dir, name, rows)
-    File.write(File.join(dir, "#{name}.yml"), rows.to_yaml)
+    # Each row alone, so that rows sharing a Time write no YAML aliases.
+    File.write(File.join(dir, "#{name}.yml"), "---\n" + rows.map { [it].to_yaml.delete_prefix("---\n") }.join)
   end
 
   def rate(location, type, family, unit_price: 0.001, active_from: Time.utc(2020, 1, 1))
@@ -308,7 +309,7 @@ RSpec.describe ByohLocationCli do
       audit = audit_rows.last
       expect(audit[:command]).to eq "byoh-location rates"
       expect(audit[:args]["yaml"]).to eq File.read(path)
-      expect(audit[:args].to_h.except("yaml")).to eq("rates_from" => "hetzner-fsn1", "multiplier" => 1.0, "file" => path, "added" => source.size)
+      expect(audit[:args].to_h.except("yaml")).to eq("rates_from" => "hetzner-fsn1", "multiplier" => 1.0, "file" => path, "added" => source.size, "replaced" => 0)
     end
 
     it "lets --visible succeed right after rates in the same process" do
@@ -338,6 +339,46 @@ RSpec.describe ByohLocationCli do
 
       all = BillingRate.load_rates(BillingRate.rate_globs)
       expect(all.group_by { it.values_at("resource_type", "resource_family", "location", "byoc", "active_from") }.values).to all(have_attributes(size: 1))
+    end
+
+    it "copies a price the source dates ahead on its date, not now" do
+      now = Time.utc(2026, 10, 12, 12)
+      allow(Time).to receive(:now).and_return(now)
+      past = Time.utc(2020, 1, 1)
+      future = now + 30 * 86400
+      write_rates(dir, "src", [rate("src", "VmVCpu", "standard", active_from: past), rate("src", "IPAddress", "IPv4", unit_price: 0.003, active_from: future)])
+      expect(cli("rates", "--location", location.name, "--rates-from", "src")[0]).to eq 0
+      expect(load_file.map { it.values_at("resource_type", "unit_price", "active_from") }).to eq [["VmVCpu", 0.001, past], ["IPAddress", 0.003, future]]
+
+      # The source gains a dated VmVCpu price and an IPv4 price in force now.
+      write_rates(dir, "src", [
+        rate("src", "VmVCpu", "standard", active_from: past), rate("src", "VmVCpu", "standard", unit_price: 0.002, active_from: future),
+        rate("src", "IPAddress", "IPv4", unit_price: 0.001, active_from: past), rate("src", "IPAddress", "IPv4", unit_price: 0.003, active_from: future),
+      ])
+      expect(cli("rates", "--location", location.name, "--rates-from", "src")[1]).to start_with "Wrote 2 rates copied from src (x1.0) to #{path}.\n"
+      expect(load_file.drop(2).map { it.values_at("resource_type", "unit_price", "active_from") }).to eq [["VmVCpu", 0.002, future], ["IPAddress", 0.001, now]]
+      expect(cli("rates", "--location", location.name, "--rates-from", "src")[1]).to start_with "#{path} already has every rate of src.\n"
+
+      # A new multiplier changes the price now, and replaces the dated
+      # rows that are not in force yet instead of tying with them.
+      later = now + 60
+      allow(Time).to receive(:now).and_return(later)
+      expect(cli("rates", "--location", location.name, "--rates-from", "src", "--multiplier", "2")[1])
+        .to start_with "Wrote 4 rates copied from src (x2.0) to #{path}, replacing 2 not yet in force.\n"
+      rows = load_file
+      expect(rows.size).to eq 6
+      expect(rows.select { it["active_from"] == future }.map { it.values_at("resource_type", "unit_price") }).to contain_exactly(["VmVCpu", 0.004], ["IPAddress", 0.006])
+      expect(rows.select { it["active_from"] == later }.map { it.values_at("resource_type", "unit_price") }).to contain_exactly(["VmVCpu", 0.002], ["IPAddress", 0.002])
+      expect(audit_rows.last[:args]["replaced"]).to eq 2
+
+      # Run again within the same second: the rows dated now have billed
+      # nothing yet, so they are replaced too.
+      expect(cli("rates", "--location", location.name, "--rates-from", "src", "--multiplier", "3")[1])
+        .to start_with "Wrote 4 rates copied from src (x3.0) to #{path}, replacing 4 not yet in force.\n"
+      rows = load_file
+      expect(rows.group_by { it.values_at("resource_type", "active_from") }.values).to all(have_attributes(size: 1))
+      expect(rows.select { it["active_from"] == later }.map { it.values_at("resource_type", "unit_price") }).to contain_exactly(["VmVCpu", 0.003], ["IPAddress", 0.003])
+      expect(BillingRate.load_rates(BillingRate.rate_globs).map { it["id"] }.tally.values.max).to eq 1
     end
 
     it "reads an empty rate file as no rates" do

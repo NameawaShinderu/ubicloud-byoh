@@ -384,25 +384,39 @@ class ByohLocationCli
 
   # Appends rates for location, copied from every rate of source, to the
   # location's overlay file. A key (type, family, byoc) the file lacks gets
-  # all source rows with their own active_from. A key it has gets one row,
-  # active from now, only when the price differs. So running the same
-  # command again adds nothing.
+  # all source rows with their own active_from. For a key it has, the
+  # source row in force now and every source row dated later are copied,
+  # each active from now or its own later date, unless the file already
+  # charges that price then. So a price upstream schedules ahead starts
+  # on its date, and running the same command again adds nothing.
   def copy_rates(location, source, multiplier)
     source_rows = source_rates(source, multiplier)
     path = rate_file(location)
     existing = File.exist?(path) ? (YAML.load_file(path, permitted_classes: [Time]) || []) : []
     now = Time.now.utc.floor
-    added = source_rows.group_by { it.values_at(*RATE_KEY) }.flat_map do |key, rows|
-      current = existing.select { it.values_at(*RATE_KEY) == key }.max_by { it["active_from"] }
-      if current.nil?
-        rows.map { copied_rate(location, it, multiplier, it["active_from"], rate_id(location, it, multiplier)) }
-      else
-        latest = rows.max_by { it["active_from"] }
-        if current["unit_price"].to_f.round(10) == (latest["unit_price"] * multiplier).round(10) && current["billed_by"] == latest["billed_by"]
-          []
-        else
-          [copied_rate(location, latest, multiplier, now, rate_id(location, latest, multiplier, now.iso8601))]
-        end
+    added = []
+    replaced = []
+    source_rows.group_by { it.values_at(*RATE_KEY) }.each do |key, rows|
+      mine = existing.select { it.values_at(*RATE_KEY) == key }
+      if mine.empty?
+        added.concat(rows.map { copied_rate(location, it, multiplier, it["active_from"], rate_id(location, it, multiplier)) })
+        next
+      end
+
+      in_force = rows.select { it["active_from"] <= now }.max_by { it["active_from"] }
+      [in_force, *rows.select { it["active_from"] > now }.sort_by { it["active_from"] }].compact.each do |row|
+        at = [now, row["active_from"]].max
+        previous = mine.select { it["active_from"] <= at }.max_by { it["active_from"] }
+        next if previous && previous["unit_price"].to_f.round(10) == (row["unit_price"] * multiplier).round(10) && previous["billed_by"] == row["billed_by"]
+
+        # A row of the file dated at the same time, now or later, has
+        # billed nothing yet (processes load the file when they start),
+        # so it is replaced instead of left to tie with the copy.
+        stale = mine.select { it["active_from"] == at }
+        replaced.concat(stale)
+        copy = copied_rate(location, row, multiplier, at, rate_id(location, row, multiplier, at.iso8601))
+        mine = mine - stale + [copy]
+        added << copy
       end
     end
 
@@ -413,14 +427,14 @@ class ByohLocationCli
 
     # One document of rows, each dumped alone so that Psych writes no
     # aliases for values the rows share (YAML.load_file refuses them).
-    yaml = "---\n" + (existing + added).map { [it].to_yaml.delete_prefix("---\n") }.join
+    yaml = "---\n" + (existing - replaced + added).map { [it].to_yaml.delete_prefix("---\n") }.join
     FileUtils.mkdir_p(File.dirname(path))
     File.write("#{path}.tmp", yaml)
     File.rename("#{path}.tmp", path)
     # The YAML goes into the audit row too, so a database backup can
     # restore a lost overlay directory.
-    audit("rates", location, {rates_from: source, multiplier:, file: path, added: added.size, yaml:})
-    @out.puts "Wrote #{added.size} rates copied from #{source} (x#{multiplier}) to #{path}."
+    audit("rates", location, {rates_from: source, multiplier:, file: path, added: added.size, replaced: replaced.size, yaml:})
+    @out.puts "Wrote #{added.size} rates copied from #{source} (x#{multiplier}) to #{path}#{", replacing #{replaced.size} not yet in force" unless replaced.empty?}."
   end
 
   # The rates copy_rates would copy; refuses when it cannot run.
