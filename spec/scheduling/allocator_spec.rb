@@ -1835,10 +1835,11 @@ RSpec.describe Al do
       al = Scheduling::Allocator::VmHostSliceAllocation.new(nil, req, nil)
 
       vh = VmHost.first
-      expect { al.select_cpuset(vh.id, 24) }.to raise_error Scheduling::Allocator::NoSpaceLeft, "failed to allocate cpus"
+      expect(Clog).to receive(:emit).with("allocator counter drift", {allocator_counter_drift: {vm_host_id: vh.ubid, free_cpus: 15, requested_cpus: 24}})
+      expect { al.select_cpuset(vh.id, 24) }.to raise_error(Scheduling::Allocator::CounterDrift, /failed to allocate cpus on #{vh.ubid}/) { expect(it.vm_host_id).to eq(vh.id) }
     end
 
-    it "raises NoSpaceLeft and rolls back when the host counters admit a slice but no CPUs are free" do
+    it "raises CounterDrift and rolls back when the host counters admit a slice but no CPUs are free" do
       vh = VmHost.first
       # All non-IO CPUs are taken, but used_cores still claims free cores
       # (the IO-CPU accounting drift that error-looped the 4th VM).
@@ -1848,7 +1849,8 @@ RSpec.describe Al do
       al = Al::Allocation.best_allocation(create_req(vm, vol, use_slices: true))
       expect(al).not_to be_nil
 
-      expect { al.update(vm) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, "failed to allocate cpus")
+      expect(Clog).to receive(:emit).with("allocator counter drift", anything).and_call_original
+      expect { al.update(vm) }.to raise_error(Scheduling::Allocator::CounterDrift, /failed to allocate cpus on #{vh.ubid}: counters admit the slice but only 1 of 2 CPUs are free/)
       expect(vm.reload.vm_host_id).to be_nil
       expect(AssignedVmAddress.where(dst_vm_id: vm.id).count).to eq(0)
       expect(vh.reload.used_hugepages_1g).to eq(2)

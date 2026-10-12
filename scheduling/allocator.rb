@@ -4,6 +4,18 @@ module Scheduling::Allocator
   class NoSpaceLeft < RuntimeError
   end
 
+  # A host whose counters admit an allocation that its CPU rows cannot
+  # satisfy. That is a bookkeeping bug, not a lack of capacity, so the
+  # caller should retry on another host rather than wait for this one.
+  class CounterDrift < NoSpaceLeft
+    attr_reader :vm_host_id
+
+    def initialize(message, vm_host_id)
+      super(message)
+      @vm_host_id = vm_host_id
+    end
+  end
+
   # CHECK constraints that catch a concurrent allocation using the
   # capacity an allocation was scored on. Any other CHECK violation is a
   # bug and must not be reported as a lack of capacity.
@@ -572,7 +584,11 @@ module Scheduling::Allocator
         .limit(n)
         .map(&:cpu_number)
 
-      fail NoSpaceLeft, "failed to allocate cpus" if cpus.size != n
+      if cpus.size != n
+        vm_host_ubid = UBID.to_ubid(vm_host_id)
+        Clog.emit("allocator counter drift", {allocator_counter_drift: {vm_host_id: vm_host_ubid, free_cpus: cpus.size, requested_cpus: n}})
+        raise CounterDrift.new("failed to allocate cpus on #{vm_host_ubid}: counters admit the slice but only #{cpus.size} of #{n} CPUs are free", vm_host_id)
+      end
 
       cpus
     end
