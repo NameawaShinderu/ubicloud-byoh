@@ -355,7 +355,7 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(vm_host.used_cores).to eq 1
     end
 
-    it "reserves no IO cpus on generic hosts without SPDK" do
+    it "reserves no IO cpus on generic hosts" do
       HostProvider.create do |hp|
         hp.id = vm_host.id
         hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME

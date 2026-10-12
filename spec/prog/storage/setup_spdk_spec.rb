@@ -43,6 +43,21 @@ RSpec.describe Prog::Storage::SetupSpdk do
       expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-spdk install #{spdk_version} 4 ubuntu-24.04")
       expect { setup_spdk.install_spdk }.to hop("start_service")
     end
+
+    it "records and installs the same cpu count on a generic host" do
+      HostProvider.create do |hp|
+        hp.id = vm_host.id
+        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+        hp.server_identifier = "byoh-1"
+      end
+      expect { setup_spdk.start }.to hop("install_spdk")
+      installation = vm_host.reload.spdk_installations.first
+      expect(installation.cpu_count).to eq 4
+      expect(installation.hugepages).to eq 4
+
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-spdk install #{spdk_version} 4 ubuntu-24.04")
+      expect { setup_spdk.install_spdk }.to hop("start_service")
+    end
   end
 
   describe "#start_service" do

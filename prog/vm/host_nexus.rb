@@ -154,14 +154,18 @@ class Prog::Vm::HostNexus < Prog::Base
           total_cpus:,
         }
         vm_host.update(**kwargs)
+        # BYOH (generic) hosts run vhost-block-backend, never SPDK, so they
+        # set no CPUs aside for IO. Decide once, so the reserved CPUs and
+        # used_cores agree.
+        io_cpu_count = (vm_host.provider_name == HostProvider::GENERIC_PROVIDER_NAME) ? 0 : vm_host.spdk_cpu_count
         (0..total_cpus - 1).each do |cpu|
           VmHostCpu.create(
             vm_host_id: vm_host.id,
             cpu_number: cpu,
-            spdk: cpu < vm_host.spdk_cpu_count,
+            spdk: cpu < io_cpu_count,
           )
         end
-        vm_host.update(used_cores: vm_host.spdk_cpu_count * total_cores / total_cpus)
+        vm_host.update(used_cores: io_cpu_count * total_cores / total_cpus)
       end
     end
 

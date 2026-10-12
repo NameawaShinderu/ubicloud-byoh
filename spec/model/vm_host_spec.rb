@@ -520,27 +520,6 @@ RSpec.describe VmHost do
       vm_host.total_cpus = 96
       expect(vm_host.spdk_cpu_count).to eq(4)
     end
-
-    it "uses no cpus for generic hosts without SPDK installations" do
-      vm_host.total_cpus = 8
-      HostProvider.create do |hp|
-        hp.id = vm_host.id
-        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
-        hp.server_identifier = "byoh-1"
-      end
-      expect(vm_host.spdk_cpu_count).to eq(0)
-    end
-
-    it "uses spdk cpus for generic hosts with SPDK installations" do
-      vm_host.total_cpus = 8
-      HostProvider.create do |hp|
-        hp.id = vm_host.id
-        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
-        hp.server_identifier = "byoh-1"
-      end
-      SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100)
-      expect(vm_host.spdk_cpu_count).to eq(2)
-    end
   end
 
   describe "#allow_slices" do

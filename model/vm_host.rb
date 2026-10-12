@@ -170,16 +170,8 @@ class VmHost < Sequel::Model
     assigned_host_addresses_dataset.first { {family(ip) => 4} }
   end
 
-  # BYOH (generic) hosts run vhost-block-backend, never SPDK, so they have
-  # no CPUs to set aside for SPDK unless an SPDK installation exists.
-  def byoh_without_spdk?
-    provider_name == HostProvider::GENERIC_PROVIDER_NAME && spdk_installations_dataset.empty?
-  end
-
   def spdk_cpu_count
-    if byoh_without_spdk?
-      0
-    elsif total_cpus <= 64
+    if total_cpus <= 64
       2
     else
       4
