@@ -20,7 +20,7 @@ class Prog::RolloutRhizome < Prog::Base
         DB[:ipv4_address]
           .left_join(:assigned_vm_address, [:ip])
           .join(:address, [:cidr])
-          .where(Sequel[:assigned_vm_address][:ip] => nil)
+          .where(Sequel[:assigned_vm_address][:ip] => nil, Sequel[:ipv4_address][:reserved] => false)
           .where(Sequel[:address][:routed_to_host_id] => Sequel[:vm_host][:id])
           .exists,
       )

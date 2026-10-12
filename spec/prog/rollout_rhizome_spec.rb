@@ -76,6 +76,15 @@ RSpec.describe Prog::RolloutRhizome do
       expect(st.stack.first["initial_host_ids"]).to eq([wdc2_host.id])
     end
 
+    it "skips an initial host whose only free IPv4 addresses are reserved" do
+      fsn1_address = Address.create(cidr: "1.1.1.0/31", routed_to_host_id: fsn1_host.id)
+      fsn1_address.populate_ipv4_addresses(reserved_ips: %w[1.1.1.0 1.1.1.1])
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: wdc2_host.id).populate_ipv4_addresses
+      st = described_class.assemble(vm_project_id: project_id)
+
+      expect(st.stack.first["initial_host_ids"]).to eq([wdc2_host.id])
+    end
+
     it "skips an initial host without enough free hugepages for the rollout VM" do
       fsn1_host.update(total_hugepages_1g: 8, used_hugepages_1g: 8)
       Address.create(cidr: "1.1.1.0/30", routed_to_host_id: fsn1_host.id).populate_ipv4_addresses
