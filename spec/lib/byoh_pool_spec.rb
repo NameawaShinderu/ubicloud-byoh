@@ -292,6 +292,12 @@ RSpec.describe ByohPool do
       ]
     end
 
+    it "checks once more after its last wait" do
+      vm = place_vm("5.9.10.1")
+      pool = described_class.new(host, sleeper: ->(_) { vm.assigned_vm_address.destroy }, drain_polls: 1)
+      expect(pool.remove("5.9.10.0/29", drain: true)).to eq []
+    end
+
     it "gives up waiting for drained VMs" do
       vm = place_vm("5.9.10.1")
       pool = described_class.new(host, sleeper: ->(_) {}, drain_polls: 1)

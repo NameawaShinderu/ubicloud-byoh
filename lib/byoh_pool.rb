@@ -478,11 +478,14 @@ class ByohPool
       ByohOperatorLog.record(command: "byoh-pool remove-drain", target_id: host.id, args: {cidr: address.cidr.to_s, vms: vms.map(&:ubid)}, result: "ok")
     end
 
-    @drain_polls.times do
-      return if AssignedVmAddress.where(address_id: address.id).empty?
+    polls = 0
+    until AssignedVmAddress.where(address_id: address.id).empty?
+      if polls == @drain_polls
+        raise Error, "#{address.cidr}: its VMs are still being destroyed; run remove again once they are gone (its addresses stay reserved meanwhile)"
+      end
       @sleeper.call(DRAIN_POLL_SECONDS)
+      polls += 1
     end
-    raise Error, "#{address.cidr}: its VMs are still being destroyed; run remove again once they are gone (its addresses stay reserved meanwhile)"
   end
 
   def declaration_mismatches(address, entry, pool_rows)

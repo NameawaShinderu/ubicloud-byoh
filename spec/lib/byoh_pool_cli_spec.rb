@@ -150,8 +150,21 @@ RSpec.describe ByohPoolCli do
       expect(err).to include "its VMs are still being destroyed"
     end
 
-    it "needs --pool" do
+    it "waits at least one poll for a short timeout, rounding up" do
+      place_vm("5.9.10.1")
+      expect(cli("remove", "--host", host.ubid, "--pool", "5.9.10.0/30", "--drain", "--drain-timeout", "7")[0]).to eq 1
+      expect(sleeps).to eq [5, 5]
+      sleeps.clear
+      expect(cli("remove", "--host", host.ubid, "--pool", "5.9.10.0/30", "--drain", "--drain-timeout", "1")[0]).to eq 1
+      expect(sleeps).to eq [5]
+    end
+
+    it "needs --pool and a positive --drain-timeout" do
       expect(cli("remove", "--host", host.ubid)).to eq [1, "", "! --pool is required\n"]
+      ["0", "-5"].each do |timeout|
+        expect(cli("remove", "--host", host.ubid, "--pool", "5.9.10.0/30", "--drain", "--drain-timeout", timeout))
+          .to eq [1, "", "! --drain-timeout must be a positive number of seconds\n"]
+      end
     end
   end
 

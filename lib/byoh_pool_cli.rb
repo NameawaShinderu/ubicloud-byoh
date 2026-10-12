@@ -118,9 +118,10 @@ class ByohPoolCli
       o.on("--drain-timeout SECONDS", Integer, "How long to wait for drained VMs (default 600)") { opts[:drain_timeout] = it }
     end
     raise Error, "--pool is required" unless opts[:pool]
+    raise Error, "--drain-timeout must be a positive number of seconds" unless opts[:drain_timeout].positive?
 
     host = mutable_host(opts)
-    pool = ByohPool.new(host, sleeper: @sleeper, drain_polls: opts[:drain_timeout] / ByohPool::DRAIN_POLL_SECONDS)
+    pool = ByohPool.new(host, sleeper: @sleeper, drain_polls: (opts[:drain_timeout].to_f / ByohPool::DRAIN_POLL_SECONDS).ceil)
     finish(pool.remove(opts[:pool], drain: opts[:drain]), "Removed pool #{opts[:pool]} from host #{host.ubid}.")
   end
 
