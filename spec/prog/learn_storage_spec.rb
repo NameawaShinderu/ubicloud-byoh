@@ -31,6 +31,28 @@ EOS
       ])
     end
 
+    it "refuses to run when VM storage volumes use the host's storage devices" do
+      vmh = Prog::Vm::HostNexus.assemble("::1").subject
+      ls = described_class.new(Strand.new(stack: [{"subject_id" => vmh.id}]))
+      sd = StorageDevice.create(vm_host_id: vmh.id, name: "DEFAULT", available_storage_gib: 80, total_storage_gib: 100)
+      vm = create_vm(vm_host_id: vmh.id)
+      VmStorageVolume.create(vm_id: vm.id, disk_index: 0, size_gib: 20, boot: true, use_bdev_ubi: false, storage_device_id: sd.id)
+
+      expect(ls.sshable).not_to receive(:_cmd)
+      expect { ls.start }.to raise_error RuntimeError, "Refusing to relearn storage of #{vmh.ubid}: VM storage volumes already use its storage devices, and relearning would reset their available_storage_gib"
+      expect(sd.reload.available_storage_gib).to eq 80
+    end
+
+    it "ignores VM storage volumes on other hosts' storage devices" do
+      vmh = Prog::Vm::HostNexus.assemble("::1").subject
+      other_sd = StorageDevice.create(vm_host_id: create_vm_host.id, name: "DEFAULT", available_storage_gib: 80, total_storage_gib: 100)
+      VmStorageVolume.create(vm_id: create_vm.id, disk_index: 0, size_gib: 20, boot: true, use_bdev_ubi: false, storage_device_id: other_sd.id)
+      ls = described_class.new(Strand.new(stack: [{"subject_id" => vmh.id}]))
+      expect(ls).to receive(:make_model_instances).and_return([])
+
+      expect { ls.start }.to exit({"msg" => "created StorageDevice records"})
+    end
+
     it "exits, updating existing StorageDevice model instances" do
       vmh = Prog::Vm::HostNexus.assemble("::1").subject
       ls = described_class.new(Strand.new(stack: [{"subject_id" => vmh.id}]))
