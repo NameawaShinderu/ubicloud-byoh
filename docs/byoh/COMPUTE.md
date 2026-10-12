@@ -399,7 +399,7 @@ Notes:
 
 | # | Change | Files | Spec |
 |---|---|---|---|
-| 1 | `display_size` returns `"#{family}-#{vcpus}c-#{mem}"` when no catalog match. Lands first; `serializers/vm.rb:10`, `views/vm/index.erb:23`, `views/vm/overview.erb:9` raise NoMethodError otherwise | `model/vm.rb:151-159` | `spec/model/vm_spec.rb` |
+| 1 | `display_size` returns `"#{family}-#{vcpus}c-#{memory_gib}g"` (e.g. `standard-3c-12g`) when no catalog match. As in the §3 display names, the `c` number counts vCPUs, not cores. Lands first; `serializers/vm.rb:10`, `views/vm/index.erb:23`, `views/vm/overview.erb:9` raise NoMethodError otherwise | `model/vm.rb:151-159` | `spec/model/vm_spec.rb` |
 | 2 | Typed `Scheduling::Allocator::NoSpaceLeft` (port 0a8bb6324). `select_cpuset` raises it; nexus rescues the class; `Sequel::CheckConstraintViolation` in `update` re-raised as `NoSpaceLeft` (portability F2) | `allocator.rb:519`, `prog/vm/metal/nexus.rb:91` | 4-core host with 2 IO CPUs: 4th slice → NoSpaceLeft, not RuntimeError |
 | 3 | IO-CPU accounting: port `origin/main:prog/vm/host_nexus.rb:133-139` and upstream migrations `20260831_add_io_to_vm_host_cpu.rb`, `20260831_backfill_vm_host_cpu_io.rb`. Generic override: `io_cpu_count = 0` when no `spdk_installations` **and** `accepts_slices` (`model/metal/vm.rb:126-131` pins backends to IO CPUs on non-slice hosts). Backfill migration `migrate/20261012000000_byoh_io_cpu.rb` for generic hosts with no slice on CPUs 0-1 | `prog/vm/host_nexus.rb`, `model/vm_host.rb` | host_nexus spec + migration spec. m8i: 4 usable cores |
 | 4 | Right-size new burstable slices: `allocator.rb:484` → `memory_gib: @request.memory_gib`. Grow-on-reuse needs **three** changes: (a) SQL prefilter `allocator.rb:205-208,214-216` admits a slice short on memory if the host has free hugepages for the delta; (b) `VmHostSliceAllocation#is_valid` (`allocator.rb:429-435`) checks host hugepages for the delta instead of returning `true`; (c) one guarded UPDATE grows slice `total_memory_gib` and host `used_hugepages_1g`. Slices are grow-only; empty-slice destroy returns the grown total; `verify_hugepages` stays consistent | `scheduling/allocator.rb` | grow on reuse; prefilter admits; `is_valid` rejects when hugepages short; race into CHECK; destroy returns grown total |
@@ -409,6 +409,8 @@ Notes:
 | 8 | `NoCapacity` page lists every dimension | `prog/vm/metal/nexus.rb:104-105` | spec |
 
 Rollout: deploy; check `vm_host.used_cores` and `io` rows on the AWS host; create/destroy ×20 with no counter drift.
+
+**Step 4 intentionally diverges from upstream.** Upstream sizes every slice by vCPU count and never grows it. Right-sized, grow-on-reuse burstable slices (and the slice row lock taken on reuse) change placement on **every** host with `accepts_slices`, including upstream's Hetzner and Leaseweb hosts, not only BYOH hosts. Expect merge conflicts in `VmHostSliceAllocation` whenever upstream changes the allocator; keep the fork's behaviour and re-apply its specs.
 
 ### Phase 1: Flexible tier (~3 weeks; mem ratio 1.0, no balloon)
 
