@@ -123,13 +123,17 @@ class Vm < Sequel::Model
     end
 
     def storage_volumes
-      add_cpus = vm_host.spdk_installations.empty? && !vm_host.accepts_slices
+      # Pin the storage backend to the IO cpus on hosts without slices. A host
+      # with no IO cpus (e.g. a BYOH host) leaves "cpus" unset, because the
+      # host treats an empty list as set and would configure zero queues.
+      io_cpus = if vm_host.spdk_installations.empty? && !vm_host.accepts_slices
+        vm_host.cpus.filter(&:spdk).map(&:cpu_number)
+      else
+        []
+      end
 
       vm_storage_volumes.map { |s|
-        if add_cpus
-          spdk_cpus = vm_host.cpus.filter(&:spdk).map(&:cpu_number)
-          cpus = spdk_cpus.shuffle.take(s.num_queues)
-        end
+        cpus = io_cpus.shuffle.take(s.num_queues)
         {
           "boot" => s.boot,
           "image" => s.boot_image&.name,
@@ -151,7 +155,7 @@ class Vm < Sequel::Model
           "copy_on_read" => false,
           "track_written" => s.track_written,
         }.tap { |v|
-          v["cpus"] = cpus if add_cpus
+          v["cpus"] = cpus unless cpus.empty?
           v["archive_source"] = storage_archive_source(s) if s.machine_image_version_id
         }
       }

@@ -435,6 +435,16 @@ RSpec.describe Vm do
       expect(storage_volumes[1]["cpus"].sort).to eq([0, 1])
     end
 
+    it "leaves the cpus field unset when the host has no IO cpus" do
+      vm_host.update(accepts_slices: false)
+      VmStorageVolume.where(vm_id: vm.id).update(spdk_installation_id: nil)
+      vm_host.spdk_installations.first.destroy
+      VmHostCpu.where(vm_host_id: vm_host.id).update(spdk: false)
+      storage_volumes = vm.storage_volumes
+      expect(storage_volumes[0]).not_to have_key("cpus")
+      expect(storage_volumes[1]).not_to have_key("cpus")
+    end
+
     it "adds archive_source when volume has machine_image_version_id" do
       project_id = Project.create(name: "test").id
       store = MachineImageStore.create(
