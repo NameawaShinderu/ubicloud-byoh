@@ -758,7 +758,7 @@ Scripts: `scripts/byoh/providers/wireguard-tunnel/{vps.sh,host.sh}`.
 
 ## 10. Pool lifecycle [PLANNED P1]
 
-`bin/byoh-pool` replaces `scripts/byoh-ops/reconfigure-routed-networks.rb`, which destroys every VM (`:93-123`).
+`bin/byoh-pool` replaces `scripts/byoh-ops/reconfigure-routed-networks.rb`, which destroyed every VM. That script was deleted on 2026-10-12 (still in git history at 0a24426cc).
 
 | Command | Behaviour |
 |---|---|
@@ -1078,7 +1078,7 @@ Order: protect first, open last. Do not touch the live env outside these steps.
 | L7 | P2 | Recreate VMs so they get the new netns rules. | recreate on the old rhizome |
 | L8 | P3 | `bin/byoh-pool verify` and `--from-outside` for all 8 EIPs; full VERIFY.md checklist. | n/a |
 | L9 | P4, separate window | IPv6 spike on a **second disposable host** first; then VPC/subnet IPv6, ENI /80, drain, `byoh-pool ipv6 set`, recreate. | stay `ula` |
-| L10 | after L4 | Delete `scripts/byoh/providers/aws-routed-network-setup.sh` and `scripts/byoh-ops/reconfigure-routed-networks.rb`. | git |
+| L10 | after L4 | Delete `scripts/byoh/providers/aws-routed-network-setup.sh` (`reconfigure-routed-networks.rb` is already gone). | git |
 
 Console phases (§12.7) are tested on a separate dev control plane and a canary host before any live rollout.
 
