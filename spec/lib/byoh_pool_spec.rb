@@ -151,6 +151,21 @@ RSpec.describe ByohPool do
       )
     end
 
+    it "keeps an onlink pool's derived reservations when it leaves onlink delivery" do
+      host = register([
+        "192.168.5.8/29,delivery=onlink,segment=192.168.5.0/24,gateway=192.168.5.9,reserve=192.168.5.10",
+        "192.168.5.16/30,delivery=onlink,segment=192.168.5.0/24,gateway=192.168.5.1,usable=all",
+      ], main_ip: "192.168.5.2")
+      yaml, notes = described_class.new(host).export(set: {"delivery" => "fabric"})
+      expect(notes).to eq ["192.168.5.8/29: leaves onlink delivery but keeps 192.168.5.9 reserved"]
+      expect(YAML.safe_load(yaml)["routed_networks"].first(2)).to eq [
+        {"cidr" => "192.168.5.8/29", "delivery" => "fabric", "exposure" => "internal", "reserve" => ["192.168.5.9", "192.168.5.10"]},
+        {"cidr" => "192.168.5.16/30", "delivery" => "fabric", "exposure" => "internal"},
+      ]
+      described_class.new(host).annotate(ByohPoolDeclaration.parse_yaml(yaml).entries.select(&:ipv4?))
+      expect(ipv4_row("192.168.5.9")[:reserved]).to be true
+    end
+
     it "exports a registered pool that is not declared" do
       address = Address.create(cidr: "5.9.20.0/30", routed_to_host_id: host.id)
       address.populate_ipv4_addresses

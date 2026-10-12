@@ -128,11 +128,19 @@ class ByohPool
       entry = by_cidr[cidr]
       pool_rows = rows_by_cidr.fetch(cidr, [])
       hash = {"cidr" => cidr, "delivery" => set.fetch("delivery", address.delivery), "exposure" => set.fetch("exposure", address.exposure)}
-      if hash["delivery"] == "onlink" && entry&.onlink?
-        hash.merge!("segment" => entry.segment.to_s, "gateway" => entry.gateway.to_s, "usable" => entry.usable)
+      reserve = pool_rows.select { it[:reserved] }.map { it[:ip].to_s }
+      if entry&.onlink?
+        # The segment's network, broadcast and gateway are reserved by the
+        # onlink declaration itself. A pool that leaves onlink delivery
+        # keeps them in its reserve, so no VM takes the LAN gateway.
+        auto_reserved = entry.reserved_ips - entry.reserve
+        if hash["delivery"] == "onlink"
+          hash.merge!("segment" => entry.segment.to_s, "gateway" => entry.gateway.to_s, "usable" => entry.usable)
+          reserve -= auto_reserved
+        elsif !auto_reserved.empty?
+          notes << "#{cidr}: leaves onlink delivery but keeps #{auto_reserved.join(", ")} reserved"
+        end
       end
-      auto_reserved = entry ? entry.reserved_ips - entry.reserve : []
-      reserve = pool_rows.select { it[:reserved] }.map { it[:ip].to_s } - auto_reserved
 
       if hash["exposure"] == "nat"
         external = pool_rows.reject { it[:reserved] }.to_h { [it[:ip].to_s, external_map[it[:ip].to_s] || it[:external_ip]&.to_s] }
