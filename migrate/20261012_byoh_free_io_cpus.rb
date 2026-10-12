@@ -22,7 +22,8 @@ Sequel.migration do
 
     (from(:vm_host_cpu).columns! & [:spdk, :io]).each do |column|
       from(:vm_host_cpu)
-        .where(vm_host_id: byoh_hosts_without_spdk, column => true)
+        .where(vm_host_id: byoh_hosts_without_spdk)
+        .where(column => true)
         .update(column => false)
     end
   end
