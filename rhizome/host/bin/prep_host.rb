@@ -4,6 +4,7 @@
 require_relative "../../common/lib/arch"
 require_relative "../../common/lib/util"
 require_relative "../lib/cloud_hypervisor"
+require_relative "../lib/kvm_check"
 require_relative "../lib/spdk_setup"
 require "fileutils"
 require "socket"
@@ -16,6 +17,11 @@ end
 unless (env_type = ARGV.shift)
   puts "need environment type as argument"
   exit 1
+end
+
+# Fail before changing anything if this host cannot run VMs at all.
+if (kvm_problem = KvmCheck.problem)
+  abort kvm_problem
 end
 
 # Set up hostname to better identify servers in transcripts.
