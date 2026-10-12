@@ -57,6 +57,9 @@ provider "aws" {
 }
 
 locals {
+  # The original environment keeps its unsuffixed names; every other
+  # workspace (e.g. "canary") gets its own.
+  name_suffix = terraform.workspace == "company-mumbai" ? "" : "-${terraform.workspace}"
   project_tag = "ubicloud-byoh-test"
   base_tags = {
     Project   = local.project_tag
@@ -85,7 +88,7 @@ resource "aws_vpc" "byoh" {
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
-  tags                 = merge(local.base_tags, { Name = "ubi-byoh-test-vpc" })
+  tags                 = merge(local.base_tags, { Name = "ubi-byoh-test-vpc${local.name_suffix}" })
 }
 
 resource "aws_subnet" "byoh" {
@@ -93,12 +96,12 @@ resource "aws_subnet" "byoh" {
   cidr_block              = var.subnet_cidr
   availability_zone       = var.availability_zone
   map_public_ip_on_launch = true
-  tags                    = merge(local.base_tags, { Name = "ubi-byoh-test-subnet" })
+  tags                    = merge(local.base_tags, { Name = "ubi-byoh-test-subnet${local.name_suffix}" })
 }
 
 resource "aws_internet_gateway" "byoh" {
   vpc_id = aws_vpc.byoh.id
-  tags   = merge(local.base_tags, { Name = "ubi-byoh-test-igw" })
+  tags   = merge(local.base_tags, { Name = "ubi-byoh-test-igw${local.name_suffix}" })
 }
 
 resource "aws_route_table" "byoh" {
@@ -107,7 +110,7 @@ resource "aws_route_table" "byoh" {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.byoh.id
   }
-  tags = merge(local.base_tags, { Name = "ubi-byoh-test-rtb" })
+  tags = merge(local.base_tags, { Name = "ubi-byoh-test-rtb${local.name_suffix}" })
 }
 
 resource "aws_route_table_association" "byoh" {
@@ -117,10 +120,10 @@ resource "aws_route_table_association" "byoh" {
 
 # --- Security group -------------------------------------------------
 resource "aws_security_group" "byoh" {
-  name        = "ubi-byoh-test-sg"
+  name        = "ubi-byoh-test-sg${local.name_suffix}"
   description = "Ubicloud BYOH test: SSH + web UI + intra-SG"
   vpc_id      = aws_vpc.byoh.id
-  tags        = merge(local.base_tags, { Name = "ubi-byoh-test-sg" })
+  tags        = merge(local.base_tags, { Name = "ubi-byoh-test-sg${local.name_suffix}" })
 
   # NOTE: operator SSH and VM-via-EIP SSH share the same port 22. If you
   # want to split them, tighten operator_ssh_cidr to your /32 and add a
@@ -175,10 +178,10 @@ resource "aws_security_group" "byoh" {
 # silently override those rules. The host itself only exposes key-only
 # sshd, the same posture as upstream Ubicloud hosts on Hetzner.
 resource "aws_security_group" "data" {
-  name        = "ubi-byoh-test-data-sg"
+  name        = "ubi-byoh-test-data-sg${local.name_suffix}"
   description = "Ubicloud BYOH data plane: VM traffic filtered by Ubicloud firewalls"
   vpc_id      = aws_vpc.byoh.id
-  tags        = merge(local.base_tags, { Name = "ubi-byoh-test-data-sg" })
+  tags        = merge(local.base_tags, { Name = "ubi-byoh-test-data-sg${local.name_suffix}" })
 
   ingress {
     description = "Operator SSH to the host"
@@ -223,7 +226,7 @@ resource "tls_private_key" "ssh" {
 resource "aws_key_pair" "byoh" {
   key_name   = "ubi-byoh-test-key-${terraform.workspace}"
   public_key = tls_private_key.ssh.public_key_openssh
-  tags       = merge(local.base_tags, { Name = "ubi-byoh-test-key" })
+  tags       = merge(local.base_tags, { Name = "ubi-byoh-test-key${local.name_suffix}" })
 }
 
 resource "local_sensitive_file" "ssh_private" {
@@ -261,7 +264,7 @@ resource "aws_instance" "ctrl" {
   }
 
   tags = merge(local.base_tags, {
-    Name = "ubi-byoh-ctrl"
+    Name = "ubi-byoh-ctrl${local.name_suffix}"
     Role = "control-plane"
   })
 }
@@ -315,7 +318,7 @@ resource "aws_instance" "data" {
   }
 
   tags = merge(local.base_tags, {
-    Name = "ubi-byoh-data"
+    Name = "ubi-byoh-data${local.name_suffix}"
     Role = "data-plane"
   })
 }
@@ -330,7 +333,7 @@ resource "aws_eip" "byoh" {
   count  = length(var.byoh_secondary_private_ips)
   domain = "vpc"
   tags = merge(local.base_tags, {
-    Name          = "ubi-byoh-eip-${count.index}"
+    Name          = "ubi-byoh-eip${local.name_suffix}-${count.index}"
     PrivateTarget = var.byoh_secondary_private_ips[count.index]
   })
 }
