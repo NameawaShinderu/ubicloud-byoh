@@ -5,10 +5,16 @@ class Prog::Vm::HostNexus < Prog::Base
   frame_reader :vhost_block_backend_version, :default_boot_images, :install_os
   frame_accessor :accepting_before_patch
 
-  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false)
+  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false, ipv6_mode: "gua")
     DB.transaction do
-      unless Location[location_id]
+      unless (location = Location[location_id])
         raise "No existing Location"
+      end
+
+      # Only a BYOH location carries the network profile that BYOH hosts
+      # are configured from.
+      if provider_name == HostProvider::GENERIC_PROVIDER_NAME && !location.byoh?
+        raise "A generic provider host needs a BYOH location, but #{location.name} is not one"
       end
 
       # BYOH hosts cannot rely on Prog::LearnNetwork because a typical
@@ -30,7 +36,7 @@ class Prog::Vm::HostNexus < Prog::Base
       sshable_args = {host: sshable_hostname}
       sshable_args[:raw_private_key_1] = ssh_private_key if ssh_private_key
       Sshable.create_with_id(id, **sshable_args)
-      vmh = VmHost.create_with_id(id, location_id:, family:, net6:, ndp_needed:)
+      vmh = VmHost.create_with_id(id, location_id:, family:, net6:, ndp_needed:, ipv6_mode:)
 
       if [HostProvider::HETZNER_PROVIDER_NAME, *HostProvider::LEASEWEB_PROVIDER_NAMES, HostProvider::GENERIC_PROVIDER_NAME].include?(provider_name)
         effective_server_identifier = server_identifier

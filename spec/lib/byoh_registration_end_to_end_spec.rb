@@ -15,11 +15,15 @@ require_relative "../model/spec_helper"
 #     → Hosting::GenericApis#hardware_reset → Hosting::RedfishClient#power_reset → wire.
 #     Excon stubs stand in for a real BMC but the code path is 100% production.
 RSpec.describe ByohRegistration, "end_to_end" do
+  let(:location) {
+    Location.create(name: "byoh-e2e", display_name: "byoh-e2e", ui_name: "BYOH e2e", visible: false,
+      provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"ula48" => "fd00:1:2::/48"})
+  }
   let(:base_reg) {
     described_class.new(
+      location:,
       main_ip: "203.0.113.42",
       routed_networks: ["10.99.0.0/29", "fd00:feed::/64"],
-      location_label: "byoh-e2e-test",
     )
   }
 
@@ -60,9 +64,9 @@ RSpec.describe ByohRegistration, "end_to_end" do
   describe "vm_host.hardware_reset → Redfish wire" do
     let(:strand) {
       described_class.new(
+        location:,
         main_ip: "203.0.113.99",
         routed_networks: ["10.100.0.0/29", "fd00:beef::/64"],
-        location_label: "byoh-reset-test",
         bmc_config: {
           "protocol" => "redfish",
           "endpoint" => "https://bmc-under-test",
@@ -105,9 +109,9 @@ RSpec.describe ByohRegistration, "end_to_end" do
       # Re-register with a different reset_type and verify it propagates all
       # the way to the HTTP body.
       st = described_class.new(
+        location:,
         main_ip: "203.0.113.88",
         routed_networks: ["10.101.0.0/29", "fd00:cafe::/64"],
-        location_label: "byoh-reset-test-2",
         bmc_config: {
           "protocol" => "redfish",
           "endpoint" => "https://bmc-under-test-2",
@@ -152,6 +156,7 @@ RSpec.describe ByohRegistration, "end_to_end" do
     it "raises CapabilityMissing when reimage is attempted on a generic host" do
       allow(Config).to receive(:development?).and_return(true)
       strand = described_class.new(
+        location:,
         main_ip: "203.0.113.77",
         routed_networks: ["10.102.0.0/29", "fd00:dead::/64"],
         bmc_config: {
@@ -168,9 +173,14 @@ RSpec.describe ByohRegistration, "end_to_end" do
   end
 
   describe "a bare IPv4 routed network" do
-    it "registers it as a /32 pool" do
-      strand = described_class.new(main_ip: "203.0.113.88", routed_networks: ["198.51.100.5"]).register!
-      expect(VmHost[strand.id].assigned_subnets.map { it.cidr.to_s }.sort).to eq(["198.51.100.5/32", "203.0.113.88/32"])
+    it "registers it as a /32 pool, with net6 from the location" do
+      strand = described_class.new(main_ip: "203.0.113.88", location:, routed_networks: ["198.51.100.5"]).register!
+      vm_host = VmHost[strand.id]
+      expect(vm_host.assigned_subnets.map { it.cidr.to_s }.sort).to eq(["198.51.100.5/32", "203.0.113.88/32"])
+      # Without an IPv6 pool, net6 is a /64 of the location's ula48.
+      expect(vm_host.net6.netmask.prefix_len).to eq 64
+      expect(ByohNetworkProfile.covers?(NetAddr::IPv6Net.parse("fd00:1:2::/48"), vm_host.net6)).to be true
+      expect(vm_host.ipv6_mode).to eq "ula"
     end
   end
 end

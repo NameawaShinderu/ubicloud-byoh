@@ -12,48 +12,81 @@ require "uri"
 class ByohRegistration
   class ValidationError < StandardError; end
 
-  attr_reader :main_ip, :routed_networks, :location_label, :server_identifier,
-    :bmc_config, :ssh_key_source, :default_boot_images
+  # Attempts at drawing an unused /64 from the location's ula48.
+  ULA_ATTEMPTS = 32
+
+  attr_reader :main_ip, :server_identifier, :bmc_config, :ssh_key_source, :default_boot_images
 
   # @param main_ip [String] management IPv4 address of the host (what the
   #   control plane will SSH to; becomes the sshable.host).
-  # @param routed_networks [Array<String>] zero or more CIDRs to declare
-  #   routable to this host. Mix of v4 and v6 allowed. The first v6 /64
-  #   becomes vm_host.net6; all v4 entries become Address rows populated
-  #   for VM IP allocation. If no v6 is given, a random ULA /64 is
-  #   auto-generated so that VM allocation (which hardcodes ephemeral_net6)
-  #   doesn't crash.
+  # @param location [Location, String] the BYOH location of the host, or
+  #   its name, display name or ubid.
+  # @param pools [Array<String, Hash>] the host's address pools, each in the
+  #   inline form "CIDR[,key=value...]" or as a hash (see
+  #   ByohPoolDeclaration). At most one IPv6 /64, which becomes
+  #   vm_host.net6; without one, a /64 is drawn from the location's ula48.
+  # @param routed_networks [Array<String>] the older name of pools.
+  # @param pool_file [String, nil] path of a pools.yaml v2 document whose
+  #   pools are added to the others.
+  # @param ipv6_mode [String, nil] gua or ula; derived from the IPv6 pool
+  #   when not given.
   # @param ssh_key_source [String, Symbol] `:generate` to mint a fresh
   #   Ed25519 keypair, or an absolute path to an existing Ed25519 private
   #   key file on disk.
-  # @param location_label [String] operator-chosen label stored in
-  #   provider_config.location_label (shown in admin UI; no routing impact).
   # @param server_identifier [String, nil] operator-chosen HostProvider
-  #   identifier. Defaults to a generated `byoh-<random>` if nil.
+  #   identifier. Defaults to `byoh-<vm_host uuid>` if nil.
   # @param bmc_config [Hash, nil] optional BMC section (see #validate_bmc!).
   # @param default_boot_images [Array<String>] optional list of Ubicloud boot
   #   image names to download on the host at registration time (e.g.
   #   ["ubuntu-noble"]). Without this the host comes up with an empty
   #   boot_image table and the VM allocator can't match anything,
   #   causing "no space left on any eligible host" at first VM create.
-  def initialize(main_ip:, routed_networks: [], ssh_key_source: :generate,
-    location_label: "byoh", server_identifier: nil, bmc_config: nil,
-    default_boot_images: [])
+  def initialize(main_ip:, location:, pools: [], routed_networks: [], pool_file: nil, ipv6_mode: nil,
+    ssh_key_source: :generate, server_identifier: nil, bmc_config: nil, default_boot_images: [], random: SecureRandom)
     @main_ip = main_ip
-    @routed_networks = Array(routed_networks)
+    @location_input = location
+    @pool_inputs = Array(pools) + Array(routed_networks)
+    @pool_file = pool_file
+    @explicit_ipv6_mode = ipv6_mode
     @ssh_key_source = ssh_key_source
-    @location_label = location_label
     @server_identifier = server_identifier
     @bmc_config = bmc_config
     @default_boot_images = Array(default_boot_images)
+    @random = random
   end
 
+  # Checks the input once; later calls return at once. Returns self.
   def validate!
+    return self if @validated
+
     validate_main_ip!
-    validate_routed_networks!
+    @location = resolve_location(@location_input)
+    @entries, @uplink, @notes = parse_pools
+    @notes += ByohPoolDeclaration.validate_set!(@entries, main_ip: @main_ip, location: @location, ipv6_mode: @explicit_ipv6_mode)
     validate_ssh_key_source!
     validate_bmc! if @bmc_config
+    @validated = true
     self
+  rescue ByohPoolDeclaration::ValidationError => ex
+    raise ValidationError, ex.message
+  end
+
+  def location
+    validate!
+    @location
+  end
+
+  # The validated pool entries, without the derived ULA.
+  def entries
+    validate!
+    @entries
+  end
+
+  # Remarks for the operator, such as the exposure chosen for a pool that
+  # did not name one.
+  def notes
+    validate!
+    @notes
   end
 
   # Returns the parsed Ed25519 keypair (binary blob suitable for storage in
@@ -84,37 +117,60 @@ class ByohRegistration
     prepare_keypair.last
   end
 
-  # The `host_provider.config` payload. Includes main_ip, location_label,
-  # routed_networks (with an auto-generated ULA /64 appended if the operator
-  # didn't supply one), and the bmc section if configured. Never contains a
-  # plaintext BMC password — callers must pass `bmc.password_env` instead.
+  # The `host_provider.config` payload: main_ip, the location name, the
+  # normalised pools (with a /64 of the location's ula48 appended if no
+  # IPv6 pool is declared), the uplink of a pools file and the bmc
+  # section. Computed once, so the derived /64 does not change between
+  # showing it and registering.
   def provider_config
-    cfg = {
-      "main_ip4" => @main_ip,
-      "location_label" => @location_label,
-      "routed_networks" => effective_routed_networks,
-    }
-    cfg["bmc"] = @bmc_config if @bmc_config
-    cfg
+    @provider_config ||= begin
+      networks = entries.map(&:to_config)
+      networks << {"cidr" => derive_ula_64, "ndp" => false} unless entries.any?(&:ipv6?)
+      cfg = {
+        "main_ip4" => @main_ip,
+        "location_label" => location.name,
+        "routed_networks" => networks,
+      }
+      cfg["uplink"] = @uplink if @uplink
+      cfg["bmc"] = @bmc_config if @bmc_config
+      cfg
+    end
+  end
+
+  def ipv6_mode
+    ByohPoolDeclaration.ipv6_mode(entries, @explicit_ipv6_mode)
   end
 
   # Call Prog::Vm::HostNexus.assemble with validated input + pre-generated
   # SSH key. Returns the resulting Strand. Caller is responsible for
-  # printing the UBID to the operator.
-  def register!(location_id: nil)
+  # printing the UBID to the operator. The registration is written to the
+  # operator log, a failure outside the failed transaction.
+  def register!
     validate!
     prepare_keypair
 
     kwargs = {
+      location_id: location.id,
       provider_name: HostProvider::GENERIC_PROVIDER_NAME,
       provider_config:,
       server_identifier: @server_identifier,
       ssh_private_key: keypair,
+      ipv6_mode:,
+      ndp_needed: entries.any?(&:ndp_needed?),
     }
-    kwargs[:location_id] = location_id if location_id
     kwargs[:default_boot_images] = @default_boot_images unless @default_boot_images.empty?
 
-    Prog::Vm::HostNexus.assemble(@main_ip, **kwargs)
+    args = {main_ip: @main_ip, location: location.name, pools: provider_config["routed_networks"], server_identifier: @server_identifier}
+    begin
+      DB.transaction do
+        strand = Prog::Vm::HostNexus.assemble(@main_ip, **kwargs)
+        ByohOperatorLog.record(command: "register-byoh-host", target_id: strand.id, args:, result: "ok")
+        strand
+      end
+    rescue => ex
+      ByohOperatorLog.record(command: "register-byoh-host", target_id: nil, args:, result: "error: #{ex.message}")
+      raise
+    end
   end
 
   # Human-facing instructions the CLI shows before running register!. The
@@ -136,42 +192,73 @@ class ByohRegistration
     INSTRUCTIONS
   end
 
-  def self.generate_ula_64
-    ula_bytes = [0xfd] + Array.new(5) { rand(256) }
-    hex = ula_bytes.map { |b| format("%02x", b) }.join
-    "#{hex[0..3]}:#{hex[4..7]}:#{hex[8..11]}:0::/64"
+  # Finds a location by name, display name or ubid.
+  def self.find_location(key)
+    Location.first(project_id: nil, name: key) ||
+      Location.first(project_id: nil, display_name: key) ||
+      (Location[key] if key.match?(/\A10[0-9a-z]{24}\z/))
   end
 
   private
 
-  def effective_routed_networks
-    entries = @routed_networks.map { |c| {"cidr" => c} }
-    unless entries.any? { |e| e["cidr"].include?(":") }
-      entries << {"cidr" => self.class.generate_ula_64}
+  def resolve_location(input)
+    raise ValidationError, "a BYOH location is required; create one with bin/byoh-location" unless input
+    location = input.is_a?(Location) ? input : self.class.find_location(input.to_s)
+    raise ValidationError, "no location #{input}; create it with bin/byoh-location" unless location
+    raise ValidationError, "location #{location.name} is not a BYOH location; create one with bin/byoh-location" unless location.byoh?
+    location
+  end
+
+  # The pools of the file and of the inline inputs. A bare IPv4 address is
+  # read as a /32, as registration always did, with a note.
+  def parse_pools
+    notes = []
+    uplink = nil
+    entries = []
+    if @pool_file
+      text = begin
+        File.read(@pool_file)
+      rescue SystemCallError => ex
+        raise ValidationError, "cannot read pool file: #{ex.message}"
+      end
+      document = ByohPoolDeclaration.parse_yaml(text)
+      if @explicit_ipv6_mode && document.ipv6_mode && @explicit_ipv6_mode != document.ipv6_mode
+        raise ValidationError, "--ipv6-mode #{@explicit_ipv6_mode} contradicts ipv6_mode #{document.ipv6_mode} of the pool file"
+      end
+      @explicit_ipv6_mode ||= document.ipv6_mode
+      uplink = document.uplink
+      entries.concat(document.entries)
     end
-    entries
+
+    @pool_inputs.each do |input|
+      if input.is_a?(String)
+        cidr, rest = input.split(",", 2)
+        cidr = cidr.to_s.strip
+        if ByohPoolDeclaration.parse_ipv4(cidr)
+          notes << "#{cidr}: no prefix given, read as #{cidr}/32"
+          input = ["#{cidr}/32", rest].compact.join(",")
+        end
+      end
+      entries << ByohPoolDeclaration.parse(input)
+    end
+    [entries, uplink, notes]
+  end
+
+  # A random /64 of the location's ula48 that no host uses.
+  def derive_ula_64
+    ula48 = location.byoh_profile.ula48 or
+      raise ValidationError, "location #{location.name} has no ula48; declare an IPv6 /64 or set one with bin/byoh-location set --ula48"
+    ULA_ATTEMPTS.times do
+      candidate = ula48.nth_subnet(64, @random.random_number(1 << 16)).to_s
+      return candidate if DB[:vm_host].where(Sequel.lit("net6 && ?::cidr", candidate)).empty?
+    end
+    raise ValidationError, "could not find an unused /64 in #{ula48} after #{ULA_ATTEMPTS} attempts; declare an IPv6 /64"
   end
 
   def validate_main_ip!
     IPAddr.new(@main_ip).ipv4? or raise ValidationError, "main_ip must be IPv4"
   rescue IPAddr::Error
     raise ValidationError, "main_ip is not a valid IP address: #{@main_ip}"
-  end
-
-  def validate_routed_networks!
-    @routed_networks.each do |cidr|
-      parsed = IPAddr.new(cidr)
-      if parsed.ipv6? && parsed.prefix != 64
-        raise ValidationError, "IPv6 routed_networks must be /64 (got #{cidr}); Ubicloud slices a /64 per host"
-      end
-      # Every address of a declared block becomes VM-allocatable, so a block
-      # around the management IP would hand the host's own address to a VM.
-      if parsed.ipv4? && parsed.include?(@main_ip) && parsed.prefix != 32
-        raise ValidationError, "routed_network #{cidr} contains main_ip #{@main_ip}; declare VM pools that exclude the management IP"
-      end
-    rescue IPAddr::InvalidAddressError
-      raise ValidationError, "routed_network is not a valid CIDR: #{cidr}"
-    end
   end
 
   def validate_ssh_key_source!

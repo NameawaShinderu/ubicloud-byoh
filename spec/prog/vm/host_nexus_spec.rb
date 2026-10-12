@@ -162,6 +162,10 @@ RSpec.describe Prog::Vm::HostNexus do
     end
 
     describe "generic (BYOH) provider" do
+      let(:byoh_location) do
+        Prog::LocationNexus.assemble(name: "byoh-test", display_name: "byoh-test", ui_name: "BYOH test", visible: false,
+          provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: Sequel.pg_jsonb({"ula48" => "fd00:1:2::/48"})).subject
+      end
       let(:provider_config) do
         {
           "main_ip4" => "203.0.113.42",
@@ -175,6 +179,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
       it "creates a HostProvider row with the operator config" do
         st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           provider_config:)
 
@@ -186,6 +191,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
       it "extracts the declared IPv6 /64 into vm_host.net6 (so LearnNetwork is skipped)" do
         st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           provider_config:)
 
@@ -194,6 +200,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
       it "creates Address rows for declared v4 networks and auto-prepends the management /32" do
         st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           provider_config:)
 
@@ -206,6 +213,7 @@ RSpec.describe Prog::Vm::HostNexus do
           "routed_networks" => [{"cidr" => "203.0.113.40/29"}, {"cidr" => "fd00:feed::/64"}],
         )
         st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           provider_config: cfg)
 
@@ -215,6 +223,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
       it "populates ipv4_address rows from declared v4 blocks (skipping the mgmt /32)" do
         described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           provider_config:)
 
@@ -227,6 +236,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
       it "allocates a VM v4 IP from the declared pool via ip4_random_vm_network" do
         st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           provider_config:)
 
@@ -237,6 +247,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
       it "allocates a VM v6 /79 slice from the declared net6" do
         st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           provider_config:)
 
@@ -248,6 +259,7 @@ RSpec.describe Prog::Vm::HostNexus do
       it "leaves net6 unset when no IPv6 network is declared" do
         cfg = provider_config.merge("routed_networks" => [{"cidr" => "10.99.0.0/29"}])
         st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           provider_config: cfg)
 
@@ -256,11 +268,29 @@ RSpec.describe Prog::Vm::HostNexus do
 
       it "uses an operator-supplied server_identifier when one is passed" do
         st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           server_identifier: "homelab-r1-01",
           provider_config:)
 
         expect(st.subject.provider.server_identifier).to eq("homelab-r1-01")
+      end
+
+      it "refuses a location that is not a BYOH location" do
+        expect {
+          described_class.assemble("203.0.113.42", provider_name: HostProvider::GENERIC_PROVIDER_NAME, provider_config:)
+        }.to raise_error RuntimeError, "A generic provider host needs a BYOH location, but hetzner-fsn1 is not one"
+        expect(Sshable.where(host: "203.0.113.42").count).to eq 0
+      end
+
+      it "stores the ipv6_mode it is given" do
+        st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config:,
+          ipv6_mode: "ula")
+
+        expect(st.subject.ipv6_mode).to eq("ula")
       end
     end
 
