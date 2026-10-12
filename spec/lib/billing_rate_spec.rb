@@ -12,6 +12,11 @@ RSpec.describe BillingRate do
       expect(Config).to receive(:billing_rates_extra_dir).and_return("/etc/ubicloud/billing_rates.d").at_least(:once)
       expect(described_class.rate_globs).to eq ["config/billing_rates/*.yml", "/etc/ubicloud/billing_rates.d/*.yml"]
     end
+
+    it "treats an empty BILLING_RATES_EXTRA_DIR as unset" do
+      expect(Config).to receive(:billing_rates_extra_dir).and_return("").at_least(:once)
+      expect(described_class.rate_globs).to eq ["config/billing_rates/*.yml"]
+    end
   end
 
   describe ".load_rates" do

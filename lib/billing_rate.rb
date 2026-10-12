@@ -17,7 +17,14 @@ class BillingRate
   # The shipped rates, plus the operator's overlay directory (rates for
   # BYOH locations) when BILLING_RATES_EXTRA_DIR is set.
   def self.rate_globs
-    ["config/billing_rates/*.yml", *(File.join(Config.billing_rates_extra_dir, "*.yml") if Config.billing_rates_extra_dir)]
+    ["config/billing_rates/*.yml", *(File.join(extra_dir, "*.yml") if extra_dir)]
+  end
+
+  # BILLING_RATES_EXTRA_DIR, or nil when it is unset or empty: an empty
+  # value would put the filesystem root's YAML files in the rates.
+  def self.extra_dir
+    dir = Config.billing_rates_extra_dir
+    dir unless dir.to_s.empty?
   end
 
   # Reads the rates without memoising them, so that a check can see a file

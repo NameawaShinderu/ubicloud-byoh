@@ -323,6 +323,8 @@ RSpec.describe ByohLocationCli do
       expect(cli("rates", "--location", location.name, "--rates-from", "hetzner-fsn1", "--multiplier", "0")[2]).to end_with "! --multiplier must be positive\n"
       allow(Config).to receive(:billing_rates_extra_dir).and_return(nil)
       expect(cli("rates", "--location", location.name, "--rates-from", "hetzner-fsn1")[2]).to end_with "! BILLING_RATES_EXTRA_DIR is not set\n"
+      allow(Config).to receive(:billing_rates_extra_dir).and_return("")
+      expect(cli("rates", "--location", location.name, "--rates-from", "hetzner-fsn1")[2]).to end_with "! BILLING_RATES_EXTRA_DIR is not set\n"
       expect(File.exist?(path)).to be false
     end
   end

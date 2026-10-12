@@ -48,7 +48,7 @@ module ByohPreflightWarnings
     locations = Location.exclude(byoh_network: nil).order(:name).all
     return warnings if locations.empty?
 
-    unless Config.billing_rates_extra_dir
+    unless BillingRate.extra_dir
       warnings << "BILLING_RATES_EXTRA_DIR is unset, so web, respirate and monitor do not load the billing rates of BYOH locations"
     end
 

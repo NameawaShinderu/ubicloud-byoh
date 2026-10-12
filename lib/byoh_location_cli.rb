@@ -369,7 +369,7 @@ class ByohLocationCli
   end
 
   def rate_file(location)
-    File.join(Config.billing_rates_extra_dir, "#{location.name}.yml") if Config.billing_rates_extra_dir
+    File.join(BillingRate.extra_dir, "#{location.name}.yml") if BillingRate.extra_dir
   end
 
   # Appends rates for location, copied from every rate of source, to the
@@ -415,7 +415,7 @@ class ByohLocationCli
 
   # The rates copy_rates would copy; refuses when it cannot run.
   def source_rates(source, multiplier)
-    raise Error, "BILLING_RATES_EXTRA_DIR is not set" unless Config.billing_rates_extra_dir
+    raise Error, "BILLING_RATES_EXTRA_DIR is not set" unless BillingRate.extra_dir
     raise Error, "--multiplier must be positive" unless multiplier.positive?
 
     rows = BillingRate.load_rates(BillingRate.rate_globs).select { it["location"] == source }
