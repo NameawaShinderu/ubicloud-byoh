@@ -19,7 +19,9 @@ unless (env_type = ARGV.shift)
   exit 1
 end
 
-# Fail before changing anything if this host cannot run VMs at all.
+# Fail before this script changes anything if the host cannot run VMs at
+# all. Other prep steps run in parallel with this one and may already have
+# changed the host; checking before any of them is a job for a preflight.
 if (kvm_problem = KvmCheck.problem)
   abort kvm_problem
 end
