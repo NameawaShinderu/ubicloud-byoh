@@ -463,8 +463,10 @@ class ByohPool
     vm_addresses.update(external_ip: DB[:ipv4_address].where(ip: Sequel[:assigned_vm_address][:ip]).select(:external_ip))
   end
 
-  # The VM's control-plane address, IPv4 billing name and DNS records
-  # follow its external IP.
+  # The VM's control-plane address and IPv4 billing name follow its
+  # external IP. The load balancer and Postgres DNS records are rewritten
+  # too, but their writers still publish the pool address until service
+  # DNS moves to Vm#public_ip4 (M2 WP7).
   def refresh_vms(vms)
     vms.each do |vm|
       vm.sshable&.update(host: vm.cp_reach_ip4&.to_s || vm.ip6_string)
