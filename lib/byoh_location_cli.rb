@@ -192,6 +192,10 @@ class ByohLocationCli
     if new_profile["ula48"] != old_profile["ula48"] && !VmHost.where(location_id: location.id).empty?
       raise Error, "ula48 cannot change while the location has hosts"
     end
+    if opts[:ui_name]
+      taken = Location.where(project_id: nil, ui_name: opts[:ui_name]).exclude(id: location.id).select_map(:name)
+      raise Error, "location #{taken.first} already uses UI name #{opts[:ui_name]}" unless taken.empty?
+    end
     check_profile!(new_profile, location)
     require_rates!(location, "stays hidden") if opts[:visible]
 

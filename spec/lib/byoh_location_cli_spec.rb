@@ -214,6 +214,12 @@ RSpec.describe ByohLocationCli do
       expect(audit_rows.last[:args].to_h).to eq("ui_name" => "Site 1", "byoh_network" => location.byoh_network.to_h)
     end
 
+    it "refuses a UI name another location shows, but keeps its own" do
+      expect(cli("set", "--location", location.name, "--ui-name", "Germany")).to eq [1, "", "! location hetzner-fsn1 already uses UI name Germany\n"]
+      expect(location.reload.ui_name).to eq "byoh-1"
+      expect(cli("set", "--location", location.name, "--ui-name", "byoh-1")[0]).to eq 0
+    end
+
     it "records a call that changes nothing" do
       expect(cli("set", "--location", location.name)[0]).to eq 0
       expect(audit_rows.map { it[:command] }).to eq ["byoh-location set"]
