@@ -8,7 +8,7 @@ RSpec.describe ByohRegistration do
     {
       main_ip: "203.0.113.42",
       routed_networks: ["10.99.0.0/29", "fd00:feed::/64"],
-      location_label: "homelab-rack-A"
+      location_label: "homelab-rack-A",
     }
   }
 
@@ -47,7 +47,33 @@ RSpec.describe ByohRegistration do
       }.to raise_error(described_class::ValidationError, /does not exist/)
     end
 
+    it "accepts an ssh_key_source that is a readable file" do
+      Dir.mktmpdir do |dir|
+        path = File.join(dir, "key")
+        File.write(path, "x")
+        expect { described_class.new(**base_args.merge(ssh_key_source: path)).validate! }.not_to raise_error
+      end
+    end
+
+    it "rejects an ssh_key_source that is neither :generate nor a path" do
+      expect {
+        described_class.new(**base_args.merge(ssh_key_source: :other)).validate!
+      }.to raise_error(described_class::ValidationError, /does not exist/)
+    end
+
     describe "bmc validation" do
+      it "requires a Hash" do
+        expect {
+          described_class.new(**base_args, bmc_config: "https://bmc.example").validate!
+        }.to raise_error(described_class::ValidationError, /must be a Hash/)
+      end
+
+      it "rejects an endpoint that is not a parseable URL" do
+        expect {
+          described_class.new(**base_args, bmc_config: {"endpoint" => "https://bmc example", "username" => "admin", "password" => "x"}).validate!
+        }.to raise_error(described_class::ValidationError, /not a valid URL/)
+      end
+
       it "requires endpoint" do
         expect {
           described_class.new(**base_args, bmc_config: {"username" => "admin", "password" => "x"}).validate!
@@ -70,7 +96,7 @@ RSpec.describe ByohRegistration do
         expect {
           described_class.new(**base_args, bmc_config: {
             "protocol" => "ipmi", "endpoint" => "http://192.168.1.11",
-            "username" => "admin", "password" => "x"
+            "username" => "admin", "password" => "x",
           }).validate!
         }.to raise_error(described_class::ValidationError, /'ipmi' is not supported in v1/)
       end
@@ -78,7 +104,7 @@ RSpec.describe ByohRegistration do
       it "rejects non-http(s) endpoint schemes" do
         expect {
           described_class.new(**base_args, bmc_config: {
-            "endpoint" => "tcp://192.168.1.11:623", "username" => "admin", "password" => "x"
+            "endpoint" => "tcp://192.168.1.11:623", "username" => "admin", "password" => "x",
           }).validate!
         }.to raise_error(described_class::ValidationError, /must be http/)
       end
@@ -87,7 +113,7 @@ RSpec.describe ByohRegistration do
         expect {
           described_class.new(**base_args, bmc_config: {
             "protocol" => "redfish", "endpoint" => "https://192.168.1.11",
-            "username" => "admin", "password_env" => "TEST_BMC_PASS_SILENCED"
+            "username" => "admin", "password_env" => "TEST_BMC_PASS_SILENCED",
           }).validate!
         }.not_to raise_error
       end
@@ -115,7 +141,7 @@ RSpec.describe ByohRegistration do
     it "includes bmc section when configured" do
       cfg = described_class.new(**base_args, bmc_config: {
         "protocol" => "redfish", "endpoint" => "https://192.168.1.11",
-        "username" => "admin", "password_env" => "TEST_BMC_PASS_SILENCED"
+        "username" => "admin", "password_env" => "TEST_BMC_PASS_SILENCED",
       }).provider_config
       expect(cfg["bmc"]["endpoint"]).to eq("https://192.168.1.11")
       expect(cfg["bmc"]["password_env"]).to eq("TEST_BMC_PASS_SILENCED")
@@ -182,7 +208,7 @@ RSpec.describe ByohRegistration do
       reg = described_class.new(**base_args, bmc_config: {
         "protocol" => "redfish", "endpoint" => "https://192.168.1.11",
         "username" => "admin", "password_env" => "TEST_BMC_PASS_SILENCED",
-        "verify_ssl" => false
+        "verify_ssl" => false,
       })
       strand = reg.register!
       vm_host = VmHost[strand.id]
@@ -199,6 +225,12 @@ RSpec.describe ByohRegistration do
       reg = described_class.new(**base_args)
       strand = reg.register!
       expect(strand.stack.first["default_boot_images"]).to eq([])
+    end
+
+    it "places the host in an operator-supplied location" do
+      location = Location.create(name: "byoh-test-loc", display_name: "BYOH test", ui_name: "BYOH test", visible: true, provider: "hetzner")
+      st = described_class.new(**base_args).register!(location_id: location.id)
+      expect(VmHost[st.id].location_id).to eq(location.id)
     end
 
     it "honors an operator-supplied server_identifier" do

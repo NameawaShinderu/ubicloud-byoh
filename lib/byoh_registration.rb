@@ -92,7 +92,7 @@ class ByohRegistration
     cfg = {
       "main_ip4" => @main_ip,
       "location_label" => @location_label,
-      "routed_networks" => effective_routed_networks
+      "routed_networks" => effective_routed_networks,
     }
     cfg["bmc"] = @bmc_config if @bmc_config
     cfg
@@ -107,9 +107,9 @@ class ByohRegistration
 
     kwargs = {
       provider_name: HostProvider::GENERIC_PROVIDER_NAME,
-      provider_config: provider_config,
+      provider_config:,
       server_identifier: @server_identifier,
-      ssh_private_key: keypair
+      ssh_private_key: keypair,
     }
     kwargs[:location_id] = location_id if location_id
     kwargs[:default_boot_images] = @default_boot_images unless @default_boot_images.empty?
@@ -134,6 +134,12 @@ class ByohRegistration
         echo '#{public_key}' >> /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
     INSTRUCTIONS
+  end
+
+  def self.generate_ula_64
+    ula_bytes = [0xfd] + Array.new(5) { rand(256) }
+    hex = ula_bytes.map { |b| format("%02x", b) }.join
+    "#{hex[0..3]}:#{hex[4..7]}:#{hex[8..11]}:0::/64"
   end
 
   private
@@ -165,9 +171,9 @@ class ByohRegistration
 
   def validate_ssh_key_source!
     return if @ssh_key_source == :generate
-    raise ValidationError, "ssh_key_source must be :generate or a file path" unless @ssh_key_source.is_a?(String)
-    raise ValidationError, "SSH key file does not exist: #{@ssh_key_source}" unless File.file?(@ssh_key_source)
-    raise ValidationError, "SSH key file is not readable: #{@ssh_key_source}" unless File.readable?(@ssh_key_source)
+    unless @ssh_key_source.is_a?(String) && File.file?(@ssh_key_source)
+      raise ValidationError, "SSH key file does not exist: #{@ssh_key_source.inspect}"
+    end
   end
 
   def validate_bmc!
@@ -202,11 +208,5 @@ class ByohRegistration
     unless protocol == "redfish"
       raise ValidationError, "bmc.protocol '#{protocol}' is not supported in v1 (use 'redfish')"
     end
-  end
-
-  def self.generate_ula_64
-    ula_bytes = [0xfd] + Array.new(5) { rand(256) }
-    hex = ula_bytes.map { |b| format("%02x", b) }.join
-    "#{hex[0..3]}:#{hex[4..7]}:#{hex[8..11]}:0::/64"
   end
 end

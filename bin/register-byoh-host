@@ -46,7 +46,7 @@ options = {
   location_label: "byoh",
   assume_yes: false,
   bmc: nil,
-  default_boot_images: []
+  default_boot_images: [],
 }
 
 def ensure_bmc(opts)
@@ -100,7 +100,10 @@ parser = OptionParser.new do |o|
     ensure_bmc(options)["reset_type"] = v
   end
   o.separator ""
-  o.on("-h", "--help", "Show this help") { puts o; exit 0 }
+  o.on("-h", "--help", "Show this help") {
+    puts o
+    exit 0
+  }
 end
 parser.parse!
 
@@ -120,7 +123,7 @@ registration = ByohRegistration.new(
   location_label: options[:location_label],
   server_identifier: options[:server_identifier],
   bmc_config: options[:bmc],
-  default_boot_images: options[:default_boot_images]
+  default_boot_images: options[:default_boot_images],
 )
 
 begin
