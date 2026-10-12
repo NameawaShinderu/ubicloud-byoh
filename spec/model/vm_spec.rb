@@ -5,6 +5,23 @@ require_relative "spec_helper"
 RSpec.describe Vm do
   subject(:vm) { described_class.new(display_state: "creating", created_at: Time.now) }
 
+  describe "#display_size" do
+    it "returns the catalog size name" do
+      vm = described_class.new(family: "standard", arch: "x64", vcpus: 4, cpu_percent_limit: 400, memory_gib: 16)
+      expect(vm.display_size).to eq("standard-4")
+    end
+
+    it "returns the catalog size name when cpu_percent_limit is not set" do
+      vm = described_class.new(family: "burstable", arch: "x64", vcpus: 2, memory_gib: 4)
+      expect(vm.display_size).to eq("burstable-2")
+    end
+
+    it "returns a descriptive name when no catalog size matches" do
+      vm = described_class.new(family: "standard", arch: "x64", vcpus: 3, cpu_percent_limit: 300, memory_gib: 12)
+      expect(vm.display_size).to eq("standard-3c-12g")
+    end
+  end
+
   describe "#display_state" do
     let(:vm) {
       v = create_vm(display_state: "creating")

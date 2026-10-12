@@ -147,7 +147,9 @@ class Vm < Sequel::Model
   end
 
   # Reverse look-up the vm_size instance that was used to create this VM
-  # and use its name as a display name.
+  # and use its name as a display name. VMs whose shape is not in the
+  # catalog (e.g. created with a custom shape) get a descriptive name
+  # instead, so the pages and API listing them keep working.
   def display_size
     vm_size = Option::VmSizes.find {
       it.family == family &&
@@ -155,7 +157,7 @@ class Vm < Sequel::Model
         it.vcpus == vcpus &&
         (cpu_percent_limit.nil? || it.cpu_percent_limit == cpu_percent_limit)
     }
-    vm_size.name
+    vm_size&.name || "#{family}-#{vcpus}c-#{memory_gib}g"
   end
 
   # Various names in linux, like interface names, are obliged to be
