@@ -30,6 +30,36 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     strand.save_changes
   end
 
+  # Free capacity of each accepting host in every dimension the
+  # allocator checks, so a NoCapacity page shows which one ran out.
+  # Limited to a few hosts to keep the query cheap.
+  def host_capacity_summary(location_filter)
+    vm_host_id = Sequel[:vm_host][:id]
+    free_storage_gib = DB[:storage_device]
+      .where(vm_host_id:, enabled: true)
+      .select { coalesce(sum(available_storage_gib), 0) }
+    free_ipv4 = DB[:ipv4_address]
+      .left_join(:assigned_vm_address, ip: :ip)
+      .join(:address, [:cidr])
+      .where(:routed_to_host_id => vm_host_id, Sequel[:assigned_vm_address][:ip] => nil)
+      .select { count.function.* }
+
+    ds = VmHost.where(allocation_state: "accepting", arch: vm.arch)
+    ds = ds.where(location_id: location_filter) unless location_filter.empty?
+    ds.order(vm_host_id).limit(10)
+      .select(vm_host_id, :used_cores, :total_cores, :used_hugepages_1g, :total_hugepages_1g, free_storage_gib.as(:free_storage_gib), free_ipv4.as(:free_ipv4))
+      .naked
+      .map {
+        {
+          "host" => UBID.to_ubid(it[:id]),
+          "cores" => "#{it[:used_cores]}/#{it[:total_cores]}",
+          "hugepages_1g" => "#{it[:used_hugepages_1g]}/#{it[:total_hugepages_1g]}",
+          "free_storage_gib" => it[:free_storage_gib],
+          "free_ipv4" => it[:free_ipv4],
+        }
+      }
+  end
+
   def before_destroy
     register_deadline(nil, 5 * 60)
     vm.active_billing_records.each(&:finalize)
@@ -100,7 +130,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       end
       if waiting_seconds >= page_after_minutes * 60
         utilization = VmHost.where(allocation_state: "accepting", arch: vm.arch).select_map { sum(:used_cores) * 100.0 / sum(:total_cores) }.first.to_f
-        Prog::PageNexus.assemble("No capacity left at #{Location[vm.location_id].display_name} for #{vm.family} family of #{vm.arch}", ["NoCapacity", Location[vm.location_id].display_name, vm.arch, vm.family], queued_vms.limit(25).select_map(Sequel[:vm][:id]).map { UBID.to_ubid(it) }, extra_data: {queue_size: queued_vms.count, utilization:})
+        Prog::PageNexus.assemble("No capacity left at #{Location[vm.location_id].display_name} for #{vm.family} family of #{vm.arch}", ["NoCapacity", Location[vm.location_id].display_name, vm.arch, vm.family], queued_vms.limit(25).select_map(Sequel[:vm][:id]).map { UBID.to_ubid(it) }, extra_data: {queue_size: queued_vms.count, utilization:, hosts: host_capacity_summary(location_filter)})
       end
 
       nap (30.0 / (1 + waiting_seconds / 120.0)).clamp(5, 30)

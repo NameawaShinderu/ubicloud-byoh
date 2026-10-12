@@ -330,6 +330,40 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(Page.count).to eq(1)
     end
 
+    it "lists the free capacity of every candidate host in the page" do
+      expect(Scheduling::Allocator).to receive(:allocate).and_raise(Scheduling::Allocator::NoSpaceLeft.new("no space left on any eligible host"))
+      StorageDevice.create(vm_host_id: vm_host.id, name: "stor1", available_storage_gib: 30, total_storage_gib: 100)
+      StorageDevice.create(vm_host_id: vm_host.id, name: "stor2", available_storage_gib: 12, total_storage_gib: 50)
+      StorageDevice.create(vm_host_id: vm_host.id, name: "stor3", available_storage_gib: 99, total_storage_gib: 99, enabled: false)
+      address = Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vm_host.id)
+      AssignedVmAddress.create(dst_vm_id: vm.id, ip: "1.1.1.1", address_id: address.id)
+      # Excluded: other location, other arch, not accepting
+      create_vm_host(location_id: Location::HETZNER_HEL1_ID)
+      create_vm_host(arch: "arm64")
+      create_vm_host(allocation_state: "draining")
+      empty_host = create_vm_host(total_cores: 4, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 10)
+
+      vm.created_at = Time.now - 11 * 60
+      expect { nx.start }.to nap(5)
+
+      hosts = Page.first.details["hosts"].sort_by { it["host"] }
+      expect(hosts).to eq([
+        {"host" => vm_host.ubid, "cores" => "2/48", "hugepages_1g" => "16/375", "free_storage_gib" => 42, "free_ipv4" => 3},
+        {"host" => empty_host.ubid, "cores" => "4/4", "hugepages_1g" => "10/10", "free_storage_gib" => 0, "free_ipv4" => 0},
+      ].sort_by { it["host"] })
+    end
+
+    it "lists hosts of every location in the page when there is no location filter" do
+      expect(Scheduling::Allocator).to receive(:allocate).and_raise(Scheduling::Allocator::NoSpaceLeft.new("no space left on any eligible host"))
+      other = create_vm_host(location_id: Location::HETZNER_HEL1_ID)
+      st.stack = [{"storage_volumes" => storage_volumes, "force_host_id" => other.id}]
+
+      vm.created_at = Time.now - 11 * 60
+      expect { nx.start }.to nap(5)
+
+      expect(Page.first.details["hosts"].map { it["host"] }).to contain_exactly(vm_host.ubid, other.ubid)
+    end
+
     it "does not create a page if VM has been waiting less than 10 minutes" do
       expect(Scheduling::Allocator).to receive(:allocate).and_raise(Scheduling::Allocator::NoSpaceLeft.new("no space left on any eligible host"))
 
