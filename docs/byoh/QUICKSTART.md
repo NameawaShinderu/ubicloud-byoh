@@ -396,3 +396,10 @@ instances, EIPs, SG, RT, IGW, subnet, VPC, keypair.
 - Destroy the VMs via the UI and re-create — confirm IPs get recycled
 - Try the `vm_host.hardware_reset` path (dev-mode only) to exercise the BMC-via-Redfish path (note: AWS bare metal has no BMC; this will raise `CapabilityMissing` as expected)
 - Replicate the setup on OVH or Hetzner — the only thing that changes is Step 2 (provisioning) and the "install routed IP block" pre-work. Everything from Step 3 onward is identical.
+
+## See also
+
+- [ROADMAP.md](ROADMAP.md): what works today, and the build plan (milestones M0-M12)
+- [NETWORKING.md](NETWORKING.md): host network contract, pools, exposure, access without a public IP
+- [COMPUTE.md](COMPUTE.md): capacity accounting, tiers, overcommit
+- [PLATFORMS.md](PLATFORMS.md): per-platform support and the host preflight checks
