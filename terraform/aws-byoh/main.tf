@@ -167,6 +167,54 @@ resource "aws_security_group" "byoh" {
   }
 }
 
+# --- Data plane security group ---------------------------------------
+# AWS plays the role of the provider's network (Hetzner, OVH…): it hands
+# every packet for the VM pool to the host, and the CUSTOMER decides what
+# reaches each VM through Ubicloud firewall rules, which rhizome enforces
+# per VM (netns forward chain, policy drop). Filtering ports here would
+# silently override those rules. The host itself only exposes key-only
+# sshd, the same posture as upstream Ubicloud hosts on Hetzner.
+resource "aws_security_group" "data" {
+  name        = "ubi-byoh-test-data-sg"
+  description = "Ubicloud BYOH data plane: VM traffic filtered by Ubicloud firewalls"
+  vpc_id      = aws_vpc.byoh.id
+  tags        = merge(local.base_tags, { Name = "ubi-byoh-test-data-sg" })
+
+  ingress {
+    description = "Operator SSH to the host"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.operator_ssh_cidr]
+  }
+
+  ingress {
+    description     = "Control plane (rhizome over SSH, VM reachability probes)"
+    from_port       = 0
+    to_port         = 0
+    protocol        = "-1"
+    security_groups = [aws_security_group.byoh.id]
+  }
+
+  dynamic "ingress" {
+    for_each = var.data_plane_open_ingress ? [1] : []
+    content {
+      description = "All traffic to the VM pool; Ubicloud firewalls decide"
+      from_port   = 0
+      to_port     = 0
+      protocol    = "-1"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
 # --- Generated SSH keypair (saved to .generated/ locally) -----------
 resource "tls_private_key" "ssh" {
   algorithm = "ED25519"
@@ -224,7 +272,7 @@ resource "aws_instance" "data" {
   instance_type               = var.data_plane_instance_type
   key_name                    = aws_key_pair.byoh.key_name
   subnet_id                   = aws_subnet.byoh.id
-  vpc_security_group_ids      = [aws_security_group.byoh.id]
+  vpc_security_group_ids      = [aws_security_group.data.id]
   associate_public_ip_address = true
 
   # CRITICAL: the data plane forwards packets destined for the BYOH

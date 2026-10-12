@@ -73,3 +73,9 @@ variable "data_plane_nested_virtualization" {
   type        = bool
   default     = false
 }
+
+variable "data_plane_open_ingress" {
+  description = "Let all internet traffic reach the data plane so Ubicloud's per-VM firewall rules (set by customers in the UI/API) are the only filter, like a real provider network. false = only the operator and the control plane can reach the data plane, so VMs are unreachable from outside."
+  type        = bool
+  default     = false
+}
