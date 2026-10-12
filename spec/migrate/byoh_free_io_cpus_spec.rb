@@ -29,7 +29,7 @@ RSpec.describe "migrate/20261012_byoh_free_io_cpus.rb" do
     VmHostCpu.where(vm_host_id: vm_host.id).select_order_map([:cpu_number, :spdk, :vm_host_slice_id])
   end
 
-  it "frees the unassigned IO cpus of generic hosts without SPDK, idempotently" do
+  it "frees the IO cpus of generic hosts without SPDK, idempotently" do
     byoh = host_with_cpus(HostProvider::GENERIC_PROVIDER_NAME)
     slice = create_vm_host_slice(vm_host_id: byoh.id)
     VmHostCpu.where(vm_host_id: byoh.id, cpu_number: 1).update(vm_host_slice_id: slice.id)
@@ -40,7 +40,7 @@ RSpec.describe "migrate/20261012_byoh_free_io_cpus.rb" do
 
     2.times { migration.apply(DB, :up) }
 
-    expect(cpu_map(byoh)).to eq [[0, false, nil], [1, true, slice.id], [2, false, nil], [3, false, nil]]
+    expect(cpu_map(byoh)).to eq [[0, false, nil], [1, false, slice.id], [2, false, nil], [3, false, nil]]
     untouched = [[0, true, nil], [1, true, nil], [2, false, nil], [3, false, nil]]
     expect(cpu_map(byoh_spdk)).to eq untouched
     expect(cpu_map(hetzner)).to eq untouched
