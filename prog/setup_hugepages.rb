@@ -39,8 +39,19 @@ class Prog::SetupHugepages < Prog::Base
     host_meminfo = sshable.cmd("cat /proc/meminfo")
     available_memory_match = host_meminfo.match(/^MemAvailable:\s+(\d+) kB$/)
     fail "Couldn't extract available memory" unless available_memory_match
+    available_kib = Integer(available_memory_match.captures.first)
+
+    # When the setup runs again on a host that booted with hugepages
+    # reserved, MemAvailable no longer includes them. Add them back, minus
+    # the struct page memory already returned for 1G pages, so the clamp
+    # measures the same memory as on the first run.
+    reserved_hugepages = host_meminfo[/^HugePages_Total:\s+(\d+)$/, 1].to_i
+    reserved_hugepage_kib = host_meminfo[/^Hugepagesize:\s+(\d+) kB$/, 1].to_i
+    freed_vmemmap_kib = (reserved_hugepage_kib == 1048576) ? reserved_hugepages * 16380 : 0
+    available_kib += reserved_hugepages * reserved_hugepage_kib - freed_vmemmap_kib
+
     vmemmap_kib = hugepage_cnt * 16380
-    available_limit = [(Integer(available_memory_match.captures.first) + vmemmap_kib) / 1048576 - 4, 0].max
+    available_limit = [(available_kib + vmemmap_kib) / 1048576 - 4, 0].max
     if available_limit < hugepage_cnt
       Clog.emit("hugepage count clamped to available memory", {hugepage_clamp: {formula_count: hugepage_cnt, clamped_count: available_limit}})
       hugepage_cnt = available_limit

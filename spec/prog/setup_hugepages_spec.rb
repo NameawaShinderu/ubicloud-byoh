@@ -51,6 +51,31 @@ RSpec.describe Prog::SetupHugepages do
       expect { sh.start }.to exit({"msg" => "hugepages installed"})
     end
 
+    it "counts the hugepages already reserved when setup runs again" do
+      # 57 1G pages reserved at boot, with their struct page memory returned.
+      expect_prerequisites
+      expect(sh.sshable).to receive(:_cmd).with("cat /proc/meminfo").and_return(<<~MEMINFO)
+        MemAvailable: #{65011712 - 57 * 1048576 + 57 * 16380} kB
+        HugePages_Total:      57
+        Hugepagesize:    1048576 kB
+      MEMINFO
+      expect(Clog).not_to receive(:emit)
+      expect_grub_update(57)
+      expect { sh.start }.to exit({"msg" => "hugepages installed"})
+    end
+
+    it "counts reserved 2M hugepages without a struct page credit" do
+      expect_prerequisites
+      expect(sh.sshable).to receive(:_cmd).with("cat /proc/meminfo").and_return(<<~MEMINFO)
+        MemAvailable: #{65011712 - 1024 * 2048} kB
+        HugePages_Total:    1024
+        Hugepagesize:       2048 kB
+      MEMINFO
+      expect(Clog).not_to receive(:emit)
+      expect_grub_update(57)
+      expect { sh.start }.to exit({"msg" => "hugepages installed"})
+    end
+
     it "never asks for a negative hugepage count" do
       vm_host.update(total_mem_gib: 4)
       expect_prerequisites
