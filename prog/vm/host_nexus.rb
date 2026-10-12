@@ -3,6 +3,9 @@
 class Prog::Vm::HostNexus < Prog::Base
   subject_is :sshable, :vm_host
 
+  # The smallest dedicated slice (2 threads) books 8 GiB of 1G hugepages.
+  MIN_SLICE_HUGEPAGES = 8
+
   def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [])
     DB.transaction do
       unless Location[location_id]
@@ -283,6 +286,11 @@ class Prog::Vm::HostNexus < Prog::Base
 
     spdk_hugepages = vm_host.spdk_installations.sum(&:hugepages)
     fail "Used hugepages exceed SPDK hugepages" unless total_hugepages - free_hugepages <= spdk_hugepages
+
+    usable_hugepages = total_hugepages - spdk_hugepages
+    if vm_host.accepts_slices && usable_hugepages < MIN_SLICE_HUGEPAGES
+      fail "Only #{usable_hugepages} usable 1G hugepages; a host that runs dedicated slices needs at least #{MIN_SLICE_HUGEPAGES}"
+    end
 
     total_vm_mem_gib = if vm_host.accepts_slices
       vm_host.slices.sum(&:total_memory_gib)

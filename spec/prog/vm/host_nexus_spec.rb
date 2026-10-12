@@ -733,14 +733,22 @@ RSpec.describe Prog::Vm::HostNexus do
 
     it "calculates used memory for slices and hops" do
       expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
-        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 10\nHugePages_Free: 8")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 12\nHugePages_Free: 10")
       SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100, hugepages: 4)
       vm_host.update(accepts_slices: true)
       create_vm_host_slice(vm_host_id: vm_host.id, name: "standard1", total_memory_gib: 2)
       create_vm_host_slice(vm_host_id: vm_host.id, name: "standard2", total_memory_gib: 3)
       expect { nx.verify_hugepages }.to hop("start_slices")
-      expect(vm_host.reload.total_hugepages_1g).to eq(10)
+      expect(vm_host.reload.total_hugepages_1g).to eq(12)
       expect(vm_host.used_hugepages_1g).to eq(9)
+    end
+
+    it "fails if a host that runs slices has fewer usable hugepages than the smallest slice" do
+      expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 11\nHugePages_Free: 9")
+      SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100, hugepages: 4)
+      vm_host.update(accepts_slices: true)
+      expect { nx.verify_hugepages }.to raise_error RuntimeError, "Only 7 usable 1G hugepages; a host that runs dedicated slices needs at least 8"
     end
 
     it "updates vm_host with hugepage stats and hops" do
