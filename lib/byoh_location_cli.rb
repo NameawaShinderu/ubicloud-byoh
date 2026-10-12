@@ -116,7 +116,10 @@ class ByohLocationCli
     raise Error, "location #{taken.first} already uses that name, display name or UI name" unless taken.empty?
 
     multiplier = opts[:multiplier] || 1.0
-    source_rates(opts[:rates_from], multiplier) if opts[:rates_from]
+    copies = opts[:rates_from] ? source_rates(opts[:rates_from], multiplier).map { it.merge("location" => name) } : []
+    # Checked before anything is created, so that a refused --visible
+    # leaves no location behind.
+    require_rates!(name, "cannot be created visible", copies) if opts[:visible]
     profile["ula48"] ||= generate_ula48
     check_profile!(profile, nil)
 
@@ -197,7 +200,7 @@ class ByohLocationCli
       raise Error, "location #{taken.first} already uses UI name #{opts[:ui_name]}" unless taken.empty?
     end
     check_profile!(new_profile, location)
-    require_rates!(location, "stays hidden") if opts[:visible]
+    require_rates!(location.name, "stays hidden") if opts[:visible]
 
     changes = {}
     changes[:ui_name] = opts[:ui_name] if opts[:ui_name]
@@ -227,7 +230,7 @@ class ByohLocationCli
 
   def cmd_grant(argv)
     location, project = location_and_project(argv, "grant")
-    require_rates!(location, "cannot be granted (run the rates command)")
+    require_rates!(location.name, "cannot be granted (run the rates command)")
 
     DB.transaction do
       project.set_ff_visible_locations(((project.get_ff_visible_locations || []) + [location.name]).uniq)
@@ -359,13 +362,15 @@ class ByohLocationCli
     raise Error, "could not pick an unused ula48; pass --ula48"
   end
 
-  def require_rates!(location, consequence)
-    missing = ByohPreflightWarnings.missing_rates(location.name)
-    raise Error, "location #{location.name} #{consequence}: no billing rate for #{missing.map { it.join("/") }.join(", ")}" unless missing.empty?
+  # Refuses unless the rate files, plus the rates in extra, have every
+  # minimum rate of the location.
+  def require_rates!(name, consequence, extra = [])
+    missing = ByohPreflightWarnings.missing_rates(name, BillingRate.load_rates(BillingRate.rate_globs) + extra)
+    raise Error, "location #{name} #{consequence}: no billing rate for #{missing.map { it.join("/") }.join(", ")}" unless missing.empty?
   end
 
   def update_visibility(location, visible)
-    require_rates!(location, "stays hidden") if visible
+    require_rates!(location.name, "stays hidden") if visible
     DB.transaction do
       location.update(visible:)
       audit(visible ? "set-visible" : "set-hidden", location, {})

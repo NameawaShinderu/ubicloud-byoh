@@ -104,6 +104,29 @@ RSpec.describe ByohLocationCli do
       expect(audit_rows.map { it[:command] }).to eq ["byoh-location create", "byoh-location rates", "byoh-location set-visible"]
     end
 
+    it "refuses --visible before creating anything when the rates would be incomplete" do
+      allow(Config).to receive(:billing_rates_extra_dir).and_return(dir)
+      write_rates(dir, "partial", [rate("partial", "VmVCpu", "standard")])
+      missing = "VmVCpu/burstable, VmStorage/standard, VmStorage/burstable, IPAddress/IPv4, MachineImageStorage/standard"
+      expect(cli("create", "--name", "byoh-1", "--rates-from", "partial", "--visible"))
+        .to eq [1, "", "! location byoh-1 cannot be created visible: no billing rate for #{missing}\n"]
+      expect(cli("create", "--name", "byoh-1", "--visible"))
+        .to eq [1, "", "! location byoh-1 cannot be created visible: no billing rate for VmVCpu/standard, #{missing}\n"]
+      expect(Location.where(name: "byoh-1").count).to eq 0
+      expect(File.exist?(File.join(dir, "byoh-1.yml"))).to be false
+      expect(audit_rows).to be_empty
+    end
+
+    it "makes a location visible with the rates its overlay file already has" do
+      allow(Config).to receive(:billing_rates_extra_dir).and_return(dir)
+      write_rates(dir, "byoh-1", full_rates("byoh-1"))
+      expect(random).to receive(:random_bytes).and_return("\x01\x02\x03\x04\x05".b)
+      status, output, = cli("create", "--name", "byoh-1", "--visible")
+      expect(status).to eq 0
+      expect(output).to include "Location byoh-1 is now visible."
+      expect(Location.first(name: "byoh-1").visible).to be true
+    end
+
     it "retries a generated ula48 that another location uses" do
       byoh_location("byoh-old", {"ula48" => "fd01:203:405::/48"})
       expect(random).to receive(:random_bytes).and_return("\x01\x02\x03\x04\x05".b, "\x01\x02\x03\x04\x06".b)
