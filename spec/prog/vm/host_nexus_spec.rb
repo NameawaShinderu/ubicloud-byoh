@@ -760,6 +760,14 @@ RSpec.describe Prog::Vm::HostNexus do
       expect { nx.verify_hugepages }.to raise_error RuntimeError, "Only 7 usable 1G hugepages; a host that runs dedicated slices needs at least 8"
     end
 
+    it "accepts fewer usable hugepages on arm64, where the smallest slice books less memory" do
+      expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 6\nHugePages_Free: 6")
+      vm_host.update(accepts_slices: true, arch: "arm64")
+      expect { nx.verify_hugepages }.to hop("start_slices")
+      expect(vm_host.reload.total_hugepages_1g).to eq(6)
+    end
+
     it "updates vm_host with hugepage stats and hops" do
       expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
         .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 10\nHugePages_Free: 8")

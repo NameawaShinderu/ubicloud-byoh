@@ -178,6 +178,15 @@ class VmHost < Sequel::Model
     end
   end
 
+  # The 1G hugepages the smallest dedicated slice (2 vCPUs) books on this
+  # host's architecture, using the allocator's memory to vCPU ratio.
+  def min_slice_hugepages
+    request = Scheduling::Allocator::Request.new
+    request.arch_filter = arch
+    request.family = "standard"
+    request.memory_gib_for_vcpus(2)
+  end
+
   def create_addresses(ip_records: nil)
     ip_records ||= Hosting::Apis.pull_ips(self)
     return if ip_records.nil? || ip_records.empty?

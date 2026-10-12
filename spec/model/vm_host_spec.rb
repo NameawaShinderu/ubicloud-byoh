@@ -522,6 +522,18 @@ RSpec.describe VmHost do
     end
   end
 
+  describe "#min_slice_hugepages" do
+    it "is 8 on x64" do
+      vm_host.arch = "x64"
+      expect(vm_host.min_slice_hugepages).to eq(8)
+    end
+
+    it "is 6 on arm64" do
+      vm_host.arch = "arm64"
+      expect(vm_host.min_slice_hugepages).to eq(6)
+    end
+  end
+
   describe "#allow_slices" do
     it "allows slices" do
       expect { vm_host.allow_slices }.to change(vm_host, :accepts_slices).to(true)
