@@ -337,31 +337,58 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       StorageDevice.create(vm_host_id: vm_host.id, name: "stor3", available_storage_gib: 99, total_storage_gib: 99, enabled: false)
       address = Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vm_host.id)
       AssignedVmAddress.create(dst_vm_id: vm.id, ip: "1.1.1.1", address_id: address.id)
-      # Excluded: other location, other arch, not accepting
+      # Excluded: other location, other arch, not accepting, other family
       create_vm_host(location_id: Location::HETZNER_HEL1_ID)
       create_vm_host(arch: "arm64")
       create_vm_host(allocation_state: "draining")
+      create_vm_host(family: "premium")
       empty_host = create_vm_host(total_cores: 4, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 10)
+      half_host = create_vm_host(total_cores: 48, used_cores: 24)
 
       vm.created_at = Time.now - 11 * 60
       expect { nx.start }.to nap(5)
 
-      hosts = Page.first.details["hosts"].sort_by { it["host"] }
-      expect(hosts).to eq([
+      # Most free cores first
+      expect(Page.first.details["hosts"]).to eq([
         {"host" => vm_host.ubid, "cores" => "2/48", "hugepages_1g" => "16/375", "free_storage_gib" => 42, "free_ipv4" => 3},
+        {"host" => half_host.ubid, "cores" => "24/48", "hugepages_1g" => "16/375", "free_storage_gib" => 0, "free_ipv4" => 0},
         {"host" => empty_host.ubid, "cores" => "4/4", "hugepages_1g" => "10/10", "free_storage_gib" => 0, "free_ipv4" => 0},
-      ].sort_by { it["host"] })
+      ])
     end
 
-    it "lists hosts of every location in the page when there is no location filter" do
+    it "orders hosts with the same free cores by free hugepages in the page" do
       expect(Scheduling::Allocator).to receive(:allocate).and_raise(Scheduling::Allocator::NoSpaceLeft.new("no space left on any eligible host"))
-      other = create_vm_host(location_id: Location::HETZNER_HEL1_ID)
-      st.stack = [{"storage_volumes" => storage_volumes, "force_host_id" => other.id}]
+      roomy = create_vm_host(used_hugepages_1g: 0)
 
       vm.created_at = Time.now - 11 * 60
       expect { nx.start }.to nap(5)
 
-      expect(Page.first.details["hosts"].map { it["host"] }).to contain_exactly(vm_host.ubid, other.ubid)
+      expect(Page.first.details["hosts"].map { it["host"] }).to eq([roomy.ubid, vm_host.ubid])
+    end
+
+    it "lists only the forced host in the page, even when it is not accepting" do
+      expect(Scheduling::Allocator).to receive(:allocate).and_raise(Scheduling::Allocator::NoSpaceLeft.new("no space left on any eligible host"))
+      forced = create_vm_host(location_id: Location::HETZNER_HEL1_ID, allocation_state: "draining")
+      st.stack = [{"storage_volumes" => storage_volumes, "force_host_id" => forced.id}]
+
+      vm.created_at = Time.now - 11 * 60
+      expect { nx.start }.to nap(5)
+
+      expect(Page.first.details["hosts"].map { it["host"] }).to eq([forced.ubid])
+    end
+
+    it "reports the requested family when a lost race already set the host's family" do
+      expect(Scheduling::Allocator).to receive(:allocate) do |vm, *|
+        vm.family = "premium"
+        raise Scheduling::Allocator::NoSpaceLeft, "no space left on vh"
+      end
+      expect(Clog).to receive(:emit).with("No capacity left", {lack_of_capacity: hash_including(family: "standard")})
+
+      vm.created_at = Time.now - 11 * 60
+      expect { nx.start }.to nap(5)
+
+      expect(Page.first.summary).to eq("No capacity left at #{Location[vm.location_id].display_name} for standard family of x64")
+      expect(Page.from_tag_parts("NoCapacity", Location[vm.location_id].display_name, "x64", "standard")).not_to be_nil
     end
 
     it "excludes a host whose counters drifted from the next attempts" do
@@ -377,6 +404,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
 
       expect(st.reload.stack.first["exclude_host_ids"]).to eq([excluded.id, drifted.id])
       expect(vm.reload.waiting_for_capacity_set?).to be(true)
+      expect(Page.first.details["hosts"].map { it["host"] }).to eq([vm_host.ubid])
     end
 
     it "does not create a page if VM has been waiting less than 10 minutes" do

@@ -30,10 +30,12 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     strand.save_changes
   end
 
-  # Free capacity of each accepting host in every dimension the
-  # allocator checks, so a NoCapacity page shows which one ran out.
-  # Limited to a few hosts to keep the query cheap.
-  def host_capacity_summary(location_filter)
+  # Free capacity of the hosts the allocator considered, in every
+  # dimension it checks, so a NoCapacity page shows which one ran out.
+  # Uses the allocator's host filters and lists the hosts with the most
+  # free cores and hugepages first. Limited to a few hosts to keep the
+  # query cheap.
+  def host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:)
     vm_host_id = Sequel[:vm_host][:id]
     free_storage_gib = DB[:storage_device]
       .where(vm_host_id:, enabled: true)
@@ -44,9 +46,13 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       .where(:routed_to_host_id => vm_host_id, Sequel[:assigned_vm_address][:ip] => nil)
       .select { count.function.* }
 
-    ds = VmHost.where(allocation_state: "accepting", arch: vm.arch)
+    ds = VmHost.where(arch:)
+    ds = ds.where(allocation_state: allocation_state_filter) unless allocation_state_filter.empty?
     ds = ds.where(location_id: location_filter) unless location_filter.empty?
-    ds.order(vm_host_id).limit(10)
+    ds = ds.where(vm_host_id => host_filter) unless host_filter.empty?
+    ds = ds.exclude(vm_host_id => host_exclusion_filter) unless host_exclusion_filter.empty?
+    ds = ds.where(family: family_filter) unless family_filter.empty?
+    ds.order(Sequel.desc(Sequel[:total_cores] - Sequel[:used_cores]), Sequel.desc(Sequel[:total_hugepages_1g] - Sequel[:used_hugepages_1g]), vm_host_id).limit(10)
       .select(vm_host_id, :used_cores, :total_cores, :used_hugepages_1g, :total_hugepages_1g, free_storage_gib.as(:free_storage_gib), free_ipv4.as(:free_ipv4))
       .naked
       .map {
@@ -69,6 +75,10 @@ class Prog::Vm::Metal::Nexus < Prog::Base
 
   label def start
     queued_vms = Vm.join(:strand, id: :id).where(:location_id => vm.location_id, :arch => vm.arch, Sequel[:strand][:label] => "start")
+    # The allocator sets the VM's family to the host's before a lost
+    # race rolls the allocation back, so report the requested one.
+    family = vm.family
+    arch = vm.arch
     begin
       distinct_storage_devices = frame["distinct_storage_devices"] || false
       host_exclusion_filter = frame["exclude_host_ids"] || []
@@ -127,7 +137,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
 
       incr_waiting_for_capacity unless vm.waiting_for_capacity_set?
 
-      Clog.emit("No capacity left", {lack_of_capacity: {location: Location[vm.location_id].name, arch: vm.arch, family: vm.family, queue_size: queued_vms.count}})
+      Clog.emit("No capacity left", {lack_of_capacity: {location: Location[vm.location_id].name, arch:, family:, queue_size: queued_vms.count}})
 
       waiting_seconds = Time.now - vm.created_at
       page_after_minutes = if vm.location_id == Location::GITHUB_RUNNERS_ID
@@ -136,8 +146,9 @@ class Prog::Vm::Metal::Nexus < Prog::Base
         10
       end
       if waiting_seconds >= page_after_minutes * 60
-        utilization = VmHost.where(allocation_state: "accepting", arch: vm.arch).select_map { sum(:used_cores) * 100.0 / sum(:total_cores) }.first.to_f
-        Prog::PageNexus.assemble("No capacity left at #{Location[vm.location_id].display_name} for #{vm.family} family of #{vm.arch}", ["NoCapacity", Location[vm.location_id].display_name, vm.arch, vm.family], queued_vms.limit(25).select_map(Sequel[:vm][:id]).map { UBID.to_ubid(it) }, extra_data: {queue_size: queued_vms.count, utilization:, hosts: host_capacity_summary(location_filter)})
+        utilization = VmHost.where(allocation_state: "accepting", arch:).select_map { sum(:used_cores) * 100.0 / sum(:total_cores) }.first.to_f
+        hosts = host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:)
+        Prog::PageNexus.assemble("No capacity left at #{Location[vm.location_id].display_name} for #{family} family of #{arch}", ["NoCapacity", Location[vm.location_id].display_name, arch, family], queued_vms.limit(25).select_map(Sequel[:vm][:id]).map { UBID.to_ubid(it) }, extra_data: {queue_size: queued_vms.count, utilization:, hosts:})
       end
 
       nap (30.0 / (1 + waiting_seconds / 120.0)).clamp(5, 30)
@@ -145,7 +156,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
 
     vm.nics.each(&:incr_vm_allocated)
     decr_waiting_for_capacity
-    if (page = Page.from_tag_parts("NoCapacity", vm.location.display_name, vm.arch, vm.family)) && page.created_at < Time.now - 15 * 60 && queued_vms.count <= 1
+    if (page = Page.from_tag_parts("NoCapacity", vm.location.display_name, arch, family)) && page.created_at < Time.now - 15 * 60 && queued_vms.count <= 1
       page.incr_resolve
     end
 
