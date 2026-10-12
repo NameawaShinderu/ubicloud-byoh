@@ -3,15 +3,32 @@
 class Prog::SetupHugepages < Prog::Base
   subject_is :sshable, :vm_host
 
+  # update-grub sources this after /etc/default/grub, and it is rewritten on
+  # every run, so running the setup again never adds a second set of tokens.
+  GRUB_DROP_IN = "/etc/default/grub.d/99-ubicloud-hugepages.cfg"
+
+  # Earlier versions appended the tokens to GRUB_CMDLINE_LINUX in
+  # /etc/default/grub on every run. Strip them so only the drop-in sets them.
+  STRIP_GRUB_TOKENS = "sudo sed -i -E '/^GRUB_CMDLINE_LINUX=/ s/[[:space:]]*\\b(hugetlb_free_vmemmap|default_hugepagesz|hugepagesz|hugepages)=[^[:space:]\"]*//g' /etc/default/grub"
+
   label def start
+    if vm_host.arch == "x64" && sshable.cmd("grep -cw pdpe1gb /proc/cpuinfo || true").to_i.zero?
+      fail "CPU lacks the pdpe1gb flag, so it cannot use 1G hugepages"
+    end
+
+    if sshable.cmd("grep -c '^GRUB_CMDLINE_LINUX=' /etc/default/grub || true").to_i.zero?
+      fail "/etc/default/grub has no GRUB_CMDLINE_LINUX line; the host must boot with GRUB"
+    end
+
     hugepage_size = "1G"
 
     # Reserve 5G of overhead for the host. SPDK will use 2 of the hugepages +
     # upto about 1G of the 5G as not all SPDK allocations are from hugepages.
     # On production servers we have observed total memory to be up to ~1/43
     # lower than the reported physical memory. We therefore use 42/43 as a
-    # safety ratio to avoid overcommitting memory for hugepages.
-    hugepage_cnt = vm_host.total_mem_gib * 42 / 43 - 5
+    # safety ratio to avoid overcommitting memory for hugepages. Small hosts
+    # get no hugepages rather than a negative count.
+    hugepage_cnt = [vm_host.total_mem_gib * 42 / 43 - 5, 0].max
 
     # Platforms with large kernel or driver preallocations keep less usable
     # memory than physical memory implies; clamp against measured
@@ -23,13 +40,17 @@ class Prog::SetupHugepages < Prog::Base
     available_memory_match = host_meminfo.match(/^MemAvailable:\s+(\d+) kB$/)
     fail "Couldn't extract available memory" unless available_memory_match
     vmemmap_kib = hugepage_cnt * 16380
-    available_limit = (Integer(available_memory_match.captures.first) + vmemmap_kib) / 1048576 - 4
+    available_limit = [(Integer(available_memory_match.captures.first) + vmemmap_kib) / 1048576 - 4, 0].max
     if available_limit < hugepage_cnt
       Clog.emit("hugepage count clamped to available memory", {hugepage_clamp: {formula_count: hugepage_cnt, clamped_count: available_limit}})
       hugepage_cnt = available_limit
     end
 
-    sshable.cmd("sudo sed -i '/^GRUB_CMDLINE_LINUX=\"/ s/\"$/ hugetlb_free_vmemmap=on default_hugepagesz=':hugepage_size' hugepagesz=':hugepage_size' hugepages=':hugepage_cnt'&/' /etc/default/grub", hugepage_size:, hugepage_cnt:)
+    sshable.cmd(STRIP_GRUB_TOKENS)
+    sshable.cmd("sudo mkdir -p /etc/default/grub.d")
+    sshable.write_file(GRUB_DROP_IN, <<~CFG)
+      GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX hugetlb_free_vmemmap=on default_hugepagesz=#{hugepage_size} hugepagesz=#{hugepage_size} hugepages=#{hugepage_cnt}"
+    CFG
     sshable.cmd("sudo update-grub")
 
     pop "hugepages installed"
