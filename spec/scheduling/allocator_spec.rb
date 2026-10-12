@@ -890,7 +890,7 @@ RSpec.describe Al do
       al1 = Al::Allocation.best_allocation(create_req(vm, vol))
       al2 = Al::Allocation.best_allocation(create_req(vm, vol))
       al1.update(vm1)
-      expect { al2.update(vm2) }.to raise_error(Sequel::CheckConstraintViolation, /core_allocation_limit/)
+      expect { al2.update(vm2) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /core_allocation_limit/)
     end
 
     it "fails concurrent allocations if memory constraints are violated" do
@@ -901,7 +901,7 @@ RSpec.describe Al do
       al1 = Al::Allocation.best_allocation(create_req(vm, vol))
       al2 = Al::Allocation.best_allocation(create_req(vm, vol))
       al1.update(vm1)
-      expect { al2.update(vm2) }.to raise_error(Sequel::CheckConstraintViolation, /hugepages_allocation_limit/)
+      expect { al2.update(vm2) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /hugepages_allocation_limit/)
     end
 
     it "fails concurrent allocations if storage constraints are violated" do
@@ -911,7 +911,7 @@ RSpec.describe Al do
       al1 = Al::Allocation.best_allocation(create_req(vm, vol))
       al2 = Al::Allocation.best_allocation(create_req(vm, vol))
       al1.update(vm1)
-      expect { al2.update(vm2) }.to raise_error(Sequel::CheckConstraintViolation, /available_storage_gib_non_negative/)
+      expect { al2.update(vm2) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /available_storage_gib_non_negative/)
     end
 
     it "fails concurrent allocations of gpus" do
@@ -1632,7 +1632,39 @@ RSpec.describe Al do
       al = Scheduling::Allocator::VmHostSliceAllocation.new(nil, req, nil)
 
       vh = VmHost.first
-      expect { al.select_cpuset(vh.id, 24) }.to raise_error "failed to allocate cpus"
+      expect { al.select_cpuset(vh.id, 24) }.to raise_error Scheduling::Allocator::NoSpaceLeft, "failed to allocate cpus"
+    end
+
+    it "raises NoSpaceLeft and rolls back when the host counters admit a slice but no CPUs are free" do
+      vh = VmHost.first
+      # All non-IO CPUs are taken, but used_cores still claims free cores
+      # (the IO-CPU accounting drift that error-looped the 4th VM).
+      Prog::Vm::VmHostSliceNexus.assemble_with_host("sl1", vh, family: "standard", allowed_cpus: (2..15), memory_gib: 8)
+
+      vm = create_vm(ip4_enabled: true)
+      al = Al::Allocation.best_allocation(create_req(vm, vol, use_slices: true))
+      expect(al).not_to be_nil
+
+      expect { al.update(vm) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, "failed to allocate cpus")
+      expect(vm.reload.vm_host_id).to be_nil
+      expect(AssignedVmAddress.where(dst_vm_id: vm.id).count).to eq(0)
+      expect(vh.reload.used_hugepages_1g).to eq(2)
+      expect(VmHostSlice.count).to eq(1)
+    end
+
+    it "converts a capacity CHECK constraint violation into NoSpaceLeft" do
+      vh = VmHost.first
+      vm = create_vm
+      al = Al::Allocation.best_allocation(create_req(vm, vol, use_slices: true))
+      expect(al).not_to be_nil
+
+      # A concurrent allocation takes the hugepages after scoring
+      vh.update(used_hugepages_1g: 50)
+
+      expect { al.update(vm) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on #{vh.ubid}: .*hugepages_allocation_limit/)
+      expect(vm.reload.vm_host_id).to be_nil
+      expect(vh.reload.used_hugepages_1g).to eq(50)
+      expect(VmHostSlice.count).to eq(0)
     end
   end
 

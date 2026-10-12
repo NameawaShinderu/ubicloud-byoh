@@ -324,11 +324,19 @@ module Scheduling::Allocator
 
     def update(vm)
       vm_host = VmHost[@candidate_host[:vm_host_id]]
-      DB.transaction do
+      # Use a savepoint so that a NoSpaceLeft raised half way through
+      # (e.g. a concurrent allocation took the CPUs or hugepages) rolls
+      # back the partial allocation, while the caller's transaction stays
+      # usable to record that the VM is waiting for capacity.
+      DB.transaction(savepoint: true) do
         Allocation.update_vm(vm_host, vm)
         @vm_host_allocations.each { it.update(vm, vm_host) }
         @device_allocations.each { it.update(vm, vm_host) }
       end
+    rescue Sequel::CheckConstraintViolation => ex
+      # A concurrent allocation used up the capacity this allocation was
+      # scored on, and a capacity CHECK constraint caught it.
+      raise NoSpaceLeft, "#{vm} no space left on #{UBID.to_ubid(@candidate_host[:vm_host_id])}: #{ex.message}"
     end
 
     def to_s
@@ -519,7 +527,7 @@ module Scheduling::Allocator
         .limit(n)
         .map(&:cpu_number)
 
-      fail "failed to allocate cpus" if cpus.size != n
+      fail NoSpaceLeft, "failed to allocate cpus" if cpus.size != n
 
       cpus
     end
