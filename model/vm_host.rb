@@ -184,6 +184,11 @@ class VmHost < Sequel::Model
 
   APIPA_MASK = NetAddr::Mask32.new(32).freeze
 
+  # Link-local /24s that cloud platforms use for their own services, such
+  # as the instance metadata service at 169.254.169.254. A veth address in
+  # one of them shadows that service for the VM (NETWORKING.md 6.4).
+  APIPA_EXCLUDED = %w[169.254.0.0/24 169.254.169.0/24 169.254.170.0/24 169.254.255.0/24].map { NetAddr::IPv4Net.parse(it) }.freeze
+
   def veth_pair_random_ip4_addr
     ips_string = vms_dataset.select_map(:local_vetho_ip).map { it.network.to_s }
     ip = APIPA_RANGE.nth(2 * SecureRandom.random_number(APIPA_LEN))

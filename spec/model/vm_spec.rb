@@ -224,6 +224,52 @@ RSpec.describe Vm do
     end
   end
 
+  describe "public and control-plane IPv4" do
+    let(:location) {
+      Location.create(name: "byoh-vm", display_name: "byoh-vm", ui_name: "byoh-vm", visible: false,
+        provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"cp_reach" => "public"})
+    }
+    let(:host) {
+      Prog::Vm::HostNexus.assemble("10.98.1.10", location_id: location.id, provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+        provider_config: {"main_ip4" => "10.98.1.10", "routed_networks" => [{"cidr" => "fd00:feed::/64"}]}).subject
+    }
+
+    def vm_on(exposure, external_ip: nil)
+      address = Address.create(cidr: "10.98.5.0/30", routed_to_host_id: host.id, exposure:)
+      vm = create_vm(vm_host_id: host.id)
+      AssignedVmAddress.create(ip: address.cidr.nth(1).to_s, address_id: address.id, dst_vm_id: vm.id, external_ip:)
+      vm
+    end
+
+    it "has no public IPv4 without an address" do
+      vm = create_vm(vm_host_id: host.id)
+      expect([vm.public_ip4, vm.public_ip4_scope, vm.cp_reach_ip4]).to eq [nil, nil, nil]
+    end
+
+    it "reaches a nat VM at its external IP when the control plane comes from outside" do
+      vm = vm_on("nat", external_ip: "8.8.8.10")
+      expect(vm.public_ip4).to be_a NetAddr::IPv4
+      expect([vm.public_ip4.to_s, vm.public_ip4_scope, vm.cp_reach_ip4.to_s]).to eq ["8.8.8.10", "public", "8.8.8.10"]
+    end
+
+    it "does not reach an internal VM from outside" do
+      vm = vm_on("internal")
+      expect([vm.public_ip4.to_s, vm.public_ip4_scope, vm.cp_reach_ip4]).to eq ["10.98.5.1", "internal", nil]
+    end
+
+    it "reaches every VM at its pool address when the control plane is on the host's network" do
+      location.update(byoh_network: {"cp_reach" => "onhost"})
+      vm = vm_on("nat", external_ip: "8.8.8.10")
+      expect(vm.cp_reach_ip4.to_s).to eq "10.98.5.1"
+    end
+
+    it "keeps the pool address for a VM outside a BYOH host" do
+      host.update(location_id: Location::HETZNER_FSN1_ID)
+      vm = vm_on("internal")
+      expect([vm.public_ip4.to_s, vm.public_ip4_scope, vm.cp_reach_ip4.to_s]).to eq ["10.98.5.1", "public", "10.98.5.1"]
+    end
+  end
+
   describe "#utility functions" do
     let(:project) { Project.create(name: "test-util") }
 

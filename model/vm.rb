@@ -92,6 +92,29 @@ class Vm < Sequel::Model
 
   def byoh_host? = !!vm_host&.byoh?
 
+  # The address the internet reaches the VM's IPv4 at: the external IP a
+  # nat pool address is 1:1 NATed to, otherwise the address itself.
+  def public_ip4 = assigned_vm_address&.external_ip || ip4
+
+  # Whether the VM's IPv4 faces the internet. Only a BYOH host has
+  # internal pools.
+  def public_ip4_scope
+    return unless ip4
+    return "public" unless byoh_host?
+
+    (assigned_vm_address.address.exposure == "internal") ? "internal" : "public"
+  end
+
+  # The IPv4 the control plane connects to: the pool address when the
+  # control plane sits on the host's network (cp_reach onhost), the public
+  # address otherwise, and none for an internal address it cannot reach.
+  def cp_reach_ip4
+    return ip4 unless byoh_host?
+    return ip4 if vm_host.location.byoh_profile.cp_reach == "onhost"
+
+    public_ip4 unless public_ip4_scope == "internal"
+  end
+
   def ip4_string
     ip4&.to_s
   end
