@@ -120,6 +120,24 @@ RSpec.describe ByohHostCli do
       expect(audit_rows).to eq []
     end
 
+    it "refuses a host that is accepting VMs" do
+      host = legacy_host
+      host.update(allocation_state: "accepting")
+      expect(cli("move-location", "--host", host.ubid, "--location", "byoh-1", "--empty-only"))
+        .to eq [1, "", "! host #{host.ubid} is accepting VMs; move it to draining first (admin \"Move to Draining\") so no VM is placed on it during the move\n"]
+      expect(host.reload.location_id).to eq Location::HETZNER_FSN1_ID
+    end
+
+    it "reminds the operator to accept VMs again after moving a draining host" do
+      host = legacy_host
+      host.update(allocation_state: "draining")
+      byoh_1
+      expect(cli("move-location", "--host", host.ubid, "--location", "byoh-1", "--empty-only")).to eq [0,
+        "Moved host #{host.ubid} from location hetzner-fsn1 to byoh-1.\n" \
+        "The host is draining; set it to accepting in the admin UI when it should take VMs.\n", ""]
+      expect(host.reload.allocation_state).to eq "draining"
+    end
+
     it "refuses pools that overlap the target's overlay network or private subnets" do
       target = Location.create(name: "byoh-3", display_name: "byoh-3", ui_name: "byoh-3", visible: false,
         provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"overlay_ipv4_cidrs" => ["172.20.0.0/14"]})

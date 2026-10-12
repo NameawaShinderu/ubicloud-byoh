@@ -74,9 +74,16 @@ class ByohHostCli
     from = host.location
     notes = []
     DB.transaction do
-      # The row lock makes a concurrent allocation wait until the move
-      # commits, so a VM placed before it is seen here.
+      # The row lock makes the move wait for an allocation that already
+      # wrote a VM to the host, so that VM is counted here. It does not
+      # stop an allocation that chose the host before the lock but writes
+      # after the move commits: the allocator does not re-check the
+      # location then. Requiring a host that is not accepting keeps it out
+      # of every candidate search for the whole move.
       host = VmHost.dataset.for_update.with_pk(host.id)
+      if host.allocation_state == "accepting"
+        raise Error, "host #{host.ubid} is accepting VMs; move it to draining first (admin \"Move to Draining\") so no VM is placed on it during the move"
+      end
       vms = host.vms_dataset.count
       raise Error, "host #{host.ubid} has #{vms} VMs; destroy them first" unless vms.zero?
 
@@ -88,6 +95,7 @@ class ByohHostCli
     end
     @out.puts "Moved host #{host.ubid} from location #{from.name} to #{target.name}."
     notes.each { @out.puts "  #{it}" }
+    @out.puts "The host is #{host.allocation_state}; set it to accepting in the admin UI when it should take VMs." if host.allocation_state == "draining"
   end
 
   # The host's pools must pass the same location checks registration
