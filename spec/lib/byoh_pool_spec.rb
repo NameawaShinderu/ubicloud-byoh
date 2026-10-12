@@ -298,6 +298,23 @@ RSpec.describe ByohPool do
       expect(pool.remove("5.9.10.0/29", drain: true)).to eq []
     end
 
+    it "refuses to drain VMs that their owners destroy, or that prevent_destroy protects" do
+      owned = place_vm("5.9.10.1")
+      pg = create_postgres_resource(project: owned.project, location_id: Location::HETZNER_FSN1_ID)
+      PostgresServer.create(timeline: create_postgres_timeline(location_id: Location::HETZNER_FSN1_ID), resource: pg, vm_id: owned.id,
+        is_representative: true, synchronization_status: "ready", timeline_access: "push", version: "16")
+      protected_vm = place_vm("5.9.10.3")
+      Strand.create_with_id(protected_vm, prog: "Vm::Nexus", label: "wait")
+      protected_vm.incr_prevent_destroy
+      reserved = DB[:ipv4_address].where(cidr: "5.9.10.0/29", reserved: true).select_order_map(:ip)
+      blocked = {owned => "belongs to a PostgresServer", protected_vm => "prevent_destroy is set"}.sort_by { it.first.id }.map { "#{it.first.ubid} (#{it.last})" }
+      expect { pool.remove("5.9.10.0/29", drain: true) }.to raise_error(described_class::Error,
+        "5.9.10.0/29 cannot be drained: #{blocked.join(", ")}; destroy those through their owner or clear prevent_destroy, then remove the pool")
+      expect(DB[:ipv4_address].where(cidr: "5.9.10.0/29", reserved: true).select_order_map(:ip)).to eq reserved
+      expect(Semaphore.where(name: "destroy").count).to eq 0
+      expect(pool_actions).to eq []
+    end
+
     it "gives up waiting for drained VMs" do
       vm = place_vm("5.9.10.1")
       pool = described_class.new(host, sleeper: ->(_) {}, drain_polls: 1)

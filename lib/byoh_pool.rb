@@ -21,6 +21,14 @@ class ByohPool
 
   DRAIN_POLL_SECONDS = 5
 
+  # Services whose progs destroy their own VMs. Destroying such a VM
+  # directly would leave its owner pointing at a deleted VM. A load
+  # balancer member is not here: the VM's destroy takes it out.
+  def self.vm_owners
+    [PostgresServer, GithubRunner, KubernetesNode, MinioServer, VictoriaMetricsServer,
+      InferenceEndpointReplica, InferenceRouterReplica, ParseableServer]
+  end
+
   attr_reader :host
 
   # sleeper and drain_polls pace the wait for drained VMs to go away.
@@ -216,6 +224,7 @@ class ByohPool
 
     args = {cidr: cidr.to_s}
     if drain && address && !(vms = pool_vms([address.id])).empty?
+      refuse_undrainable(cidr, vms)
       drain!(address, vms)
       args[:drained_vms] = vms.map(&:ubid)
     end
@@ -469,6 +478,23 @@ class ByohPool
       LoadBalancer.where(id: LoadBalancerVm.where(vm_id: vm.id).select(:load_balancer_id)).all.each(&:incr_rewrite_dns_records)
       PostgresResource.where(id: PostgresServer.where(vm_id: vm.id).select(:resource_id)).all.each(&:incr_refresh_dns_record)
     end
+  end
+
+  # A drain destroys VMs directly, so it refuses VMs that only their owner
+  # may destroy and VMs protected by prevent_destroy, which would never go.
+  def refuse_undrainable(cidr, vms)
+    ids = vms.map(&:id)
+    owners = self.class.vm_owners.flat_map { |model| model.where(vm_id: ids).select_map(:vm_id).map { [it, model.name] } }.to_h
+    blocked = vms.filter_map do |vm|
+      if (owner = owners[vm.id])
+        "#{vm.ubid} (belongs to a #{owner})"
+      elsif vm.prevent_destroy_set?
+        "#{vm.ubid} (prevent_destroy is set)"
+      end
+    end
+    return if blocked.empty?
+
+    raise Error, "#{cidr} cannot be drained: #{blocked.join(", ")}; destroy those through their owner or clear prevent_destroy, then remove the pool"
   end
 
   def drain!(address, vms)
