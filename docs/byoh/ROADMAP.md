@@ -123,7 +123,25 @@ M3 does not depend on the rebase and can start in parallel with M0 (E0 note in Â
 
 Each row block gives scope, the owning design sections, key files, gates and what changes for customers. File lists are the main ones; the owning section has the full list.
 
-#### M0. Live capacity correctness (fork, before the rebase) [PLANNED M0]
+#### M0. Live capacity correctness (fork, before the rebase) [DONE 2026-10-12]
+
+**Status:** shipped in `5897e5276..90ecfd0a8` and deployed to the live AWS environment.
+
+Tests:
+- Full suite: 5491 examples, 0 failures.
+- Frozen run: 5471 examples, 0 failures.
+- Every M0-touched file is at 100% coverage. The only misses are upstream `:nocov:` guards.
+
+Verified live:
+- CPUs 0-1 are released.
+- Two burstable-1 VMs fit into the existing slice.
+- A standard-2 waits for capacity cleanly.
+- Counters return exactly after destroy.
+
+Not done in M0:
+- The `io` column rename. It arrives with the rebase in M1.
+- Upstream's `MemAvailable >= 2 GiB` verify check (b50b9f278).
+- Exact-moment KVM/preflight. That arrives in M4.
 
 | Item | Detail |
 |---|---|

@@ -341,6 +341,14 @@ docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test u
 - The containers run as root, so `var/` ends up root-owned.
 - The earlier session's results: BYOH specs, 80 examples, 0 failures; a 1911-example subset, 0 failures.
 - **The full `rake` (coverage + frozen_spec) has never been run.**
+- **Full-suite recipe that works here:**
+  - Use a clean worktree, so the gitignored `backups/*.rb` are not counted.
+  - Use a database name ending in `test`, with the `citext` and `btree_gist` extensions.
+  - Pass random `CLOVER_*` secrets as `-e` variables.
+  - Run `bundle exec rake coverage_sspec`, then `CLOVER_FREEZE=true bundle exec rspec spec`.
+  - Pattern: `docker run --rm --network ubi-test-net -v <wt>:/app -w /app -e RACK_ENV=test -e CLOVER_DATABASE_URL=postgres://clover@ubi-pg-test:5432/clover_m0full_test ... ubi-bundler`.
+  - After M0 (2026-10-12): 5491 and 5471 examples, 0 failures. Line coverage 98.73%, branch 99.82%.
+  - The remaining gaps are pre-existing: `config.rb`, `clover.rb` and CLI files (load-order noise), the reconfigure script, and small BYOH gaps in `lib/hosting/base.rb`, `byoh_registration.rb` and `generic_apis.rb`.
 - Upstream's gate is **100% line and 100% branch coverage per file** (`spec/coverage_helper.rb`). Likely failures (UNVERIFIED):
   - the overridden bodies in `lib/hosting/base.rb`
   - several branches in `generic_apis.rb`
