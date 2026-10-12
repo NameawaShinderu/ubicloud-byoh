@@ -72,6 +72,7 @@ class ByohHostCli
     raise Error, "host #{host.ubid} is already in location #{target.name}" if host.location_id == target.id
 
     from = host.location
+    notes = []
     DB.transaction do
       # The row lock makes a concurrent allocation wait until the move
       # commits, so a VM placed before it is seen here.
@@ -79,12 +80,31 @@ class ByohHostCli
       vms = host.vms_dataset.count
       raise Error, "host #{host.ubid} has #{vms} VMs; destroy them first" unless vms.zero?
 
+      notes = check_pools_for_location(host, target) unless rollback
       host.update(location_id: target.id)
       host.provider.update(config: Sequel.pg_jsonb(host.provider.config.to_h.merge("location_label" => target.name)))
       ByohOperatorLog.record(command: rollback ? "move-location-rollback" : "move-location", target_id: host.id,
         args: {from: from.name, to: target.name}, result: "ok")
     end
     @out.puts "Moved host #{host.ubid} from location #{from.name} to #{target.name}."
+    notes.each { @out.puts "  #{it}" }
+  end
+
+  # The host's pools must pass the same location checks registration
+  # applies, so moving cannot place pools in a location that would refuse
+  # them. Returns notes for the operator.
+  def check_pools_for_location(host, target)
+    pools = Array(host.provider.config["routed_networks"]).map { ByohPoolDeclaration.parse(it, legacy: true) }
+    errors = pools.flat_map { ByohPoolDeclaration.location_overlap_errors(it, target) }
+    raise Error, "host #{host.ubid} cannot move to #{target.name}:\n#{errors.join("\n")}" unless errors.empty?
+
+    ula48 = target.byoh_profile.ula48
+    declared_v6 = pools.select(&:ipv6?).map { it.cidr.to_s }
+    if ula48 && !declared_v6.include?(host.net6.to_s) && !ByohNetworkProfile.overlap?(ula48, host.net6)
+      ["note: the host's IPv6 network #{host.net6} is outside #{target.name}'s ula48 #{ula48}; it keeps working, but re-register the host to draw one from #{ula48}"]
+    else
+      []
+    end
   end
 
   def cmd_setup_egress_nat(argv)

@@ -441,5 +441,5 @@ class ByohPoolDeclaration
   end
 
   private_class_method :parse_inline, :build_entry, :legacy_cidr, :build_v4_entry, :build_v6_entry, :externals, :external_by_offset, :choice,
-    :list_of_ips, :derive_ipv6_mode, :database_overlap_errors, :location_overlap_errors, :external_ip_errors
+    :list_of_ips, :derive_ipv6_mode, :database_overlap_errors, :external_ip_errors
 end

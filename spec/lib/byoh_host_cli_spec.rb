@@ -120,6 +120,40 @@ RSpec.describe ByohHostCli do
       expect(audit_rows).to eq []
     end
 
+    it "refuses pools that overlap the target's overlay network or private subnets" do
+      target = Location.create(name: "byoh-3", display_name: "byoh-3", ui_name: "byoh-3", visible: false,
+        provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"overlay_ipv4_cidrs" => ["172.20.0.0/14"]})
+      PrivateSubnet.create(name: "ps", location_id: target.id, net4: "10.7.0.0/26", net6: "fd10::/64", project_id: Project.create(name: "p").id)
+      host = Prog::Vm::HostNexus.assemble("203.0.113.42", location_id: byoh_1.id, provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+        provider_config: {"main_ip4" => "203.0.113.42", "location_label" => "byoh-1",
+                          "routed_networks" => [{"cidr" => "172.20.1.0/30", "exposure" => "internal"}, {"cidr" => "10.7.0.0/30", "exposure" => "internal"}]}).subject
+      expect(cli("move-location", "--host", host.ubid, "--location", "byoh-3", "--empty-only")).to eq [1, "",
+        "! host #{host.ubid} cannot move to byoh-3:\n" \
+        "172.20.1.0/30 overlaps the location's overlay network 172.20.0.0/14\n" \
+        "10.7.0.0/30 overlaps the private subnet 10.7.0.0/26 in this location\n"]
+      expect(host.reload.location_id).to eq byoh_1.id
+      expect(audit_rows).to eq []
+    end
+
+    it "notes an IPv6 network drawn outside the target's ula48" do
+      Location.create(name: "byoh-3", display_name: "byoh-3", ui_name: "byoh-3", visible: false,
+        provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"ula48" => "fd12:3456:789a::/48"})
+      host = generic_host(byoh_1)
+      expect(cli("move-location", "--host", host.ubid, "--location", "byoh-3", "--empty-only")[1])
+        .to eq "Moved host #{host.ubid} from location byoh-1 to byoh-3.\n"
+
+      host.update(net6: "fd99:1:2:3::/64")
+      expect(cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-fsn1", "--empty-only")[0]).to eq 0
+      expect(cli("move-location", "--host", host.ubid, "--location", "byoh-3", "--empty-only")[1])
+        .to eq "Moved host #{host.ubid} from location hetzner-fsn1 to byoh-3.\n" \
+          "  note: the host's IPv6 network fd99:1:2:3::/64 is outside byoh-3's ula48 fd12:3456:789a::/48; it keeps working, but re-register the host to draw one from fd12:3456:789a::/48\n"
+
+      host.update(net6: "fd12:3456:789a:1::/64")
+      expect(cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-fsn1", "--empty-only")[0]).to eq 0
+      expect(cli("move-location", "--host", host.ubid, "--location", "byoh-3", "--empty-only")[1])
+        .to eq "Moved host #{host.ubid} from location hetzner-fsn1 to byoh-3.\n"
+    end
+
     it "refuses a rollback into a BYOH location or of a host outside one" do
       host = generic_host(byoh_1)
       expect(cli("move-location", "--host", host.ubid, "--rollback-to", byoh_2.name, "--empty-only")[2])
