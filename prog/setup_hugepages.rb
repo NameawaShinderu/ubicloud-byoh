@@ -11,13 +11,17 @@ class Prog::SetupHugepages < Prog::Base
   # /etc/default/grub on every run. Strip them so only the drop-in sets them.
   STRIP_GRUB_TOKENS = "sudo sed -i -E '/^GRUB_CMDLINE_LINUX=/ s/[[:space:]]*\\b(hugetlb_free_vmemmap|default_hugepagesz|hugepagesz|hugepages)=[^[:space:]\"]*//g' /etc/default/grub"
 
+  GRUB_CHECK = "[ -f /etc/default/grub ] && sudo sh -c 'command -v update-grub' > /dev/null && echo ok || true"
+
   label def start
     if vm_host.arch == "x64" && sshable.cmd("grep -cw pdpe1gb /proc/cpuinfo || true").to_i.zero?
       fail "CPU lacks the pdpe1gb flag, so it cannot use 1G hugepages"
     end
 
-    if sshable.cmd("grep -c '^GRUB_CMDLINE_LINUX=' /etc/default/grub || true").to_i.zero?
-      fail "/etc/default/grub has no GRUB_CMDLINE_LINUX line; the host must boot with GRUB"
+    # The drop-in appends to $GRUB_CMDLINE_LINUX, which works even when no
+    # GRUB_CMDLINE_LINUX line exists, so only GRUB itself is required.
+    unless sshable.cmd(GRUB_CHECK).strip == "ok"
+      fail "/etc/default/grub or update-grub is missing; the host must boot with GRUB"
     end
 
     hugepage_size = "1G"

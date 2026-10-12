@@ -11,9 +11,9 @@ RSpec.describe Prog::SetupHugepages do
     vm_host
   }
 
-  def expect_prerequisites(pdpe1gb: "16\n", grub_line: "1\n")
+  def expect_prerequisites(pdpe1gb: "16\n", grub: "ok\n")
     expect(sh.sshable).to receive(:_cmd).with("grep -cw pdpe1gb /proc/cpuinfo || true").and_return(pdpe1gb)
-    expect(sh.sshable).to receive(:_cmd).with("grep -c '^GRUB_CMDLINE_LINUX=' /etc/default/grub || true").and_return(grub_line)
+    expect(sh.sshable).to receive(:_cmd).with(described_class::GRUB_CHECK).and_return(grub)
   end
 
   def expect_grub_update(hugepages)
@@ -96,7 +96,7 @@ RSpec.describe Prog::SetupHugepages do
     it "does not check for pdpe1gb on arm64" do
       vm_host.update(arch: "arm64")
       expect(sh.sshable).not_to receive(:_cmd).with("grep -cw pdpe1gb /proc/cpuinfo || true")
-      expect(sh.sshable).to receive(:_cmd).with("grep -c '^GRUB_CMDLINE_LINUX=' /etc/default/grub || true").and_return("1\n")
+      expect(sh.sshable).to receive(:_cmd).with(described_class::GRUB_CHECK).and_return("ok\n")
       expect(sh.sshable).to receive(:_cmd).with("cat /proc/meminfo").and_return("MemAvailable: 65011712 kB\n")
       expect_grub_update(57)
       expect { sh.start }.to exit({"msg" => "hugepages installed"})
@@ -107,9 +107,9 @@ RSpec.describe Prog::SetupHugepages do
       expect { sh.start }.to raise_error RuntimeError, "CPU lacks the pdpe1gb flag, so it cannot use 1G hugepages"
     end
 
-    it "fails if /etc/default/grub has no GRUB_CMDLINE_LINUX line" do
-      expect_prerequisites(grub_line: "0\n")
-      expect { sh.start }.to raise_error RuntimeError, "/etc/default/grub has no GRUB_CMDLINE_LINUX line; the host must boot with GRUB"
+    it "fails if the host does not boot with GRUB" do
+      expect_prerequisites(grub: "")
+      expect { sh.start }.to raise_error RuntimeError, "/etc/default/grub or update-grub is missing; the host must boot with GRUB"
     end
 
     it "fails if available memory couldn't be extracted" do
