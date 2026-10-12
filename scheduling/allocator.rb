@@ -4,6 +4,17 @@ module Scheduling::Allocator
   class NoSpaceLeft < RuntimeError
   end
 
+  # CHECK constraints that catch a concurrent allocation using the
+  # capacity an allocation was scored on. Any other CHECK violation is a
+  # bug and must not be reported as a lack of capacity.
+  CAPACITY_CONSTRAINTS = %w[
+    core_allocation_limit
+    hugepages_allocation_limit
+    cpu_allocation_limit
+    memory_allocation_limit
+    available_storage_gib_non_negative
+  ].freeze
+
   def self.allocate(vm, storage_volumes, distinct_storage_devices: false, gpu_count: 0, gpu_device: nil, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], location_filter: [], location_preference: [], family_filter: [], os_filter: nil, data_center_exclusion_filter: [])
     requires_track_written = storage_volumes.any? { it["track_written"] }
     uses_machine_image = storage_volumes.any? { it["machine_image_version_id"] }
@@ -340,6 +351,8 @@ module Scheduling::Allocator
         @device_allocations.each { it.update(vm, vm_host) }
       end
     rescue Sequel::CheckConstraintViolation => ex
+      raise unless CAPACITY_CONSTRAINTS.any? { ex.message.include?(it) }
+
       # A concurrent allocation used up the capacity this allocation was
       # scored on, and a capacity CHECK constraint caught it.
       raise NoSpaceLeft, "#{vm} no space left on #{UBID.to_ubid(@candidate_host[:vm_host_id])}: #{ex.message}"

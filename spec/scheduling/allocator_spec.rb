@@ -1141,6 +1141,14 @@ RSpec.describe Al do
       expect(vmh.reload.used_cores).to eq(1)
     end
 
+    it "re-raises a CHECK constraint violation that is not about capacity" do
+      vm = create_vm
+      al = Al::Allocation.best_allocation(create_req(vm, vol))
+      expect(Al::Allocation).to receive(:update_vm).and_raise(Sequel::CheckConstraintViolation.new("new row for relation \"vm\" violates check constraint \"vring_workers_positive_if_ubiblk\""))
+
+      expect { al.update(vm) }.to raise_error(Sequel::CheckConstraintViolation, /vring_workers_positive_if_ubiblk/)
+    end
+
     it "allocates standard-gpu VM correctly on GEX44 host" do
       vmh = VmHost.first
       # Set the host to match GEX44 specs - it is an x64 host, but with one thread per core
