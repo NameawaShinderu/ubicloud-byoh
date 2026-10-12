@@ -1122,7 +1122,23 @@ RSpec.describe Al do
         address.cidr.len.times { |i| AssignedVmAddress.create(dst_vm_id: other_vm.id, ip: address.cidr.nth(i).to_s, address_id: address.id) }
       end
       vm = create_vm(ip4_enabled: true)
-      expect { Al::Allocation.update_vm(vmh, vm) }.to raise_error(RuntimeError, /no ip4 addresses left/)
+      expect { Al::Allocation.update_vm(vmh, vm) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no ip4 addresses left/)
+    end
+
+    it "raises NoSpaceLeft and rolls back when a concurrent allocation takes the last ipv4 address" do
+      vmh = VmHost.first
+      vm = create_vm(ip4_enabled: true)
+      al = Al::Allocation.best_allocation(create_req(vm, vol))
+      expect(al).not_to be_nil
+
+      other_vm = create_vm
+      vmh.assigned_subnets.each do |address|
+        address.cidr.len.times { |i| AssignedVmAddress.create(dst_vm_id: other_vm.id, ip: address.cidr.nth(i).to_s, address_id: address.id) }
+      end
+
+      expect { al.update(vm) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no ip4 addresses left/)
+      expect(vm.reload.vm_host_id).to be_nil
+      expect(vmh.reload.used_cores).to eq(1)
     end
 
     it "allocates standard-gpu VM correctly on GEX44 host" do
@@ -1472,7 +1488,31 @@ RSpec.describe Al do
       # simulate the slice going away while being allocated
       slice2.update(enabled: false, used_cpu_percent: 0, used_memory_gib: 0)
 
-      expect { al.update(vm) }.to raise_error RuntimeError, "failed to update slice"
+      expect { al.update(vm) }.to raise_error Scheduling::Allocator::NoSpaceLeft, "failed to update slice"
+      expect(vm.reload.vm_host_id).to be_nil
+      expect(vm.vm_host_slice_id).to be_nil
+      expect(slice2.reload.used_cpu_percent).to eq(0)
+      expect(vh.reload.used_hugepages_1g).to eq(26)
+    end
+
+    it "raises NoSpaceLeft when the slice is destroyed while being allocated" do
+      vh = VmHost.first
+      slice = Prog::Vm::VmHostSliceNexus.assemble_with_host("sl1", vh, family: "burstable", allowed_cpus: (2..3), memory_gib: 8, is_shared: true).subject
+      slice.update(used_cpu_percent: 100, used_memory_gib: 4, enabled: true)
+      vh.update(total_cores: 4, total_cpus: 8, used_cores: 4, total_hugepages_1g: 27, used_hugepages_1g: 26)
+
+      vm = create_vm(family: "burstable", vcpus: 1, memory_gib: 2, cpu_percent_limit: 50, cpu_burst_percent_limit: 50)
+      al = Al::Allocation.best_allocation(create_req(vm, vol, use_slices: true, require_shared_slice: true))
+      expect(al).not_to be_nil
+
+      # VmHostSliceNexus#destroy commits after the slice was scored
+      VmHostCpu.where(vm_host_slice_id: slice.id).update(vm_host_slice_id: nil)
+      slice.strand.destroy
+      slice.destroy
+
+      expect { al.update(vm) }.to raise_error Scheduling::Allocator::NoSpaceLeft, "failed to update slice"
+      expect(vm.reload.vm_host_id).to be_nil
+      expect(vm.vm_host_slice_id).to be_nil
     end
 
     it "allocates with no slice if no host available for standard" do
@@ -1805,6 +1845,35 @@ RSpec.describe Al do
       expect(AssignedVmAddress.where(dst_vm_id: vm.id).count).to eq(0)
       expect(vh.reload.used_hugepages_1g).to eq(2)
       expect(VmHostSlice.count).to eq(1)
+    end
+
+    it "raises NoSpaceLeft when a concurrent new slice takes the host's last cores" do
+      vh = VmHost.first
+      vh.update(used_cores: 7)
+      vm1 = create_vm
+      vm2 = create_vm
+      al1 = Al::Allocation.best_allocation(create_req(vm1, vol, use_slices: true))
+      al2 = Al::Allocation.best_allocation(create_req(vm2, vol, use_slices: true))
+      al1.update(vm1)
+
+      expect { al2.update(vm2) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, "no cores left on #{vh.ubid}")
+      expect(vm2.reload.vm_host_id).to be_nil
+      expect(vh.reload.used_cores).to eq(8)
+      expect(VmHostSlice.count).to eq(1)
+    end
+
+    it "raises NoSpaceLeft when a concurrent new slice takes the CPUs it picked" do
+      vh = VmHost.first
+      Prog::Vm::VmHostSliceNexus.assemble_with_host("sl1", vh, family: "standard", allowed_cpus: (2..3), memory_gib: 8)
+      vm = create_vm
+      al = Al::Allocation.best_allocation(create_req(vm, vol, use_slices: true))
+      # The CPUs were free when picked, but another slice took them first
+      expect(al.instance_variable_get(:@vm_host_allocations).first).to receive(:select_cpuset).and_return([2, 3])
+
+      expect { al.update(vm) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, "Not enough CPUs available.")
+      expect(vm.reload.vm_host_id).to be_nil
+      expect(VmHostSlice.count).to eq(1)
+      expect(VmHostCpu.where(cpu_number: [2, 3]).select_map(:vm_host_slice_id).uniq.size).to eq(1)
     end
 
     it "converts a capacity CHECK constraint violation into NoSpaceLeft" do

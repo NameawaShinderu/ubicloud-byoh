@@ -290,7 +290,7 @@ module Scheduling::Allocator
 
     def self.update_vm(vm_host, vm)
       ip4, address = vm_host.ip4_random_vm_network if vm.ip4_enabled
-      fail "no ip4 addresses left" if vm.ip4_enabled && !ip4
+      fail NoSpaceLeft, "no ip4 addresses left" if vm.ip4_enabled && !ip4
 
       update_args = {
         vm_host_id: vm_host.id,
@@ -468,17 +468,17 @@ module Scheduling::Allocator
     def update(vm, vm_host)
       DB.transaction do
         if @existing_slice
-          # update the VM
-          vm.update(vm_host_slice_id: @existing_slice.id)
-
           # Lock the slice so the growth below is computed from the
           # current usage, not from the one seen while scoring.
           #
           # if we cannot find the slice, likely because it was
-          # marked to be destroyed in parallel, we need to fail
-          # and start the allocation process again
+          # marked to be destroyed or destroyed in parallel, we need
+          # to fail and start the allocation process again
           slice = VmHostSlice.where(id: @existing_slice.id, enabled: true).for_update.first
-          fail "failed to update slice" unless slice
+          fail NoSpaceLeft, "failed to update slice" unless slice
+
+          # update the VM
+          vm.update(vm_host_slice_id: slice.id)
 
           # Grow the slice if it is short on memory, and take the
           # difference from the host. Slices only grow; destroying the
@@ -506,6 +506,15 @@ module Scheduling::Allocator
           threads_per_core = vm_host.total_cpus / vm_host.total_cores
           request_cores = @request.cores_for_vcpus(threads_per_core)
           slice_cpus = request_cores * threads_per_core
+
+          # Lock the host so that new slices on it pick their CPUs one
+          # after another, and re-check its cores now that no concurrent
+          # allocation can change them. Past this point, too few free CPU
+          # rows means the counters drifted, not that a race was lost.
+          locked_host = VmHost.where(id: vm_host.id).for_update.first
+          if locked_host.used_cores + request_cores > locked_host.total_cores
+            fail NoSpaceLeft, "no cores left on #{vm_host.ubid}"
+          end
           cpus = select_cpuset(vm_host.id, slice_cpus)
 
           st = Prog::Vm::VmHostSliceNexus.assemble_with_host(

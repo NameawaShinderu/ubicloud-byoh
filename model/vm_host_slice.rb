@@ -34,7 +34,7 @@ class VmHostSlice < Sequel::Model
     ).update(vm_host_slice_id: id)
 
     # A concurrent xact might take some of the CPUs, so check if we got them all
-    fail "Not enough CPUs available." if allocated_cpus != allowed_cpus.size
+    fail Scheduling::Allocator::NoSpaceLeft, "Not enough CPUs available." if allocated_cpus != allowed_cpus.size
 
     # Get the proportion of cores to cpus from the host
     threads_per_core = vm_host.total_cpus / vm_host.total_cores

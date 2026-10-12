@@ -101,7 +101,7 @@ RSpec.describe VmHostSlice do
     it "raises an error if not enough cpus are available" do
       expect {
         vm_host_slice.set_allowed_cpus([2, 3, 4])
-      }.to raise_error("Not enough CPUs available.")
+      }.to raise_error(Scheduling::Allocator::NoSpaceLeft, "Not enough CPUs available.")
     end
   end
 
