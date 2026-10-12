@@ -75,6 +75,23 @@ RSpec.describe Hosting::GenericApis do
       expect(ips.map(&:ip_address)).to eq(["203.0.113.42/32"])
     end
 
+    it "defaults the network contract of the management /32" do
+      expect(api.pull_ips.first.to_h).to include(delivery: "routed", exposure: "public", reserved_ips: [], external_ips: {})
+    end
+
+    it "keeps the meaning of legacy entries" do
+      expect(api.pull_ips.last.to_h.slice(:delivery, :exposure)).to eq(delivery: "routed", exposure: "public")
+    end
+
+    it "carries each pool's delivery, exposure, reserved and external IPs" do
+      ips = with_config(routed_networks: [
+        {"cidr" => "10.98.1.0/30", "delivery" => "onlink", "exposure" => "nat", "segment" => "10.98.1.0/24", "gateway" => "10.98.1.1",
+         "external" => {"10.98.1.2" => "8.8.8.2", "10.98.1.3" => "8.8.8.3"}},
+      ]).pull_ips
+      expect(ips.last).to have_attributes(ip_address: "10.98.1.0/30", delivery: "onlink", exposure: "nat",
+        reserved_ips: %w[10.98.1.0 10.98.1.1], external_ips: {"10.98.1.2" => "8.8.8.2", "10.98.1.3" => "8.8.8.3"})
+    end
+
     it "returns only the management /32 without a config" do
       host_provider.update(config: nil)
       expect(described_class.new(host_provider.reload).pull_ips.map(&:ip_address)).to eq(["203.0.113.42/32"])

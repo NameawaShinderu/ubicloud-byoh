@@ -4146,6 +4146,18 @@ RSpec.describe CloverAdmin do
     expect(row.first).to include(vm_host.ubid, "accepting", "FSN1-DC1", "hetzner", "standard", "2", "4 / 48", "32 / 375", "800 / 1500", "0 / 0", "2")
   end
 
+  it "shows reserved IPv4 addresses apart from used ones in VM Host Usage" do
+    vm_host = create_vm_host
+    address = Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vm_host.id)
+    address.populate_ipv4_addresses(reserved_ips: %w[1.1.1.0 1.1.1.3])
+    AssignedVmAddress.create(dst_vm_id: create_vm(vm_host_id: vm_host.id).id, ip: "1.1.1.1", address_id: address.id)
+
+    click_link "VM Host Usage"
+    click_button "Search"
+    row = page.all(".vm-host-usage-table tbody tr").map { it.all("td").map(&:text) }
+    expect(row.first).to include("1 / 4 (reserved 2)")
+  end
+
   it "filters VM Host Usage by arch, total_cores, state and provider, composing filters" do
     x64_48 = create_vm_host(arch: "x64", total_cores: 48, allocation_state: "accepting")
     x64_96 = create_vm_host(arch: "x64", total_cores: 96, allocation_state: "draining")

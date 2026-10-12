@@ -192,7 +192,27 @@ RSpec.describe VmHost do
       end
 
       expect(Clog).not_to receive(:emit)
-      expect(vm_host.ip4_random_vm_network).to eq [nil, nil]
+      expect(vm_host.ip4_random_vm_network).to eq [nil, nil, nil]
+    end
+
+    it "skips reserved addresses and returns the external IP of a nat address" do
+      address = Address.create(vm_host:, cidr: "10.0.0.0/31", exposure: "nat")
+      address.populate_ipv4_addresses(reserved_ips: ["10.0.0.0"], external_ips: {"10.0.0.1" => "8.8.8.1"})
+
+      ip4, r_address, external_ip = vm_host.ip4_random_vm_network
+      expect(ip4.to_s).to eq "10.0.0.1"
+      expect(external_ip.to_s).to eq "8.8.8.1"
+      # Only address columns reach the model, so it can be saved.
+      expect(r_address.values.keys).to match_array Address.columns
+      expect { r_address.save_changes }.not_to raise_error
+    end
+
+    it "draws from the pools of the requested exposure" do
+      Address.create(vm_host:, cidr: "10.0.0.0/32", exposure: "internal").populate_ipv4_addresses
+      Address.create(vm_host:, cidr: "8.8.8.8/32").populate_ipv4_addresses
+
+      expect(vm_host.ip4_random_vm_network.first.to_s).to eq "8.8.8.8"
+      expect(vm_host.ip4_random_vm_network(exposure: "internal")).to match [have_attributes(to_s: "10.0.0.0"), be_a(Address), nil]
     end
   end
 
@@ -368,6 +388,26 @@ RSpec.describe VmHost do
       expect { vm_host.create_addresses }
         .to change { vm_host.assigned_subnets_dataset.count }.by(4)
         .and not_change { Strand.where(prog: "SetupNftables").count }
+    end
+
+    it "stores the network contract of BYOH pool records" do
+      vm_host.sshable.update(host: "1.1.0.0")
+      ip_records = [
+        Hosting::GenericApis::IpInfo.new(ip_address: "1.1.0.0/32", source_host_ip: "1.1.0.0"),
+        Hosting::GenericApis::IpInfo.new(ip_address: "10.0.0.0/31", source_host_ip: "1.1.0.0", delivery: "fabric", exposure: "nat",
+          reserved_ips: ["10.0.0.0"], external_ips: {"10.0.0.1" => "8.8.8.1"}),
+      ]
+      vm_host.create_addresses(ip_records:)
+
+      expect(vm_host.assigned_subnets_dataset.order(:cidr).select_map([:cidr, :delivery, :exposure]).map { [it[0].to_s, it[1], it[2]] }).to eq [
+        ["1.1.0.0/32", "routed", "public"],
+        ["10.0.0.0/31", "fabric", "nat"],
+      ]
+      expect(DB[:ipv4_address].order(:ip).select_map([:ip, :reserved, :external_ip]).map { it.map(&:to_s) }).to eq [
+        ["10.0.0.0", "true", ""],
+        ["10.0.0.1", "false", "8.8.8.1"],
+      ]
+      expect(vm_host.assigned_host_addresses_dataset.select_map(:ip).map(&:to_s)).to eq ["1.1.0.0/32"]
     end
 
     it "returns immediately if there are no addresses to create" do

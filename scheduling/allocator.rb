@@ -220,6 +220,7 @@ module Scheduling::Allocator
               .left_join(:assigned_vm_address, ip: :ip)
               .join(:address, [:cidr])
               .where { assigned_vm_address[:ip] =~ nil }
+              .where(Sequel[:ipv4_address][:reserved] => false)
               .select_group(:routed_to_host_id)
               .select_append { (count.function.* > 0).as(:ipv4_available) })
             .with(:storage_devices, DB[:storage_device]

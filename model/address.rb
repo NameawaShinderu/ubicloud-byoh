@@ -24,8 +24,10 @@ class Address < Sequel::Model
   end
 
   # The caller decides which addresses open a VM pool; host-claimed ones,
-  # recorded in assigned_host_address instead, never do.
-  def populate_ipv4_addresses
+  # recorded in assigned_host_address instead, never do. reserved_ips are
+  # imported but never allocated, and external_ips maps a pool address to
+  # the public address it is 1:1 NATed to.
+  def populate_ipv4_addresses(reserved_ips: [], external_ips: {})
     # ipv6 has no pool table; VM addresses are chosen randomly from the /64.
     return unless cidr.is_a?(NetAddr::IPv4Net)
 
@@ -40,7 +42,10 @@ class Address < Sequel::Model
       addresses.pop
     end
 
-    DB[:ipv4_address].import([:ip, :cidr], addresses)
+    rows = addresses.map do |ip, block|
+      [ip, block, reserved_ips.include?(ip.to_s), external_ips[ip.to_s]]
+    end
+    DB[:ipv4_address].import([:ip, :cidr, :reserved, :external_ip], rows)
   end
 end
 

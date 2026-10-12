@@ -6,7 +6,7 @@ class Prog::CheckIpReachability < Prog::Base
 
   label def start
     vm_ips = DB[:ipv4_address]
-      .where(cidr: vm_host.assigned_subnets_dataset.select(:cidr))
+      .where(cidr: vm_host.assigned_subnets_dataset.select(:cidr), reserved: false)
       .order(:ip)
       .select_map { host(:ip) }
     host_ips = vm_host.assigned_host_addresses_dataset.where { {family(ip) => 4} }.order(:ip).select_map { host(:ip) }

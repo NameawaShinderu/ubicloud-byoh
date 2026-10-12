@@ -46,6 +46,18 @@ RSpec.describe Address do
     end
   end
 
+  it "marks reserved addresses and records external IPs" do
+    vm_host = create_vm_host
+    address = described_class.create(cidr: "10.0.0.0/30", vm_host:, exposure: "nat")
+    address.populate_ipv4_addresses(reserved_ips: ["10.0.0.0", "10.0.0.3"], external_ips: {"10.0.0.1" => "8.8.8.1", "10.0.0.2" => "8.8.8.2"})
+    expect(DB[:ipv4_address].order(:ip).select_map([:ip, :reserved, :external_ip]).map { it.map(&:to_s) }).to eq [
+      ["10.0.0.0", "true", ""],
+      ["10.0.0.1", "false", "8.8.8.1"],
+      ["10.0.0.2", "false", "8.8.8.2"],
+      ["10.0.0.3", "true", ""],
+    ]
+  end
+
   it "populates ipv4_address table with addresses in cidr" do
     vm_host = Prog::Vm::HostNexus.assemble("1.2.3.4").subject
     address = described_class.create(cidr: "0.0.0.0/30", vm_host:)

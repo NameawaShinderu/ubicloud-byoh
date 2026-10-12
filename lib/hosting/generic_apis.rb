@@ -11,8 +11,15 @@ require "ipaddr"
 #     "location_label" => "homelab-rack-A",
 #     "routed_networks" => [{"cidr" => "10.99.0.0/29"}, {"cidr" => "fd00:feed::/64"}],
 #     "bmc" => {"endpoint" => "https://...", "username" => "...", "password_env" => "..."} }
+#
+# A routed_networks entry may also carry the network contract keys that
+# ByohPoolDeclaration documents (delivery, exposure, external, reserve, ...).
 class Hosting::GenericApis < Hosting::ProviderApis
-  IpInfo = Data.define(:ip_address, :source_host_ip) do
+  IpInfo = Data.define(:ip_address, :source_host_ip, :delivery, :exposure, :reserved_ips, :external_ips) do
+    def initialize(ip_address:, source_host_ip:, delivery: "routed", exposure: "public", reserved_ips: [], external_ips: {})
+      super
+    end
+
     # The management address is claimed by the host; every declared block is
     # routed to it and stays VM-allocatable.
     def host_only? = ip_address == "#{source_host_ip}/32"
@@ -25,8 +32,12 @@ class Hosting::GenericApis < Hosting::ProviderApis
   # vm_host.net6 at registration instead.
   def pull_ips
     mgmt_ip = @provider.vm_host.sshable.host
-    cidrs = Array(config["routed_networks"]).map { it["cidr"] }.reject { it.include?(":") }
-    ip_infos = cidrs.map { IpInfo.new(ip_address: it, source_host_ip: mgmt_ip) }
+    pools = Array(config["routed_networks"]).map { ByohPoolDeclaration.parse(it, legacy: true) }.select(&:ipv4?)
+    cidrs = pools.map { it.cidr.to_s }
+    ip_infos = pools.map do
+      IpInfo.new(ip_address: it.cidr.to_s, source_host_ip: mgmt_ip, delivery: it.delivery, exposure: it.exposure,
+        reserved_ips: it.reserved_ips, external_ips: it.external)
+    end
 
     mgmt_addr = IPAddr.new(mgmt_ip)
     unless cidrs.any? { IPAddr.new(it).include?(mgmt_addr) }

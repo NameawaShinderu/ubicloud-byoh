@@ -13,6 +13,8 @@ RSpec.describe Prog::CheckIpReachability do
     before do
       Address.create(cidr: "2001:db8::/64", routed_to_host_id: vmh.id)
       Address.create(cidr: "123.123.123.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
+      # Reserved addresses are never handed to VMs, so they are not checked.
+      Address.create(cidr: "123.123.124.0/31", routed_to_host_id: vmh.id).populate_ipv4_addresses(reserved_ips: %w[123.123.124.0 123.123.124.1])
     end
 
     it "checks the host and VM addresses and pops" do

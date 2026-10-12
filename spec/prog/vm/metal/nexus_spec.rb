@@ -589,8 +589,8 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       StorageDevice.create(vm_host_id: vm_host.id, name: "stor1", available_storage_gib: 30, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vm_host.id, name: "stor2", available_storage_gib: 12, total_storage_gib: 50)
       StorageDevice.create(vm_host_id: vm_host.id, name: "stor3", available_storage_gib: 99, total_storage_gib: 99, enabled: false)
-      address = Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vm_host.id)
-      address.populate_ipv4_addresses
+      address = Address.create(cidr: "1.1.1.0/29", routed_to_host_id: vm_host.id)
+      address.populate_ipv4_addresses(reserved_ips: %w[1.1.1.4 1.1.1.5 1.1.1.6 1.1.1.7])
       AssignedVmAddress.create(dst_vm_id: vm.id, ip: "1.1.1.1", address_id: address.id)
       # Excluded: other location, other arch, not accepting, other family
       create_vm_host(location_id: Location::HETZNER_HEL1_ID)

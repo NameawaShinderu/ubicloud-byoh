@@ -2217,7 +2217,8 @@ class CloverAdmin < Roda
           .select_group(Sequel[:address][:routed_to_host_id])
           .select_append(
             Sequel.function(:count).*.as(:total_ip4),
-            Sequel.function(:count).*.filter(Sequel[:assigned_vm_address][:ip] => nil, Sequel[:assigned_host_address][:ip] => nil).as(:available_ip4),
+            Sequel.function(:count).*.filter(Sequel[:assigned_vm_address][:ip] => nil, Sequel[:assigned_host_address][:ip] => nil, Sequel[:ipv4_address][:reserved] => false).as(:available_ip4),
+            Sequel.function(:count).*.filter(Sequel[:ipv4_address][:reserved] => true).as(:reserved_ip4),
           )
 
         vmh = Sequel[:vm_host]
@@ -2246,6 +2247,7 @@ class CloverAdmin < Roda
             Sequel.function(:coalesce, Sequel[:bi][:image_types], 0).as(:image_types),
             Sequel.function(:coalesce, Sequel[:ip][:available_ip4], 0).as(:available_ip4),
             Sequel.function(:coalesce, Sequel[:ip][:total_ip4], 0).as(:total_ip4),
+            Sequel.function(:coalesce, Sequel[:ip][:reserved_ip4], 0).as(:reserved_ip4),
           )
           .order(Sequel[:location][:name], vmh[:data_center], vmh[:family], vmh[:id])
 
@@ -2257,7 +2259,9 @@ class CloverAdmin < Roda
 
         @data = ds.map do |row|
           used_storage = row[:total_storage] - row[:available_storage]
-          used_ip4 = row[:total_ip4] - row[:available_ip4]
+          # Reserved addresses are never allocated, so they count as neither.
+          used_ip4 = row[:total_ip4] - row[:available_ip4] - row[:reserved_ip4]
+          reserved_ip4 = " (reserved #{row[:reserved_ip4]})" if row[:reserved_ip4] > 0
           {
             ubid: UBID.to_ubid(row[:id]),
             location: row[:location],
@@ -2269,7 +2273,7 @@ class CloverAdmin < Roda
             cores: "#{row[:used_cores]} / #{row[:total_cores]}",
             hugepages: "#{row[:used_hugepages_1g]} / #{row[:total_hugepages_1g]}",
             storage_gib: "#{used_storage} / #{row[:total_storage]}",
-            ip4: "#{used_ip4} / #{row[:total_ip4]}",
+            ip4: "#{used_ip4} / #{row[:total_ip4]}#{reserved_ip4}",
             image_types: row[:image_types],
           }
         end

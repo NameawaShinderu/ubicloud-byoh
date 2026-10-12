@@ -51,7 +51,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     free_ipv4 = DB[:ipv4_address]
       .left_join(:assigned_vm_address, ip: :ip)
       .join(:address, [:cidr])
-      .where(:routed_to_host_id => vm_host_id, Sequel[:assigned_vm_address][:ip] => nil)
+      .where(:routed_to_host_id => vm_host_id, Sequel[:assigned_vm_address][:ip] => nil, Sequel[:ipv4_address][:reserved] => false)
       .select { count.function.* }
 
     ds = VmHost.where(arch:)

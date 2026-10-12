@@ -145,15 +145,25 @@ class VmHost < Sequel::Model
     end
   end
 
-  def ip4_random_vm_network
+  # The address exposures a VM's requested IPv4 exposure may draw from.
+  IP4_EXPOSURE_POOLS = {"internet" => %w[public nat], "internal" => %w[internal]}.freeze
+
+  # Returns a free pool address, its Address and the external IP it is
+  # 1:1 NATed to (nil unless the pool is nat).
+  def ip4_random_vm_network(exposure: "internet")
     res = DB[:ipv4_address]
       .join(:address, [:cidr])
       .where(cidr: assigned_subnets_dataset.select(:cidr))
+      .where(Sequel[:ipv4_address][:reserved] => false, Sequel[:address][:exposure] => IP4_EXPOSURE_POOLS.fetch(exposure))
       .exclude(assigned_vm_addresses_dataset.where(ip: Sequel[:ipv4_address][:ip]).select(1).exists)
       .order { random.function }
       .first
 
-    res ? [res.delete(:ip), Address.call(res)] : [nil, nil]
+    return [nil, nil, nil] unless res
+
+    external_ip = res.delete(:external_ip)
+    res.delete(:reserved)
+    [res.delete(:ip), Address.call(res), external_ip]
   end
 
   # IPv4 range to use for setting local_vetho_ip for VM in hosts.
@@ -219,12 +229,15 @@ class VmHost < Sequel::Model
           fail "BUG: source host #{ip_record.source_host_ip} isn't added to the database"
         end
 
-        adr = Address.create(cidr: ip_addr, routed_to_host_id: id)
+        # Only BYOH records carry the network contract; the others keep the
+        # column defaults.
+        record = ip_record.to_h
+        adr = Address.create(cidr: ip_addr, routed_to_host_id: id, **record.slice(:delivery, :exposure))
         # A claimed address joins the host's set; a routed one opens its VM pool.
         if ip_record.host_only?
           AssignedHostAddress.create(host_id: id, ip: ip_addr, address_id: adr.id)
         else
-          adr.populate_ipv4_addresses
+          adr.populate_ipv4_addresses(**record.slice(:reserved_ips, :external_ips))
         end
       end
     end
