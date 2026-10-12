@@ -270,7 +270,8 @@ class ByohLocationCli
       audit("delete", location, {name: location.name})
     end
     @out.puts "Location #{location.name} will be deleted by its strand."
-    @out.puts "The rate file #{rate_file(location)} is kept: old invoices may refer to its rates." if rate_file(location)
+    path = rate_file(location)
+    @out.puts "The rate file #{path} is kept: old invoices may refer to its rates." if path && File.exist?(path)
   end
 
   def parse(argv, banner)

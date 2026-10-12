@@ -380,6 +380,7 @@ RSpec.describe ByohLocationCli do
     it "deletes an empty location through its strand and keeps the rate file" do
       Strand.create_with_id(location, prog: "LocationNexus", label: "wait")
       allow(Config).to receive(:billing_rates_extra_dir).and_return(dir)
+      write_rates(dir, "byoh-1", full_rates("byoh-1"))
       status, output, = cli("delete", "--location", location.name)
       expect(status).to eq 0
       expect(output).to eq "Location byoh-1 will be deleted by its strand.\nThe rate file #{dir}/byoh-1.yml is kept: old invoices may refer to its rates.\n"
@@ -389,6 +390,12 @@ RSpec.describe ByohLocationCli do
 
     it "does not mention a rate file without an overlay directory" do
       Strand.create_with_id(location, prog: "LocationNexus", label: "wait")
+      expect(cli("delete", "--location", location.name)[1]).to eq "Location byoh-1 will be deleted by its strand.\n"
+    end
+
+    it "does not mention a rate file that was never written" do
+      Strand.create_with_id(location, prog: "LocationNexus", label: "wait")
+      allow(Config).to receive(:billing_rates_extra_dir).and_return(dir)
       expect(cli("delete", "--location", location.name)[1]).to eq "Location byoh-1 will be deleted by its strand.\n"
     end
 
