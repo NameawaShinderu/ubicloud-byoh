@@ -344,6 +344,15 @@ RSpec.describe ByohPool do
       expect(pool_actions.map { it[:args].to_h }).to eq [{"ip" => "10.98.1.128", "external" => "8.8.4.4", "from" => "8.8.8.10"}]
     end
 
+    it "names BILLING_RATES_EXTRA_DIR when a VM's billing rate is not loaded, changing nothing" do
+      vm = place_vm("10.98.1.128")
+      BillingRecord.create(project_id: vm.project_id, resource_id: vm.id, resource_name: "8.8.8.10", billing_rate_id: "5ba4e8fd-4c1c-8c34-8c10-7e8a2a0bd9a8", amount: 1)
+      expect { pool.remap("10.98.1.128", "8.8.4.4") }.to raise_error(described_class::Error,
+        "billing rate 5ba4e8fd-4c1c-8c34-8c10-7e8a2a0bd9a8 of #{vm.ubid} is not loaded; run with BILLING_RATES_EXTRA_DIR set, as web and respirate are")
+      expect(ipv4_row("10.98.1.128")[:external_ip].to_s).to eq "8.8.8.10"
+      expect(pool_actions).to eq []
+    end
+
     it "maps an address that lost its external IP, for a VM the control plane does not reach" do
       host
       DB[:ipv4_address].where(ip: "10.98.1.129").update(external_ip: nil)

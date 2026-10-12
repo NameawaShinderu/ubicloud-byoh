@@ -462,7 +462,9 @@ class ByohPool
       vm_address = vm.assigned_vm_address
       resource_name = vm_address.external_ip&.to_s || vm_address.ip.to_s
       vm.active_billing_records.each do |record|
-        record.update(resource_name:) if record.billing_rate["resource_type"] == "IPAddress"
+        rate = record.billing_rate or
+          raise Error, "billing rate #{record.billing_rate_id} of #{vm.ubid} is not loaded; run with BILLING_RATES_EXTRA_DIR set, as web and respirate are"
+        record.update(resource_name:) if rate["resource_type"] == "IPAddress"
       end
       LoadBalancer.where(id: LoadBalancerVm.where(vm_id: vm.id).select(:load_balancer_id)).all.each(&:incr_rewrite_dns_records)
       PostgresResource.where(id: PostgresServer.where(vm_id: vm.id).select(:resource_id)).all.each(&:incr_refresh_dns_record)
