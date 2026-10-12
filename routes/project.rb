@@ -2,23 +2,18 @@
 
 class Clover
   hash_branch("project") do |r|
-    r.is do
+    r.is web? do
       r.get do
         no_authorization_needed
-
-        if api?
-          paginated_result(current_account.projects_dataset.where(:visible), Serializers::Project)
-        else
-          view "project/index"
-        end
+        view "project/index"
       end
 
       r.post do
         no_authorization_needed
         handle_validation_failure("project/create")
 
-        if current_account.projects_dataset.count >= 10
-          fail CloverError.new(400, "InvalidRequest", "Project limit exceeded. You can create up to 10 projects. Contact support@ubicloud.com if you need more.")
+        if current_account.projects_dataset.count >= current_account.project_limit
+          fail CloverError.new(400, "InvalidRequest", "Project limit exceeded. You can create up to #{current_account.project_limit} projects. Contact support@ubicloud.com if you need more.")
         end
 
         DB.transaction do
@@ -26,12 +21,8 @@ class Clover
           audit_log(@project, "create")
         end
 
-        if api?
-          Serializers::Project.serialize(@project)
-        else
-          flash["notice"] = "Project created"
-          r.redirect @project
-        end
+        flash["notice"] = "Project created"
+        r.redirect @project
       end
     end
 
@@ -104,6 +95,24 @@ class Clover
       @project = Clover.authorized_project(current_account, project_id)
       check_found_object(@project)
 
+      if @project.get_ff_require_mfa_or_omniauth
+        if api?
+          # Only allow API access if the account has MFA setup or does not have a password
+          # (if account doesn't have password, it must have omniauth authentication setup)
+          if DB[:account_webauthn_keys].where(account_id: current_account_id).empty? &&
+              DB[:account_otp_keys].where(id: current_account_id).empty? &&
+              !DB[:account_password_hashes].where(id: current_account_id).empty?
+            no_authorization_needed
+            raise CloverError.new(403, "AccessDenied", "Project #{@project.ubid} requires token's account to have multifactor authentication enabled or login only allowed via external provider")
+          end
+        elsif rodauth.authenticated_by.length < 2 && !rodauth.authenticated_by.include?("omniauth")
+          no_authorization_needed
+          # For web access, only allow access if the current session is MFA authenticated or omniauth authenticated
+          flash["error"] = "Project #{@project.ubid} requires multifactor authentication enabled or login via external provider"
+          r.redirect "/project"
+        end
+      end
+
       @project_permissions = all_permissions(@project.id) if web?
 
       r.get true do
@@ -144,7 +153,7 @@ class Clover
 
         DB.transaction do
           @project.update(name: typecast_params.nonempty_str!("name"))
-          audit_log(@project, "update")
+          audit_log(@project, "rename")
         end
 
         flash["notice"] = "The project name is updated to '#{@project.name}'."

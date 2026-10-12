@@ -41,11 +41,15 @@ when "migrate"
   DB.extension :pg_enum
 
   DB.loggers << Logger.new($stdout)
+  opts = {}
+  if Config.validate_migration_dates
+    opts[:allow_migration_number] = 20230117..(Date.today + 5).strftime("%Y%m%d").to_i
+  end
   if version && File.file?(version)
-    Sequel::TimestampMigrator.new(DB, "migrate").run_single(version, :down)
+    Sequel::TimestampMigrator.new(DB, "migrate", **opts).run_single(version, :down)
   else
     version &&= Integer(version, 10)
-    Sequel::TimestampMigrator.apply(DB, "migrate", version)
+    Sequel::TimestampMigrator.run(DB, "migrate", target: version, **opts)
   end
 
   # Check if the alternate-user password hash user needs to run
@@ -61,10 +65,18 @@ SQL
     user = DB.get(Sequel.lit("current_user"))
     ph_user = "#{user}_password"
 
+    ph_connect_opts_proc = DB.opts[:connect_opts_proc]
+    if Config.clover_database_gcp_iam_auth_enabled
+      require_relative "../lib/gcp_database_auth"
+      ph_sa = Config.clover_database_gcp_clover_password_login_sa ||
+        fail("clover_database_gcp_clover_password_login_sa must be set to run ph migrations under GCP IAM auth")
+      ph_connect_opts_proc = GcpDatabaseAuth.connect_opts_proc(ph_user => ph_sa)
+    end
+
     # NB: this grant/revoke cannot be transaction-isolated, so, in
     # sensitive settings, it would be good to check role access.
     DB["GRANT CREATE ON SCHEMA public TO ?", ph_user.to_sym].get
-    Sequel.postgres(**DB.opts, user: ph_user) do |ph_db|
+    Sequel.postgres(**DB.opts, user: ph_user, connect_opts_proc: ph_connect_opts_proc) do |ph_db|
       ph_db.loggers << Logger.new($stdout) if ph_db.loggers.empty?
       Sequel::Migrator.run(ph_db, "migrate/ph", table: "schema_migrations_password")
     end
@@ -87,7 +99,7 @@ SQL
 when "refresh_sequel_caches"
   require_args.call(0..0)
 
-  %w[schema index static_cache pg_auto_constraint_validations].each do |type|
+  %w[schema index static_cache pg_auto_constraint_validations].freeze.each do |type|
     filename = "cache/#{type}.cache"
     File.delete(filename) if File.file?(filename)
   end
@@ -105,7 +117,7 @@ when "dump_sequel_caches"
   text_dir = "cache-text-#{Time.now.to_i}"
   Dir.mkdir(text_dir)
   puts "Writing diffable version of cache files to #{text_dir}"
-  %w[schema index static_cache pg_auto_constraint_validations].each do |type|
+  %w[schema index static_cache pg_auto_constraint_validations].freeze.each do |type|
     File.write(File.join(text_dir, "#{type}.txt"), Marshal.load(File.binread("cache/#{type}.cache")).pretty_inspect)
   end
 when "unused_associations_check"
@@ -114,7 +126,7 @@ when "unused_associations_check"
   Sequel::Model.update_unused_associations_data
 
   # Do not complain about unused project, strand, or semaphore associations or options
-  keep_associations = %w[project strand semaphores]
+  keep_associations = %w[project strand semaphores].freeze
   keep = proc { |_, association| keep_associations.include?(association) }
 
   unused = Sequel::Model.unused_associations
@@ -156,7 +168,7 @@ when "annotate"
   require_relative "../model"
   DB.loggers.clear
   require "sequel/annotate"
-  ignore_dirs = %w[aws metal]
+  ignore_dirs = %w[aws gcp metal].freeze
   files = Dir["model/**/*.rb"].reject do |file|
     ignore_dirs.include?(File.basename(File.dirname(file)))
   end

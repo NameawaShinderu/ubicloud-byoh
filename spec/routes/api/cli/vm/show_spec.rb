@@ -22,12 +22,14 @@ RSpec.describe Clover, "cli vm show" do
       size: standard-2
       unix-user: ubi
       storage-size-gib: 0
+      boot-image: ubuntu-jammy
       ip6: 128:1234::2
       ip4-enabled: false
       ip4: 128.0.0.1
       private-ipv4: #{@vm.private_ipv4}
       private-ipv6: #{@vm.private_ipv6}
       subnet: default-eu-central-h1
+      maintenance-window-start-at: 
       firewall 1:
         id: #{@fw.ubid}
         name: default-eu-central-h1-default
@@ -35,8 +37,10 @@ RSpec.describe Clover, "cli vm show" do
         location: eu-central-h1
         path: /location/eu-central-h1/firewall/default-eu-central-h1-default
         rules:
-          1: #{@fw.firewall_rules[0].ubid}  0.0.0.0/0  0..65535  
-          2: #{@fw.firewall_rules[1].ubid}  ::/0  0..65535  
+          1: #{@fw.firewall_rules[0].ubid}  0.0.0.0/0  0..65535  tcp  
+          2: #{@fw.firewall_rules[1].ubid}  0.0.0.0/0  0..65535  udp  
+          3: #{@fw.firewall_rules[2].ubid}  ::/0  0..65535  tcp  
+          4: #{@fw.firewall_rules[3].ubid}  ::/0  0..65535  udp  
     END
   end
 
@@ -61,7 +65,9 @@ RSpec.describe Clover, "cli vm show" do
       firewall 1:
         rules:
           1: 0.0.0.0/0  0..65535  
-          2: ::/0  0..65535  
+          2: 0.0.0.0/0  0..65535  
+          3: ::/0  0..65535  
+          4: ::/0  0..65535  
     END
   end
 end

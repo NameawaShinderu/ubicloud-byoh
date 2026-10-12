@@ -7,6 +7,13 @@ require "fileutils"
 require "json"
 
 class CertServerSetup
+  # Upstream publishes a checksums.txt next to each tarball; these are the
+  # digests it lists for server_version.
+  CHECKSUMS = {
+    "x86_64" => "be92e125f3dc753a7b0c3a365768fe4e2506e367f7feadbca56a69099566efbd",
+    "arm64" => "8a628c54d4508cdbfb6bd52757ab942fb17a34558f98ab7d498fa17e3cc06b2f",
+  }.freeze
+
   def initialize(vm_name)
     @vm_name = vm_name
   end
@@ -16,7 +23,7 @@ class CertServerSetup
   end
 
   def cert_folder
-    vp.q_cert
+    vp.cert
   end
 
   def cert_path
@@ -47,9 +54,12 @@ class CertServerSetup
     File.join(cert_folder, "metadata-endpoint-#{server_version}")
   end
 
+  def package_arch
+    @package_arch ||= Arch.render(x64: "x86_64", arm64: "arm64")
+  end
+
   def package_url
-    arch = Arch.render(x64: "x86_64", arm64: "arm64")
-    "https://github.com/ubicloud/metadata-endpoint/releases/download/v#{server_version}/metadata-endpoint_Linux_#{arch}.tar.gz"
+    "https://github.com/ubicloud/metadata-endpoint/releases/download/v#{server_version}/metadata-endpoint_Linux_#{package_arch}.tar.gz"
   end
 
   def setup
@@ -69,17 +79,17 @@ class CertServerSetup
     end
 
     create_cert_folder
-    r "cp #{server_main_path}/metadata-endpoint #{vm_server_path}" unless File.exist?(vm_server_path)
-    r "sudo chown #{@vm_name}:#{@vm_name} #{vm_server_path}"
+    r "cp", "#{server_main_path}/metadata-endpoint", vm_server_path unless File.exist?(vm_server_path)
+    r "sudo", "chown", "#{@vm_name}:#{@vm_name}", vm_server_path
   end
 
   def download_server
     temp_tarball = "/tmp/metadata-endpoint-#{server_version}.tar.gz"
-    r "curl -L3 -o #{temp_tarball} #{package_url}"
+    fail "Invalid SHA-256 digest" unless curl_file(package_url, temp_tarball) == CHECKSUMS.fetch(package_arch)
 
     FileUtils.mkdir_p(server_main_path)
     FileUtils.cd server_main_path do
-      r "tar -xzf #{temp_tarball}"
+      r "tar", "-xzf", temp_tarball, "--no-same-owner"
     end
 
     FileUtils.rm_f(temp_tarball)
@@ -122,11 +132,11 @@ CERT_SERVICE
   end
 
   def enable_and_start_service
-    r "systemctl enable --now #{service_name}"
+    r "systemctl", "enable", "--now", service_name
   end
 
   def stop_and_remove_service
-    r "systemctl disable --now #{service_name}" if File.exist?(service_file_path)
+    r "systemctl", "disable", "--now", service_name if File.exist?(service_file_path)
     r "systemctl daemon-reload"
     FileUtils.rm_f(service_file_path)
   end
@@ -137,6 +147,7 @@ CERT_SERVICE
   def create_cert_folder
     FileUtils.mkdir(cert_folder)
   rescue Errno::EEXIST
+    nil
   end
 
   def put_certificate(cert_payload, cert_key_payload)

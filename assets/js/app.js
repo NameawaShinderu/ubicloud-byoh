@@ -1,10 +1,14 @@
 $(function () {
   setupAutoRefresh();
+  setupCountdownButtons();
+  setupScrollToBottom();
   setupDatePicker();
   setupFormOptionUpdates();
   setupPlayground();
   setupMetricsCharts();
   setupPgConfigCard();
+  setupStructuredDataCard();
+  setupLogDestinationForm();
 });
 
 $(".toggle-mobile-menu").on("click", function (event) {
@@ -135,6 +139,35 @@ function setupAutoRefresh() {
   });
 }
 
+function setupCountdownButtons() {
+  $("[data-countdown-until]").each(function () {
+    const button = $(this);
+    const label = button.text().trim();
+    const retryAtMs = parseInt(button.data("countdown-until"), 10) * 1000;
+
+    function tick() {
+      const remainingSeconds = Math.ceil((retryAtMs - Date.now()) / 1000);
+      if (remainingSeconds <= 0) {
+        button.prop("disabled", false).text(label);
+        return;
+      }
+      // Zero-padded and tabular-nums so the button doesn't jitter as digits change.
+      const padded = String(remainingSeconds).padStart(2, "0");
+      const countdown = $("<span>", {class: "tabular-nums", text: padded});
+      button.empty().append(document.createTextNode(label + " ("), countdown, document.createTextNode("s)"));
+      setTimeout(tick, 1000);
+    }
+
+    tick();
+  });
+}
+
+function setupScrollToBottom() {
+  $("[data-scroll-to-bottom]").each(function () {
+    this.scrollTop = this.scrollHeight;
+  });
+}
+
 function setupDatePicker() {
   if (!$.prototype.flatpickr) { return; }
 
@@ -164,6 +197,9 @@ function setupDatePicker() {
     if ($(this).data("defaultdate")) {
       options.defaultDate = $(this).data("defaultdate");
     }
+    if ($(this).data("dateformat")) {
+      options.dateFormat = $(this).data("dateformat");
+    }
 
     $(this).flatpickr(options);
   });
@@ -182,12 +218,13 @@ $(".fork-icon").on("click", function () {
 
 $(".connection-info-format-selector select, .connection-info-format-selector input").on('change', function() {
   let format = $(".connection-info-format-selector select").val();
-  let port = $(".connection-info-format-selector input").is(":checked") ? "6432" : "5432";
+  let port = $(".connection-info-format-selector input[name=use_pgbouncer]").is(":checked") ? "6432" : "5432";
+  let suffix = $(".connection-info-format-selector input[name=use_private_dns]").is(":checked") ? "-private" : "";
   let reveal_status = $(".connection-info-box:visible").find(".group").hasClass('active')
 
   $(".connection-info-box").hide();
-  $(".connection-info-box-" + format + "-" + port).find(".group").toggleClass('active', reveal_status);
-  $(".connection-info-box-" + format + "-" + port).show();
+  $(".connection-info-box-" + format + "-" + port + suffix).find(".group").toggleClass('active', reveal_status);
+  $(".connection-info-box-" + format + "-" + port + suffix).show();
 });
 
 
@@ -217,19 +254,27 @@ function redrawChildOptions(name) {
       }
 
       let elements2select = [];
+      // Options the server marked as unavailable stay disabled and
+      // unselectable, whichever parent option is chosen.
+      let available = ":not(.option-unavailable)";
+
       switch (child_type) {
         case "input_radio":
           $("input[name=" + child_name + "]").parent().hide()
           $("input[name=" + child_name + "]").prop('disabled', true).prop('checked', false).prop('selected', false);
           $("input[name=" + child_name + "]").parent(classes).show()
-          $("input[name=" + child_name + "]").parent(classes).children("input[name=" + child_name + "]").prop('disabled', false);
+          $("input[name=" + child_name + "]").parent(classes + available).children("input[name=" + child_name + "]").prop('disabled', false);
 
           if (option_dirty[child_name]) {
-            elements2select = $("input[name=" + child_name + "][value=" + option_dirty[child_name] + "]").parent(classes);
+            elements2select = $("input[name=" + child_name + "][value=" + option_dirty[child_name] + "]").parent(classes + available);
           }
 
           if (elements2select.length == 0) {
             option_dirty[child_name] = null;
+            elements2select = $("input[name=" + child_name + "]").parent(classes + available);
+          }
+
+          if (elements2select.length == 0) {
             elements2select = $("input[name=" + child_name + "]").parent(classes);
           }
 
@@ -592,6 +637,13 @@ function setupPlayground() {
 }
 
 const metricsCharts = [];
+// When set, all charts show this fixed window instead of the relative
+// time-range selection. Set by drag-to-zoom, cleared by "Reset zoom" or
+// picking a new time range.
+let metricsZoomRange = null;
+// Metrics are sampled too sparsely to render windows narrower than the
+// smallest time-range preset (30 minutes) without gaps.
+const MIN_ZOOM_WINDOW_MS = 30 * 60 * 1000;
 const colorPalette = [
   {
     color: '#5470c6',
@@ -630,12 +682,14 @@ function setupMetricsCharts() {
   }
 
   const charts = document.querySelectorAll('#metrics-container [id$="-chart"]');
+  const zoomable = metricsContainer.hasAttribute('data-zoomable');
 
   charts.forEach(chart => {
     const metricKey = chart.getAttribute('data-metric-key');
     const chartInstance = {
       key: metricKey,
       unit: chart.getAttribute('data-metric-unit'),
+      zoomable,
       chart: echarts.init(chart)
     };
     metricsCharts.push(chartInstance);
@@ -644,11 +698,34 @@ function setupMetricsCharts() {
 
   updateMetricsCharts();
 
-  $('#metrics-container #time-range').on('change', updateMetricsCharts);
+  $('#metrics-container #time-range').on('change', resetMetricsZoom);
   $('#metrics-container #refresh-button').on('click', updateMetricsCharts);
+  $('#metrics-container #reset-zoom-button').on('click', resetMetricsZoom);
+  $('#metrics-container #node-filter').on('change', function () {
+    for (const chartInstance of metricsCharts) {
+      const names = (chartInstance.chart.getOption().series || []).map(series => series.name);
+      chartInstance.chart.setOption({ legend: { selected: metricsLegendSelection(names) } });
+    }
+  });
 
-  // Reload charts every 5 minutes.
-  setInterval(updateMetricsCharts, 5 * 60 * 1000);
+  $('#metrics-container').on('click', '.maximize-chart-button', function () {
+    toggleChartMaximize($(this).closest('.metric-chart-card'));
+  });
+  $(document).on('keydown', function (event) {
+    if (event.key === 'Escape') {
+      const maximizedCard = $('#metrics-container .chart-maximized');
+      if (maximizedCard.length) {
+        toggleChartMaximize(maximizedCard);
+      }
+    }
+  });
+
+  // Reload charts every 5 minutes, unless zoomed into a fixed window.
+  setInterval(() => {
+    if (!metricsZoomRange) {
+      updateMetricsCharts();
+    }
+  }, 5 * 60 * 1000);
 }
 
 function setupInitialChartOptions(chartInstance) {
@@ -699,9 +776,106 @@ function setupInitialChartOptions(chartInstance) {
     },
   }
 
+  if (chartInstance.zoomable) {
+    options.toolbox = {
+      // Registers drag-to-zoom on the x axis; the empty icons keep the
+      // toolbox buttons themselves hidden.
+      feature: {
+        dataZoom: {
+          yAxisIndex: 'none',
+          icon: { zoom: 'path://', back: 'path://' }
+        }
+      }
+    };
+  }
+
   chartInstance.chart.setOption(options);
+  enableChartZoom(chartInstance);
+
+  if (chartInstance.zoomable) {
+    chartInstance.chart.on('datazoom', function (event) {
+      // Only user brush selections carry a batch with axis values; the
+      // dataZoom actions we dispatch ourselves don't.
+      const selection = event.batch && event.batch[0];
+      if (!selection || selection.startValue == null || selection.endValue == null) {
+        return;
+      }
+      zoomMetricsCharts(selection.startValue, selection.endValue);
+    });
+  }
 
   window.addEventListener('resize', debounce(chartInstance.chart.resize, 300));
+}
+
+function enableChartZoom(chartInstance) {
+  if (!chartInstance.zoomable) {
+    return;
+  }
+  chartInstance.chart.dispatchAction({
+    type: 'takeGlobalCursor',
+    key: 'dataZoomSelect',
+    dataZoomSelectActive: true
+  });
+}
+
+function zoomMetricsCharts(startMs, endMs) {
+  if (endMs - startMs < MIN_ZOOM_WINDOW_MS) {
+    const center = (startMs + endMs) / 2;
+    startMs = center - MIN_ZOOM_WINDOW_MS / 2;
+    endMs = center + MIN_ZOOM_WINDOW_MS / 2;
+    // Expanding the selection can push the window into the future; shift
+    // it back so it ends at now.
+    const overshoot = endMs - Date.now();
+    if (overshoot > 0) {
+      startMs -= overshoot;
+      endMs -= overshoot;
+    }
+  }
+  metricsZoomRange = { start: new Date(startMs), end: new Date(endMs) };
+  $('#metrics-container #reset-zoom-button').removeClass('hidden');
+  updateMetricsCharts();
+}
+
+function resetMetricsZoom() {
+  metricsZoomRange = null;
+  $('#metrics-container #reset-zoom-button').addClass('hidden');
+  updateMetricsCharts();
+}
+
+function toggleChartMaximize(card) {
+  const maximize = !card.hasClass('chart-maximized');
+  card.toggleClass('chart-maximized fixed inset-0 z-50 flex flex-col', maximize);
+  card.toggleClass('rounded-lg border', !maximize);
+  card.find('.metric-chart').toggleClass('h-64', !maximize).toggleClass('grow', maximize);
+  card.find('.maximize-icon').toggleClass('hidden', maximize);
+  card.find('.minimize-icon').toggleClass('hidden', !maximize);
+  // Keep the page behind the maximized chart from scrolling.
+  $('body').toggleClass('overflow-hidden', maximize);
+
+  const chart = echarts.getInstanceByDom(card.find('.metric-chart')[0]);
+  if (chart) {
+    chart.resize();
+  }
+}
+
+// Hides the series belonging to the nodes the filter is not showing. Series
+// not named after a node, such as the per-verb or per-direction ones, are
+// always kept. Returns nothing without a filter, so pages that have none keep
+// whatever the user toggled in the legend.
+function metricsLegendSelection(seriesNames) {
+  const filter = $('#metrics-container #node-filter');
+  if (!filter.length) {
+    return undefined;
+  }
+
+  const node = filter.val() || 'all';
+  const nodes = filter.find('option').map(function () { return this.value; }).get();
+  const selected = {};
+  for (const name of seriesNames) {
+    const owner = nodes.find(value => value !== 'all' && (name === value || name.endsWith(' ' + value)));
+    selected[name] = node === 'all' || !owner || owner === node;
+  }
+  return selected;
 }
 
 function queryAndUpdateChart(chartInstance, start_time, end_time) {
@@ -734,9 +908,12 @@ function queryAndUpdateChart(chartInstance, start_time, end_time) {
           const value = Number(Number(item[1]).toFixed(2));
           return [ts, value]
         });
-        const labelKeys = Object.keys(series["labels"]);
-        const firstKey = labelKeys[0];
-        const seriesName = series["labels"][firstKey] || series["labels"]["name"] || metric["name"];
+        const labels = series["labels"];
+        const nameParts = Object.keys(labels)
+          .filter(key => key !== "name" && key !== "__name__")
+          .map(key => labels[key]);
+        nameParts.unshift(labels["name"]);
+        const seriesName = nameParts.filter(Boolean).join(" ") || metric["name"];
 
         chartSeries.push({
           name: seriesName,
@@ -755,21 +932,36 @@ function queryAndUpdateChart(chartInstance, start_time, end_time) {
         });
       }
 
+      const legend = {
+        type: 'scroll',
+        data: chartSeries.map(series => series.name),
+        right: '2%',
+      };
+      const legendSelection = metricsLegendSelection(legend.data);
+      if (legendSelection) {
+        legend.selected = legendSelection;
+      }
+
       chartInstance.chart.hideLoading();
       chartInstance.chart.setOption({
         ...chartInstance.chart.getOption(),
-        legend: {
-          data: chartSeries.map(series => series.name),
-          right: '2%',
-        },
+        legend,
         xAxis: {
           type: 'time',
           min: start_time.getTime(),
-          max: end_time.getTime()
+          max: end_time.getTime(),
+          splitLine: { show: true },
+          axisLabel: { hideOverlap: true }
         },
         series: chartSeries,
         graphic: [],
       }, true);
+      if (chartInstance.zoomable) {
+        // The fetched data now spans exactly the requested window, so undo
+        // any client-side zoom clip left over from a brush selection.
+        chartInstance.chart.dispatchAction({ type: 'dataZoom', start: 0, end: 100 });
+        enableChartZoom(chartInstance);
+      }
       chartInstance.chart.resize();
     })
     .catch(error => {
@@ -792,10 +984,16 @@ function queryAndUpdateChart(chartInstance, start_time, end_time) {
 }
 
 function updateMetricsCharts() {
-  const timeDuration = $('#metrics-container #time-range').val() || "1h";
-  const timeDurationSeconds = durationToSeconds(timeDuration);
-  const start_time = new Date(Date.now() - timeDurationSeconds * 1000);
-  const end_time = new Date(Date.now());
+  let start_time, end_time;
+  if (metricsZoomRange) {
+    start_time = metricsZoomRange.start;
+    end_time = metricsZoomRange.end;
+  } else {
+    const timeDuration = $('#metrics-container #time-range').val() || "1h";
+    const timeDurationSeconds = durationToSeconds(timeDuration);
+    start_time = new Date(Date.now() - timeDurationSeconds * 1000);
+    end_time = new Date(Date.now());
+  }
 
   for (const chartInstance of metricsCharts) {
     chartInstance.chart.showLoading();
@@ -890,41 +1088,131 @@ function flexiblePrecision(value, precision) {
   return (value < 10) ? value.toFixed(increasedPrecision) : value.toFixed(precision);
 }
 
+function addRowToConfigCard(card, key, value) {
+  const placeholder = card.find(".config-placeholder-group");
+  if (!placeholder.length) return;
+  const newRow = placeholder.clone(true);
+  newRow.data("config-id", (placeholder.data("config-id") || 0) + 1);
+  newRow.find("input").prop("disabled", false);
+  newRow.find("input").eq(0).val(key);
+  newRow.find("input").eq(1).val(value);
+  newRow.removeClass("hidden config-placeholder-group").addClass("config-group");
+  placeholder.before(newRow);
+}
+
 function setupPgConfigCard() {
   $(".delete-config-btn").on("click", function (event) {
     const configGroup = $(this).closest(".group");
     configGroup.remove();
   });
 
-  $(".add-config-btn").on("click", function (event) {
-    event.preventDefault();
-    addConfigRow(event.target);
-  });
-
-  function addConfigRow(addBtn) {
-    const createConfigGroup = $(addBtn).closest(".group");
+  $(".add-config-btn").on("click", function (e) {
+    e.preventDefault();
+    const createConfigGroup = $(e.target).closest(".group");
     const keyInput = createConfigGroup.find("input").eq(0);
     const valueInput = createConfigGroup.find("input").eq(1);
     if (!keyInput[0].reportValidity()) return;
-
-    const placeHolderGroup = $(addBtn).closest(".group").siblings(".config-placeholder-group");
-    const configId = placeHolderGroup.data("config-id");
-
-    const newConfigId = configId + 1;
-    const newConfigGroup = placeHolderGroup.clone(true);
-    newConfigGroup.data("config-id", newConfigId);
-    newConfigGroup.find("input").prop("disabled", false);
-
-    newConfigGroup.removeClass("hidden");
-    newConfigGroup.removeClass("config-placeholder-group");
-    newConfigGroup.addClass("config-group");
-
-    newConfigGroup.find("input").eq(0).prop("value", keyInput.val());
-    newConfigGroup.find("input").eq(1).prop("value", valueInput.val());
-
+    addRowToConfigCard(createConfigGroup.parent(), keyInput.val(), valueInput.val());
     keyInput.val("");
     valueInput.val("");
+  });
+}
 
-    $(addBtn).closest(".group").before(newConfigGroup);
+function setupStructuredDataCard() {
+  function addKvRow(addBtn) {
+    const newKvRow = $(addBtn).closest(".new-sd-kv-row");
+    const group = $(addBtn).closest(".sd-id-group");
+    const sdId = group.data("sd-id");
+    const keyInput = newKvRow.find(".new-sd-key");
+    const valueInput = newKvRow.find(".new-sd-value");
+    const key = keyInput.val().trim();
+    if (!key) return;
+
+    const placeholder = group.find(".sd-kv-placeholder-row");
+    const newRow = placeholder.clone(true);
+    newRow.find('input[name="structured_data_ids[]"]').val(sdId).prop("disabled", false);
+    newRow.find('input[name="structured_data_keys[]"]').val(key).prop("disabled", false);
+    newRow.find('input[name="structured_data_values[]"]').val(valueInput.val()).prop("disabled", false);
+    newRow.removeClass("sd-kv-placeholder-row hidden").addClass("sd-kv-row");
+
+    group.find(".sd-kv-rows").append(newRow);
+    keyInput.val("");
+    valueInput.val("");
   }
+
+  $(document).on("click", ".add-sd-id-btn", function (e) {
+    e.preventDefault();
+    const nameInput = $(this).siblings(".new-sd-id-name");
+    const sdId = nameInput.val().trim();
+    if (!sdId) return;
+
+    const placeholder = $(".sd-id-placeholder-group");
+    const newGroup = placeholder.clone(true);
+    newGroup.attr("data-sd-id", sdId);
+    newGroup.find(".sd-id-label").text(sdId);
+    newGroup.removeClass("sd-id-placeholder-group hidden").addClass("sd-id-group");
+
+    placeholder.before(newGroup);
+    nameInput.val("");
+  });
+
+  $(document).on("click", ".add-sd-kv-btn", function (e) {
+    e.preventDefault();
+    addKvRow(this);
+  });
+
+  $(document).on("click", ".delete-sd-id-btn", function (e) {
+    e.preventDefault();
+    $(this).closest(".sd-id-group").remove();
+  });
+
+  $(document).on("click", ".delete-sd-kv-btn", function (e) {
+    e.preventDefault();
+    $(this).closest(".sd-kv-row").remove();
+  });
+
+  $(document).on("submit", "form:has(#sd-id-groups)", function () {
+    $(".sd-id-group .add-sd-kv-btn").each(function () {
+      addKvRow(this);
+    });
+  });
+}
+
+function setupLogDestinationForm() {
+  function protocolFor(type) {
+    return type === "otlp" ? "https://" : "tcp://";
+  }
+
+  function stripProtocol(url) {
+    return url.replace(/^https?:\/\/|^tcp:\/\//, "");
+  }
+
+  $(document).on("change", "#log-destination-provider", function () {
+    const selected = $(this).find("option:selected");
+    const type = selected.data("type");
+    const url = selected.data("url") || "";
+    const headers = selected.data("headers") || [];
+
+    $("#log-destination-type").val(type);
+    $("#url-prefix").text(protocolFor(type));
+    $("#url-display").val(url ? stripProtocol(url) : "");
+    $("label[for='url-display']").text(type === "otlp" ? "OTLP Endpoint URL" : "Syslog TCP Endpoint");
+
+    if (type === "otlp") {
+      $("#log-destination-otlp-auth").removeClass("hidden");
+      $("#log-destination-syslog-auth").addClass("hidden");
+      const card = $("#log-destination-otlp-auth");
+      card.find(".config-group").remove();
+      headers.forEach(([key, value]) => addRowToConfigCard(card, key, value));
+    } else {
+      $("#log-destination-otlp-auth").addClass("hidden");
+      $("#log-destination-syslog-auth").removeClass("hidden");
+    }
+  });
+
+  $(document).on("submit", "form:has(#url-display)", function () {
+    const prefix = $("#url-prefix").text();
+    const suffix = $("#url-display").val();
+    $("#url-hidden").val(prefix + suffix);
+  });
 }

@@ -24,8 +24,22 @@ RSpec.describe Prog::Test::Vm do
     Nic.create(private_subnet_id: subnet.id, vm_id: vm.id, name: "nic-1",
       private_ipv4: "192.168.0.1/32", private_ipv6: "fd01:db8:85a1::/64",
       mac: "00:00:00:00:00:01", state: "active")
-    VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 20, disk_index: 0, use_bdev_ubi: false)
-    VmStorageVolume.create(vm_id: vm.id, boot: false, size_gib: 20, disk_index: 1, use_bdev_ubi: false)
+    sd = StorageDevice.create(vm_host_id: vm_host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100, unix_device_list: ["sda"])
+    vbb = create_vhost_block_backend(version: "v0.4.2", vm_host_id: vm_host.id)
+    2.times do |i|
+      kek = StorageKeyEncryptionKey.create_random(auth_data: "auth_data_#{i}")
+      VmStorageVolume.create(
+        vm_id: vm.id,
+        boot: i == 0,
+        size_gib: 20,
+        disk_index: i,
+        use_bdev_ubi: false,
+        storage_device_id: sd.id,
+        vhost_block_backend_id: vbb.id,
+        key_encryption_key_1_id: kek.id,
+        vring_workers: 1,
+      )
+    end
     vm
   }
 
@@ -63,7 +77,7 @@ RSpec.describe Prog::Test::Vm do
   end
 
   describe "#storage_persistence" do
-    it "creates files on first boot" do
+    it "creates files on first boot and continues to rotate_storage_keys" do
       refresh_frame(vm_test, new_values: {"first_boot" => true})
       expect(sshable).to receive(:_cmd).with("mkdir ~/persistence_test")
       (1..5).each do |i|
@@ -71,10 +85,10 @@ RSpec.describe Prog::Test::Vm do
         expect(sshable).to receive(:_cmd).with("head -c 1M /dev/urandom | tee /tmp/persistence-test | sha256sum | awk '{print $1}'").and_return(some_sha256)
         expect(sshable).to receive(:_cmd).with("mv /tmp/persistence-test /home/ubi/persistence_test/#{some_sha256}")
       end
-      expect { vm_test.storage_persistence }.to hop("install_packages")
+      expect { vm_test.storage_persistence }.to hop("rotate_storage_keys")
     end
 
-    it "verifies files on subsequent boots" do
+    it "verifies files on subsequent boots and continues to the full suite" do
       refresh_frame(vm_test, new_values: {"first_boot" => false})
       expect(sshable).to receive(:_cmd).with("ls ~/persistence_test").and_return("sha256_1\nsha256_2\nsha256_3\nsha256_4\nsha256_5\n")
       (1..5).each do |i|
@@ -97,6 +111,24 @@ RSpec.describe Prog::Test::Vm do
       expect(sshable).to receive(:_cmd).with("sha256sum /home/ubi/persistence_test/sha256_1 | awk '{print $1}'").and_return("different_sha256")
       expect { vm_test.storage_persistence }.to hop("failed")
       expect(strand.reload.exitval).to eq({"msg" => "persistence test: file content mismatch"})
+    end
+  end
+
+  describe "#rotate_storage_keys" do
+    it "assembles a KEK rotation child for each volume and waits" do
+      expect { vm_test.rotate_storage_keys }.to hop("wait_rotate_storage_keys")
+      expect(vm_test.strand.children.map(&:prog)).to eq(["Storage::RotateKek", "Storage::RotateKek"])
+    end
+  end
+
+  describe "#wait_rotate_storage_keys" do
+    it "naps while a rotation child is still running" do
+      Strand.create(prog: "Storage::RotateKek", label: "rotate", stack: [{}], parent_id: vm_test.strand.id)
+      expect { vm_test.wait_rotate_storage_keys }.to nap(10)
+    end
+
+    it "continues to ping_google once the rotations finish" do
+      expect { vm_test.wait_rotate_storage_keys }.to hop("ping_google")
     end
   end
 
@@ -161,7 +193,53 @@ RSpec.describe Prog::Test::Vm do
       expect(sshable).to receive(:_cmd).with("sudo chown ubi #{mount_path}")
       expect(sshable).to receive(:_cmd).with("dd if=/dev/urandom of=#{mount_path}/1.txt bs=512 count=10000")
       expect(sshable).to receive(:_cmd).with("sync #{mount_path}/1.txt")
-      expect { vm_test.verify_extra_disks }.to hop("verify_vm_stats")
+      expect { vm_test.verify_extra_disks }.to hop("verify_track_written")
+    end
+  end
+
+  describe "#verify_track_written" do
+    it "verifies track_written for each disk" do
+      vols = vm_test.vm.vm_storage_volumes
+      expect(vols[0].vm.vm_host.sshable).to receive(:_cmd)
+        .with("sudo host/bin/storage-dump-metadata #{vm.inhost_name} DEFAULT 0 v0.4.2", stdin: /.*/)
+        .and_return(<<~OUT,
+          data file: /var/storage/vmt05cpe/0/disk.raw (42949672960 bytes)
+          source: raw (path: /var/storage/images/ubuntu-noble-20250502.1.raw, size: 3758096384 bytes)
+          metadata version: 2.0
+          stripe size: 1048576 bytes
+          fetched stripes: 0, 5-12, 111, 285, 303, 305
+          written stripes: 0, 5, 6, 12, 111, 285, 303
+          has-source stripes: 0-3583
+        OUT
+                   )
+
+      expect(vols[1].vm.vm_host.sshable).to receive(:_cmd)
+        .with("sudo host/bin/storage-dump-metadata #{vm.inhost_name} DEFAULT 1 v0.4.2", stdin: /.*/)
+        .and_return(<<~OUT,
+          data file: /var/storage/vmt05cpe/1/disk.raw (42949672960 bytes)
+          source: None
+          metadata version: 2.0
+          stripe size: 1048576 bytes
+          fetched stripes:
+          written stripes: 0-4, 36, 128
+          has-source stripes:
+        OUT
+                   )
+
+      expect { vm_test.verify_track_written }.to hop("verify_vm_stats")
+    end
+
+    it "fails if no written stripes reported for a disk" do
+      expect(vm_test.vm.vm_storage_volumes[0].vm.vm_host.sshable).to receive(:_cmd)
+        .with("sudo host/bin/storage-dump-metadata #{vm.inhost_name} DEFAULT 0 v0.4.2", stdin: /.*/)
+        .and_return(<<~OUT,
+          stripe size: 1048576 bytes
+          fetched stripes: 0, 5-12, 111, 285, 303, 305
+          written stripes:
+          has-source stripes: 0-3583
+        OUT
+                   )
+      expect { vm_test.verify_track_written }.to hop("failed")
     end
   end
 
@@ -190,14 +268,14 @@ RSpec.describe Prog::Test::Vm do
       }
     }
 
-    it "verifies vm stats and hops to stop_semaphore" do
+    it "verifies vm stats and hops to verify_storage_rpc" do
       vm_stats_output = {
         "disk_0" => valid_disk_stats_output,
         "disk_1" => valid_disk_stats_output,
         "vm" => valid_vm_stats_output,
       }
       expect(vm_test.vm.vm_host.sshable).to receive(:_cmd).with("sudo host/bin/vm-stats #{vm_test.vm.inhost_name}").and_return(vm_stats_output.to_json)
-      expect { vm_test.verify_vm_stats }.to hop("stop_semaphore")
+      expect { vm_test.verify_vm_stats }.to hop("verify_storage_rpc")
     end
 
     it "fails if top level key vm is missing in vm-stats output" do
@@ -215,6 +293,27 @@ RSpec.describe Prog::Test::Vm do
       expect(vm_test.vm.vm_host.sshable).to receive(:_cmd).with("sudo host/bin/vm-stats #{vm_test.vm.inhost_name}").and_return(vm_stats_output.to_json)
       expect { vm_test.verify_vm_stats }.to hop("failed")
       expect(strand.reload.exitval).to eq({"msg" => "missing expected key 'disk_1' in vm-stats output"})
+    end
+
+    it "ignores extra keys in vm-stats output" do
+      vm_stats_output = {
+        "disk_0" => valid_disk_stats_output.merge("ubiblk_stats" => {"bytes_read" => 1, "write_ops" => 2}),
+        "disk_1" => valid_disk_stats_output,
+        "vm" => valid_vm_stats_output.merge("unexpected_key" => "value"),
+      }
+      expect(vm_test.vm.vm_host.sshable).to receive(:_cmd).with("sudo host/bin/vm-stats #{vm_test.vm.inhost_name}").and_return(vm_stats_output.to_json)
+      expect { vm_test.verify_vm_stats }.to hop("verify_storage_rpc")
+    end
+
+    it "fails if the ubiblk stats RPC reported an error" do
+      vm_stats_output = {
+        "disk_0" => valid_disk_stats_output.merge("ubiblk_stats_error" => "Errno::ENOENT: no such file"),
+        "disk_1" => valid_disk_stats_output,
+        "vm" => valid_vm_stats_output,
+      }
+      expect(vm_test.vm.vm_host.sshable).to receive(:_cmd).with("sudo host/bin/vm-stats #{vm_test.vm.inhost_name}").and_return(vm_stats_output.to_json)
+      expect { vm_test.verify_vm_stats }.to hop("failed")
+      expect(strand.reload.exitval).to eq({"msg" => "ubiblk stats error in disk_0 stats: Errno::ENOENT: no such file"})
     end
 
     it "fails if expected keys are missing in vm stats" do
@@ -243,10 +342,33 @@ RSpec.describe Prog::Test::Vm do
     end
   end
 
+  describe "#verify_storage_rpc" do
+    it "hops to stop_semaphore when version matches" do
+      expected_version = Config.vhost_block_backend_version.delete_prefix("v")
+      request = {"command" => "version"}.to_json
+      expect(vm_test.vm.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm_test.vm.inhost_name}/0/rpc.sock -q 2 -w 2 | head -n 1", stdin: request).and_return({"version" => expected_version}.to_json)
+      expect { vm_test.verify_storage_rpc }.to hop("stop_semaphore")
+    end
+
+    it "fails if unable to get vhost-block-backend version using RPC" do
+      request = {"command" => "version"}.to_json
+      expect(vm_test.vm.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm_test.vm.inhost_name}/0/rpc.sock -q 2 -w 2 | head -n 1", stdin: request).and_return({"error" => "some error"}.to_json)
+      expect { vm_test.verify_storage_rpc }.to hop("failed")
+      expect(strand.reload.exitval).to eq({"msg" => "Failed to get vhost-block-backend version for VM #{vm_test.vm.ubid} using RPC"})
+    end
+  end
+
   describe "#ping_google" do
-    it "pings google and hops to next step" do
+    it "pings google and hops to verify_io_rates on the post-reboot pass" do
+      refresh_frame(vm_test, new_values: {"first_boot" => false})
       expect(sshable).to receive(:_cmd).with("ping -c 2 google.com")
       expect { vm_test.ping_google }.to hop("verify_io_rates")
+    end
+
+    it "skips fio and hops to ping_vms_in_subnet on the pre-reboot pass" do
+      refresh_frame(vm_test, new_values: {"first_boot" => true})
+      expect(sshable).to receive(:_cmd).with("ping -c 2 google.com")
+      expect { vm_test.ping_google }.to hop("ping_vms_in_subnet")
     end
   end
 
@@ -314,7 +436,7 @@ RSpec.describe Prog::Test::Vm do
         ephemeral_net6: "2001:db8:85a2::/64", nic_name: "nic-2",
         private_ipv4: "192.168.0.2/32", private_ipv6: "fd01:db8:85a2::/64",
         mac: "00:00:00:00:00:02", ipv4: "1.1.1.2")
-      nic = other_vm.nics.first
+      nic = other_vm.user_nic
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{other_vm.ip4}")
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{nic.private_ipv4.network}")
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{other_vm.ip6}")
@@ -335,7 +457,7 @@ RSpec.describe Prog::Test::Vm do
     }
 
     it "fails to ping private interfaces of vms not in the same subnet and hops to next step" do
-      nic = other_vm.nics.first
+      nic = other_vm.user_nic
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{other_vm.ip4}")
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{nic.private_ipv4.network}").and_raise Sshable::SshError.new("ping failed", "", "", nil, nil)
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{other_vm.ip6}")
@@ -344,7 +466,7 @@ RSpec.describe Prog::Test::Vm do
     end
 
     it "raises error if pinging private ipv4 of vms in other subnets succeed" do
-      nic = other_vm.nics.first
+      nic = other_vm.user_nic
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{other_vm.ip4}")
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{nic.private_ipv4.network}")
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{other_vm.ip6}")
@@ -353,7 +475,7 @@ RSpec.describe Prog::Test::Vm do
     end
 
     it "raises error if pinging private ipv6 of vms in other subnets succeed" do
-      nic = other_vm.nics.first
+      nic = other_vm.user_nic
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{other_vm.ip4}")
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{other_vm.ip6}")
       expect(sshable).to receive(:_cmd).with("ping -c 2 #{nic.private_ipv6.nth(2)}")

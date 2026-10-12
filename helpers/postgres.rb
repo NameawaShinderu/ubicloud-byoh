@@ -34,7 +34,7 @@ class Clover
     requested_postgres_vcpu_count = (requested_standby_count + 1) * parsed_size.vcpu_count
     Validation.validate_vcpu_quota(@project, "PostgresVCpu", requested_postgres_vcpu_count)
 
-    validate_postgres_config(version, user_config, pgbouncer_user_config)
+    validate_postgres_config(version, user_config, pgbouncer_user_config, memory_gib: parsed_size.memory_gib)
 
     pg = nil
     DB.transaction do
@@ -56,7 +56,6 @@ class Clover
       ).subject
       audit_log(pg, "create")
     end
-    send_notification_mail_to_partners(pg, current_account.email)
 
     if api?
       Serializers::Postgres.serialize(pg, {detailed: true})
@@ -66,8 +65,23 @@ class Clover
     end
   end
 
+  POSTGRES_ACTION_LOG_MESSAGES = {
+    postgres_scale: "Postgres database scale requested",
+    postgres_ha_change: "Postgres database high availability change requested",
+    postgres_upgrade: "Postgres database upgrade requested",
+  }.freeze
+
+  def postgres_action_log(pg, event, **details)
+    Clog.emit(POSTGRES_ACTION_LOG_MESSAGES.fetch(event), {event => {
+      resource_ubid: pg.ubid,
+      project_ubid: @project.ubid,
+      account_ubid: current_account.ubid,
+      location: @location.display_name,
+    }.merge(details)})
+  end
+
   def postgres_list(tags_param: nil)
-    dataset = dataset_authorize(@project.postgres_resources_dataset.eager(:timeline, representative_server: [:strand, vm: :vm_storage_volumes]), "Postgres:view").eager(:semaphores, :location, strand: :children)
+    dataset = dataset_authorize(@project.postgres_resources_dataset.eager(:project, :timeline, representative_server: [:semaphores, :strand, vm: :vm_storage_volumes]), "Postgres:view").eager(:semaphores, :location, strand: :children)
 
     if tags_param
       tags_param = tags_param.split(",")
@@ -85,27 +99,34 @@ class Clover
       dataset = dataset.where(location_id: @location.id) if @location
       paginated_result(dataset, Serializers::Postgres)
     else
-      @postgres_databases = dataset.all
+      @postgres_databases = dataset.order(:name).all
         .group_by { |r| r.read_replica? ? r[:parent_id] : r[:id] }
         .flat_map { |group_id, rs| rs.sort_by { |r| r[:created_at] } }
       view "postgres/index"
     end
   end
 
-  def send_notification_mail_to_partners(resource, user_email)
-    if resource.requires_partner_notification_email? && (email = Config.send(:"postgres_#{resource.flavor}_notification_email"))
-      flavor_name = resource.flavor.capitalize
-      Util.send_email(email, "New #{flavor_name} Postgres database has been created.",
-        greeting: "Hello #{flavor_name} team,",
-        body: ["New #{flavor_name} Postgres database has been created.",
-          "ID: #{resource.ubid}",
-          "Location: #{resource.location.display_name}",
-          "Name: #{resource.name}",
-          "E-mail: #{user_email}",
-          "Instance VM Size: #{resource.target_vm_size}",
-          "Instance Storage Size: #{resource.target_storage_size_gib}",
-          "HA: #{resource.ha_type}"])
+  # Middle step of the resize and upgrade timelines. It names the maintenance
+  # window if there is one, and offers to set one if there is not. subject is
+  # what waits for the window, such as "Failover" or "The upgrade".
+  def maintenance_window_step(pg, subject)
+    if (window = pg.maintenance_window_label)
+      ["hero-cog-8-tooth", "Wait for the maintenance window", h(window)]
+    else
+      link = "<a href=\"#{path(pg)}/settings\" class=\"font-medium text-orange-600 hover:text-orange-700\">Set a maintenance window</a>"
+      ["hero-cog-8-tooth", "No maintenance window", "#{subject} starts right away. #{link}."]
     end
+  end
+
+  def postgres_option_metadata(option_tree)
+    valid = OptionTreeGenerator.collect_valid_values(option_tree)
+    {
+      flavor: Option::POSTGRES_FLAVOR_OPTIONS.slice(*valid["flavor"]).transform_values { |v| {display_name: v.title} },
+      location: (valid["location"] || []).to_h { |l| [l.name, {display_name: l.display_name, ui_name: l.ui_name, provider: l.provider}] },
+      family: Option::POSTGRES_FAMILY_OPTIONS.slice(*valid["family"]).transform_values { |v| {display_name: v.description, category: v.category} },
+      size: Option::POSTGRES_SIZE_OPTIONS.slice(*valid["size"]).transform_values { |v| {vcpu: v.vcpu_count, memory_gib: v.memory_gib} },
+      ha_type: Option::POSTGRES_HA_OPTIONS.slice(*valid["ha_type"]).transform_values { |v| {display_name: v.description, standby_count: v.standby_count} },
+    }
   end
 
   def postgres_require_customer_firewall!
@@ -116,12 +137,19 @@ class Clover
     fw
   end
 
-  def validate_postgres_config(version, user_config, pgbouncer_user_config)
+  def validate_postgres_config(version, user_config, pgbouncer_user_config, memory_gib:)
     pg_validator = Validation::PostgresConfigValidator.new(version)
     pg_errors = pg_validator.validation_errors(user_config)
 
     pgbouncer_validator = Validation::PostgresConfigValidator.new("pgbouncer")
     pgbouncer_errors = pgbouncer_validator.validation_errors(pgbouncer_user_config)
+
+    # Ceiling depends on how much memory the server has.
+    shmem_percent_key = "ubicloud.shared_memory_percent"
+    if (requested = user_config[shmem_percent_key]) && !pg_errors.key?(shmem_percent_key)
+      max = Validation.postgres_max_shared_memory_percent(memory_gib)
+      pg_errors[shmem_percent_key] = "must be at most #{max} on a server with #{memory_gib} GiB of memory" if Integer(requested, 10) > max
+    end
 
     if pg_errors.any? || pgbouncer_errors.any?
       pg_errors = pg_errors.transform_keys { |key| "pg_config.#{key}" }

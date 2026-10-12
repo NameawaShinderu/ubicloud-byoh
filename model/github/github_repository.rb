@@ -20,7 +20,9 @@ class GithubRepository < Sequel::Model
     10_737_418_240 # 10GB
   end
 
-  alias_method :bucket_name, :ubid
+  def bucket_name
+    Config.is_e2e ? "e2e-#{ubid}" : ubid
+  end
 
   def repository_name
     name.split("/", 2).last
@@ -57,10 +59,11 @@ class GithubRepository < Sequel::Model
 
     begin
       CloudflareClient.new(Config.github_cache_blob_storage_api_key).delete_token(access_key)
-      this.update(access_key: nil, secret_key: nil)
     rescue Excon::Error::HTTPStatus
       Clog.emit("Repository credentials failed to delete Cloudflare token", {failed_cloudflare_token_delete: {bucket_name:}})
     end
+
+    this.update(access_key: nil, secret_key: nil)
   end
 
   def setup_blob_storage
@@ -98,6 +101,16 @@ class GithubRepository < Sequel::Model
       region: Config.github_cache_blob_storage_region,
       request_checksum_calculation: "when_required",
       response_checksum_validation: "when_required",
+      # We only issue small control-plane calls through this client (multipart
+      # create/complete/abort, delete); blob data moves over presigned URLs
+      # directly from the runner. Without explicit timeouts the AWS SDK defaults
+      # (15s open / 60s read, 3 retries) let a hung R2 call exceed the 30s web
+      # request timeout. Bound them so a slow R2 fails fast instead: the
+      # network-hang worst case is (1 + retry_limit) * http_read_timeout = ~24s,
+      # which stays under the 30s web request timeout.
+      http_open_timeout: 5,
+      http_read_timeout: 8,
+      retry_limit: 2,
     )
   end
 end

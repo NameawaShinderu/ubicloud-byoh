@@ -11,6 +11,15 @@ RSpec.describe VmHost do
   let(:session) { {ssh_session: Net::SSH::Connection::Session.allocate} }
   let(:ssh_session) { session[:ssh_session] }
 
+  let(:provider_api) {
+    HostProvider.create do
+      it.id = vm_host.id
+      it.server_identifier = "123"
+      it.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+    end
+    vm_host.provider.api
+  }
+
   describe "#ip6_random_vm_network" do
     it "can generate random ipv6 subnets" do
       expect(vm_host.ip6_random_vm_network.contains(vm_host.ip6)).to be false
@@ -70,7 +79,7 @@ RSpec.describe VmHost do
     it "has a shortcut to install Rhizome" do
       st = vm_host.install_rhizome
       expect(st.prog).to eq("InstallRhizome")
-      expect(st.stack).to eq(["subject_id" => vm_host.id, "target_folder" => "host", "install_specs" => false])
+      expect(st.stack).to eq(["subject_id" => vm_host.id, "target_folder" => "host"])
     end
   end
 
@@ -91,7 +100,7 @@ RSpec.describe VmHost do
       expect(vm_host.reload.location_id).to eq target_location.id
       download_strands = Strand.where(prog: "DownloadBootImage").all
       downloaded_names = download_strands.map { it.stack.first["image_name"] }.sort
-      expect(downloaded_names).to eq %w[almalinux-9 debian-12 github-ubuntu-2204 github-ubuntu-2404 postgres-ubuntu-2204 ubuntu-jammy ubuntu-noble]
+      expect(downloaded_names).to eq %w[almalinux-9 debian-12 github-ubuntu-2204 github-ubuntu-2404 postgres-ubuntu-2204 postgres-ubuntu-2604 ubuntu-jammy ubuntu-noble].freeze
     end
 
     it "downloads github images when moving to github-runners location" do
@@ -102,7 +111,7 @@ RSpec.describe VmHost do
       expect(vm_host.reload.location_id).to eq target_location.id
       download_strands = Strand.where(prog: "DownloadBootImage").all
       downloaded_names = download_strands.map { it.stack.first["image_name"] }.sort
-      expect(downloaded_names).to eq %w[github-ubuntu-2204 github-ubuntu-2404]
+      expect(downloaded_names).to eq %w[github-ubuntu-2204 github-ubuntu-2404].freeze
     end
 
     it "logs and returns early if already in the target location" do
@@ -168,7 +177,7 @@ RSpec.describe VmHost do
     end
 
     it "returns an unused ip address if there is one" do
-      address_id = Address.create(vm_host:, cidr: "128.0.0.0/30").id
+      address_id = Address.create(vm_host:, cidr: "128.0.0.0/30").tap(&:populate_ipv4_addresses).id
       ips = %w[128.0.0.0 128.0.0.1 128.0.0.2 128.0.0.3]
 
       4.times do
@@ -205,32 +214,97 @@ RSpec.describe VmHost do
 
     it "reimages the server in development" do
       expect(Config).to receive(:development?).and_return(true)
-      expect(Hosting::Apis).to receive(:reimage_server).with(vm_host)
+      expect(provider_api).to receive(:reimage).with(no_args)
       vm_host.reimage
     end
   end
 
   describe "#hardware_reset" do
     it "hardware resets the server" do
-      expect(Hosting::Apis).to receive(:hardware_reset_server).with(vm_host)
+      expect(provider_api).to receive(:hardware_reset).with(no_args)
       vm_host.hardware_reset
+    end
+  end
+
+  describe "#leaseweb?" do
+    def make_provider(name)
+      HostProvider.create do
+        it.id = vm_host.id
+        it.server_identifier = "123"
+        it.provider_name = name
+      end
+    end
+
+    it "is false without a provider" do
+      expect(vm_host.leaseweb?).to be false
+    end
+
+    it "is false for hetzner" do
+      make_provider(HostProvider::HETZNER_PROVIDER_NAME)
+      expect(vm_host.leaseweb?).to be false
+    end
+
+    it "is true for the base org" do
+      make_provider(HostProvider::LEASEWEB_PROVIDER_NAME)
+      expect(vm_host.leaseweb?).to be true
+    end
+
+    it "is true for the eu org" do
+      make_provider(HostProvider::LEASEWEB_EU_PROVIDER_NAME)
+      expect(vm_host.leaseweb?).to be true
+    end
+  end
+
+  describe "#power_on" do
+    it "powers on the server" do
+      expect(provider_api).to receive(:power_on).with(no_args)
+      vm_host.power_on
+    end
+  end
+
+  describe "#power_status" do
+    it "returns the power status of the server" do
+      expect(provider_api).to receive(:power_status).with(no_args).and_return("running")
+      expect(vm_host.power_status).to eq "running"
     end
   end
 
   describe "#create_addresses" do
     let(:hetzner_ips) {
       [
-        ["1.1.1.0/30", "1.1.1.1", true],
-        ["1.1.1.12/32", "1.1.0.0", true],
-        ["1.1.1.13/32", "1.1.1.1", false],
-        ["2a01:4f8:10a:128b::/64", "1.1.1.1", true],
+        ["1.1.1.0/30", "1.1.1.1"],
+        ["1.1.1.12/32", "1.1.0.0"],
+        ["1.1.1.13/32", "1.1.1.1"],
+        ["2a01:4f8:10a:128b::/64", "1.1.1.1"],
       ].map {
-        Hosting::HetznerApis::IpInfo.new(ip_address: _1, source_host_ip: _2, is_failover: _3)
+        Hosting::HetznerApis::IpInfo.new(ip_address: _1, source_host_ip: _2)
       }
     }
 
-    it "fails if a failover ip of non existent server is being added" do
-      expect(Hosting::Apis).to receive(:pull_ips).and_return(hetzner_ips)
+    # Server 91478's real /ips rows, with server 12493302's routed /26 bolted on
+    # so one host exercises both of Leaseweb's shapes.
+    def leaseweb_91478_ip_rows
+      row = ->(ip, prefix_length, type: "NORMAL_IP", main_ip: false, gateway: "") {
+        {"ip" => ip, "prefixLength" => prefix_length, "type" => type, "networkType" => "PUBLIC",
+         "mainIp" => main_ip, "gateway" => gateway}
+      }
+      [
+        row.call("23.105.171.112/26", 26, main_ip: true, gateway: "23.105.171.126"),
+        row.call("23.105.176.0/29", 29, type: "NETWORK", gateway: "23.105.176.6"),
+        row.call("23.105.176.1/29", 29, gateway: "23.105.176.6"),
+        row.call("23.105.176.2/29", 29, gateway: "23.105.176.6"),
+        row.call("23.105.176.3/29", 29, gateway: "23.105.176.6"),
+        row.call("23.105.176.4/29", 29, type: "ROUTER1", gateway: "23.105.176.6"),
+        row.call("23.105.176.5/29", 29, type: "ROUTER2", gateway: "23.105.176.6"),
+        row.call("23.105.176.6/29", 29, type: "GATEWAY", gateway: "23.105.176.6"),
+        row.call("23.105.176.7/29", 29, type: "BROADCAST", gateway: "23.105.176.6"),
+        row.call("2607:f5b7:1:30:9::_112/64", 64, gateway: "2607:f5b7:1:30::1"),
+        *(64..127).map { row.call("216.22.15.#{it}/26", 26) },
+      ]
+    end
+
+    it "fails if the source host isn't in the database" do
+      expect(provider_api).to receive(:pull_ips).with(no_args).and_return(hetzner_ips)
       expect { vm_host.create_addresses }.to raise_error(RuntimeError, "BUG: source host 1.1.1.1 isn't added to the database")
     end
 
@@ -242,7 +316,7 @@ RSpec.describe VmHost do
     end
 
     it "creates addresses" do
-      expect(Hosting::Apis).to receive(:pull_ips).and_return(hetzner_ips)
+      expect(provider_api).to receive(:pull_ips).with(no_args).and_return(hetzner_ips)
       vm_host.sshable.update(host: "1.1.0.0")
       Sshable.create(host: "1.1.1.1")
       expect { vm_host.create_addresses }
@@ -251,7 +325,7 @@ RSpec.describe VmHost do
     end
 
     it "does not setup nftables while preparing the vm host" do
-      expect(Hosting::Apis).to receive(:pull_ips).and_return(hetzner_ips)
+      expect(provider_api).to receive(:pull_ips).with(no_args).and_return(hetzner_ips)
       vm_host.sshable.update(host: "1.1.0.0")
       Sshable.create(host: "1.1.1.1")
       vm_host.update(allocation_state: "unprepared")
@@ -261,49 +335,83 @@ RSpec.describe VmHost do
     end
 
     it "returns immediately if there are no addresses to create" do
-      expect(Hosting::Apis).to receive(:pull_ips).and_return(nil)
+      expect(provider_api).to receive(:pull_ips).with(no_args).and_return(nil)
       vm_host.create_addresses
       expect(vm_host.assigned_subnets_dataset.count).to eq(0)
     end
 
     it "skips already assigned subnets" do
-      expect(Hosting::Apis).to receive(:pull_ips).and_return(hetzner_ips)
+      expect(provider_api).to receive(:pull_ips).with(no_args).and_return(hetzner_ips)
       vm_host.sshable.update(host: "1.1.0.0")
       Sshable.create(host: "1.1.1.1")
       Address.create(cidr: NetAddr::IPv4Net.parse("1.1.1.0/30"), routed_to_host_id: vm_host.id)
       expect { vm_host.create_addresses }.to change { vm_host.assigned_subnets_dataset.count }.by(3)
     end
 
-    it "updates the routed_to_host_id if the address is reassigned to another host and there is no vm using the ip range" do
-      expect(Hosting::Apis).to receive(:pull_ips).and_return([
-        Hosting::HetznerApis::IpInfo.new(ip_address: "1.1.1.0/30", source_host_ip: "1.1.1.1", is_failover: true),
-      ])
+    it "fails loudly when the provider hands an address another host still holds" do
       vm_host.sshable.update(host: "1.1.0.0")
-      adr = Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vm_host.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vm_host.id)
 
       vm_host2 = create_vm_host
       vm_host2.sshable.update(host: "1.1.1.1")
+      ip_records = [Hosting::HetznerApis::IpInfo.new(ip_address: "1.1.1.0/30", source_host_ip: "1.1.1.1")]
 
-      expect { vm_host2.create_addresses }.to change { adr.reload.routed_to_host_id }.from(vm_host.id).to(vm_host2.id)
+      # Addresses never move between hosts, so a cidr collision is a bug to
+      # surface, not a failover to re-point.
+      expect { vm_host2.create_addresses(ip_records:) }.to raise_error Sequel::ValidationFailed, "cidr is already taken"
     end
 
-    it "fails if the ip range is already assigned to a vm" do
-      expect(Hosting::Apis).to receive(:pull_ips).and_return([
-        Hosting::HetznerApis::IpInfo.new(ip_address: "1.1.1.0/30", source_host_ip: "1.1.1.1", is_failover: true),
-      ])
+    # The switched /29 members carry the segment's gateway. Its router ARPs for
+    # them and the host answers by proxy, so VMs draw from them as from the
+    # routed block Leaseweb sends to the main IP.
+    it "opens the leaseweb switched segment to the vm pool alongside the routed block" do
+      allow(Config).to receive_messages(
+        leaseweb_connection_string: "https://api.leaseweb.com",
+        leaseweb_api_key: "key123",
+      )
+      HostProvider.create do
+        it.id = vm_host.id
+        it.server_identifier = "91478"
+        it.provider_name = HostProvider::LEASEWEB_PROVIDER_NAME
+      end
+      vm_host.sshable.update(host: "23.105.171.112")
+      rows = leaseweb_91478_ip_rows
+      stub_request(:get, "https://api.leaseweb.com/bareMetals/v2/servers/91478/ips").with(query: {limit: 50, offset: 0})
+        .to_return(status: 200, body: JSON.generate(ips: rows.take(50), _metadata: {totalCount: rows.length}))
+      stub_request(:get, "https://api.leaseweb.com/bareMetals/v2/servers/91478/ips").with(query: {limit: 50, offset: 50})
+        .to_return(status: 200, body: JSON.generate(ips: rows.drop(50), _metadata: {totalCount: rows.length}))
 
-      vm_host.sshable.update(host: "1.1.0.0")
-      adr = Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vm_host.id)
+      ip_records = vm_host.provider.api.pull_ips
+      vm_host.create_addresses(ip_records:)
+      netplan = Hosting::LeasewebNetplan.new(public_mac: "8c:84:74:54:ea:d0", internal_mac: nil, internal_ip: nil, ip_infos: ip_records,
+        nameservers: ["23.19.53.53", "23.19.52.52"], search_domains: ["dedi.leaseweb.net"])
 
-      vm_host2 = create_vm_host
-      vm_host2.sshable.update(host: "1.1.1.1")
+      expect(netplan.addresses_by_mac).to eq(
+        "8c:84:74:54:ea:d0" => [
+          "23.105.171.112/32",
+          "216.22.15.64/26",
+          "2607:f5b7:1:30:9::2/112",
+        ],
+      )
+      # The gatewayed /112 never enters the registry: hosts and VMs strictly
+      # never share a prefix, and nothing may present it as allocatable.
+      expect(vm_host.assigned_subnets_dataset.select_order_map(:cidr).map(&:to_s)).to eq [
+        "23.105.171.112/32",
+        "23.105.176.1/32",
+        "23.105.176.2/32",
+        "23.105.176.3/32",
+        "216.22.15.64/26",
+      ]
+      # The claim set is exactly the main IP; the segment members, the routed
+      # block, and the delegated prefix belong to VMs, not the host.
+      expect(vm_host.assigned_host_addresses_dataset.select_order_map(:ip).map(&:to_s)).to eq ["23.105.171.112/32"]
+      # The VM pool and the nftables set SetupNftables drops traffic to until a
+      # VM claims an address both take the segment members and the routed block.
+      expect(DB[:ipv4_address].select_order_map(:ip).map(&:to_s)).to eq(["23.105.176.1", "23.105.176.2", "23.105.176.3"] + (65..126).map { "216.22.15.#{it}" })
 
-      vm = create_vm
-      AssignedVmAddress.create(address_id: adr.id, dst_vm_id: vm.id, ip: "1.1.1.1/32")
-
-      expect {
-        vm_host2.create_addresses
-      }.to raise_error RuntimeError, "BUG: failover ip 1.1.1.0/30 is already assigned to a vm"
+      sn = Prog::SetupNftables.new(Strand.new(stack: [{"subject_id" => vm_host.id}], prog: "SetupNftables"))
+      expect(sn.sshable).to receive(:_cmd).with("sudo host/bin/setup-nftables.rb \\[\\\"23.105.176.1/32\\\",\\\"23.105.176.2/32\\\",\\\"23.105.176.3/32\\\",\\\"216.22.15.64/26\\\"\\]")
+      expect { sn.start }.to exit({"msg" => "nftables was setup"})
     end
   end
 
@@ -337,18 +445,6 @@ RSpec.describe VmHost do
       StorageDevice.create(vm_host_id: vm_host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100, unix_device_list: ["wwn-random-id1", "wwn-random-id2"])
       expect(vm_host.disk_device_ids).to eq(["wwn-random-id1", "wwn-random-id2"])
     end
-
-    it "converts disk devices when StorageDevice has unix_device_list with the old formatting for SSD disks" do
-      StorageDevice.create(vm_host_id: vm_host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100, unix_device_list: ["sda"])
-      expect(vm_host.sshable).to receive(:_cmd).with("ls -l /dev/disk/by-id/ | grep sda\\$ | grep 'wwn-' | sed -E 's/.*(wwn[^ ]*).*/\\1/'").and_return("wwn-random-id1")
-      expect(vm_host.disk_device_ids).to eq(["wwn-random-id1"])
-    end
-
-    it "converts disk devices when StorageDevice has unix_device_list with the old formatting for NVMe disks" do
-      StorageDevice.create(vm_host_id: vm_host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100, unix_device_list: ["nvme0n1"])
-      expect(vm_host.sshable).to receive(:_cmd).with("ls -l /dev/disk/by-id/ | grep nvme0n1\\$ | grep 'nvme-eui' | sed -E 's/.*(nvme-eui[^ ]*).*/\\1/'").and_return("nvme-eui.random-id")
-      expect(vm_host.disk_device_ids).to eq(["nvme-eui.random-id"])
-    end
   end
 
   describe "#disk_device_names" do
@@ -370,9 +466,19 @@ RSpec.describe VmHost do
       }
     }
 
+    def dns_probe_cmd(nameserver)
+      "timeout 5 ruby -rresolv -e 'd = Resolv::DNS.new(nameserver: [ARGV[0]]); d.timeouts = 2; d.getresource(\".\", Resolv::DNS::Resource::IN::SOA)' -- #{nameserver}"
+    end
+
+    def stub_dns_probe(nameserver, exitstatus)
+      expect(ssh_session).to receive(:_exec!).with(dns_probe_cmd(nameserver)).and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", exitstatus))
+    end
+
     before do
       StorageDevice.create(vm_host_id: vm_host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100, unix_device_list: ["wwn-random-id1"])
       allow(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_return("sda")
+      allow(ssh_session).to receive(:_exec!).with(dns_probe_cmd("8.8.8.8")).and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
+      allow(ssh_session).to receive(:_exec!).with(dns_probe_cmd("2606:4700:4700::1111")).and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
     end
 
     it "checks pulse" do
@@ -387,20 +493,28 @@ RSpec.describe VmHost do
       expect(ssh_session).to receive(:_exec!).with("cat /sys/devices/system/clocksource/clocksource0/available_clocksource").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("tsc hpet acpi_pm \n", 0))
       expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("up")
 
-      expect(ssh_session).to receive(:_exec!).and_raise Sshable::SshError
+      expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_raise Sshable::SshError
       expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
       expect(Semaphore.where(strand_id: vm_host.id, name: "checkup").count).to eq(1)
     end
 
+    def stub_smartctl_sda_passes
+      expect(ssh_session).to receive(:_exec!).with("sudo smartctl -j -H /dev/sda -d scsi | jq .smart_status.passed").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("true\n", 0))
+    end
+
+    def stub_empty_lsblk
+      expect(ssh_session).to receive(:_exec!).with("lsblk --json").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new('{"blockdevices":[]}', 0))
+    end
+
     it "checks pulse on a non-default mountpoint with kernel errors" do
-      expect(vm_host).to receive(:check_storage_smartctl).and_return(true)
-      expect(vm_host).to receive(:check_storage_read_write).and_return(true)
+      stub_smartctl_sda_passes
+      stub_empty_lsblk
       expect(ssh_session).to receive(:_exec!).with("journalctl -kS -1min --no-pager").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("Nov 04 12:18:04 ubuntu kernel: Buffer I/O error on dev sda, logical block 1032, lost async page write", 0))
       expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
     end
 
     it "checks pulse on a with read/write errors" do
-      expect(vm_host).to receive(:check_storage_smartctl).and_return(true)
+      stub_smartctl_sda_passes
       expect(ssh_session).to receive(:_exec!).with("lsblk --json").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new('{"blockdevices": [{"name": "fd0","maj:min": "2:0","rm": true,"size": "4K","ro": false,"type": "disk","mountpoints": [null]},{"name": "sda","maj:min": "8:0","rm": false,"size": "2.2G","ro": false,"type": "disk","mountpoints": [null],"children": [{"name": "sda1","maj:min": "8:1","rm": false,"size": "2.1G","ro": false,"type": "part","mountpoints": ["/"]},{"name": "sda14","maj:min": "8:14","rm": false,"size": "4M","ro": false,"type": "part","mountpoints": [null]}]}]}', 0))
       file_path = "/test-file-monitor"
       expect(ssh_session).to receive(:_exec!).with("sudo bash -c head\\ -c\\ 1M\\ \\</dev/zero\\ \\>\\ #{file_path}").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("failed to write file", 1))
@@ -410,39 +524,89 @@ RSpec.describe VmHost do
     end
 
     it "checks pulse with kernel errors" do
-      expect(vm_host).to receive(:check_storage_smartctl).and_return(true)
-      expect(vm_host).to receive(:check_storage_nvme).and_return(true)
-      expect(vm_host).to receive(:check_storage_read_write).and_return(true)
+      stub_smartctl_sda_passes
+      stub_empty_lsblk
       expect(ssh_session).to receive(:_exec!).with("journalctl -kS -1min --no-pager").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("exit code 1", 1))
       expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
     end
 
     it "checks pulse with smartctl errors" do
-      expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_return("nvme0n1")
-      expect(ssh_session).to receive(:_exec!).with("sudo smartctl -j -H /dev/nvme0n1 | jq .smart_status.passed").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("false\n", 0))
+      expect(ssh_session).to receive(:_exec!).with("sudo smartctl -j -H /dev/sda -d scsi | jq .smart_status.passed").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("false\n", 0))
       expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
+    end
+
+    it "runs smartctl without -d scsi on non-sd, non-nvme devices" do
+      StorageDevice.create(vm_host_id: vm_host.id, name: "EXTRA", total_storage_gib: 100, available_storage_gib: 100, unix_device_list: ["wwn-random-id2"])
+      expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id2").and_return("vda")
+      expect(ssh_session).to receive(:_exec!).with("sudo smartctl -j -H /dev/sda -d scsi | jq .smart_status.passed").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("true\n", 0))
+      expect(ssh_session).to receive(:_exec!).with("sudo smartctl -j -H /dev/vda | jq .smart_status.passed").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("false\n", 0))
+      expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
+    end
+
+    def stub_nvme_smart_log(critical_warning:, avail_spare: 100, spare_thresh: 10)
+      payload = JSON.generate(
+        critical_warning:,
+        avail_spare:,
+        spare_thresh:,
+      )
+      expect(ssh_session).to receive(:_exec!).with("sudo nvme smart-log -o json /dev/nvme0n1").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new(payload, 0))
+    end
+
+    def stub_remaining_health_checks_pass
+      stub_empty_lsblk
+      expect(ssh_session).to receive(:_exec!).with("journalctl -kS -1min --no-pager").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
+      expect(ssh_session).to receive(:_exec!).with("cat /sys/devices/system/clocksource/clocksource0/available_clocksource").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("tsc\n", 0))
     end
 
     it "checks pulse with nvme errors" do
       expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_return("nvme0n1")
-      expect(vm_host).to receive(:check_storage_smartctl).and_return(true)
-      expect(ssh_session).to receive(:_exec!).with("sudo nvme smart-log /dev/nvme0n1 | grep \"critical_warning\" | awk '{print $3}'").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("1\n", 0))
+      stub_nvme_smart_log(critical_warning: 1)
       expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
     end
 
     it "checks pulse with no nvme errors" do
       expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_return("nvme0n1")
-      expect(vm_host).to receive(:check_storage_smartctl).and_return(true)
-      expect(ssh_session).to receive(:_exec!).with("sudo nvme smart-log /dev/nvme0n1 | grep \"critical_warning\" | awk '{print $3}'").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("0\n", 0))
-      expect(vm_host).to receive(:check_storage_read_write).and_return(true)
-      expect(vm_host).to receive(:check_storage_kernel_logs).and_return(true)
-      expect(vm_host).to receive(:check_clock_source).and_return(true)
+      stub_nvme_smart_log(critical_warning: 0)
+      stub_remaining_health_checks_pass
       expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("up")
     end
 
+    it "fails non-github-runner hosts on critical_warning 4" do
+      expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_return("nvme0n1")
+      stub_nvme_smart_log(critical_warning: 4)
+      expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
+    end
+
+    it "fails when avail_spare is at or below spare_thresh even without a critical warning" do
+      expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_return("nvme0n1")
+      stub_nvme_smart_log(critical_warning: 0, avail_spare: 10, spare_thresh: 10)
+      expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
+    end
+
+    it "passes github-runner hosts on critical_warning 4 when spare is above threshold" do
+      vm_host.update(location_id: Location::GITHUB_RUNNERS_ID)
+      expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_return("nvme0n1")
+      stub_nvme_smart_log(critical_warning: 4, avail_spare: 99, spare_thresh: 10)
+      stub_remaining_health_checks_pass
+      expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("up")
+    end
+
+    it "fails github-runner hosts on critical_warning 4 when spare is at or below threshold" do
+      vm_host.update(location_id: Location::GITHUB_RUNNERS_ID)
+      expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_return("nvme0n1")
+      stub_nvme_smart_log(critical_warning: 4, avail_spare: 10, spare_thresh: 10)
+      expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
+    end
+
+    it "fails github-runner hosts on critical_warning 1" do
+      vm_host.update(location_id: Location::GITHUB_RUNNERS_ID)
+      expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-random-id1").and_return("nvme0n1")
+      stub_nvme_smart_log(critical_warning: 1)
+      expect(vm_host.check_pulse(session:, previous_pulse: pulse)[:reading]).to eq("down")
+    end
+
     it "checks pulse on a non-default mountpoint with faulty read/write on disk" do
-      expect(vm_host).to receive(:check_storage_smartctl).and_return(true)
-      expect(vm_host).to receive(:check_storage_nvme).and_return(true)
+      stub_smartctl_sda_passes
       expect(ssh_session).to receive(:_exec!).with("lsblk --json").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new('{"blockdevices": [{"name": "fd0","maj:min": "2:0","rm": true,"size": "4K","ro": false,"type": "disk","mountpoints": [null]},{"name": "sda","maj:min": "8:0","rm": false,"size": "2.2G","ro": false,"type": "disk","mountpoints": [null],"children": [{"name": "sda1","maj:min": "8:1","rm": false,"size": "2.1G","ro": false,"type": "part","mountpoints": ["/random-mountpoint"]},{"name": "sda14","maj:min": "8:14","rm": false,"size": "4M","ro": false,"type": "part","mountpoints": [null]}]}]}', 0))
       file_path = "/random-mountpoint/test-file-monitor"
       expect(ssh_session).to receive(:_exec!).with("sudo bash -c head\\ -c\\ 1M\\ \\</dev/zero\\ \\>\\ #{file_path}").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
@@ -457,12 +621,83 @@ RSpec.describe VmHost do
         expect { vm_host.check_pulse(session:, previous_pulse: "notnil") }.to raise_error(ex)
       end
     end
-  end
 
-  describe "#render_arch" do
-    it "errors on an unexpected architecture" do
-      vm_host.arch = "nope"
-      expect { vm_host.render_arch(arm64: "a", x64: "x") }.to raise_error RuntimeError, "BUG: inexhaustive render code"
+    def stub_health_checks_pass
+      stub_smartctl_sda_passes
+      stub_remaining_health_checks_pass
+    end
+
+    it "reads dns egress up on both families and resolves an active page" do
+      Prog::PageNexus.assemble("#{vm_host.ubid} IPv6 DNS egress failing", ["VmHostDnsEgressIpv6", vm_host.id], vm_host.ubid, resource_id: vm_host.id, severity: "warning")
+      page = Page.from_tag_parts("VmHostDnsEgressIpv6", vm_host.id)
+      stub_health_checks_pass
+      pulse = vm_host.check_pulse(session:, previous_pulse: {})
+      expect(pulse[:dns_egress4]).to eq("up")
+      expect(pulse[:dns_egress4_rpt]).to eq(1)
+      expect(pulse[:dns_egress6]).to eq("up")
+      expect(pulse[:dns_egress6_rpt]).to eq(1)
+      expect(Semaphore.where(strand_id: page.id, name: "resolve").count).to eq(1)
+    end
+
+    it "does not page when dns egress is down for less than five probes" do
+      stub_health_checks_pass
+      stub_dns_probe("8.8.8.8", 1)
+      previous = {dns_egress4: "down", dns_egress4_rpt: 3, dns_egress4_chg: Time.now - 600}
+      pulse = vm_host.check_pulse(session:, previous_pulse: previous)
+      expect(pulse[:dns_egress4]).to eq("down")
+      expect(pulse[:dns_egress4_rpt]).to eq(4)
+      expect(pulse[:dns_egress4_chg]).to eq(previous[:dns_egress4_chg])
+      expect(Page.from_tag_parts("VmHostDnsEgressIpv4", vm_host.id)).to be_nil
+    end
+
+    it "does not page when dns egress is down for less than 300 seconds" do
+      stub_health_checks_pass
+      stub_dns_probe("8.8.8.8", 1)
+      previous = {dns_egress4: "down", dns_egress4_rpt: 4, dns_egress4_chg: Time.now - 30}
+      pulse = vm_host.check_pulse(session:, previous_pulse: previous)
+      expect(pulse[:dns_egress4_rpt]).to eq(5)
+      expect(Page.from_tag_parts("VmHostDnsEgressIpv4", vm_host.id)).to be_nil
+    end
+
+    it "pages once when dns egress stays down past both thresholds" do
+      # The host reading is not under test: fail the health checks at
+      # their first, cheapest command so both check_pulse calls need only
+      # one stub, and drive the dns state through previous_pulse.
+      expect(ssh_session).to receive(:_exec!).with("sudo smartctl -j -H /dev/sda -d scsi | jq .smart_status.passed").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("false\n", 0)).twice
+      expect(ssh_session).to receive(:_exec!).with(dns_probe_cmd("8.8.8.8")).and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0)).twice
+      expect(ssh_session).to receive(:_exec!).with(dns_probe_cmd("2606:4700:4700::1111")).and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 1)).twice
+      previous = {dns_egress6: "down", dns_egress6_rpt: 4, dns_egress6_chg: Time.now - 300}
+      pulse = vm_host.check_pulse(session:, previous_pulse: previous)
+      expect(pulse[:dns_egress6_rpt]).to eq(5)
+      page = Page.from_tag_parts("VmHostDnsEgressIpv6", vm_host.id)
+      expect(page.severity).to eq("warning")
+      expect(page.summary).to eq("#{vm_host.ubid} IPv6 DNS egress failing")
+      expect(page.resource_id).to eq(vm_host.id)
+      vm_host.check_pulse(session:, previous_pulse: pulse)
+      expect(Page.count).to eq(1)
+    end
+
+    it "skips the IPv6 probe when the host has no IPv6" do
+      vm_host.update(net6: nil)
+      stub_health_checks_pass
+      pulse = vm_host.check_pulse(session:, previous_pulse: {})
+      expect(pulse[:dns_egress4]).to eq("up")
+      expect(pulse).not_to have_key(:dns_egress6)
+    end
+
+    it "treats a dns probe exception as down" do
+      stub_health_checks_pass
+      expect(ssh_session).to receive(:_exec!).with(dns_probe_cmd("8.8.8.8")).and_raise(Sshable::SshError.new("cmd", "", "", nil, nil))
+      expect(Clog).to receive(:emit).with("DNS egress probe exception on VmHost #{vm_host.ubid}", instance_of(Hash)).and_call_original
+      pulse = vm_host.check_pulse(session:, previous_pulse: {})
+      expect(pulse[:dns_egress4]).to eq("down")
+      expect(pulse[:dns_egress6]).to eq("up")
+    end
+
+    it "reraises connection errors from the dns probe" do
+      stub_health_checks_pass
+      expect(ssh_session).to receive(:_exec!).with(dns_probe_cmd("8.8.8.8")).and_raise(IOError.new("closed stream"))
+      expect { vm_host.check_pulse(session:, previous_pulse: {}) }.to raise_error(IOError)
     end
   end
 
@@ -485,40 +720,20 @@ RSpec.describe VmHost do
     end
   end
 
-  describe "#check_last_boot_id" do
-    it "raises if command execution exits with non-zero status code" do
-      expect(ssh_session).to receive(:_exec!).with("cat /proc/sys/kernel/random/boot_id").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("it didn't work", 1))
-      expect { vm_host.check_last_boot_id(ssh_session) }.to raise_error(RuntimeError, "Failed to exec on session: it didn't work")
-    end
-
-    it "does nothing if boot_id matches" do
-      vm_host.last_boot_id = "boot-id"
-      expect(ssh_session).to receive(:_exec!).with("cat /proc/sys/kernel/random/boot_id").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("boot-id", 0))
-      expect { vm_host.check_last_boot_id(ssh_session) }.not_to raise_error
-    end
-
-    it "assembles a page for it" do
-      vm_host.last_boot_id = "boot-id"
-      expect(ssh_session).to receive(:_exec!).with("cat /proc/sys/kernel/random/boot_id").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("another-boot-id", 0))
-      vm_host.check_last_boot_id(ssh_session)
-      expect(Page.first.summary).to eq("Recorded last_boot_id of #{vm_host.ubid} in database differs from the actual boot_id")
-    end
-  end
-
-  describe "#spdk_cpu_count" do
+  describe "#io_cpu_count" do
     it "uses 2 cpus for AX161" do
       vm_host.total_cpus = 64
-      expect(vm_host.spdk_cpu_count).to eq(2)
+      expect(vm_host.io_cpu_count).to eq(2)
     end
 
     it "uses 4 cpus for RX220" do
       vm_host.total_cpus = 80
-      expect(vm_host.spdk_cpu_count).to eq(4)
+      expect(vm_host.io_cpu_count).to eq(4)
     end
 
     it "uses 4 cpus for AX162" do
       vm_host.total_cpus = 96
-      expect(vm_host.spdk_cpu_count).to eq(4)
+      expect(vm_host.io_cpu_count).to eq(4)
     end
   end
 

@@ -3,25 +3,32 @@
 class Prog::Kubernetes::KubernetesNodepoolNexus < Prog::Base
   subject_is :kubernetes_nodepool
 
-  def self.assemble(name:, node_count:, kubernetes_cluster_id:, target_node_size: "standard-2", target_node_storage_size_gib: nil)
+  frame_reader :machine_image_version_id
+
+  def self.assemble(name:, node_count:, kubernetes_cluster_id:, target_node_size: "standard-2", target_node_storage_size_gib: nil, machine_image_version_id: nil)
     DB.transaction do
-      unless KubernetesCluster[kubernetes_cluster_id]
+      unless (cluster = KubernetesCluster[kubernetes_cluster_id])
         fail "No existing cluster"
       end
 
+      Validation.validate_kubernetes_name(name)
       Validation.validate_kubernetes_worker_node_count(node_count)
 
-      kn = KubernetesNodepool.create(name:, node_count:, kubernetes_cluster_id:, target_node_size:, target_node_storage_size_gib:)
+      kn = KubernetesNodepool.create(name:, node_count:, kubernetes_cluster_id:, target_node_size:, target_node_storage_size_gib:, version: cluster.version)
 
-      Strand.create_with_id(kn, prog: "Kubernetes::KubernetesNodepoolNexus", label: "start")
+      strand = Strand.create_with_id(kn, prog: "Kubernetes::KubernetesNodepoolNexus", label: "start", stack: [{"machine_image_version_id" => machine_image_version_id, "waiting_strand_id" => kubernetes_cluster_id}])
+      kn.incr_start_bootstrapping if cluster.strand.label == "wait"
+      strand
     end
   end
 
   label def start
     register_deadline("wait", 120 * 60)
     when_start_bootstrapping_set? do
+      decr_start_bootstrapping
       hop_bootstrap_worker_nodes
     end
+    hop_bootstrap_worker_nodes if kubernetes_nodepool.cluster.strand.label == "wait"
     nap 10
   end
 
@@ -31,7 +38,7 @@ class Prog::Kubernetes::KubernetesNodepoolNexus < Prog::Base
 
     if current_node_count < desired_node_count
       (desired_node_count - current_node_count).times do
-        bud Prog::Kubernetes::ProvisionKubernetesNode, {"nodepool_id" => kubernetes_nodepool.id, "subject_id" => kubernetes_nodepool.kubernetes_cluster_id}
+        bud Prog::Kubernetes::ProvisionKubernetesNode, {"nodepool_id" => kubernetes_nodepool.id, "subject_id" => kubernetes_nodepool.kubernetes_cluster_id, "machine_image_version_id" => machine_image_version_id}
       end
     elsif current_node_count > desired_node_count
       excess_nodes = kubernetes_nodepool.functional_nodes.first(current_node_count - desired_node_count)
@@ -42,8 +49,8 @@ class Prog::Kubernetes::KubernetesNodepoolNexus < Prog::Base
 
   label def wait_worker_node
     reap do
-      kubernetes_nodepool.cluster.incr_update_billing_records
-      hop_wait
+      decr_scale_worker_count
+      hop_wait_and_wakeup_waiting_strand
     end
   end
 
@@ -52,7 +59,6 @@ class Prog::Kubernetes::KubernetesNodepoolNexus < Prog::Base
       hop_upgrade
     end
     when_scale_worker_count_set? do
-      decr_scale_worker_count
       hop_bootstrap_worker_nodes
     end
     nap 6 * 60 * 60
@@ -64,11 +70,19 @@ class Prog::Kubernetes::KubernetesNodepoolNexus < Prog::Base
     node_to_upgrade = kubernetes_nodepool.nodes.find do |node|
       node_version = kubernetes_nodepool.cluster.client(session: node.sshable.connect).version
       node_minor_version = node_version.match(/^v\d+\.(\d+)$/)&.captures&.first&.to_i
-      cluster_minor_version = kubernetes_nodepool.cluster.version.match(/^v\d+\.(\d+)$/)&.captures&.first&.to_i
 
-      next false unless node_minor_version && cluster_minor_version
+      unless node_minor_version
+        Prog::PageNexus.assemble(
+          "Invalid version format for #{node.name} of cluster #{kubernetes_nodepool.cluster.ubid}",
+          ["K8sInvalidVersion", kubernetes_nodepool.cluster.ubid, node.name],
+          node.ubid,
+          resource_id: node.id,
+          extra_data: {node_version:, nodepool_version: kubernetes_nodepool.version},
+        )
+        next false
+      end
 
-      node_minor_version == cluster_minor_version - 1
+      node_minor_version < Option.kubernetes_minor_version(kubernetes_nodepool.version)
     end
 
     hop_wait unless node_to_upgrade
@@ -85,7 +99,10 @@ class Prog::Kubernetes::KubernetesNodepoolNexus < Prog::Base
     reap do
       decr_destroy
 
-      kubernetes_nodepool.nodes.each(&:incr_destroy)
+      kubernetes_nodepool.nodes.each do |node|
+        Page.from_tag_parts("K8sInvalidVersion", kubernetes_nodepool.cluster.ubid, node.name)&.incr_resolve
+        node.incr_destroy
+      end
       nap 5 unless kubernetes_nodepool.nodes.empty?
       kubernetes_nodepool.destroy
       pop "kubernetes nodepool is deleted"

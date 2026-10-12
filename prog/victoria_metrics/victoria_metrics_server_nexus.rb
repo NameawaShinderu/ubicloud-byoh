@@ -11,7 +11,7 @@ class Prog::VictoriaMetrics::VictoriaMetricsServerNexus < Prog::Base
 
   def_delegators :victoria_metrics_server, :vm, :resource
 
-  def self.assemble(victoria_metrics_resource_id)
+  def self.assemble(victoria_metrics_resource_id, is_representative: true)
     vr = VictoriaMetricsResource[victoria_metrics_resource_id]
     fail "No existing VictoriaMetricsResource" unless vr
 
@@ -33,7 +33,7 @@ class Prog::VictoriaMetrics::VictoriaMetricsServerNexus < Prog::Base
       )
 
       id = ubid.to_uuid
-      VictoriaMetricsServer.create_with_id(id, victoria_metrics_resource_id:, vm_id: vm_st.id)
+      VictoriaMetricsServer.create_with_id(id, victoria_metrics_resource_id:, vm_id: vm_st.id, is_representative:)
       Strand.create_with_id(id, prog: "VictoriaMetrics::VictoriaMetricsServerNexus", label: "start")
     end
   end
@@ -45,7 +45,7 @@ class Prog::VictoriaMetrics::VictoriaMetricsServerNexus < Prog::Base
         # child strand budded from parent strand unvailable, exit to
         # avoid two strands in #destroy
         pop "exiting early due to destroy semaphore"
-      elsif !%w[destroy wait_children_destroyed].include?(label)
+      elsif !%w[destroy wait_children_destroyed].freeze.include?(label)
         hop_destroy
       elsif strand.stack.count > 1
         pop "operation is cancelled due to the destruction of the VictoriaMetrics server"
@@ -121,6 +121,7 @@ class Prog::VictoriaMetrics::VictoriaMetricsServerNexus < Prog::Base
     case vm.sshable.d_check("configure_victoria_metrics")
     when "Succeeded"
       vm.sshable.d_clean("configure_victoria_metrics")
+      decr_initial_provisioning
       hop_wait
     when "Failed", "NotStarted"
       config_json = JSON.generate({
@@ -155,7 +156,14 @@ class Prog::VictoriaMetrics::VictoriaMetricsServerNexus < Prog::Base
       hop_refresh_certificates
     end
 
-    nap 60 * 60 * 24 * 30
+    disk_usage_percent = Integer(vm.sshable.cmd("df --output=pcent /dat/victoria_metrics | tail -n 1").strip.delete("%"), 10)
+    if disk_usage_percent >= 90
+      Prog::PageNexus.assemble("#{victoria_metrics_server.ubid} data disk is #{disk_usage_percent}% full", disk_usage_page_tag_parts, victoria_metrics_server.ubid, resource_id: victoria_metrics_server.id, severity: "warning", extra_data: {disk_usage_percent:})
+    else
+      Page.from_tag_parts(*disk_usage_page_tag_parts)&.incr_resolve
+    end
+
+    nap 60 * 60
   end
 
   label def refresh_certificates
@@ -181,7 +189,7 @@ class Prog::VictoriaMetrics::VictoriaMetricsServerNexus < Prog::Base
   label def unavailable
     register_deadline("wait", 10 * 60)
 
-    reap
+    reap(fallthrough: true)
     nap 5 unless strand.children.select { it.prog == "VictoriaMetrics::VictoriaMetricsServerNexus" && it.label == "restart" }.empty?
 
     if available?
@@ -203,6 +211,7 @@ class Prog::VictoriaMetrics::VictoriaMetricsServerNexus < Prog::Base
 
   label def wait_children_destroyed
     reap(nap: 5) do
+      Page.from_tag_parts(*disk_usage_page_tag_parts)&.incr_resolve
       vm.incr_destroy
       victoria_metrics_server.destroy
 
@@ -217,6 +226,10 @@ class Prog::VictoriaMetrics::VictoriaMetricsServerNexus < Prog::Base
   rescue => ex
     Clog.emit("victoria_metrics server is down", {victoria_metrics_server_down: Util.exception_to_hash(ex, into: {ubid: victoria_metrics_server.ubid})})
     false
+  end
+
+  def disk_usage_page_tag_parts
+    ["VictoriaMetricsDiskUsageHigh", victoria_metrics_server.id]
   end
 
   def create_certificate

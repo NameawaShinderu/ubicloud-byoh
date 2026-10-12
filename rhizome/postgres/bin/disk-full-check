@@ -1,0 +1,119 @@
+#!/bin/bash
+set -eu
+
+DAT=${DAT:-/dat}
+
+# Logical slot WAL retention threshold to drop the slot. see drop_inactive_or_lagging_logical_slots
+LOGICAL_SLOT_MAX_WAL_BYTES=2147483648
+
+read name btotal bused bavailable usedp mount_path <<< "$(df -P -B1 "$DAT" | tail -n +2)"
+PGDATA="$DAT/$1/data"
+
+# Drop logical replication slots that are inactive or retain more than
+# LOGICAL_SLOT_MAX_WAL_BYTES of WAL, then CHECKPOINT.
+drop_inactive_or_lagging_logical_slots() {
+  # Query: drop each matching slot and return the WAL bytes held by the most lagging
+  local slots_held_bytes
+  slots_held_bytes=$(psql -d postgres -At -c "SELECT COALESCE(MAX(wal_bytes), 0) FROM (SELECT pg_drop_replication_slot(slot_name), pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS wal_bytes FROM pg_replication_slots WHERE slot_type = 'logical' AND (NOT active OR pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) > $LOGICAL_SLOT_MAX_WAL_BYTES)) t;" 2>/dev/null) || return 1
+  test "${slots_held_bytes:-0}" -eq 0 && return 1
+  echo "[disk-full-check] dropped inactive or lagging logical slots holding ${slots_held_bytes} bytes of WAL; checkpointing"
+  psql -d postgres -c "CHECKPOINT" >/dev/null 2>&1 || true
+  return 0
+}
+
+if test "$btotal" -le 68719476736; then # Smaller thresholds for disks <= 64GB (hobby)
+  recover_threshold=2147483648    # 2GB
+  readonly_threshold=1073741824   # 1GB
+  restart_threshold=536870912     # 512MB
+  human_buffer_size=500M
+elif test "$btotal" -le 137438953472; then # Smaller thresholds for disks <= 128GB (minimum cloud size)
+  recover_threshold=7516192768    # 7GB
+  readonly_threshold=5368709120   # 5GB
+  restart_threshold=3221225472    # 3GB
+  human_buffer_size=1G
+elif test "$btotal" -le 549755813888; then # Disks between 128GB and 512GB
+  recover_threshold=10737418240   # 10GB
+  readonly_threshold=7516192768   # 7GB
+  restart_threshold=5368709120    # 5GB
+  human_buffer_size=1G
+else # all larger sizes
+  recover_threshold=$((btotal * 3 / 100))     # 3%
+  readonly_threshold=$((btotal * 2 / 100))    # 2%
+  restart_threshold=$((btotal * 1 / 100))     # 1%
+  human_buffer_size=1G
+fi
+
+# pg_log_throttle: force minimize verbosity of Postgres logs under severe 
+# disk pressure (restart_threshold), by linking file with low verbosity configs.
+PG_LOG_THROTTLE_SRC="${PG_LOG_THROTTLE_SRC:-/etc/postgresql-common/pg-logs-throttle}"
+CONF_D="${CONF_D:-/etc/postgresql/$1/main/conf.d}"
+PG_LOG_THROTTLE_CONF="991-pg-logs-throttle.conf"
+
+# Skip the enable/disable path if the file is not installed (older instances)
+pg_log_throttle_supported=0
+if test -f "$PG_LOG_THROTTLE_SRC/$PG_LOG_THROTTLE_CONF" && test -d "$CONF_D"; then
+  pg_log_throttle_supported=1
+fi
+
+enable_pg_log_throttle() {
+  if test -e "$CONF_D/$PG_LOG_THROTTLE_CONF"; then
+    return 1
+  fi
+  ln -sf "$PG_LOG_THROTTLE_SRC/$PG_LOG_THROTTLE_CONF" "$CONF_D/$PG_LOG_THROTTLE_CONF"
+}
+
+disable_pg_log_throttle() {
+  if ! test -e "$CONF_D/$PG_LOG_THROTTLE_CONF"; then
+    return 1
+  fi
+  rm -f "$CONF_D/$PG_LOG_THROTTLE_CONF"
+}
+
+reload_needed=0
+
+if test "$bavailable" -gt "$recover_threshold"; then
+  if grep -q "default_transaction_read_only = 'on'" "$PGDATA/postgresql.auto.conf"; then
+    sed -i "/default_transaction_read_only = 'on'/d" "$PGDATA/postgresql.auto.conf"
+    test -f "$DAT/disk-full-read-only-pending-restart-$1" && rm -f "$DAT/disk-full-read-only-pending-restart-$1"
+    reload_needed=1
+  elif ! test -f "$DAT/disk-full-human-buffer"; then
+    fallocate -l "$human_buffer_size" "$DAT/disk-full-human-buffer"
+  fi
+  if test "$pg_log_throttle_supported" = 1; then
+    if disable_pg_log_throttle; then
+      reload_needed=1
+    fi
+  fi
+elif test "$bavailable" -lt "$readonly_threshold"; then
+  if ! grep -q "default_transaction_read_only = 'on'" "$PGDATA/postgresql.auto.conf"; then
+    if test -n "$(tail -c 1 "$PGDATA/postgresql.auto.conf")"; then
+      echo >> "$PGDATA/postgresql.auto.conf"
+    fi
+    echo "default_transaction_read_only = 'on'" >> "$PGDATA/postgresql.auto.conf"
+    touch "$DAT/disk-full-read-only-pending-restart-$1"
+    reload_needed=1
+  elif test "$bavailable" -lt "$restart_threshold" && test -f "$DAT/disk-full-read-only-pending-restart-$1"; then
+    # Try to free WAL first by dropping inactive or lagging logical replication slots
+    if drop_inactive_or_lagging_logical_slots; then
+      exit 0
+    fi
+
+    # Terminate customer backends so new connections pick up the read-only
+    # default applied by the earlier `reload`. We cannot `pg_ctlcluster restart`
+    # here because the cluster is managed by systemd and pg_ctlcluster refuses
+    # to act on it; this service runs as postgres without sudo. `ubi_replication`
+    # is preserved so standbys keep streaming; `ubi_monitoring` is preserved
+    # so metrics scraping continues.
+    psql -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename NOT IN ('ubi_replication', 'ubi_monitoring') AND pid <> pg_backend_pid();" >/dev/null
+    rm -f "$DAT/disk-full-read-only-pending-restart-$1"
+    if test "$pg_log_throttle_supported" = 1; then
+      if enable_pg_log_throttle; then
+        reload_needed=1
+      fi
+    fi
+  fi
+fi
+
+if test "$reload_needed" = 1; then
+  pg_ctlcluster "$1" main reload
+fi

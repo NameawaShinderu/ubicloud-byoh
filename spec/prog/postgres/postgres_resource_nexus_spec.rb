@@ -24,6 +24,11 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
   end
 
   describe ".assemble" do
+    def placed_az_suffix(postgres_resource)
+      nic = postgres_resource.representative_server.vm.user_nic
+      AwsSubnet[nic.strand.stack[0]["aws_subnet_id"]].az_suffix
+    end
+
     let(:customer_project) { Project.create(name: "default") }
     let(:private_location) {
       loc = Location.create(
@@ -70,8 +75,10 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
 
     it "does not allow giving different version than parent for restore" do
       parent = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-parent-name", target_vm_size: "standard-2", target_storage_size_gib: 128, target_version: "16").subject
+      restore_target = Time.now
+      parent.timeline.update(cached_earliest_backup_at: restore_target - 15 * 60)
       expect {
-        described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-name", target_vm_size: "standard-2", target_storage_size_gib: 128, parent_id: parent.id, target_version: "17", restore_target: Time.now)
+        described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-name", target_vm_size: "standard-2", target_storage_size_gib: 128, parent_id: parent.id, target_version: "17", restore_target:)
       }.to raise_error Validation::ValidationFailed, "Validation failed for following fields: version"
     end
 
@@ -84,6 +91,126 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
       child = child_strand.subject
       expect(child.representative_server.timeline_id).to eq(parent.timeline.id)
       expect(child.representative_server.timeline_access).to eq("fetch")
+    end
+
+    it "defaults target_image_family to ubuntu-2604 for a top-level resource" do
+      pg = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-fam-default", target_vm_size: "standard-2", target_storage_size_gib: 128).subject
+      expect(pg.target_image_family).to eq("ubuntu-2604")
+    end
+
+    it "threads an explicit target_image_family onto a top-level resource" do
+      pg = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-fam-explicit", target_vm_size: "standard-2", target_storage_size_gib: 128, target_image_family: "ubuntu-2604").subject
+      expect(pg.target_image_family).to eq("ubuntu-2604")
+    end
+
+    it "inherits the parent's serving image family for a child resource" do
+      parent = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-parent-fam", target_vm_size: "standard-2", target_storage_size_gib: 128).subject
+      parent.representative_server.update(image_family: "ubuntu-2604")
+      restore_target = Time.now
+      parent.timeline.update(cached_earliest_backup_at: restore_target - 15 * 60)
+
+      child = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-child-fam", target_vm_size: "standard-2", target_storage_size_gib: 128, parent_id: parent.id, restore_target:).subject
+      expect(child.target_image_family).to eq("ubuntu-2604")
+    end
+
+    it "uses existing orphaned timeline when restore_from_timeline_id is set" do
+      existing = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-existing", target_vm_size: "standard-2", target_storage_size_gib: 128).subject
+      timeline = existing.representative_server.timeline
+      restore_target = Time.now
+      timeline.update(cached_earliest_backup_at: restore_target - 15 * 60)
+
+      restored = described_class.assemble(
+        project_id: customer_project.id, location_id:, name: "pg-restored", target_vm_size: "standard-2", target_storage_size_gib: 128,
+        restore_from_timeline_id: timeline.id, restore_target:,
+      ).subject
+
+      expect(restored.representative_server.timeline_id).to eq(timeline.id)
+      expect(restored.representative_server.timeline_access).to eq("fetch")
+      expect(restored.parent_id).to be_nil
+      expect(restored.superuser_password).not_to eq(existing.superuser_password)
+    end
+
+    it "supports PITR via restore_from_timeline_id after the original resource is deleted" do
+      original = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-deleted", target_vm_size: "standard-2", target_storage_size_gib: 128).subject
+      timeline = original.representative_server.timeline
+      restore_target = Time.now
+      timeline.update(cached_earliest_backup_at: restore_target - 15 * 60)
+      original.representative_server.destroy
+      original.destroy
+
+      restored = described_class.assemble(
+        project_id: customer_project.id, location_id:, name: "pg-pitr", target_vm_size: "standard-2", target_storage_size_gib: 128,
+        restore_from_timeline_id: timeline.id, restore_target:,
+      ).subject
+
+      expect(restored.representative_server.timeline_id).to eq(timeline.id)
+      expect(restored.restore_target).to be_within(1).of(restore_target)
+    end
+
+    it "rejects restore_from_timeline_id with parent_id" do
+      expect {
+        described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-name", target_vm_size: "standard-2", target_storage_size_gib: 128,
+          parent_id: "pgd2m9djgryj6nq73jrdddnkrt", restore_from_timeline_id: "pt00000000000000000000000a")
+      }.to raise_error RuntimeError, "Cannot specify both parent_id and restore_from_timeline_id"
+    end
+
+    it "rejects restore_from_timeline_id referencing a missing timeline" do
+      expect {
+        described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-name", target_vm_size: "standard-2", target_storage_size_gib: 128,
+          restore_from_timeline_id: "00000000-0000-0000-0000-000000000001", restore_target: Time.now)
+      }.to raise_error RuntimeError, "No existing timeline"
+    end
+
+    it "validates restore_target against the orphaned timeline's window" do
+      existing = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-existing", target_vm_size: "standard-2", target_storage_size_gib: 128).subject
+      timeline = existing.representative_server.timeline
+
+      expect {
+        described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-restored", target_vm_size: "standard-2", target_storage_size_gib: 128,
+          restore_from_timeline_id: timeline.id, restore_target: Time.now)
+      }.to raise_error Validation::ValidationFailed, "Validation failed for following fields: restore_target"
+    end
+
+    it "places the first server in the zone the requested id names" do
+      private_location.update(project: customer_project)
+      LocationAz.create(location_id: private_location.id, az: "b", zone_id: "usw2-az2")
+
+      pg = described_class.assemble(project_id: customer_project.id, location_id: private_location.id, name: "pg-preferred",
+        target_vm_size: "standard-2", target_storage_size_gib: 128, preferred_availability_zone_id: "usw2-az2").subject
+      expect(placed_az_suffix(pg)).to eq("b")
+      expect(pg.representative_server.vm.strand.stack[0]["required_availability_zone"]).to be_nil
+
+      pg = described_class.assemble(project_id: customer_project.id, location_id: private_location.id, name: "pg-required",
+        target_vm_size: "standard-2", target_storage_size_gib: 128, required_availability_zone_id: "usw2-az2").subject
+      expect(placed_az_suffix(pg)).to eq("b")
+      expect(pg.representative_server.vm.strand.stack[0]["required_availability_zone"]).to eq("b")
+    end
+
+    it "refuses to create a resource requiring a zone id the location does not have" do
+      private_location.update(project: customer_project)
+
+      expect {
+        described_class.assemble(project_id: customer_project.id, location_id: private_location.id, name: "pg-name",
+          target_vm_size: "standard-2", target_storage_size_gib: 128, required_availability_zone_id: "usw2-az9")
+      }.to raise_error RuntimeError, "us-west-2 has no availability zone usw2-az9"
+      expect(PostgresResource.where(name: "pg-name")).to be_empty
+    end
+
+    it "rejects a resource that both prefers and requires an availability zone" do
+      private_location.update(project: customer_project)
+
+      expect {
+        described_class.assemble(project_id: customer_project.id, location_id: private_location.id, name: "pg-name",
+          target_vm_size: "standard-2", target_storage_size_gib: 128, preferred_availability_zone_id: "usw2-az1", required_availability_zone_id: "usw2-az2")
+      }.to raise_error Sequel::ValidationFailed, "preferred_availability_zone_id and required_availability_zone_id is invalid"
+    end
+
+    it "rejects an availability zone request for a location without availability zones" do
+      expect {
+        described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-name", target_vm_size: "standard-2",
+          target_storage_size_gib: 128, required_availability_zone_id: "usw2-az1")
+      }.to raise_error RuntimeError, "Availability zone requests are only supported for AWS locations"
+      expect(PostgresResource.where(name: "pg-name")).to be_empty
     end
 
     it "creates internal firewall and customer private subnet and firewall" do
@@ -128,6 +255,82 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
       ]
     end
 
+    it "applies Config.postgres_internal_firewall_cidrs to the internal firewall" do
+      expect(Config).to receive(:postgres_internal_firewall_cidrs).and_return(["3.143.188.173/32", "18.224.223.229/32"]).at_least(:once)
+      pg = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-name", target_vm_size: "standard-2", target_storage_size_gib: 128).subject
+
+      rules = pg.internal_firewall.firewall_rules.map { "#{it.cidr}:#{it.port_range.to_range}" }
+      expect(rules).to include(
+        "3.143.188.173/32:5432...5433",
+        "3.143.188.173/32:6432...6433",
+        "18.224.223.229/32:5432...5433",
+        "18.224.223.229/32:6432...6433",
+      )
+    end
+
+    it "uses presigned cert if available for hostname version v3" do
+      DnsZone.create(project_id: postgres_project.id, name: "pg.ubicloud.app")
+      allow(Config).to receive_messages(acme_email: "test@ubicloud.com")
+      st = Strand.create_with_id(Prog::Vnet::MaintainPresignedPostgresCerts::STRAND_ID, prog: "Vnet::MaintainPresignedPostgresCerts", label: "wait", schedule: Time.now - 100)
+      postgres_resource_id = PostgresResource.generate_uuid
+      cert_data, csr_key = Util.create_certificate(subject: "/CN=*.#{UBID.to_ubid(postgres_resource_id)}.pg.ubicloud.app", duration: 60 * 60 * 24 * 30 * 3)
+      cert_data = cert_data.to_s
+      csr_key = csr_key.to_der
+      cert = Cert.create(hostname: "*.#{UBID.to_ubid(postgres_resource_id)}.pg.ubicloud.app", cert: cert_data, csr_key:)
+      DB[:presigned_postgres_cert].insert(postgres_resource_id:, cert_id: cert.id)
+      expect(PostgresResource.count).to eq 0
+      pg = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-name", target_vm_size: "standard-2", target_storage_size_gib: 128, hostname_version: "v3").subject
+      expect(PostgresResource.count).to eq 1
+      expect(pg.id).to eq postgres_resource_id
+      expect(pg.project_id).to eq customer_project.id
+      expect(pg.hostname).to eq "pg-name.#{UBID.to_ubid(postgres_resource_id)}.pg.ubicloud.app"
+      expect(pg.hostname_version).to eq "v3"
+      expect(pg.server_cert).to eq cert_data
+      expect(pg.server_cert_key).to eq OpenSSL::PKey::EC.new(csr_key).to_pem
+      expect(pg.strand.stack[0]["use_publicly_signed_certificates"]).to be true
+      expect(pg.strand.stack[0]["current_cert_id"]).to eq cert.id
+      expect(DB[:presigned_postgres_cert].count).to eq 0
+      expect(st.reload.schedule).to be_within(5).of(Time.now)
+    end
+
+    it "handles case where presigned cert isn't available for hostname version v3" do
+      DnsZone.create(project_id: postgres_project.id, name: "pg.ubicloud.app")
+      allow(Config).to receive_messages(postgres_service_hostname: "pg.ubicloud.app", acme_email: "test@ubicloud.com")
+      expect(PostgresResource.count).to eq 0
+      st = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-name", target_vm_size: "standard-2", target_storage_size_gib: 128, hostname_version: "v3")
+      pg = st.subject
+      expect(PostgresResource.count).to eq 1
+      expect(pg.project_id).to eq customer_project.id
+      expect(pg.hostname).to eq "pg-name.#{pg.ubid}.pg.ubicloud.app"
+      expect(pg.hostname_version).to eq "v3"
+      expect(pg.server_cert).to be_nil
+      expect(pg.server_cert_key).to be_nil
+      expect(pg.strand.stack[0]["use_publicly_signed_certificates"]).to be true
+      expect(pg.strand.stack[0]["initial_cert_id"]).to eq pg.strand.stack[0]["current_cert_id"]
+      cert = Cert.with_pk!(pg.strand.stack[0]["initial_cert_id"])
+      expect(pg.strand.stack[0]["current_cert_id"]).to eq cert.id
+      expect(cert.hostname).to eq "*.#{pg.ubid}.pg.ubicloud.app"
+      expect(cert.private_hostname).to eq "*.#{pg.ubid}.private.pg.ubicloud.app"
+      expect(cert.strand.label).to eq "start"
+      expect(cert.strand.stack[0]["waiting_strand_id"]).to eq pg.id
+    end
+
+    it "does not use publicly signed certs for hostname version v3 if there is no DNS zone" do
+      allow(Config).to receive_messages(postgres_service_hostname: "pg.ubicloud.app", acme_email: "test@ubicloud.com")
+      expect(PostgresResource.count).to eq 0
+      st = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-name", target_vm_size: "standard-2", target_storage_size_gib: 128, hostname_version: "v3")
+      pg = st.subject
+      expect(PostgresResource.count).to eq 1
+      expect(pg.project_id).to eq customer_project.id
+      expect(pg.hostname).to be_nil
+      expect(pg.hostname_version).to eq "v3"
+      expect(pg.server_cert).to be_nil
+      expect(pg.server_cert_key).to be_nil
+      expect(pg.strand.stack[0]).not_to have_key("use_publicly_signed_certificates")
+      expect(pg.strand.stack[0]).not_to have_key("initial_cert_id")
+      expect(pg.strand.stack[0]).not_to have_key("current_cert_id")
+    end
+
     it "sets use_different_az semaphore for AWS locations when FF is set" do
       customer_project.set_ff_postgres_aws_use_different_azs_for_standbys(true)
       private_location.update(project: customer_project)
@@ -151,6 +354,87 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
       pg = described_class.assemble(project_id: customer_project.id, location_id: private_location.id, name: "pg-name", target_vm_size: "standard-2", target_storage_size_gib: 128).subject
 
       expect(pg.use_different_az_set?).to be false
+    end
+  end
+
+  describe ".unarchive" do
+    let(:customer_project) { Project.create(name: "default") }
+
+    it "rejects malformed UBIDs" do
+      expect { described_class.unarchive("u" * 26) }.to raise_error(RuntimeError, /Invalid UBID/)
+    end
+
+    it "fails if archived PostgresResource not found" do
+      id = "00000000-0000-0000-0000-000000000001"
+      expect { described_class.unarchive(id) }.to raise_error(RuntimeError, "No archived PostgresResource for id #{id}")
+    end
+
+    it "fails if archived representative server not found" do
+      pg = create_postgres_resource(project: customer_project, location_id:)
+      id = pg.id
+      pg.destroy
+      expect { described_class.unarchive(id) }.to raise_error(RuntimeError, "No archived representative PostgresServer for id #{id}")
+    end
+
+    it "fails if original timeline no longer exists" do
+      pg = create_postgres_resource(project: customer_project, location_id:)
+      server = create_postgres_server(resource: pg)
+      timeline = server.timeline
+      id = pg.id
+      pg.destroy
+      server.destroy
+      timeline.destroy
+      expect { described_class.unarchive(id) }.to raise_error(RuntimeError, /Original timeline .* no longer exists/)
+    end
+
+    it "fails if original timeline has no restorable backup" do
+      pg = create_postgres_resource(project: customer_project, location_id:)
+      server = create_postgres_server(resource: pg)
+      id = pg.id
+      pg.destroy
+      server.destroy
+      expect { described_class.unarchive(id) }.to raise_error(RuntimeError, /has no restorable backup/)
+    end
+
+    it "accepts a UBID and resolves to UUID" do
+      pg = create_postgres_resource(project: customer_project, location_id:)
+      ubid = pg.ubid
+      id = pg.id
+      pg.destroy
+      expect { described_class.unarchive(ubid) }.to raise_error(RuntimeError, "No archived representative PostgresServer for id #{id}")
+    end
+
+    it "reassembles archived resource fetching from original timeline" do
+      original = described_class.assemble(project_id: customer_project.id, location_id:, name: "pg-archived", target_vm_size: "standard-2", target_storage_size_gib: 128, hostname_version: "v1").subject
+      timeline = original.representative_server.timeline
+      timeline.update(cached_earliest_backup_at: Time.now - 30 * 60)
+      # Representative served ubuntu-2604 (so the backup carries its index bytes),
+      # but the resource target drifted to ubuntu-2204. The unarchive must follow
+      # the representative's serving family, not the drifted target.
+      original.representative_server.update(image_family: "ubuntu-2604")
+      original.update(maintenance_window_start_at: 5, cert_auth_users: ["alice"], trusted_ca_certs: "ca-pem", target_image_family: "ubuntu-2204")
+      id = original.id
+      original.representative_server.destroy
+      original.destroy
+
+      strand = described_class.unarchive(id)
+      restored = strand.subject
+
+      expect(restored.name).to eq("pg-archived")
+      expect(restored.project_id).to eq(customer_project.id)
+      expect(restored.id).not_to eq(id)
+      expect(restored.restore_target).to be_nil
+      expect(restored.maintenance_window_start_at).to eq(5)
+      expect(restored.cert_auth_users).to eq(["alice"])
+      expect(restored.trusted_ca_certs).to eq("ca-pem")
+      expect(restored.hostname_version).to eq("v1")
+      expect(restored.target_image_family).to eq("ubuntu-2604")
+      expect(restored.representative_server.timeline_id).to eq(timeline.id)
+      expect(restored.representative_server.timeline_access).to eq("fetch")
+      expect(restored.representative_server.unarchive_set?).to be true
+      expect(restored.representative_server.update_superuser_password_set?).to be true
+      # archived firewall rules are not restored, assemble's defaults remain
+      expect(restored.customer_firewall.firewall_rules.count).to eq(4)
     end
   end
 
@@ -206,23 +490,35 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
   end
 
   describe "#start" do
+    it "starts an independent strand for log aggregation setup and hops" do
+      postgres_server
+      expect { nx.start }.to hop("wait_representative_server")
+
+      strand = Strand.first(prog: "Postgres::SetupLogAggregation")
+      expect(strand.label).to eq("start")
+      expect(strand.parent_id).to be_nil
+      expect(strand.stack[0]["subject_id"]).to eq(postgres_resource.id)
+    end
+  end
+
+  describe "#wait_representative_server" do
     it "naps if postgres server is not ready" do
       postgres_server
-      expect { nx.start }.to nap(5)
+      expect { nx.wait_representative_server }.to nap(60)
     end
 
     it "hops if postgres server is ready" do
-      postgres_server.vm.strand.update(label: "wait")
-      expect { nx.start }.to hop("refresh_dns_record")
+      postgres_server.vm.update(provisioned_at: Time.now)
+      expect { nx.wait_representative_server }.to hop("refresh_dns_record")
       expect(Semaphore.where(strand_id: st.id, name: "initial_provisioning").first).to exist
     end
 
     it "buds trigger_pg_current_xact_id_on_parent if it has parent" do
-      postgres_server.vm.strand.update(label: "wait")
+      postgres_server.vm.update(provisioned_at: Time.now)
       parent = create_postgres_resource(project:, location_id:)
       create_postgres_server(resource: parent)
       postgres_resource.update(parent:)
-      expect { nx.start }.to hop("refresh_dns_record")
+      expect { nx.wait_representative_server }.to hop("refresh_dns_record")
       expect(st.children.count).to eq(1)
       expect(st.children.first.label).to eq("trigger_pg_current_xact_id_on_parent")
     end
@@ -236,105 +532,110 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
 
       fresh_nx = described_class.new(st)
       parent_sshable = fresh_nx.postgres_resource.parent.representative_server.vm.sshable
-      expect(parent_sshable).to receive(:_cmd).with("PGOPTIONS='-c statement_timeout=60s' psql -U postgres -t --csv -v 'ON_ERROR_STOP=1'", hash_including(:stdin)).and_return("1234")
+      expect(parent_sshable).to receive(:_cmd).with("PGOPTIONS='-c statement_timeout=60s' psql -U postgres -d postgres -t --csv -v 'ON_ERROR_STOP=1'", hash_including(:stdin)).and_return("1234")
 
       expect { fresh_nx.trigger_pg_current_xact_id_on_parent }.to exit({"msg" => "triggered pg_current_xact_id"})
     end
   end
 
-  describe "#refresh_dns_record" do
-    let(:name) { postgres_resource.name }
+  {"v2" => :postgres_service_hostname, "v3" => :postgres_service_hostname_v3}.each do |hostname_version, config_var|
+    describe "#refresh_dns_record for hostname version #{hostname_version}" do
+      let(:name) { postgres_resource.name }
+      let(:hostname) { postgres_resource.hostname + "." }
+      let(:private_hostname) { postgres_resource.private_hostname + "." }
 
-    it "creates dns records and hops" do
-      postgres_server
-      expect(Config).to receive(:postgres_service_hostname).and_return("pg.example.com").at_least(:once)
-      dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
-      nx.incr_initial_provisioning
+      before do
+        expect(Config).to receive(config_var).and_return("pg.example.com").at_least(:once)
+        postgres_resource.update(hostname_version:)
+      end
 
-      dns_zone.insert_record(record_name: "#{name}.pg.example.com.", type: "A", ttl: 10, data: "2.3.4.5")
-      dns_zone.insert_record(record_name: "#{name}.pg.example.com.", type: "AAAA", ttl: 10, data: "2::1")
-      dns_zone.insert_record(record_name: "private.#{name}.pg.example.com.", type: "A", ttl: 10, data: "127.0.0.1")
-      dns_zone.insert_record(record_name: "private.#{name}.pg.example.com.", type: "AAAA", ttl: 10, data: "::1")
-      DnsRecord.where(dns_zone_id: dns_zone.id).update(created_at: Time.now - 10)
+      it "creates dns records and hops" do
+        postgres_server
+        dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
+        nx.incr_initial_provisioning
 
-      expect { nx.refresh_dns_record }.to hop("initialize_certificates")
+        dns_zone.insert_record(record_name: hostname, type: "A", ttl: 10, data: "2.3.4.5")
+        dns_zone.insert_record(record_name: hostname, type: "AAAA", ttl: 10, data: "2::1")
+        dns_zone.insert_record(record_name: private_hostname, type: "A", ttl: 10, data: "127.0.0.1")
+        dns_zone.insert_record(record_name: private_hostname, type: "AAAA", ttl: 10, data: "::1")
+        DnsRecord.where(dns_zone_id: dns_zone.id).update(created_at: Time.now - 10)
 
-      ds = DnsRecord.where(dns_zone_id: dns_zone.id)
-        .exclude(:tombstoned)
-        .distinct(:name, :type)
-        .reverse(:name, :type, :created_at)
-      expect(ds.select_map([:type, :name, :data])).to eq [
-        ["AAAA", "private.#{name}.pg.example.com.", postgres_server.vm.private_ipv6_string],
-        ["A", "private.#{name}.pg.example.com.", postgres_server.vm.private_ipv4_string],
-        ["AAAA", "#{name}.pg.example.com.", postgres_server.vm.ip6_string],
-        ["A", "#{name}.pg.example.com.", postgres_server.vm.ip4_string],
-      ]
-      expect(DnsRecord.where(dns_zone_id: dns_zone.id).where(:tombstoned).select_order_map([:type, :name, :data])).to eq [
-        ["A", "#{name}.pg.example.com.", "2.3.4.5"],
-        ["A", "private.#{name}.pg.example.com.", "127.0.0.1"],
-        ["AAAA", "#{name}.pg.example.com.", "2::1"],
-        ["AAAA", "private.#{name}.pg.example.com.", "::1"],
-      ]
-    end
+        expect { nx.refresh_dns_record }.to hop("initialize_certificates")
 
-    it "does not create public AAAA record for older resources" do
-      postgres_server.resource.update(created_at: Time.utc(2026, 1, 13, 19))
-      expect(Config).to receive(:postgres_service_hostname).and_return("pg.example.com").at_least(:once)
-      dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
-      nx.incr_initial_provisioning
-      expect { nx.refresh_dns_record }.to hop("initialize_certificates")
-      expect(DnsRecord.where(dns_zone_id: dns_zone.id).select_order_map([:type, :name])).to eq [
-        ["A", "#{name}.pg.example.com."],
-        ["A", "private.#{name}.pg.example.com."],
-        ["AAAA", "private.#{name}.pg.example.com."],
-      ]
-    end
+        ds = DnsRecord.where(dns_zone_id: dns_zone.id)
+          .exclude(:tombstoned)
+          .distinct(:name, :type)
+          .reverse(:name, :type, :created_at)
+        expect(ds.select_map([:type, :name, :data])).to eq [
+          ["AAAA", private_hostname, postgres_server.vm.private_ipv6_string],
+          ["A", private_hostname, postgres_server.vm.private_ipv4_string],
+          ["AAAA", hostname, postgres_server.vm.ip6_string],
+          ["A", hostname, postgres_server.vm.ip4_string],
+        ]
+        expect(DnsRecord.where(dns_zone_id: dns_zone.id).where(:tombstoned).select_order_map([:type, :name, :data])).to eq [
+          ["A", hostname, "2.3.4.5"],
+          ["A", private_hostname, "127.0.0.1"],
+          ["AAAA", hostname, "2::1"],
+          ["AAAA", private_hostname, "::1"],
+        ]
+      end
 
-    it "updates public AAAA record if it already exists for older resources" do
-      postgres_server.resource.update(created_at: Time.utc(2026, 1, 13, 19))
-      expect(Config).to receive(:postgres_service_hostname).and_return("pg.example.com").at_least(:once)
-      dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
-      dns_zone.insert_record(record_name: postgres_server.resource.hostname, type: "AAAA", ttl: 10, data: "::1")
-      DnsRecord.where(dns_zone_id: dns_zone.id).update(created_at: Time.now - 60)
-      nx.incr_initial_provisioning
-      expect { nx.refresh_dns_record }.to hop("initialize_certificates")
-      DnsRecord.where(dns_zone_id: dns_zone.id).where { created_at < Time.now - 10 }.destroy
-      expect(DnsRecord.where(dns_zone_id: dns_zone.id).exclude(:tombstoned).select_order_map([:type, :name])).to eq [
-        ["A", "#{name}.pg.example.com."],
-        ["A", "private.#{name}.pg.example.com."],
-        ["AAAA", "#{name}.pg.example.com."],
-        ["AAAA", "private.#{name}.pg.example.com."],
-      ]
-    end
+      it "does not create public AAAA record if one does not exist" do
+        postgres_server
+        dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
+        nx.incr_initial_provisioning
+        expect { nx.refresh_dns_record }.to hop("initialize_certificates")
+        expect(DnsRecord.where(dns_zone_id: dns_zone.id).select_order_map([:type, :name])).to eq [
+          ["A", hostname],
+          ["A", private_hostname],
+          ["AAAA", private_hostname],
+        ]
+      end
 
-    it "creates CNAME DNS records for AWS instances" do
-      postgres_server
-      AwsInstance.create_with_id(postgres_server.vm, ipv4_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com")
-      postgres_resource.location.update(provider: "aws")
-      expect(Config).to receive(:postgres_service_hostname).and_return("pg.example.com").at_least(:once)
-      dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
-      nx.incr_initial_provisioning
-      expect { nx.refresh_dns_record }.to hop("initialize_certificates")
-      expect(DnsRecord.where(dns_zone_id: dns_zone.id).select_order_map([:type, :name])).to eq [["CNAME", "#{name}.pg.example.com."]]
-    end
+      it "updates public AAAA record if it already exists" do
+        dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
+        dns_zone.insert_record(record_name: postgres_server.resource.hostname, type: "AAAA", ttl: 10, data: "::1")
+        DnsRecord.where(dns_zone_id: dns_zone.id).update(created_at: Time.now - 60)
+        nx.incr_initial_provisioning
+        expect { nx.refresh_dns_record }.to hop("initialize_certificates")
+        DnsRecord.where(dns_zone_id: dns_zone.id).where { created_at < Time.now - 10 }.destroy
+        expect(DnsRecord.where(dns_zone_id: dns_zone.id).exclude(:tombstoned).select_order_map([:type, :name])).to eq [
+          ["A", hostname],
+          ["A", private_hostname],
+          ["AAAA", hostname],
+          ["AAAA", private_hostname],
+        ]
+      end
 
-    it "hops even if dns zone is not configured" do
-      postgres_server
-      expect { nx.refresh_dns_record }.to hop("wait")
-    end
+      it "creates CNAME DNS records for AWS instances" do
+        postgres_server
+        ipv4_dns_name = "ec2-44-224-119-46.us-west-2.compute.amazonaws.com"
+        AwsInstance.create_with_id(postgres_server.vm, ipv4_dns_name:)
+        postgres_resource.location.update(provider: "aws")
+        dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
+        nx.incr_initial_provisioning
+        expect { nx.refresh_dns_record }.to hop("initialize_certificates")
+        expect(DnsRecord.where(dns_zone_id: dns_zone.id).select_order_map([:type, :name, :data])).to eq [["CNAME", hostname, ipv4_dns_name + "."]]
+      end
 
-    it "hops to wait if initial_provisioning is not set even with dns zone" do
-      postgres_server
-      expect(Config).to receive(:postgres_service_hostname).and_return("pg.example.com").at_least(:once)
-      DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
-      expect { nx.refresh_dns_record }.to hop("wait")
+      it "hops even if dns zone is not configured" do
+        postgres_server
+        expect { nx.refresh_dns_record }.to hop("wait")
+      end
+
+      it "hops to wait if initial_provisioning is not set even with dns zone" do
+        postgres_server
+        DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
+        expect { nx.refresh_dns_record }.to hop("wait")
+      end
     end
   end
 
   describe "#initialize_certificates" do
     it "hops to wait_servers after creating certificates" do
       pr = create_postgres_resource(project:, location_id:)
-      pr.update(root_cert_1: nil, root_cert_key_1: nil, root_cert_2: nil, root_cert_key_2: nil, server_cert: nil, server_cert_key: nil)
+      pr.update(root_cert_1: nil, root_cert_key_1: nil, root_cert_2: nil, root_cert_key_2: nil, server_cert: nil, server_cert_key: nil,
+        client_root_cert_1: nil, client_root_cert_key_1: nil, client_root_cert_2: nil, client_root_cert_key_2: nil, client_cert: nil, client_cert_key: nil, hostname_version: "v2")
       Firewall.create(name: "#{pr.ubid}-internal-firewall", location_id:, project: postgres_project)
       expect(Config).to receive(:postgres_service_hostname).and_return("pg.example.com").at_least(:once)
       DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
@@ -343,16 +644,75 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
       expect { init_nx.initialize_certificates }.to hop("wait_servers")
       pr.reload
       expect(pr.root_cert_1).not_to be_nil
+      expect(pr.root_cert_key_1).not_to be_nil
       expect(pr.root_cert_2).not_to be_nil
+      expect(pr.root_cert_key_2).not_to be_nil
       expect(pr.server_cert).not_to be_nil
+      expect(pr.server_cert_key).not_to be_nil
+      expect(pr.client_root_cert_1).not_to be_nil
+      expect(pr.client_root_cert_key_1).not_to be_nil
+      expect(pr.client_root_cert_2).not_to be_nil
+      expect(pr.client_root_cert_key_2).not_to be_nil
+      expect(pr.client_cert).not_to be_nil
+      expect(pr.client_cert_key).not_to be_nil
+
+      sans = OpenSSL::X509::Certificate.new(pr.server_cert)
+        .extensions
+        .find { it.oid == "subjectAltName" }
+        .value
+        .split(", ")
+      expect(sans).to eq %W[DNS:#{pr.ubid}.pg.example.com DNS:#{pr.hostname} DNS:#{pr.private_hostname}]
+    end
+
+    it "uses wildcards for v3 certificates" do
+      pr = create_postgres_resource(project:, location_id:)
+      pr.update(hostname_version: "v3", root_cert_1: nil, root_cert_key_1: nil, root_cert_2: nil, root_cert_key_2: nil, server_cert: nil, server_cert_key: nil,
+        client_root_cert_1: nil, client_root_cert_key_1: nil, client_root_cert_2: nil, client_root_cert_key_2: nil, client_cert: nil, client_cert_key: nil)
+      DnsZone.create(project_id: postgres_project.id, name: "pg.ubicloud.app")
+
+      init_nx = described_class.new(pr.strand)
+      expect { init_nx.initialize_certificates }.to hop("wait_servers")
+
+      sans = OpenSSL::X509::Certificate.new(pr.reload.server_cert)
+        .extensions
+        .find { it.oid == "subjectAltName" }
+        .value
+        .split(", ")
+      expect(sans).to eq %W[DNS:#{pr.ubid}.pg.ubicloud.app DNS:*.#{pr.ubid}.pg.ubicloud.app DNS:*.#{pr.ubid}.private.pg.ubicloud.app]
+    end
+
+    it "hops is using a publicly signed certificate and initial cert is already creted" do
+      nx.postgres_resource.update(hostname_version: "v3")
+      refresh_frame(nx, new_values: {"use_publicly_signed_certificates" => true})
+      expect { nx.initialize_certificates }.to hop("wait_servers")
+    end
+
+    it "naps if needing an initial cert and one is not available" do
+      nx.postgres_resource.update(hostname_version: "v3")
+      refresh_frame(nx, new_values: {"use_publicly_signed_certificates" => true, "initial_cert_id" => Cert.create(hostname: "*.#{postgres_resource.ubid}.pg.example.com").id})
+      expect { nx.initialize_certificates }.to nap(600)
+    end
+
+    it "uses initial cert if avaliable" do
+      expect(Config).to receive(:postgres_service_hostname_v3).and_return("pg.example.com").at_least(:once)
+      DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
+      cert, csr_key = Util.create_certificate(subject: "/CN=" + postgres_resource.cert_hostname, duration: 60 * 60 * 24 * 30 * 3)
+      nx.postgres_resource.update(hostname_version: "v3", server_cert: nil)
+      refresh_frame(nx, new_values: {"use_publicly_signed_certificates" => true, "initial_cert_id" => Cert.create(hostname: "*.#{postgres_resource.ubid}.pg.example.com", cert: cert.to_s, csr_key: csr_key.to_der).id})
+      expect { nx.initialize_certificates }.to hop("wait_servers")
+      expect(nx.postgres_resource.server_cert).to eq cert.to_s
+      expect(nx.postgres_resource.server_cert_key).to eq OpenSSL::PKey::EC.new(csr_key.to_der).to_pem
     end
 
     it "naps if there are children" do
-      DnsZone.create(project_id: postgres_project.id, name: "postgres.ubicloud.com")
-      expect(Config).to receive(:postgres_service_hostname).and_return("postgres.ubicloud.com").at_least(:once)
       st.update(label: "initialize_certificates")
       Strand.create(parent: st, prog: "Postgres::PostgresResourceNexus", label: "trigger_pg_current_xact_id_on_parent", lease: Time.now + 10)
+
+      nx.postgres_resource.update(root_cert_1: "rc1", client_root_cert_1: "crc1")
       expect { nx.initialize_certificates }.to nap(5)
+      expect(nx.postgres_resource.this
+        .where(root_cert_1: "rc1", client_root_cert_1: "crc1")
+        .count).to eq 1
     end
   end
 
@@ -443,6 +803,68 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
       expect { nx.refresh_certificates }.to hop("wait")
       expect(Semaphore.where(strand_id: postgres_server.strand.id, name: "refresh_certificates").first).to exist
     end
+
+    it "works when using publicly signed certificates" do
+      DnsZone.create(project_id: postgres_project.id, name: "pg.ubicloud.app")
+      postgres_server
+      short_server_cert_pem, short_server_key_pem = Util.create_certificate(
+        subject: "/CN=Test Server",
+        extensions: ["keyUsage=digitalSignature"],
+        duration: 60 * 60 * 24 * 12,
+        issuer_cert: OpenSSL::X509::Certificate.new(postgres_resource.root_cert_1),
+        issuer_key: OpenSSL::PKey::EC.new(postgres_resource.root_cert_key_1),
+      ).map(&:to_pem)
+      short_client_cert_pem, short_client_key_pem = Util.create_certificate(
+        subject: "/CN=Test Server",
+        extensions: ["keyUsage=digitalSignature"],
+        duration: 60 * 60 * 24 * 29,
+        issuer_cert: OpenSSL::X509::Certificate.new(postgres_resource.client_root_cert_1),
+        issuer_key: OpenSSL::PKey::EC.new(postgres_resource.client_root_cert_key_1),
+      ).map(&:to_pem)
+      postgres_resource.update(server_cert: short_server_cert_pem, server_cert_key: short_server_key_pem, client_cert: short_client_cert_pem, client_cert_key: short_client_key_pem, hostname_version: "v3")
+
+      refresh_frame(nx, new_values: {"use_publicly_signed_certificates" => true})
+      expect { nx.refresh_certificates }.to hop("wait_refresh_public_cert")
+      expect(postgres_resource.server_cert).to eq short_server_cert_pem
+      expect(postgres_resource.server_cert_key).to eq short_server_key_pem
+      expect(Semaphore.where(strand_id: postgres_server.strand.id, name: "refresh_certificates").first).to exist
+      expect(postgres_resource.strand.stack[0]["refresh_cert_id"]).to eq postgres_resource.strand.stack[0]["current_cert_id"]
+      cert = Cert.with_pk!(postgres_resource.strand.stack[0]["refresh_cert_id"])
+      expect(cert.hostname).to eq "*.#{postgres_resource.ubid}.pg.ubicloud.app"
+      expect(cert.private_hostname).to eq "*.#{postgres_resource.ubid}.private.pg.ubicloud.app"
+      expect(cert.strand.label).to eq "start"
+      expect(cert.strand.stack[0]["waiting_strand_id"]).to eq postgres_resource.id
+    end
+  end
+
+  describe "#wait_refresh_public_cert" do
+    let(:cert) do
+      Prog::Vnet::CertNexus.assemble(postgres_resource.cert_hostname, postgres_resource.dns_zone.id, private_hostname: postgres_resource.cert_private_hostname).subject
+    end
+
+    before do
+      DnsZone.create(project_id: postgres_project.id, name: "postgres.ubicloud.com")
+      allow(Config).to receive(:postgres_service_hostname_v3).and_return("postgres.ubicloud.com")
+      postgres_server
+      refresh_frame(nx, new_values: {"use_publicly_signed_certificates" => true, "refresh_cert_id" => cert.id})
+    end
+
+    it "naps if cert not ready" do
+      expect { nx.wait_refresh_public_cert }.to nap(600)
+    end
+
+    it "updates cert and hops if cert is ready" do
+      server_cert, server_cert_key = Util.create_certificate(
+        subject: "/CN=Test Server",
+        extensions: ["keyUsage=digitalSignature"],
+        duration: 60 * 60 * 24 * 29,
+      )
+      cert.update(cert: server_cert.to_pem, csr_key: server_cert_key.to_der)
+      expect { nx.wait_refresh_public_cert }.to hop("wait")
+      expect(postgres_resource.reload.server_cert).to eq server_cert.to_pem
+      expect(postgres_resource.server_cert_key).to eq server_cert_key.to_pem
+      expect(Semaphore.where(strand_id: postgres_server.strand.id, name: "refresh_certificates").first).to exist
+    end
   end
 
   describe "#wait_servers" do
@@ -471,6 +893,7 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
 
       expect { nx.update_billing_records }.to hop("wait")
       expect(BillingRecord.where(resource_id: postgres_resource.id).count).to eq(2)
+      expect(BillingRecord.where(resource_id: postgres_resource.id).map { it.resource_tags["slot"] }).to contain_exactly("primary-vcpu", "primary-storage")
     end
 
     it "creates standby billing records for HA enabled resources" do
@@ -479,12 +902,9 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
       project.update(billable: true)
 
       expect { nx.update_billing_records }.to hop("wait")
-      # 2 primary records (VCpu + Storage) + 2 standby records (StandbyVCpu + StandbyStorage) = 4 total
-      billing_records = BillingRecord.where(resource_id: postgres_resource.id).all
-      expect(billing_records.count).to eq(4)
-      # Check billing rates include standby types
-      resource_types = billing_records.map { it.billing_rate["resource_type"] }
-      expect(resource_types).to include("PostgresStandbyVCpu", "PostgresStandbyStorage")
+      expect(BillingRecord.where(resource_id: postgres_resource.id).count).to eq(4)
+      expect(BillingRecord.where(resource_id: postgres_resource.id).map { it.billing_rate["resource_type"] }).to include("PostgresStandbyVCpu", "PostgresStandbyStorage")
+      expect(BillingRecord.where(resource_id: postgres_resource.id).map { it.resource_tags["slot"] }).to contain_exactly("primary-vcpu", "primary-storage", "standby-vcpu-0", "standby-storage-0")
     end
 
     it "does not recreate billing records when they match existing records" do
@@ -499,6 +919,7 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
         resource_name: postgres_resource.name,
         billing_rate_id: vcpu_rate_id,
         amount: 2,
+        resource_tags: {"slot" => "primary-vcpu"},
       )
       br_storage = BillingRecord.create(
         project_id: project.id,
@@ -506,6 +927,7 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
         resource_name: postgres_resource.name,
         billing_rate_id: storage_rate_id,
         amount: 64,
+        resource_tags: {"slot" => "primary-storage"},
       )
 
       expect { nx.update_billing_records }.to hop("wait")
@@ -529,6 +951,7 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
         billing_rate_id: vcpu_rate_id,
         amount: 4,
         span: past_span,
+        resource_tags: {"slot" => "primary-vcpu"},
       )
       br_storage = BillingRecord.create(
         project_id: project.id,
@@ -537,6 +960,7 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
         billing_rate_id: storage_rate_id,
         amount: 128,
         span: past_span,
+        resource_tags: {"slot" => "primary-storage"},
       )
 
       expect { nx.update_billing_records }.to hop("wait")
@@ -568,15 +992,15 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
       expect { nx.wait }.to hop("refresh_certificates")
     end
 
-    it "hops to refresh_certificates when refresh_certificates is set" do
-      nx.incr_refresh_certificates
+    it "hops to refresh_certificates if the certificate is checked more than 7 days ago if using publicly signed certificates" do
+      postgres_resource.update(certificate_last_checked_at: Time.now - 60 * 60 * 24 * 7 - 1)
+      refresh_frame(nx, new_values: {"use_publicly_signed_certificates" => true})
       expect { nx.wait }.to hop("refresh_certificates")
     end
 
-    it "calls set_firewall_rules method of the postgres resource when update_firewall_rules is set" do
-      nx.incr_update_firewall_rules
-      expect { nx.wait }.to nap(30)
-      expect(Semaphore.where(strand_id: st.id, name: "update_firewall_rules")).to be_empty
+    it "hops to refresh_certificates when refresh_certificates is set" do
+      nx.incr_refresh_certificates
+      expect { nx.wait }.to hop("refresh_certificates")
     end
 
     it "calls handle_storage_auto_scale when check_disk_usage is set and decrements the semaphore" do
@@ -624,20 +1048,77 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
         Firewall.create(name: "#{postgres_resource.ubid}-internal-firewall", location_id:, project: postgres_project)
       end
 
-      it "triggers server deletion and waits until it is deleted" do
-        postgres_server
-        expect(Config).to receive(:postgres_service_hostname).and_return("pg.example.com").at_least(:once)
-        DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
+      {"v2" => :postgres_service_hostname, "v3" => :postgres_service_hostname_v3}.each do |hostname_version, config_var|
+        it "triggers server deletion and waits until it is deleted for hostname version #{hostname_version}" do
+          postgres_server
+          postgres_resource.update(hostname_version:)
+          expect(Config).to receive(config_var).and_return("pg.example.com").at_least(:once)
+          dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
 
-        expect { nx.wait_children_destroyed }.to exit({"msg" => "postgres resource is deleted"})
-        expect(Semaphore.where(strand_id: postgres_server.strand.id, name: "destroy").first).to exist
-        expect(postgres_resource).not_to exist
+          if hostname_version == "v3"
+            cert = Prog::Vnet::CertNexus.assemble("test.postgres.exampe.com", dns_zone.id)
+            refresh_frame(nx, new_values: {"current_cert_id" => cert.id})
+          end
+          expect { nx.wait_children_destroyed }.to exit({"msg" => "postgres resource is deleted"})
+          expected_destroy_strands = if hostname_version == "v3"
+            [postgres_server.id, cert.id].sort
+          else
+            [postgres_server.id]
+          end
+          expect(Semaphore.where(name: "destroy").select_order_map(:strand_id)).to eq expected_destroy_strands
+          expect(postgres_resource).not_to exist
+        end
       end
 
       it "completes destroy even if dns zone is not configured" do
         postgres_server
         expect { nx.wait_children_destroyed }.to exit({"msg" => "postgres resource is deleted"})
         expect(postgres_resource).not_to exist
+      end
+
+      it "starts an independent strand to tear down log aggregation if a parseable stream is provisioned" do
+        postgres_server
+        ubid = postgres_resource.ubid
+        postgres_resource.update(parseable_password: "dummy")
+
+        expect { nx.wait_children_destroyed }.to exit({"msg" => "postgres resource is deleted"})
+
+        strand = Strand.first(prog: "Postgres::TeardownLogAggregation")
+        expect(strand.label).to eq("start")
+        expect(strand.parent_id).to be_nil
+        expect(strand.stack[0]["ubid"]).to eq(ubid)
+      end
+
+      it "does not start a teardown strand if log aggregation was never set up" do
+        postgres_server
+
+        expect { nx.wait_children_destroyed }.to exit({"msg" => "postgres resource is deleted"})
+
+        expect(Strand.first(prog: "Postgres::TeardownLogAggregation")).to be_nil
+      end
+
+      it "resolves resource-keyed pages so they do not orphan after the resource is gone" do
+        postgres_server
+        tags = %w[PGStorageAutoScaleMaxSize PGStorageAutoScaleQuotaInsufficient PGStorageAutoScaleCanceled PostgresUpgradeFailed]
+        pages = tags.map { Prog::PageNexus.assemble("#{postgres_resource.ubid} #{it}", [it, postgres_resource.id], postgres_resource.ubid, resource_id: postgres_resource.id).subject }
+        pages << Prog::PageNexus.assemble("#{postgres_resource.ubid} has an expired deadline!", ["Deadline", postgres_resource.id, "Postgres::PostgresResourceNexus", "wait"], postgres_resource.ubid, resource_id: postgres_resource.id).subject
+        decoy = Prog::PageNexus.assemble("#{postgres_server.ubid} PGDiskUsageHigh", ["PGDiskUsageHigh", postgres_server.id], postgres_server.ubid, resource_id: postgres_server.id).subject
+
+        expect { nx.wait_children_destroyed }.to exit({"msg" => "postgres resource is deleted"})
+
+        pages.each do |page|
+          expect(Semaphore.where(strand_id: page.id, name: "resolve").count).to eq(1)
+        end
+        expect(Semaphore.where(strand_id: decoy.id, name: "resolve").count).to eq(0)
+      end
+
+      it "resolves a page that predates resource_id and carries the resource id only in its tag" do
+        legacy = Page.create(tag: Page.generate_tag(["PGStorageAutoScaleMaxSize", postgres_resource.id]))
+        Strand.create_with_id(legacy, prog: "PageNexus", label: "wait")
+
+        expect { nx.wait_children_destroyed }.to exit({"msg" => "postgres resource is deleted"})
+
+        expect(Semaphore.where(strand_id: legacy.id, name: "resolve").count).to eq(1)
       end
     end
   end

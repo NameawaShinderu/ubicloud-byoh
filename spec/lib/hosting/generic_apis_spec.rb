@@ -1,238 +1,150 @@
 # frozen_string_literal: true
 
 RSpec.describe Hosting::GenericApis do
-  let(:vmh) {
+  let(:vm_host) {
     vmh = create_vm_host
     vmh.sshable.update(host: "203.0.113.42")
     vmh
   }
 
-  let(:routed_networks) {
-    [
-      {"cidr" => "203.0.113.40/29", "is_failover" => false},
-      {"cidr" => "2001:db8:dead::/64", "is_failover" => false},
-    ]
-  }
-
-  let(:config_hash) {
+  let(:config) {
     {
       "main_ip4" => "203.0.113.42",
       "location_label" => "homelab-rack-A",
-      "routed_networks" => routed_networks,
+      "routed_networks" => [{"cidr" => "10.99.0.0/29"}, {"cidr" => "2001:db8:dead::/64"}],
     }
   }
 
-  let(:generic_host) {
+  let(:host_provider) {
     HostProvider.create do |hp|
-      hp.id = vmh.id
+      hp.id = vm_host.id
       hp.server_identifier = "byoh-test-1"
       hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
-      hp.config = config_hash
+      hp.config = config
     end
   }
 
-  let(:generic_apis) { described_class.new(generic_host) }
+  let(:api) { host_provider.api }
 
-  describe "pull_ips" do
-    it "returns only IPv4 entries from operator-declared routed networks (v6 is stored on vm_host.net6)" do
-      result = generic_apis.pull_ips
-      expect(result.map(&:ip_address)).to contain_exactly("203.0.113.40/29")
-      expect(result[0]).to have_attributes(
-        source_host_ip: "203.0.113.42",
-        is_failover: false,
-      )
+  let(:bmc) {
+    {"protocol" => "redfish", "endpoint" => "https://bmc.example", "username" => "admin", "password" => "s3cret", "verify_ssl" => false}
+  }
+
+  def with_config(**changes)
+    host_provider.update(config: config.merge(changes.transform_keys(&:to_s)))
+    described_class.new(host_provider.reload)
+  end
+
+  def stub_redfish_system(power_state: "On")
+    Excon.stub({path: "/redfish/v1/Systems", method: :get},
+      {status: 200, body: {"Members" => [{"@odata.id" => "/redfish/v1/Systems/1"}]}.to_json})
+    Excon.stub({path: "/redfish/v1/Systems/1", method: :get},
+      {status: 200, body: {"PowerState" => power_state, "Actions" => {"#ComputerSystem.Reset" => {"target" => "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"}}}.to_json})
+  end
+
+  def expect_reset_type(reset_type)
+    Excon.stub({path: "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", method: :post}, lambda { |req|
+      expect(JSON.parse(req[:body])).to eq("ResetType" => reset_type)
+      {status: 204, body: ""}
+    })
+  end
+
+  it "is what HostProvider#api returns for a generic provider" do
+    expect(api).to be_a(described_class)
+  end
+
+  describe "#pull_ips" do
+    it "returns the declared IPv4 networks after the management /32" do
+      expect(api.pull_ips.map { [it.ip_address, it.source_host_ip] }).to eq([
+        ["203.0.113.42/32", "203.0.113.42"],
+        ["10.99.0.0/29", "203.0.113.42"],
+      ])
     end
 
-    it "auto-prepends the management IP as /32 when not covered by any declared block" do
-      generic_host.update(config: {
-        "main_ip4" => "203.0.113.42",
-        "routed_networks" => [{"cidr" => "10.99.0.0/24"}],
+    it "lets the host claim only the management address" do
+      expect(api.pull_ips.map { [it.host_only?, it.host_connectivity?] }).to eq([[true, false], [false, false]])
+    end
+
+    it "omits the management /32 when a declared block covers it" do
+      ips = with_config(routed_networks: [{"cidr" => "203.0.113.40/29"}]).pull_ips
+      expect(ips.map(&:ip_address)).to eq(["203.0.113.40/29"])
+    end
+
+    it "uses the sshable host even when main_ip4 differs" do
+      ips = with_config(main_ip4: "1.2.3.4", routed_networks: []).pull_ips
+      expect(ips.map(&:ip_address)).to eq(["203.0.113.42/32"])
+    end
+
+    it "returns only the management /32 without a config" do
+      host_provider.update(config: nil)
+      expect(described_class.new(host_provider.reload).pull_ips.map(&:ip_address)).to eq(["203.0.113.42/32"])
+    end
+  end
+
+  describe "#reimage" do
+    it "raises CapabilityMissing because BYOH hosts have no PXE server" do
+      expect { with_config(bmc:).reimage }.to raise_error(Hosting::CapabilityMissing, /does not support automated reimage/)
+    end
+  end
+
+  describe "without a Redfish BMC" do
+    it "raises CapabilityMissing for hardware_reset and power_on" do
+      expect { api.hardware_reset }.to raise_error(Hosting::CapabilityMissing, /hardware reset must be performed manually/)
+      expect { api.power_on }.to raise_error(Hosting::CapabilityMissing, /power on must be performed manually/)
+    end
+
+    it "reports that power status is unavailable" do
+      expect(api.power_status).to eq("no Redfish BMC configured")
+    end
+
+    it "treats a bmc section without an endpoint as no BMC" do
+      expect { with_config(bmc: {"username" => "admin"}).hardware_reset }.to raise_error(Hosting::CapabilityMissing)
+    end
+
+    it "treats a non-redfish protocol as no BMC" do
+      expect { with_config(bmc: bmc.merge("protocol" => "ipmi")).hardware_reset }.to raise_error(Hosting::CapabilityMissing)
+    end
+  end
+
+  describe "with a Redfish BMC" do
+    it "power-cycles with ForceRestart by default" do
+      stub_redfish_system
+      expect_reset_type("ForceRestart")
+      expect(with_config(bmc:).hardware_reset).to be_nil
+    end
+
+    it "honors a configured reset_type" do
+      stub_redfish_system
+      expect_reset_type("PowerCycle")
+      expect(with_config(bmc: bmc.merge("reset_type" => "PowerCycle")).hardware_reset).to be_nil
+    end
+
+    it "powers on with the On reset type" do
+      stub_redfish_system(power_state: "Off")
+      expect_reset_type("On")
+      expect(with_config(bmc:).power_on).to be_nil
+    end
+
+    it "does not power on a system that is already on" do
+      stub_redfish_system(power_state: "On")
+      expect(with_config(bmc:).power_on).to be_nil
+    end
+
+    it "reports the Redfish power state" do
+      stub_redfish_system(power_state: "Off")
+      expect(with_config(bmc:).power_status).to eq("redfish: Off")
+    end
+
+    it "reads the password from password_env when set" do
+      stub_redfish_system
+      Excon.stub({path: "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", method: :post}, lambda { |req|
+        expect(req[:password]).to eq("from-env")
+        {status: 204, body: ""}
       })
-      result = described_class.new(generic_host.reload).pull_ips
-      expect(result.map(&:ip_address)).to eq(["203.0.113.42/32", "10.99.0.0/24"])
-    end
-
-    it "does NOT prepend the management /32 when it's already inside a declared block" do
-      generic_host.update(config: {
-        "main_ip4" => "203.0.113.42",
-        "routed_networks" => [{"cidr" => "203.0.113.40/29"}],
-      })
-      result = described_class.new(generic_host.reload).pull_ips
-      expect(result.map(&:ip_address)).to eq(["203.0.113.40/29"])
-    end
-
-    it "returns just the auto-prepended management /32 when no routed networks are configured" do
-      generic_host.update(config: {})
-      result = described_class.new(generic_host.reload).pull_ips
-      expect(result.map(&:ip_address)).to eq(["203.0.113.42/32"])
-    end
-
-    it "honors is_failover flag from config" do
-      generic_host.update(config: {
-        "main_ip4" => "203.0.113.42",
-        "routed_networks" => [
-          {"cidr" => "203.0.113.99/32", "is_failover" => true},
-        ],
-      })
-      result = described_class.new(generic_host.reload).pull_ips
-      failover = result.find { |r| r.ip_address == "203.0.113.99/32" }
-      expect(failover.is_failover).to be(true)
-    end
-
-    it "uses sshable.host as source_host_ip regardless of what main_ip4 says" do
-      generic_host.update(config: {"main_ip4" => "1.2.3.4", "routed_networks" => [{"cidr" => "10.0.0.0/29"}]})
-      result = described_class.new(generic_host.reload).pull_ips
-      expect(result.first.source_host_ip).to eq("203.0.113.42")
-    end
-
-    it "uses a per-network source_host_ip when the operator declared one" do
-      generic_host.update(config: {"routed_networks" => [{"cidr" => "10.0.0.0/29", "source_host_ip" => "10.0.0.1"}]})
-      result = described_class.new(generic_host.reload).pull_ips
-      expect(result.map { [it.ip_address, it.source_host_ip] }).to eq([["203.0.113.42/32", "203.0.113.42"], ["10.0.0.0/29", "10.0.0.1"]])
-    end
-  end
-
-  describe "pull_dc" do
-    it "returns the operator-supplied location label" do
-      expect(generic_apis.pull_dc("any")).to eq("homelab-rack-A")
-    end
-
-    it "returns a sensible default when no label is set" do
-      generic_host.update(config: {})
-      expect(described_class.new(generic_host.reload).pull_dc(nil)).to eq("byoh-unknown")
-    end
-  end
-
-  describe "reimage" do
-    it "raises CapabilityMissing when no BMC is configured" do
-      expect { generic_apis.reimage("byoh-test-1") }
-        .to raise_error(Hosting::CapabilityMissing, /does not support automated reimage/)
-    end
-
-    it "still raises CapabilityMissing even when a Redfish BMC IS configured (Ubicloud doesn't run a PXE server for BYOH hosts)" do
-      generic_host.update(config: config_hash.merge("bmc" => {
-        "protocol" => "redfish",
-        "endpoint" => "https://bmc.example",
-        "username" => "admin",
-        "password" => "s3cret",
-      }))
-      expect { described_class.new(generic_host.reload).reimage("byoh-test-1") }
-        .to raise_error(Hosting::CapabilityMissing, /does not support automated reimage/)
-    end
-  end
-
-  describe "reset" do
-    it "raises CapabilityMissing when no BMC is configured" do
-      expect { generic_apis.reset("byoh-test-1") }
-        .to raise_error(Hosting::CapabilityMissing, /no Redfish BMC endpoint/)
-    end
-
-    it "power-cycles the host via Redfish when a BMC is configured" do
-      generic_host.update(config: config_hash.merge("bmc" => {
-        "protocol" => "redfish",
-        "endpoint" => "https://bmc.example",
-        "username" => "admin",
-        "password" => "s3cret",
-        "verify_ssl" => false,
-      }))
-      Excon.stub({path: "/redfish/v1/Systems", method: :get},
-        {status: 200, body: {"Members" => [{"@odata.id" => "/redfish/v1/Systems/1"}]}.to_json})
-      Excon.stub({path: "/redfish/v1/Systems/1", method: :get},
-        {status: 200, body: {"Actions" => {"#ComputerSystem.Reset" => {"target" => "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"}}}.to_json})
-      Excon.stub(
-        {path: "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", method: :post},
-        ->(req) {
-          expect(JSON.parse(req[:body])).to eq("ResetType" => "ForceRestart")
-          {status: 204, body: ""}
-        },
-      )
-
-      expect(described_class.new(generic_host.reload).reset("byoh-test-1")).to be_nil
-    end
-
-    it "honors bmc.reset_type override for BMCs that need PowerCycle" do
-      generic_host.update(config: config_hash.merge("bmc" => {
-        "protocol" => "redfish",
-        "endpoint" => "https://bmc.example",
-        "username" => "admin",
-        "password" => "s3cret",
-        "verify_ssl" => false,
-        "system_id" => "Self",
-        "reset_type" => "PowerCycle",
-      }))
-      Excon.stub({path: "/redfish/v1/Systems/Self", method: :get},
-        {status: 200, body: {"Actions" => {"#ComputerSystem.Reset" => {"target" => "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset"}}}.to_json})
-      Excon.stub(
-        {path: "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset", method: :post},
-        ->(req) {
-          expect(JSON.parse(req[:body])).to eq("ResetType" => "PowerCycle")
-          {status: 204, body: ""}
-        },
-      )
-
-      expect(described_class.new(generic_host.reload).reset("byoh-test-1")).to be_nil
-    end
-
-    it "raises CapabilityMissing when the bmc section has no endpoint" do
-      generic_host.update(config: config_hash.merge("bmc" => {"username" => "admin"}))
-      expect { described_class.new(generic_host.reload).reset("byoh-test-1") }
-        .to raise_error(Hosting::CapabilityMissing, /no Redfish BMC endpoint/)
-    end
-
-    it "raises CapabilityMissing when protocol is ipmi (v1 is redfish-only)" do
-      generic_host.update(config: config_hash.merge("bmc" => {
-        "protocol" => "ipmi",
-        "endpoint" => "192.168.1.11",
-        "username" => "admin",
-        "password" => "s3cret",
-      }))
-      expect { described_class.new(generic_host.reload).reset("byoh-test-1") }
-        .to raise_error(Hosting::CapabilityMissing, /no Redfish BMC endpoint/)
-    end
-
-    it "reads the BMC password from an env var when password_env is set" do
-      ENV["TEST_BMC_PASSWORD"] = "from-env"
-      begin
-        generic_host.update(config: config_hash.merge("bmc" => {
-          "protocol" => "redfish",
-          "endpoint" => "https://bmc.example",
-          "username" => "admin",
-          "password_env" => "TEST_BMC_PASSWORD",
-          "verify_ssl" => false,
-          "system_id" => "1",
-        }))
-        Excon.stub({path: "/redfish/v1/Systems/1", method: :get},
-          {status: 200, body: {"Actions" => {"#ComputerSystem.Reset" => {"target" => "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"}}}.to_json})
-
-        captured_auth = nil
-        Excon.stub(
-          {path: "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", method: :post},
-          ->(req) {
-            captured_auth = req[:headers]["Authorization"]
-            {status: 204, body: ""}
-          },
-        )
-        described_class.new(generic_host.reload).reset("byoh-test-1")
-
-        # Excon sets Authorization: Basic base64(user:password). Decode and verify.
-        expect(captured_auth).to start_with("Basic ")
-        decoded = Base64.decode64(captured_auth.sub("Basic ", ""))
-        expect(decoded).to eq("admin:from-env")
-      ensure
-        ENV.delete("TEST_BMC_PASSWORD")
-      end
-    end
-  end
-
-  describe "set_server_name" do
-    it "is a no-op for BYOH hosts" do
-      expect(generic_apis.set_server_name("byoh-test-1", "new-name")).to be_nil
-    end
-  end
-
-  describe "factory integration with HostProvider#api" do
-    it "HostProvider#api returns a Hosting::GenericApis instance for generic provider" do
-      expect(generic_host.api).to be_a(described_class)
+      ENV["BYOH_TEST_BMC_PASS"] = "from-env"
+      with_config(bmc: bmc.except("password").merge("password_env" => "BYOH_TEST_BMC_PASS")).hardware_reset
+    ensure
+      ENV.delete("BYOH_TEST_BMC_PASS")
     end
   end
 end

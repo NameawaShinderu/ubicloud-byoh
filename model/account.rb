@@ -23,6 +23,10 @@ class Account < Sequel::Model(:accounts)
 
   FREE_MAIL_DOMAINS = %w[gmail.com outlook.com hotmail.com yahoo.com icloud.com protonmail.com proton.me].freeze
 
+  def self.open_with_email(email)
+    exclude(status_id: 3)[email:]
+  end
+
   def provider_names
     identities.map(&:provider).join(", ")
   end
@@ -47,17 +51,14 @@ class Account < Sequel::Model(:accounts)
   end
 
   def first_sole_project_with_resources
-    Project
-      .where(id: DB[:access_tag]
-        .select_group(:project_id)
-        .where(project_id: projects_dataset.select(Sequel[:project][:id]))
-        .having(Sequel.function(:count).* => 1))
+    projects_dataset
+      .where_sole_admin_is(self)
       .first_project_with_resources
   end
 
   def suspend
     update(suspended_at: Time.now)
-    DB[:account_active_session_keys].where(account_id: id).delete(force: true)
+    DB[:account_active_session_keys].where(account_id: id).delete
     api_keys_dataset.update(is_valid: false)
     PaymentMethod.where(billing_info_id: projects_dataset.select(:billing_info_id)).update(fraud: true)
     ProjectInvitation.where(inviter_id: id).destroy
@@ -71,17 +72,19 @@ end
 
 # Table: accounts
 # Columns:
-#  id           | uuid                     | PRIMARY KEY
-#  status_id    | integer                  | NOT NULL DEFAULT 1
-#  email        | citext                   | NOT NULL
-#  name         | text                     |
-#  created_at   | timestamp with time zone | NOT NULL DEFAULT now()
-#  suspended_at | timestamp with time zone |
+#  id            | uuid                     | PRIMARY KEY
+#  status_id     | integer                  | NOT NULL DEFAULT 1
+#  email         | citext                   | NOT NULL
+#  name          | text                     |
+#  created_at    | timestamp with time zone | NOT NULL DEFAULT now()
+#  suspended_at  | timestamp with time zone |
+#  project_limit | integer                  | NOT NULL DEFAULT 10
 # Indexes:
 #  accounts_pkey        | PRIMARY KEY btree (id)
 #  accounts_email_index | UNIQUE btree (email) WHERE status_id = ANY (ARRAY[1, 2])
 # Check constraints:
-#  valid_email | (email ~ '^[^,;@ \r\n]+@[^,@; \r\n]+\.[^,@; \r\n]+$'::citext)
+#  project_limit_positive | (project_limit > 0)
+#  valid_email            | (email ~ '^[^,;@ \r\n]+@[^,@; \r\n]+\.[^,@; \r\n]+$'::citext)
 # Foreign key constraints:
 #  accounts_status_id_fkey | (status_id) REFERENCES account_statuses(id)
 # Referenced By:
@@ -105,6 +108,7 @@ end
 #  account_remember_keys            | account_remember_keys_id_fkey                    | (id) REFERENCES accounts(id)
 #  account_session_keys             | account_session_keys_id_fkey                     | (id) REFERENCES accounts(id)
 #  account_sms_codes                | account_sms_codes_id_fkey                        | (id) REFERENCES accounts(id)
+#  account_source                   | account_source_account_id_fkey                   | (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 #  account_verification_keys        | account_verification_keys_id_fkey                | (id) REFERENCES accounts(id)
 #  account_webauthn_keys            | account_webauthn_keys_account_id_fkey            | (account_id) REFERENCES accounts(id)
 #  account_webauthn_user_ids        | account_webauthn_user_ids_id_fkey                | (id) REFERENCES accounts(id)

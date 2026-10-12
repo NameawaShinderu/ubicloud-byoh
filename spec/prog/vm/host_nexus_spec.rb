@@ -8,11 +8,11 @@ RSpec.describe Prog::Vm::HostNexus do
   let(:st) { described_class.assemble("192.168.0.1") }
   let(:hetzner_ips) {
     [
-      ["127.0.0.1", "127.0.0.1", false],
-      ["30.30.30.32/29", "127.0.0.1", true],
-      ["2a01:4f8:10a:128b::/64", "127.0.0.1", true],
+      ["127.0.0.1/32", "127.0.0.1"],
+      ["30.30.30.32/29", "127.0.0.1"],
+      ["2a01:4f8:10a:128b::/64", "127.0.0.1"],
     ].map {
-      Hosting::HetznerApis::IpInfo.new(ip_address: _1, source_host_ip: _2, is_failover: _3)
+      Hosting::HetznerApis::IpInfo.new(ip_address: _1, source_host_ip: _2)
     }
   }
 
@@ -43,12 +43,16 @@ RSpec.describe Prog::Vm::HostNexus do
     end
 
     it "creates addresses properly and sets the server name for a hetzner host" do
-      expect(Hosting::Apis).to receive(:pull_ips).and_return(hetzner_ips)
-      expect(Hosting::Apis).to receive(:pull_data_center).and_return("fsn1-dc14")
-      expect(Hosting::Apis).to receive(:set_server_name).and_return(nil)
+      api = instance_double(Hosting::HetznerApis)
+      allow(Hosting::ProviderApis).to receive(:for).and_return(api)
+      expect(api).to receive(:pull_ips).and_return(hetzner_ips)
+      expect(api).to receive(:pull_data_center).and_return("fsn1-dc14")
+      expect(api).to receive(:pull_inventory).and_return(server_model: "AX102")
+      expect(api).to receive(:set_server_name).and_return(nil)
       st = described_class.assemble("127.0.0.1", provider_name: HostProvider::HETZNER_PROVIDER_NAME, server_identifier: "1")
       expect(st).to be_a Strand
       expect(st.label).to eq("start")
+      expect(st.subject.inventory.server_model).to eq "AX102"
       expect(st.subject.assigned_subnets.count).to eq(3)
       expect(st.subject.assigned_subnets.map { it.cidr.to_s }.sort).to eq(["127.0.0.1/32", "30.30.30.32/29", "2a01:4f8:10a:128b::/64"].sort)
 
@@ -58,11 +62,93 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(st.subject.data_center).to eq("fsn1-dc14")
     end
 
+    it "creates addresses from the leaseweb api" do
+      allow(Config).to receive_messages(
+        leaseweb_connection_string: "https://api.leaseweb.com",
+        leaseweb_api_key: "key123",
+      )
+      rows = [
+        {ip: "216.22.50.197/26", prefixLength: 26, type: "NORMAL_IP", networkType: "PUBLIC", mainIp: true, gateway: "216.22.50.254"},
+        {ip: "216.22.15.64/26", prefixLength: 26, type: "NORMAL_IP", networkType: "PUBLIC", mainIp: false, gateway: ""},
+        {ip: "216.22.15.65/26", prefixLength: 26, type: "NORMAL_IP", networkType: "PUBLIC", mainIp: false, gateway: ""},
+        {ip: "2607:f5b7:3:104::_64/64", prefixLength: 64, type: "NORMAL_IP", networkType: "PUBLIC", mainIp: false, gateway: ""},
+      ]
+      stub_request(:get, "https://api.leaseweb.com/bareMetals/v2/servers/123/ips").with(query: {limit: 50, offset: 0})
+        .to_return(status: 200, body: JSON.generate(ips: rows, _metadata: {totalCount: rows.length}))
+      stub_request(:get, "https://api.leaseweb.com/bareMetals/v2/servers/123")
+        .to_return(status: 200, body: JSON.generate(
+          location: {site: "AMS-01", suite: "8", rack: "9200"},
+          rack: {capacity: "10G"},
+          specs: {
+            chassis: "HPE RL300",
+            cpu: {type: "Ampere Altra Max M128-30", quantity: 2},
+            ram: {size: 512, unit: "GB"},
+            hdd: [{size: 3.84, unit: "TB", amount: 2, type: "NVME"}],
+          },
+          contract: {billingCycle: 1, billingFrequency: "MONTH", pricePerFrequency: "512.34", currency: "EUR"},
+        ))
+      stub_request(:put, "https://api.leaseweb.com/bareMetals/v2/servers/123").to_return(status: 204)
+
+      st = described_class.assemble("216.22.50.197", provider_name: HostProvider::LEASEWEB_PROVIDER_NAME, server_identifier: "123")
+      expect(st.subject.provider_name).to eq(HostProvider::LEASEWEB_PROVIDER_NAME)
+      expect(st.subject.data_center).to eq("AMS-01-8-9200")
+      expect(st.subject.inventory).to have_attributes(
+        server_model: "HPE RL300",
+        cpu: "2x Ampere Altra Max M128-30",
+        memory: "512GB",
+        storage: "2x 3.84TB NVMe SSD",
+        uplink: "10Gbps",
+        gpu: nil,
+        monthly_price: BigDecimal("512.34"),
+        currency: "EUR",
+      )
+      expect(st.subject.assigned_subnets.map { it.cidr.to_s }.sort).to eq(["216.22.15.64/26", "216.22.50.197/32", "2607:f5b7:3:104::/64"])
+      # Only the gatewayed main IP is claimed; the routed block and prefix are VM space.
+      expect(st.subject.assigned_host_addresses.map { it.ip.to_s }).to eq ["216.22.50.197/32"]
+      # The block's network and broadcast addresses stay out of the VM pool.
+      expect(DB[:ipv4_address].select_order_map(:ip).map(&:to_s)).to eq((65..126).map { "216.22.15.#{it}" })
+    end
+
+    it "creates addresses from the leaseweb-eu org with its own key" do
+      allow(Config).to receive_messages(
+        leaseweb_connection_string: "https://api.leaseweb.com",
+        leaseweb_eu_api_key: "eu-key",
+      )
+      rows = [
+        {ip: "212.95.60.214/26", prefixLength: 26, type: "NORMAL_IP", networkType: "PUBLIC", mainIp: true, gateway: "212.95.60.254"},
+      ]
+      eu = {headers: {"X-Lsw-Auth" => "eu-key"}}
+      stub_request(:get, "https://api.leaseweb.com/bareMetals/v2/servers/456/ips").with(query: {limit: 50, offset: 0}, **eu)
+        .to_return(status: 200, body: JSON.generate(ips: rows, _metadata: {totalCount: rows.length}))
+      stub_request(:get, "https://api.leaseweb.com/bareMetals/v2/servers/456").with(**eu)
+        .to_return(status: 200, body: JSON.generate(
+          location: {site: "FRA-10", suite: "2", rack: "11"},
+          rack: {capacity: "10G"},
+          specs: {
+            chassis: "Dell R6615",
+            cpu: {type: "AMD EPYC 9354P", quantity: 1},
+            ram: {size: 384, unit: "GB"},
+            hdd: [{size: 1.92, unit: "TB", amount: 2, type: "NVME"}],
+          },
+          contract: {billingCycle: 1, billingFrequency: "MONTH", pricePerFrequency: "441.00", currency: "EUR"},
+        ))
+      stub_request(:put, "https://api.leaseweb.com/bareMetals/v2/servers/456").with(**eu).to_return(status: 204)
+
+      st = described_class.assemble("212.95.60.214", provider_name: HostProvider::LEASEWEB_EU_PROVIDER_NAME, server_identifier: "456")
+      expect(st.subject.provider_name).to eq(HostProvider::LEASEWEB_EU_PROVIDER_NAME)
+      expect(st.subject.data_center).to eq("FRA-10-2-11")
+      expect(st.subject.inventory.monthly_price).to eq(BigDecimal("441.00"))
+      expect(st.subject.assigned_host_addresses.map { it.ip.to_s }).to eq ["212.95.60.214/32"]
+    end
+
     it "does not set the server name in development" do
       expect(Config).to receive(:development?).and_return(true)
-      expect(Hosting::Apis).to receive(:pull_ips).and_return(hetzner_ips)
-      expect(Hosting::Apis).to receive(:pull_data_center).and_return("fsn1-dc14")
-      expect(Hosting::Apis).not_to receive(:set_server_name)
+      api = instance_double(Hosting::HetznerApis)
+      allow(Hosting::ProviderApis).to receive(:for).and_return(api)
+      expect(api).to receive(:pull_ips).and_return(hetzner_ips)
+      expect(api).to receive(:pull_data_center).and_return("fsn1-dc14")
+      expect(api).to receive(:pull_inventory).and_return(server_model: "AX102")
+      expect(api).not_to receive(:set_server_name)
 
       described_class.assemble("127.0.0.1", provider_name: HostProvider::HETZNER_PROVIDER_NAME, server_identifier: "1")
     end
@@ -177,11 +263,49 @@ RSpec.describe Prog::Vm::HostNexus do
         expect(st.subject.provider.server_identifier).to eq("homelab-r1-01")
       end
     end
+
+    it "stores install_os in stack" do
+      st = described_class.assemble("127.0.0.1")
+      expect(st.stack.first["install_os"]).to be false
+
+      st = described_class.assemble("1.2.3.4", install_os: true)
+      expect(st.stack.first["install_os"]).to be true
+    end
+  end
+
+  def assemble_hetzner_host(**)
+    api = instance_double(Hosting::HetznerApis, pull_ips: nil, pull_data_center: "fsn1-dc14", pull_inventory: {server_model: "AX102"}, set_server_name: nil)
+    allow(Hosting::ProviderApis).to receive(:for).and_return(api)
+    described_class.assemble("127.0.0.1", provider_name: HostProvider::HETZNER_PROVIDER_NAME, server_identifier: "1", **)
   end
 
   describe "#start" do
-    it "hops to setup_ssh_keys" do
+    it "hops to install_host_os when assembled with install_os" do
+      st = described_class.assemble("192.168.0.2", install_os: true)
+      expect { described_class.new(st).start }.to hop("install_host_os")
+    end
+
+    it "hops to setup_ssh_keys when not installing the OS" do
       expect { nx.start }.to hop("setup_ssh_keys")
+    end
+  end
+
+  describe "#install_host_os" do
+    it "pushes the Hetzner::InstallOs prog and sets a deadline for a Hetzner host" do
+      nx = described_class.new(assemble_hetzner_host(install_os: true))
+      expect { nx.install_host_os }.to hop("start", "Hetzner::InstallOs")
+      expect(nx.strand.stack.first["deadline_target"]).to eq("setup_ssh_keys")
+    end
+
+    it "hops to setup_ssh_keys without installing when the host is not on Hetzner" do
+      st = described_class.assemble("192.168.0.2", install_os: true)
+      expect { described_class.new(st).install_host_os }.to hop("setup_ssh_keys")
+    end
+
+    it "hops to setup_ssh_keys once the OS is installed" do
+      nx = described_class.new(assemble_hetzner_host(install_os: true))
+      nx.strand.retval = {"msg" => "operating system installed"}
+      expect { nx.install_host_os }.to hop("setup_ssh_keys")
     end
   end
 
@@ -285,16 +409,34 @@ RSpec.describe Prog::Vm::HostNexus do
 
   describe "#bootstrap_rhizome" do
     it "pushes a bootstrap rhizome process" do
-      expect { nx.bootstrap_rhizome }.to raise_error(Prog::Base::Hop) { |hop|
-        expect(hop.new_label).to eq("start")
-        expect(hop.new_prog).to eq("BootstrapRhizome")
+      expect { nx.bootstrap_rhizome }.to hop("start", "BootstrapRhizome") { |hop|
         expect(hop.strand_update_args[:stack].first).to include("target_folder" => "host")
       }
     end
 
-    it "hops once BootstrapRhizome has returned" do
+    it "hops to check_ip_reachability once BootstrapRhizome has returned" do
       nx.strand.retval = {"msg" => "rhizome user bootstrapped and source installed"}
-      expect { nx.bootstrap_rhizome }.to hop("prep")
+      expect { nx.bootstrap_rhizome }.to hop("check_ip_reachability")
+    end
+  end
+
+  describe "#check_ip_reachability" do
+    it "pushes the ip reachability program" do
+      expect { nx.check_ip_reachability }.to hop("start", "CheckIpReachability")
+    end
+
+    it "hops to prep once CheckIpReachability has returned" do
+      nx.strand.retval = {"msg" => "all ip addresses are reachable"}
+      expect { nx.check_ip_reachability }.to hop("prep")
+    end
+
+    it "skips the check for BYOH hosts" do
+      HostProvider.create { |hp|
+        hp.id = vm_host.id
+        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+        hp.server_identifier = "byoh-1"
+      }
+      expect { nx.check_ip_reachability }.to hop("prep")
     end
   end
 
@@ -319,11 +461,41 @@ RSpec.describe Prog::Vm::HostNexus do
       ])
     end
 
+    it "sets up the ndp proxy when the host needs ndp" do
+      vm_host.update(net6: "2a01:4f9:2b:35a::/64", ndp_needed: true)
+
+      expect { nx.prep }.to hop("wait_prep")
+
+      expect(Strand.where(parent_id: st.id).select_map(:prog)).to include("SetupNdpProxy")
+    end
+
+    it "sets up the ndp proxy alongside LearnNetwork when net6 is not known yet" do
+      vm_host.update(ndp_needed: true)
+
+      expect { nx.prep }.to hop("wait_prep")
+
+      child_progs = Strand.where(parent_id: st.id).select_map(:prog)
+      expect(child_progs).to include("SetupNdpProxy", "LearnNetwork")
+    end
+
     it "learns the network from the host if it is not set a-priori" do
       expect { nx.prep }.to hop("wait_prep")
 
       child_progs = Strand.where(parent_id: st.id).select_map(:prog)
       expect(child_progs).to include("LearnNetwork")
+    end
+
+    it "passes format_storage to LearnStorage when assembled with install_os, regardless of provider" do
+      st = described_class.assemble("192.168.0.2", install_os: true)
+      expect { described_class.new(st).prep }.to hop("wait_prep")
+      learn_storage = Strand.where(parent_id: st.id, prog: "LearnStorage").first
+      expect(learn_storage.stack.first["format_storage"]).to be true
+    end
+
+    it "does not format storage for a host that was not assembled with install_os" do
+      expect { nx.prep }.to hop("wait_prep")
+      learn_storage = Strand.where(parent_id: st.id, prog: "LearnStorage").first
+      expect(learn_storage.stack.first["format_storage"]).to be false
     end
   end
 
@@ -338,7 +510,7 @@ RSpec.describe Prog::Vm::HostNexus do
     it "updates the vm_host record from the finished programs" do
       Strand.create(parent_id: st.id, prog: "LearnMemory", label: "start", exitval: {"mem_gib" => 1})
       Strand.create(parent_id: st.id, prog: "LearnOs", label: "start", exitval: {"os_version" => "ubuntu-24.04"})
-      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "arm64", "total_sockets" => 2, "total_dies" => 3, "total_cores" => 4, "total_cpus" => 5})
+      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "arm64", "total_sockets" => 2, "total_dies" => 3, "total_cores" => 4, "total_cpus" => 5, "cpu_numa_nodes" => [0, 0, 1, 1, nil]})
       Strand.create(parent_id: st.id, prog: "ArbitraryOtherProg", label: "start", exitval: {})
 
       expect { nx.wait_prep }.to hop("setup_hugepages")
@@ -351,7 +523,7 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(vm_host.total_cpus).to eq 5
       expect(vm_host.total_dies).to eq 3
       expect(vm_host.total_sockets).to eq 2
-      expect(VmHostCpu.where(vm_host_id: vm_host.id).select_order_map([:cpu_number, :spdk])).to eq [[0, true], [1, true], [2, false], [3, false], [4, false]]
+      expect(VmHostCpu.where(vm_host_id: vm_host.id).select_order_map([:cpu_number, :io, :numa_node])).to eq [[0, true, 0], [1, true, 0], [2, false, 1], [3, false, 1], [4, false, nil]]
       expect(vm_host.used_cores).to eq 1
     end
 
@@ -361,12 +533,12 @@ RSpec.describe Prog::Vm::HostNexus do
         hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
         hp.server_identifier = "byoh-1"
       end
-      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "x64", "total_sockets" => 1, "total_dies" => 1, "total_cores" => 4, "total_cpus" => 8})
+      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "x64", "total_sockets" => 1, "total_dies" => 1, "total_cores" => 4, "total_cpus" => 8, "cpu_numa_nodes" => [0] * 8})
 
       expect { nx.wait_prep }.to hop("setup_hugepages")
 
       vm_host.reload
-      expect(VmHostCpu.where(vm_host_id: vm_host.id, spdk: true).count).to eq 0
+      expect(VmHostCpu.where(vm_host_id: vm_host.id, io: true).count).to eq 0
       expect(vm_host.used_cores).to eq 0
     end
 
@@ -400,9 +572,7 @@ RSpec.describe Prog::Vm::HostNexus do
   describe "#setup_storage_backend" do
     it "pushes the vhost_block_backend program by default" do
       vm_host.update(arch: "x64")
-      expect { nx.setup_storage_backend }.to raise_error(Prog::Base::Hop) { |hop|
-        expect(hop.new_label).to eq("start")
-        expect(hop.new_prog).to eq("Storage::SetupVhostBlockBackend")
+      expect { nx.setup_storage_backend }.to hop("start", "Storage::SetupVhostBlockBackend") { |hop|
         expect(hop.strand_update_args[:stack].first).to include("allocation_weight" => 100)
       }
     end
@@ -423,13 +593,38 @@ RSpec.describe Prog::Vm::HostNexus do
   end
 
   describe "#wait_download_boot_images" do
-    it "hops to prep_reboot if all tasks are done" do
-      expect { nx.wait_download_boot_images }.to hop("prep_reboot")
+    it "hops to patch if all tasks are done" do
+      expect { nx.wait_download_boot_images }.to hop("patch")
     end
 
     it "donates its time if child strands are still running" do
       Strand.create(parent_id: st.id, prog: "DownloadBootImage", label: "start", lease: Time.now + 10)
       expect { nx.wait_download_boot_images }.to nap(120)
+    end
+  end
+
+  describe "#patch" do
+    it "runs apply_patches if not running" do
+      expect(nx.vm_host.sshable).to receive(:d_check).with("apply_patches").and_return("NotStarted")
+      expect(nx.vm_host.sshable).to receive(:d_run).with("apply_patches", "sudo", "bash", "-c", "apt update && apt full-upgrade -y")
+      expect { nx.patch }.to nap(60)
+    end
+
+    it "runs apply_patches if failed" do
+      expect(nx.vm_host.sshable).to receive(:d_check).with("apply_patches").and_return("Failed")
+      expect(nx.vm_host.sshable).to receive(:d_run).with("apply_patches", "sudo", "bash", "-c", "apt update && apt full-upgrade -y")
+      expect { nx.patch }.to nap(60)
+    end
+
+    it "naps if in progress" do
+      expect(nx.vm_host.sshable).to receive(:d_check).with("apply_patches").and_return("InProgress")
+      expect { nx.patch }.to nap(60)
+    end
+
+    it "hops to prep_reboot if apply_patches succeeds" do
+      expect(nx.vm_host.sshable).to receive(:d_check).with("apply_patches").and_return("Succeeded")
+      expect(nx.vm_host.sshable).to receive(:d_clean).with("apply_patches")
+      expect { nx.patch }.to hop("prep_reboot")
     end
   end
 
@@ -465,7 +660,57 @@ RSpec.describe Prog::Vm::HostNexus do
 
       nx.incr_checkup
       expect(nx).to receive(:available?).and_return(true)
+      expect(nx).to receive(:get_boot_id).and_return("someboot")
       expect { nx.wait }.to nap(6 * 60 * 60)
+    end
+
+    it "restarts the VMs when a checkup finds a reachable host had an out-of-band reboot" do
+      nx.incr_checkup
+      vm_host.update(last_boot_id: "oldboot")
+      expect(nx).to receive(:available?).and_return(true)
+      expect(nx).to receive(:get_boot_id).and_return("newboot")
+      expect { nx.wait }.to hop("start_slices")
+      expect(vm_host.reload.last_boot_id).to eq("newboot")
+      expect(Page.from_tag_parts("LastBootIDDiscrepancy", vm_host.ubid).resource_id).to eq(vm_host.id)
+    end
+
+    context "when patch set" do
+      before { nx.incr_patch }
+
+      it "hops to patch if there are no VMs" do
+        expect { nx.wait }.to hop("patch")
+          .and change { nx.vm_host.allocation_state }.from("unprepared").to("draining")
+          .and change { nx.graceful_reboot_set? }.from(false).to(true)
+      end
+
+      it "naps if there are VMs" do
+        create_vm(vm_host_id: nx.vm_host.id)
+
+        expect { nx.wait }.to nap(60)
+          .and change { nx.strand.stack[0]["accepting_before_patch"] }.from(nil).to(true)
+          .and change { nx.vm_host.allocation_state }.from("unprepared").to("draining")
+      end
+
+      it "does not set graceful_reboot if host is already draining" do
+        nx.vm_host.allocation_state = "draining"
+
+        expect { nx.wait }.to hop("patch")
+          .and not_change { nx.graceful_reboot_set? }
+          .and change { nx.patch_set? }.from(true).to(false)
+          .and change { nx.strand.stack[0]["deadline_target"] }.from(nil).to("prep_reboot")
+        expect(Time.new(nx.strand.stack[0]["deadline_at"])).to be_within(5).of(Time.now + 600)
+      end
+
+      it "sets graceful_restart semaphore if host was in accepting before patch" do
+        nx.vm_host.allocation_state = "draining"
+        refresh_frame(nx, new_values: {"accepting_before_patch" => true})
+
+        expect { nx.wait }.to hop("patch")
+          .and change { nx.patch_set? }.from(true).to(false)
+          .and change { nx.graceful_reboot_set? }.from(false).to(true)
+          .and change { nx.strand.stack[0]["deadline_target"] }.from(nil).to("prep_reboot")
+        expect(Time.new(nx.strand.stack[0]["deadline_at"])).to be_within(5).of(Time.now + 600)
+      end
     end
   end
 
@@ -491,9 +736,26 @@ RSpec.describe Prog::Vm::HostNexus do
       expect { nx.unavailable }.to nap(30)
     end
 
-    it "hops to wait if host is available" do
+    it "checks the boot_id and hops to wait if an available host did not reboot" do
+      nx.incr_checkup
       expect(nx).to receive(:available?).and_return(true)
+      vm_host.update(last_boot_id: "boot-id")
+      expect(nx).to receive(:get_boot_id).and_return("boot-id")
       expect { nx.unavailable }.to hop("wait")
+      expect(nx.checkup_set?).to be false
+    end
+
+    it "restarts the VMs when an available host had an out-of-band reboot" do
+      nx.incr_checkup
+      expect(nx).to receive(:available?).and_return(true)
+      vm_host.update(last_boot_id: "oldboot")
+      expect(nx).to receive(:get_boot_id).and_return("newboot")
+      expect { nx.unavailable }.to hop("start_slices")
+      expect(vm_host.reload.last_boot_id).to eq("newboot")
+      expect(nx.checkup_set?).to be false
+      page = Page.first
+      expect(page.summary).to eq("Recorded last_boot_id of #{vm_host.ubid} differs from the actual boot_id; treating as an out-of-band reboot and restarting its VMs")
+      expect(page.resource_id).to eq(vm_host.id)
     end
   end
 
@@ -511,11 +773,14 @@ RSpec.describe Prog::Vm::HostNexus do
       expect { nx.destroy }.to nap(15)
     end
 
-    it "deletes and exits" do
+    it "deletes and exits, resolving dns egress pages" do
       vm_host.update(allocation_state: "draining")
+      Prog::PageNexus.assemble("#{vm_host.ubid} IPv6 DNS egress failing", ["VmHostDnsEgressIpv6", vm_host.id], vm_host.ubid, resource_id: vm_host.id, severity: "warning")
+      page = Page.from_tag_parts("VmHostDnsEgressIpv6", vm_host.id)
       expect(vm_host).to receive(:destroy)
       expect(sshable).to receive(:destroy)
       expect { nx.destroy }.to exit({"msg" => "vm host deleted"})
+      expect(Semaphore.where(strand_id: page.id, name: "resolve").count).to eq(1)
     end
   end
 
@@ -568,12 +833,14 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(nx).to receive(:get_boot_id).and_return("xyz")
       vm1 = create_vm(vm_host_id: vm_host.id, name: "vm1")
       vm2 = create_vm(vm_host_id: vm_host.id, name: "vm2")
+      vm3 = create_vm(vm_host_id: vm_host.id, name: "vm3", display_state: "deleting")
       nx.incr_reboot
       expect(nx.reboot_set?).to be true
       expect { nx.prep_reboot }.to hop("reboot")
       expect(vm_host.reload.last_boot_id).to eq("xyz")
       expect(vm1.reload.display_state).to eq("rebooting")
       expect(vm2.reload.display_state).to eq("rebooting")
+      expect(vm3.reload.display_state).to eq("deleting")
       expect(nx.reboot_set?).to be false
     end
 
@@ -615,6 +882,25 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(vm_host.reload.last_boot_id).to eq("pqr")
     end
 
+    it "brings VMs back up end-to-end after an out-of-band reboot" do
+      vm = create_vm(vm_host_id: vm_host.id, memory_gib: 1)
+      Strand.create(id: vm.id, prog: "Vm::Nexus", label: "wait")
+      vm_host.update(last_boot_id: "oldboot", allocation_state: "accepting")
+
+      # A healthy host in unavailable whose boot_id changed rebooted out-of-band;
+      # we jump straight to restarting the VMs, skipping the fresh-reboot verify checks.
+      expect(nx).to receive(:available?).and_return(true)
+      expect(nx).to receive(:get_boot_id).and_return("newboot")
+      expect { nx.unavailable }.to hop("start_slices")
+      expect(vm_host.reload.last_boot_id).to eq("newboot")
+
+      expect { nx.start_slices }.to hop("start_vms")
+      expect { nx.start_vms }.to hop("configure_metrics")
+
+      # The VM was signaled to restart, exactly as on a requested reboot.
+      expect(vm.start_after_host_reboot_set?(cached: false)).to be true
+    end
+
     it "verify_spdk hops to verify_hugepages if spdk started" do
       SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1.0", allocation_weight: 100)
       SpdkInstallation.create(vm_host_id: vm_host.id, version: "v3.0", allocation_weight: 100)
@@ -637,9 +923,11 @@ RSpec.describe Prog::Vm::HostNexus do
       vm_host.update(allocation_state: "unprepared")
       vm = create_vm(vm_host_id: vm_host.id)
       Strand.create(id: vm.id, prog: "Vm::Nexus", label: "wait")
+      expect(nx.strand.stack.first.keys).to include("install_os", "default_boot_images", "vhost_block_backend_version")
       expect { nx.start_vms }.to hop("configure_metrics")
       expect(vm_host.reload.allocation_state).to eq("accepting")
       expect(vm.start_after_host_reboot_set?).to be true
+      expect(nx.strand.stack.first.keys).not_to include("install_os", "default_boot_images", "vhost_block_backend_version")
     end
 
     it "start_vms starts vms & becomes accepting & hops to configure_metrics if was draining and in graceful reboot" do
@@ -649,6 +937,17 @@ RSpec.describe Prog::Vm::HostNexus do
       Strand.create(id: vm.id, prog: "Vm::Nexus", label: "wait")
       expect { nx.start_vms }.to hop("configure_metrics")
       expect(vm_host.reload.allocation_state).to eq("accepting")
+    end
+
+    it "start_vms starts vms & hops to configure_metrics if was draining and in graceful reboot and not in patch" do
+      vm_host.update(allocation_state: "draining")
+      nx.incr_graceful_reboot
+      nx.incr_patch
+      vm = create_vm(vm_host_id: vm_host.id)
+      Strand.create(id: vm.id, prog: "Vm::Nexus", label: "wait")
+      expect { nx.start_vms }.to hop("configure_metrics")
+      expect(vm_host.reload.allocation_state).to eq("draining")
+      expect(vm_host.graceful_reboot_set?).to be true
     end
 
     it "start_vms starts vms & raises if not in draining and in graceful reboot" do
@@ -683,9 +982,11 @@ RSpec.describe Prog::Vm::HostNexus do
     it "prep_hardware_reset transitions to hardware_reset" do
       vm1 = create_vm(vm_host_id: vm_host.id, name: "vm1", display_state: "running")
       vm2 = create_vm(vm_host_id: vm_host.id, name: "vm2", display_state: "running")
+      vm3 = create_vm(vm_host_id: vm_host.id, name: "vm3", display_state: "deleting")
       expect { nx.prep_hardware_reset }.to hop("hardware_reset")
       expect(vm1.reload.display_state).to eq("rebooting")
       expect(vm2.reload.display_state).to eq("rebooting")
+      expect(vm3.reload.display_state).to eq("deleting")
     end
 
     it "hardware_reset transitions to reboot if is in draining state" do
@@ -724,9 +1025,21 @@ RSpec.describe Prog::Vm::HostNexus do
       expect { nx.verify_hugepages }.to raise_error RuntimeError, "Couldn't extract free hugepage count"
     end
 
-    it "fails if not enough hugepages for VMs" do
+    it "fails if available memory couldn't be extracted" do
       expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
         .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 5\nHugePages_Free: 2")
+      expect { nx.verify_hugepages }.to raise_error RuntimeError, "Couldn't extract available memory"
+    end
+
+    it "fails if hugepages leave too little memory for the host OS" do
+      expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 120\nHugePages_Free: 120\nMemAvailable: 76148 kB")
+      expect { nx.verify_hugepages }.to raise_error RuntimeError, "Insufficient memory left for the host OS"
+    end
+
+    it "fails if not enough hugepages for VMs" do
+      expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 5\nHugePages_Free: 2\nMemAvailable: 4194304 kB")
       SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100, hugepages: 4)
       create_vm(vm_host_id: vm_host.id, name: "vm1", memory_gib: 1)
       create_vm(vm_host_id: vm_host.id, name: "vm2", memory_gib: 2)
@@ -735,14 +1048,14 @@ RSpec.describe Prog::Vm::HostNexus do
 
     it "fails if used hugepages exceed spdk hugepages" do
       expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
-        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 10\nHugePages_Free: 5")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 10\nHugePages_Free: 5\nMemAvailable: 4194304 kB")
       SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100, hugepages: 4)
       expect { nx.verify_hugepages }.to raise_error RuntimeError, "Used hugepages exceed SPDK hugepages"
     end
 
     it "calculates used memory for slices and hops" do
       expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
-        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 12\nHugePages_Free: 10")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 12\nHugePages_Free: 10\nMemAvailable: 4194304 kB")
       SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100, hugepages: 4)
       vm_host.update(accepts_slices: true)
       create_vm_host_slice(vm_host_id: vm_host.id, name: "standard1", total_memory_gib: 2)
@@ -754,7 +1067,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
     it "fails if a host that runs slices has fewer usable hugepages than the smallest slice" do
       expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
-        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 11\nHugePages_Free: 9")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 11\nHugePages_Free: 9\nMemAvailable: 4194304 kB")
       SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100, hugepages: 4)
       vm_host.update(accepts_slices: true)
       expect { nx.verify_hugepages }.to raise_error RuntimeError, "Only 7 usable 1G hugepages; a host that runs dedicated slices needs at least 8"
@@ -762,7 +1075,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
     it "accepts fewer usable hugepages on arm64, where the smallest slice books less memory" do
       expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
-        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 6\nHugePages_Free: 6")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 6\nHugePages_Free: 6\nMemAvailable: 4194304 kB")
       vm_host.update(accepts_slices: true, arch: "arm64")
       expect { nx.verify_hugepages }.to hop("start_slices")
       expect(vm_host.reload.total_hugepages_1g).to eq(6)
@@ -770,7 +1083,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
     it "updates vm_host with hugepage stats and hops" do
       expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
-        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 10\nHugePages_Free: 8")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 10\nHugePages_Free: 8\nMemAvailable: 4194304 kB")
       SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100, hugepages: 4)
       create_vm(vm_host_id: vm_host.id, name: "vm1", memory_gib: 1)
       create_vm(vm_host_id: vm_host.id, name: "vm2", memory_gib: 2)
@@ -778,19 +1091,30 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(vm_host.reload.total_hugepages_1g).to eq(10)
       expect(vm_host.used_hugepages_1g).to eq(7)
     end
+
+    it "does not count VMs being destroyed, so a destroy racing host reboot cannot leak hugepages" do
+      expect(sshable).to receive(:_cmd).with("cat /proc/meminfo")
+        .and_return("Hugepagesize: 1048576 kB\nHugePages_Total: 10\nHugePages_Free: 8\nMemAvailable: 4194304 kB")
+      SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100, hugepages: 4)
+      create_vm(vm_host_id: vm_host.id, name: "vm1", memory_gib: 1)
+      # vm2 is mid-destroy: it already subtracted its 2G from the host in its own
+      # transaction, but its row survives until final_clean_up. Re-counting it here
+      # would clobber that decrement and leak 2G of hugepage accounting.
+      create_vm(vm_host_id: vm_host.id, name: "vm2", memory_gib: 2, display_state: "deleting")
+      expect { nx.verify_hugepages }.to hop("start_slices")
+      expect(vm_host.reload.used_hugepages_1g).to eq(5)
+    end
   end
 
   describe "#available?" do
     it "returns the available status when disks are healthy" do
       expect(sshable).to receive(:connect).and_return(nil)
-      expect(vm_host).to receive(:check_last_boot_id)
       expect(vm_host).to receive(:perform_health_checks).and_return(true)
       expect(nx.available?).to be true
     end
 
     it "returns the available status when disks are not healthy" do
       expect(sshable).to receive(:connect).and_return(nil)
-      expect(vm_host).to receive(:check_last_boot_id)
       allow(vm_host).to receive(:perform_health_checks).and_return(false)
       expect(nx.available?).to be false
     end
@@ -798,6 +1122,30 @@ RSpec.describe Prog::Vm::HostNexus do
     it "returns an error trying to connect to VmHost" do
       expect(sshable).to receive(:connect).and_raise Sshable::SshError.new("ssh failed", "", "", nil, nil)
       expect(nx.available?).to be false
+    end
+  end
+
+  describe "#check_boot_id" do
+    it "does nothing when the boot_id still matches" do
+      vm_host.update(last_boot_id: "boot-id")
+      expect(nx).to receive(:get_boot_id).and_return("boot-id")
+      expect { nx.check_boot_id }.not_to hop
+    end
+
+    it "does nothing when last_boot_id is unset" do
+      vm_host.update(last_boot_id: nil)
+      expect(nx).to receive(:get_boot_id).and_return("boot-id")
+      expect { nx.check_boot_id }.not_to hop
+    end
+
+    it "pages, adopts the new boot_id, and hops to start_slices on a mismatch" do
+      vm_host.update(last_boot_id: "oldboot")
+      expect(nx).to receive(:get_boot_id).and_return("newboot")
+      expect { nx.check_boot_id }.to hop("start_slices")
+      expect(vm_host.reload.last_boot_id).to eq("newboot")
+      page = Page.first
+      expect(page.summary).to eq("Recorded last_boot_id of #{vm_host.ubid} differs from the actual boot_id; treating as an out-of-band reboot and restarting its VMs")
+      expect(page.resource_id).to eq(vm_host.id)
     end
   end
 end

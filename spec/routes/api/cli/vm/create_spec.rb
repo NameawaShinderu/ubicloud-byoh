@@ -21,7 +21,7 @@ RSpec.describe Clover, "cli vm create" do
     expect(vm.boot_image).to eq Config.default_boot_image_name
     expect(vm.ip4_enabled).to be true
     expect(vm.strand.stack[0]["storage_volumes"][0]["size_gib"]).to eq 40
-    expect(vm.nics.first.private_subnet_id).to eq ps.id
+    expect(vm.user_nic.private_subnet_id).to eq ps.id
     expect(body).to eq "VM created with id: #{vm.ubid}\n"
   end
 
@@ -44,7 +44,7 @@ RSpec.describe Clover, "cli vm create" do
     expect(vm.boot_image).to eq Config.default_boot_image_name
     expect(vm.ip4_enabled).to be true
     expect(vm.strand.stack[0]["storage_volumes"][0]["size_gib"]).to eq 40
-    expect(vm.nics.first.private_subnet_id).to eq ps.id
+    expect(vm.user_nic.private_subnet_id).to eq ps.id
     expect(body).to eq "VM created with id: #{vm.ubid}\n"
   end
 
@@ -64,7 +64,7 @@ RSpec.describe Clover, "cli vm create" do
     expect(vm.boot_image).to eq "debian-12"
     expect(vm.ip4_enabled).to be false
     expect(vm.strand.stack[0]["storage_volumes"][0]["size_gib"]).to eq 80
-    expect(vm.nics.first.private_subnet_id).to eq ps.id
+    expect(vm.user_nic.private_subnet_id).to eq ps.id
     expect(body).to eq "VM created with id: #{vm.ubid}\n"
   end
 
@@ -83,7 +83,7 @@ RSpec.describe Clover, "cli vm create" do
     expect(vm.boot_image).to eq "debian-12"
     expect(vm.ip4_enabled).to be false
     expect(vm.strand.stack[0]["storage_volumes"][0]["size_gib"]).to eq 80
-    expect(vm.nics.first.private_subnet_id).to eq ps.id
+    expect(vm.user_nic.private_subnet_id).to eq ps.id
     expect(body).to eq "VM created with id: #{vm.ubid}\n"
   end
 
@@ -103,6 +103,11 @@ RSpec.describe Clover, "cli vm create" do
         private_subnet_id: Private subnet with the given id "#{ps.ubid}" is not found in the location "eu-north-h1"
     END
     expect(Vm.count).to eq 0
+  end
+
+  it "defaults the boot image to ubuntu-noble when -b is omitted" do
+    cli(%w[vm eu-central-h1/test-vm create] << "a a")
+    expect(Vm.first.boot_image).to eq "ubuntu-noble"
   end
 
   it "shows errors if trying to create a vm with an invalid number of arguments" do

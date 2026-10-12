@@ -10,7 +10,8 @@ require "uri"
 #
 #   GET  /redfish/v1/Systems                  → discover SystemId
 #   GET  /redfish/v1/Systems/{SystemId}       → read Actions.#Reset.target
-#   POST {Reset.target} {"ResetType": "..."}  → power-cycle
+#   POST {Reset.target} {"ResetType": "..."}  → power-cycle or power on
+#   GET  /redfish/v1/Systems/{SystemId}       → PowerState
 #
 # Intentionally NOT implemented: session authentication (Basic is fine
 # for one-shot commands), BIOS attribute manipulation, virtual media
@@ -33,6 +34,12 @@ class Hosting::RedfishClient
     target = reset_action_target(sys_id)
     http_post(target, {"ResetType" => reset_type})
     nil
+  end
+
+  # The system's PowerState, e.g. "On" or "Off".
+  def power_state
+    sys_id = @system_id || discover_system_id
+    http_get("/redfish/v1/Systems/#{sys_id}").fetch("PowerState", "unknown")
   end
 
   def discover_system_id
@@ -60,9 +67,9 @@ class Hosting::RedfishClient
       user: @username,
       password: @password,
       ssl_verify_peer: @verify_ssl,
-      connect_timeout: 10,
-      read_timeout: 60,
-      write_timeout: 60,
+      connect_timeout: 5,
+      read_timeout: 20,
+      write_timeout: 20,
       headers: {"Content-Type" => "application/json", "Accept" => "application/json"})
   end
 

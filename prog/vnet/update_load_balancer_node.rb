@@ -2,9 +2,10 @@
 
 class Prog::Vnet::UpdateLoadBalancerNode < Prog::Base
   subject_is :vm
+  frame_reader :load_balancer_id
 
   def load_balancer
-    @load_balancer ||= LoadBalancer[frame.fetch("load_balancer_id")]
+    @load_balancer ||= LoadBalancer[load_balancer_id]
   end
 
   def inhost_name
@@ -23,7 +24,7 @@ class Prog::Vnet::UpdateLoadBalancerNode < Prog::Base
 
     # if there is literally no up resources to balance for, we simply not do
     # load balancing.
-    hop_remove_load_balancer if load_balancer.active_vm_ports.count == 0
+    hop_remove_load_balancer if load_balancer.active_vm_ports_dataset.empty?
 
     vm.vm_host.sshable.cmd("sudo ip netns exec :inhost_name nft --file -", inhost_name:, stdin: generate_lb_based_nat_rules)
     pop "load balancer is updated"

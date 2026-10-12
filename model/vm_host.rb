@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require_relative "../model"
-require_relative "../lib/hosting/apis"
 require_relative "../lib/system_parser"
 
 class VmHost < Sequel::Model
@@ -10,6 +9,7 @@ class VmHost < Sequel::Model
   one_to_many :vms, read_only: true
   one_to_many :assigned_subnets, key: :routed_to_host_id, class: :Address, read_only: true
   one_to_one :provider, key: :id, class: :HostProvider, read_only: true
+  one_to_one :inventory, key: :id, class: :VmHostInventory, read_only: true
   one_to_many :assigned_host_addresses, key: :host_id, read_only: true
   one_to_many :spdk_installations, remover: nil, clearer: nil
   one_to_many :vhost_block_backends, remover: nil, clearer: nil
@@ -26,9 +26,13 @@ class VmHost < Sequel::Model
   plugin :association_dependencies, assigned_host_addresses: :destroy, assigned_subnets: :destroy, provider: :destroy, spdk_installations: :destroy, storage_devices: :destroy, pci_devices: :destroy, boot_images: :destroy, slices: :destroy, cpus: :destroy, vhost_block_backends: :destroy, gpu_partitions: :destroy
 
   plugin ResourceMethods
-  plugin SemaphoreMethods, :checkup, :reboot, :hardware_reset, :destroy, :graceful_reboot, :configure_metrics
+  plugin SemaphoreMethods, :checkup, :reboot, :hardware_reset, :destroy, :graceful_reboot, :configure_metrics, :patch
   include HealthMonitorMethods
   include MetricsTargetMethods
+
+  def active_vms_dataset
+    vms_dataset.exclude(display_state: "deleting")
+  end
 
   def host_prefix
     net6.netmask.prefix_len
@@ -38,8 +42,14 @@ class VmHost < Sequel::Model
     provider&.provider_name
   end
 
+  def leaseweb? = HostProvider::LEASEWEB_PROVIDER_NAMES.include?(provider_name)
+
   def sshable_host
     sshable.host
+  end
+
+  def admin_ssh_user
+    "root"
   end
 
   # Compute the IPv6 Subnet that can be used to address the host
@@ -114,9 +124,9 @@ class VmHost < Sequel::Model
       NetAddr::IPv6.new(net6.network.addr | lower_bits), NetAddr::Mask128.new(prefix),
     )
 
-    # :nocov:
+    # simplecov:disable
     fail "BUG: host should be supernet of randomized subnet" unless net6.rel(proposal) == 1
-    # :nocov:
+    # simplecov:enable
 
     case (rn = ip6_reserved_network(prefix)) && proposal.network.cmp(rn.network)
     when 0
@@ -170,7 +180,7 @@ class VmHost < Sequel::Model
     assigned_host_addresses_dataset.first { {family(ip) => 4} }
   end
 
-  def spdk_cpu_count
+  def io_cpu_count
     if total_cpus <= 64
       2
     else
@@ -188,37 +198,28 @@ class VmHost < Sequel::Model
   end
 
   def create_addresses(ip_records: nil)
-    ip_records ||= Hosting::Apis.pull_ips(self)
+    ip_records ||= provider.api.pull_ips
     return if ip_records.nil? || ip_records.empty?
 
     DB.transaction do
       ip_records.each do |ip_record|
+        # Connectivity space reaches the netplan but never the address registry.
+        next if ip_record.host_connectivity?
+
         ip_addr = ip_record.ip_address
-        source_host_ip = ip_record.source_host_ip
-        is_failover_ip = ip_record.is_failover
 
         next if assigned_subnets.any? { |a| a.cidr.to_s == ip_addr }
 
-        # we need to find if it was previously created
-        # if it was, we need to update the routed_to_host_id but only if there is no VM that's using it
-        # if it wasn't, we need to create it
-        adr = Address.where(cidr: ip_addr).first
-        if adr && is_failover_ip
-          if adr.assigned_vm_addresses.count > 0
-            fail "BUG: failover ip #{ip_addr} is already assigned to a vm"
-          end
-
-          adr.update(routed_to_host_id: id)
-        else
-          if Sshable.where(host: source_host_ip).count == 0
-            fail "BUG: source host #{source_host_ip} isn't added to the database"
-          end
-
-          adr = Address.create(cidr: ip_addr, routed_to_host_id: id, is_failover_ip:)
+        if Sshable.where(host: ip_record.source_host_ip).empty?
+          fail "BUG: source host #{ip_record.source_host_ip} isn't added to the database"
         end
 
-        unless is_failover_ip
+        adr = Address.create(cidr: ip_addr, routed_to_host_id: id)
+        # A claimed address joins the host's set; a routed one opens its VM pool.
+        if ip_record.host_only?
           AssignedHostAddress.create(host_id: id, ip: ip_addr, address_id: adr.id)
+        else
+          adr.populate_ipv4_addresses
         end
       end
     end
@@ -229,8 +230,8 @@ class VmHost < Sequel::Model
   # Operational Functions
 
   # Introduced for refreshing rhizome programs via REPL.
-  def install_rhizome(install_specs: false)
-    Strand.create(prog: "InstallRhizome", label: "start", stack: [{subject_id: id, target_folder: "host", install_specs:}])
+  def install_rhizome
+    Strand.create(prog: "InstallRhizome", label: "start", stack: [{subject_id: id, target_folder: "host"}])
   end
 
   # Introduced for downloading a new boot image via REPL.
@@ -262,7 +263,11 @@ class VmHost < Sequel::Model
   end
 
   def set_data_center
-    update(data_center: Hosting::Apis.pull_data_center(self))
+    update(data_center: provider.api.pull_data_center)
+  end
+
+  def create_inventory
+    VmHostInventory.create(provider.api.pull_inventory) { it.id = id }
   end
 
   def allow_slices
@@ -274,7 +279,7 @@ class VmHost < Sequel::Model
   end
 
   def set_server_name
-    Hosting::Apis.set_server_name(self)
+    provider.api.set_server_name(ubid)
   end
 
   def reimage
@@ -282,7 +287,7 @@ class VmHost < Sequel::Model
       fail "BUG: reimage is only allowed in development"
     end
 
-    Hosting::Apis.reimage_server(self)
+    provider.api.reimage
   end
 
   # Cuts power to a Server and starts it again. This forcefully stops it
@@ -290,27 +295,56 @@ class VmHost < Sequel::Model
   # may lead to data loss, it’s equivalent to pulling the power cord and
   # plugging it in again. Reset should only be used when reboot does not work.
   def hardware_reset
-    Hosting::Apis.hardware_reset_server(self)
+    provider.api.hardware_reset
   end
 
-  def check_storage_smartctl(ssh_session, devices)
-    devices.map do |device_name|
-      command = ["sudo smartctl -j -H /dev/:device_name"]
-      command << "-d scsi" if device_name.start_with?("sd")
-      command << "| jq .smart_status.passed"
-      command = NetSsh.combine(*command)
-      passed = ssh_session.exec!(command, device_name:).strip == "true"
-      Clog.emit("Device #{device_name} failed smartctl check on VmHost #{ubid}", {}) unless passed
-      passed
-    end.all?(true)
+  def power_on
+    provider.api.power_on
   end
 
-  def check_storage_nvme(ssh_session, devices)
-    devices.reject { |device_name| !device_name.start_with?("nvme") }.map do |device_name|
-      passed = ssh_session.exec!("sudo nvme smart-log /dev/:device_name | grep \"critical_warning\" | awk '{print $3}'", device_name:).strip == "0"
-      Clog.emit("Device #{device_name} failed nvme smart-log check on VmHost #{ubid}", {}) unless passed
-      passed
-    end.all?(true)
+  def power_status
+    provider.api.power_status
+  end
+
+  def check_storage_smart(ssh_session, devices)
+    devices.map { |device_name|
+      if device_name.start_with?("nvme")
+        check_nvme_smart(ssh_session, device_name)
+      else
+        check_non_nvme_smart(ssh_session, device_name)
+      end
+    }.all?(true)
+  end
+
+  def check_non_nvme_smart(ssh_session, device_name)
+    command = ["sudo smartctl -j -H /dev/:device_name"]
+    command << "-d scsi" if device_name.start_with?("sd")
+    command << "| jq .smart_status.passed"
+    command = NetSsh.combine(*command)
+    passed = ssh_session.exec!(command, device_name:).strip == "true"
+    Clog.emit("Device #{device_name} failed smartctl check on VmHost #{ubid}", {}) unless passed
+    passed
+  end
+
+  def check_nvme_smart(ssh_session, device_name)
+    smart = JSON.parse(ssh_session.exec!("sudo nvme smart-log -o json /dev/:device_name", device_name:))
+    cw = Integer(smart["critical_warning"])
+    avail_spare = Integer(smart["avail_spare"])
+    spare_thresh = Integer(smart["spare_thresh"])
+
+    # For github runner hosts, allow critical warning 0x4 (reliability
+    # degraded, end of warranty) and no warning 0x0. For other hosts, we will
+    # page on 0x4 so that we can proactively move workloads off the host
+    # before they experience failures.
+    allowed_cw = if location_id == Location::GITHUB_RUNNERS_ID
+      [0, 4]
+    else
+      [0]
+    end
+
+    passed = allowed_cw.include?(cw) && avail_spare > spare_thresh
+    Clog.emit("Device #{device_name} failed nvme smart-log check on VmHost #{ubid}", {critical_warning: cw, avail_spare:, spare_thresh:}) unless passed
+    passed
   end
 
   def check_storage_read_write(ssh_session, devices, test_file_suffix:)
@@ -369,14 +403,6 @@ class VmHost < Sequel::Model
     clock_status
   end
 
-  def check_last_boot_id(ssh_session)
-    boot_id = ssh_session.exec!("cat /proc/sys/kernel/random/boot_id")
-    fail "Failed to exec on session: #{boot_id}" unless boot_id.exitstatus.zero?
-    if boot_id.strip != last_boot_id
-      Prog::PageNexus.assemble("Recorded last_boot_id of #{ubid} in database differs from the actual boot_id", ["LastBootIDDiscrepancy", ubid], ubid, severity: "info")
-    end
-  end
-
   def init_health_monitor_session
     {
       ssh_session: sshable.start_fresh_session,
@@ -390,11 +416,6 @@ class VmHost < Sequel::Model
   end
 
   def disk_device_ids
-    # we use this next line to migrate data from the old formatting (storing device names) to the new (storing id) so we trigger the convert
-    # whenever an element inside unix_device_list is not a SSD or NVMe id.
-    # SSD and NVMe ids start with wwn or nvme-eui respectively.
-    # YYY: This next line can be removed in the future after the first run of the code.
-    storage_devices.each { |sd| sd.migrate_device_name_to_device_id if sd.unix_device_list.any? { |device_name| device_name !~ /\A(wwn|nvme-eui)/i } }
     storage_devices.flat_map { |sd| sd.unix_device_list }
   end
 
@@ -404,12 +425,22 @@ class VmHost < Sequel::Model
 
   def perform_health_checks(ssh_session, test_file_suffix: "monitor")
     device_names = disk_device_names(ssh_session)
-    check_storage_smartctl(ssh_session, device_names) &&
-      check_storage_nvme(ssh_session, device_names) &&
+    check_storage_smart(ssh_session, device_names) &&
       check_storage_read_write(ssh_session, device_names, test_file_suffix:) &&
       check_storage_kernel_logs(ssh_session, device_names) &&
       check_clock_source(ssh_session)
   end
+
+  # The same upstream resolvers the per-VM dnsmasq forwards to (see
+  # cloudinit in rhizome/host/lib/vm_setup.rb): the host's root
+  # namespace shares the uplink path with the VM DNS egress leg of
+  # each family.
+  DNS_EGRESS_UPSTREAMS = {"4" => "8.8.8.8", "6" => "2606:4700:4700::1111"}.freeze
+
+  # A root SOA query has an answer at every resolver, so a negative DNS
+  # answer cannot read as an egress failure: only a response that never
+  # arrives (Resolv::ResolvError, or the timeout kill) exits nonzero.
+  DNS_EGRESS_PROBE = "timeout 5 ruby -rresolv -e 'd = Resolv::DNS.new(nameserver: [ARGV[0]]); d.timeouts = 2; d.getresource(\".\", Resolv::DNS::Resource::IN::SOA)' -- :nameserver"
 
   def check_pulse(session:, previous_pulse:)
     reading = begin
@@ -422,11 +453,41 @@ class VmHost < Sequel::Model
     end
     pulse = aggregate_readings(previous_pulse:, reading:)
 
-    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !reload.checkup_set?
+    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !checkup_set?(cached: false)
       incr_checkup
     end
 
+    pulse.merge!(dns_egress_pulse(session, previous_pulse, "4"))
+    pulse.merge!(dns_egress_pulse(session, previous_pulse, "6")) if net6
+
     pulse
+  end
+
+  # DNS egress failures page (severity warning) instead of feeding the
+  # up/down pulse: an upstream DNS family outage must not make a healthy
+  # host look down, but it silently halves the failover margin of the
+  # dual-stack VM resolvers, so it must not stay unnoticed either.
+  def dns_egress_pulse(session, previous_pulse, family)
+    reading = begin
+      (session[:ssh_session].exec!(DNS_EGRESS_PROBE, nameserver: DNS_EGRESS_UPSTREAMS.fetch(family)).exitstatus == 0) ? "up" : "down"
+    rescue IOError, Errno::ECONNRESET
+      raise
+    rescue => e
+      Clog.emit("DNS egress probe exception on VmHost #{ubid}", Util.exception_to_hash(e))
+      "down"
+    end
+
+    repeat = previous_pulse[:"dns_egress#{family}"] == reading
+    rpt = repeat ? previous_pulse[:"dns_egress#{family}_rpt"] + 1 : 1
+    chg = repeat ? previous_pulse[:"dns_egress#{family}_chg"] : Time.now
+
+    if reading == "up"
+      Page.from_tag_parts("VmHostDnsEgressIpv#{family}", id)&.incr_resolve
+    elsif rpt >= 5 && Time.now - chg >= 300
+      Prog::PageNexus.assemble("#{ubid} IPv#{family} DNS egress failing", ["VmHostDnsEgressIpv#{family}", id], ubid, resource_id: id, severity: "warning")
+    end
+
+    {"dns_egress#{family}": reading, "dns_egress#{family}_rpt": rpt, "dns_egress#{family}_chg": chg}
   end
 
   def available_storage_gib
@@ -435,17 +496,6 @@ class VmHost < Sequel::Model
 
   def total_storage_gib
     storage_devices.sum(&:total_storage_gib)
-  end
-
-  def render_arch(arm64:, x64:)
-    case arch
-    when "arm64"
-      arm64
-    when "x64"
-      x64
-    else
-      fail "BUG: inexhaustive render code"
-    end
   end
 
   def metrics_config
@@ -468,8 +518,8 @@ class VmHost < Sequel::Model
     end
     target_location = Location.with_pk!(target_location_id)
 
-    target_image_names = %w[github-ubuntu-2404 github-ubuntu-2204]
-    target_image_names += %w[ubuntu-noble ubuntu-jammy almalinux-9 debian-12 postgres-ubuntu-2204] unless target_location.id == Location::GITHUB_RUNNERS_ID
+    target_image_names = %w[github-ubuntu-2404 github-ubuntu-2204].freeze
+    target_image_names += %w[ubuntu-noble ubuntu-jammy almalinux-9 debian-12 postgres-ubuntu-2204 postgres-ubuntu-2604].freeze unless target_location.id == Location::GITHUB_RUNNERS_ID
 
     DB.ignore_duplicate_queries do
       target_image_names.each { |image_name| download_boot_image(image_name) }
@@ -502,6 +552,7 @@ end
 #  accepts_slices     | boolean                  | NOT NULL DEFAULT false
 #  location_id        | uuid                     | NOT NULL
 #  family             | text                     | NOT NULL
+#  score_offset       | double precision         | NOT NULL DEFAULT 0
 # Indexes:
 #  vm_host_pkey     | PRIMARY KEY btree (id)
 #  vm_host_ip6_key  | UNIQUE btree (ip6)
@@ -515,15 +566,17 @@ end
 #  vm_host_id_fkey          | (id) REFERENCES sshable(id)
 #  vm_host_location_id_fkey | (location_id) REFERENCES location(id)
 # Referenced By:
-#  address               | address_routed_to_host_id_fkey      | (routed_to_host_id) REFERENCES vm_host(id)
-#  assigned_host_address | assigned_host_address_host_id_fkey  | (host_id) REFERENCES vm_host(id)
-#  boot_image            | boot_image_vm_host_id_fkey          | (vm_host_id) REFERENCES vm_host(id)
-#  gpu_partition         | gpu_partition_vm_host_id_fkey       | (vm_host_id) REFERENCES vm_host(id)
-#  host_provider         | host_provider_id_fkey               | (id) REFERENCES vm_host(id)
-#  pci_device            | pci_device_vm_host_id_fkey          | (vm_host_id) REFERENCES vm_host(id)
-#  spdk_installation     | spdk_installation_vm_host_id_fkey   | (vm_host_id) REFERENCES vm_host(id)
-#  storage_device        | storage_device_vm_host_id_fkey      | (vm_host_id) REFERENCES vm_host(id)
-#  vhost_block_backend   | vhost_block_backend_vm_host_id_fkey | (vm_host_id) REFERENCES vm_host(id)
-#  vm                    | vm_vm_host_id_fkey                  | (vm_host_id) REFERENCES vm_host(id)
-#  vm_host_cpu           | vm_host_cpu_vm_host_id_fkey         | (vm_host_id) REFERENCES vm_host(id)
-#  vm_host_slice         | vm_host_slice_vm_host_id_fkey       | (vm_host_id) REFERENCES vm_host(id)
+#  address               | address_routed_to_host_id_fkey        | (routed_to_host_id) REFERENCES vm_host(id)
+#  assigned_host_address | assigned_host_address_host_id_fkey    | (host_id) REFERENCES vm_host(id)
+#  boot_image            | boot_image_vm_host_id_fkey            | (vm_host_id) REFERENCES vm_host(id)
+#  gpu_partition         | gpu_partition_vm_host_id_fkey         | (vm_host_id) REFERENCES vm_host(id)
+#  host_provider         | host_provider_id_fkey                 | (id) REFERENCES vm_host(id)
+#  pci_device            | pci_device_vm_host_id_fkey            | (vm_host_id) REFERENCES vm_host(id)
+#  remote_storage_server | remote_storage_server_vm_host_id_fkey | (vm_host_id) REFERENCES vm_host(id)
+#  spdk_installation     | spdk_installation_vm_host_id_fkey     | (vm_host_id) REFERENCES vm_host(id)
+#  storage_device        | storage_device_vm_host_id_fkey        | (vm_host_id) REFERENCES vm_host(id)
+#  vhost_block_backend   | vhost_block_backend_vm_host_id_fkey   | (vm_host_id) REFERENCES vm_host(id)
+#  vm                    | vm_vm_host_id_fkey                    | (vm_host_id) REFERENCES vm_host(id)
+#  vm_host_cpu           | vm_host_cpu_vm_host_id_fkey           | (vm_host_id) REFERENCES vm_host(id)
+#  vm_host_inventory     | vm_host_inventory_id_fkey             | (id) REFERENCES vm_host(id) ON DELETE CASCADE
+#  vm_host_slice         | vm_host_slice_vm_host_id_fkey         | (vm_host_id) REFERENCES vm_host(id)

@@ -5,35 +5,51 @@ require "openssl"
 
 class Prog::Vnet::CertNexus < Prog::Base
   subject_is :cert
+  frame_reader :add_private, :wait_deadline
+  frame_accessor :last_dns_validation_request, :restarted
 
   REVOKE_REASON = "cessationOfOperation"
 
-  def self.assemble(hostname, dns_zone_id, add_private: false)
+  ACME_CLIENT_OPTIONS = {
+    connection_options: {request: {open_timeout: 5, timeout: 10}.freeze}.freeze,
+    bad_nonce_retry: 3,
+  }.freeze
+
+  def self.assemble(hostname, dns_zone_id, private_hostname: nil, waiting_strand_id: nil, wait_deadline: nil)
     unless Config.development? || DnsZone[dns_zone_id]
       fail "Given DNS zone doesn't exist with the id #{dns_zone_id}"
     end
 
     DB.transaction do
-      cert = Cert.create(hostname:, dns_zone_id:)
+      cert = Cert.create(hostname:, dns_zone_id:, private_hostname:)
 
-      Strand.create_with_id(cert, prog: "Vnet::CertNexus", label: "start", stack: [{"restarted" => 0, "add_private" => add_private}])
+      Strand.create_with_id(cert, prog: "Vnet::CertNexus", label: "start", stack: [{"restarted" => 0, "waiting_strand_id" => waiting_strand_id, "wait_deadline" => wait_deadline}])
     end
   end
 
+  def before_destroy
+    register_deadline(nil, 3 * 60 * 60, page: "warning")
+  end
+
   label def start
-    register_deadline("wait", 10 * 60)
+    register_deadline("wait", wait_deadline || 10 * 60)
 
     if Config.development? && cert.dns_zone_id.nil?
-      crt, key = Util.create_certificate(subject: "/CN=" + cert.hostname, duration: 60 * 60 * 24 * 30 * 3)
+      san = "subjectAltName=DNS:#{cert.hostname}"
+      san += ",DNS:#{cert.private_hostname}" if cert.private_hostname
+      crt, key = Util.create_certificate(
+        subject: "/CN=" + cert.hostname,
+        extensions: [san],
+        duration: 60 * 60 * 24 * 30 * 3,
+      )
       cert.update(cert: crt, csr_key: key.to_der)
       hop_wait
     end
 
     account_key = OpenSSL::PKey::EC.generate("prime256v1")
-    client = Acme::Client.new(private_key: account_key, directory: Config.acme_directory)
+    client = Acme::Client.new(private_key: account_key, directory: Config.acme_directory, **ACME_CLIENT_OPTIONS)
     account = client.new_account(contact: "mailto:#{Config.acme_email}", terms_of_service_agreed: true, external_account_binding: {kid: Config.acme_eab_kid, hmac_key: Config.acme_eab_hmac_key})
-    identifiers = [cert.hostname]
-    identifiers << "private.#{cert.hostname}" if frame["add_private"]
+    identifiers = cert.hostnames
     order = client.new_order(identifiers:)
     cert.update(kid: account.kid, account_key: account_key.to_der, order_url: order.url)
     order.authorizations.each do |authorization|
@@ -59,7 +75,7 @@ class Prog::Vnet::CertNexus < Prog::Base
     end
 
     each_authorization { it.dns.request_validation }
-    update_stack("last_dns_validation_request" => Time.now.to_i)
+    self.last_dns_validation_request = Time.now.to_i
 
     hop_wait_dns_validation
   end
@@ -72,12 +88,12 @@ class Prog::Vnet::CertNexus < Prog::Base
       when "pending", "processing"
         all_valid = false
         t = Time.now.to_i
-        if frame["last_dns_validation_request"]&.<(t - 120)
+        if last_dns_validation_request&.<(t - 120)
           # Rerequest DNS validation every 2 minutes, in case the ACME provider
           # checked originally and couldn't validate the DNS record, and won't
           # check again (or as quickly) until rerequested.
           dns_challenge.request_validation
-          update_stack("last_dns_validation_request" => t)
+          self.last_dns_validation_request = t
         end
       when "valid"
         # do nothing
@@ -98,7 +114,8 @@ class Prog::Vnet::CertNexus < Prog::Base
   end
 
   label def cert_finalization
-    names = frame["add_private"] ? ["private.#{cert.hostname}"] : []
+    names = [cert.private_hostname]
+    names.compact!
     acme_order.finalize(csr: Acme::Client::CertificateRequest.new(private_key: OpenSSL::PKey::EC.new(cert.csr_key), common_name: cert.hostname, names:))
     hop_wait_cert_finalization
   end
@@ -110,7 +127,7 @@ class Prog::Vnet::CertNexus < Prog::Base
     when "valid"
       cert.update(cert: acme_order.certificate, created_at: Time.now)
       cleanup_dns_challenge_records
-      hop_wait
+      hop_wait_and_wakeup_waiting_strand
     else
       Clog.emit("Certificate finalization failed", {order_status:})
       cleanup_dns_challenge_records
@@ -119,23 +136,26 @@ class Prog::Vnet::CertNexus < Prog::Base
   end
 
   label def wait
-    if cert.created_at < Time.now - 60 * 60 * 24 * 30 * 3 # 3 months
+    expires_at = cert.expires_at || cert.created_at + 60 * 60 * 24 * 30 * 3 # 90 days
+    nap_time = expires_at - Time.now
+
+    if nap_time < 0
       cert.incr_destroy
       nap 0
     end
 
-    nap 60 * 60 * 24 * 30 # 1 month
+    nap(nap_time + 60 * 60)
   end
 
   label def restart
     when_restarted_set? do
       decr_restarted
-      update_stack({"restarted" => strand.stack.first["restarted"] + 1})
+      self.restarted += 1
       hop_start
     end
 
     cert.incr_restarted
-    nap [60 * (strand.stack.first["restarted"] + 1), 60 * 10].min
+    nap [60 * (restarted + 1), 60 * 10].min
   end
 
   label def destroy
@@ -168,7 +188,7 @@ class Prog::Vnet::CertNexus < Prog::Base
     # If the private_key is not yet set, we did not start the communication with
     # ACME server yet, therefore, we return nil.
     if cert.account_key
-      @acme_client ||= Acme::Client.new(private_key: Util.parse_key(cert.account_key), directory: Config.acme_directory, kid: cert.kid)
+      @acme_client ||= Acme::Client.new(private_key: Util.parse_key(cert.account_key), directory: Config.acme_directory, kid: cert.kid, **ACME_CLIENT_OPTIONS)
     end
   end
 

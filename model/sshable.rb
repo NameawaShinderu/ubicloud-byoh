@@ -27,6 +27,11 @@ class Sshable < Sequel::Model
     IOError,
   ].freeze
 
+  dataset_module do
+    order :by_id, :id
+    exclude :with_host_keys, host_keys: nil
+  end
+
   def admin_label
     "#{unix_user}@#{host}"
   end
@@ -92,7 +97,7 @@ class Sshable < Sequel::Model
     JSON.parse(cmd(cmd, **args))
   end
 
-  def cmd(cmd, stdin: nil, log: true, timeout: :default)
+  def cmd(cmd, stdin: nil, log: true, timeout: :default, session: nil)
     start = Time.now
     stdout = StringIO.new
     stderr = StringIO.new
@@ -113,7 +118,7 @@ class Sshable < Sequel::Model
     end
 
     begin
-      ch = connect.open_channel do |ch|
+      ch = (session || connect).open_channel do |ch|
         channel_duration = Time.now - start
         ch.exec(cmd) do |ch, success|
           ch.on_data do |ch, data|
@@ -139,14 +144,17 @@ class Sshable < Sequel::Model
       end
       channel_wait(ch, wait_deadline)
     rescue
-      invalidate_cache_entry
+      # A caller-supplied session is not in the thread-local cache and its
+      # lifecycle is owned by the caller, so leave the cache alone.
+      invalidate_cache_entry unless session
       raise
     end
 
     stdout_str = stdout.string.freeze
     stderr_str = stderr.string.freeze
+    success = exit_code&.zero?
 
-    if log
+    if log == true || (log == :on_error && !success)
       finish = Time.now
       embed = {ubid:, start:, finish:, timeout:, duration: finish - start,
                cmd:, exit_code:, exit_signal:}
@@ -166,7 +174,7 @@ class Sshable < Sequel::Model
       Clog.emit("ssh cmd execution", {ssh: embed})
     end
 
-    fail (exit_code ? SshError : SshTimeout).new(cmd, stdout_str, stderr_str, exit_code, exit_signal) unless exit_code&.zero?
+    fail (exit_code ? SshError : SshTimeout).new(cmd, stdout_str, stderr_str, exit_code, exit_signal) unless success
 
     stdout_str
   end
@@ -187,6 +195,18 @@ class Sshable < Sequel::Model
     cmd("common/bin/daemonizer2 restart :unit_name", unit_name:)
   end
 
+  def d_stop(unit_name)
+    cmd("common/bin/daemonizer2 stop :unit_name", unit_name:)
+  end
+
+  def d_logs(unit_name, lines: nil)
+    if lines
+      cmd("sudo journalctl -u :unit_name -n :lines --no-pager", unit_name:, lines:)
+    else
+      cmd("sudo journalctl -u :unit_name --no-pager", unit_name:)
+    end
+  end
+
   # A huge number of settings are needed to isolate net-ssh from the
   # host system and provide some anti-hanging assurance (keepalive,
   # timeout).
@@ -202,15 +222,18 @@ class Sshable < Sequel::Model
   def connect
     Thread.current[:clover_ssh_cache] ||= {}
 
-    # Cache hit.
+    # Cache hit, unless the session was closed underneath us, e.g. by
+    # the server terminating the connection. Then reconnect.
     if (sess = Thread.current[:clover_ssh_cache][[host, unix_user]])
-      return sess
+      return sess if live_session?(sess)
+      invalidate_cache_entry
     end
 
     # Cache miss.
     start = Time.now
     sess = start_fresh_session
     @connect_duration = Time.now - start
+    sess.transport.socket.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
     Thread.current[:clover_ssh_cache][[host, unix_user]] = sess
 
     if (lock_name = maybe_ssh_session_lock_name)
@@ -223,25 +246,73 @@ LOCK
 
       begin
         cmd(lock_contents, lock_name:, log: false)
-      rescue SshError => ex
-        session_fail_msg = case (exit_code = ex.exit_code)
-        when 92
-          "could not create session lock file for #{lock_name}"
-        when 124
-          "session lock conflict for #{lock_name}"
-        else
-          "unknown SshError"
-        end
-
-        Clog.emit("session lock failure", {contended_session_lock: {exit_code:, session_fail_msg:, sshable_ubid: ubid.to_s, prog: Prog::Base.current_prog}})
+      rescue SshError
       end
     end
 
     sess
   end
 
+  def live_session?(sess)
+    return false if sess.closed?
+    sess.process(0)
+    !sess.closed?
+  rescue IOError, *SSH_CONNECTION_ERRORS
+    false
+  end
+
+  KnownHosts = Data.define(:host_keys, :new_host_keys) do
+    def search_for(host, options = {})
+      keys = host_keys.map do |str|
+        _, blob = str.split(" ", 3)
+        Net::SSH::HostKeyEntries::PubKey.new(Net::SSH::Buffer.new(blob.unpack1("m")).read_key)
+      end
+
+      Net::SSH::HostKeys.new(keys, host, self, options)
+    end
+
+    def add(host, key, options = {})
+      new_host_keys << "#{key.ssh_type} #{[key.to_blob].pack("m0")}"
+    end
+  end
+
   def start_fresh_session(&block)
-    Net::SSH.start(host, unix_user, **COMMON_SSH_ARGS, key_data: keys.map(&:private_key), &block)
+    new_host_keys = []
+    args = {**COMMON_SSH_ARGS, key_data: keys.map(&:private_key)}
+    unless unix_user == "runneradmin"
+      args[:known_hosts] = KnownHosts.new(host_keys || [], new_host_keys)
+      args[:verify_host_key] = :always if host_keys
+    end
+
+    if block
+      Net::SSH.start(host, unix_user, **args) do |session|
+        add_host_keys(new_host_keys) unless new_host_keys.empty?
+        yield session
+      end
+    else
+      sess = Net::SSH.start(host, unix_user, **args)
+      add_host_keys(new_host_keys) unless new_host_keys.empty?
+      sess
+    end
+  end
+
+  def add_host_keys(keys)
+    if this.where(host_keys:).update(host_keys: Sequel.pg_array((host_keys || []) + keys, :text)) == 1
+      Clog.emit("sshable host keys added", {sshable_host_keys_added: {sshable: ubid, keys:}})
+    end
+    reload
+  end
+
+  def check_for_new_host_keys
+    # If the Sshable doesn't have host keys, they will be added during
+    # the first connection attempt, in which case this code isn't needed
+    return unless host_keys
+
+    start_fresh_session do |sess|
+      handle_host_keys_update(sess)
+      sess.send_global_request("keepalive@openssh.com") { nil }
+      sess.loop { !sess.pending_requests.empty? }
+    end
   end
 
   def invalidate_cache_entry
@@ -269,6 +340,69 @@ LOCK
 
   private
 
+  HOSTKEYS_PROVE_REQUEST = "hostkeys-prove-00@openssh.com"
+  RSA_SIGNATURE_TYPES = %w[ssh-rsa rsa-sha2-256 rsa-sha2-512].freeze
+
+  # For hosts with known host keys, check if they have additional host keys
+  # using OpenSSH protocol extensions. If so, add those keys to host_keys.
+  # This allows for newer, stronger keys to be automatically added and used.
+  # This is not done automatically for every session for performance reasons.
+  def handle_host_keys_update(sess)
+    sess.on_global_request("hostkeys-00@openssh.com") do |data, _want_reply|
+      matched = false
+      new_keys = []
+
+      until data.eof?
+        blob = data.read_string
+        begin
+          key = Net::SSH::Buffer.new(blob).read_key
+        rescue NotImplementedError
+          # Unsupported key type
+          next
+        end
+
+        str = "#{key.ssh_type} #{[blob].pack("m0")}"
+        if host_keys.include?(str)
+          matched = true
+        else
+          new_keys << [key, blob, str]
+        end
+      end
+
+      if !matched
+        Prog::PageNexus.assemble(
+          "No matching existing host keys when checking for updated host keys",
+          ["SshableHostKeyUpdate", id], ubid, resource_id: id, severity: "error",
+        )
+      elsif !new_keys.empty?
+        args = new_keys.flat_map { |_, blob, _| [:string, blob] }
+        sess.send_global_request(HOSTKEYS_PROVE_REQUEST, *args) do |success, response|
+          next unless success
+
+          session_id = sess.transport.algorithms.session_id
+          proven_keys = new_keys.filter_map do |key, blob, str|
+            next unless (sig_blob = response.read_string)
+
+            sig_buffer = Net::SSH::Buffer.new(sig_blob)
+            sig_type = sig_buffer.read_string
+            next unless (key.ssh_type == "ssh-rsa") ? RSA_SIGNATURE_TYPES.include?(sig_type) : (sig_type == key.ssh_type)
+
+            signed_data = Net::SSH::Buffer.from(:string, HOSTKEYS_PROVE_REQUEST, :string, session_id, :string, blob).to_s
+            begin
+              str if key.ssh_do_verify(sig_buffer.read_string, signed_data, host_key: sig_type)
+            rescue
+              false
+            end
+          end
+
+          add_host_keys(proven_keys) unless proven_keys.empty?
+        end
+      end
+
+      false
+    end
+  end
+
   def channel_wait(ch, wait_deadline)
     if wait_deadline
       ch.connection.loop do
@@ -283,11 +417,12 @@ end
 
 # Table: sshable
 # Columns:
-#  id                | uuid | PRIMARY KEY
-#  host              | text |
-#  raw_private_key_1 | text |
-#  raw_private_key_2 | text |
-#  unix_user         | text | NOT NULL DEFAULT 'rhizome'::text
+#  id                | uuid   | PRIMARY KEY
+#  host              | text   |
+#  raw_private_key_1 | text   |
+#  raw_private_key_2 | text   |
+#  unix_user         | text   | NOT NULL DEFAULT 'rhizome'::text
+#  host_keys         | text[] |
 # Indexes:
 #  sshable_pkey     | PRIMARY KEY btree (id)
 #  sshable_host_key | UNIQUE btree (host)

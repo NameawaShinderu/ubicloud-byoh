@@ -22,17 +22,28 @@ class StorageKeyEncryption
     nonce << cipher.update(plaintext) << cipher.final << cipher.auth_tag
   end
 
+  # Inverse of aes256gcm_encrypt.
+  def self.aes256gcm_decrypt(key, auth_data, wrapped)
+    cipher = OpenSSL::Cipher.new("aes-256-gcm")
+    cipher.decrypt
+    cipher.key = key
+    cipher.iv = wrapped[0, 12]
+    cipher.auth_data = auth_data
+    cipher.auth_tag = wrapped[-16..]
+    cipher.update(wrapped[12...-16]) + cipher.final
+  end
+
+  def encrypted_dek_json(data_encryption_key)
+    JSON.pretty_generate({
+      cipher: data_encryption_key[:cipher],
+      key: wrap_key(data_encryption_key[:key]).map { |s| Base64.strict_encode64(s) },
+      key2: wrap_key(data_encryption_key[:key2]).map { |s| Base64.strict_encode64(s) },
+    })
+  end
+
   def write_encrypted_dek(key_file, data_encryption_key)
     File.open(key_file, "w") {
-      wrapped_key1 = wrap_key(data_encryption_key[:key])
-      wrapped_key2 = wrap_key(data_encryption_key[:key2])
-      wrapped_key1_b64 = wrapped_key1.map { |s| Base64.strict_encode64(s) }
-      wrapped_key2_b64 = wrapped_key2.map { |s| Base64.strict_encode64(s) }
-      _1.write(JSON.pretty_generate({
-        cipher: data_encryption_key[:cipher],
-        key: wrapped_key1_b64,
-        key2: wrapped_key2_b64,
-      }))
+      _1.write(encrypted_dek_json(data_encryption_key))
       fsync_or_fail(_1)
     }
   end

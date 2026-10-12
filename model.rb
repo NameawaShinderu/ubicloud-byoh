@@ -19,11 +19,10 @@ Sequel::Model.plugin :singular_table_names
 Sequel::Model.plugin :subclasses unless ENV["RACK_ENV"] == "development"
 Sequel::Model.plugin :column_encryption do |enc|
   key = Config.clover_column_encryption_key
-  if Config.kms_decrypt_clover_column_encryption_key_with_arn
-    require "aws-sdk-kms"
-    kms_client = Aws::KMS::Client.new
-    response = kms_client.decrypt(ciphertext_blob: key, key_id: Config.kms_decrypt_clover_column_encryption_key_with_arn)
-    key = response.plaintext
+  if (aws_kms_arn = Config.kms_decrypt_clover_column_encryption_key_with_arn)
+    key = KmsKeyDecryptor.aws_kms(aws_kms_arn, key)
+  elsif (gcp_kms_key = Config.kms_decrypt_clover_column_encryption_key_with_gcp_kms_key)
+    key = KmsKeyDecryptor.gcp_kms(gcp_kms_key, key)
   end
   enc.key 0, key
 end
@@ -76,10 +75,15 @@ end
 
 module SequelExtensions
   def delete(force: false, &)
-    # Do not error if this is a plain dataset that does not respond to destroy
-    return super(&) unless respond_to?(:destroy)
+    check_delete_callstack! if !force && Config.test?
+    super(&)
+  end
 
-    caller_lines = caller
+  private
+
+  def check_delete_callstack!
+    # Skip SequelExtensions#delete caller
+    caller_lines = caller(2)
     rodauth_in_callstack = !caller_lines.grep(/rodauth/).empty?
     destroy_in_callstack = !caller_lines.grep(/sequel\/model\/base.*_destroy_delete/).empty?
 
@@ -87,26 +91,13 @@ module SequelExtensions
     # environment variable is set)
     callee_in_callstack = !caller_lines.grep(/#{Regexp.escape(__FILE__)}.*delete/).empty?
 
-    unless rodauth_in_callstack || destroy_in_callstack || callee_in_callstack || force
+    unless rodauth_in_callstack || destroy_in_callstack || callee_in_callstack
       raise "Calling delete is discouraged as it skips hooks such as before_destroy, which " \
             "we use to archive records. Use destroy instead. If you know what you are doing " \
             "and still want to use delete, you can pass force: true to trigger delete."
     end
-
-    if is_a?(Sequel::Dataset)
-      super(&)
-    else
-      super()
-    end
   end
 end
 
-module Sequel
-  class Dataset
-    prepend SequelExtensions
-  end
-
-  class Model
-    prepend SequelExtensions
-  end
-end
+Sequel::Model::DatasetMethods.include SequelExtensions
+Sequel::Model.include SequelExtensions

@@ -1,4 +1,4 @@
-FROM docker.io/library/node:24.12-alpine3.23 AS frontend-builder
+FROM docker.io/library/node:26.5-alpine3.23 AS frontend-builder
 WORKDIR /app
 COPY tailwind.config.js package.json package-lock.json ./
 COPY views/ ./views/
@@ -8,7 +8,7 @@ RUN npm ci
 RUN npm run prod
 
 
-FROM docker.io/library/ruby:4.0.2-alpine3.23 AS bundler
+FROM docker.io/library/ruby:4.0.7-alpine3.23 AS bundler
 # Install build dependencies
 # - build-base, git, curl: To ensure certain gems can be compiled
 # - postgresql-dev: Required for postgresql gem
@@ -20,15 +20,18 @@ COPY Gemfile Gemfile.lock ./
 RUN bundle install
 
 
-FROM docker.io/library/ruby:4.0.2-alpine3.23
+FROM docker.io/library/ruby:4.0.7-alpine3.23
 # Install runtime dependencies
 # - tzdata: The public-domain time zone database
 # - curl: Required for healthcheck and some basic operations
 # - postgresql-client: Required for postgresql gem at runtime
 # - gcompat: Required for nokogiri gem at runtime. https://nokogiri.org/tutorials/installing_nokogiri.html#linux-musl-error-loading-shared-library
 # - foreman: Helps to start different parts of app based on Procfile
+# - jemalloc: Reduces memory fragmentation; arch-independent path on Alpine
+ENV JEMALLOC_PATH=/usr/lib/libjemalloc.so.2
 RUN apk update --no-cache && \
-    apk add tzdata curl postgresql-client gcompat libffi --no-cache && \
+    apk add tzdata curl postgresql-client gcompat libffi jemalloc --no-cache && \
+    test -f "$JEMALLOC_PATH" && \
     gem install foreman
 
 RUN adduser -D ubicloud && \
@@ -45,6 +48,8 @@ COPY --chown=ubicloud . /app
 
 ENV RACK_ENV=production
 ENV PORT=3000
+ENV LD_PRELOAD=${JEMALLOC_PATH}
+ENV MALLOC_CONF=narenas:2,background_thread:true
 
 EXPOSE 3000
 

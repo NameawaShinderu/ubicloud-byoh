@@ -6,8 +6,10 @@ require_relative "../../common/lib/util"
 
 class VhostBlockBackend
   SHA256_BY_VERSION_AND_ARCH = {
-    ["v0.4.0", :x64] => "c74f1d4bef624d5f46e3763d6d63ac79ca3e8f3fccd1696840266398834d53d0",
-    ["v0.4.0", :arm64] => "65dd7354b087a07fca7d35bca00014532fd636e7aae838e32d87ee0d37284fad",
+    ["v0.5.1", :x64] => "7b82f4769a7ee52b1fa71d17f12dbe02a4795e4bdb5e8fe4cea98bb3a7913972",
+    ["v0.5.1", :arm64] => "f538c4ee0618274a738d5cb3695c720004a46d3edef89bce6c17a0a0df12b719",
+    ["v0.4.2", :x64] => "e7e430f2e722a2d5d7c18a4f609360e003798d481e26da6db380e698ccb079eb",
+    ["v0.4.2", :arm64] => "ada92fe076e49f731f5d343d445b1e80d7685b811c33cde7fe88918e93649093",
     ["v0.3.1", :x64] => "3b4a6d3387a8da7c914d85203955c0a879168518aed76679a334070403630262",
     ["v0.3.1", :arm64] => "d7cd297468569a0fa197d48eb7d21b64aea9598895d1b5b97da8bec5e307d57b",
     ["v0.2.2", :x64] => "f5b7b2b88fa18e5070ff319b15363aed671e496d9f6cccec3bbcc48a6f38a44a",
@@ -18,7 +20,9 @@ class VhostBlockBackend
 
   def initialize(version)
     @version = version
-    @v0_4_or_later = Gem::Version.new(version.delete_prefix("v")) >= Gem::Version.new("0.4.0")
+    parsed = Gem::Version.new(version.delete_prefix("v"))
+    @v0_4_or_later = parsed >= Gem::Version.new("0.4.0")
+    @v0_5_or_later = parsed >= Gem::Version.new("0.5.0")
   end
 
   def config_v2?
@@ -26,6 +30,16 @@ class VhostBlockBackend
   end
 
   def supports_archive?
+    @v0_4_or_later
+  end
+
+  # The remote stripe server (serve a volume over the remote stripe protocol)
+  # ships from v0.5.0 onwards.
+  def supports_remote_stripe_server?
+    @v0_5_or_later
+  end
+
+  def supports_stats_rpc?
     @v0_4_or_later
   end
 
@@ -60,6 +74,14 @@ class VhostBlockBackend
     "#{dir}/archive"
   end
 
+  def dump_metadata_path
+    "#{dir}/dump-metadata"
+  end
+
+  def remote_stripe_server_path
+    "#{dir}/remote-stripe-server"
+  end
+
   def download
     temp_tarball = "/tmp/vhost-backend-#{@version}.tar.gz"
     puts "Downloading ubiblk package from #{url}"
@@ -67,7 +89,7 @@ class VhostBlockBackend
     fail "Invalid SHA-256 digest" unless downloaded_sha256 == sha256
     FileUtils.mkdir_p(dir)
     FileUtils.cd dir do
-      r "tar -xzf #{temp_tarball}"
+      r "tar", "-xzf", temp_tarball
     end
     FileUtils.rm_f temp_tarball
   end

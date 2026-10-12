@@ -51,6 +51,10 @@ module Metrics
           labels: {name: "Cache & Buffers"},
           query: "sum((node_memory_Cached_bytes{ubicloud_resource_id=\"$ubicloud_resource_id\", ubicloud_resource_role=\"primary\"} + node_memory_Buffers_bytes{ubicloud_resource_id=\"$ubicloud_resource_id\", ubicloud_resource_role=\"primary\"}) / node_memory_MemTotal_bytes{ubicloud_resource_id=\"$ubicloud_resource_id\", ubicloud_resource_role=\"primary\"} * 100)",
         ),
+        TimeSeries.new(
+          labels: {name: "Committed Memory"},
+          query: "sum(node_memory_Committed_AS_bytes{ubicloud_resource_id=\"$ubicloud_resource_id\", ubicloud_resource_role=\"primary\"} / node_memory_CommitLimit_bytes{ubicloud_resource_id=\"$ubicloud_resource_id\", ubicloud_resource_role=\"primary\"} * 100)",
+        ),
       ],
     ),
     disk_usage:
@@ -186,6 +190,161 @@ module Metrics
         TimeSeries.new(
           labels: {name: "Rollbacks"},
           query: "sum(rate(pg_stat_database_xact_rollback{ubicloud_resource_id=\"$ubicloud_resource_id\", ubicloud_resource_role=\"primary\"}[1m]))",
+        ),
+      ],
+    ),
+  }
+
+  KUBERNETES_METRICS = {
+    cpu_usage:
+    MetricDefinition.new(
+      name: "CPU Usage",
+      description: "Percentage of CPU used per node",
+      unit: "%",
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "(1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\", ubicloud_resource_id=\"$ubicloud_resource_id\"}[1m]))) * 100",
+        ),
+      ],
+    ),
+    load_average:
+    MetricDefinition.new(
+      name: "Load Average",
+      description: "System load average over the last minute",
+      unit: nil,
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "sum by (instance) (node_load1{ubicloud_resource_id=\"$ubicloud_resource_id\"})",
+        ),
+      ],
+    ),
+    memory_usage:
+    MetricDefinition.new(
+      name: "Memory Usage",
+      description: "Percentage of memory in use per node",
+      unit: "%",
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "sum by (instance) ((1 - (node_memory_MemAvailable_bytes{ubicloud_resource_id=\"$ubicloud_resource_id\"} / node_memory_MemTotal_bytes{ubicloud_resource_id=\"$ubicloud_resource_id\"})) * 100)",
+        ),
+      ],
+    ),
+    disk_usage:
+    MetricDefinition.new(
+      name: "Disk Usage",
+      description: "Root filesystem utilization per node",
+      unit: "%",
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "max by (instance) (100 - (node_filesystem_avail_bytes{mountpoint=\"/\", ubicloud_resource_id=\"$ubicloud_resource_id\"} / node_filesystem_size_bytes{mountpoint=\"/\", ubicloud_resource_id=\"$ubicloud_resource_id\"} * 100))",
+        ),
+      ],
+    ),
+    disk_io:
+    MetricDefinition.new(
+      name: "Disk I/O",
+      description: "I/O operations per second",
+      unit: "IOPS",
+      series: [
+        TimeSeries.new(
+          labels: {name: "Reads"},
+          query: "sum by (instance) (rate(node_disk_reads_completed_total{ubicloud_resource_id=\"$ubicloud_resource_id\"}[1m]))",
+        ),
+        TimeSeries.new(
+          labels: {name: "Writes"},
+          query: "sum by (instance) (rate(node_disk_writes_completed_total{ubicloud_resource_id=\"$ubicloud_resource_id\"}[1m]))",
+        ),
+      ],
+    ),
+    network_traffic:
+    MetricDefinition.new(
+      name: "Network Traffic",
+      description: "Incoming and outgoing network traffic",
+      unit: "bytes/s",
+      series: [
+        TimeSeries.new(
+          labels: {name: "Received"},
+          query: "sum by (instance) (rate(node_network_receive_bytes_total{ubicloud_resource_id=\"$ubicloud_resource_id\"}[1m]))",
+        ),
+        TimeSeries.new(
+          labels: {name: "Transmitted"},
+          query: "sum by (instance) (rate(node_network_transmit_bytes_total{ubicloud_resource_id=\"$ubicloud_resource_id\"}[1m]))",
+        ),
+      ],
+    ),
+    api_request_rate:
+    MetricDefinition.new(
+      name: "API Server Requests",
+      description: "API server request rate by response code",
+      unit: "req/s",
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "sum by (code) (ubicloud:apiserver_request:rate5m{ubicloud_resource_id=\"$ubicloud_resource_id\"})",
+        ),
+      ],
+    ),
+    api_request_latency:
+    MetricDefinition.new(
+      name: "API Server Latency",
+      description: "99th percentile API server request duration by verb",
+      unit: "seconds",
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "max by (verb) (ubicloud:apiserver_latency_seconds:p99{ubicloud_resource_id=\"$ubicloud_resource_id\"})",
+        ),
+      ],
+    ),
+    api_inflight_requests:
+    MetricDefinition.new(
+      name: "API Server Inflight Requests",
+      description: "Requests the API server is currently serving",
+      unit: "count",
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "sum by (request_kind) (apiserver_current_inflight_requests{ubicloud_resource_id=\"$ubicloud_resource_id\"})",
+        ),
+      ],
+    ),
+    pending_pods:
+    MetricDefinition.new(
+      name: "Pending Pods",
+      description: "Pods waiting to be scheduled, by scheduler queue",
+      unit: "count",
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "max by (queue) (scheduler_pending_pods{ubicloud_resource_id=\"$ubicloud_resource_id\"})",
+        ),
+      ],
+    ),
+    cluster_database_size:
+    MetricDefinition.new(
+      name: "Cluster Database Size",
+      description: "Size of the cluster state database",
+      unit: "bytes",
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "max(apiserver_storage_size_bytes{ubicloud_resource_id=\"$ubicloud_resource_id\"})",
+        ),
+      ],
+    ),
+    cluster_objects:
+    MetricDefinition.new(
+      name: "Cluster Objects",
+      description: "Number of objects stored in the cluster state database",
+      unit: "count",
+      series: [
+        TimeSeries.new(
+          labels: {},
+          query: "max(ubicloud:apiserver_storage_objects:total{ubicloud_resource_id=\"$ubicloud_resource_id\"})",
         ),
       ],
     ),

@@ -2,25 +2,6 @@
 
 class PrivateSubnet < Sequel::Model
   module Metal
-    def connect_subnet(subnet)
-      ConnectedSubnet.create(subnet_hash(subnet))
-      nics.each do |nic|
-        create_tunnels(subnet.nics, nic)
-      end
-      subnet.incr_refresh_keys
-    end
-
-    def disconnect_subnet(subnet)
-      nics(eager: {src_ipsec_tunnels: [:src_nic, :dst_nic]}, dst_ipsec_tunnels: [:src_nic, :dst_nic]).each do |nic|
-        (nic.src_ipsec_tunnels + nic.dst_ipsec_tunnels).each do |tunnel|
-          tunnel.destroy if tunnel.src_nic.private_subnet_id == subnet.id || tunnel.dst_nic.private_subnet_id == subnet.id
-        end
-      end
-      ConnectedSubnet.where(subnet_hash(subnet)).destroy
-      subnet.incr_refresh_keys
-      incr_refresh_keys
-    end
-
     def create_tunnels(nics, src_nic)
       nics.each do |dst_nic|
         next if src_nic == dst_nic
@@ -39,6 +20,64 @@ class PrivateSubnet < Sequel::Model
             .join(:subnet, {id: [:subnet_id_1, :subnet_id_2]})
             .select(Sequel.case({subnet_id_1: :subnet_id_2}, :subnet_id_1, Sequel[:subnet][:id])),
           cycle: {columns: :id})
+    end
+
+    # In a mesh of transitively connected subnets, the subnet with the
+    # smallest ID is the "connected leader": the single subnet
+    # responsible for coordinating rekeying for the entire mesh. A
+    # standalone subnet is its own leader.
+    def connected_leader_id
+      mesh_dataset.order(:id).get(:id)
+    end
+
+    private
+
+    # The mesh as a dataset: this subnet plus everything transitively
+    # reachable over connected_subnet edges.
+    def mesh_dataset
+      DB[:subnet]
+        .with_recursive(:subnet,
+          this.select(:id),
+          DB[:connected_subnet]
+            .join(:subnet, {id: [:subnet_id_1, :subnet_id_2]})
+            .select(Sequel.case({subnet_id_1: :subnet_id_2}, :subnet_id_1, Sequel[:subnet][:id])),
+          cycle: {columns: :id})
+        .exclude(:is_cycle)
+    end
+
+    def metal_connect_subnet(subnet)
+      ConnectedSubnet.create(subnet_hash(subnet))
+      nics.each do |nic|
+        create_tunnels(subnet.nics, nic)
+      end
+      PrivateSubnet.incr_refresh_keys([subnet.id, id])
+    end
+
+    def metal_disconnect_subnet(subnet)
+      DB.ignore_duplicate_queries do
+        nics(eager: {src_ipsec_tunnels: [:src_nic, :dst_nic], dst_ipsec_tunnels: [:src_nic, :dst_nic]}).each do |nic|
+          (nic.src_ipsec_tunnels + nic.dst_ipsec_tunnels).each do |tunnel|
+            tunnel.destroy if tunnel.src_nic.private_subnet_id == subnet.id || tunnel.dst_nic.private_subnet_id == subnet.id
+          end
+        end
+      end
+      ConnectedSubnet.where(subnet_hash(subnet)).destroy
+      PrivateSubnet.incr_refresh_keys([subnet.id, id])
+    end
+
+    def metal_apply_firewalls
+      incr_update_firewall_rules
+    end
+
+    def metal_validate_firewall_attachment(firewall)
+      # metal has no firewall count cap
+      nil
+    end
+
+    # Reserve the same addresses as AWS for future-proofing: first four
+    # (network, router, DNS, future use) and last one (broadcast).
+    def metal_ipv4_reservation
+      [4, 1]
     end
   end
 end

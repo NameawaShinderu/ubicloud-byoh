@@ -45,7 +45,10 @@ class SemSnap
   end
 
   def incr(name)
-    if (semaphore = Semaphore.incr(@strand_id, name))
+    # Don't wake the current strand again over a semaphore increment
+    # mid-run: the prog's own nap or other flow control is
+    # authoritative.
+    if (semaphore = Semaphore.incr(@strand_id, name, wake: false))
       add_semaphore_instance_to_snapshot(Semaphore.with_pk(semaphore))
     end
   end
@@ -55,7 +58,7 @@ class SemSnap
   def apply
     return if @defer_delete.empty?
 
-    Semaphore.where(strand_id: @strand_id, id: @defer_delete).destroy
+    Semaphore.where(strand_id: @strand_id, id: @defer_delete).delete
     @defer_delete.clear
   end
 

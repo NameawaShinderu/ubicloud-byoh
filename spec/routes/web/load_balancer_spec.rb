@@ -265,12 +265,13 @@ RSpec.describe Clover, "load balancer" do
         expect(page).to have_flash_notice("VM is attached to the load balancer")
         expect(lb.vms.count).to eq(1)
 
-        expect(Config).to receive(:load_balancer_service_hostname).and_return("lb.ubicloud.com").at_least(:once)
+        expect(Config).not_to receive(:load_balancer_service_hostname)
+        expect(Config).to receive(:load_balancer_service_hostname_v2).and_return("lb2.ubicloud.com").at_least(:once)
         visit "#{project.path}#{lb.path}"
         expect(page.all("dt,dd").map(&:text)).to eq [
           "ID", lb.ubid,
           "Name", "dummy-lb-3",
-          "Connection String", "dummy-lb-3.#{ps.ubid[-5...]}.lb.ubicloud.com",
+          "Connection String", "dummy-lb-3.#{lb.ubid}.lb2.ubicloud.com",
           "Private Subnet", "dummy-ps-1",
           "Algorithm", "Hash Based",
           "Stack", "dual",
@@ -286,7 +287,7 @@ RSpec.describe Clover, "load balancer" do
         expect(page.all("dt,dd").map(&:text)).to eq [
           "ID", lb.ubid,
           "Name", "dummy-lb-3",
-          "Connection String", "dummy-lb-3.#{ps.ubid[-5...]}.lb.ubicloud.com",
+          "Connection String", "dummy-lb-3.#{lb.ubid}.lb2.ubicloud.com",
           "Private Subnet", "dummy-ps-1",
           "Algorithm", "Hash Based",
           "Stack", "IPv4",
@@ -307,6 +308,19 @@ RSpec.describe Clover, "load balancer" do
         expect(page.title).to eq("Ubicloud - #{ps.name}")
       end
 
+      it "allows attaching vms without IPv4 only to IPv6-only load balancers" do
+        ps = Prog::Vnet::SubnetNexus.assemble(project.id, name: "dummy-ps-1", location_id: Location::HETZNER_FSN1_ID).subject
+        lb = Prog::Vnet::LoadBalancerNexus.assemble(ps.id, name: "dummy-lb-3", src_port: 80, dst_port: 8000, stack: "ipv6").subject
+        vm = Prog::Vm::Nexus.assemble("k y", project.id, name: "dummy-vm-1", private_subnet_id: ps.id, enable_ip4: false).subject
+
+        visit "#{project.path}#{lb.path}/vms"
+        expect(page).to have_select("vm_id", with_options: [vm.name])
+
+        lb.update(stack: "ipv4")
+        page.refresh
+        expect(page).to have_no_select("vm_id", with_options: [vm.name])
+      end
+
       it "can not attach vm when it is already attached to another load balancer" do
         ps = Prog::Vnet::SubnetNexus.assemble(project.id, name: "dummy-ps-1", location_id: Location::HETZNER_FSN1_ID).subject
         lb1 = Prog::Vnet::LoadBalancerNexus.assemble(ps.id, name: "dummy-lb-3", src_port: 80, dst_port: 8000).subject
@@ -325,6 +339,7 @@ RSpec.describe Clover, "load balancer" do
 
         expect(page.title).to eq("Ubicloud - #{lb2.name}")
         expect(page).to have_content "VM is already attached to a load balancer"
+        expect(page.html).not_to include(vm.name)
         expect(lb2.vms.count).to eq(0)
       end
 
@@ -335,7 +350,7 @@ RSpec.describe Clover, "load balancer" do
 
         visit "#{project.path}#{lb.path}/vms"
         select vm.name, from: "vm_id"
-        vm.nics.first.destroy
+        vm.user_nic.destroy
         vm.destroy
         click_button "Attach"
 
@@ -382,7 +397,7 @@ RSpec.describe Clover, "load balancer" do
 
         expect(page.title).to eq("Ubicloud - #{lb.name}")
         expect(lb.reload.vms.count).to eq(1)
-        vm.nics.first.destroy
+        vm.user_nic.destroy
         vm.destroy
         click_button "Detach"
 
@@ -404,6 +419,7 @@ RSpec.describe Clover, "load balancer" do
 
     describe "rename" do
       it "can rename load balancer" do
+        Strand.create_with_id(lb, prog: "Vnet::LoadBalancerNexus", label: "wait")
         old_name = lb.name
         visit "#{project.path}#{lb.path}/settings"
         fill_in "name", with: "new-name%"
@@ -417,6 +433,33 @@ RSpec.describe Clover, "load balancer" do
         expect(page).to have_flash_notice("Name updated")
         expect(lb.reload.name).to eq "new-name"
         expect(page).to have_content("new-name")
+
+        expect(lb.rewrite_dns_records_set?).to be true
+        expect(lb.refresh_cert_set?).to be false
+      end
+
+      it "increments refresh cert semaphore if the load balancer is cert enabled and hostname version is 1" do
+        Strand.create_with_id(lb, prog: "Vnet::LoadBalancerNexus", label: "wait")
+        lb.update(cert_enabled: true, hostname_version: 1)
+        visit "#{project.path}#{lb.path}/settings"
+        fill_in "name", with: "new-name"
+        click_button "Rename"
+        expect(page).to have_flash_notice("Name updated")
+        expect(lb.reload.name).to eq "new-name"
+        expect(lb.rewrite_dns_records_set?).to be true
+        expect(lb.refresh_cert_set?).to be true
+      end
+
+      it "does not increments refresh cert semaphore if the load balancer is cert enabled and hostname version is 2" do
+        Strand.create_with_id(lb, prog: "Vnet::LoadBalancerNexus", label: "wait")
+        lb.update(cert_enabled: true, hostname_version: 2)
+        visit "#{project.path}#{lb.path}/settings"
+        fill_in "name", with: "new-name"
+        click_button "Rename"
+        expect(page).to have_flash_notice("Name updated")
+        expect(lb.reload.name).to eq "new-name"
+        expect(lb.rewrite_dns_records_set?).to be true
+        expect(lb.refresh_cert_set?).to be false
       end
 
       it "does not show rename option without permissions" do

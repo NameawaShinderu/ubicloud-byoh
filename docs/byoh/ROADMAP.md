@@ -153,7 +153,9 @@ Not done in M0:
 | Customer can | Create the 4th VM on the live host; get a "no capacity" state instead of a stuck `creating`. |
 | Open | CMP-P0 frees IO CPUs; compute critic hole 11 suggests keeping 1 thread out on hosts with < 16 threads. Size from G3 (M5). |
 
-#### M1. Upstream rebase (NET-P0) and the serial-log snapshot (C0) [PLANNED M1]
+#### M1. Upstream rebase (NET-P0) and the serial-log snapshot (C0) [CODE DONE 2026-10-12]
+
+**Status:** merged as a merge commit (not a rebase, so published history and tags stay valid); full gate green apart from 3 specs that fail identically on pure upstream here (CLAUDE.md §8). The live window, a fresh canary registration, and the DB-dump rehearsal are still to do; the upgrade steps are in CLAUDE.md §8. `CheckIpReachability` is skipped entirely for generic hosts rather than gated per IP.
 
 | Item | Detail |
 |---|---|

@@ -104,7 +104,7 @@ RSpec.describe Clover, "github" do
     end
 
     it "toggles premium runners for installation" do
-      installation.update(allocator_preferences: {})
+      installation.update(allocator_preferences: {}, created_at: Time.utc(2026, 5, 1))
 
       # enable
       visit "#{project.path}/github/#{installation.ubid}/setting"
@@ -137,7 +137,9 @@ RSpec.describe Clover, "github" do
     end
 
     it "shows badge for free premium runner upgrade" do
-      installation.update(created_at: Time.now)
+      now = Time.utc(2026, 6, 1)
+      allow(Time).to receive(:now).and_return(now)
+      project.set_ff_free_runner_upgrade_until(now + 100)
 
       visit "#{project.path}/github/#{installation.ubid}/setting"
       expect(page.status_code).to eq(200)
@@ -248,6 +250,7 @@ RSpec.describe Clover, "github" do
         ready_at: now - 50,
         runner_id: 2,
         vm_id: Prog::Vm::Nexus.assemble("dummy-public key", project.id, name: "runner-vm", size: "premium-4", location_id: Location::GITHUB_RUNNERS_ID).subject.update(allocated_at: now).id,
+        location_id: Location::GITHUB_RUNNERS_ID,
         workflow_job: {
           "id" => 123,
           "name" => "test-job",
@@ -261,6 +264,7 @@ RSpec.describe Clover, "github" do
       runner_not_created = Prog::Github::GithubRunnerNexus.assemble(installation, label: "ubicloud-arm", repository_name: "my-repo").subject.update(
         created_at: now - 38,
         vm_id: Prog::Vm::Nexus.assemble("dummy-public key", project.id, name: "runner-vm-2", size: "standard-4", arch: "arm64", location_id: Location::GITHUB_RUNNERS_ID).id,
+        location_id: Location::GITHUB_RUNNERS_ID,
       )
       runner_concurrency_limit = Prog::Github::GithubRunnerNexus.assemble(installation, label: "ubicloud-standard-2", repository_name: "my-repo").update(label: "wait_concurrency_limit").subject.update(created_at: now - 3.68 * 60 * 60)
       runner_custom_label_quota = Prog::Github::GithubRunnerNexus.assemble(installation, label: "ubicloud-standard-4", repository_name: "my-repo").update(label: "apply_custom_label_quota").subject.update(created_at: now - 120)
@@ -274,7 +278,7 @@ RSpec.describe Clover, "github" do
           resource_id: project.id,
           resource_name: "Daily Usage #{time.strftime("%Y-%m-%d")}",
           span: Sequel::Postgres::PGRange.new(time, time),
-          billing_rate_id: BillingRate.from_resource_properties("GitHubRunnerMinutes", family, "global")["id"],
+          billing_rate_id: BillingRate.from_resource_properties("GitHubRunnerMinutes", family, "global", false, BILLING_RATE_ACTIVE_AT)["id"],
           amount:,
         )
       end
@@ -295,8 +299,8 @@ RSpec.describe Clover, "github" do
       expect(page.all("#current-usages div").map { it.text.split("\n") }).to eq [
         ["Allocated vCPU", "4 vCPU"],
         ["Requested vCPU", "14 vCPU"],
-        ["Today", "$0.01"],
-        ["Last 30 Days", "$1280.01"],
+        ["Today", "$0.02"],
+        ["Last 30 Days", "$1600.02"],
       ]
     end
 
@@ -323,7 +327,7 @@ RSpec.describe Clover, "github" do
     end
 
     it "shows badge for free premium runner upgrade" do
-      installation.update(created_at: Time.now)
+      project.set_ff_free_runner_upgrade_until(Time.now + 100)
 
       visit "#{project.path}/github/#{installation.ubid}/runner"
       expect(page.status_code).to eq(200)
@@ -334,12 +338,57 @@ RSpec.describe Clover, "github" do
       expect(page.title).to eq("Ubicloud - GitHub Runner Settings")
     end
 
+    it "shows info about standard runners given premium hardware" do
+      installation.update(allocator_preferences: {})
+
+      vm = create_vm(project_id: project.id, name: "upgraded-vm", family: "premium", location_id: Location::GITHUB_RUNNERS_ID, allocated_at: Time.now)
+      runner = GithubRunner.create(installation_id: installation.id, repository_name: repository.name, label: "ubicloud-standard-4", vm_id: vm.id, location_id: vm.location_id)
+      Strand.create_with_id(runner, prog: "Github::GithubRunnerNexus", label: "wait")
+
+      visit "#{project.path}/github/#{installation.ubid}/runner"
+      expect(page.status_code).to eq(200)
+      expect(page).to have_content "Some of your standard runners were given premium hardware instead, on us."
+      expect(page).to have_no_content "Some of your premium runners were given standard hardware instead"
+
+      runner.update(label: "ubicloud-premium-4")
+      visit "#{project.path}/github/#{installation.ubid}/runner"
+      expect(page).to have_no_content "Some of your standard runners were given premium hardware instead, on us."
+
+      runner.update(label: "ubicloud-standard-4", vm_id: nil, location_id: nil)
+      visit "#{project.path}/github/#{installation.ubid}/runner"
+      expect(page).to have_content runner.ubid
+      expect(page).to have_no_content "Some of your standard runners were given premium hardware instead, on us."
+    end
+
+    it "shows info about premium runners given standard hardware" do
+      installation.update(allocator_preferences: {"family_filter" => ["premium", "standard"]})
+
+      vm = create_vm(project_id: project.id, name: "downgraded-vm", family: "standard", location_id: Location::GITHUB_RUNNERS_ID, allocated_at: Time.now)
+      runner = GithubRunner.create(installation_id: installation.id, repository_name: repository.name, label: "ubicloud-standard-4", vm_id: vm.id, location_id: vm.location_id)
+      Strand.create_with_id(runner, prog: "Github::GithubRunnerNexus", label: "wait")
+
+      visit "#{project.path}/github/#{installation.ubid}/runner"
+      expect(page.status_code).to eq(200)
+      expect(page).to have_content "Some of your premium runners were given standard hardware instead"
+      expect(page).to have_no_content "Some of your standard runners were given premium hardware instead, on us."
+
+      vm.update(allocated_at: nil)
+      visit "#{project.path}/github/#{installation.ubid}/runner"
+      expect(page).to have_no_content "Some of your premium runners were given standard hardware instead"
+
+      vm.update(allocated_at: Time.now, arch: "arm64")
+      runner.update(label: "ubicloud-standard-4-arm")
+      visit "#{project.path}/github/#{installation.ubid}/runner"
+      expect(page).to have_no_content "Some of your premium runners were given standard hardware instead"
+    end
+
     it "shows concurrency warning for limited access accounts" do
       installation.project.update(reputation: "limited")
-      Array.new(3).each {
-        runner = GithubRunner.create(installation_id: installation.id, repository_name: repository.name, label: "ubicloud-standard-60")
+      3.times do |i|
+        vm = create_vm(project_id: project.id, name: "test-vm-#{i}", vcpus: 60)
+        runner = GithubRunner.create(installation_id: installation.id, repository_name: repository.name, label: "ubicloud-standard-60", vm_id: vm.id, location_id: vm.location_id)
         Strand.create_with_id(runner, prog: "Github::GithubRunnerNexus", label: "wait")
-      }
+      end
       visit "#{project.path}/github/#{installation.ubid}/runner"
       expect(page.status_code).to eq(200)
       expect(page).to have_content "You've reached your vCPU concurrency limit"
@@ -371,33 +420,55 @@ RSpec.describe Clover, "github" do
       expect(page).to have_content "3 hours ago"
     end
 
-    it "can delete cache entries" do
+    it "can delete a cache entry" do
       entry = create_cache_entry(key: "new-cache")
-      client = instance_double(Aws::S3::Client)
-      expect(Aws::S3::Client).to receive(:new).and_return(client)
-      expect(client).to receive(:delete_object).with(bucket: repository.bucket_name, key: entry.blob_key)
-
       visit "#{project.path}/github/#{installation.ubid}/cache"
+      find("#entry-#{entry.ubid} input[type=checkbox]").check
+      click_button "Delete Selected Cache Entries"
 
-      expect(page.status_code).to eq(200)
-      expect(page).to have_content entry.key
-
-      find("#entry-#{entry.ubid} .delete-btn").click
-      expect(page).to have_flash_notice("Cache '#{entry.key}' deleted.")
+      expect(DB[:audit_log].where(action: "destroy").count).to eq(1)
+      expect(page.title).to eq "Ubicloud - Caches"
+      expect(page).to have_flash_notice("1 cache entry scheduled for deletion")
+      ds = Strand.where(prog: "Github::DeleteCacheEntries")
+      expect(ds.count).to eq 1
+      st = ds.first
+      expect(st.stack[0]["subject_id"]).to eq entry.repository_id
+      expect(st.stack[0]["cache_entry_ids"]).to eq [entry.id]
     end
 
-    it "raises not found when cache entry not exists" do
-      entry = create_cache_entry(key: "new-cache")
+    it "can delete multiple cache entries" do
+      repository2 = GithubRepository.create(name: "test-user/test-repo2", installation_id: installation.id)
+      entry1 = create_cache_entry(key: "cache-1")
+      entry2 = create_cache_entry(key: "cache-2", repository_id: repository2.id)
+      create_cache_entry(key: "cache-3")
       client = instance_double(Aws::S3::Client)
-      expect(Aws::S3::Client).to receive(:new).and_return(client)
-      expect(client).to receive(:delete_object).with(bucket: repository.bucket_name, key: entry.blob_key)
+      allow(Aws::S3::Client).to receive(:new).and_return(client)
+      allow(client).to receive(:delete_object)
 
       visit "#{project.path}/github/#{installation.ubid}/cache"
-      entry_ubid = entry.ubid
-      entry.destroy
+      find("#entry-#{entry1.ubid} input[type=checkbox]").check
+      find("#entry-#{entry2.ubid} input[type=checkbox]").check
+      click_button "Delete Selected Cache Entries"
 
-      find("#entry-#{entry_ubid} .delete-btn").click
-      expect(page.status_code).to eq 404
+      expect(page.title).to eq "Ubicloud - Caches"
+      expect(page).to have_flash_notice("2 cache entries scheduled for deletion")
+      expect(DB[:audit_log].where(action: "destroy").count).to eq(1)
+      data = Strand.where(prog: "Github::DeleteCacheEntries")
+        .map { it.stack[0].values_at("subject_id", "cache_entry_ids") }
+        .sort
+      expect(data).to eq({
+        repository.id => [entry1.id],
+        repository2.id => [entry2.id],
+      }.sort)
+    end
+
+    it "handles no cache entries selected for deletion" do
+      create_cache_entry(key: "new-cache")
+
+      visit "#{project.path}/github/#{installation.ubid}/cache"
+      click_button "Delete Selected Cache Entries"
+      expect(page).to have_flash_notice("No cache entries selected for deletion")
+      expect(page.title).to eq "Ubicloud - Caches"
     end
 
     it "can delete all cache entries for a repository" do

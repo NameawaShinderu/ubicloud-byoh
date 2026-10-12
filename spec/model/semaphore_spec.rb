@@ -15,6 +15,24 @@ RSpec.describe Semaphore do
     expect { described_class.incr(st.id, nil) }.to raise_error(RuntimeError)
   end
 
+  it ".incr wakes the strand without demoting an overdue schedule" do
+    st.update(schedule: overdue = Time.now - 100)
+    described_class.incr(st.id, "foo")
+    expect(st.reload.schedule).to be_within(1).of(overdue)
+  end
+
+  it ".incr with wake: false does not change the schedule" do
+    st.update(schedule: future = Time.now + 1000)
+    expect(described_class.incr(st.id, "foo", wake: false)).not_to be_nil
+    expect(st.reload.schedule).to be_within(1).of(future)
+  end
+
+  it ".incr pulls a future schedule to now" do
+    st.update(schedule: Time.now + 1000)
+    described_class.incr(st.id, "foo")
+    expect(st.reload.schedule).to be_within(2).of(Time.now)
+  end
+
   it ".set_at returns the Time the given semaphore id was set at" do
     time = described_class.set_at(described_class.generate_uuid)
     expect(time).to be_within(1).of(Time.now)
@@ -28,6 +46,6 @@ RSpec.describe Semaphore do
 
   it "#inspect_values_hash includes set_at" do
     sem = described_class.create(name: "foo", strand_id: st.id)
-    expect(Time.parse(sem.inspect_values_hash[:set_at] + " UTC")).to be_within(2).of(Time.now)
+    expect(Time.new(sem.inspect_values_hash[:set_at] + " UTC")).to be_within(2).of(Time.now)
   end
 end

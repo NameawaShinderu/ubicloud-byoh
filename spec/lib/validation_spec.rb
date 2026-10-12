@@ -51,12 +51,6 @@ RSpec.describe Validation do
         expect(io_limits.max_read_mbytes_per_sec).to be_nil
         expect(io_limits.max_write_mbytes_per_sec).to be_nil
       end
-
-      it "no IO limits for standard-gpu" do
-        io_limits = described_class.validate_vm_size("standard-gpu-6", "x64").io_limits
-        expect(io_limits.max_read_mbytes_per_sec).to be_nil
-        expect(io_limits.max_write_mbytes_per_sec).to be_nil
-      end
     end
 
     describe "#validate_vm_storage_size" do
@@ -273,6 +267,7 @@ RSpec.describe Validation do
       it "valid boot image" do
         expect { described_class.validate_boot_image("ubuntu-jammy") }.not_to raise_error
         expect { described_class.validate_boot_image("almalinux-9") }.not_to raise_error
+        expect { described_class.validate_boot_image("my-image@latest") }.not_to raise_error
       end
 
       it "invalid boot image" do
@@ -303,13 +298,13 @@ RSpec.describe Validation do
 
       it "valid cloudflare response" do
         expect(Config).to receive(:cloudflare_turnstile_site_key).and_return("cf_site_key")
-        Excon.stub({url: "https://challenges.cloudflare.com/turnstile/v0/siteverify", method: :post}, {status: 200, body: {"success" => true}.to_json})
+        stub_request(:post, "https://challenges.cloudflare.com/turnstile/v0/siteverify").to_return(status: 200, body: {"success" => true}.to_json)
         expect(described_class.validate_cloudflare_turnstile("cf_response")).to be_nil
       end
 
       it "invalid cloudflare response" do
         expect(Config).to receive(:cloudflare_turnstile_site_key).and_return("cf_site_key")
-        Excon.stub({url: "https://challenges.cloudflare.com/turnstile/v0/siteverify", method: :post}, {status: 200, body: {"success" => false, "error-codes" => "123"}.to_json})
+        stub_request(:post, "https://challenges.cloudflare.com/turnstile/v0/siteverify").to_return(status: 200, body: {"success" => false, "error-codes" => "123"}.to_json)
         expect { described_class.validate_cloudflare_turnstile("cf_response") }.to raise_error described_class::ValidationFailed
       end
     end
@@ -368,6 +363,108 @@ RSpec.describe Validation do
       ].each do |url|
         expect { described_class.validate_url(url) }.to raise_error described_class::ValidationFailed
       end
+    end
+  end
+
+  describe "#validate_syslog_url" do
+    it "valid urls" do
+      [
+        "tcp://logs.example.com:6514",
+        "tcp://192.168.1.1:1",
+        "tcp://logs.example.com:65535",
+      ].each do |url|
+        expect(described_class.validate_syslog_url(url)).to be_nil
+      end
+    end
+
+    it "rejects non-tcp schemes" do
+      ["https://logs.example.com:6514", "syslog://logs.example.com:6514"].each do |url|
+        expect { described_class.validate_syslog_url(url) }.to raise_error { |e|
+          expect(e).to be_a(described_class::ValidationFailed)
+          expect(e.details[:url]).to include("Only tcp URLs are supported")
+        }
+      end
+    end
+
+    it "rejects missing host" do
+      ["tcp://:6514", "tcp:something"].each do |url|
+        expect { described_class.validate_syslog_url(url) }.to raise_error described_class::ValidationFailed
+      end
+    end
+
+    it "rejects missing port" do
+      expect { described_class.validate_syslog_url("tcp://logs.example.com") }.to raise_error described_class::ValidationFailed
+    end
+
+    it "rejects port out of range" do
+      ["tcp://logs.example.com:0", "tcp://logs.example.com:99999"].each do |url|
+        expect { described_class.validate_syslog_url(url) }.to raise_error { |e|
+          expect(e).to be_a(described_class::ValidationFailed)
+          expect(e.details[:url]).to include("port must be between 1 and 65535")
+        }
+      end
+    end
+
+    it "rejects invalid URI" do
+      expect { described_class.validate_syslog_url("not a url") }.to raise_error described_class::ValidationFailed
+    end
+  end
+
+  describe "#validate_log_destination_options" do
+    it "accepts nil options" do
+      expect(described_class.validate_log_destination_options("otlp", nil)).to be_nil
+      expect(described_class.validate_log_destination_options("syslog", nil)).to be_nil
+    end
+
+    it "accepts valid otlp headers" do
+      expect(described_class.validate_log_destination_options("otlp", {"headers" => {"api-key" => "secret"}})).to be_nil
+    end
+
+    it "accepts valid syslog structured_data" do
+      expect(described_class.validate_log_destination_options("syslog", {"structured_data" => {"provider@123" => {"key" => "val"}}})).to be_nil
+    end
+
+    it "accepts empty options hash for otlp" do
+      expect(described_class.validate_log_destination_options("otlp", {})).to be_nil
+    end
+
+    it "accepts empty options hash for syslog" do
+      expect(described_class.validate_log_destination_options("syslog", {})).to be_nil
+    end
+
+    it "rejects unknown keys for otlp" do
+      expect { described_class.validate_log_destination_options("otlp", {"structured_data" => {}}) }.to raise_error { |e|
+        expect(e).to be_a(described_class::ValidationFailed)
+        expect(e.details[:options]).to include("may only contain 'headers'")
+      }
+    end
+
+    it "rejects unknown keys for syslog" do
+      expect { described_class.validate_log_destination_options("syslog", {"headers" => {}}) }.to raise_error { |e|
+        expect(e).to be_a(described_class::ValidationFailed)
+        expect(e.details[:options]).to include("may only contain 'structured_data'")
+      }
+    end
+
+    it "rejects non-string header values" do
+      expect { described_class.validate_log_destination_options("otlp", {"headers" => {"key" => 123}}) }.to raise_error { |e|
+        expect(e).to be_a(described_class::ValidationFailed)
+        expect(e.details[:options]).to include("flat object with string values")
+      }
+    end
+
+    it "rejects structured_data with non-hash SD-ID values" do
+      expect { described_class.validate_log_destination_options("syslog", {"structured_data" => {"id" => "not-a-hash"}}) }.to raise_error { |e|
+        expect(e).to be_a(described_class::ValidationFailed)
+        expect(e.details[:options]).to include("SD-IDs to key/value objects")
+      }
+    end
+
+    it "rejects structured_data with non-string leaf values" do
+      expect { described_class.validate_log_destination_options("syslog", {"structured_data" => {"id" => {"key" => 99}}}) }.to raise_error { |e|
+        expect(e).to be_a(described_class::ValidationFailed)
+        expect(e.details[:options]).to include("SD-IDs to key/value objects")
+      }
     end
   end
 
@@ -467,19 +564,32 @@ RSpec.describe Validation do
 
   describe "#validate_kubernetes_version" do
     it "valid versions" do
-      Option.kubernetes_versions.each do |version|
+      Option.selectable_kubernetes_versions.each do |version|
         expect(described_class.validate_kubernetes_version(version)).to be_nil
       end
     end
 
     it "invalid versions" do
-      ["v1.30", "v1.25", "invalid", "1.34"].each do |version|
+      unselectable = Option.kubernetes_versions - Option.selectable_kubernetes_versions
+      (["v1.30", "v1.25", "invalid", "1.34"] + unselectable).each do |version|
         expect { described_class.validate_kubernetes_version(version) }.to raise_error described_class::ValidationFailed
       end
     end
   end
 
-  describe "#validate_private_location_name" do
+  describe "#validate_kubernetes_location" do
+    it "accepts kubernetes-supported locations" do
+      Option.kubernetes_locations.each do |location|
+        expect(described_class.validate_kubernetes_location(location.id)).to be_nil
+      end
+    end
+
+    it "rejects locations that do not support kubernetes" do
+      expect { described_class.validate_kubernetes_location(Location::HETZNER_HEL1_ID) }.to raise_error described_class::ValidationFailed
+    end
+  end
+
+  describe "#validate_provider_location_name" do
     it "validates aws region names" do
       expect { described_class.validate_provider_location_name("aws", "us-west-2") }.not_to raise_error
       expect { described_class.validate_provider_location_name("aws", "eu-central-2") }.to raise_error described_class::ValidationFailed
@@ -600,22 +710,6 @@ RSpec.describe Validation do
       }.to raise_error described_class::ValidationFailed
     end
 
-    it "invalidates postgres upgrade when flavor is lantern" do
-      expect {
-        described_class.validate_postgres_upgrade(
-          instance_double(
-            PostgresResource,
-            version: "16",
-            target_version: "16",
-            needs_convergence?: false,
-            ongoing_failover?: false,
-            read_replica?: false,
-            flavor: PostgresResource::Flavor::LANTERN,
-          ),
-        )
-      }.to raise_error described_class::ValidationFailed
-    end
-
     it "invalidates postgres upgrade when it cannot be upgraded" do
       expect {
         described_class.validate_postgres_upgrade(
@@ -625,7 +719,6 @@ RSpec.describe Validation do
             needs_convergence?: false,
             ongoing_failover?: false,
             read_replica?: false,
-            flavor: PostgresResource::Flavor::STANDARD,
           ),
         )
       }.to raise_error described_class::ValidationFailed
@@ -641,8 +734,40 @@ RSpec.describe Validation do
 
     it "invalidates postgres version" do
       expect {
-        described_class.validate_postgres_version("18", PostgresResource::Flavor::LANTERN)
+        described_class.validate_postgres_version("15", PostgresResource::Flavor::STANDARD)
       }.to raise_error described_class::ValidationFailed
+    end
+  end
+
+  describe "#validate_postgres_cert_auth_user_name" do
+    it "valid names" do
+      [
+        "abc",
+        "abc123",
+        "abc-123",
+        "abc_123",
+        "ABC_123",
+        "postgres_reader",
+        "a" * 64,
+      ].each do |name|
+        expect(described_class.validate_postgres_cert_auth_user_name(name)).to be_nil
+      end
+    end
+
+    it "invalid names" do
+      [
+        nil,
+        "",
+        "abc def",
+        "abc$123",
+        "u\nhost all all 0.0.0.0/0 trust",
+        "a" * 65,
+        "postgres",
+        "ubi_replication",
+        "all",
+      ].each do |name|
+        expect { described_class.validate_postgres_cert_auth_user_name(name) }.to raise_error described_class::ValidationFailed
+      end
     end
   end
 end

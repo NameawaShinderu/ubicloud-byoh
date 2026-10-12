@@ -1,12 +1,10 @@
 # frozen_string_literal: true
 
 require_relative "spec_helper"
-require_relative "../../model/address"
 
 RSpec.describe OidcProvider do
   let(:registration_body) do
     {
-      registration_endpoint: "https://example.com/register",
       issuer: "https://host/issuer",
       authorization_endpoint: "https://host/auth",
       token_endpoint: "https://host/tok",
@@ -30,31 +28,10 @@ RSpec.describe OidcProvider do
     expect(described_class.name_for_ubid(provider.ubid)).to eq "TestOIDC"
   end
 
-  [true, false].each do |with_group_prefix|
-    it ".register registers a new provider#{" with group prefix" if with_group_prefix}" do
-      Excon.stub({path: "/.well-known/openid-configuration", method: :get}, {status: 200, body: registration_body})
-      scopes = "openid email"
-      if with_group_prefix
-        scopes += " groups"
-        group_prefix = "foo-"
-      end
-
-      request_body = {
-        client_name: "Ubicloud",
-        redirect_uris: ["#{Config.base_url}/auth/0pk8pg19vxe24gbdms7hmw780h/callback"],
-        scopes:,
-      }.to_json
-      response_body = {
-        client_id: "123",
-        client_secret: "456",
-        registration_client_uri: "https://host/rc",
-        registration_access_token: "789",
-      }.to_json
-      Excon.stub({path: "/register", method: :post, body: request_body}, {status: 201, body: response_body})
-
-      expect(described_class).to receive(:generate_uuid).and_return("9a2d00a7-7d70-8816-82db-4c9e34e1d008")
-      oidc_provider = described_class.register("Test", "https://example.com", group_prefix:)
-      expect(described_class.all).to eq [oidc_provider]
+  it ".register registers a new provider with given client_id and client_secret" do
+    stub_request(:get, "https://example.com/.well-known/openid-configuration").to_return(status: 200, body: registration_body)
+    %w[https://example.com/.well-known/openid-configuration https://example.com].each do |url|
+      oidc_provider = described_class.register("Test", url, client_id: "123", client_secret: "456")
       expect(oidc_provider.url).to eq "https://host/issuer"
       expect(oidc_provider.client_id).to eq "123"
       expect(oidc_provider.client_secret).to eq "456"
@@ -62,43 +39,34 @@ RSpec.describe OidcProvider do
       expect(oidc_provider.token_endpoint).to eq "/tok"
       expect(oidc_provider.userinfo_endpoint).to eq "/ui"
       expect(oidc_provider.jwks_uri).to eq "https://host/jw"
-      expect(oidc_provider.registration_client_uri).to eq "https://host/rc"
-      expect(oidc_provider.registration_access_token).to eq "789"
-      if group_prefix
-        expect(oidc_provider.group_prefix).to eq "foo-"
-      else
-        expect(oidc_provider.group_prefix).to be_nil
-      end
+      expect(oidc_provider.registration_client_uri).to be_nil
+      expect(oidc_provider.registration_access_token).to be_nil
     end
+    expect(described_class.count).to eq 2
   end
 
-  it ".register registers a new provider with given client_id and client_secret" do
-    Excon.stub({path: "/.well-known/openid-configuration", method: :get}, {status: 200, body: registration_body})
-    expect(described_class).to receive(:generate_uuid).and_return("9a2d00a7-7d70-8816-82db-4c9e34e1d008")
-    oidc_provider = described_class.register("Test", "https://example.com/.well-known/openid-configuration", client_id: "123", client_secret: "456")
-    expect(described_class.all).to eq [oidc_provider]
-    expect(oidc_provider.url).to eq "https://host/issuer"
-    expect(oidc_provider.client_id).to eq "123"
-    expect(oidc_provider.client_secret).to eq "456"
-    expect(oidc_provider.authorization_endpoint).to eq "/auth"
-    expect(oidc_provider.token_endpoint).to eq "/tok"
-    expect(oidc_provider.userinfo_endpoint).to eq "/ui"
-    expect(oidc_provider.jwks_uri).to eq "https://host/jw"
-    expect(oidc_provider.registration_client_uri).to be_nil
-    expect(oidc_provider.registration_access_token).to be_nil
+  it ".discovery_attributes returns the column values without creating a row" do
+    stub_request(:get, "https://example.com/.well-known/openid-configuration").to_return(status: 200, body: registration_body)
+    attrs = described_class.discovery_attributes("Test", "https://example.com", client_id: "123", client_secret: "456")
+    expect(attrs).to eq(
+      display_name: "Test",
+      url: "https://host/issuer",
+      client_id: "123",
+      client_secret: "456",
+      authorization_endpoint: "/auth",
+      token_endpoint: "/tok",
+      userinfo_endpoint: "/ui",
+      jwks_uri: "https://host/jw",
+      group_prefix: nil,
+      pkce_supported: false,
+    )
+    expect(described_class.count).to eq 0
   end
 
-  it ".register handles errors registering a new provider" do
-    Excon.stub({path: "/.well-known/openid-configuration", method: :get}, {status: 200, body: registration_body})
-
-    body = {
-      client_name: "Ubicloud",
-      redirect_uris: ["#{Config.base_url}/auth/0pk8pg19vxe24gbdms7hmw780h/callback"],
-      scopes: "openid email",
-    }.to_json
-    Excon.stub({path: "/register", method: :post, body:}, {status: 403, body: {error: "bad"}.to_json})
-
-    expect(described_class).to receive(:generate_uuid).and_return("9a2d00a7-7d70-8816-82db-4c9e34e1d008")
-    expect { described_class.register("Test", "https://example.com") }.to raise_error(RuntimeError, 'Unable to register with oidc provider: 403 {"error" => "bad"}')
+  it ".discovery_attributes detects S256 PKCE support from the discovery document" do
+    body = JSON.parse(registration_body).merge("code_challenge_methods_supported" => ["plain", "S256"]).to_json
+    stub_request(:get, "https://example.com/.well-known/openid-configuration").to_return(status: 200, body:)
+    attrs = described_class.discovery_attributes("Test", "https://example.com", client_id: "123", client_secret: "456")
+    expect(attrs[:pkce_supported]).to be true
   end
 end

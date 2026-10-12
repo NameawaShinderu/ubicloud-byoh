@@ -5,6 +5,10 @@ class MonitorableResource
   attr_accessor :monitor_job_started_at, :monitor_job_finished_at
   attr_writer :session
 
+  # Page after consecutive monitor session opens have failed for this long.
+  # Catches sshd outages while a strand is stuck retrying outside of `wait`.
+  OPEN_SESSION_FAILURE_PAGE_THRESHOLD = 5 * 60
+
   def initialize(resource)
     @resource = resource
     @session = nil
@@ -12,6 +16,8 @@ class MonitorableResource
     @pulse_check_started_at = Time.now
     @pulse_thread = nil
     @deleted = false
+    @open_session_failure_started_at = nil
+    @open_session_failure_paged = false
     if resource.is_a?(VmHost)
       @attached_resources = {}
       @attached_resources_mutex = Mutex.new
@@ -27,13 +33,22 @@ class MonitorableResource
   end
 
   def open_resource_session
-    return if @session && @pulse[:reading] == "up"
+    if @session && @pulse[:reading] == "up"
+      clear_open_session_failure
+      return
+    end
 
     @session = @resource.reload.init_health_monitor_session
   rescue Sequel::NoExistingObject
     Clog.emit("Resource is deleted.", {resource_deleted: {ubid: @resource.ubid}})
     @session = nil
     @deleted = true
+    clear_open_session_failure
+  rescue *Sshable::SSH_CONNECTION_ERRORS
+    record_open_session_failure
+    raise
+  else
+    clear_open_session_failure
   end
 
   def check_pulse
@@ -61,7 +76,7 @@ class MonitorableResource
     begin
       @pulse = @resource.check_pulse(session: @session, previous_pulse: @pulse)
       @session[:last_pulse] = Time.now
-      Clog.emit("Got new pulse.", {got_pulse: {ubid: @resource.ubid, pulse: @pulse}}) if (rpt = @pulse[:reading_rpt]) && (rpt < 6 || rpt % 5 == 1) || @pulse[:reading] != "up"
+      Clog.emit("Got new pulse.", {got_pulse: {ubid: @resource.ubid, pulse: @pulse}}) if (rpt = @pulse[:reading_rpt]) && (rpt < 6 || rpt % 20 == 1) || @pulse[:reading] != "up"
     rescue => ex
       if !stale_retry &&
           (
@@ -77,7 +92,15 @@ class MonitorableResource
         rescue
           nil
         end
-        @session.merge!(@resource.init_health_monitor_session)
+        begin
+          new_session = @resource.init_health_monitor_session
+        rescue *Sshable::SSH_CONNECTION_ERRORS
+          # Drop session so next monitor cycle reinits via open_resource_session,
+          # which tracks persistent failures.
+          @session = nil
+          raise
+        end
+        @session.merge!(new_session)
         retry
       end
 
@@ -123,5 +146,30 @@ class MonitorableResource
     end
 
     nil
+  end
+
+  private
+
+  def record_open_session_failure
+    return unless @resource.page_on_sshable_failure?
+    @open_session_failure_started_at ||= Time.now
+    return if @open_session_failure_paged
+    elapsed = Time.now - @open_session_failure_started_at
+    return if elapsed < @resource.open_session_failure_page_threshold
+
+    Prog::PageNexus.assemble(
+      "#{@resource.ubid} sshable unreachable for #{elapsed.to_i}s",
+      ["SshableUnreachable", @resource.id],
+      @resource.ubid,
+      resource_id: @resource.id,
+    )
+    @open_session_failure_paged = true
+  end
+
+  def clear_open_session_failure
+    return unless @open_session_failure_started_at
+    Page.from_tag_parts("SshableUnreachable", @resource.id)&.incr_resolve if @open_session_failure_paged
+    @open_session_failure_started_at = nil
+    @open_session_failure_paged = false
   end
 end

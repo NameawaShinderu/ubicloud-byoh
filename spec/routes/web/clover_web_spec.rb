@@ -26,6 +26,18 @@ RSpec.describe Clover do
   end
 
   if Config.unfrozen_test?
+    if ENV["FORCE_AUTOLOAD"] == "1"
+      it "raises for access to hidden models" do
+        visit "/webhook/hidden-model-access"
+        expect(page.body).to eq "Attempt to access a hidden model in Clover"
+      end
+
+      it "raises for access to hidden model method" do
+        visit "/webhook/hidden-model-method-call"
+        expect(page.body).to eq "Calling Account.inspect directly in Clover is not allowed"
+      end
+    end
+
     it "raises error if no_authorization_needed called when not needed or already authorized" do
       create_account.create_project_with_default_policy("project-1")
       login
@@ -69,6 +81,15 @@ RSpec.describe Clover do
 
     expect(page.title).to eq("Ubicloud - Invalid Parameter Type")
     expect(page.status_code).to eq(400)
+    expect(Page.count).to eq 0
+  end
+
+  it "returns 400 without paging for malformed query strings" do
+    post "/login", {}, {"QUERY_STRING" => "x=%zz", "HTTP_ACCEPT" => "application/json"}
+
+    expect(last_response.status).to eq(400)
+    expect(JSON.parse(last_response.body).dig("error", "type")).to eq("BadRequest")
+    expect(Page.count).to eq 0
   end
 
   it "handles missing handle_validation_failure_call" do
@@ -91,13 +112,71 @@ RSpec.describe Clover do
 
     visit "/webhook/test-error"
 
-    expect(page.title).to eq("Ubicloud - UnexceptedError")
+    expect(page.title).to eq("Ubicloud - UnexpectedError")
   end
 
   it "raises unexpected errors in test environment" do
     expect(Clog).not_to receive(:emit)
 
     expect { visit "/webhook/test-error?message=treat+as+unexpected+error" }.to raise_error(RuntimeError, "treat as unexpected error")
+  end
+
+  it "pages for unexpected errors and deduplicates repeats" do
+    visit "/webhook/test-error"
+    expect(page.title).to eq("Ubicloud - UnexpectedError")
+
+    pg = Page.active.first!(tag: "Clover500-RuntimeError")
+    expect(pg.severity).to eq("warning")
+    expect(pg.details).not_to have_key("exception_message")
+    expect(pg.details["exception_class"]).to eq("RuntimeError")
+    expect(pg.details["request_method"]).to eq("GET")
+    expect(pg.details["request_path"]).to eq("/webhook/test-error")
+    expect(pg.resource_id).to be_nil
+    expect(pg.details["backtrace"]).to be_a(Array)
+    expect(pg.details["backtrace"].first).to include("clover.rb")
+
+    visit "/webhook/test-error"
+    expect(Page.active.where(tag: "Clover500-RuntimeError").count).to eq 1
+  end
+
+  it "still serves the error response when paging fails" do
+    expect(Prog::PageNexus).to receive(:assemble).with(
+      "Unexpected RuntimeError in Clover web request",
+      ["Clover500", "RuntimeError"],
+      [],
+      resource_id: nil,
+      severity: "warning",
+      extra_data: {
+        exception_class: "RuntimeError",
+        request_method: "GET",
+        request_path: "/webhook/test-error",
+        backtrace: instance_of(Array),
+      },
+    ).and_raise(RuntimeError.new("paging failure"))
+    allow(Clog).to receive(:emit).and_call_original
+    expect(Clog).to receive(:emit).with("failed to page for unexpected error", instance_of(Hash)).and_call_original
+
+    visit "/webhook/test-error"
+
+    expect(page.title).to eq("Ubicloud - UnexpectedError")
+    expect(Page.count).to eq 0
+  end
+
+  it "pages for unexpected errors on the runtime host" do
+    expect(Vm).to receive(:from_runtime_jwt_payload).and_raise(RuntimeError.new("test error"))
+
+    get "/runtime/test", {}, {"HTTP_ACCEPT" => "application/json"}
+
+    expect(last_response.status).to eq(500)
+    expect(JSON.parse(last_response.body)["type"]).to eq("UnexpectedError")
+    expect(Page.count).to eq 1
+  end
+
+  if ENV["PROCESS_TYPE"] == "web"
+    it "disallows SSH access from web process" do
+      visit "/webhook/test-ssh-access"
+      expect(page.body).to eq "undefined-undefined method 'start' for module Net::SSH-Sshable#cmd is not allowed from the web process"
+    end
   end
 
   it "does not have broken links" do

@@ -1,13 +1,12 @@
-
 <% @page_title = "Create GPU Virtual Machine" %>
 
 <%== part(
   "components/page_header",
   breadcrumbs: [
-    %w[Projects /project],
+    %w[Projects /project].freeze,
     [@project.name, @project.path],
     ["Virtual Machines", "#{@project.path}/vm"],
-    %w[Create #]
+    %w[Create #].freeze
   ]
 ) %>
 
@@ -15,11 +14,10 @@
   <div class="overflow-hidden rounded-lg shadow ring-1 ring-black ring-opacity-5 bg-white">
     <div class="px-4 py-5 sm:p-6">
       <div class="max-w-3xl">
-
         <% gpu_options = [
                     [
             "nvidia-rtx-pro-6000",
-            ["NVIDIA RTX PRO 6000", "Blackwell, 96 GB VRAM", "$1150/mo", "$1.58/hour"],
+            ["NVIDIA RTX PRO 6000", "Blackwell, 96 GB VRAM", "Contact for pricing", ""],
             "opacity-50 h-full flex",
             { disabled: "disabled" }
           ],
@@ -42,22 +40,16 @@
         </div>
 
         <div class="mt-6 text-sm text-gray-600">
-          GPU virtual machines are not enabled for this project.
-          Email
-          <a href="mailto:support@ubicloud.com"
-            class="font-medium text-orange-600 hover:text-orange-700">
-            support@ubicloud.com
-          </a>
+          GPU virtual machines are not enabled for this project. Email
+          <a href="mailto:support@ubicloud.com" class="font-medium text-orange-600 hover:text-orange-700"> support@ubicloud.com </a>
           to enable GPU VMs.
         </div>
       </div>
     </div>
+
     <div class="px-4 py-5 sm:p-6">
       <div class="flex items-center justify-end gap-x-6">
-        <a href="<%= @project.path %>/vm"
-           class="text-sm font-semibold leading-6 text-gray-900">
-          Cancel
-        </a>
+        <a href="<%= @project.path %>/vm" class="text-sm font-semibold leading-6 text-gray-900"> Cancel </a>
       </div>
     </div>
   </div>

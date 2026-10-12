@@ -22,6 +22,11 @@ RSpec.describe Prog::Vm::Aws::Nexus do
   let(:location_credential_aws) {
     loc = LocationCredentialAws.create_with_id(location, access_key: "test-access-key", secret_key: "test-secret-key")
     LocationAz.create(location_id: loc.id, az: "a", zone_id: "usw2-az1")
+    LocationAz.create(location_id: loc.id, az: "b", zone_id: "usw2-az2")
+    LocationAz.create(location_id: loc.id, az: "c", zone_id: "usw2-az3")
+    LocationAz.create(location_id: loc.id, az: "d", zone_id: "usw2-az4")
+    LocationAz.create(location_id: loc.id, az: "e", zone_id: "usw2-az5")
+    LocationAz.create(location_id: loc.id, az: "f", zone_id: "usw2-az6")
     loc
   }
 
@@ -47,7 +52,7 @@ RSpec.describe Prog::Vm::Aws::Nexus do
   let(:aws_instance) { AwsInstance.create_with_id(vm, instance_id: "i-0123456789abcdefg") }
 
   let(:nic_aws_resource) {
-    NicAwsResource.create_with_id(vm.nics.first, network_interface_id: "eni-0123456789abcdefg")
+    NicAwsResource.create_with_id(vm.user_nic, network_interface_id: "eni-0123456789abcdefg", subnet_id: "subnet-12345678")
   }
 
   let(:client) { Aws::EC2::Client.new(stub_responses: true) }
@@ -55,24 +60,33 @@ RSpec.describe Prog::Vm::Aws::Nexus do
   let(:iam_client) { Aws::IAM::Client.new(stub_responses: true) }
 
   let(:user_data) {
-    public_key = vm.sshable.keys.first.public_key.shellescape
-    <<~USER_DATA
-#!/bin/bash
-custom_user="#{vm.unix_user}"
-if [ ! -d /home/$custom_user ]; then
-  adduser $custom_user --disabled-password --gecos ""
-  usermod -aG sudo $custom_user
-  echo "$custom_user ALL=(ALL:ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$custom_user
-  mkdir -p /home/$custom_user/.ssh
-  cp /home/ubuntu/.ssh/authorized_keys /home/$custom_user/.ssh/
-  chown -R $custom_user:$custom_user /home/$custom_user/.ssh
-  chmod 700 /home/$custom_user/.ssh
-  chmod 600 /home/$custom_user/.ssh/authorized_keys
-fi
-echo #{public_key} > /home/$custom_user/.ssh/authorized_keys
-usermod -L ubuntu
-    USER_DATA
+    cloud_config(unix_user: vm.unix_user, keys: [vm.sshable.keys.first.public_key], runcmd: ["usermod -L ubuntu"])
   }
+
+  # Returns the dual-NIC netplan runcmd entry from the cloud-config sent to run_instances.
+  def netplan_runcmd
+    user_data = Base64.decode64(client.api_requests.find { it[:operation_name] == :run_instances }[:params][:user_data])
+    YAML.safe_load(user_data.delete_prefix("#cloud-config\n"))["runcmd"].find { it.include?("61-ubicloud.yaml") }
+  end
+
+  # Mirrors the cloud-config Prog::Vm::Aws::Nexus#create_instance builds. The key
+  # goes in `users` rather than a shell script so cloud-init installs it during
+  # its network stage, which is when sshd starts, instead of in modules-final.
+  def cloud_config(unix_user:, keys:, runcmd:)
+    "#cloud-config\n" + {
+      "users" => [
+        "default",
+        {
+          "name" => unix_user,
+          "groups" => "sudo",
+          "sudo" => "ALL=(ALL:ALL) NOPASSWD:ALL",
+          "shell" => "/bin/bash",
+          "ssh_authorized_keys" => keys,
+        },
+      ],
+      "runcmd" => runcmd,
+    }.to_yaml.delete_prefix("---\n")
+  end
 
   before do
     allow(Aws::EC2::Client).to receive(:new).with(credentials: anything, region: "us-west-2").and_return(client)
@@ -87,14 +101,15 @@ usermod -L ubuntu
       loc
     }
 
-    it "creates correct number of storage volumes for storage optimized instance types" do
+    it "creates one VmStorageVolume per input storage volume on AWS" do
       storage_volumes = [
         {encrypted: true, size_gib: 30},
         {encrypted: true, size_gib: 7500},
       ]
 
       vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, location_id: assemble_loc.id, size: "i8g.8xlarge", arch: "arm64", storage_volumes:).subject
-      expect(vm.vm_storage_volumes.count).to eq(3)
+      expect(vm.vm_storage_volumes.count).to eq(2)
+      expect(vm.vm_storage_volumes.map(&:size_gib).sort).to eq([30, 7500])
     end
 
     it "hops to start_aws if location is aws" do
@@ -102,29 +117,23 @@ usermod -L ubuntu
       expect(st.label).to eq("start")
     end
 
-    it "gives correct max_disk_size for vm family" do
-      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, location_id: assemble_loc.id, size: "i7ie.24xlarge").subject
-      expect(vm.vm_storage_volumes.count).to eq(8)
-      expect(vm.vm_storage_volumes.sum { it.size_gib }).to eq(60000)
-    end
-
-    it "gives correct size even when volume size smaller than max disk size" do
-      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, location_id: assemble_loc.id, size: "i7ie.large").subject
-      expect(vm.vm_storage_volumes.count).to eq(1)
-      expect(vm.vm_storage_volumes.sum { it.size_gib }).to equal(1250)
-    end
-
-    it "gives correct max_disk_size for vm family with specialized disk size" do
-      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, location_id: assemble_loc.id, size: "i7ie.2xlarge").subject
-      expect(vm.vm_storage_volumes.count).to eq(2)
-      expect(vm.vm_storage_volumes.sum { it.size_gib }).to equal(5000)
-    end
-
-    it "fails if machine image version is provided for non-metal location" do
-      miv = create_machine_image_version_metal
+    it "fails if machine image is provided for non-metal location" do
       expect {
-        Prog::Vm::Nexus.assemble("some_ssh key", project.id, location_id: assemble_loc.id, machine_image_version_id: miv.id)
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, location_id: assemble_loc.id, boot_image: "test-image@1.0")
       }.to raise_error("Machine images are only supported for metal locations")
+    end
+
+    it "fails if a machine image version id is provided for non-metal location" do
+      expect {
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, location_id: assemble_loc.id, storage_volumes: [{size_gib: 20, machine_image_version_id: MachineImageVersion.generate_uuid}])
+      }.to raise_error("Machine images are only supported for metal locations")
+    end
+
+    it "creates a management NIC when use_separate_management_nic is set" do
+      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, location_id: assemble_loc.id, use_separate_management_nic: true).subject
+      expect(vm.nics.count).to eq(2)
+      expect(vm.user_nic).not_to be_nil
+      expect(vm.management_nic).not_to be_nil
     end
   end
 
@@ -150,12 +159,12 @@ usermod -L ubuntu
 
   describe "#start" do
     it "naps if vm nics are not in wait state" do
-      vm.nics.first.strand.update(label: "start")
+      vm.user_nic.strand.update(label: "start")
       expect { nx.start }.to nap(1)
     end
 
     it "creates a role for instance" do
-      vm.nics.first.strand.update(label: "wait")
+      vm.user_nic.strand.update(label: "wait")
       iam_client.stub_responses(:create_role, {role: {role_name: vm.name, path: "/", role_id: "ROLE123", arn: "arn:aws:iam::123456789012:role/#{vm.name}", create_date: Time.now}})
       expect(iam_client).to receive(:create_role).with({
         role_name: vm.name,
@@ -169,13 +178,14 @@ usermod -L ubuntu
             },
           ],
         }.to_json,
+        tags: Util.aws_tags(vm.name),
       }).and_call_original
 
       expect { nx.start }.to hop("create_role_policy")
     end
 
     it "hops to create_role_policy if role already exists" do
-      vm.nics.first.strand.update(label: "wait")
+      vm.user_nic.strand.update(label: "wait")
       expect(iam_client).to receive(:create_role).with({role_name: vm.name, assume_role_policy_document: {
         Version: "2012-10-17",
         Statement: [
@@ -185,12 +195,12 @@ usermod -L ubuntu
             Action: "sts:AssumeRole",
           },
         ],
-      }.to_json}).and_raise(Aws::IAM::Errors::EntityAlreadyExists.new(nil, "EntityAlreadyExists"))
+      }.to_json, tags: Util.aws_tags(vm.name)}).and_raise(Aws::IAM::Errors::EntityAlreadyExists.new(nil, "EntityAlreadyExists"))
       expect { nx.start }.to hop("create_role_policy")
     end
 
     it "hops to create_instance if it's a runner instance" do
-      vm.nics.first.strand.update(label: "wait")
+      vm.user_nic.strand.update(label: "wait")
       vm.update(unix_user: "runneradmin")
       expect { nx.start }.to hop("create_instance")
     end
@@ -224,8 +234,14 @@ usermod -L ubuntu
                 "arn:aws:logs:*:*:log-group:/#{vm.name}/postgresql:*",
               ],
             },
+            {
+              Effect: "Allow",
+              Action: "guardduty:SendSecurityTelemetry",
+              Resource: "*",
+            },
           ],
         }.to_json,
+        tags: Util.aws_tags("#{vm.name}-cw-agent-policy"),
       }).and_call_original
 
       expect { nx.create_role_policy }.to hop("attach_role_policy")
@@ -262,6 +278,7 @@ usermod -L ubuntu
       iam_client.stub_responses(:create_instance_profile, instance_profile: {instance_profile_name: "#{vm.name}-instance-profile", instance_profile_id: "test-id", path: "/", roles: [], arn: "arn:aws:iam::123456789012:instance-profile/#{vm.name}-instance-profile", create_date: Time.now})
       expect(iam_client).to receive(:create_instance_profile).with({
         instance_profile_name: "#{vm.name}-instance-profile",
+        tags: Util.aws_tags("#{vm.name}-instance-profile"),
       }).and_call_original
 
       expect { nx.create_instance_profile }.to hop("add_role_to_instance_profile")
@@ -344,14 +361,125 @@ usermod -L ubuntu
         metadata_options: {http_tokens: "required"},
         min_count: 1,
         max_count: 1,
-        tag_specifications: Util.aws_tag_specifications("instance", vm.name),
+        tag_specifications: Util.aws_tag_specifications("instance", vm.name) + Util.aws_tag_specifications("volume", vm.name),
         iam_instance_profile: {name: "#{vm.name}-instance-profile"},
-        client_token: vm.id,
+        client_token: "#{vm.id}-#{vm.family}",
         instance_market_options: nil,
         user_data: Base64.encode64(user_data),
       }).and_call_original
       expect { nx.create_instance }.to hop("wait_instance_created")
       expect(vm.aws_instance).to have_attributes(instance_id: "i-0123456789abcdefg", az_id: "use1-az1", iam_role: "testvm", ipv4_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com")
+    end
+
+    it "attaches both pre-created mgmt and user ENIs and policy-routes the data NIC" do
+      user_nic_record = vm.user_nic
+      aws_subnet = user_nic_record.private_subnet.private_subnet_aws_resource.aws_subnets.first
+      nic_aws_resource.update(subnet_id: "subnet-12345678", aws_subnet_id: aws_subnet.id)
+      mgmt_nic = Prog::Vnet::NicNexus.assemble(user_nic_record.private_subnet_id, name: "#{vm.name}-mgmt-nic", is_management: true).subject
+      mgmt_nic.update(vm_id: vm.id)
+      NicAwsResource.create_with_id(mgmt_nic.id, network_interface_id: "eni-mgmt-0000000000", subnet_id: "subnet-12345678")
+      refresh_frame(nx, new_values: {"use_separate_management_nic" => true})
+      client.stub_responses(:describe_network_interfaces, network_interfaces: [
+        {network_interface_id: "eni-mgmt-0000000000", mac_address: "0a:00:00:00:00:01", private_ip_address: "10.0.1.4"},
+        {network_interface_id: "eni-0123456789abcdefg", mac_address: "0a:1b:2c:3d:4e:5f", private_ip_address: "10.0.1.5"},
+      ])
+      client.stub_responses(:run_instances, instances: [{instance_id: "i-0123456789abcdefg", network_interfaces: [{subnet_id: "subnet-12345678"}], public_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com"}])
+      expect(client).to receive(:run_instances).with(hash_including(
+        network_interfaces: [
+          {network_interface_id: "eni-mgmt-0000000000", device_index: 0},
+          {network_interface_id: "eni-0123456789abcdefg", device_index: 1},
+        ],
+      )).and_call_original
+      expect { nx.create_instance }.to hop("wait_instance_created")
+      user_data = netplan_runcmd
+      # mgmt NIC: only SSH (from-mgmt) on table 100, default suppressed; data NIC: main default + table 200
+      expect(user_data).to include("network: {config: disabled}")
+      netplan_yaml = user_data[/rm -f \/etc\/netplan\/50-cloud-init\.yaml\necho (.*?) > \/etc\/netplan\/61-ubicloud\.yaml/m, 1].shellsplit.first
+      netplan = YAML.safe_load(netplan_yaml)
+      expect(netplan_yaml).to include('macaddress: "0a:00:00:00:00:01"')
+      mgmt, user = netplan["network"]["ethernets"].values_at("mgmt-nic", "user-nic")
+      expect(mgmt["match"]).to eq("macaddress" => "0a:00:00:00:00:01")
+      expect(user["match"]).to eq("macaddress" => "0a:1b:2c:3d:4e:5f")
+      expect(mgmt["dhcp4-overrides"]).to eq("use-routes" => false)
+      expect(mgmt["routing-policy"]).to eq [{"from" => "10.0.1.4/32", "table" => 100}]
+      expect(user["routing-policy"]).to eq [{"from" => "10.0.1.5/32", "table" => 200}]
+    end
+
+    it "uses the subnet project flag for management IPv6 RA policy routes" do
+      user_nic_record = vm.user_nic
+      service_project = Project.create(name: "postgres-service").tap { it.set_ff_postgres_aws_ssh_ipv6(false) }
+      user_nic_record.private_subnet.project.set_ff_postgres_aws_ssh_ipv6(true)
+      user_nic_record.private_subnet.private_subnet_aws_resource.update(user_security_group_id: "sg-user", mgmt_security_group_id: "sg-mgmt")
+      vm.update(project_id: service_project.id)
+      aws_subnet = user_nic_record.private_subnet.private_subnet_aws_resource.aws_subnets.first
+      aws_subnet.update(ipv6_cidr: "2600:1f14:1000::/64")
+      nic_aws_resource.update(subnet_id: "subnet-12345678", aws_subnet_id: aws_subnet.id)
+      mgmt_nic = Prog::Vnet::NicNexus.assemble(user_nic_record.private_subnet_id, name: "#{vm.name}-mgmt-nic", is_management: true).subject
+      mgmt_nic.update(vm_id: vm.id)
+      NicAwsResource.create_with_id(mgmt_nic.id, network_interface_id: "eni-mgmt-0000000000", subnet_id: "subnet-12345678", aws_subnet_id: aws_subnet.id)
+      refresh_frame(nx, new_values: {"use_separate_management_nic" => true})
+      client.stub_responses(:describe_network_interfaces, network_interfaces: [
+        {network_interface_id: "eni-mgmt-0000000000", mac_address: "0a:00:00:00:00:01", private_ip_address: "10.0.1.4", ipv_6_addresses: [{ipv_6_address: "2600:1f14:1000::4"}]},
+        {network_interface_id: "eni-0123456789abcdefg", mac_address: "0a:1b:2c:3d:4e:5f", private_ip_address: "10.0.1.5", ipv_6_addresses: [{ipv_6_address: "2600:1f14:1000::5"}]},
+      ])
+      client.stub_responses(:run_instances, instances: [{instance_id: "i-0123456789abcdefg", network_interfaces: [{subnet_id: "subnet-12345678"}], public_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com"}])
+
+      expect { nx.create_instance }.to hop("wait_instance_created")
+      user_data = netplan_runcmd
+      netplan = YAML.safe_load(user_data[/rm -f \/etc\/netplan\/50-cloud-init\.yaml\necho (.*?) > \/etc\/netplan\/61-ubicloud\.yaml/m, 1].shellsplit.first)
+      mgmt, user = netplan["network"]["ethernets"].values_at("mgmt-nic", "user-nic")
+      expect(mgmt).to include("dhcp6" => true, "accept-ra" => true, "dhcp6-overrides" => {"use-routes" => false})
+      expect(user).to include("dhcp6" => true, "accept-ra" => true)
+      expect(mgmt["routing-policy"]).to include("from" => "2600:1f14:1000::4", "table" => 100)
+      expect(mgmt["routes"]).to include("to" => "2600:1f14:1000::/64", "scope" => "link", "table" => 100)
+      expect(user["routing-policy"]).to eq [{"from" => "10.0.1.5/32", "table" => 200}]
+      expect(user["routes"].select { it["to"].include?(":") }).to be_empty
+      expect(user_data).to include("/etc/systemd/network/10-netplan-mgmt-nic.network.d/10-ubicloud-ipv6.conf")
+      expect(user_data).to include("[IPv6AcceptRA]\nRouteTable=100")
+    end
+
+    it "fails clearly when IPv6 SSH is enabled on a subnet without IPv6 CIDR" do
+      vm.user_nic.private_subnet.project.set_ff_postgres_aws_ssh_ipv6(true)
+      vm.user_nic.private_subnet.private_subnet_aws_resource.update(user_security_group_id: "sg-user", mgmt_security_group_id: "sg-mgmt")
+      aws_subnet = vm.user_nic.private_subnet.private_subnet_aws_resource.aws_subnets.first
+      nic_aws_resource.update(subnet_id: "subnet-12345678", aws_subnet_id: aws_subnet.id)
+      mgmt_nic = Prog::Vnet::NicNexus.assemble(vm.user_nic.private_subnet_id, name: "#{vm.name}-mgmt-nic", is_management: true).subject
+      mgmt_nic.update(vm_id: vm.id)
+      NicAwsResource.create_with_id(mgmt_nic.id, network_interface_id: "eni-mgmt-0000000000", subnet_id: "subnet-12345678", aws_subnet_id: aws_subnet.id)
+      refresh_frame(nx, new_values: {"use_separate_management_nic" => true})
+      client.stub_responses(:describe_network_interfaces, network_interfaces: [
+        {network_interface_id: "eni-mgmt-0000000000", mac_address: "0a:00:00:00:00:01", private_ip_address: "10.0.1.4", ipv_6_addresses: [{ipv_6_address: "2600:1f14:1000::4"}]},
+        {network_interface_id: "eni-0123456789abcdefg", mac_address: "0a:1b:2c:3d:4e:5f", private_ip_address: "10.0.1.5", ipv_6_addresses: [{ipv_6_address: "2600:1f14:1000::5"}]},
+      ])
+      expect(client).not_to receive(:run_instances)
+
+      expect { nx.create_instance }.to raise_error("AWS subnet #{aws_subnet.id} is missing ipv6_cidr")
+    end
+
+    it "routes GuardDuty telemetry out the mgmt NIC when the endpoint is present" do
+      vm.project.set_ff_aws_cloudwatch_logs(true)
+      aws_subnet = vm.user_nic.private_subnet.private_subnet_aws_resource.aws_subnets.first
+      vm.user_nic.private_subnet.private_subnet_aws_resource.update(vpc_id: "vpc-12345678")
+      nic_aws_resource.update(subnet_id: "subnet-12345678", aws_subnet_id: aws_subnet.id)
+      mgmt_nic = Prog::Vnet::NicNexus.assemble(vm.user_nic.private_subnet_id, name: "#{vm.name}-mgmt-nic", is_management: true).subject
+      mgmt_nic.update(vm_id: vm.id)
+      NicAwsResource.create_with_id(mgmt_nic.id, network_interface_id: "eni-mgmt-0000000000", subnet_id: "subnet-12345678")
+      refresh_frame(nx, new_values: {"use_separate_management_nic" => true})
+      client.stub_responses(:describe_network_interfaces,
+        {network_interfaces: [
+          {network_interface_id: "eni-mgmt-0000000000", mac_address: "0a:00:00:00:00:01", private_ip_address: "10.0.1.4"},
+          {network_interface_id: "eni-0123456789abcdefg", mac_address: "0a:1b:2c:3d:4e:5f", private_ip_address: "10.0.1.5"},
+        ]},
+        {network_interfaces: [{network_interface_id: "eni-gd-0000000000", private_ip_address: "10.0.1.9"}]})
+      client.stub_responses(:describe_vpc_endpoints, vpc_endpoints: [{vpc_endpoint_id: "vpce-1", network_interface_ids: ["eni-gd-0000000000"]}])
+      client.stub_responses(:run_instances, instances: [{instance_id: "i-0123456789abcdefg", network_interfaces: [{subnet_id: "subnet-12345678"}], public_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com"}])
+      expect { nx.create_instance }.to hop("wait_instance_created")
+      user_data = netplan_runcmd
+      netplan = YAML.safe_load(user_data[/rm -f \/etc\/netplan\/50-cloud-init\.yaml\necho (.*?) > \/etc\/netplan\/61-ubicloud\.yaml/m, 1].shellsplit.first)
+      expect(netplan.dig("network", "ethernets", "mgmt-nic", "routing-policy")).to eq [
+        {"from" => "10.0.1.4/32", "table" => 100},
+        {"to" => "10.0.1.9/32", "table" => 100},
+      ]
     end
 
     it "skips instance profile creation for runner instances" do
@@ -360,6 +488,51 @@ usermod -L ubuntu
       expect(client).to receive(:run_instances).with(hash_not_including(:iam_instance_profile)).and_call_original
       expect { nx.create_instance }.to hop("wait_instance_created")
       expect(vm.aws_instance).to have_attributes(instance_id: "i-0123456789abcdefg", az_id: "use1-az1", iam_role: "testvm", ipv4_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com")
+    end
+
+    it "uses an AWS-assigned public IP instead of an EIP when the nic does not use an eip" do
+      client.stub_responses(:run_instances, instances: [{instance_id: "i-0123456789abcdefg", network_interfaces: [{subnet_id: "subnet-12345678", network_interface_id: "eni-aws-created", private_ip_address: vm.user_nic.private_ipv4.network.to_s}], public_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com"}])
+      vm.update(unix_user: "runneradmin")
+      vm.user_nic.nic_aws_resource.update(use_eip: false, create_network_interface: false)
+      vm.user_nic.private_subnet.private_subnet_aws_resource.update(user_security_group_id: "sg-12345678")
+      expect(client).to receive(:run_instances).with(hash_including(
+        network_interfaces: [
+          {
+            device_index: 0,
+            subnet_id: "subnet-12345678",
+            private_ip_address: vm.user_nic.private_ipv4.network.to_s,
+            groups: ["sg-12345678"],
+            associate_public_ip_address: true,
+            ipv_6_address_count: 1,
+            delete_on_termination: true,
+          },
+        ],
+      )).and_call_original
+      expect { nx.create_instance }.to hop("wait_instance_created")
+      # The launch-created interface id is recorded so later labels can look it up.
+      expect(vm.user_nic.nic_aws_resource.reload.network_interface_id).to eq("eni-aws-created")
+    end
+
+    it "lets AWS assign the private IPv4 of a nic without one and stores it" do
+      client.stub_responses(:run_instances, instances: [{instance_id: "i-0123456789abcdefg", network_interfaces: [{subnet_id: "subnet-12345678", network_interface_id: "eni-aws-created", private_ip_address: "10.0.0.23"}], public_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com"}])
+      vm.update(unix_user: "runneradmin")
+      nx.user_nic.private_ipv4 = nil
+      vm.user_nic.nic_aws_resource.update(use_eip: false, create_network_interface: false)
+      vm.user_nic.private_subnet.private_subnet_aws_resource.update(user_security_group_id: "sg-12345678")
+      expect(client).to receive(:run_instances).with(hash_including(
+        network_interfaces: [
+          {
+            device_index: 0,
+            subnet_id: "subnet-12345678",
+            groups: ["sg-12345678"],
+            associate_public_ip_address: true,
+            ipv_6_address_count: 1,
+            delete_on_termination: true,
+          },
+        ],
+      )).and_call_original
+      expect { nx.create_instance }.to hop("wait_instance_created")
+      expect(vm.user_nic.reload.private_ipv4.to_s).to eq("10.0.0.23/32")
     end
 
     it "naps until instance profile not propagated yet" do
@@ -373,17 +546,6 @@ usermod -L ubuntu
     it "raises exception if it's not for invalid instance profile" do
       client.stub_responses(:run_instances, Aws::EC2::Errors::InvalidParameterValue.new(nil, "Invalid instance name"))
       expect { nx.create_instance }.to raise_error(Aws::EC2::Errors::InvalidParameterValue)
-    end
-
-    it "sets transparent cache host for runners" do
-      client.stub_responses(:run_instances, instances: [{instance_id: "i-0123456789abcdefg", network_interfaces: [{subnet_id: "subnet-12345678"}], public_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com"}])
-      vm.update(unix_user: "runneradmin")
-      expected_user_data = user_data + "echo \"#{vm.private_ipv4} ubicloudhostplaceholder.blob.core.windows.net\" >> /etc/hosts"
-      expect(client).to receive(:run_instances).with(hash_including(
-        user_data: Base64.encode64(expected_user_data),
-      )).and_call_original
-      expect { nx.create_instance }.to hop("wait_instance_created")
-      expect(vm.aws_instance).to have_attributes(instance_id: "i-0123456789abcdefg", az_id: "use1-az1", iam_role: "testvm", ipv4_dns_name: "ec2-44-224-119-46.us-west-2.compute.amazonaws.com")
     end
 
     it "uses spot instances for runners when enabled" do
@@ -418,7 +580,7 @@ usermod -L ubuntu
         client.stub_responses(:run_instances, Aws::EC2::Errors::InsufficientInstanceCapacity.new(nil, "Insufficient capacity for instance type"))
         vm.update(unix_user: "runneradmin")
         installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: vm.project_id)
-        GithubRunner.create(label: "ubicloud-standard-2", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id)
+        GithubRunner.create(label: "ubicloud-standard-2", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id, location_id: vm.location_id)
         expect(Clog).to receive(:emit).with("insufficient instance capacity", instance_of(Hash)).and_call_original
       end
 
@@ -455,122 +617,288 @@ usermod -L ubuntu
     end
 
     describe "when insufficient capacity error for non-runner" do
-      let(:nic) { vm.nics.first }
-      let(:nic_nx) { Prog::Vnet::Aws::NicNexus.new(nic.strand) }
+      let(:nic) { vm.user_nic }
 
       before do
         client.stub_responses(:run_instances, Aws::EC2::Errors::InsufficientInstanceCapacity.new(nil, "Insufficient capacity"))
         nic.nic_aws_resource.update(subnet_az: "a")
-        refresh_frame(nic_nx, new_frame: {"exclude_availability_zones" => []})
       end
 
-      it "retries by excluding the failed AZ on first failure" do
+      it "adds failed AZ to exclude_availability_zones on first failure" do
         expect(Clog).to receive(:emit).with("retrying in different az", instance_of(Hash)).and_call_original
         expect { nx.create_instance }.to hop("wait_old_nic_deleted")
-          .and change { nic.reload.destroy_set? }.from(false).to(true)
+          .and change { nic.destroy_set?(cached: false) }.from(false).to(true)
         expect(st.stack.last["exclude_availability_zones"]).to eq(["a"])
-        expect(st.stack.last["retry_count"]).to eq(1)
+        expect(st.stack.last["unsupported_azs"]).to eq([])
       end
 
-      it "increments retry count on subsequent failures" do
-        refresh_frame(nx, new_values: {"retry_count" => 2})
-        refresh_frame(nic_nx, new_values: {"exclude_availability_zones" => ["b", "c"]})
-        expect(Clog).to receive(:emit).with("retrying in different az", instance_of(Hash)).and_call_original
-        expect(nx).to receive(:update_stack).with({
-          "exclude_availability_zones" => ["b", "c", "a"],
-          "retry_count" => 3,
-        }).and_call_original
+      it "preserves unsupported_azs from use_different_az" do
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["b"]})
         expect { nx.create_instance }.to hop("wait_old_nic_deleted")
+        expect(st.stack.last["unsupported_azs"]).to eq(["b"])
+        expect(st.stack.last["exclude_availability_zones"]).to eq(["a"])
       end
 
-      it "avoids duplicate AZs in exclusion list" do
-        refresh_frame(nic_nx, new_values: {"exclude_availability_zones" => ["a", "b"]})
+      it "resets only exclude_availability_zones when all AZs tried" do
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["b", "c", "d"], "exclude_availability_zones" => ["e", "f"]})
+        expect(Clog).to receive(:emit).with("resetting transient az exclusions", instance_of(Hash))
+        expect { nx.create_instance }.to nap(300)
+        expect(st.stack.last["unsupported_azs"]).to eq(["b", "c", "d"])
+        expect(st.stack.last["exclude_availability_zones"]).to eq([])
+      end
+
+      it "avoids duplicate AZs in exclude_availability_zones" do
+        refresh_frame(nx, new_values: {"exclude_availability_zones" => ["a", "b"]})
         expect { nx.create_instance }.to hop("wait_old_nic_deleted")
         expect(st.stack.last["exclude_availability_zones"]).to eq(["a", "b"])
-      end
-
-      it "clear exclude_availability_zones after 5 retry attempts" do
-        refresh_frame(nx, new_values: {"retry_count" => 5})
-        expect(Clog).not_to receive(:emit).with("retrying in different az", instance_of(Hash))
-        expect { nx.create_instance }.to nap(300)
-        expect(st.stack.last["exclude_availability_zones"]).to be_nil
-      end
-
-      it "logs retry details in emission" do
-        refresh_frame(nx, new_values: {"retry_count" => 3})
-        expect(Clog).to receive(:emit).with("retrying in different az", instance_of(Hash)).and_wrap_original do |m, a, b|
-          expect(b).to eq(retry_different_az: {
-            vm:,
-            error: "Aws::EC2::Errors::InsufficientInstanceCapacity",
-            message: "Insufficient capacity",
-            retry_count: 4,
-          })
-        end
-        expect { nx.create_instance }.to hop("wait_old_nic_deleted")
       end
     end
 
     describe "when unsupported instance type error" do
-      let(:nic) { vm.nics.first }
-      let(:nic_nx) { Prog::Vnet::Aws::NicNexus.new(nic.strand) }
+      let(:nic) { vm.user_nic }
 
       before do
         client.stub_responses(:run_instances, Aws::EC2::Errors::Unsupported.new(nil, "Instance type not supported"))
         nic.nic_aws_resource.update(subnet_az: "a")
-        refresh_frame(nic_nx, new_frame: {"exclude_availability_zones" => []})
       end
 
-      it "retries by excluding the failed AZ on first failure" do
+      it "adds failed AZ to unsupported_azs on first failure" do
         expect(Clog).to receive(:emit).with("retrying in different az", instance_of(Hash)).and_call_original
         expect { nx.create_instance }.to hop("wait_old_nic_deleted")
-          .and change { nic.reload.destroy_set? }.from(false).to(true)
-        expect(st.stack.last["exclude_availability_zones"]).to eq(["a"])
-        expect(st.stack.last["retry_count"]).to eq(1)
+          .and change { nic.destroy_set?(cached: false) }.from(false).to(true)
+        expect(st.stack.last["unsupported_azs"]).to eq(["a"])
+        expect(st.stack.last["exclude_availability_zones"]).to eq([])
       end
 
-      it "increments retry count on subsequent failures" do
-        refresh_frame(nx, new_values: {"retry_count" => 2})
-        refresh_frame(nic_nx, new_values: {"exclude_availability_zones" => ["b", "c"]})
-        expect(Clog).to receive(:emit).with("retrying in different az", instance_of(Hash)).and_call_original
-        expect(nx).to receive(:update_stack).with({
-          "exclude_availability_zones" => ["b", "c", "a"],
-          "retry_count" => 3,
-        }).and_call_original
-        expect { nx.create_instance }.to hop("wait_old_nic_deleted")
+      it "pages and naps 1 hour when all AZs are unsupported" do
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["b", "c", "d", "e", "f"]})
+        expect(Clog).to receive(:emit).with("all azs unsupported for instance type", instance_of(Hash)).and_call_original
+        expect { nx.create_instance }.to nap(60 * 60)
+        page = Page.from_tag_parts("InstanceTypeUnsupported", vm.id)
+        expect(page.summary).to eq("#{vm.name} instance type unsupported in all AZs")
+        expect(page.details["related_resources"]).to eq([vm.ubid])
+        expect(page.resource_id).to eq(vm.id)
+        expect(st.stack.last["unsupported_azs"]).to eq(["b", "c", "d", "e", "f", "a"])
+        expect(st.stack.last["exclude_availability_zones"]).to eq([])
       end
 
-      it "avoids duplicate AZs in exclusion list" do
-        refresh_frame(nic_nx, new_values: {"exclude_availability_zones" => ["a", "b"]})
-        expect { nx.create_instance }.to hop("wait_old_nic_deleted")
-        expect(st.stack.last["exclude_availability_zones"]).to eq(["a", "b"])
-      end
-
-      it "clear exclude_availability_zones after 5 retry attempts" do
-        refresh_frame(nx, new_values: {"retry_count" => 5})
-        expect(Clog).not_to receive(:emit).with("retrying in different az", instance_of(Hash))
+      it "preserves unsupported_azs when resetting transient exclusions" do
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["b", "c", "d"], "exclude_availability_zones" => ["e", "f"]})
+        expect(Clog).to receive(:emit).with("resetting transient az exclusions", instance_of(Hash))
         expect { nx.create_instance }.to nap(300)
-        expect(st.stack.last["exclude_availability_zones"]).to be_nil
+        expect(st.stack.last["unsupported_azs"]).to eq(["b", "c", "d", "a"])
+        expect(st.stack.last["exclude_availability_zones"]).to eq([])
       end
 
-      it "logs retry details in emission" do
-        refresh_frame(nx, new_values: {"retry_count" => 3})
-        expect(Clog).to receive(:emit).with("retrying in different az", instance_of(Hash)).and_wrap_original do |m, a, b|
-          expect(b).to eq(retry_different_az: {
-            vm:,
-            error: "Aws::EC2::Errors::Unsupported",
-            message: "Instance type not supported",
-            retry_count: 4,
-          })
-        end
+      it "retries in different az with remaining AZs" do
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["b"]})
+        expect(Clog).to receive(:emit).with("retrying in different az", instance_of(Hash)).and_call_original
         expect { nx.create_instance }.to hop("wait_old_nic_deleted")
+        expect(st.stack.last["unsupported_azs"]).to eq(["b", "a"])
       end
+
+      it "avoids duplicate AZs in unsupported_azs" do
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["a", "b"]})
+        expect { nx.create_instance }.to hop("wait_old_nic_deleted")
+        expect(st.stack.last["unsupported_azs"]).to eq(["a", "b"])
+      end
+    end
+
+    describe "mixed error sequences" do
+      let(:nic) { vm.user_nic }
+
+      before do
+        nic.nic_aws_resource.update(subnet_az: "a")
+      end
+
+      it "resets transient but keeps permanent when mixed errors exhaust all AZs" do
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["b", "c", "d"], "exclude_availability_zones" => ["e", "f"]})
+        client.stub_responses(:run_instances, Aws::EC2::Errors::InsufficientInstanceCapacity.new(nil, "Insufficient capacity"))
+        expect(Clog).to receive(:emit).with("resetting transient az exclusions", instance_of(Hash))
+        expect { nx.create_instance }.to nap(300)
+        expect(st.stack.last["unsupported_azs"]).to eq(["b", "c", "d"])
+        expect(st.stack.last["exclude_availability_zones"]).to eq([])
+      end
+
+      it "pages when unsupported errors accumulate across all AZs" do
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["b", "c", "d", "e", "f"]})
+        client.stub_responses(:run_instances, Aws::EC2::Errors::Unsupported.new(nil, "Instance type not supported"))
+        expect { nx.create_instance }.to nap(60 * 60)
+        expect(Page.from_tag_parts("InstanceTypeUnsupported", vm.id).resource_id).to eq(vm.id)
+        expect(st.stack.last["unsupported_azs"]).to eq(["b", "c", "d", "e", "f", "a"])
+      end
+
+      it "does not page when unsupported covers some AZs but transient covers the rest" do
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["b", "c", "d"], "exclude_availability_zones" => ["e", "f"]})
+        client.stub_responses(:run_instances, Aws::EC2::Errors::Unsupported.new(nil, "Instance type not supported"))
+        expect(Prog::PageNexus).not_to receive(:assemble)
+        expect(Clog).to receive(:emit).with("resetting transient az exclusions", instance_of(Hash))
+        expect { nx.create_instance }.to nap(300)
+        expect(st.stack.last["unsupported_azs"]).to eq(["b", "c", "d", "a"])
+        expect(st.stack.last["exclude_availability_zones"]).to eq([])
+      end
+    end
+
+    it "raises on invalid az_failure_type" do
+      expect { nx.retry_in_different_az(RuntimeError.new("test"), :bogus) }.to raise_error("unexpected az_failure_type: bogus")
+    end
+
+    describe "when the availability zone is required" do
+      let(:nic) { vm.user_nic }
+
+      before do
+        nic.nic_aws_resource.update(subnet_az: "a")
+        refresh_frame(nx, new_values: {"required_availability_zone" => "a"})
+        client.stub_responses(:run_instances, Aws::EC2::Errors::InsufficientInstanceCapacity.new(nil, "Insufficient capacity"))
+      end
+
+      it "keeps the vm in place and retries there" do
+        expect(Clog).to receive(:emit).with("retrying in required az", instance_of(Hash)).and_call_original
+        expect { nx.create_instance }.to nap(60)
+          .and not_change { nic.destroy_set?(cached: false) }
+        expect(st.stack.last["exclude_availability_zones"]).to eq([])
+        expect(st.stack.last["unsupported_azs"]).to eq([])
+      end
+
+      it "retries in place for unsupported instance types too" do
+        client.stub_responses(:run_instances, Aws::EC2::Errors::Unsupported.new(nil, "Instance type not supported"))
+        expect { nx.create_instance }.to nap(60)
+        expect(st.stack.last["unsupported_azs"]).to eq([])
+      end
+
+      describe "with a postgres family fallback available" do
+        let(:ps) do
+          resource = create_postgres_resource(project:, location_id: location.id)
+          PostgresServer.create(timeline: create_postgres_timeline(location_id: location.id), resource:, vm_id: vm.id,
+            is_representative: true, synchronization_status: "ready", timeline_access: "push", version: PostgresResource.default_version)
+        end
+
+        before do
+          Strand.create_with_id(ps, prog: "Postgres::PostgresServerNexus", label: "start")
+          project.set_ff_postgres_instance_type_fallback(true)
+        end
+
+        it "still falls back to another instance family, since the zone is the constraint and the family is not" do
+          expect { nx.create_instance }.to nap(60)
+            .and change { vm.reload.family }.from("m6gd").to("m8gd")
+            .and change { ps.ignore_instance_size_mismatch_set?(cached: false) }.from(false).to(true)
+        end
+
+        it "keeps the minute between attempts when the fallback family has no capacity either, instead of flipping families without delay" do
+          project.set_ff_enable_m6gd(true)
+          expect { nx.create_instance }.to nap(60).and change { vm.reload.family }.from("m6gd").to("m8gd")
+          expect { nx.create_instance }.to nap(60).and change { vm.reload.family }.from("m8gd").to("m6gd")
+        end
+      end
+
+      it "names the required zone on the expired deadline page, so the missing az fallback is explained" do
+        refresh_frame(nx, new_values: {"deadline_target" => "wait", "deadline_at" => st.time_string(Time.now - 1)})
+
+        st.unsynchronized_run
+
+        page = Page.from_tag_parts("Deadline", st.id, st.prog, "wait")
+        expect(page.details["required_availability_zone"]).to eq("a")
+      end
+    end
+
+    describe "when postgres family fallback engages" do
+      let(:nic) { vm.user_nic }
+
+      before do
+        nic.nic_aws_resource.update(subnet_az: "a")
+        refresh_frame(nx, new_values: {"unsupported_azs" => ["b", "c", "d", "e", "f"]})
+        client.stub_responses(:run_instances, Aws::EC2::Errors::Unsupported.new(nil, "Instance type not supported"))
+      end
+
+      it "invokes try_postgres_family_fallback, clears both AZ sets, and naps 0" do
+        expect(nx).to receive(:try_postgres_family_fallback).and_return(true)
+        expect { nx.create_instance }.to nap(0)
+        expect(st.stack.last["unsupported_azs"]).to eq([])
+        expect(st.stack.last["exclude_availability_zones"]).to eq([])
+      end
+    end
+  end
+
+  describe "#try_postgres_family_fallback" do
+    before do
+      # Decouple from config/instance_availability.yml
+      allow(OptionTreeFilter).to receive(:filter).with(provider: "aws", location: "us-west-2").and_return(
+        [
+          {family: "m6gd", size: "m6gd.large"},
+          {family: "m7gd", size: "m7gd.large"},
+          {family: "m8gd", size: "m8gd.large"},
+          {family: "r6gd", size: "r6gd.medium"},
+          {family: "r7gd", size: "r7gd.medium"},
+          {family: "r8gd", size: "r8gd.medium"},
+        ],
+      )
+    end
+
+    it "returns false when there is no postgres_server for the vm" do
+      expect(nx.try_postgres_family_fallback).to be false
+    end
+
+    it "returns false when the postgres_server is not fallback eligible" do
+      ps = instance_double(PostgresServer, fallback_eligible?: false)
+      allow(PostgresServer).to receive(:[]).with(vm_id: vm.id).and_return(ps)
+      expect(nx.try_postgres_family_fallback).to be false
+    end
+
+    it "returns false when no fallback candidate has a matching postgres size option" do
+      vm.update(family: "standard")
+      ps = instance_double(PostgresServer, fallback_eligible?: true)
+      allow(PostgresServer).to receive(:[]).with(vm_id: vm.id).and_return(ps)
+      expect(nx.try_postgres_family_fallback).to be false
+    end
+
+    it "skips chain entries whose project feature flag is disabled and lands on the next enabled one" do
+      # vm starts on m6gd; chain is [m6gd, m7gd, m8gd]. m7gd needs ff_enable_m7gd
+      # (off by default), so the fallback skips it and lands on m8gd (unconditional).
+      ps = instance_double(PostgresServer, fallback_eligible?: true, resource: instance_double(PostgresResource, project:, flavor: "standard", location:), ignore_instance_size_mismatch_set?: false)
+      allow(PostgresServer).to receive(:[]).with(vm_id: vm.id).and_return(ps)
+      expect(ps).to receive(:incr_ignore_instance_size_mismatch)
+      expect { nx.try_postgres_family_fallback }.to change { vm.reload.family }.from("m6gd").to("m8gd")
+    end
+
+    it "picks an earlier chain entry when its feature flag is enabled" do
+      project.set_ff_enable_m7gd(true)
+      ps = instance_double(PostgresServer, fallback_eligible?: true, resource: instance_double(PostgresResource, project:, flavor: "standard", location:), ignore_instance_size_mismatch_set?: false)
+      allow(PostgresServer).to receive(:[]).with(vm_id: vm.id).and_return(ps)
+      expect(ps).to receive(:incr_ignore_instance_size_mismatch)
+      expect { nx.try_postgres_family_fallback }.to change { vm.reload.family }.from("m6gd").to("m7gd")
+    end
+
+    it "does not incr ignore_instance_size_mismatch when already set" do
+      ps = instance_double(PostgresServer, fallback_eligible?: true, resource: instance_double(PostgresResource, project:, flavor: "standard", location:), ignore_instance_size_mismatch_set?: true)
+      allow(PostgresServer).to receive(:[]).with(vm_id: vm.id).and_return(ps)
+      expect(ps).not_to receive(:incr_ignore_instance_size_mismatch)
+      nx.try_postgres_family_fallback
+    end
+
+    it "returns false when no chain candidate is allowed by the option tree" do
+      # r-family chain members all require per-family feature flags; with none
+      # enabled the option tree excludes them, so no candidate is allowed.
+      vm.update(family: "r6gd")
+      ps = instance_double(PostgresServer, fallback_eligible?: true, resource: instance_double(PostgresResource, project:, flavor: "standard", location:), ignore_instance_size_mismatch_set?: false)
+      allow(PostgresServer).to receive(:[]).with(vm_id: vm.id).and_return(ps)
+      expect(ps).not_to receive(:incr_ignore_instance_size_mismatch)
+      expect(nx.try_postgres_family_fallback).to be false
     end
   end
 
   describe "#wait_instance_created" do
     before do
       aws_instance
-      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "running"}, network_interfaces: [{association: {public_ip: "1.2.3.4"}, ipv_6_addresses: [{ipv_6_address: "2a01:4f8:173:1ed3:aa7c::/79"}]}]}]}])
+      nic_aws_resource
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "running"}, network_interfaces: [{network_interface_id: "eni-0123456789abcdefg", association: {public_ip: "1.2.3.4"}, ipv_6_addresses: [{ipv_6_address: "2a01:4f8:173:1ed3:aa7c::/79"}]}]}]}])
+    end
+
+    it "finds the public IP via the captured interface id for a use_eip:false nic" do
+      vm.user_nic.nic_aws_resource.update(use_eip: false, create_network_interface: false, network_interface_id: "eni-aws-created")
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "running"},
+                                                                              network_interfaces: [{network_interface_id: "eni-aws-created", association: {public_ip: "1.2.3.4"}, ipv_6_addresses: [{ipv_6_address: "2a01:4f8:173:1ed3:aa7c::/79"}]}]}]}])
+      expect { nx.wait_instance_created }.to hop("wait_sshable")
+        .and change { vm.sshable.reload.host }.to("1.2.3.4")
     end
 
     it "updates the vm" do
@@ -586,6 +914,14 @@ usermod -L ubuntu
     it "updates the sshable host" do
       expect { nx.wait_instance_created }.to hop("wait_sshable")
         .and change { vm.sshable.reload.host }.to("1.2.3.4")
+    end
+
+    it "schedules the allocation waiting strand when the vm is allocated" do
+      waiting_strand = Strand.create(prog: "Test", label: "start", schedule: Time.now + 10000)
+      refresh_frame(nx, new_values: {"allocated_waiting_strand_id" => waiting_strand.id})
+
+      expect { nx.wait_instance_created }.to hop("wait_sshable")
+      expect(waiting_strand.reload.schedule).to be_within(10).of(Time.now)
     end
 
     it "naps if the instance is not running" do
@@ -606,6 +942,88 @@ usermod -L ubuntu
       client.stub_responses(:describe_instances, reservations: [])
       expect { nx.wait_instance_created }.to nap(1)
     end
+
+    it "provisions a spare runner and destroys the runner when the instance is terminated due to AWS internal error" do
+      vm.update(unix_user: "runneradmin")
+      installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: vm.project_id)
+      runner = GithubRunner.create(label: "ubicloud-standard-2", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id, location_id: vm.location_id)
+      Strand.create_with_id(runner, prog: "Github::GithubRunnerNexus", label: "start")
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "terminated"}, state_reason: {code: "Server.InternalError", message: "Server.InternalError: Internal error on launch"}}]}])
+      expect(Clog).to receive(:emit).with("aws internal error on launch", instance_of(Hash)).and_call_original
+      expect { nx.wait_instance_created }.to nap(60 * 60)
+        .and change(GithubRunner, :count).from(1).to(2)
+        .and change { runner.destroy_set?(cached: false) }.from(false).to(true)
+    end
+
+    it "does not provision another spare runner if one was already provisioned" do
+      vm.update(unix_user: "runneradmin")
+      installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: vm.project_id)
+      runner = GithubRunner.create(label: "ubicloud-standard-2", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id, location_id: vm.location_id)
+      Strand.create_with_id(runner, prog: "Github::GithubRunnerNexus", label: "start")
+      runner.incr_spare_runner_provisioned
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "terminated"}, state_reason: {code: "Server.InternalError", message: "Server.InternalError: Internal error on launch"}}]}])
+      expect { nx.wait_instance_created }.to nap(60 * 60)
+        .and not_change(GithubRunner, :count)
+        .and not_change { runner.destroy_set?(cached: false) }
+    end
+
+    it "naps without recreating when the instance is terminated due to a non-internal-error reason" do
+      vm.update(unix_user: "runneradmin")
+      installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: vm.project_id)
+      GithubRunner.create(label: "ubicloud-standard-2", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id, location_id: vm.location_id)
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "terminated"}, state_reason: {code: "Client.UserInitiatedShutdown", message: "User initiated shutdown"}}]}])
+      expect { nx.wait_instance_created }.to nap(1)
+        .and not_change(GithubRunner, :count)
+    end
+
+    it "naps without recreating when the instance is terminated due to internal error but the vm is not a runner" do
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "terminated"}, state_reason: {code: "Server.InternalError", message: "Server.InternalError: Internal error on launch"}}]}])
+      expect { nx.wait_instance_created }.to nap(1)
+    end
+
+    it "naps without recreating when the instance is terminated due to internal error but no GithubRunner record exists" do
+      vm.update(unix_user: "runneradmin")
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "terminated"}, state_reason: {code: "Server.InternalError", message: "Server.InternalError: Internal error on launch"}}]}])
+      expect { nx.wait_instance_created }.to nap(1)
+        .and not_change(GithubRunner, :count)
+    end
+
+    it "looks up the tracked NIC by id when there are multiple ENIs" do
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "running"}, network_interfaces: [
+        {network_interface_id: "eni-placeholder", association: {public_ip: "9.9.9.9"}, ipv_6_addresses: []},
+        {network_interface_id: "eni-0123456789abcdefg", association: {public_ip: "1.2.3.4"}, ipv_6_addresses: [{ipv_6_address: "2a01:4f8:173:1ed3:aa7c::/79"}]},
+      ]}]}])
+      expect { nx.wait_instance_created }.to hop("wait_sshable")
+      expect(vm.sshable.reload.host).to eq("1.2.3.4")
+      expect(vm.reload.ephemeral_net6.to_s).to eq("2a01:4f8:173:1ed3:aa7c::/79")
+    end
+
+    it "sets sshable host to mgmt NIC and ipv4_dns_name to data NIC when use_separate_management_nic is set" do
+      refresh_frame(nx, new_values: {"use_separate_management_nic" => true})
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "running"}, network_interfaces: [
+        {network_interface_id: "eni-mgmt", attachment: {device_index: 0}, association: {public_ip: "9.9.9.9", public_dns_name: "ec2-9-9-9-9.compute.amazonaws.com"}, ipv_6_addresses: []},
+        {network_interface_id: "eni-0123456789abcdefg", attachment: {device_index: 1}, association: {public_ip: "1.2.3.4", public_dns_name: "ec2-1-2-3-4.compute.amazonaws.com"}, ipv_6_addresses: [{ipv_6_address: "2a01:4f8:173:1ed3:aa7c::/79"}]},
+      ]}]}])
+      expect { nx.wait_instance_created }.to hop("wait_sshable")
+      expect(vm.sshable.reload.host).to eq("9.9.9.9")
+      expect(aws_instance.reload.ipv4_dns_name).to eq("ec2-1-2-3-4.compute.amazonaws.com")
+    end
+
+    it "uses the subnet project flag for management IPv6 ssh host selection" do
+      service_project = Project.create(name: "postgres-service").tap { it.set_ff_postgres_aws_ssh_ipv6(false) }
+      vm.user_nic.private_subnet.project.set_ff_postgres_aws_ssh_ipv6(true)
+      vm.user_nic.private_subnet.private_subnet_aws_resource.update(user_security_group_id: "sg-user", mgmt_security_group_id: "sg-mgmt")
+      vm.update(project_id: service_project.id)
+      refresh_frame(nx, new_values: {"use_separate_management_nic" => true})
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "running"}, network_interfaces: [
+        {network_interface_id: "eni-mgmt", attachment: {device_index: 0}, association: {public_ip: "9.9.9.9", public_dns_name: "ec2-9-9-9-9.compute.amazonaws.com"}, ipv_6_addresses: [{ipv_6_address: "2600:1f14:1000::4"}]},
+        {network_interface_id: "eni-0123456789abcdefg", attachment: {device_index: 1}, association: {public_ip: "1.2.3.4", public_dns_name: "ec2-1-2-3-4.compute.amazonaws.com"}, ipv_6_addresses: [{ipv_6_address: "2600:1f14:1000::5"}]},
+      ]}]}])
+
+      expect { nx.wait_instance_created }.to hop("wait_sshable")
+      expect(vm.sshable.reload.host).to eq("2600:1f14:1000::4")
+      expect(aws_instance.reload.ipv4_dns_name).to eq("ec2-1-2-3-4.compute.amazonaws.com")
+    end
   end
 
   describe "#wait_instance_created", "without sshable" do
@@ -614,7 +1032,8 @@ usermod -L ubuntu
 
     before do
       aws_instance
-      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "running"}, network_interfaces: [{association: {public_ip: "1.2.3.4"}, ipv_6_addresses: [{ipv_6_address: "2a01:4f8:173:1ed3:aa7c::/79"}]}]}]}])
+      nic_aws_resource
+      client.stub_responses(:describe_instances, reservations: [{instances: [{state: {name: "running"}, network_interfaces: [{network_interface_id: "eni-0123456789abcdefg", association: {public_ip: "1.2.3.4"}, ipv_6_addresses: [{ipv_6_address: "2a01:4f8:173:1ed3:aa7c::/79"}]}]}]}])
     end
 
     it "handles vm without sshable" do
@@ -633,31 +1052,65 @@ usermod -L ubuntu
   end
 
   describe "#wait_old_nic_deleted" do
-    let(:old_nic) { vm.nics.first }
+    let(:old_nic) { vm.user_nic }
     let(:private_subnet_id) { old_nic.private_subnet_id }
 
     before do
-      refresh_frame(nx, new_values: {"private_subnet_id" => private_subnet_id, "exclude_availability_zones" => ["a", "b"]})
+      refresh_frame(nx, new_values: {"private_subnet_id" => private_subnet_id, "unsupported_azs" => ["a"], "exclude_availability_zones" => ["b"]})
     end
 
     it "naps if old NIC still exists" do
-      expect(vm.nic).to exist
+      expect(vm.user_nic).to exist
       expect { nx.wait_old_nic_deleted }.to nap(1)
     end
 
-    it "creates new NIC and hops to wait_nic_recreated when old NIC is deleted" do
+    it "creates new NIC with combined exclusions and hops to wait_nic_recreated" do
       old_nic.update(vm_id: nil)
       vm.reload
 
       expect { nx.wait_old_nic_deleted }.to hop("wait_nic_recreated")
-      expect(vm.reload.nic.id).not_to eq(old_nic.id)
-      expect(vm.nic.strand.label).to eq("start")
-      expect(vm.nic.strand.stack.first["exclude_availability_zones"]).to eq(["a", "b"])
+      expect(vm.reload.user_nic.id).not_to eq(old_nic.id)
+      expect(vm.user_nic.strand.label).to eq("start")
+      expect(vm.user_nic.strand.stack.first["exclude_availability_zones"]).to eq(["a", "b"])
+    end
+
+    it "recreates the NIC without an EIP for AWS to create at launch when the vm was assembled without an EIP" do
+      refresh_frame(nx, new_values: {"use_eip" => false, "create_network_interface" => false})
+      old_nic.update(vm_id: nil)
+      vm.reload
+
+      expect { nx.wait_old_nic_deleted }.to hop("wait_nic_recreated")
+      user_nic = vm.reload.user_nic
+      expect(user_nic.private_ipv4).to be_nil
+      expect(user_nic.strand.stack.first["use_eip"]).to be(false)
+      expect(user_nic.strand.stack.first["create_network_interface?"]).to be(false)
+    end
+
+    it "recreates the NIC with the defaults when the frame does not record them" do
+      refresh_frame(nx, new_values: {"use_eip" => nil, "create_network_interface" => nil})
+      old_nic.update(vm_id: nil)
+      vm.reload
+
+      expect { nx.wait_old_nic_deleted }.to hop("wait_nic_recreated")
+      user_nic = vm.reload.user_nic
+      expect(user_nic.strand.stack.first["use_eip"]).to be(true)
+      expect(user_nic.strand.stack.first["create_network_interface?"]).to be(true)
+    end
+
+    it "creates both user and mgmt NICs when use_separate_management_nic is set" do
+      old_nic.update(vm_id: nil)
+      vm.reload
+      refresh_frame(nx, new_values: {"private_subnet_id" => private_subnet_id, "use_separate_management_nic" => true})
+
+      expect { nx.wait_old_nic_deleted }.to hop("wait_nic_recreated")
+      expect(vm.reload.nics.count).to eq(2)
+      expect(vm.user_nic).not_to be_nil
+      expect(vm.management_nic).not_to be_nil
     end
   end
 
   describe "#wait_nic_recreated" do
-    let(:nic) { vm.nics.first }
+    let(:nic) { vm.user_nic }
 
     it "naps if NIC strand is not in wait state" do
       nic.strand.update(label: "start")
@@ -671,28 +1124,69 @@ usermod -L ubuntu
   end
 
   describe "#wait_sshable" do
+    before { AssignedVmAddress.create(dst_vm_id: vm.id, ip: "10.0.0.1/32") }
+
     it "naps 6 seconds if it's the first time we execute wait_sshable" do
       expect { nx.wait_sshable }.to nap(6)
-        .and change { vm.reload.update_firewall_rules_set? }.from(false).to(true)
+        .and change { vm.update_firewall_rules_set?(cached: false) }.from(false).to(true)
     end
 
-    it "naps if not sshable" do
-      AssignedVmAddress.create(dst_vm_id: vm.id, ip: "10.0.0.1/32")
+    it "naps if the port is not open yet" do
       vm.incr_update_firewall_rules
       expect(Socket).to receive(:tcp).with("10.0.0.1", 22, connect_timeout: 1).and_raise Errno::ECONNREFUSED
       expect { nx.wait_sshable }.to nap(1)
     end
 
     it "hops to create_billing_record if sshable" do
-      AssignedVmAddress.create(dst_vm_id: vm.id, ip: "10.0.0.1/32")
+      vm.incr_update_firewall_rules
+      expect(Socket).to receive(:tcp).with("10.0.0.1", 22, connect_timeout: 1)
+      expect(nx.vm.sshable).to receive(:_cmd).with("true", timeout: 5)
+      expect { nx.wait_sshable }.to hop("create_billing_record")
+    end
+
+    it "naps and remembers the open port if the ssh key is not installed yet" do
+      vm.incr_update_firewall_rules
+      expect(Socket).to receive(:tcp).with("10.0.0.1", 22, connect_timeout: 1)
+      expect(nx.vm.sshable).to receive(:_cmd).and_raise Net::SSH::AuthenticationFailed.new("runneradmin")
+      expect { nx.wait_sshable }.to nap(1)
+      expect(nx.ssh_port_open).to be true
+    end
+
+    it "does not check the port again once it answered" do
+      refresh_frame(nx, new_values: {"ssh_port_open" => true})
+      vm.incr_update_firewall_rules
+      expect(Socket).not_to receive(:tcp)
+      expect(nx.vm.sshable).to receive(:_cmd).with("true", timeout: 5)
+      expect { nx.wait_sshable }.to hop("create_billing_record")
+    end
+
+    it "naps if the ssh command times out" do
+      vm.incr_update_firewall_rules
+      expect(Socket).to receive(:tcp).with("10.0.0.1", 22, connect_timeout: 1)
+      expect(nx.vm.sshable).to receive(:_cmd).and_raise Sshable::SshTimeout.new("true", "", "", nil, nil)
+      expect { nx.wait_sshable }.to nap(1)
+    end
+
+    it "probes the management NIC's EIP when use_separate_management_nic is set" do
+      refresh_frame(nx, new_values: {"use_separate_management_nic" => true})
+      nx.vm.sshable.host = "9.9.9.9"
+      vm.incr_update_firewall_rules
+      expect(Socket).to receive(:tcp).with("9.9.9.9", 22, connect_timeout: 1)
+      expect(nx.vm.sshable).to receive(:_cmd).with("true", timeout: 5)
+      expect { nx.wait_sshable }.to hop("create_billing_record")
+    end
+
+    it "does not check ssh access for a vm without an sshable" do
+      vm.sshable.destroy
       vm.incr_update_firewall_rules
       expect(Socket).to receive(:tcp).with("10.0.0.1", 22, connect_timeout: 1)
       expect { nx.wait_sshable }.to hop("create_billing_record")
     end
 
     it "skips a check if ipv4 is not enabled" do
+      vm.assigned_vm_address.destroy
       vm.incr_update_firewall_rules
-      expect(vm.ip4).to be_nil
+      expect(nx.vm.ip4).to be_nil
       expect { nx.wait_sshable }.to hop("create_billing_record")
     end
   end
@@ -720,6 +1214,14 @@ usermod -L ubuntu
       expect(vm.active_billing_records.first.billing_rate["resource_type"]).to eq("VmVCpu")
       expect(vm.provisioned_at).to be_within(1).of(now)
     end
+
+    it "schedules the waiting strand if the frame has one" do
+      waiting_strand = Strand.create(prog: "Test", label: "start", schedule: Time.now + 10000)
+      refresh_frame(nx, new_values: {"waiting_strand_id" => waiting_strand.id})
+
+      expect { nx.create_billing_record }.to hop("wait")
+      expect(waiting_strand.reload.schedule).to be_within(10).of(Time.now)
+    end
   end
 
   describe "#wait" do
@@ -742,7 +1244,7 @@ usermod -L ubuntu
     end
 
     it "hops to wait if firewall rules are applied" do
-      expect(nx).to receive(:retval).and_return({"msg" => "firewall rule is added"})
+      expect(nx).to receive(:retval).and_return({"msg" => "firewall rules synced"})
       expect { nx.update_firewall_rules }.to hop("wait")
     end
   end
@@ -753,7 +1255,7 @@ usermod -L ubuntu
       expect(Time).to receive(:now).at_least(:once).and_return(now)
       expect { nx.prevent_destroy }.to nap(30)
       expect(nx.strand.stack.first["deadline_target"]).to eq("destroy")
-      expect(Time.parse(nx.strand.stack.first["deadline_at"])).to be_within(0.00001).of(now + 24 * 60 * 60)
+      expect(Time.new(nx.strand.stack.first["deadline_at"])).to be_within(0.00001).of(now + 24 * 60 * 60)
     end
   end
 
@@ -780,6 +1282,16 @@ usermod -L ubuntu
       expect(client).to receive(:terminate_instances).with({instance_ids: ["i-0123456789abcdefg"]})
       expect { nx.destroy }.to hop("cleanup_roles")
       expect(aws_instance).not_to exist
+    end
+  end
+
+  describe "#final_clean_up" do
+    it "does not raise a foreign key violation on destroy because run_command.vm_id cascades" do
+      RunCommand.create(vm_id: vm.id, command: "fetch_serial_log")
+
+      nx.final_clean_up
+      expect(vm.exists?).to be(false)
+      expect(RunCommand.where(vm_id: vm.id).empty?).to be(true)
     end
   end
 
@@ -875,6 +1387,24 @@ usermod -L ubuntu
         .to(include(
           a_hash_including(operation_name: :remove_role_from_instance_profile, params: {instance_profile_name: "testvm-instance-profile", role_name: "testvm"}),
           a_hash_including(operation_name: :delete_instance_profile, params: {instance_profile_name: "testvm-instance-profile"}),
+          a_hash_including(operation_name: :delete_role, params: {role_name: "testvm"}),
+        ))
+    end
+
+    it "deletes inline role policies before deleting the role" do
+      iam_client.stub_responses(:list_policies, policies: [])
+      iam_client.stub_responses(:remove_role_from_instance_profile, {})
+      iam_client.stub_responses(:delete_instance_profile, {})
+      iam_client.stub_responses(:list_role_policies, policy_names: ["guardduty-telemetry", "extra-inline"])
+      iam_client.stub_responses(:delete_role_policy, {})
+      iam_client.stub_responses(:delete_role, {})
+
+      expect { nx.cleanup_roles }
+        .to exit({"msg" => "vm destroyed"})
+        .and change(iam_client, :api_requests)
+        .to(include(
+          a_hash_including(operation_name: :delete_role_policy, params: {role_name: "testvm", policy_name: "guardduty-telemetry"}),
+          a_hash_including(operation_name: :delete_role_policy, params: {role_name: "testvm", policy_name: "extra-inline"}),
           a_hash_including(operation_name: :delete_role, params: {role_name: "testvm"}),
         ))
     end

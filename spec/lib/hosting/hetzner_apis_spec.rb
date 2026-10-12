@@ -1,113 +1,145 @@
 # frozen_string_literal: true
 
 RSpec.describe Hosting::HetznerApis do
-  let(:vmh) {
+  let(:hetzner_apis) do
     vmh = create_vm_host
     vmh.sshable.update(host: "1.1.1.1")
-    vmh
-  }
-  let(:hetzner_host) {
-    HostProvider.create do |hp|
-      hp.id = vmh.id
-      hp.server_identifier = "123"
-      hp.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+    provider = HostProvider.create do
+      it.id = vmh.id
+      it.server_identifier = "123"
+      it.provider_name = HostProvider::HETZNER_PROVIDER_NAME
     end
-  }
-  let(:hetzner_apis) { described_class.new(hetzner_host) }
+    described_class.new(provider)
+  end
+
+  let(:ssh_key) { "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDQ8Z9Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0" }
+
+  before do
+    allow(Config).to receive_messages(
+      hetzner_connection_string: "https://robot-ws.your-server.de",
+      hetzner_user: "user1",
+      hetzner_password: "pass",
+      hetzner_ssh_public_key: ssh_key,
+    )
+  end
 
   describe "reimage" do
     it "can reimage a server" do
-      expect(Config).to receive(:hetzner_ssh_public_key).and_return("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDQ8Z9Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0").at_least(:once)
-      Excon.stub({path: "/boot/123/linux", method: :post}, {status: 200, body: ""})
-      Excon.stub({path: "/reset/123", method: :post, body: "type=hw"}, {status: 200, body: ""})
-      expect(hetzner_apis.reimage(123)).to be_nil
+      stub_request(:post, "https://robot-ws.your-server.de/boot/123/linux").to_return(status: 200, body: "")
+      stub_request(:post, "https://robot-ws.your-server.de/reset/123").with(body: "type=hw").to_return(status: 200, body: "")
+      expect(hetzner_apis.reimage).to be_nil
     end
 
     it "raises an error if the reimage fails" do
-      expect(Config).to receive(:hetzner_ssh_public_key).and_return("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDQ8Z9Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0").at_least(:once)
-      Excon.stub({path: "/boot/123/linux", method: :post}, {status: 200, body: ""})
-      Excon.stub({path: "/reset/123", method: :post, body: "type=hw"}, {status: 400, body: ""})
-      expect { hetzner_apis.reimage(123) }.to raise_error Excon::Error::BadRequest
+      stub_request(:post, "https://robot-ws.your-server.de/boot/123/linux").to_return(status: 200, body: "")
+      stub_request(:post, "https://robot-ws.your-server.de/reset/123").with(body: "type=hw").to_return(status: 400, body: "")
+      expect { hetzner_apis.reimage }.to raise_error Excon::Error::BadRequest
     end
 
     it "raises an error if the ssh key is not set" do
       expect(Config).to receive(:hetzner_ssh_public_key).and_return(nil)
-      expect { hetzner_apis.reimage(123) }.to raise_error RuntimeError, "hetzner_ssh_public_key is not set"
+      expect { hetzner_apis.reimage }.to raise_error RuntimeError, "hetzner_ssh_public_key is not set"
     end
 
     it "raises an error if the boot fails" do
-      expect(Config).to receive(:hetzner_ssh_public_key).and_return("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDQ8Z9Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0").at_least(:once)
-      Excon.stub({path: "/boot/123/linux", method: :post}, {status: 400, body: ""})
-      expect { hetzner_apis.reimage(123) }.to raise_error Excon::Error::BadRequest
+      stub_request(:post, "https://robot-ws.your-server.de/boot/123/linux").to_return(status: 400, body: "")
+      expect { hetzner_apis.reimage }.to raise_error Excon::Error::BadRequest
     end
   end
 
-  describe "reset" do
+  describe "enable_rescue" do
+    it "can enable the rescue system" do
+      stub_request(:post, "https://robot-ws.your-server.de/boot/123/rescue").to_return(status: 200, body: "")
+      expect(hetzner_apis.enable_rescue).to be_nil
+    end
+
+    it "raises an error if the ssh key is not set" do
+      expect(Config).to receive(:hetzner_ssh_public_key).and_return(nil)
+      expect { hetzner_apis.enable_rescue }.to raise_error RuntimeError, "hetzner_ssh_public_key is not set"
+    end
+
+    it "raises an error if enabling rescue fails" do
+      stub_request(:post, "https://robot-ws.your-server.de/boot/123/rescue").to_return(status: 400, body: "")
+      expect { hetzner_apis.enable_rescue }.to raise_error Excon::Error::BadRequest
+    end
+  end
+
+  describe "hardware_reset" do
     it "can reset a server" do
-      Excon.stub({path: "/reset/123", method: :post, body: "type=hw"}, {status: 200, body: ""})
-      expect(hetzner_apis.reset(123)).to be_nil
+      stub_request(:post, "https://robot-ws.your-server.de/reset/123").with(body: "type=hw").to_return(status: 200, body: "")
+      expect(hetzner_apis.hardware_reset).to be_nil
     end
 
     it "raises an error if the reset fails" do
-      Excon.stub({path: "/reset/123", method: :post, body: "type=hw"}, {status: 400, body: ""})
-      expect { hetzner_apis.reset(123) }.to raise_error Excon::Error::BadRequest
+      stub_request(:post, "https://robot-ws.your-server.de/reset/123").with(body: "type=hw").to_return(status: 400, body: "")
+      expect { hetzner_apis.hardware_reset }.to raise_error Excon::Error::BadRequest
     end
   end
 
-  describe "add_key" do
-    it "can add a key" do
-      key_data = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDQ8Z9Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0"
-      Excon.stub({path: "/key", method: :post}, {status: 201, body: ""})
-      expect(hetzner_apis.add_key("test_key_1", key_data)).to be_nil
+  describe "power_on" do
+    it "presses the power button if the server is shut off" do
+      stub_request(:get, "https://robot-ws.your-server.de/reset/123").to_return(status: 200, body: JSON.generate(reset: {operating_status: "shut off"}))
+      stub_request(:post, "https://robot-ws.your-server.de/reset/123").with(body: "type=power").to_return(status: 200, body: "")
+      expect(hetzner_apis.power_on).to be_nil
     end
 
-    it "raises an error if adding a key fails" do
-      key_data = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDQ8Z9Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0"
-      Excon.stub({path: "/key", method: :post}, {status: 500, body: ""})
-      expect { hetzner_apis.add_key("test_key_1", key_data) }.to raise_error Excon::Error::InternalServerError
+    it "does nothing if the server is already running" do
+      stub_request(:get, "https://robot-ws.your-server.de/reset/123").to_return(status: 200, body: JSON.generate(reset: {operating_status: "running"}))
+      expect(hetzner_apis.power_on).to be_nil
+    end
+
+    it "raises an error if pressing the power button fails" do
+      stub_request(:get, "https://robot-ws.your-server.de/reset/123").to_return(status: 200, body: JSON.generate(reset: {operating_status: "shut off"}))
+      stub_request(:post, "https://robot-ws.your-server.de/reset/123").with(body: "type=power").to_return(status: 400, body: "")
+      expect { hetzner_apis.power_on }.to raise_error Excon::Error::BadRequest
     end
   end
 
-  describe "delete_key" do
-    let(:key_data) { "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDQ8Z9Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0Z0" }
-
-    it "can delete a key" do
-      Excon.stub({path: "/key/8003339382ac5baa3637f813becce5e4", method: :delete}, {status: 200, body: ""})
-      expect(hetzner_apis.delete_key(key_data)).to be_nil
+  describe "power_status" do
+    it "returns the operating status of a server" do
+      stub_request(:get, "https://robot-ws.your-server.de/reset/123").to_return(status: 200, body: JSON.generate(reset: {operating_status: "running"}))
+      expect(hetzner_apis.power_status).to eq "running"
     end
 
-    it "raises an error if deleting a key fails" do
-      Excon.stub({path: "/key/8003339382ac5baa3637f813becce5e4", method: :delete}, {status: 500, body: ""})
-      expect { hetzner_apis.delete_key(key_data) }.to raise_error Excon::Error::InternalServerError
-    end
-
-    it "regards a missing key as deleted" do
-      Excon.stub({path: "/key/8003339382ac5baa3637f813becce5e4", method: :delete}, {status: 404, body: ""})
-      expect(hetzner_apis.delete_key(key_data)).to be_nil
+    it "raises an error if getting the power status fails" do
+      stub_request(:get, "https://robot-ws.your-server.de/reset/123").to_return(status: 404, body: "")
+      expect { hetzner_apis.power_status }.to raise_error Excon::Error::NotFound
     end
   end
 
   describe "get_main_ip4" do
     it "can get the main ip4" do
-      Excon.stub({path: "/server/123", method: :get}, {status: 200, body: "{\"server\": {\"server_ip\": \"1.2.3.4\"}}"})
+      stub_request(:get, "https://robot-ws.your-server.de/server/123").to_return(status: 200, body: "{\"server\": {\"server_ip\": \"1.2.3.4\"}}")
       expect(hetzner_apis.get_main_ip4).to eq "1.2.3.4"
     end
 
     it "raises an error if getting the main ip4 fails" do
-      Excon.stub({path: "/server/123", method: :get}, {status: 404, body: ""})
+      stub_request(:get, "https://robot-ws.your-server.de/server/123").to_return(status: 404, body: "")
       expect { hetzner_apis.get_main_ip4 }.to raise_error Excon::Error::NotFound
     end
   end
 
-  describe "pull_dc" do
+  describe "pull_data_center" do
     it "can get the dc info" do
-      Excon.stub({path: "/server/123", method: :get}, {status: 200, body: "{\"server\": {\"dc\": \"fsn1-dc8\"}}"})
-      expect(hetzner_apis.pull_dc(123)).to eq "fsn1-dc8"
+      stub_request(:get, "https://robot-ws.your-server.de/server/123").to_return(status: 200, body: "{\"server\": {\"dc\": \"fsn1-dc8\"}}")
+      expect(hetzner_apis.pull_data_center).to eq "fsn1-dc8"
     end
 
     it "raises an error if getting the dc info fails" do
-      Excon.stub({path: "/server/123", method: :get}, {status: 400, body: ""})
-      expect { hetzner_apis.pull_dc(123) }.to raise_error Excon::Error::BadRequest
+      stub_request(:get, "https://robot-ws.your-server.de/server/123").to_return(status: 400, body: "")
+      expect { hetzner_apis.pull_data_center }.to raise_error Excon::Error::BadRequest
+    end
+  end
+
+  describe "pull_inventory" do
+    it "returns the server's product name" do
+      stub_request(:get, "https://robot-ws.your-server.de/server/123").to_return(status: 200, body: JSON.generate(server: {product: "AX102-3-LTD", dc: "FSN1-DC24"}))
+      expect(hetzner_apis.pull_inventory).to eq(server_model: "AX102-3-LTD")
+    end
+
+    it "raises an error if getting the server info fails" do
+      stub_request(:get, "https://robot-ws.your-server.de/server/123").to_return(status: 400, body: "")
+      expect { hetzner_apis.pull_inventory }.to raise_error Excon::Error::BadRequest
     end
   end
 
@@ -227,13 +259,13 @@ RSpec.describe Hosting::HetznerApis do
       ]))
 
       expected = [
-        ["1.1.1.1/32", "1.1.1.1", false],
-        ["1.1.2.0/32", "1.1.1.1", false],
-        ["2.2.2.0/29", "1.1.1.1", false],
-        ["30.30.30.30/29", "1.1.1.1", true],
-        ["2a01:4f8:10a:128b::/64", "1.1.1.1", false],
+        ["1.1.1.1/32", "1.1.1.1"],
+        ["1.1.2.0/32", "1.1.1.1"],
+        ["2.2.2.0/29", "1.1.1.1"],
+        ["30.30.30.30/29", "1.1.1.1"],
+        ["2a01:4f8:10a:128b::/64", "1.1.1.1"],
       ].map {
-        Hosting::HetznerApis::IpInfo.new(ip_address: _1, source_host_ip: _2, is_failover: _3)
+        Hosting::HetznerApis::IpInfo.new(ip_address: _1, source_host_ip: _2)
       }
 
       expect(hetzner_apis.pull_ips).to eq expected
@@ -288,13 +320,13 @@ RSpec.describe Hosting::HetznerApis do
       stub_request(:get, "https://robot-ws.your-server.de/failover").to_return(status: 404)
 
       expected = [
-        ["1.1.1.1/32", "1.1.1.1", false],
-        ["1.1.2.0/32", "1.1.1.1", false],
-        ["2.2.2.0/29", "1.1.1.1", false],
-        ["15.15.15.15/29", "1.1.1.1", false],
-        ["30.30.30.30/29", "1.1.1.1", false],
+        ["1.1.1.1/32", "1.1.1.1"],
+        ["1.1.2.0/32", "1.1.1.1"],
+        ["2.2.2.0/29", "1.1.1.1"],
+        ["15.15.15.15/29", "1.1.1.1"],
+        ["30.30.30.30/29", "1.1.1.1"],
       ].map {
-        Hosting::HetznerApis::IpInfo.new(ip_address: _1, source_host_ip: _2, is_failover: _3)
+        Hosting::HetznerApis::IpInfo.new(ip_address: _1, source_host_ip: _2)
       }
 
       expect(hetzner_apis.pull_ips).to eq expected
@@ -303,18 +335,18 @@ RSpec.describe Hosting::HetznerApis do
 
   describe "set_server_name" do
     it "can set the server name" do
-      Excon.stub({path: "/server/123", method: :post, body: "server_name=84fe406c-42af-8771-bcde-4a29adc23bb0"}, {status: 200, body: "{}"})
-      expect { hetzner_apis.set_server_name(123, "84fe406c-42af-8771-bcde-4a29adc23bb0") }.not_to raise_error
+      stub_request(:post, "https://robot-ws.your-server.de/server/123").with(body: "server_name=84fe406c-42af-8771-bcde-4a29adc23bb0").to_return(status: 200, body: "{}")
+      expect { hetzner_apis.set_server_name("84fe406c-42af-8771-bcde-4a29adc23bb0") }.not_to raise_error
     end
 
     it "raises an error if setting the server name fails due to invalid input" do
-      Excon.stub({path: "/server/123", method: :post, body: "server_name=84fe406c-42af-8771-bcde-4a29adc23bb0"}, {status: 400, body: ""})
-      expect { hetzner_apis.set_server_name(123, "84fe406c-42af-8771-bcde-4a29adc23bb0") }.to raise_error Excon::Error::BadRequest
+      stub_request(:post, "https://robot-ws.your-server.de/server/123").with(body: "server_name=84fe406c-42af-8771-bcde-4a29adc23bb0").to_return(status: 400, body: "")
+      expect { hetzner_apis.set_server_name("84fe406c-42af-8771-bcde-4a29adc23bb0") }.to raise_error Excon::Error::BadRequest
     end
 
     it "raises an error if setting the server name fails due to not found" do
-      Excon.stub({path: "/server/123", method: :post, body: "server_name=84fe406c-42af-8771-bcde-4a29adc23bb0"}, {status: 404, body: ""})
-      expect { hetzner_apis.set_server_name(123, "84fe406c-42af-8771-bcde-4a29adc23bb0") }.to raise_error Excon::Error::NotFound
+      stub_request(:post, "https://robot-ws.your-server.de/server/123").with(body: "server_name=84fe406c-42af-8771-bcde-4a29adc23bb0").to_return(status: 404, body: "")
+      expect { hetzner_apis.set_server_name("84fe406c-42af-8771-bcde-4a29adc23bb0") }.to raise_error Excon::Error::NotFound
     end
   end
 end

@@ -18,4 +18,224 @@ RSpec.describe Option do
       expect(described_class.families.map(&:name)).to include("burstable")
     end
   end
+
+  describe ".locations" do
+    it "orders visible locations by display name so the default location is stable" do
+      expect(described_class.locations.map(&:display_name)).to eq(%w[eu-central-h1 eu-north-h1 us-east-a2])
+    end
+  end
+
+  describe ".gcp_instance_type_name" do
+    it "appends -lssd for machine types with local SSDs" do
+      expect(described_class.gcp_instance_type_name("c4a-standard", 8, lssd: true)).to eq("c4a-standard-8-lssd")
+    end
+
+    it "defaults to the -lssd variant" do
+      expect(described_class.gcp_instance_type_name("c4a-standard", 8)).to eq("c4a-standard-8-lssd")
+    end
+
+    it "returns the plain machine type without local SSDs" do
+      expect(described_class.gcp_instance_type_name("c4a-standard", 4, lssd: false)).to eq("c4a-standard-4")
+    end
+  end
+
+  describe "GCP Postgres options" do
+    it "defines all GCP family options" do
+      expect(Option::GCP_FAMILY_OPTIONS).to eq([
+        "c4a-standard", "c4a-highmem",
+        "c4-standard", "c4-highmem",
+        "c4d-standard", "c4d-highmem",
+        "c3-standard",
+        "c3d-standard", "c3d-highmem",
+        "z3-standardlssd", "z3-highlssd",
+      ])
+    end
+
+    it "includes GCP families in POSTGRES_FAMILY_OPTIONS" do
+      Option::GCP_FAMILY_OPTIONS.each do |family|
+        expect(Option::POSTGRES_FAMILY_OPTIONS).to have_key(family)
+      end
+    end
+
+    it "defines GCP storage options for all families" do
+      Option::GCP_FAMILY_OPTIONS.each do |family|
+        expect(Option::GCP_STORAGE_SIZE_OPTIONS).to have_key(family)
+      end
+    end
+
+    it "has a single fixed storage value per GCP family and vcpu" do
+      Option::GCP_STORAGE_SIZE_OPTIONS.each do |family, vcpu_map|
+        vcpu_map.each do |vcpu, storage_options|
+          expect(storage_options.length).to eq(1), "Expected 1 storage option for #{family} #{vcpu} vCPUs, got #{storage_options.length}"
+        end
+      end
+    end
+
+    it "has matching size options for each GCP family and vcpu" do
+      Option::GCP_STORAGE_SIZE_OPTIONS.each do |family, vcpu_map|
+        vcpu_map.each_key do |vcpu|
+          size_name = "#{family}-#{vcpu}"
+          expect(Option::POSTGRES_SIZE_OPTIONS).to have_key(size_name), "Missing POSTGRES_SIZE_OPTIONS entry for #{size_name}"
+          expect(Option::POSTGRES_SIZE_OPTIONS[size_name].family).to eq(family)
+          expect(Option::POSTGRES_SIZE_OPTIONS[size_name].vcpu_count).to eq(vcpu)
+        end
+      end
+    end
+
+    it "derives whole-GiB memory for GCP sizes even when the family ratio is fractional" do
+      Option::GCP_FAMILY_OPTIONS.each do |family|
+        Option::GCP_STORAGE_SIZE_OPTIONS[family].each_key do |vcpu|
+          expect(Option::POSTGRES_SIZE_OPTIONS["#{family}-#{vcpu}"].memory_gib).to be_an(Integer)
+        end
+      end
+      Option::VmSizes.select { Option::GCP_FAMILY_OPTIONS.include?(it.family) }.each do |size|
+        expect(size.memory_gib).to be_an(Integer), "#{size.name} memory_gib is #{size.memory_gib.inspect}"
+      end
+
+      expect(Option::POSTGRES_SIZE_OPTIONS["c4-standard-4"].memory_gib).to eq(15)
+      expect(Option::POSTGRES_SIZE_OPTIONS["c4-standard-8"].memory_gib).to eq(30)
+      expect(Option::POSTGRES_SIZE_OPTIONS["c4-highmem-4"].memory_gib).to eq(31)
+      expect(Option::VmSizes.find { it.name == "c4-highmem-8" }.memory_gib).to eq(62)
+      expect(Option::POSTGRES_SIZE_OPTIONS["c4d-standard-8"].memory_gib).to eq(31)
+      expect(Option::POSTGRES_SIZE_OPTIONS["c4d-highmem-8"].memory_gib).to eq(63)
+    end
+
+    it "uses the family's memory_gib_overrides for shapes that do not follow the ratio" do
+      expect(described_class.gcp_memory_gib("z3-standardlssd", 176)).to eq(1406)
+      expect(described_class.gcp_memory_gib("z3-standardlssd", 88)).to eq(704)
+      expect(described_class.gcp_memory_gib("c4-standard", 4)).to eq(15)
+      expect(Option::POSTGRES_SIZE_OPTIONS["z3-standardlssd-176"].memory_gib).to eq(1406)
+      expect(Option::VmSizes.find { it.name == "z3-standardlssd-176" }.memory_gib).to eq(1406)
+    end
+
+    it "builds the GCE machine type from the family's prefix, vcpu count and suffix" do
+      expect(described_class.gcp_instance_type_name("c4a-standard", 16)).to eq("c4a-standard-16-lssd")
+      expect(described_class.gcp_instance_type_name("c4d-highmem", 96)).to eq("c4d-highmem-96-lssd")
+      expect(described_class.gcp_instance_type_name("c3-standard", 88)).to eq("c3-standard-88-lssd")
+      expect(described_class.gcp_instance_type_name("c3d-highmem", 360)).to eq("c3d-highmem-360-lssd")
+      expect(described_class.gcp_instance_type_name("z3-standardlssd", 44)).to eq("z3-highmem-44-standardlssd")
+      expect(described_class.gcp_instance_type_name("z3-highlssd", 32)).to eq("z3-highmem-32-highlssd")
+    end
+
+    it "terminates rather than live migrates above the local SSD migration limit" do
+      expect(described_class.gcp_on_host_maintenance("z3-highlssd", 44)).to eq("MIGRATE")
+      expect(described_class.gcp_on_host_maintenance("z3-highlssd", 88)).to eq("TERMINATE")
+      expect(described_class.gcp_on_host_maintenance("z3-standardlssd", 176)).to eq("TERMINATE")
+      expect(described_class.gcp_on_host_maintenance("c4-standard", 288)).to eq("MIGRATE")
+    end
+
+    it "raises rather than building a machine type for an unknown family" do
+      expect { described_class.gcp_instance_type_name("standard", 2) }.to raise_error(KeyError)
+    end
+
+    it "pins the storage size in GiB for every GCP family and vcpu" do
+      expect(Option::GCP_STORAGE_SIZE_OPTIONS).to eq({
+        "c4a-standard" => {4 => [375], 8 => [750], 16 => [1500], 32 => [2250], 48 => [3750], 64 => [5250], 72 => [6000]},
+        "c4a-highmem" => {4 => [375], 8 => [750], 16 => [1500], 32 => [2250], 48 => [3750], 64 => [5250], 72 => [6000]},
+        "c4-standard" => {4 => [375], 8 => [375], 16 => [750], 24 => [1500], 32 => [1875], 48 => [3000], 96 => [6000], 144 => [9000], 192 => [12000], 288 => [18000]},
+        "c4-highmem" => {4 => [375], 8 => [375], 16 => [750], 24 => [1500], 32 => [1875], 48 => [3000], 96 => [6000], 144 => [9000], 192 => [12000], 288 => [18000]},
+        "c4d-standard" => {8 => [375], 16 => [375], 32 => [750], 48 => [1500], 64 => [2250], 96 => [3000], 192 => [6000], 384 => [12000]},
+        "c4d-highmem" => {8 => [375], 16 => [375], 32 => [750], 48 => [1500], 64 => [2250], 96 => [3000], 192 => [6000], 384 => [12000]},
+        "c3-standard" => {4 => [375], 8 => [750], 22 => [1500], 44 => [3000], 88 => [6000], 176 => [12000]},
+        "c3d-standard" => {8 => [375], 16 => [375], 30 => [750], 60 => [1500], 90 => [3000], 180 => [6000], 360 => [12000]},
+        "c3d-highmem" => {8 => [375], 16 => [375], 30 => [750], 60 => [1500], 90 => [3000], 180 => [6000], 360 => [12000]},
+        "z3-standardlssd" => {14 => [3000], 22 => [6000], 44 => [9000], 88 => [18000], 176 => [36000]},
+        "z3-highlssd" => {8 => [3000], 16 => [6000], 22 => [9000], 32 => [12000], 44 => [18000], 88 => [36000]},
+      })
+    end
+
+    it "uses correct memory coefficients for GCP families" do
+      # standard: 4 GiB/vCPU
+      expect(Option::POSTGRES_SIZE_OPTIONS["c4a-standard-8"].memory_gib).to eq(32)
+      # highmem: 8 GiB/vCPU
+      expect(Option::POSTGRES_SIZE_OPTIONS["c4a-highmem-8"].memory_gib).to eq(64)
+    end
+  end
+
+  describe "AWS storage-optimized Postgres options" do
+    it "offers the 192 vCPU size for every i family" do
+      %w[i8g i8ge i7i i7ie].each do |family|
+        size = Option::POSTGRES_SIZE_OPTIONS["#{family}.48xlarge"]
+        expect(size).not_to be_nil, "Missing POSTGRES_SIZE_OPTIONS entry for #{family}.48xlarge"
+        expect(size.family).to eq(family)
+        expect(size.vcpu_count).to eq(192)
+        expect(size.memory_gib).to eq(1536)
+      end
+    end
+
+    it "pins the 192 vCPU storage size to the instance availability data" do
+      %w[i8g i8ge i7i i7ie].each do |family|
+        available = OptionTreeFilter.filter(provider: "aws", location: "us-east-1", size: "#{family}.48xlarge").first
+        expect(available).not_to be_nil, "#{family}.48xlarge missing from instance_availability.yml"
+        expect(Option::AWS_STORAGE_SIZE_OPTIONS[family][192]).to eq(available["storage_size_options"])
+      end
+    end
+  end
+
+  describe "POSTGRES_FAMILY_FALLBACK_CHAINS" do
+    it "matches the derivation from POSTGRES_SIZE_OPTIONS" do
+      derived = (Option::POSTGRES_SIZE_OPTIONS.values.map(&:family).uniq & Option::AWS_FAMILY_OPTIONS)
+        .group_by { it.sub(/\d+/, "") }
+        .values
+        .map { |chain| chain.sort_by { it[/\d+/].to_i } }
+        .reject { |chain| chain.size < 2 }
+      expect(Option::POSTGRES_FAMILY_FALLBACK_CHAINS).to eq(derived)
+    end
+  end
+
+  describe ".postgres_fallback_candidates" do
+    it "returns the older family for the newest in a 2-element chain" do
+      expect(described_class.postgres_fallback_candidates("m8id")).to eq(["m6id"])
+    end
+
+    it "returns the newer family for the oldest in a 2-element chain" do
+      expect(described_class.postgres_fallback_candidates("m6id")).to eq(["m8id"])
+    end
+
+    it "returns all older alternatives for the newest in a 3-element chain" do
+      expect(described_class.postgres_fallback_candidates("c8gd")).to eq(["c6gd", "c7gd"])
+    end
+
+    it "returns all newer alternatives for the oldest in a 3-element chain" do
+      expect(described_class.postgres_fallback_candidates("c6gd")).to eq(["c7gd", "c8gd"])
+    end
+
+    it "returns older alternatives first then newer for a mid-chain family" do
+      expect(described_class.postgres_fallback_candidates("c7gd")).to eq(["c6gd", "c8gd"])
+    end
+
+    it "returns empty list for a family not in any chain" do
+      expect(described_class.postgres_fallback_candidates("standard")).to eq([])
+    end
+  end
+
+  describe ".postgres_family_rank" do
+    it "returns the chain index for a 2-element chain" do
+      expect(described_class.postgres_family_rank("m6id")).to eq(0)
+      expect(described_class.postgres_family_rank("m8id")).to eq(1)
+    end
+
+    it "returns the chain index for a 3-element chain" do
+      expect(described_class.postgres_family_rank("c6gd")).to eq(0)
+      expect(described_class.postgres_family_rank("c7gd")).to eq(1)
+      expect(described_class.postgres_family_rank("c8gd")).to eq(2)
+    end
+
+    it "returns -1 for a family not in any chain" do
+      expect(described_class.postgres_family_rank("standard")).to eq(-1)
+    end
+  end
+
+  describe "#kubernetes_upgrade_candidate" do
+    it "returns upgrade version for upgradeable version" do
+      expect(described_class.kubernetes_upgrade_candidate("v1.33")).to eq("v1.34")
+      expect(described_class.kubernetes_upgrade_candidate("v1.34")).to eq("v1.35")
+      expect(described_class.kubernetes_upgrade_candidate("v1.35")).to eq("v1.36")
+      expect(described_class.kubernetes_upgrade_candidate("v1.36")).to eq("v1.37")
+    end
+
+    it "returns nil for latest version" do
+      expect(described_class.kubernetes_upgrade_candidate("v1.31")).to be_nil
+    end
+  end
 end

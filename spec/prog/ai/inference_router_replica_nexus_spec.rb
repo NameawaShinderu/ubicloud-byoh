@@ -23,7 +23,7 @@ RSpec.describe Prog::Ai::InferenceRouterReplicaNexus do
       private_subnet_id: private_subnet.id,
     )
   }
-  let!(:inference_router_model) {
+  let(:inference_router_model) {
     InferenceRouterModel.create(
       model_name: "test-model",
       prompt_billing_resource: "test-model-input",
@@ -122,7 +122,7 @@ RSpec.describe Prog::Ai::InferenceRouterReplicaNexus do
         "id -u inference-router >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin inference-router",
       )
       expect(sshable).to receive(:_cmd).with(
-        "sudo wget -O /ir/workdir/fetch_linux_amd64 https://github.com/gruntwork-io/fetch/releases/download/v0.4.6/fetch_linux_amd64",
+        "sudo curl -fsSL -o /ir/workdir/fetch_linux_amd64 https://github.com/gruntwork-io/fetch/releases/download/v0.4.6/fetch_linux_amd64",
       )
       expect(sshable).to receive(:_cmd).with("sudo chmod +x /ir/workdir/fetch_linux_amd64")
       expect(sshable).to receive(:_cmd).with(
@@ -174,9 +174,10 @@ RSpec.describe Prog::Ai::InferenceRouterReplicaNexus do
       expect(inference_router).to receive(:maintenance_set?).and_return(false)
       expect { nx.unavailable }.to nap(30)
 
-      page = Page.from_tag_parts(["InferenceRouterReplicaUnavailable", replica.ubid])
+      page = Page.from_tag_parts("InferenceRouterReplicaUnavailable", replica.ubid)
       expect(page).not_to be_nil
       expect(page.severity).to eq("error")
+      expect(page.resource_id).to eq(replica.id)
     end
 
     it "does not create a page if replica is in maintenance mode" do
@@ -446,10 +447,11 @@ RSpec.describe Prog::Ai::InferenceRouterReplicaNexus do
       nx.ping_inference_router
 
       # Verify page was created
-      page = Page.from_tag_parts(["InferenceRouterReplicaUnhealthyEndpoints", replica.ubid])
+      page = Page.from_tag_parts("InferenceRouterReplicaUnhealthyEndpoints", replica.ubid)
       expect(page).not_to be_nil
       expect(page.details["unhealthy_endpoints"]).to eq(["endpoint1"])
       expect(page.severity).to eq("error")
+      expect(page.resource_id).to eq(replica.id)
 
       # Second call: all endpoints healthy, should resolve the page
       expect(sshable).to receive(:_cmd)
@@ -481,6 +483,10 @@ RSpec.describe Prog::Ai::InferenceRouterReplicaNexus do
 
   describe "#update_billing_records" do
     let(:p1) { Project.create(name: "default") }
+
+    before do
+      inference_router_model
+    end
 
     it "updates billing records" do
       expect(BillingRecord.count).to eq(0)

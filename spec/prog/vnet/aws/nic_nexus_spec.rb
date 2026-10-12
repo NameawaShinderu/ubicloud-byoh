@@ -18,7 +18,7 @@ RSpec.describe Prog::Vnet::Aws::NicNexus do
     ps.strand.update(label: "wait")
     # SubnetNexus.assemble creates PrivateSubnetAwsResource and AwsSubnet records
     # Update them with the test values
-    ps.private_subnet_aws_resource.update(security_group_id: "sg-0123456789abcdefg", vpc_id: "vpc-0123456789abcdefg")
+    ps.private_subnet_aws_resource.update(user_security_group_id: "sg-0123456789abcdefg", mgmt_security_group_id: "sg-0123456789abcdefg", vpc_id: "vpc-0123456789abcdefg")
     aws_subnet = AwsSubnet.where(private_subnet_aws_resource_id: ps.private_subnet_aws_resource.id, location_aws_az_id: az_a.id).first
     aws_subnet.update(subnet_id: "subnet-0123456789abcdefg", ipv6_cidr: "2600:1f14:1000::/64")
     nic = Prog::Vnet::NicNexus.assemble(ps.id, name: "test-nic").subject
@@ -36,10 +36,17 @@ RSpec.describe Prog::Vnet::Aws::NicNexus do
   end
 
   describe "#start" do
-    it "creates a nic aws resource" do
+    it "creates a nic aws resource that uses an eip by default" do
       NicAwsResource[nic.id].destroy
       expect { nx.start }.to hop("create_subnet")
-      expect(NicAwsResource[nic.id]).not_to be_nil
+      expect(NicAwsResource[nic.id]).to have_attributes(use_eip: true)
+    end
+
+    it "creates a nic aws resource without an eip when the frame says so" do
+      NicAwsResource[nic.id].destroy
+      expect(nx).to receive(:frame).and_return({"use_eip" => false}).at_least(:once)
+      expect { nx.start }.to hop("create_subnet")
+      expect(NicAwsResource[nic.id]).to have_attributes(use_eip: false)
     end
   end
 
@@ -61,11 +68,11 @@ RSpec.describe Prog::Vnet::Aws::NicNexus do
       expect { nx.create_subnet }.to raise_error("No available AWS subnet found")
     end
 
-    it "uses existing subnet for old aws subnet" do
-      expect(nx).to receive(:old_subnet?).and_return(true)
-      client.stub_responses(:describe_subnets, subnets: [{subnet_id: "subnet-existing", availability_zone: "a"}])
-      expect(nic.nic_aws_resource).to receive(:update).with(subnet_id: "subnet-existing", subnet_az: "a")
-      expect { nx.create_subnet }.to hop("create_network_interface")
+    it "hops to wait when not creating the network interface, letting AWS create it at launch" do
+      aws_subnet = AwsSubnet.where(private_subnet_aws_resource_id: nic.private_subnet.private_subnet_aws_resource.id).first
+      expect(nx).to receive(:frame).and_return({"aws_subnet_id" => aws_subnet.id}).at_least(:once)
+      nic.nic_aws_resource.update(create_network_interface: false)
+      expect { nx.create_subnet }.to hop("wait")
     end
   end
 
@@ -76,6 +83,14 @@ RSpec.describe Prog::Vnet::Aws::NicNexus do
       expect { nx.create_network_interface }.to hop("assign_ipv6_address")
     end
 
+    it "uses the mgmt security group for management nics" do
+      nic.update(is_management: true)
+      nic.private_subnet.private_subnet_aws_resource.update(mgmt_security_group_id: "sg-mgmt")
+      client.stub_responses(:create_network_interface, network_interface: {network_interface_id: "eni-0123456789abcdefg", ipv_6_addresses: []})
+      expect(client).to receive(:create_network_interface).with(hash_including(groups: ["sg-mgmt"])).and_call_original
+      expect { nx.create_network_interface }.to hop("assign_ipv6_address")
+    end
+
     it "finds existing network interface when IP is already in use" do
       expect(client).to receive(:create_network_interface).and_raise(Aws::EC2::Errors::InvalidIPAddressInUse.new(nil, "The IP address '10.0.0.1' is already in use."))
       client.stub_responses(:describe_network_interfaces, network_interfaces: [{network_interface_id: "eni-existing123", status: "available"}])
@@ -83,17 +98,36 @@ RSpec.describe Prog::Vnet::Aws::NicNexus do
         filters: [
           {name: "subnet-id", values: [nic.nic_aws_resource.subnet_id]},
           {name: "addresses.private-ip-address", values: [nic.private_ipv4.network.to_s]},
-          {name: "status", values: ["available"]},
+          {name: "tag:Name", values: [nic.name]},
         ],
       }).and_call_original
       expect { nx.create_network_interface }.to hop("assign_ipv6_address")
       expect(nic.nic_aws_resource.reload.network_interface_id).to eq("eni-existing123")
     end
 
-    it "fails when IP is in use but no available network interface found" do
+    it "naps when IP is in use by its own network interface that is not available yet" do
+      expect(client).to receive(:create_network_interface).and_raise(Aws::EC2::Errors::InvalidIPAddressInUse.new(nil, "The IP address '10.0.0.1' is already in use."))
+      client.stub_responses(:describe_network_interfaces, network_interfaces: [{network_interface_id: "eni-existing123", status: "pending"}])
+      expect { nx.create_network_interface }.to nap(1)
+    end
+
+    it "reallocates the private IP when it is in use by a network interface created for something else" do
+      aws_subnet = AwsSubnet.first(private_subnet_aws_resource_id: nic.private_subnet.private_subnet_aws_resource.id, subnet_id: "subnet-0123456789abcdefg")
+      nic.nic_aws_resource.update(aws_subnet_id: aws_subnet.id)
+      old_ip = nic.private_ipv4.network.to_s
       expect(client).to receive(:create_network_interface).and_raise(Aws::EC2::Errors::InvalidIPAddressInUse.new(nil, "The IP address '10.0.0.1' is already in use."))
       client.stub_responses(:describe_network_interfaces, network_interfaces: [])
-      expect { nx.create_network_interface }.to raise_error(RuntimeError, /No available network interface found for IP/)
+      logged = nil
+      expect(Clog).to receive(:emit).with("NIC private IP is taken by another network interface, reallocating", instance_of(Hash)).and_wrap_original do |original, message, metadata|
+        logged = metadata.dup
+        original.call(message, metadata)
+      end
+      expect { nx.create_network_interface }.to nap(0)
+      new_ip = nic.reload.private_ipv4
+      expect(logged).to eq({nic_ip_reallocated: {nic: nic.ubid, from: old_ip, to: new_ip.to_s}})
+      expect(new_ip.network.to_s).not_to eq(old_ip)
+      expect(new_ip.netmask.prefix_len).to eq(32)
+      expect(NetAddr::IPv4Net.parse(aws_subnet.ipv4_cidr.to_s).contains(new_ip.network)).to be(true)
     end
   end
 
@@ -134,6 +168,17 @@ RSpec.describe Prog::Vnet::Aws::NicNexus do
       expect(client).to receive(:describe_network_interfaces).with({filters: [{name: "network-interface-id", values: ["eni-0123456789abcdefg"]}, {name: "tag:Ubicloud", values: ["true"]}]}).and_call_original
 
       expect { nx.wait_network_interface_created }.to hop("allocate_eip")
+    end
+
+    it "skips elastic ip when the nic has no eip, clearing the EIP deadline" do
+      nic.nic_aws_resource.update(use_eip: false)
+      refresh_frame(nx, new_values: {"deadline_target" => "attach_eip_network_interface", "deadline_at" => (Time.now + 60).to_s})
+      client.stub_responses(:describe_network_interfaces, network_interfaces: [{status: "available"}])
+      expect(nic.nic_aws_resource).to receive(:network_interface_id).and_return("eni-0123456789abcdefg").at_least(:once)
+
+      expect { nx.wait_network_interface_created }.to hop("wait")
+      expect(frame_value(nx, "deadline_target")).to be_nil
+      expect(frame_value(nx, "deadline_at")).to be_nil
     end
   end
 
@@ -190,6 +235,12 @@ RSpec.describe Prog::Vnet::Aws::NicNexus do
       expect { nx.destroy }.to hop("destroy_entities")
     end
 
+    it "hops to destroy_entities for an AWS-managed nic without deleting the interface" do
+      nic.nic_aws_resource.update(create_network_interface: false, network_interface_id: "eni-aws-created")
+      expect(client).not_to receive(:delete_network_interface)
+      expect { nx.destroy }.to hop("destroy_entities")
+    end
+
     it "deletes the network interface" do
       client.stub_responses(:describe_network_interfaces, network_interfaces: [{status: "available"}])
       client.stub_responses(:delete_network_interface)
@@ -232,68 +283,28 @@ RSpec.describe Prog::Vnet::Aws::NicNexus do
       expect(nic.nic_aws_resource).to receive(:eip_allocation_id).and_return("eip-0123456789abcdefg").at_least(:once)
       client.stub_responses(:release_address)
       expect(client).to receive(:release_address).with({allocation_id: "eip-0123456789abcdefg"}).and_call_original
-      expect { nx.release_eip }.to hop("delete_subnet")
+      expect { nx.release_eip }.to hop("destroy_entities")
     end
 
     it "gracefully continues if the nic is not found" do
       expect(nic.nic_aws_resource).to receive(:eip_allocation_id).and_return(nil).at_least(:once)
-      expect { nx.release_eip }.to hop("delete_subnet")
+      expect { nx.release_eip }.to hop("destroy_entities")
     end
 
     it "gracefully continues if the nic_aws_resource is not found" do
       expect(nic).to receive(:nic_aws_resource).and_return(nil).at_least(:once)
-      expect { nx.release_eip }.to hop("delete_subnet")
+      expect { nx.release_eip }.to hop("destroy_entities")
     end
 
-    it "hops to delete_subnet if the eip_allocation_id is found" do
+    it "hops to destroy_entities if the eip_allocation_id is found" do
       expect(nic.nic_aws_resource).to receive(:eip_allocation_id).and_return("eip-0123456789abcdefg").at_least(:once)
-      expect { nx.release_eip }.to hop("delete_subnet")
+      expect { nx.release_eip }.to hop("destroy_entities")
     end
 
-    it "hops to delete_subnet if the address is already released" do
+    it "hops to destroy_entities if the address is already released" do
       client.stub_responses(:describe_addresses, addresses: [{allocation_id: "eip-0123456789abcdefg"}])
       client.stub_responses(:release_address, Aws::EC2::Errors::InvalidAllocationIDNotFound.new(nil, "The address 'eip-0123456789abcdefg' does not exist."))
-      expect { nx.release_eip }.to hop("delete_subnet")
-    end
-  end
-
-  describe "#delete_subnet" do
-    it "skips deletion for shared subnets (aws_subnet_id set)" do
-      aws_subnet = AwsSubnet.where(private_subnet_aws_resource_id: nic.private_subnet.private_subnet_aws_resource.id).first
-      nic.nic_aws_resource.update(aws_subnet_id: aws_subnet.id)
-      expect(client).not_to receive(:delete_subnet)
-      expect { nx.delete_subnet }.to hop("destroy_entities")
-    end
-
-    it "deletes legacy per-NIC subnet (aws_subnet_id nil)" do
-      client.stub_responses(:delete_subnet)
-      expect(client).to receive(:delete_subnet).with({subnet_id: nic.nic_aws_resource.subnet_id}).and_call_original
-      expect { nx.delete_subnet }.to hop("destroy_entities")
-    end
-
-    it "deletes subnet for old aws subnet" do
-      expect(nx).to receive(:old_subnet?).and_return(true)
-      client.stub_responses(:delete_subnet)
-      expect(client).to receive(:delete_subnet).with({subnet_id: nic.nic_aws_resource.subnet_id}).and_call_original
-      expect { nx.delete_subnet }.to hop("destroy_entities")
-    end
-
-    it "gracefully continues if the nic is not found" do
-      client.stub_responses(:delete_subnet, Aws::EC2::Errors::InvalidSubnetIDNotFound.new(nil, "The subnet 'subnet-0123456789abcdefg' does not exist."))
-      expect(nic.nic_aws_resource).to receive(:subnet_id).and_return(nil).at_least(:once)
-      expect { nx.delete_subnet }.to hop("destroy_entities")
-    end
-
-    it "raises an error if the subnet could not be deleted but we are the only nic" do
-      client.stub_responses(:delete_subnet, Aws::EC2::Errors::DependencyViolation.new(nil, "The subnet 'subnet-0123456789abcdefg' could not be deleted because it is associated with the network interface 'eni-0123456789abcdefg'."))
-      expect(nic.private_subnet).to receive(:nics).and_return([nic]).at_least(:once)
-      expect { nx.delete_subnet }.to raise_error(Aws::EC2::Errors::DependencyViolation)
-    end
-
-    it "gracefully continues if the subnet could not be deleted but we are not the only nic" do
-      client.stub_responses(:delete_subnet, Aws::EC2::Errors::DependencyViolation.new(nil, "The subnet 'subnet-0123456789abcdefg' could not be deleted because it is associated with the network interface 'eni-0123456789abcdefg'."))
-      expect(nic.private_subnet).to receive(:nics).and_return([nic, instance_double(Nic)]).at_least(:once)
-      expect { nx.delete_subnet }.to hop("destroy_entities")
+      expect { nx.release_eip }.to hop("destroy_entities")
     end
   end
 

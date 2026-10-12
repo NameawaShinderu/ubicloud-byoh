@@ -1,12 +1,20 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/util"
-
 class Prog::Postgres::ConvergePostgresResource < Prog::Base
   subject_is :postgres_resource
+  frame_accessor :total_disk_usage, :total_lsn, :servers_to_destroy
 
   label def start
     nap 60 if postgres_resource.read_replica? && !postgres_resource.parent.ready_for_read_replica?
+
+    timeline = postgres_resource.effective_timeline
+    nap 60 if timeline.take_backup_for_converge_set?
+
+    if timeline.latest_backup_size_in_gib.nil? || postgres_resource.latest_backup_too_large_for_target?
+      timeline.incr_take_backup_for_converge
+      register_deadline("wait_for_maintenance_window", 6 * 60 * 60)
+      nap 60
+    end
 
     register_deadline("wait_for_maintenance_window", 10 * 60)
 
@@ -16,7 +24,7 @@ class Prog::Postgres::ConvergePostgresResource < Prog::Base
   label def provision_servers
     hop_wait_servers_to_be_ready if postgres_resource.has_enough_fresh_servers?
 
-    if postgres_resource.servers.all? { it.vm.vm_host } || postgres_resource.location.aws?
+    if postgres_resource.servers.all? { it.vm.vm_host } || !postgres_resource.location.metal?
       postgres_resource.provision_new_standby
     end
 
@@ -28,23 +36,15 @@ class Prog::Postgres::ConvergePostgresResource < Prog::Base
     hop_wait_for_maintenance_window if postgres_resource.has_enough_ready_servers?
 
     waiting_servers = postgres_resource.servers(eager: [:semaphores, vm: [:vm_storage_volumes, :sshable]]).reject { it.is_representative || it.needs_recycling? }
+    total_disk_usage = waiting_servers.sum(&:data_disk_usage)
 
-    total_disk_usage = waiting_servers.sum do |s|
-      s.vm.sshable.cmd("df --output=used /dat | tail -n 1").strip.to_i
-    rescue
-      # /dat missing before mount_data_disk, ignore errors, if persistent then deadline will be reached
-      0
-    end
+    total_lsn = waiting_servers.sum { |s| s.last_known_lsn ? s.lsn2int(s.last_known_lsn) : 0 }
 
-    total_lsn = waiting_servers.sum do |s|
-      last_known_lsn = s.lsn_monitor_ds.get(:last_known_lsn)
-      last_known_lsn ? s.lsn2int(last_known_lsn) : 0
-    end
-
-    previous_total_disk_usage = strand.stack.first["total_disk_usage"] || 0
-    previous_total_lsn = strand.stack.first["total_lsn"] || 0
+    previous_total_disk_usage = self.total_disk_usage || 0
+    previous_total_lsn = self.total_lsn || 0
     if total_disk_usage > previous_total_disk_usage || total_lsn > previous_total_lsn
-      update_stack({"total_disk_usage" => [total_disk_usage, previous_total_disk_usage].max, "total_lsn" => [total_lsn, previous_total_lsn].max})
+      self.total_disk_usage = [total_disk_usage, previous_total_disk_usage].max
+      self.total_lsn = [total_lsn, previous_total_lsn].max
       register_deadline("wait_for_maintenance_window", 10 * 60, allow_extension: 24 * 60 * 60)
     end
 
@@ -52,14 +52,31 @@ class Prog::Postgres::ConvergePostgresResource < Prog::Base
   end
 
   label def wait_for_maintenance_window
-    nap 10 * 60 unless postgres_resource.in_maintenance_window?
-
     hop_provision_servers unless postgres_resource.has_enough_fresh_servers?
+
+    window_applies = !postgres_resource.project.get_ff_postgres_maintenance_window_platform_only || postgres_resource.pending_platform_maintenance?
+    if window_applies && !postgres_resource.in_maintenance_window? && !postgres_resource.bypass_maintenance_window_set?
+      ignore_window = begin
+        postgres_resource.representative_server.disk_usage_percent >= 95
+      rescue Sshable::SshError, *Sshable::SSH_CONNECTION_ERRORS => e
+        Clog.emit("Maintenance failed to check disk usage", Util.exception_to_hash(e, into: {resource_id: postgres_resource.id}))
+        nap 60
+      end
+      nap 10 * 60 unless ignore_window
+    end
 
     # Read replicas skip the in-place upgrade process and directly
     # recycle servers, which are provisioned at the target version instead of
     # the current version.
     if postgres_resource.version != postgres_resource.target_version && !postgres_resource.read_replica?
+      # Verify logical failover slots are synced to the upgrade candidate before
+      # fencing. Once the primary is stopped we can no longer query its slot
+      # list, so failover_target's planned-mode sync check becomes a no-op.
+      missing = postgres_resource.representative_server.unsynced_logical_failover_slots(upgrade_candidate)
+      unless missing.empty?
+        Clog.emit("Upgrade waiting for logical slot sync", {resource_id: postgres_resource.id, missing_slots: missing})
+        nap 30
+      end
       postgres_resource.representative_server.incr_fence
       hop_wait_fence_primary
     end
@@ -81,7 +98,7 @@ class Prog::Postgres::ConvergePostgresResource < Prog::Base
     when "Failed"
       hop_upgrade_failed
     when "NotStarted"
-      upgrade_candidate.vm.sshable.d_run("upgrade_postgres", "sudo", "postgres/bin/upgrade", postgres_resource.target_version)
+      upgrade_candidate.vm.sshable.d_run("upgrade_postgres", "sudo", "postgres/bin/upgrade", postgres_resource.target_version, stdin: JSON.generate(upgrade_candidate.configure_hash))
     end
 
     nap 5
@@ -103,14 +120,14 @@ class Prog::Postgres::ConvergePostgresResource < Prog::Base
   end
 
   label def upgrade_failed
-    if upgrade_candidate && !upgrade_candidate.destroy_set?
+    if postgres_resource.representative_server.strand.label == "wait_in_fence" && !postgres_resource.representative_server.unfence_set?
       logs = upgrade_candidate.vm.sshable.cmd("sudo journalctl -u upgrade_postgres")
       logs.split("\n").each { |line| Clog.emit("Postgres resource upgrade failed", {resource_id: postgres_resource.id, log: line}) }
-      upgrade_candidate.incr_destroy
-      Prog::PageNexus.assemble("#{postgres_resource.ubid} upgrade failed", ["PostgresUpgradeFailed", postgres_resource.id], postgres_resource.ubid)
+      Prog::PageNexus.assemble("#{postgres_resource.ubid} upgrade failed", ["PostgresUpgradeFailed", postgres_resource.id], postgres_resource.ubid, resource_id: postgres_resource.id)
+
+      postgres_resource.representative_server.incr_unfence
     end
 
-    postgres_resource.representative_server.incr_unfence if postgres_resource.representative_server.strand.label == "wait_in_fence"
     nap 6 * 60 * 60
   end
 
@@ -122,10 +139,10 @@ class Prog::Postgres::ConvergePostgresResource < Prog::Base
 
       # Acquire advisory lock to prevent race with cancel_storage_auto_scale
       nap 5 unless DB.get(Sequel.function(:pg_try_advisory_xact_lock, postgres_resource.storage_auto_scale_lock_key))
-      postgres_resource.incr_storage_auto_scale_not_cancellable
+      postgres_resource.incr_storage_auto_scale_not_cancellable unless postgres_resource.storage_auto_scale_not_cancellable_set?
 
       register_deadline(nil, 10 * 60)
-      postgres_resource.representative_server.trigger_failover(mode: "planned")
+      postgres_resource.representative_server.trigger_failover(mode: "planned", switch_timeline: postgres_resource.family_migration_in_progress?)
     end
 
     nap 60
@@ -133,17 +150,18 @@ class Prog::Postgres::ConvergePostgresResource < Prog::Base
 
   label def prune_servers
     postgres_resource.decr_storage_auto_scale_not_cancellable
+    postgres_resource.decr_bypass_maintenance_window
 
     # Below we only keep servers that does not need recycling or are of the
     # current version. If there are more such servers than required, we prefer
     # ready and recent servers (in that order)
     servers_to_keep = postgres_resource.servers
       .reject { it.is_representative || it.needs_recycling? || it.version != postgres_resource.target_version }
-      .sort_by { [(it.strand.label == "wait") ? 0 : 1, Time.now - it.created_at] }
+      .sort_by { [(it.strand.label == "wait") ? 0 : 1, it.fallback_active? ? 1 : 0, -Option.postgres_family_rank(it.vm.family), Time.now - it.created_at] }
       .take(postgres_resource.target_standby_count) + [postgres_resource.representative_server]
     servers_to_destroy = (postgres_resource.servers - servers_to_keep)
     servers_to_destroy.each(&:incr_destroy)
-    update_stack({"servers_to_destroy" => servers_to_destroy.map(&:id)})
+    self.servers_to_destroy = servers_to_destroy.map(&:id)
 
     servers_to_keep.each(&:incr_configure)
     postgres_resource.incr_update_billing_records
@@ -152,7 +170,7 @@ class Prog::Postgres::ConvergePostgresResource < Prog::Base
   end
 
   label def wait_prune_servers
-    nap 30 unless PostgresServer.where(id: frame["servers_to_destroy"]).empty?
+    nap 30 unless PostgresServer.where(id: servers_to_destroy).empty?
 
     pop "postgres resource is converged"
   end

@@ -4,6 +4,7 @@
       <img class="h-6 w-auto" src="/logo-white.png" alt="Ubicloud">
     </a>
   </div>
+
   <nav class="flex flex-1 flex-col">
     <ul role="list" class="flex flex-1 flex-col gap-y-7">
       <li>
@@ -56,6 +57,13 @@
             ) %>
             <%== part(
               "layouts/sidebar/item",
+              name: "Machine Images",
+              url: "#{@project.path}/machine-image",
+              is_active: request.path.start_with?("#{@project.path}/machine-image"),
+              icon: "hero-rectangle-stack"
+            ) %>
+            <%== part(
+              "layouts/sidebar/item",
               name: "Web Shell",
               url: "#{@project.path}/cli",
               is_active: request.path.start_with?("#{@project.path}/cli"),
@@ -79,9 +87,11 @@
           <% end %>
         </ul>
       </li>
+
       <% if @project_permissions && has_project_permission(["Project:user", "Project:billing", "Project:view", "Project:viewaccess", "Project:token"]) %>
         <li>
           <div class="text-xs font-semibold leading-6 text-orange-200">Project Details</div>
+
           <ul role="list" class="-mx-2 mt-2 space-y-1">
             <% if has_project_permission("Project:user")
                    users_url = "#{@project.path}/user"
@@ -92,14 +102,15 @@
                  end
 
                if users_url %>
-                 <%== part(
+              <%== part(
                     "layouts/sidebar/item",
                     name: users_label,
                     url: users_url,
                     is_active: request.path.start_with?("#{@project.path}/user"),
                     icon: "hero-users",
                   ) %>
-               <% end %>
+            <% end %>
+
             <%== part(
               "layouts/sidebar/item",
               name: "Tokens",
@@ -108,6 +119,7 @@
               icon: "hero-key",
               has_permission: has_project_permission("Project:token")
             ) %>
+
             <% if Config.stripe_secret_key %>
               <%== part(
                 "layouts/sidebar/item",
@@ -119,6 +131,7 @@
                 has_permission: has_project_permission("Project:billing")
               ) %>
             <% end %>
+
             <%== part(
               "layouts/sidebar/item",
               name: "Settings",
@@ -127,6 +140,7 @@
               icon: "hero-cog-6-tooth",
               has_permission: has_project_permission("Project:view")
             ) %>
+
             <% if @project.get_ff_private_locations %>
               <%== part(
                 "layouts/sidebar/item",
@@ -140,9 +154,11 @@
           </ul>
         </li>
       <% end %>
+
       <% if @project_permissions && has_project_permission("Project:github") && Config.github_app_name %>
         <li>
           <div class="text-xs font-semibold leading-6 text-orange-200">Integrations</div>
+
           <ul role="list" class="-mx-2 mt-2 space-y-1">
             <%== part(
               "layouts/sidebar/item",
@@ -154,8 +170,8 @@
             ) %>
           </ul>
         </li>
-
       <% end %>
+
       <li class="-mx-6 mt-auto">
         <%== render("layouts/sidebar/project_switcher") %>
       </li>

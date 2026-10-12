@@ -7,7 +7,8 @@ class Serializers::PostgresServer < Serializers::Base
       role: server.is_representative ? "primary" : "standby",
       state: server.display_state,
       synchronization_status: server.synchronization_status,
-      vm: Serializers::Vm.serialize(server.vm),
+      vm_size: server.vm.display_size,
+      fallback_active: server.fallback_active?,
     }
   end
 end

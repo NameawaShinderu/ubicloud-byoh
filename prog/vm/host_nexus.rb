@@ -2,8 +2,10 @@
 
 class Prog::Vm::HostNexus < Prog::Base
   subject_is :sshable, :vm_host
+  frame_reader :vhost_block_backend_version, :default_boot_images, :install_os
+  frame_accessor :accepting_before_patch
 
-  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [])
+  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false)
     DB.transaction do
       unless Location[location_id]
         raise "No existing Location"
@@ -30,13 +32,7 @@ class Prog::Vm::HostNexus < Prog::Base
       Sshable.create_with_id(id, **sshable_args)
       vmh = VmHost.create_with_id(id, location_id:, family:, net6:, ndp_needed:)
 
-      creates_host_provider = [
-        HostProvider::HETZNER_PROVIDER_NAME,
-        HostProvider::LEASEWEB_PROVIDER_NAME,
-        HostProvider::GENERIC_PROVIDER_NAME,
-      ].include?(provider_name)
-
-      if creates_host_provider
+      if [HostProvider::HETZNER_PROVIDER_NAME, *HostProvider::LEASEWEB_PROVIDER_NAMES, HostProvider::GENERIC_PROVIDER_NAME].include?(provider_name)
         effective_server_identifier = server_identifier
         if provider_name == HostProvider::GENERIC_PROVIDER_NAME
           effective_server_identifier ||= "byoh-#{id}"
@@ -49,9 +45,10 @@ class Prog::Vm::HostNexus < Prog::Base
         end
       end
 
-      if provider_name == HostProvider::HETZNER_PROVIDER_NAME
+      if [HostProvider::HETZNER_PROVIDER_NAME, *HostProvider::LEASEWEB_PROVIDER_NAMES].include?(provider_name)
         vmh.create_addresses
         vmh.set_data_center
+        vmh.create_inventory
         # Avoid overriding custom server names for development hosts.
         vmh.set_server_name unless Config.development?
       elsif provider_name == HostProvider::GENERIC_PROVIDER_NAME
@@ -68,30 +65,33 @@ class Prog::Vm::HostNexus < Prog::Base
       Strand.create_with_id(id,
         prog: "Vm::HostNexus",
         label: "start",
-        stack: [{"vhost_block_backend_version" => vhost_block_backend_version, "default_boot_images" => default_boot_images}])
+        stack: [{"vhost_block_backend_version" => vhost_block_backend_version, "default_boot_images" => default_boot_images, "install_os" => install_os}])
     end
   end
 
   label def start
+    hop_install_host_os if install_os
+
     hop_setup_ssh_keys
+  end
+
+  label def install_host_os
+    hop_setup_ssh_keys unless vm_host.provider_name == HostProvider::HETZNER_PROVIDER_NAME
+
+    register_deadline("setup_ssh_keys", 2 * 60 * 60)
+    hop_setup_ssh_keys if retval&.dig("msg") == "operating system installed"
+
+    push Prog::Hetzner::InstallOs
   end
 
   label def setup_ssh_keys
     # Generate a new SSH key if one is not set.
     sshable.update(raw_private_key_1: SshKey.generate.keypair) unless sshable.raw_private_key_1
 
-    # The root-key bootstrap exists so that a fresh Hetzner host, which
-    # comes up with Hetzner's preshared SSH key in /root/.ssh/authorized_keys,
-    # can have it overwritten with our generated sshable key. It only makes
-    # sense for Hetzner hosts — BYOH ("generic") hosts don't have Hetzner's
-    # preshared key, and in a mixed Hetzner+BYOH deployment where
-    # hetzner_ssh_private_key is set globally, trying to use it against a
-    # BYOH host would fail. A nil provider_name is treated as the legacy
-    # dev/test path so existing specs keep working unchanged.
-    provider_allows_hetzner_bootstrap =
-      vm_host.provider_name.nil? || vm_host.provider_name == HostProvider::HETZNER_PROVIDER_NAME
-
-    if provider_allows_hetzner_bootstrap && Config.hetzner_ssh_private_key
+    # BYOH hosts never carry the provider's preshared root key: the operator
+    # installed the sshable key out-of-band, so the root-key bootstrap would
+    # only fail against them.
+    if vm_host.provider_name != HostProvider::GENERIC_PROVIDER_NAME && Config.hetzner_ssh_private_key
       root_key = Net::SSH::Authentication::ED25519::PrivKey.read(Config.hetzner_ssh_private_key, Config.hetzner_ssh_private_key_passphrase).sign_key
       root_ssh_key = SshKey.from_binary(root_key.keypair)
 
@@ -106,9 +106,21 @@ class Prog::Vm::HostNexus < Prog::Base
 
   label def bootstrap_rhizome
     register_deadline("download_boot_images", 10 * 60)
-    hop_prep if retval&.dig("msg") == "rhizome user bootstrapped and source installed"
+    hop_check_ip_reachability if retval&.dig("msg") == "rhizome user bootstrapped and source installed"
 
     push Prog::BootstrapRhizome, {"target_folder" => "host"}
+  end
+
+  label def check_ip_reachability
+    hop_prep if retval&.dig("msg") == "all ip addresses are reachable"
+
+    # A BYOH host's pool must never be configured on the host (NETWORKING.md
+    # contract C5), which the check does to test it, and the management
+    # address may sit behind NAT or a firewall that drops ICMP. PrepHost's
+    # downloads prove outbound reachability instead.
+    hop_prep if vm_host.provider_name == HostProvider::GENERIC_PROVIDER_NAME
+
+    push Prog::CheckIpReachability
   end
 
   label def prep
@@ -117,11 +129,12 @@ class Prog::Vm::HostNexus < Prog::Base
     bud Prog::LearnMemory
     bud Prog::LearnOs
     bud Prog::LearnCpu
-    bud Prog::LearnStorage
+    bud Prog::LearnStorage, {"format_storage" => install_os}
     bud Prog::LearnPci
     bud Prog::InstallDnsmasq
     bud Prog::SetupSysstat
     bud Prog::SetupNftables
+    bud Prog::SetupNdpProxy if vm_host.ndp_needed
     bud Prog::SetupNodeExporter
     hop_wait_prep
   end
@@ -143,6 +156,7 @@ class Prog::Vm::HostNexus < Prog::Base
         arch = st.exitval.fetch("arch")
         total_cores = st.exitval.fetch("total_cores")
         total_cpus = st.exitval.fetch("total_cpus")
+        cpu_numa_nodes = st.exitval.fetch("cpu_numa_nodes")
         kwargs = {
           arch:,
           total_sockets: st.exitval.fetch("total_sockets"),
@@ -154,12 +168,13 @@ class Prog::Vm::HostNexus < Prog::Base
         # BYOH (generic) hosts run vhost-block-backend, never SPDK, so they
         # set no CPUs aside for IO. Decide once, so the reserved CPUs and
         # used_cores agree.
-        io_cpu_count = (vm_host.provider_name == HostProvider::GENERIC_PROVIDER_NAME) ? 0 : vm_host.spdk_cpu_count
+        io_cpu_count = (vm_host.provider_name == HostProvider::GENERIC_PROVIDER_NAME) ? 0 : vm_host.io_cpu_count
         (0..total_cpus - 1).each do |cpu|
           VmHostCpu.create(
             vm_host_id: vm_host.id,
             cpu_number: cpu,
-            spdk: cpu < io_cpu_count,
+            io: cpu < io_cpu_count,
+            numa_node: cpu_numa_nodes[cpu],
           )
         end
         vm_host.update(used_cores: io_cpu_count * total_cores / total_cpus)
@@ -179,14 +194,14 @@ class Prog::Vm::HostNexus < Prog::Base
     hop_download_boot_images if retval&.dig("msg") == "VhostBlockBackend was setup"
 
     push Prog::Storage::SetupVhostBlockBackend, {
-      "version" => frame["vhost_block_backend_version"],
+      "version" => vhost_block_backend_version,
       "allocation_weight" => 100,
     }
   end
 
   label def download_boot_images
     register_deadline("prep_reboot", 4 * 60 * 60)
-    frame["default_boot_images"].each { |image_name|
+    default_boot_images.each { |image_name|
       bud Prog::DownloadBootImage, {
         "image_name" => image_name,
       }
@@ -196,7 +211,7 @@ class Prog::Vm::HostNexus < Prog::Base
   end
 
   label def wait_download_boot_images
-    reap(:prep_reboot)
+    reap(:patch)
   end
 
   label def prep_reboot
@@ -204,9 +219,7 @@ class Prog::Vm::HostNexus < Prog::Base
     boot_id = get_boot_id
     vm_host.update(last_boot_id: boot_id)
 
-    vm_host.vms.each { |vm|
-      vm.update(display_state: "rebooting")
-    }
+    vm_host.active_vms_dataset.update(display_state: "rebooting")
 
     decr_reboot
 
@@ -234,7 +247,7 @@ class Prog::Vm::HostNexus < Prog::Base
 
   label def prep_hardware_reset
     register_deadline("wait", 20 * 60)
-    vm_host.vms_dataset.update(display_state: "rebooting")
+    vm_host.active_vms_dataset.update(display_state: "rebooting")
     decr_hardware_reset
     hop_hardware_reset
   end
@@ -282,6 +295,10 @@ class Prog::Vm::HostNexus < Prog::Base
     free_hugepages_match = host_meminfo.match(/^HugePages_Free:\s+(\d+)$/)
     fail "Couldn't extract free hugepage count" unless free_hugepages_match
 
+    available_memory_match = host_meminfo.match(/^MemAvailable:\s+(\d+) kB$/)
+    fail "Couldn't extract available memory" unless available_memory_match
+    fail "Insufficient memory left for the host OS" if Integer(available_memory_match.captures.first) < 2 * 1024 * 1024
+
     total_hugepages = Integer(total_hugepages_match.captures.first)
     free_hugepages = Integer(free_hugepages_match.captures.first)
 
@@ -294,10 +311,12 @@ class Prog::Vm::HostNexus < Prog::Base
       fail "Only #{usable_hugepages} usable 1G hugepages; a host that runs dedicated slices needs at least #{min_slice_hugepages}"
     end
 
+    vm_host.lock! # serialize the recompute against concurrent destroys decrementing used_hugepages_1g
+
     total_vm_mem_gib = if vm_host.accepts_slices
-      vm_host.slices.sum(&:total_memory_gib)
+      vm_host.slices_dataset.sum(:total_memory_gib) || 0
     else
-      vm_host.vms.sum(&:memory_gib)
+      vm_host.active_vms_dataset.sum(:memory_gib) || 0
     end
     fail "Not enough hugepages for VMs" unless total_hugepages - spdk_hugepages >= total_vm_mem_gib
 
@@ -325,11 +344,16 @@ class Prog::Vm::HostNexus < Prog::Base
     when_graceful_reboot_set? do
       fail "BUG: VmHost not in draining state" unless vm_host.allocation_state == "draining"
 
-      vm_host.update(allocation_state: "accepting")
-      decr_graceful_reboot
+      unless vm_host.patch_set?
+        vm_host.update(allocation_state: "accepting")
+        decr_graceful_reboot
+      end
     end
 
-    vm_host.update(allocation_state: "accepting") if vm_host.allocation_state == "unprepared"
+    if vm_host.allocation_state == "unprepared"
+      vm_host.update(allocation_state: "accepting")
+      delete_from_stack("install_os", "default_boot_images", "vhost_block_backend_version")
+    end
 
     hop_configure_metrics
   end
@@ -392,17 +416,52 @@ TIMER
     hop_wait
   end
 
+  label def patch
+    sshable = vm_host.sshable
+
+    case sshable.d_check("apply_patches")
+    when "Succeeded"
+      sshable.d_clean("apply_patches")
+      hop_prep_reboot
+    when "Failed", "NotStarted"
+      sshable.d_run("apply_patches", "sudo", "bash", "-c", "apt update && apt full-upgrade -y")
+    end
+
+    nap 60
+  end
+
   label def wait
     hardware_reset_and_reboot_checks
 
     when_checkup_set? do
       hop_unavailable if !available?
+      check_boot_id
       decr_checkup
     end
 
     when_configure_metrics_set? do
       decr_configure_metrics
       hop_configure_metrics
+    end
+
+    when_patch_set? do
+      unless vm_host.allocation_state == "draining"
+        vm_host.update(allocation_state: "draining")
+        self.accepting_before_patch = true
+      end
+
+      if vm_host.vms_dataset.empty?
+        if accepting_before_patch
+          # Move back to accepting post-reboot if it was accepting before patch semaphore set
+          incr_graceful_reboot
+          delete_from_stack("accepting_before_patch")
+        end
+        decr_patch
+        register_deadline("prep_reboot", 10 * 60)
+        hop_patch
+      end
+
+      nap 60
     end
 
     nap 6 * 60 * 60
@@ -413,6 +472,7 @@ TIMER
 
     if available?
       decr_checkup
+      check_boot_id
       hop_wait
     end
 
@@ -433,6 +493,10 @@ TIMER
       nap 15
     end
 
+    # Resolve host-keyed pages so they don't orphan after the host is gone.
+    %w[VmHostDnsEgressIpv4 VmHostDnsEgressIpv6].each do |tag|
+      Page.from_tag_parts(tag, vm_host.id)&.incr_resolve
+    end
     vm_host.destroy
     sshable.destroy
 
@@ -457,9 +521,20 @@ TIMER
     end
   end
 
+  # Detect an out-of-band reboot: if the host's live boot_id differs from the one we
+  # recorded, it rebooted without us, so page, adopt the new id, and restart its VMs.
+  # The host was already up, so we skip the fresh-reboot verify checks and start directly.
+  def check_boot_id
+    boot_id = get_boot_id
+    return if boot_id == vm_host.last_boot_id || vm_host.last_boot_id.nil?
+
+    Prog::PageNexus.assemble("Recorded last_boot_id of #{vm_host.ubid} differs from the actual boot_id; treating as an out-of-band reboot and restarting its VMs", ["LastBootIDDiscrepancy", vm_host.ubid], vm_host.ubid, resource_id: vm_host.id, severity: "info")
+    vm_host.update(last_boot_id: boot_id)
+    hop_start_slices
+  end
+
   def available?
     session = sshable.connect
-    vm_host.check_last_boot_id(session)
     vm_host.perform_health_checks(session, test_file_suffix: "respirate")
   rescue
     false

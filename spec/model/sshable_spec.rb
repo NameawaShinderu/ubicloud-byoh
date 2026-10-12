@@ -16,6 +16,12 @@ RSpec.describe Sshable do
     )
   }
 
+  def ssh_session(**)
+    socket = instance_double(Socket, setsockopt: nil)
+    instance_double(Net::SSH::Connection::Session,
+      transport: instance_double(Net::SSH::Transport::Session, socket:), **)
+  end
+
   it "can encrypt and decrypt a field" do
     sa.save_changes
 
@@ -60,7 +66,7 @@ LOCK
         expect(sa).to receive(:maybe_ssh_session_lock_name).and_return("testlockname")
         sa.invalidate_cache_entry
         expect(Net::SSH).to receive(:start) do
-          instance_double(Net::SSH::Connection::Session, close: nil)
+          ssh_session(close: nil)
         end
       end
 
@@ -69,33 +75,18 @@ LOCK
         sa.connect
       end
 
-      it "reports a failure to obtain a file descriptor with an obscure exit code" do
+      it "swallows a failure to obtain a file descriptor with an obscure exit code" do
         expect(sa).to receive(:_cmd).with(lock_script, log: false).and_raise(Sshable::SshError.new(lock_script, "", "", 92, nil))
-        expect(Clog).to receive(:emit).with("session lock failure", instance_of(Hash)).and_wrap_original do |m, a, b|
-          expect(b.dig(:contended_session_lock, :session_fail_msg)).to eq("could not create session lock file for testlockname")
-        end
         sa.connect
       end
 
-      it "reports lock conflicts when an obscure exit code is raised" do
-        sa.id = "624ec0d1-95d9-8f31-bbaa-bcccb76fe98b"
+      it "swallows lock conflicts when an obscure exit code is raised" do
         expect(sa).to receive(:_cmd).with(lock_script, log: false).and_raise(Sshable::SshError.new(lock_script, "", "", 124, nil))
-        expect(Clog).to receive(:emit).with("session lock failure", instance_of(Hash)).and_wrap_original do |m, a, b|
-          expect(b).to eq(contended_session_lock: {
-            exit_code: 124,
-            session_fail_msg: "session lock conflict for testlockname",
-            sshable_ubid: "shc97c1mcnv67qenbsk5qdzmrp",
-            prog: nil,
-          })
-        end
         sa.connect
       end
 
-      it "has a generic message for unrecognized errors" do
+      it "swallows unrecognized errors" do
         expect(sa).to receive(:_cmd).with(lock_script, log: false).and_raise(Sshable::SshError.new(lock_script, "", "", 1, nil))
-        expect(Clog).to receive(:emit).with("session lock failure", instance_of(Hash)).and_wrap_original do |m, a, b|
-          expect(b.dig(:contended_session_lock, :session_fail_msg)).to eq("unknown SshError")
-        end
         sa.connect
       end
     end
@@ -112,7 +103,7 @@ LOCK
 
     it "can cache SSH connections" do
       expect(Net::SSH).to receive(:start) do
-        instance_double(Net::SSH::Connection::Session, close: nil)
+        ssh_session(close: nil, closed?: false, process: true)
       end
 
       expect(Thread.current[:clover_ssh_cache]).to be_nil
@@ -125,6 +116,44 @@ LOCK
       expect(Thread.current[:clover_ssh_cache]).to be_empty
     end
 
+    it "reconnects when the cached session was closed underneath it" do
+      closed_sess = ssh_session(closed?: true)
+      fresh_sess = ssh_session(closed?: false, process: true)
+      expect(Net::SSH).to receive(:start).and_return(closed_sess, fresh_sess)
+
+      expect(sa.connect).to equal(closed_sess)
+      expect(sa.connect).to equal(fresh_sess)
+      expect(sa.connect).to equal(fresh_sess)
+      expect(Thread.current[:clover_ssh_cache]).to eq({["test.localhost", "testuser"] => fresh_sess})
+    end
+
+    it "turns Nagle's algorithm off on a new session" do
+      sess = ssh_session(closed?: false)
+      expect(sess.transport.socket).to receive(:setsockopt).with(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+      expect(Net::SSH).to receive(:start).and_return(sess)
+      sa.connect
+    end
+
+    it "reconnects when the server dropped the cached session while it sat idle" do
+      dropped = ssh_session(closed?: false)
+      fresh = ssh_session(closed?: false, process: true)
+      expect(Net::SSH).to receive(:start).and_return(dropped, fresh)
+      expect(dropped).to receive(:process).with(0).and_raise(Net::SSH::Disconnect, "connection closed by remote host")
+
+      expect(sa.connect).to equal(dropped)
+      expect(sa.connect).to equal(fresh)
+    end
+
+    it "reconnects when handling what was waiting closed the cached session" do
+      dropped = ssh_session(process: true)
+      expect(dropped).to receive(:closed?).and_return(false, true)
+      fresh = ssh_session(closed?: false)
+      expect(Net::SSH).to receive(:start).and_return(dropped, fresh)
+
+      expect(sa.connect).to equal(dropped)
+      expect(sa.connect).to equal(fresh)
+    end
+
     it "does not crash if a cache has never been made" do
       expect {
         sa.invalidate_cache_entry
@@ -132,7 +161,7 @@ LOCK
     end
 
     it "can invalidate a single cache entry" do
-      sess = instance_double(Net::SSH::Connection::Session, close: nil)
+      sess = ssh_session(close: nil)
       expect(Net::SSH).to receive(:start).and_return sess
       sa.connect
       expect {
@@ -141,7 +170,7 @@ LOCK
     end
 
     it "can reset caches when has cached connection" do
-      sess = instance_double(Net::SSH::Connection::Session, close: nil)
+      sess = ssh_session(close: nil)
       expect(Net::SSH).to receive(:start).and_return sess
       sa.connect
       expect {
@@ -155,12 +184,305 @@ LOCK
 
     it "can reset caches even if session fails while closing" do
       sess = Net::SSH::Connection::Session.allocate
+      allow(sess).to receive(:transport).and_return(ssh_session.transport)
       expect(sess).to receive(:close).and_raise Sshable::SshError.new("bogus", "", "", nil, nil)
       expect(Net::SSH).to receive(:start).and_return sess
       sa.connect
 
       expect(described_class.reset_cache.first).to be_a Sshable::SshError
       expect(Thread.current[:clover_ssh_cache]).to eq({})
+    end
+  end
+
+  describe "#start_fresh_session" do
+    def host_key
+      pub = SshKey.generate.public_key
+      [pub, Net::SSH::Buffer.new(pub.split(" ")[1].unpack1("m")).read_key]
+    end
+
+    def expect_ssh_start(server_key, session, verifier_class: Net::SSH::Verifiers::AcceptNew)
+      expect(Net::SSH).to receive(:start).with("test.localhost", "testuser", hash_including(known_hosts: Sshable::KnownHosts)) do |*, **opts, &block|
+        verifier = opts[:verify_host_key]
+        verifier = Net::SSH::Verifiers::AcceptNew.new if verifier == :accept_new
+        verifier = Net::SSH::Verifiers::Always.new if verifier == :always
+        expect(verifier).to be_a(verifier_class)
+
+        transport = instance_double(Net::SSH::Transport::Session, host_keys: opts[:known_hosts].search_for("test.localhost", opts))
+        args = {key: server_key, key_blob: server_key.to_blob, fingerprint: "SHA256:test", session: transport}
+        expect(verifier.verify(args)).to be true
+        expect(verifier.verify_signature { :verified }).to eq :verified
+
+        block ? block.call(session) : session
+      end
+    end
+
+    before { sa.save_changes }
+
+    it "does not record host keys for runner sshables" do
+      sa.update(unix_user: "runneradmin")
+      session = ssh_session
+      expect(Net::SSH).to receive(:start).with("test.localhost", "runneradmin", any_args) do |*, **opts, &block|
+        expect(opts.except(:key_data)).to eq described_class::COMMON_SSH_ARGS.except(:key_data)
+        expect(opts[:key_data].map { Net::SSH::KeyFactory.load_data_private_key(it).public_key.to_blob })
+          .to eq(sa.keys.map { Net::SSH::KeyFactory.load_data_private_key(it.private_key).public_key.to_blob })
+        session
+      end
+      expect(Clog).not_to receive(:emit)
+
+      expect(sa.start_fresh_session).to equal(session)
+      expect(sa.reload.host_keys).to be_nil
+    end
+
+    it "records the host key when the sshable has no host keys" do
+      pub, server_key = host_key
+      session = ssh_session
+      expect_ssh_start(server_key, session)
+      expect(Clog).to receive(:emit).with("sshable host keys added", {sshable_host_keys_added: {sshable: sa.ubid, keys: [pub]}}).and_call_original
+
+      expect(sa.start_fresh_session).to equal(session)
+      expect(sa.host_keys).to eq [pub]
+      expect(sa.reload.host_keys).to eq [pub]
+    end
+
+    it "records the host key before yielding when called with a block" do
+      pub, server_key = host_key
+      session = ssh_session
+      expect_ssh_start(server_key, session)
+
+      result = sa.start_fresh_session do |sess|
+        expect(sess).to equal(session)
+        expect(sa.reload.host_keys).to eq [pub]
+        :block_result
+      end
+      expect(result).to eq :block_result
+    end
+
+    it "does not record host keys when the host offers a known host key" do
+      pub, server_key = host_key
+      other_pub, = host_key
+      sa.update(host_keys: [other_pub, pub])
+      session = ssh_session
+      expect_ssh_start(server_key, session, verifier_class: Net::SSH::Verifiers::Always)
+      expect(Clog).not_to receive(:emit)
+
+      expect(sa.start_fresh_session).to equal(session)
+      expect(sa.reload.host_keys).to eq [other_pub, pub]
+    end
+
+    it "raises HostKeyMismatch when the host offers an unknown host key" do
+      pub, = host_key
+      _, server_key = host_key
+      sa.update(host_keys: [pub])
+      expect(Net::SSH).to receive(:start).with("test.localhost", "testuser", hash_including(known_hosts: Sshable::KnownHosts, verify_host_key: :always)) do |*, **opts|
+        transport = instance_double(Net::SSH::Transport::Session, host_keys: opts[:known_hosts].search_for("test.localhost", opts))
+        args = {key: server_key, key_blob: server_key.to_blob, fingerprint: "SHA256:test", session: transport}
+        Net::SSH::Verifiers::Always.new.verify(args)
+      end
+      expect(Clog).not_to receive(:emit)
+
+      expect { sa.start_fresh_session }.to raise_error(Net::SSH::HostKeyMismatch)
+      expect(sa.reload.host_keys).to eq [pub]
+    end
+
+    it "does not overwrite host keys concurrently recorded by another process" do
+      pub, = host_key
+      expect(Net::SSH).to receive(:start) do |*, **opts|
+        sa.this.update(host_keys: Sequel.pg_array([pub], :text))
+        opts[:known_hosts].search_for("test.localhost").add_host_key(host_key[1])
+        ssh_session
+      end
+      expect(Clog).not_to receive(:emit)
+
+      sa.start_fresh_session
+      expect(sa.host_keys).to eq [pub]
+    end
+  end
+
+  describe "#add_host_keys" do
+    before { sa.save_changes }
+
+    it "appends the keys and logs when the host keys have not changed concurrently" do
+      sa.update(host_keys: ["ssh-ed25519 a"])
+      expect(Clog).to receive(:emit).with("sshable host keys added", {sshable_host_keys_added: {sshable: sa.ubid, keys: ["ssh-ed25519 b"]}}).and_call_original
+
+      sa.add_host_keys(["ssh-ed25519 b"])
+      expect(sa.host_keys).to eq ["ssh-ed25519 a", "ssh-ed25519 b"]
+      expect(sa.reload.host_keys).to eq ["ssh-ed25519 a", "ssh-ed25519 b"]
+    end
+
+    it "does not update or log when the host keys have changed concurrently" do
+      sa.update(host_keys: ["ssh-ed25519 a"])
+      sa.this.update(host_keys: Sequel.pg_array(["ssh-ed25519 c"], :text))
+      expect(Clog).not_to receive(:emit)
+
+      sa.add_host_keys(["ssh-ed25519 b"])
+      expect(sa.host_keys).to eq ["ssh-ed25519 c"]
+    end
+  end
+
+  describe "#check_for_new_host_keys" do
+    rsa_key = OpenSSL::PKey::RSA.generate(2048)
+    ecdsa_keys = Array.new(2) { OpenSSL::PKey::EC.generate("prime256v1") }
+    ed25519_keys = Array.new(3) { Net::SSH::KeyFactory.load_data_private_key(SshKey.generate.private_key) }
+    prove_request = "hostkeys-prove-00@openssh.com"
+
+    let(:rsa_key) { rsa_key }
+    let(:ecdsa_keys) { ecdsa_keys }
+    let(:ed25519_keys) { ed25519_keys }
+    let(:server_key_class) { Struct.new(:private_key, :blob, :str) }
+
+    def server_key(type, index = 0)
+      private_key, public_key = case type
+      when :ed25519
+        key = ed25519_keys.fetch(index)
+        [key, key.public_key]
+      when :rsa
+        [rsa_key, rsa_key]
+      when :ecdsa
+        key = ecdsa_keys.fetch(index)
+        [key, key]
+      end
+      blob = public_key.to_blob
+      server_key_class.new(private_key, blob, "#{public_key.ssh_type} #{[blob].pack("m0")}")
+    end
+
+    def proof(key, sig_type, blob: key.blob)
+      data = Net::SSH::Buffer.from(:string, "hostkeys-prove-00@openssh.com", :string, "test-session-id", :string, blob).to_s
+      Net::SSH::Buffer.from(:string, sig_type, :string, key.private_key.ssh_do_sign(data, sig_type)).to_s
+    end
+
+    def expect_host_keys_session(offered, proof_response = nil)
+      algorithms = instance_double(Net::SSH::Transport::Algorithms, session_id: "test-session-id")
+      session = instance_double(Net::SSH::Connection::Session, transport: instance_double(Net::SSH::Transport::Session, algorithms:))
+      handler = nil
+      pending = []
+      requests = []
+      responses = [[false, nil]]
+      responses << proof_response if proof_response
+
+      expect(Net::SSH).to receive(:start).and_yield(session)
+      expect(session).to receive(:on_global_request).with("hostkeys-00@openssh.com") { |&block| handler = block }
+      allow(session).to receive(:send_global_request) do |*args, &block|
+        requests << args
+        pending << block
+      end
+      allow(session).to receive(:pending_requests).and_return(pending)
+      expect(session).to receive(:loop) do |&running|
+        expect(handler.call(Net::SSH::Buffer.from(*offered.flat_map { [:string, it] }), false)).to be false
+        pending.shift.call(*responses.shift) while running.call
+      end
+
+      requests
+    end
+
+    before { sa.save_changes }
+
+    it "adds new host keys the host proves it has" do
+      known = server_key(:ed25519)
+      rsa = server_key(:rsa)
+      ecdsa = server_key(:ecdsa)
+      unsupported = Net::SSH::Buffer.from(:string, "sk-ssh-ed25519@openssh.com", :string, "x").to_s
+      sa.update(host_keys: [known.str])
+
+      requests = expect_host_keys_session([known.blob, unsupported, rsa.blob, ecdsa.blob],
+        [true, Net::SSH::Buffer.from(:string, proof(rsa, "rsa-sha2-512"), :string, proof(ecdsa, "ecdsa-sha2-nistp256"))])
+      expect(Clog).to receive(:emit).with("sshable host keys added", {sshable_host_keys_added: {sshable: sa.ubid, keys: [rsa.str, ecdsa.str]}}).and_call_original
+
+      sa.check_for_new_host_keys
+      expect(requests).to eq [["keepalive@openssh.com"], [prove_request, :string, rsa.blob, :string, ecdsa.blob]]
+      expect(sa.host_keys).to eq [known.str, rsa.str, ecdsa.str]
+      expect(sa.reload.host_keys).to eq [known.str, rsa.str, ecdsa.str]
+      expect(Page.count).to eq 0
+    end
+
+    it "only adds host keys with valid proofs" do
+      known = server_key(:ed25519)
+      rsa = server_key(:rsa)
+      bad_ed25519 = server_key(:ed25519, 1)
+      ecdsa = server_key(:ecdsa)
+      bad_ecdsa = server_key(:ecdsa, 1)
+      unproven = server_key(:ed25519, 2)
+      sa.update(host_keys: [known.str])
+
+      expect_host_keys_session([known.blob, rsa.blob, bad_ed25519.blob, ecdsa.blob, bad_ecdsa.blob, unproven.blob],
+        [true, Net::SSH::Buffer.from(
+          # RSA key with a signature type that is not an RSA signature type
+          :string, proof(rsa, "ssh-ed25519"),
+          # Signature for a different blob, which raises when verified
+          :string, proof(bad_ed25519, "ssh-ed25519", blob: known.blob),
+          # Key with valid signature
+          :string, proof(ecdsa, "ecdsa-sha2-nistp256"),
+          # Non-RSA key with a signature type that does not match the key type
+          :string, proof(bad_ecdsa, "ecdsa-sha2-nistp384"),
+          # Missing signature for unproven
+        )])
+
+      sa.check_for_new_host_keys
+      expect(sa.reload.host_keys).to eq [known.str, ecdsa.str]
+    end
+
+    it "does not add host keys if no proofs are valid" do
+      known = server_key(:ed25519)
+      ecdsa = server_key(:ecdsa)
+      other_ecdsa = server_key(:ecdsa, 1)
+      sa.update(host_keys: [known.str])
+
+      expect_host_keys_session([known.blob, ecdsa.blob],
+        [true, Net::SSH::Buffer.from(:string, proof(other_ecdsa, "ecdsa-sha2-nistp256", blob: ecdsa.blob))])
+      expect(Clog).not_to receive(:emit)
+      expect(sa).not_to receive(:add_host_keys)
+
+      sa.check_for_new_host_keys
+      expect(sa.reload.host_keys).to eq [known.str]
+    end
+
+    it "does not add host keys if the host does not respond successfully to the prove request" do
+      known = server_key(:ed25519)
+      ecdsa = server_key(:ecdsa)
+      sa.update(host_keys: [known.str])
+
+      requests = expect_host_keys_session([known.blob, ecdsa.blob], [false, nil])
+      expect(sa).not_to receive(:add_host_keys)
+
+      sa.check_for_new_host_keys
+      expect(requests).to eq [["keepalive@openssh.com"], [prove_request, :string, ecdsa.blob]]
+      expect(sa.reload.host_keys).to eq [known.str]
+    end
+
+    it "pages and does not request proofs if the host does not offer a known host key" do
+      known = server_key(:ed25519)
+      ecdsa = server_key(:ecdsa)
+      sa.update(host_keys: [known.str])
+
+      requests = expect_host_keys_session([ecdsa.blob])
+      expect(sa).not_to receive(:add_host_keys)
+
+      sa.check_for_new_host_keys
+      expect(requests).to eq [["keepalive@openssh.com"]]
+      expect(sa.reload.host_keys).to eq [known.str]
+      page = Page.active.first(tag: Page.generate_tag(["SshableHostKeyUpdate", sa.id]))
+      expect(page.summary).to eq "No matching existing host keys when checking for updated host keys"
+      expect(page.severity).to eq "error"
+      expect(page.resource_id).to eq sa.id
+      expect(page.details["related_resources"]).to eq [sa.ubid]
+    end
+
+    it "does not request proofs if the host does not offer new host keys" do
+      known = server_key(:ed25519)
+      sa.update(host_keys: [known.str])
+
+      requests = expect_host_keys_session([known.blob])
+      expect(sa).not_to receive(:add_host_keys)
+
+      sa.check_for_new_host_keys
+      expect(requests).to eq [["keepalive@openssh.com"]]
+      expect(sa.reload.host_keys).to eq [known.str]
+    end
+
+    it "does not attempt connection if the sshable has no host keys" do
+      expect(sa).not_to receive(:start_fresh_session)
+      sa.check_for_new_host_keys
+      expect(sa.reload.host_keys).to be_nil
     end
   end
 
@@ -232,6 +554,18 @@ LOCK
       expect { sa.cmd("exit 1", timeout: nil, _skip_command_checking: true) }.to raise_error Sshable::SshError, "command exited with an error: exit 1"
     end
 
+    it "does not log a successful command when log: :on_error" do
+      expect(Clog).not_to receive(:emit).with("ssh cmd execution", anything)
+      simulate(cmd: "echo hello", exit_status: 0, exit_signal: nil, stdout: "hello", stderr: "world")
+      expect(sa.cmd("echo hello", log: :on_error, timeout: nil, _skip_command_checking: true)).to eq("hello")
+    end
+
+    it "logs a failing command when log: :on_error" do
+      expect(Clog).to receive(:emit).with("ssh cmd execution", instance_of(Hash))
+      simulate(cmd: "exit 1", exit_status: 1, exit_signal: 127, stderr: "", stdout: "")
+      expect { sa.cmd("exit 1", log: :on_error, timeout: nil, _skip_command_checking: true) }.to raise_error Sshable::SshError
+    end
+
     it "raises an SshError with a nil exit status" do
       simulate(cmd: "exit 1", exit_status: nil, exit_signal: nil, stderr: "", stdout: "")
       expect { sa.cmd("exit 1", timeout: nil, _skip_command_checking: true) }.to raise_error Sshable::SshTimeout, "command timed out: exit 1"
@@ -263,6 +597,46 @@ LOCK
     end
   end
 
+  describe "#cmd with a caller-supplied session" do
+    let(:session) { Net::SSH::Connection::Session.allocate }
+
+    def simulate_on(sess, cmd:, exit_status:, stdout:)
+      expect(sess).to receive(:open_channel) do |&blk|
+        chan = instance_spy(Net::SSH::Connection::Channel)
+        allow(chan).to receive(:connection).and_return(sess)
+        expect(chan).to receive(:exec).with(cmd) do |&eblk|
+          chan2 = instance_spy(Net::SSH::Connection::Channel)
+          expect(chan2).to receive(:on_request).with("exit-status") do |&blk2|
+            buf = instance_double(Net::SSH::Buffer)
+            expect(buf).to receive(:read_long).and_return(exit_status)
+            blk2.call(nil, buf)
+          end
+          expect(chan2).to receive(:on_request).with("exit-signal")
+          expect(chan2).to receive(:on_data).and_yield(instance_double(Net::SSH::Connection::Channel), stdout)
+          expect(chan2).to receive(:on_extended_data)
+          allow(chan2).to receive(:connection).and_return(sess)
+          eblk.call(chan2, true)
+        end
+        blk.call(chan, true)
+        chan
+      end
+    end
+
+    it "runs the command on the supplied session without opening a cached connection" do
+      expect(sa).not_to receive(:connect)
+      simulate_on(session, cmd: "echo hello", exit_status: 0, stdout: "hello")
+      expect(sa.cmd("echo hello", timeout: nil, session:, _skip_command_checking: true)).to eq("hello")
+    end
+
+    it "does not invalidate the connection cache when the supplied session fails" do
+      err = IOError.new("the party is over")
+      expect(sa).not_to receive(:connect)
+      expect(sa).not_to receive(:invalidate_cache_entry)
+      expect(session).to receive(:open_channel).and_raise err
+      expect { sa.cmd("irrelevant", session:, _skip_command_checking: true) }.to raise_error err
+    end
+  end
+
   describe "#cmd_json" do
     it "parses cmd output as JSON" do
       expect(sa).to receive(:_cmd).with("cat data.json").and_return('{"key": "value"}')
@@ -290,6 +664,11 @@ LOCK
       sa.d_restart(unit_name)
     end
 
+    it "calls cmd with the correct stop command" do
+      expect(sa).to receive(:_cmd).with("common/bin/daemonizer2 stop test_unit")
+      sa.d_stop(unit_name)
+    end
+
     it "calls cmd with the correct run command and no stdin" do
       expect(sa).to receive(:_cmd).with("common/bin/daemonizer2 run test_unit sudo\\ host/bin/setup-vm\\ prep\\ test_unit", stdin: nil, log: true)
       sa.d_run(unit_name, run_command)
@@ -298,6 +677,16 @@ LOCK
     it "calls cmd with the correct run command and passes stdin" do
       expect(sa).to receive(:_cmd).with("common/bin/daemonizer2 run test_unit sudo\\ host/bin/setup-vm\\ prep\\ test_unit", stdin: stdin_data, log: true)
       sa.d_run(unit_name, run_command, stdin: stdin_data)
+    end
+
+    it "calls cmd with the correct journalctl command for the unit" do
+      expect(sa).to receive(:_cmd).with("sudo journalctl -u test_unit --no-pager")
+      sa.d_logs(unit_name)
+    end
+
+    it "calls cmd with the correct journalctl command when limiting the number of lines" do
+      expect(sa).to receive(:_cmd).with("sudo journalctl -u test_unit -n 10 --no-pager")
+      sa.d_logs(unit_name, lines: 10)
     end
   end
 end

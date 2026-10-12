@@ -2,13 +2,19 @@
 
 class Prog::Kubernetes::UpgradeKubernetesNode < Prog::Base
   subject_is :kubernetes_cluster
+  frame_reader :old_node_id, :nodepool_id
+  frame_accessor :new_node_id
 
   def old_node
-    @old_node ||= KubernetesNode[frame.fetch("old_node_id")]
+    @old_node ||= KubernetesNode[old_node_id]
+  end
+
+  def new_node
+    @new_node ||= KubernetesNode[new_node_id]
   end
 
   def kubernetes_nodepool
-    @kubernetes_nodepool ||= KubernetesNodepool[frame.fetch("nodepool_id", nil)]
+    @kubernetes_nodepool ||= KubernetesNodepool[nodepool_id]
   end
 
   def before_run
@@ -18,6 +24,8 @@ class Prog::Kubernetes::UpgradeKubernetesNode < Prog::Base
   end
 
   label def start
+    register_deadline(nil, 30 * 60)
+
     new_frame = if kubernetes_nodepool
       {"nodepool_id" => kubernetes_nodepool.id}
     else
@@ -38,9 +46,39 @@ class Prog::Kubernetes::UpgradeKubernetesNode < Prog::Base
     reap(reaper:) do
       # This will not work correctly if the strand has multiple children.
       # However, the strand has only has a single child created in start.
-      update_stack({"new_node_id" => node_id})
+      self.new_node_id = node_id
 
+      hop_wait_node_ready
+    end
+  end
+
+  label def wait_node_ready
+    # kubeadm upgrade apply has a ControlPlaneNodesReady preflight that
+    # fails if any control-plane node is NotReady.
+    nap 10 unless kubernetes_cluster.all_functional_nodes_ready?
+    hop_upgrade_kubeadm
+  end
+
+  label def upgrade_kubeadm
+    hop_drain_old_node if kubernetes_nodepool
+    hop_drain_old_node if kubernetes_cluster.kubeadm_recorded_minor_version == kubernetes_cluster.version
+
+    state = new_node.vm.sshable.d_check("kubeadm_upgrade_apply")
+    case state
+    when "Succeeded"
       hop_drain_old_node
+    when "NotStarted"
+      new_node.vm.sshable.d_run(
+        "kubeadm_upgrade_apply",
+        "bash", "-c",
+        "kubeadm upgrade apply --yes $(kubeadm version -o short)",
+      )
+      nap 30
+    when "InProgress"
+      nap 30
+    else
+      Clog.emit((state == "Failed") ? "could not run kubeadm upgrade apply" : "got unknown state from daemonizer2 check: #{state}")
+      nap 65536
     end
   end
 

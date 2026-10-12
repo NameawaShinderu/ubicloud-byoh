@@ -4,7 +4,7 @@ require_relative "../../model/spec_helper"
 
 RSpec.describe Prog::DnsZone::SetupDnsServerVm do
   subject(:prog) {
-    st = described_class.assemble(ds.id)
+    st = described_class.assemble(ds)
     described_class.new(st)
   }
 
@@ -25,38 +25,141 @@ RSpec.describe Prog::DnsZone::SetupDnsServerVm do
     (1..2).map { |i| build_zone.call("zone#{i}.domain.io", 3600) } << build_zone.call("k8s.ubicloud.com", 15)
   end
   let(:project) { Project.create(name: "ubicloud-dns") }
+  let(:gcp_location) do
+    Location.create(name: "gcp-us-central1", provider: "gcp",
+      display_name: "gcp-us-central1", ui_name: "GCP US Central 1", visible: true)
+  end
 
   describe ".assemble" do
     it "validates input" do
       expect {
-        described_class.assemble(SecureRandom.uuid)
+        described_class.assemble(nil, name: nil)
       }.to raise_error RuntimeError, "No existing Dns Server"
 
       expect {
-        described_class.assemble(ds.id, name: "InVaLidNAME")
+        described_class.assemble(ds, name: "InVaLidNAME")
       }.to raise_error Validation::ValidationFailed, "Validation failed for following fields: name"
 
       expect {
-        described_class.assemble(ds.id, location_id: nil)
+        described_class.assemble(ds, location_id: nil)
       }.to raise_error RuntimeError, "No existing Location"
 
-      expect(described_class.assemble(ds.id)).to be_a Strand
+      expect(described_class.assemble(ds)).to be_a Strand
+      expect(ds.strand).to have_attributes(prog: "DnsZone::DnsServerNexus", label: "wait")
 
       expect(Vm.count).to eq 1
-      expect(Vm.first.unix_user).to eq "ubi"
+
+      vm = Vm.first
+      expect(vm.boot_image).to eq "ubuntu-noble"
+      expect(vm.unix_user).to eq "ubi"
     end
 
     it "errors out if the dns service project id is not put into config properly" do
       expect(Config).to receive(:dns_service_project_id).and_return(nil)
       expect {
-        described_class.assemble(ds.id)
+        described_class.assemble(ds)
       }.to raise_error RuntimeError, "No existing Project"
     end
 
-    it "errors out if the DNS Server VMs are not in sync" do
-      expect(described_class).to receive(:vms_in_sync?).and_return(false)
+    it "rejects a vm size that does not exist" do
       expect {
-        described_class.assemble(ds.id)
+        described_class.assemble(ds, vm_size: "bogus-2")
+      }.to raise_error Validation::ValidationFailed, /size/
+    end
+
+    it "derives the arch from the vm size for arm64-only GCP sizes" do
+      described_class.assemble(ds, vm_size: "c4a-standard-4", location_id: gcp_location.id)
+
+      vm = Vm.first
+      expect(vm.arch).to eq "arm64"
+      expect(vm.family).to eq "c4a-standard"
+      expect(vm.vcpus).to eq 4
+    end
+
+    it "keeps the x64 default for a vm size that exists for both arches" do
+      described_class.assemble(ds, vm_size: "standard-2")
+
+      expect(Vm.first.arch).to eq "x64"
+    end
+
+    it "excludes host ids of existing dns server vms" do
+      existing_vm = create_vm_with_sshable
+      vm_host = create_vm_host
+      existing_vm.update(vm_host_id: vm_host.id)
+      ds.add_vm(existing_vm)
+
+      {false => [existing_vm.vm_host_id], true => []}.each do |allow_unspread, expected_ids|
+        expect(Config).to receive(:allow_unspread_servers).and_return(allow_unspread)
+
+        st = described_class.assemble(ds)
+        vm_strand = Strand[st.stack.first["subject_id"]]
+        expect(vm_strand.stack.first["exclude_host_ids"]).to eq expected_ids
+      end
+    end
+
+    it "creates a dedicated dns subnet with control-plane-only SSH when restrict_ssh_to_control_plane is set" do
+      described_class.assemble(ds, vm_size: "c4a-standard-4", location_id: gcp_location.id, restrict_ssh_to_control_plane: true)
+
+      subnet = Vm.first.user_nic.private_subnet
+      expect(subnet.name).to eq "dns-gcp-us-central1"
+      expect(subnet.firewalls.map(&:name)).to eq ["dns-gcp-us-central1"]
+      rules = subnet.firewalls.flat_map(&:firewall_rules)
+      expect(rules.map { it.port_range.begin }.uniq).to eq [22]
+      expect(rules.map(&:protocol).uniq).to eq ["tcp"]
+      expect(rules.map { it.cidr.to_s }.sort).to eq Config.control_plane_outbound_cidrs.sort
+    end
+
+    it "reuses an existing dns subnet without touching its firewall rules" do
+      subnet = Prog::Vnet::SubnetNexus.assemble(project.id, name: "dns-gcp-us-central1", location_id: gcp_location.id).subject
+
+      described_class.assemble(ds, vm_size: "c4a-standard-4", location_id: gcp_location.id, restrict_ssh_to_control_plane: true)
+
+      expect(Vm.first.user_nic.private_subnet_id).to eq subnet.id
+      rules = subnet.firewalls.flat_map(&:firewall_rules)
+      expect(rules.map { it.port_range.begin }.uniq).to eq [0]
+    end
+
+    it "keeps the metal subnet default firewall untouched" do
+      described_class.assemble(ds)
+
+      subnet = Vm.first.user_nic.private_subnet
+      expect(subnet.name).to eq "default-eu-central-h1"
+      rules = subnet.firewalls.flat_map(&:firewall_rules)
+      expect(rules.map { it.port_range.begin }.uniq).to eq [0]
+    end
+
+    it "does not exclude hosts for existing cloud vms without a vm host" do
+      existing_vm = create_vm_with_sshable
+      ds.add_vm(existing_vm)
+      expect(Config).to receive(:allow_unspread_servers).and_return(false)
+
+      st = described_class.assemble(ds)
+      vm_strand = Strand[st.stack.first["subject_id"]]
+      expect(vm_strand.stack.first["exclude_host_ids"]).to eq []
+    end
+
+    it "propagates parameters to the created vm" do
+      described_class.assemble(ds, name: "custom-dns", vm_size: "standard-4", storage_size_gib: 37, boot_image: "almalinux-9", location_id: Location::LEASEWEB_WDC02_ID)
+
+      vm = Vm.first
+      expect(vm.name).to eq "custom-dns"
+      expect(vm.family).to eq "standard"
+      expect(vm.vcpus).to eq 4
+      expect(vm.boot_image).to eq "almalinux-9"
+      expect(vm.location_id).to eq Location::LEASEWEB_WDC02_ID
+      expect(vm.strand.stack.first["storage_volumes"].first["size_gib"]).to eq 37
+    end
+
+    it "errors out if the DNS Server VMs are not in sync" do
+      ds.add_vm(create_vm_with_sshable)
+      ds.add_vm(create_vm_with_sshable)
+      ds.reload
+
+      expect(ds.vms[0].sshable).to receive(:_cmd).and_return "foo"
+      expect(ds.vms[1].sshable).to receive(:_cmd).and_return "bar"
+
+      expect {
+        described_class.assemble(ds)
       }.to raise_error RuntimeError, "Existing DNS Server VMs are not in sync, try again later"
     end
   end
@@ -64,15 +167,9 @@ RSpec.describe Prog::DnsZone::SetupDnsServerVm do
   describe ".vms_in_sync?" do
     let(:vms) { [create_vm_with_sshable, create_vm_with_sshable] }
 
-    it "returns true if no VMs are given" do
-      expect(described_class.vms_in_sync?(nil)).to be true
+    it "returns true if the vm count is < 2" do
       expect(described_class.vms_in_sync?([])).to be true
-    end
-
-    it "returns false if the command outputs are do not match" do
-      expect(vms[0].sshable).to receive(:_cmd).and_return "foo"
-      expect(vms[1].sshable).to receive(:_cmd).and_return "bar"
-      expect(described_class.vms_in_sync?(vms)).to be false
+      expect(described_class.vms_in_sync?([vms.first])).to be true
     end
 
     it "returns true if the dns records match, irrespective of order" do
@@ -118,7 +215,8 @@ RSpec.describe Prog::DnsZone::SetupDnsServerVm do
       prog.vm.strand.update(label: "wait")
       expect(prog.strand.stack.first["deadline_at"]).to be_nil
       expect { prog.start }.to hop("prepare")
-      expect(prog.vm.firewall_rules.filter { it.protocol == "udp" }.length).to eq(2)
+      expect(prog.vm.firewall_rules.filter { it.protocol == "udp" && it.port_range.begin == 53 }.map { it.cidr.to_s }.sort).to eq(["0.0.0.0/0", "::/0"])
+      expect(prog.vm.firewall_rules.filter { it.protocol == "tcp" && it.port_range.begin == 53 }.map { it.cidr.to_s }.sort).to eq(["0.0.0.0/0", "::/0"])
       expect(prog.strand.stack.first["deadline_at"]).not_to be_nil
     end
 
@@ -133,10 +231,22 @@ RSpec.describe Prog::DnsZone::SetupDnsServerVm do
       prog.vm.strand.update(label: "wait")
       expect(prog.strand.stack.first["deadline_at"]).to be_nil
       expect { prog.start }.to hop("prepare")
-      expect(prog.vm.firewall_rules.filter { it.protocol == "udp" }.length).to eq(2)
+      expect(prog.vm.firewall_rules.filter { it.protocol == "udp" && it.port_range.begin == 53 }.map { it.cidr.to_s }.sort).to eq(["0.0.0.0/0", "::/0"])
       expect(prog.strand.stack.first["deadline_at"]).not_to be_nil
 
       expect(prog.vm.firewalls.map(&:id)).to include(fw.id)
+    end
+
+    it "does not reuse a dns firewall from another location" do
+      other_location = Location.create(name: "gcp-us-east4", provider: "gcp",
+        display_name: "gcp-us-east4", ui_name: "GCP US East 4", visible: true)
+      other_fw = Firewall.create(name: "dns", location_id: other_location.id, project_id: Config.dns_service_project_id)
+
+      prog.vm.location.update(provider: "gcp")
+      prog.vm.strand.update(label: "wait")
+      expect { prog.start }.to hop("prepare")
+      expect(prog.vm.vm_firewalls_dataset.select_map(:id)).not_to include(other_fw.id)
+      expect(prog.vm.vm_firewalls_dataset.select_map(:location_id)).to eq [prog.vm.location_id]
     end
   end
 
@@ -144,7 +254,7 @@ RSpec.describe Prog::DnsZone::SetupDnsServerVm do
     it "runs some commands to prepare vm for knot installation and restarts" do
       prog.vm.strand.update(label: "wait")
 
-      expect(prog.sshable).to receive(:_cmd).with(/sudo ln -sf \/run\/systemd\/resolve\/resolv.conf \/etc\/resolv.conf[\S\s]*sudo systemctl reboot/)
+      expect(prog.sshable).to receive(:_cmd).with(/sudo ln -sf \/run\/systemd\/resolve\/resolv.conf \/etc\/resolv.conf[\S\s]*sudo apt-get -y install knot\nsudo systemctl reboot/)
 
       expect { prog.prepare }.to hop("setup_knot")
     end
@@ -166,8 +276,8 @@ RSpec.describe Prog::DnsZone::SetupDnsServerVm do
   - domain: "zone2.domain.io."
       CONF
 
-      expect(prog.sshable).to receive(:_cmd).with(/sudo apt-get -y install knot/)
-      expect(prog.sshable).to receive(:_cmd).with("sudo tee /etc/knot/knot.conf > /dev/null", stdin: /#{zone_conf}/)
+      expect(prog.sshable).to receive(:_cmd).with("sudo tee /etc/default/knot > /dev/null", stdin: "KNOTD_ARGS=\"-C /var/lib/knot/confdb\"")
+      expect(prog.sshable).to receive(:_cmd).with("sudo tee /etc/knot/knot.conf > /dev/null", stdin: /mod-stats:[\S\s]*module: "mod-stats\/custom"[\S\s]*#{zone_conf}/)
 
       expect { prog.setup_knot }.to hop("sync_zones")
     end
@@ -181,7 +291,7 @@ RSpec.describe Prog::DnsZone::SetupDnsServerVm do
 
     it "writes knot zone template for each zone" do
       dzs
-      Semaphore.where(name: "refresh_dns_servers").destroy
+      Semaphore.where(name: "refresh_dns_servers").delete
 
       f1 = <<-CONF
 zone1.domain.io.          3600    SOA     ns.zone1.domain.io. zone1.domain.io. 37 86400 7200 1209600 3600
@@ -195,6 +305,8 @@ zone2.domain.io.          3600    NS      toruk.
 k8s.ubicloud.com.          3600    SOA     ns.k8s.ubicloud.com. k8s.ubicloud.com. 37 86400 7200 1209600 15
 k8s.ubicloud.com.          3600    NS      toruk.
       CONF
+
+      expect(prog.sshable).to receive(:_cmd).with("sudo rm -f /var/lib/knot/*.zone /var/lib/knot/journal/*")
 
       expect(prog.sshable).to receive(:_cmd).with("sudo -u knot tee /var/lib/knot/zone1.domain.io.zone > /dev/null", stdin: f1)
       expect(prog.sshable).to receive(:_cmd).with("sudo -u knot tee /var/lib/knot/zone2.domain.io.zone > /dev/null", stdin: f2)
@@ -236,18 +348,18 @@ zone-flush zone2.domain.io
       dummy_sshable = prog.ds.vms.first.sshable
 
       expect(prog.vm.sshable).to receive(:_cmd).twice
-        .with("sudo -u knot knotc", stdin: "zone-read --")
+        .with("sudo -u knot knotc", log: false, stdin: "zone-read --")
         .and_return("line1\nline2")
 
       expect(dummy_sshable).to receive(:_cmd)
-        .with("sudo -u knot knotc", stdin: "zone-read --")
+        .with("sudo -u knot knotc", log: false, stdin: "zone-read --")
         .and_return("line1\nline3")
 
       # Different outputs
       expect { prog.validate }.to hop("sync_zones")
 
       expect(dummy_sshable).to receive(:_cmd)
-        .with("sudo -u knot knotc", stdin: "zone-read --")
+        .with("sudo -u knot knotc", log: false, stdin: "zone-read --")
         .and_return("line2\nline1")
 
       # Same output but different order, doesn't matter
@@ -269,7 +381,7 @@ zone-flush zone2.domain.io
   def create_vm_with_sshable
     vm = Vm.create(unix_user: "ubi", public_key: "ssh-ed25519 key", name: Vm.generate_uuid, family: "standard",
       cores: 0, vcpus: 2, cpu_percent_limit: 200, cpu_burst_percent_limit: 0, memory_gib: 8, arch: "x64",
-      location_id: Location::HETZNER_FSN1_ID, boot_image: "ubuntu-jammy", display_state: "running",
+      location_id: Location::HETZNER_FSN1_ID, boot_image: "ubuntu-noble", display_state: "running",
       ip4_enabled: false, created_at: Time.now, project_id: project.id)
     Sshable.create_with_id(vm)
     vm

@@ -7,6 +7,9 @@ partition_number = ARGV[0]
 partition_number ||= if (match = /monitor\.(\d+)\z/.match(ENV["DYNO"] || ENV["PS"]))
   match[1] # Heroku/Foreman
 end
+partition_number ||= if (pod_index = ENV["K8S_POD_INDEX"])
+  (Integer(pod_index) + 1).to_s # Kubernetes StatefulSet (0-based)
+end
 
 # For simplicity, monitor always runs partitioned. Even if only running a single
 # process, in which case, the partition is the entire id space.
@@ -46,24 +49,27 @@ if Config.test?
 else
   runner_args = {ignore_threads: 2}
   monitor_models = [
-    VmHost,
-    PostgresServer,
+    VmHost.exclude(allocation_state: "unprepared"),
+    PostgresServer.exclude(id: Semaphore.where(name: "initial_provisioning").where(strand_id: PostgresServer.select(:id)).select(:strand_id)),
     MinioServer,
     GithubRunner.exclude(ready_at: nil),
     LoadBalancerVmPort,
     KubernetesCluster,
     VictoriaMetricsServer,
+    ParseableServer,
     KubernetesNode.eager(:vm, :kubernetes_cluster),
   ]
   host_attached_types = [
     Vm.exclude(unix_user: "runneradmin").eager(:vm_storage_volumes)
-      .exclude(Strand.where(id: Sequel[:vm][:id], label: %w[stopped stopped_by_admin unavailable]).exists),
+      .exclude(Strand.where(id: Sequel[:vm][:id], label: %w[stopped stopped_by_admin unavailable].freeze).exists),
     VmHostSlice.exclude(id: Vm.where(unix_user: "runneradmin").exclude(vm_host_slice_id: nil).select(:vm_host_slice_id)),
   ]
 
   metric_export_models = [
-    PostgresServer,
-    VmHost,
+    PostgresServer.exclude(id: Semaphore.where(name: "initial_provisioning").where(strand_id: PostgresServer.select(:id)).select(:strand_id)),
+    VmHost.exclude(allocation_state: "unprepared"),
+    ParseableServer.exclude(id: Semaphore.where(name: "initial_provisioning").where(strand_id: ParseableServer.select(:id)).select(:strand_id)),
+    KubernetesNode.eager(:vm, :kubernetes_cluster, :kubernetes_nodepool),
   ]
 end
 

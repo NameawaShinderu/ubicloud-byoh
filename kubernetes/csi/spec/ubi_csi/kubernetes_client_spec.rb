@@ -318,4 +318,145 @@ RSpec.describe Csi::KubernetesClient do
       expect(client.get_coredns_pods).to eq([{"name" => "coredns-abc123", "ip" => "10.96.0.5"}, {"name" => "coredns-xyz789", "ip" => "10.96.0.6"}])
     end
   end
+
+  describe "#list_storage_classes_for_driver" do
+    it "returns names of StorageClasses provisioned by our driver" do
+      sc_list = {"items" => [
+        {"metadata" => {"name" => "ubicloud-standard"}, "provisioner" => "csi.ubicloud.com"},
+        {"metadata" => {"name" => "ubicloud-fast"}, "provisioner" => "csi.ubicloud.com"},
+        {"metadata" => {"name" => "other"}, "provisioner" => "other.example.com"},
+      ]}
+      expect(client).to receive(:run_kubectl).with("get", "storageclasses", "-oyaml").and_return(YAML.dump(sc_list))
+      expect(client.list_storage_classes_for_driver).to eq(["ubicloud-standard", "ubicloud-fast"])
+    end
+
+    it "returns an empty array when no StorageClasses match" do
+      sc_list = {"items" => [{"metadata" => {"name" => "other"}, "provisioner" => "other.example.com"}]}
+      expect(client).to receive(:run_kubectl).with("get", "storageclasses", "-oyaml").and_return(YAML.dump(sc_list))
+      expect(client.list_storage_classes_for_driver).to eq([])
+    end
+  end
+
+  describe "#list_csi_nodes_with_driver" do
+    it "returns hostnames of nodes where our driver's node plugin is registered" do
+      csinodes = {"items" => [
+        {"metadata" => {"name" => "worker-1"}, "spec" => {"drivers" => [{"name" => "csi.ubicloud.com"}]}},
+        {"metadata" => {"name" => "worker-2"}, "spec" => {"drivers" => [{"name" => "other.example.com"}, {"name" => "csi.ubicloud.com"}]}},
+        {"metadata" => {"name" => "worker-3"}, "spec" => {"drivers" => [{"name" => "other.example.com"}]}},
+        {"metadata" => {"name" => "worker-4"}, "spec" => {}},
+      ]}
+      expect(client).to receive(:run_kubectl).with("get", "csinodes", "-oyaml").and_return(YAML.dump(csinodes))
+      expect(client.list_csi_nodes_with_driver).to eq(["worker-1", "worker-2"])
+    end
+  end
+
+  describe "#list_driver_pvs" do
+    def pv(name, driver, node)
+      affinity = node ? {"required" => {"nodeSelectorTerms" => [{"matchExpressions" => [{"values" => [node]}]}]}} : nil
+      {
+        "metadata" => {"name" => name},
+        "spec" => {
+          "capacity" => {"storage" => "5Gi"},
+          "csi" => {"driver" => driver, "volumeHandle" => "vol-#{name}"},
+          "nodeAffinity" => affinity,
+        },
+      }
+    end
+
+    it "returns the node, handle and size of each PV our driver pinned to a node" do
+      pv_list = {"items" => [
+        pv("a", "csi.ubicloud.com", "worker-1"),
+        pv("b", "other.example.com", "worker-1"),
+        pv("c", "csi.ubicloud.com", nil),
+      ]}
+      expect(client).to receive(:run_kubectl).with("get", "pv", "-oyaml").and_return(YAML.dump(pv_list))
+
+      expect(client.list_driver_pvs).to eq([{node: "worker-1", volume_handle: "vol-a", capacity: "5Gi"}])
+    end
+  end
+
+  describe "#list_csi_storage_capacities" do
+    it "returns the objects owned by the given uid, whether or not their StorageClass still exists" do
+      owned = {"metadata" => {"name" => "csisc-a", "ownerReferences" => [{"uid" => "deploy-uid"}]}, "storageClassName" => "ubicloud-standard"}
+      owned_for_deleted_class = {"metadata" => {"name" => "csisc-b", "ownerReferences" => [{"uid" => "deploy-uid"}]}, "storageClassName" => "deleted-class"}
+      other_owner = {"metadata" => {"name" => "csisc-c", "ownerReferences" => [{"uid" => "other-uid"}]}, "storageClassName" => "ubicloud-standard"}
+      unowned = {"metadata" => {"name" => "csisc-d"}, "storageClassName" => "ubicloud-standard"}
+      capacity_list = {"items" => [owned, owned_for_deleted_class, other_owner, unowned]}
+      expect(client).to receive(:run_kubectl).with("-n", "ubicsi", "get", "csistoragecapacities", "-oyaml").and_return(YAML.dump(capacity_list))
+
+      expect(client.list_csi_storage_capacities(owner_uid: "deploy-uid")).to eq([owned, owned_for_deleted_class])
+    end
+  end
+
+  describe "#create_csi_storage_capacity" do
+    let(:base_obj) do
+      {
+        "apiVersion" => "storage.k8s.io/v1",
+        "kind" => "CSIStorageCapacity",
+        "metadata" => {"name" => "csisc-w1-standard", "namespace" => "ubicsi"},
+        "nodeTopology" => {"matchLabels" => {"kubernetes.io/hostname" => "worker-1"}},
+        "storageClassName" => "ubicloud-standard",
+        "capacity" => "1073741824",
+        "maximumVolumeSize" => "10737418240",
+      }
+    end
+
+    it "creates the object with the right shape" do
+      expect(client).to receive(:run_kubectl).with("create", "-f", "-", yaml_data: base_obj)
+      client.create_csi_storage_capacity(
+        name: "csisc-w1-standard",
+        hostname: "worker-1",
+        storage_class: "ubicloud-standard",
+        capacity_bytes: 1_073_741_824,
+        max_volume_size: 10_737_418_240,
+      )
+    end
+
+    it "stamps an ownerReference when provided" do
+      owner_ref = {"apiVersion" => "apps/v1", "kind" => "Deployment", "name" => "ubicsi-provisioner", "uid" => "deploy-uid", "controller" => true}
+      expected = base_obj.merge("metadata" => base_obj["metadata"].merge("ownerReferences" => [owner_ref]))
+      expect(client).to receive(:run_kubectl).with("create", "-f", "-", yaml_data: expected)
+      client.create_csi_storage_capacity(
+        name: "csisc-w1-standard",
+        hostname: "worker-1",
+        storage_class: "ubicloud-standard",
+        capacity_bytes: 1_073_741_824,
+        max_volume_size: 10_737_418_240,
+        owner_ref:,
+      )
+    end
+  end
+
+  describe "#patch_csi_storage_capacity" do
+    it "merge-patches capacity and maximumVolumeSize" do
+      patch = {capacity: "1073741824", maximumVolumeSize: "10737418240"}.to_json
+      expect(client).to receive(:run_kubectl).with("-n", "ubicsi", "patch", "csistoragecapacity", "csisc-x", "--type=merge", "-p", patch)
+      client.patch_csi_storage_capacity(name: "csisc-x", capacity_bytes: 1_073_741_824, max_volume_size: 10_737_418_240)
+    end
+  end
+
+  describe "#delete_csi_storage_capacity" do
+    it "deletes the object with --ignore-not-found" do
+      expect(client).to receive(:run_kubectl).with("-n", "ubicsi", "delete", "csistoragecapacity", "csisc-x", "--ignore-not-found=true")
+      client.delete_csi_storage_capacity(name: "csisc-x")
+    end
+  end
+
+  describe "#get_provisioner_deployment_owner_ref" do
+    it "returns an ownerReference pointing at the controller Deployment" do
+      deploy = {
+        "apiVersion" => "apps/v1",
+        "kind" => "Deployment",
+        "metadata" => {"name" => "ubicsi-provisioner", "uid" => "deploy-uid-123"},
+      }
+      expect(client).to receive(:run_kubectl).with("-n", "ubicsi", "get", "deployment", "ubicsi-provisioner", "-oyaml").and_return(YAML.dump(deploy))
+      expect(client.get_provisioner_deployment_owner_ref).to eq({
+        "apiVersion" => "apps/v1",
+        "kind" => "Deployment",
+        "name" => "ubicsi-provisioner",
+        "uid" => "deploy-uid-123",
+        "controller" => true,
+      })
+    end
+  end
 end

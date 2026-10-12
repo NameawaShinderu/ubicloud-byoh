@@ -51,6 +51,21 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
     loc
   end
 
+  def create_gcp_location
+    loc = Location.create(
+      name: "us-central1",
+      display_name: "GCP US Central 1",
+      ui_name: "gcp-us-central1",
+      visible: true,
+      provider: "gcp",
+    )
+    LocationCredentialGcp.create_with_id(loc,
+      project_id: "test-gcp-project",
+      service_account_email: "test@test-gcp-project.iam.gserviceaccount.com",
+      credentials_json: '{"type":"service_account","project_id":"test-gcp-project"}')
+    loc
+  end
+
   def backup_fixture(days_ago:)
     Struct.new(:key, :last_modified).new(
       "basebackups_005/base_backup_stop_sentinel.json",
@@ -105,8 +120,15 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
       expect(st_child.subject.backup_period_hours).to eq(6)
     end
 
+    it "does not generate access_key/secret_key for GCP locations" do
+      gcp_location = create_gcp_location
+      tl = described_class.assemble(location_id: gcp_location.id).subject
+      expect(tl.access_key).to be_nil
+      expect(tl.secret_key).to be_nil
+    end
+
     it "does not generate access_key/secret_key when AWS & Config.aws_postgres_iam_access" do
-      expect(Config).to receive(:aws_postgres_iam_access).and_return(true).twice
+      expect(Config).to receive(:aws_postgres_iam_access).and_return(true)
 
       tl = described_class.assemble(location_id: Location::HETZNER_FSN1_ID).subject
       expect(tl.access_key).not_to be_nil
@@ -133,7 +155,7 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
     end
 
     describe "when blob storage is aws s3" do
-      it "creates user and policies and hops" do
+      def move_timeline_to_aws
         aws_location = create_aws_location
         postgres_timeline.update(location_id: aws_location.id)
         resource = create_postgres_resource(project:, location_id: aws_location.id)
@@ -146,6 +168,10 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
         resource.update(private_subnet_id: aws_private_subnet.id)
         server = create_postgres_server(resource:, timeline: postgres_timeline)
         server.strand.update(label: "wait")
+      end
+
+      it "creates user and policies and hops" do
+        move_timeline_to_aws
 
         iam_client = Aws::IAM::Client.new(stub_responses: true)
         iam_client.stub_responses(:create_user)
@@ -153,7 +179,57 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
         iam_client.stub_responses(:attach_user_policy)
         iam_client.stub_responses(:create_access_key, access_key: {access_key_id: "access-key", secret_access_key: "secret-key", user_name: "username", status: "Active"})
 
-        expect(nx.postgres_timeline.location.location_credential_aws).to receive(:iam_client).and_return(iam_client).at_least(:once)
+        location_credential = nx.postgres_timeline.location.location_credential_aws
+        expect(location_credential).to receive(:iam_client).and_return(iam_client).at_least(:once)
+        expect(location_credential).to receive(:aws_iam_account_id).and_return("123456789012")
+
+        expect { nx.start }.to hop("setup_bucket")
+
+        postgres_timeline.reload
+        expect(postgres_timeline.access_key).to eq("access-key")
+        expect(postgres_timeline.secret_key).to eq("secret-key")
+      end
+
+      it "reuses the policy and user left behind by a previous attempt" do
+        move_timeline_to_aws
+        ubid = postgres_timeline.ubid
+
+        iam_client = Aws::IAM::Client.new(stub_responses: true)
+        iam_client.stub_responses(:create_policy, Aws::IAM::Errors::EntityAlreadyExists.new(nil, "policy already exists"))
+        iam_client.stub_responses(:create_user, Aws::IAM::Errors::EntityAlreadyExists.new(nil, "user already exists"))
+        iam_client.stub_responses(:attach_user_policy)
+        iam_client.stub_responses(:list_access_keys, access_key_metadata: [{access_key_id: "stale-key", user_name: ubid}])
+        iam_client.stub_responses(:delete_access_key)
+        iam_client.stub_responses(:create_access_key, access_key: {access_key_id: "access-key", secret_access_key: "secret-key", user_name: "username", status: "Active"})
+
+        location_credential = nx.postgres_timeline.location.location_credential_aws
+        expect(location_credential).to receive(:iam_client).and_return(iam_client).at_least(:once)
+        expect(location_credential).to receive(:aws_iam_account_id).and_return("123456789012").at_least(:once)
+
+        expect(iam_client).to receive(:attach_user_policy).with(user_name: ubid, policy_arn: "arn:aws:iam::123456789012:policy/#{ubid}").and_call_original
+        expect(iam_client).to receive(:delete_access_key).with(user_name: ubid, access_key_id: "stale-key").and_call_original
+
+        expect { nx.start }.to hop("setup_bucket")
+
+        postgres_timeline.reload
+        expect(postgres_timeline.access_key).to eq("access-key")
+        expect(postgres_timeline.secret_key).to eq("secret-key")
+      end
+
+      it "sets up blob storage for a timeline whose leader is gone" do
+        aws_location = create_aws_location
+        postgres_timeline.update(location_id: aws_location.id)
+
+        iam_client = Aws::IAM::Client.new(stub_responses: true)
+        iam_client.stub_responses(:create_policy)
+        iam_client.stub_responses(:create_user)
+        iam_client.stub_responses(:attach_user_policy)
+        iam_client.stub_responses(:create_access_key, access_key: {access_key_id: "access-key", secret_access_key: "secret-key", user_name: "username", status: "Active"})
+
+        location_credential = nx.postgres_timeline.location.location_credential_aws
+        expect(location_credential).to receive(:iam_client).and_return(iam_client).at_least(:once)
+        expect(location_credential).to receive(:aws_iam_account_id).and_return("123456789012").at_least(:once)
+        expect(nx.postgres_timeline.leader).to be_nil
 
         expect { nx.start }.to hop("setup_bucket")
 
@@ -163,9 +239,19 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
       end
     end
 
+    describe "when blob storage is gcp gcs" do
+      it "skips setup_blob_storage and hops to setup_bucket" do
+        gcp_location = create_gcp_location
+        postgres_timeline.update(location_id: gcp_location.id)
+
+        expect(nx.postgres_timeline).to receive(:setup_blob_storage).and_call_original
+        expect { nx.start }.to hop("setup_bucket")
+      end
+    end
+
     it "hops without creating bucket if blob storage is not configured" do
       # No minio cluster created, so blob_storage is nil
-      expect(nx).not_to receive(:setup_blob_storage)
+      expect(nx.postgres_timeline).not_to receive(:setup_blob_storage)
       expect { nx.start }.to hop("wait_leader")
     end
   end
@@ -186,35 +272,9 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
 
       iam_client = Aws::IAM::Client.new(stub_responses: true)
       iam_client.stub_responses(:create_policy, {policy: {arn: "policy-arn"}})
-      expect(nx.postgres_timeline.location.location_credential_aws).to receive(:iam_client).and_return(iam_client).at_least(:once)
+      expect(postgres_timeline.location.location_credential_aws).to receive(:iam_client).and_return(iam_client).at_least(:once)
 
-      nx.setup_aws_s3
-    end
-
-    it "#destroy_aws_s3 detach policy to vm role when aws_postgres_iam_access configured" do
-      expect(Config).to receive(:aws_postgres_iam_access).and_return(true)
-      aws_location = create_aws_location
-      postgres_timeline.update(location_id: aws_location.id)
-
-      iam_client = Aws::IAM::Client.new(stub_responses: true)
-      expect(nx.postgres_timeline.location.location_credential_aws).to receive(:iam_client).and_return(iam_client).at_least(:once)
-      expect(nx.postgres_timeline.location.location_credential_aws).to receive(:aws_iam_account_id).and_return("123456789012")
-
-      expect(iam_client).to receive(:delete_policy).with(policy_arn: "arn:aws:iam::123456789012:policy/#{postgres_timeline.ubid}")
-
-      nx.destroy_aws_s3
-    end
-
-    it "#destroy_aws_s3 ignores NoSuchEntity error" do
-      aws_location = create_aws_location
-      postgres_timeline.update(location_id: aws_location.id)
-
-      iam_client = Aws::IAM::Client.new(stub_responses: true)
-      expect(nx.postgres_timeline.location.location_credential_aws).to receive(:iam_client).and_return(iam_client).at_least(:once)
-
-      expect(iam_client).to receive(:list_attached_user_policies).and_raise(Aws::IAM::Errors::NoSuchEntity.new(nil, "NoSuchEntity"))
-
-      nx.destroy_aws_s3
+      postgres_timeline.setup_blob_storage
     end
 
     it "naps if aws and the key is not available" do
@@ -254,25 +314,54 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
       expect { nx.wait_leader }.to nap(5)
     end
 
-    it "hops if leader is ready" do
+    it "hops if leader is ready and wal-g credentials work" do
       create_minio_cluster
       resource = create_postgres_resource(project:, location_id:)
-      create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
+      server = create_postgres_server(resource:, timeline: postgres_timeline)
+      server.strand.update(label: "wait")
+      expect(nx.postgres_timeline.leader.vm.sshable).to receive(:_cmd).with("sudo -u postgres /usr/bin/wal-g st check read --config /etc/postgresql/wal-g.env")
 
       expect { nx.wait_leader }.to hop("wait")
+    end
+
+    it "naps if leader is in wait but wal-g credentials haven't propagated yet" do
+      create_minio_cluster
+      resource = create_postgres_resource(project:, location_id:)
+      server = create_postgres_server(resource:, timeline: postgres_timeline)
+      server.strand.update(label: "wait")
+      expect(nx.postgres_timeline.leader.vm.sshable).to receive(:_cmd).and_raise(Sshable::SshError.new("cmd", "", "denied", 1, nil))
+
+      expect { nx.wait_leader }.to nap(5)
+    end
+
+    it "hops to wait so the GC can run when no server references the timeline (orphaned)" do
+      expect(PostgresServer[timeline_id: postgres_timeline.id]).to be_nil
+
+      expect { nx.wait_leader }.to hop("wait")
+    end
+
+    it "still naps while leaderless if a non-leader (fetch) server references the timeline" do
+      create_minio_cluster
+      resource = create_postgres_resource(project:, location_id:)
+      create_postgres_server(resource:, timeline: postgres_timeline, is_representative: false)
+      expect(nx.postgres_timeline.leader).to be_nil
+      expect(PostgresServer[timeline_id: postgres_timeline.id]).not_to be_nil
+
+      expect { nx.wait_leader }.to nap(5)
+    end
+
+    it "lets a leaderless, backup-less, old timeline reach self-destruct through wait_leader" do
+      create_minio_cluster
+      mock_minio_client(list_objects: [])
+      postgres_timeline.update(created_at: Time.now - 11 * 24 * 60 * 60)
+      expect(PostgresServer[timeline_id: postgres_timeline.id]).to be_nil
+
+      expect { nx.wait_leader }.to hop("wait")
+      expect { nx.wait }.to hop("destroy")
     end
   end
 
   describe "#wait" do
-    it "naps if blob storage is not configured" do
-      # No minio cluster exists for the timeline's location, so blob_storage is nil
-      resource = create_postgres_resource(project:, location_id:)
-      create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
-
-      expect(nx.postgres_timeline.blob_storage).to be_nil
-      expect { nx.wait }.to nap(20 * 60)
-    end
-
     it "self-destructs if there's no leader, no backups and the timeline is old enough" do
       create_minio_cluster
       resource = create_postgres_resource(project:, location_id:)
@@ -292,63 +381,97 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
       resource = create_postgres_resource(project:, location_id:)
       create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
 
-      backup = backup_fixture(days_ago: 3)
-      mock_minio_client(list_objects: [backup])
-
-      expect(nx.postgres_timeline.leader.vm.sshable).to receive(:_cmd).with("common/bin/daemonizer --check take_postgres_backup").and_return("NotStarted")
+      expect(nx.postgres_timeline.leader.vm.sshable).to receive(:_cmd).with("common/bin/daemonizer2 check take_postgres_backup").and_return("NotStarted")
 
       expect { nx.wait }.to hop("take_backup")
-    end
-
-    it "creates a missing backup page if last completed backup is older than 2 days" do
-      create_minio_cluster
-      resource = create_postgres_resource(project:, location_id:)
-      create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
-      # Set latest_backup_started_at to avoid need_backup? returning true due to nil check
-      postgres_timeline.update(latest_backup_started_at: Time.now)
-
-      backup = backup_fixture(days_ago: 3)
-      mock_minio_client(list_objects: [backup])
-
-      expect(nx.postgres_timeline.leader.vm.sshable).to receive(:_cmd).with("common/bin/daemonizer --check take_postgres_backup").and_return("Succeeded")
-
-      expect { nx.wait }.to nap(20 * 60)
-      expect(Page.count).to eq(1)
-    end
-
-    it "resolves the missing page if last completed backup is more recent than 2 days" do
-      create_minio_cluster
-      resource = create_postgres_resource(project:, location_id:)
-      create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
-      # Set latest_backup_started_at to avoid need_backup? returning true due to nil check
-      postgres_timeline.update(latest_backup_started_at: Time.now)
-
-      backup = backup_fixture(days_ago: 1)
-      mock_minio_client(list_objects: [backup])
-
-      expect(nx.postgres_timeline.leader.vm.sshable).to receive(:_cmd).with("common/bin/daemonizer --check take_postgres_backup").and_return("Succeeded")
-
-      # Create a real Page with the "MissingBackup" tag and its Strand (needed for semaphores)
-      page = Page.create(tag: Page.generate_tag(["MissingBackup", postgres_timeline.id]), summary: "Missing backup")
-      Strand.create_with_id(page, prog: "PageNexus", label: "wait")
-
-      expect { nx.wait }.to nap(20 * 60)
-      expect(Semaphore.where(strand_id: page.id, name: "resolve").count).to eq(1)
     end
 
     it "naps if there is nothing to do" do
       create_minio_cluster
       resource = create_postgres_resource(project:, location_id:)
       create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
-      # Set latest_backup_started_at to avoid need_backup? returning true due to nil check
       postgres_timeline.update(latest_backup_started_at: Time.now)
+
+      expect { nx.wait }.to nap(20 * 60)
+    end
+
+    it "decrements and refreshes the blob storage policy when refresh_blob_storage_policy is set" do
+      create_minio_cluster
+      resource = create_postgres_resource(project:, location_id:)
+      create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
+      postgres_timeline.update(latest_backup_started_at: Time.now)
+      nx.incr_refresh_blob_storage_policy
+
+      expect(nx.postgres_timeline).to receive(:refresh_blob_storage_policy)
+
+      expect { nx.wait }.to nap(20 * 60)
+      expect(Semaphore.where(strand_id: postgres_timeline.id, name: "refresh_blob_storage_policy").count).to eq(0)
+    end
+  end
+
+  describe "#before_run" do
+    it "skips check if timeline is within the grace period" do
+      create_minio_cluster
+      resource = create_postgres_resource(project:, location_id:)
+      create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
+
+      nx.before_run
+      expect(Page.count).to eq(0)
+    end
+
+    it "creates a warning missing backup page if last completed backup is between 2 and 3 days old" do
+      create_minio_cluster
+      resource = create_postgres_resource(project:, location_id:)
+      create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
+      postgres_timeline.update(created_at: Time.now - 3 * 24 * 60 * 60)
+
+      backup = backup_fixture(days_ago: 2.5)
+      mock_minio_client(list_objects: [backup])
+
+      nx.before_run
+      expect(Page.count).to eq(1)
+      page = Page.first
+      expect(page.severity).to eq("warning")
+      expect(page.resource_id).to eq(postgres_timeline.id)
+    end
+
+    it "escalates to an error missing backup page if last completed backup is older than 3 days" do
+      create_minio_cluster
+      resource = create_postgres_resource(project:, location_id:)
+      create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
+      postgres_timeline.update(created_at: Time.now - 4 * 24 * 60 * 60)
+
+      backup = backup_fixture(days_ago: 4)
+      mock_minio_client(list_objects: [backup])
+
+      nx.before_run
+      expect(Page.count).to eq(1)
+      expect(Page.first.severity).to eq("error")
+    end
+
+    it "resolves the missing page if last completed backup is more recent than 2 days" do
+      create_minio_cluster
+      resource = create_postgres_resource(project:, location_id:)
+      create_postgres_server(resource:, timeline: postgres_timeline).strand.update(label: "wait")
+      postgres_timeline.update(created_at: Time.now - 7 * 60 * 60)
 
       backup = backup_fixture(days_ago: 1)
       mock_minio_client(list_objects: [backup])
 
-      expect(nx.postgres_timeline.leader.vm.sshable).to receive(:_cmd).with("common/bin/daemonizer --check take_postgres_backup").and_return("Succeeded")
+      page = Page.create(tag: Page.generate_tag(["MissingBackup", postgres_timeline.id]), summary: "Missing backup")
+      Strand.create_with_id(page, prog: "PageNexus", label: "wait")
 
-      expect { nx.wait }.to nap(20 * 60)
+      nx.before_run
+      expect(Semaphore.where(strand_id: page.id, name: "resolve").count).to eq(1)
+    end
+
+    it "does not create a page if there is no leader" do
+      create_minio_cluster
+      postgres_timeline.update(created_at: Time.now - 3 * 24 * 60 * 60)
+      mock_minio_client(list_objects: [])
+
+      nx.before_run
+      expect(Page.count).to eq(0)
     end
   end
 
@@ -362,25 +485,65 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
       server
     end
 
-    it "hops to wait if backup is not needed" do
-      # Set latest_backup_started_at to recent so "Succeeded" makes need_backup? return false
-      postgres_timeline.update(latest_backup_started_at: Time.now)
-
-      # need_backup? calls sshable.cmd once, returns "Succeeded" so need_backup? is false
-      expect(nx.postgres_timeline.leader.vm.sshable).to receive(:_cmd).with("common/bin/daemonizer --check take_postgres_backup").and_return("Succeeded")
-
+    it "hops to wait if there is no leader" do
+      server.destroy
       expect { nx.take_backup }.to hop("wait")
     end
 
-    it "takes backup if it is needed" do
-      # need_backup? is called once (returns true because NotStarted),
-      # then cmd is called to run the backup
+    it "cleans up and hops to wait if the backup is successful" do
+      postgres_timeline.incr_take_backup_for_converge
       sshable = nx.postgres_timeline.leader.vm.sshable
-      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer --check take_postgres_backup").and_return("NotStarted").ordered
-      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer sudo\\ postgres/bin/take-backup\\ 17 take_postgres_backup").ordered
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 check take_postgres_backup").and_return("Succeeded").ordered
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 clean take_postgres_backup").ordered
 
       expect { nx.take_backup }.to hop("wait")
+      expect(postgres_timeline.take_backup_for_converge_set?(cached: false)).to be(false)
+    end
+
+    it "naps if a backup is already in progress" do
+      sshable = nx.postgres_timeline.leader.vm.sshable
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 check take_postgres_backup").and_return("InProgress")
+
+      expect { nx.take_backup }.to nap(60)
+    end
+
+    it "starts the backup, records its size, and naps when the unit has not started" do
+      sshable = nx.postgres_timeline.leader.vm.sshable
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 check take_postgres_backup").and_return("NotStarted").ordered
+      expect(sshable).to receive(:_cmd).with("df --output=used /dat | tail -n 1").and_return((200 * 1024 * 1024).to_s).ordered
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 run take_postgres_backup sudo postgres/bin/take-backup 18 25", {log: true, stdin: nil}).ordered
+
+      expect { nx.take_backup }.to nap(60)
       expect(postgres_timeline.reload.latest_backup_started_at).not_to be_nil
+      expect(postgres_timeline.latest_backup_size_in_gib).to eq(200)
+    end
+
+    it "passes cpu.weight to take-backup when the optimized backup config is disabled" do
+      sshable = nx.postgres_timeline.leader.vm.sshable
+      allow(nx.postgres_timeline).to receive(:walg_optimized_config_enabled?).and_return(false)
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 check take_postgres_backup").and_return("NotStarted").ordered
+      expect(sshable).to receive(:_cmd).with("df --output=used /dat | tail -n 1").and_return((200 * 1024 * 1024).to_s).ordered
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 run take_postgres_backup sudo postgres/bin/take-backup 18", {log: true, stdin: nil}).ordered
+
+      expect { nx.take_backup }.to nap(60)
+    end
+
+    it "retries when the previous backup failed" do
+      sshable = nx.postgres_timeline.leader.vm.sshable
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 check take_postgres_backup").and_return("Failed").ordered
+      expect(sshable).to receive(:_cmd).with("df --output=used /dat | tail -n 1").and_return("0").ordered
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 run take_postgres_backup sudo postgres/bin/take-backup 18 25", {log: true, stdin: nil}).ordered
+
+      expect { nx.take_backup }.to nap(60)
+    end
+
+    it "raises and skips the run if data_disk_usage fails" do
+      sshable = nx.postgres_timeline.leader.vm.sshable
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer2 check take_postgres_backup").and_return("NotStarted").ordered
+      expect(sshable).to receive(:_cmd).with("df --output=used /dat | tail -n 1").and_raise(RuntimeError, "ssh failure").ordered
+
+      expect { nx.take_backup }.to raise_error(RuntimeError, "ssh failure")
+      expect(postgres_timeline.reload.latest_backup_size_in_gib).to be_nil
     end
   end
 
@@ -389,6 +552,31 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
       # No minio cluster, so blob_storage is nil
       expect { nx.destroy }.to exit({"msg" => "postgres timeline is deleted"})
       expect(postgres_timeline).not_to exist
+    end
+
+    it "resolves timeline-keyed pages so they do not orphan after the timeline is gone" do
+      pages = [
+        Prog::PageNexus.assemble("Missing backup at #{postgres_timeline}!", ["MissingBackup", postgres_timeline.id], postgres_timeline.ubid, resource_id: postgres_timeline.id).subject,
+        Prog::PageNexus.assemble("#{postgres_timeline.ubid} has an expired deadline!", ["Deadline", postgres_timeline.id, "Postgres::PostgresTimelineNexus", "wait"], postgres_timeline.ubid, resource_id: postgres_timeline.id).subject,
+      ]
+      other_timeline = create_postgres_timeline(location_id:)
+      decoy = Prog::PageNexus.assemble("Missing backup at #{other_timeline}!", ["MissingBackup", other_timeline.id], other_timeline.ubid, resource_id: other_timeline.id).subject
+
+      expect { nx.destroy }.to exit({"msg" => "postgres timeline is deleted"})
+
+      pages.each do |page|
+        expect(Semaphore.where(strand_id: page.id, name: "resolve").count).to eq(1)
+      end
+      expect(Semaphore.where(strand_id: decoy.id, name: "resolve").count).to eq(0)
+    end
+
+    it "resolves a page that predates resource_id and carries the timeline id only in its tag" do
+      legacy = Page.create(tag: Page.generate_tag(["MissingBackup", postgres_timeline.id]))
+      Strand.create_with_id(legacy, prog: "PageNexus", label: "wait")
+
+      expect { nx.destroy }.to exit({"msg" => "postgres timeline is deleted"})
+
+      expect(Semaphore.where(strand_id: legacy.id, name: "resolve").count).to eq(1)
     end
 
     describe "when blob storage is minio" do
@@ -406,19 +594,74 @@ RSpec.describe Prog::Postgres::PostgresTimelineNexus do
 
     describe "when blob storage is aws s3" do
       let(:aws_location) { create_aws_location }
-      let(:iam_client) { Aws::IAM::Client.new(stub_responses: true) }
+      let(:s3_client) { Aws::S3::Client.new(stub_responses: true) }
 
       before do
         postgres_timeline.update(location_id: aws_location.id)
+        allow(Aws::S3::Client).to receive(:new).and_return(s3_client)
+        allow(Aws::IAM::Client).to receive(:new).and_return(Aws::IAM::Client.new(stub_responses: true))
+        sts_client = Aws::STS::Client.new(stub_responses: true)
+        sts_client.stub_responses(:get_caller_identity, account: "123456789012")
+        allow(Aws::STS::Client).to receive(:new).and_return(sts_client)
       end
 
-      it "destroys blob storage and postgres timeline" do
-        iam_client.stub_responses(:delete_user)
-        iam_client.stub_responses(:list_attached_user_policies, attached_policies: [{policy_arn: "arn:aws:iam::aws:policy/AmazonS3FullAccess"}])
-        iam_client.stub_responses(:delete_policy)
-        iam_client.stub_responses(:list_access_keys, access_key_metadata: [{access_key_id: "access-key"}])
-        iam_client.stub_responses(:delete_access_key)
-        expect(nx.postgres_timeline.location.location_credential_aws).to receive(:iam_client).and_return(iam_client).at_least(:once)
+      it "empties and deletes the bucket, then destroys blob storage and timeline" do
+        s3_client.stub_responses(:list_objects_v2, {contents: [{key: "basebackups_005/backup"}]}, {contents: []})
+
+        expect { nx.destroy }.to exit({"msg" => "postgres timeline is deleted"})
+        expect(postgres_timeline).not_to exist
+      end
+
+      it "ignores a missing bucket (NoSuchBucket) during teardown" do
+        s3_client.stub_responses(:list_objects_v2, "NoSuchBucket")
+
+        expect { nx.destroy }.to exit({"msg" => "postgres timeline is deleted"})
+        expect(postgres_timeline).not_to exist
+      end
+    end
+
+    describe "when blob storage is gcp gcs" do
+      let(:iam_service) { instance_double(Google::Apis::IamV1::IamService) }
+
+      it "deletes bucket contents and bucket then destroys timeline" do
+        gcp_location = create_gcp_location
+        postgres_timeline.update(location_id: gcp_location.id)
+        gcp_credential = gcp_location.location_credential_gcp
+        expect(gcp_credential).to receive(:iam_client).and_return(iam_service)
+
+        file1 = instance_double(Google::Cloud::Storage::File)
+        file2 = instance_double(Google::Cloud::Storage::File)
+        bucket = instance_double(Google::Cloud::Storage::Bucket)
+        storage_client = instance_double(Google::Cloud::Storage::Project)
+
+        expect(nx.postgres_timeline).to receive(:blob_storage_client).and_return(storage_client)
+        expect(nx.postgres_timeline.location).to receive(:location_credential_gcp).and_return(gcp_credential)
+        expect(storage_client).to receive(:bucket).with(postgres_timeline.ubid).and_return(bucket)
+        expect(bucket).to receive(:files).and_return([file1, file2])
+        expect(file1).to receive(:delete)
+        expect(file2).to receive(:delete)
+        expect(bucket).to receive(:delete)
+
+        expect(iam_service).to receive(:delete_project_service_account).with(
+          "projects/-/serviceAccounts/#{postgres_timeline.access_key}",
+        )
+
+        expect { nx.destroy }.to exit({"msg" => "postgres timeline is deleted"})
+        expect(postgres_timeline).not_to exist
+      end
+
+      it "handles missing bucket gracefully" do
+        gcp_location = create_gcp_location
+        postgres_timeline.update(location_id: gcp_location.id)
+        gcp_credential = gcp_location.location_credential_gcp
+        expect(gcp_credential).to receive(:iam_client).and_return(iam_service)
+
+        storage_client = instance_double(Google::Cloud::Storage::Project)
+        expect(nx.postgres_timeline).to receive(:blob_storage_client).and_return(storage_client)
+        expect(nx.postgres_timeline.location).to receive(:location_credential_gcp).and_return(gcp_credential)
+        expect(storage_client).to receive(:bucket).with(postgres_timeline.ubid).and_return(nil)
+
+        expect(iam_service).to receive(:delete_project_service_account)
 
         expect { nx.destroy }.to exit({"msg" => "postgres timeline is deleted"})
         expect(postgres_timeline).not_to exist

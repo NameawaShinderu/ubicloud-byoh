@@ -3,6 +3,7 @@
 module MetricsTargetMethods
   MAX_SCRAPE_FETCH_COUNT = 4
   FILENAME_FORMAT = "%Y-%m-%dT%H-%M-%S-%N"
+  METRICS_BACKLOG_THRESHOLD_SECONDS = 300
 
   def metrics_config
     {
@@ -18,6 +19,9 @@ module MetricsTargetMethods
       # Additional label names and values to be added to the collected metrics
       additional_labels: {foo: "bar"},
 
+      # Regexps for scraped lines to drop before buffering/export (optional)
+      exclude_metrics: [],
+
       # Directory to store the collected metrics
       metrics_dir: "/home/ubi/metrics",
 
@@ -28,6 +32,7 @@ module MetricsTargetMethods
 
   def export_metrics(session:, tsdb_client:)
     scrape_results = scrape_endpoints(session)
+    session[:last_export_bytes] = scrape_results.sum { it.samples.bytesize }
 
     if scrape_results.empty?
       return
@@ -46,12 +51,36 @@ module MetricsTargetMethods
     scrape_results.count
   end
 
+  def observe_metrics_backlog(session)
+    tag = metrics_backlog_page_tag
+    metrics_done_dir = "#{metrics_dir}/done"
+    config_path = "#{metrics_dir}/config.json"
+    fields = session[:ssh_session].exec!("echo $(date +%s) $(stat -c %Y :config_path) $(test -d :metrics_done_dir && stat -c %Y :metrics_done_dir || echo 0) $(test -d :metrics_done_dir && ls :metrics_done_dir | wc -l || echo 0)", config_path:, metrics_done_dir:).split
+    now, configured_at, collected_at, metrics_backlog = fields.map { Integer(it, 10) }
+
+    if now - [configured_at, collected_at].max > METRICS_BACKLOG_THRESHOLD_SECONDS
+      Prog::PageNexus.assemble("#{ubid} is not collecting metrics",
+        [tag, id], ubid, resource_id: id, severity: "warning")
+      return
+    end
+
+    metrics_interval = metrics_config[:interval].to_i
+
+    if metrics_backlog * metrics_interval > METRICS_BACKLOG_THRESHOLD_SECONDS
+      Prog::PageNexus.assemble("#{ubid} metrics backlog high",
+        [tag, id], ubid,
+        resource_id: id, severity: "warning", extra_data: {metrics_backlog:})
+    elsif metrics_backlog * metrics_interval < METRICS_BACKLOG_THRESHOLD_SECONDS * 0.8
+      Page.from_tag_parts(tag, id)&.incr_resolve
+    end
+  end
+
   def scrape_endpoints(session)
     scrape_files = session[:ssh_session].exec!("ls :metrics_dir/done | sort | head -n :fetch_count", metrics_dir:, fetch_count: MAX_SCRAPE_FETCH_COUNT).split("\n")
 
     scrape_files.filter_map do |file|
       time_str = file.split(".").first
-      time = Time.strptime(time_str, FILENAME_FORMAT)
+      time = Time.strptime("#{time_str} UTC", "#{FILENAME_FORMAT} %Z")
       status = {}
 
       samples = session[:ssh_session].exec!("cat :metrics_dir/done/:file", metrics_dir:, file:, status:)

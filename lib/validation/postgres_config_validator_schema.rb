@@ -42,7 +42,7 @@ module Validation
       "archive_command" => {
         description: "Sets the shell command that will be called to archive a WAL file.",
         type: :string,
-        default: "/usr/bin/wal-g wal-push %p --config /etc/postgresql/wal-g.env",
+        default: "/usr/bin/walg-daemon-client /tmp/wal-g wal-push %f",
       },
       "archive_library" => {
         description: "Sets the library that will be called to archive a WAL file.",
@@ -258,10 +258,9 @@ module Validation
       },
       "client_connection_check_interval" => {
         description: "Sets the time interval between checks for disconnection while running queries.",
-        type: :integer,
-        min: 0,
-        max: 2147483647,
-        default: 0,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "0",
       },
       "client_encoding" => {
         description: "Sets the client's character set encoding.",
@@ -771,17 +770,15 @@ module Validation
       },
       "idle_in_transaction_session_timeout" => {
         description: "Sets the maximum allowed idle time between queries, when in a transaction.",
-        type: :integer,
-        min: 0,
-        max: 2147483647,
-        default: 0,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "0",
       },
       "idle_session_timeout" => {
         description: "Sets the maximum allowed idle time between queries, when not in a transaction.",
-        type: :integer,
-        min: 0,
-        max: 2147483647,
-        default: 0,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "0",
       },
       "ignore_checksum_failure" => {
         description: "Continues processing after a checksum failure.",
@@ -910,10 +907,9 @@ module Validation
       },
       "lock_timeout" => {
         description: "Sets the maximum allowed duration of any wait for a lock.",
-        type: :integer,
-        min: 0,
-        max: 2147483647,
-        default: 0,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "0",
       },
       "log_autovacuum_min_duration" => {
         description: "Sets the minimum execution time above which autovacuum actions will be logged.",
@@ -935,11 +931,13 @@ module Validation
         description: "Sets the destination for server log output.",
         type: :string,
         default: "stderr",
+        deny: true,
       },
       "log_directory" => {
         description: "Sets the destination directory for log files.",
         type: :string,
         default: "pg_log",
+        deny: true,
       },
       "log_disconnections" => {
         description: "Logs end of a session, including duration.",
@@ -973,6 +971,7 @@ module Validation
         description: "Sets the file name pattern for log files.",
         type: :string,
         default: "postgresql.log",
+        deny: true,
       },
       "log_hostname" => {
         description: "Logs the host name in the connection logs.",
@@ -983,6 +982,7 @@ module Validation
         description: "Controls information prefixed to each log line.",
         type: :string,
         default: "%m [%p] %q%u@%d ",
+        deny: true,
       },
       "log_lock_waits" => {
         description: "Logs long lock waits.",
@@ -1096,6 +1096,7 @@ module Validation
         description: "Sets the time zone to use in log messages.",
         type: :string,
         default: "UTC",
+        deny: true,
       },
       "log_transaction_sample_rate" => {
         description: "Sets the fraction of transactions from which to log all statements.",
@@ -1114,6 +1115,7 @@ module Validation
         type: :bool,
         default: "on",
         requires_restart: true,
+        deny: true,
       },
       "logical_decoding_work_mem" => {
         description: "Sets the maximum memory to be used for logical decoding.",
@@ -1390,17 +1392,15 @@ module Validation
       },
       "post_auth_delay" => {
         description: "Sets the amount of time to wait after authentication on connection startup.",
-        type: :integer,
-        min: 0,
-        max: 2147,
-        default: 0,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "0",
       },
       "pre_auth_delay" => {
         description: "Sets the amount of time to wait before authentication on connection startup.",
-        type: :integer,
-        min: 0,
-        max: 60,
-        default: 0,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "0",
       },
       "primary_conninfo" => {
         description: "Sets the connection string to be used to connect to the sending server.",
@@ -1434,10 +1434,9 @@ module Validation
       },
       "recovery_min_apply_delay" => {
         description: "Sets the minimum delay for applying changes during recovery.",
-        type: :integer,
-        min: 0,
-        max: 2147483647,
-        default: 0,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "0",
       },
       "recovery_prefetch" => {
         description: "Prefetch referenced blocks during recovery.",
@@ -1726,24 +1725,21 @@ module Validation
       },
       "tcp_keepalives_idle" => {
         description: "Time between issuing TCP keepalives.",
-        type: :integer,
-        min: 0,
-        max: 2147483647,
-        default: 2,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "2",
       },
       "tcp_keepalives_interval" => {
         description: "Time between TCP keepalive retransmits.",
-        type: :integer,
-        min: 0,
-        max: 2147483647,
-        default: 2,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "2",
       },
       "tcp_user_timeout" => {
         description: "TCP user timeout.",
-        type: :integer,
-        min: 0,
-        max: 2147483647,
-        default: 0,
+        type: :string,
+        pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+        default: "0",
       },
       "temp_buffers" => {
         description: "Sets the maximum number of temporary buffers used by each session.",
@@ -1839,6 +1835,14 @@ module Validation
         description: 'Treats "expr=NULL" as "expr IS NULL".',
         type: :bool,
         default: "off",
+      },
+      "ubicloud.shared_memory_percent" => {
+        description: "Percent of VM memory reserved for the shared_memory. shared_buffers sized to fit in it. Limited to 50% on VMs with memory less or equal 16GB",
+        type: :integer,
+        min: 25,
+        max: 75,
+        default: 25,
+        requires_restart: true,
       },
       "unix_socket_directories" => {
         description: "Sets the directories where Unix-domain sockets will be created.",
@@ -2352,6 +2356,110 @@ module Validation
         type: :string,
         default: "SELECT 1",
       },
+      "server_lifetime" => {
+        description: "Close an unused server connection that has been connected longer than this many seconds.",
+        type: :float,
+        default: 3600.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "server_idle_timeout" => {
+        description: "Close a server connection if it has been idle more than this many seconds.",
+        type: :float,
+        default: 600.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "server_connect_timeout" => {
+        description: "Cancel connection to a server if login does not finish in this many seconds.",
+        type: :float,
+        default: 15.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "server_login_retry" => {
+        description: "Wait this many seconds before retrying to connect to a server that failed.",
+        type: :float,
+        default: 15.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "server_fast_close" => {
+        description: "Disconnect a server in close_needed state without waiting for the session to end.",
+        type: :enum,
+        allowed_values: ["0", "1"],
+        default: "0",
+      },
+      "client_login_timeout" => {
+        description: "Disconnect a client that does not complete login within this many seconds.",
+        type: :float,
+        default: 60.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "client_idle_timeout" => {
+        description: "Disconnect a client that has been idle longer than this many seconds.",
+        type: :float,
+        default: 0.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "query_timeout" => {
+        description: "Cancel a query running longer than this many seconds.",
+        type: :float,
+        default: 0.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "query_wait_timeout" => {
+        description: "Cancel a query that has waited to be executed longer than this many seconds.",
+        type: :float,
+        default: 120.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "cancel_wait_timeout" => {
+        description: "Cancel a cancel request that has waited to be executed longer than this many seconds.",
+        type: :float,
+        default: 10.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "idle_transaction_timeout" => {
+        description: "Disconnect a client that has been in idle in transaction state longer than this many seconds.",
+        type: :float,
+        default: 0.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "transaction_timeout" => {
+        description: "Disconnect a client whose transaction has run longer than this many seconds.",
+        type: :float,
+        default: 0.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "autodb_idle_timeout" => {
+        description: "Free automatically created database pools that have been unused this many seconds.",
+        type: :float,
+        default: 3600.0,
+        min: 0.0,
+        max: 65535.0,
+      },
+      "scram_iterations" => {
+        description: "Number of iterations to use when generating SCRAM-SHA-256 secrets.",
+        type: :integer,
+        default: 4096,
+        min: 1,
+        max: 2147483647,
+      },
+      "suspend_timeout" => {
+        description: "Seconds to wait for buffer flush during SUSPEND or reboot before dropping the connection.",
+        type: :integer,
+        default: 10,
+        min: 1,
+        max: 65535,
+      },
     }.freeze
 
     PG_17_CONFIG_SCHEMA = begin
@@ -2458,10 +2566,9 @@ module Validation
         },
         "transaction_timeout" => {
           description: "Sets the maximum allowed duration of any transaction within a session (not a prepared transaction).",
-          type: :integer,
-          max: 2147483647,
-          min: 0,
-          default: 0,
+          type: :string,
+          pattern: /\A[0-9]+(us|ms|s|min|h|d)?\z/,
+          default: "0",
         },
         "wal_summary_keep_time" => {
           description: "Time for which WAL summary files should be kept.",
@@ -2479,6 +2586,13 @@ module Validation
     PG_18_CONFIG_SCHEMA = begin
       removed = ["ssl_ecdh_curve"]
       added_or_modified = {
+        "autovacuum_max_workers" => {
+          description: "Sets the maximum number of simultaneously running autovacuum worker processes.",
+          type: :integer,
+          default: 3,
+          min: 1,
+          max: 262143,
+        },
         "autovacuum_vacuum_max_threshold" => {
           description: "Minimum number of tuple updates or deletes prior to vacuum.",
           type: :integer,
@@ -2565,6 +2679,7 @@ module Validation
           description: "Controls information prefixed to each log line. Supports %L for local server IP address.",
           type: :string,
           default: "%m [%p] %q%u@%d ",
+          deny: true,
         },
         "log_lock_failures" => {
           description: "Controls whether a detailed log message is produced when a lock acquisition fails.",

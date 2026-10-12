@@ -49,18 +49,18 @@ class Vm < Sequel::Model
       fail "BUG: need uniform number of cores allocated per die" unless cores_per_die.denominator == 1
 
       topo = [threads_per_core, cores_per_die, dies_per_package, packages].map { |num|
-        # :nocov:
+        # simplecov:disable
         fail "BUG: non-integer in topology array" unless num.denominator == 1
-        # :nocov:
+        # simplecov:enable
 
         Integer(num)
       }
 
-      # :nocov:
+      # simplecov:disable
       unless topo.reduce(:*) == vcpus
         fail "BUG: arithmetic does not result in the correct number of vcpus"
       end
-      # :nocov:
+      # simplecov:enable
 
       CloudHypervisorCpuTopo.new(*topo)
     end
@@ -87,17 +87,17 @@ class Vm < Sequel::Model
 
       project_public_keys = project.get_ff_vm_public_ssh_keys || []
 
-      # B200 GPUs require QEMU
-      hypervisor ||= (pci_devices.any? { |pci| pci.device == "2901" }) ? "qemu" : "ch"
+      # B200 and B300 GPUs require QEMU
+      hypervisor ||= (pci_devices.any? { |pci| %w[2901 3182].freeze.include?(pci.device) }) ? "qemu" : "ch"
 
       # we don't write secrets to params_json, because it
       # shouldn't be stored in the host for security reasons.
       JSON.pretty_generate(
         vm_name: name,
-        public_ipv6: project.get_ff_ipv6_disabled ? nic.private_subnet.random_private_ipv6.to_s : ephemeral_net6.to_s,
+        public_ipv6: project.get_ff_ipv6_disabled ? user_nic.private_subnet.random_private_ipv6.to_s : ephemeral_net6.to_s,
         public_ipv4: ip4.to_s,
         local_ipv4: local_vetho_ip.to_s,
-        dns_ipv4: nic.private_subnet.net4.nth(2).to_s,
+        dns_ipv4: user_nic.private_subnet.net4.nth(2).to_s,
         unix_user:,
         ssh_public_keys: [public_key] + project_public_keys,
         nics: nics.map { [it.private_ipv6.to_s, it.private_ipv4.to_s, it.ubid_to_tap_name, it.mac, it.private_ipv4_gateway] },
@@ -119,21 +119,17 @@ class Vm < Sequel::Model
         hugepages:,
         init_script: init_script&.init_script || "",
         ipv6_disabled: project.get_ff_ipv6_disabled || false,
+        append_serial_console: location_id == Location::GITHUB_RUNNERS_ID,
       )
     end
 
     def storage_volumes
-      # Pin the storage backend to the IO cpus on hosts without slices. A host
-      # with no IO cpus (e.g. a BYOH host) leaves "cpus" unset, because the
-      # host treats an empty list as set and would configure zero queues.
-      io_cpus = if vm_host.spdk_installations.empty? && !vm_host.accepts_slices
-        vm_host.cpus.filter(&:spdk).map(&:cpu_number)
-      else
-        []
+      if vm_host_slice
+        pool_cpus = (vm_host_slice.cpus.map(&:cpu_number) +
+          vm_host.cpus.filter_map { |cpu| cpu.cpu_number if cpu.io }).sort!.uniq
       end
 
       vm_storage_volumes.map { |s|
-        cpus = io_cpus.shuffle.take(s.num_queues)
         {
           "boot" => s.boot,
           "image" => s.boot_image&.name,
@@ -149,15 +145,34 @@ class Vm < Sequel::Model
           "read_only" => s.size_gib == 0,
           "max_read_mbytes_per_sec" => s.max_read_mbytes_per_sec,
           "max_write_mbytes_per_sec" => s.max_write_mbytes_per_sec,
-          "slice_name" => vm_host_slice&.inhost_name || "system.slice",
+          # Use system.slice so the storage daemon can use io pool cpus in
+          # addition to vm cpus.
+          "slice_name" => "system.slice",
           "num_queues" => s.num_queues,
           "queue_size" => s.queue_size,
           "copy_on_read" => false,
           "track_written" => s.track_written,
         }.tap { |v|
-          v["cpus"] = cpus unless cpus.empty?
+          v["allowed_cpus"] = pool_cpus if pool_cpus
           v["archive_source"] = storage_archive_source(s) if s.machine_image_version_id
+          v["remote_source"] = storage_remote_source(s) if s.remote_storage_server_id
         }
+      }
+    end
+
+    # Descriptor for a boot volume whose stripes come from a remote storage
+    # server. The PSK is wrapped with the volume's KEK, mirroring how archive
+    # credentials are delivered, so it is never sent to the host in plaintext.
+    def storage_remote_source(sv)
+      server = sv.remote_storage_server
+      {
+        "address" => server.address,
+        "psk_identity" => server.psk_identity,
+        "encrypted_psk" => sv.key_encryption_key_1.encrypt(Base64.decode64(server.psk), "remote-psk"),
+        "autofetch" => true,
+        # Size the target's disk.raw from the source's actual byte size so an
+        # oversized source (e.g. an SPDK-migrated disk.raw) is carried forward.
+        "disk_size_bytes" => server.source_disk_file_size,
       }
     end
 
@@ -174,6 +189,7 @@ class Vm < Sequel::Model
         "encrypted_access_key_id" => kek.encrypt(store.access_key, "archive-access-key"),
         "encrypted_secret_access_key" => kek.encrypt(store.secret_key, "archive-secret-key"),
         "encrypted_archive_kek" => kek.encrypt(Base64.decode64(metal.archive_kek.key), "archive-kek"),
+        "autofetch" => true,
       }
     end
 
@@ -185,14 +201,64 @@ class Vm < Sequel::Model
       }.to_h
     end
 
+    def create_storage_volumes(storage_volume_params)
+      # Some tests create VMs with two storage volumes, and the shape of
+      # StorageKeyEncryptionKey creation query will be the same for both. So,
+      # ignore duplicate key errors.
+      DB.ignore_duplicate_queries do
+        storage_volume_params.each_with_index do |params, index|
+          if (miv_id = params[:machine_image_version_id])
+            # Lock for share before checking status, so it conflicts with the
+            # lock in MachineImage::VersionMetalNexus#destroy acquired when
+            # moving status out of 'ready'. This is to serialize the check and
+            # update transactions and prevent race conditions.
+            mivm = MachineImageVersionMetal.where(id: miv_id).for_share.first
+            fail "machine image version #{miv_id} is not available" unless mivm&.status == "ready"
+          end
+
+          key_encryption_key = if params[:encrypted]
+            StorageKeyEncryptionKey.create_random(auth_data: "#{inhost_name}_#{index}")
+          end
+
+          VmStorageVolume.create(
+            vm_id: id,
+            boot: params[:boot],
+            size_gib: params[:size_gib],
+            disk_index: index,
+            use_bdev_ubi: false,
+            max_read_mbytes_per_sec: params[:max_read_mbytes_per_sec],
+            max_write_mbytes_per_sec: params[:max_write_mbytes_per_sec],
+            track_written: params.fetch(:track_written, false),
+            key_encryption_key_1_id: key_encryption_key&.id,
+            machine_image_version_id: params[:machine_image_version_id],
+            remote_storage_server_id: params[:remote_storage_server_id],
+          )
+        end
+      end
+    end
+
     private
 
     def metal_ip6
       ephemeral_net6&.nth(2)
     end
 
+    def metal_fetch_serial_log
+      vm_host.sshable.cmd("sudo tail -c :max_bytes /vm/:vm_name/serial.log", max_bytes: RunCommand::MAX_OUTPUT_BYTES, vm_name: inhost_name)
+    end
+
     def metal_update_firewall_rules_prog
       Prog::Vnet::Metal::UpdateFirewallRules
+    end
+
+    def metal_validate_firewall_cap(firewall)
+      # metal has no firewall count cap
+      nil
+    end
+
+    def metal_validate_subnet_firewall_cap(subnet)
+      # metal has no firewall count cap
+      nil
     end
   end
 end

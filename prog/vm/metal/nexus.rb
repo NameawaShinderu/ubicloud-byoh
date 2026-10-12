@@ -5,7 +5,15 @@ require "json"
 class Prog::Vm::Metal::Nexus < Prog::Base
   DEFAULT_SIZE = "standard-2"
 
+  # Hosts running CloudHypervisor versions newer than the Ubuntu 22.04 default
+  # are only available on Ubuntu 24.04, so a VM pinned to one of these versions
+  # must be allocated to a matching host.
+  CH_VERSION_OS_VERSIONS = {"46.0" => "ubuntu-24.04", "53.0" => "ubuntu-24.04"}.freeze
+
   subject_is :vm
+  frame_reader :distinct_storage_devices, :exclude_host_ids, :exclude_data_centers, :gpu_count, :gpu_device,
+    :force_host_id, :storage_volumes, :ch_version
+  frame_accessor :reason_determined
 
   def vm_name
     @vm_name ||= vm.inhost_name
@@ -35,7 +43,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   # Uses the allocator's host filters and lists the hosts with the most
   # free cores and hugepages first. Limited to a few hosts to keep the
   # query cheap.
-  def host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:)
+  def host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:, data_center_exclusion_filter:, os_filter:)
     vm_host_id = Sequel[:vm_host][:id]
     free_storage_gib = DB[:storage_device]
       .where(vm_host_id:, enabled: true)
@@ -52,6 +60,8 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     ds = ds.where(vm_host_id => host_filter) unless host_filter.empty?
     ds = ds.exclude(vm_host_id => host_exclusion_filter) unless host_exclusion_filter.empty?
     ds = ds.where(family: family_filter) unless family_filter.empty?
+    ds = ds.exclude(data_center: data_center_exclusion_filter) unless data_center_exclusion_filter.empty?
+    ds = ds.where(os_version: os_filter) if os_filter
     ds.order(Sequel.desc(Sequel[:total_cores] - Sequel[:used_cores]), Sequel.desc(Sequel[:total_hugepages_1g] - Sequel[:used_hugepages_1g]), vm_host_id).limit(10)
       .select(vm_host_id, :used_cores, :total_cores, :used_hugepages_1g, :total_hugepages_1g, free_storage_gib.as(:free_storage_gib), free_ipv4.as(:free_ipv4))
       .naked
@@ -64,6 +74,14 @@ class Prog::Vm::Metal::Nexus < Prog::Base
           "free_ipv4" => it[:free_ipv4],
         }
       }
+  end
+
+  def boots_from_customer_machine_image?
+    project_id = vm.vm_storage_volumes_dataset
+      .where(boot: true)
+      .association_join(machine_image_version: :machine_image)
+      .get(Sequel[:machine_image][:project_id])
+    !!project_id && !Project.service_project?(project_id)
   end
 
   def before_destroy
@@ -80,20 +98,21 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     family = vm.family
     arch = vm.arch
     begin
-      distinct_storage_devices = frame["distinct_storage_devices"] || false
-      host_exclusion_filter = frame["exclude_host_ids"] || []
-      data_center_exclusion_filter = frame["exclude_data_centers"] || []
-      gpu_count = frame["gpu_count"] || 0
-      gpu_device = frame["gpu_device"] || nil
+      distinct_storage_devices = self.distinct_storage_devices || false
+      host_exclusion_filter = exclude_host_ids || []
+      data_center_exclusion_filter = exclude_data_centers || []
+      gpu_count = self.gpu_count || 0
+      gpu_device = self.gpu_device || nil
       runner = GithubRunner.first(vm_id: vm.id) if vm.location_id == Location::GITHUB_RUNNERS_ID
       allocation_state_filter, location_filter, location_preference, host_filter, family_filter =
-        if frame["force_host_id"]
-          [[], [], [], [frame["force_host_id"]], []]
+        if force_host_id
+          [[], [], [], [force_host_id], []]
         elsif vm.location_id == Location::GITHUB_RUNNERS_ID
           runner_location_filter = [Location::GITHUB_RUNNERS_ID, Location::HETZNER_FSN1_ID, Location::HETZNER_HEL1_ID]
           runner_location_preference = [Location::GITHUB_RUNNERS_ID]
           installation = runner&.installation
           prefs = installation&.allocator_preferences || {}
+          host_exclusion_filter |= prefs["host_exclusion_filter"] || []
 
           runner_family_filter = if runner&.not_upgrade_premium_set? || vm.family == "premium"
             [vm.family]
@@ -113,9 +132,10 @@ class Prog::Vm::Metal::Nexus < Prog::Base
           [["accepting"], [vm.location_id], [], [], [vm.family]]
         end
       family_filter = ["standard"] if vm.family == "burstable"
+      os_filter = CH_VERSION_OS_VERSIONS[ch_version]
 
       Scheduling::Allocator.allocate(
-        vm, frame["storage_volumes"],
+        vm, storage_volumes,
         distinct_storage_devices:,
         allocation_state_filter:,
         location_filter:,
@@ -125,6 +145,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
         data_center_exclusion_filter:,
         gpu_count:,
         gpu_device:,
+        os_filter:,
         family_filter:,
       )
     rescue Scheduling::Allocator::NoSpaceLeft
@@ -140,8 +161,8 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       end
       if waiting_seconds >= page_after_minutes * 60
         utilization = VmHost.where(allocation_state: "accepting", arch:).select_map { sum(:used_cores) * 100.0 / sum(:total_cores) }.first.to_f
-        hosts = host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:)
-        Prog::PageNexus.assemble("No capacity left at #{Location[vm.location_id].display_name} for #{family} family of #{arch}", ["NoCapacity", Location[vm.location_id].display_name, arch, family], queued_vms.limit(25).select_map(Sequel[:vm][:id]).map { UBID.to_ubid(it) }, extra_data: {queue_size: queued_vms.count, utilization:, hosts:})
+        hosts = host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:, data_center_exclusion_filter:, os_filter:)
+        Prog::PageNexus.assemble("No capacity left at #{Location[vm.location_id].display_name} for #{family} family of #{arch}", ["NoCapacity", Location[vm.location_id].display_name, arch, family], queued_vms.limit(25).select_map(Sequel[:vm][:id]).map { UBID.to_ubid(it) }, resource_id: nil, extra_data: {queue_size: queued_vms.count, utilization:, hosts:})
       end
 
       nap (30.0 / (1 + waiting_seconds / 120.0)).clamp(5, 30)
@@ -149,11 +170,12 @@ class Prog::Vm::Metal::Nexus < Prog::Base
 
     vm.nics.each(&:incr_vm_allocated)
     decr_waiting_for_capacity
+    wakeup_waiting_strand("allocated_waiting_strand_id")
     if (page = Page.from_tag_parts("NoCapacity", vm.location.display_name, arch, family)) && page.created_at < Time.now - 15 * 60 && queued_vms.count <= 1
       page.incr_resolve
     end
 
-    register_deadline("wait", 10 * 60)
+    register_deadline("wait", 10 * 60, page: !boots_from_customer_machine_image?)
 
     # We don't need storage_volume info anymore, so delete it before
     # transitioning to the next state.
@@ -182,7 +204,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       sudo usermod -a -G kvm :vm_name
     COMMAND
 
-    host.sshable.cmd(command, vm_name:, vm_home:, uid:)
+    host.sshable.cmd(command, vm_name:, vm_home:, uid:, log: :on_error)
 
     hop_create_billing_record
   end
@@ -191,7 +213,16 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     case host.sshable.cmd("common/bin/daemonizer --check prep_:vm_name", vm_name:)
     when "Succeeded"
       vm.nics.each(&:incr_setup_nic)
-      hop_clean_prep
+
+      incr_clean_prep
+
+      # The Vm's systemd unit is already written and started by this point, so
+      # this is the earliest point we can learn which hypervisor it ended up
+      # running. It's a fire-and-forget independent Strand rather than a bud,
+      # since nothing here depends on its outcome.
+      Prog::LearnHypervisor.assemble(vm.id)
+
+      hop_wait_sshable
     when "NotStarted", "Failed"
       secrets_json = JSON.generate({
         storage: vm.storage_secrets,
@@ -200,29 +231,26 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       write_params_json
 
       d_command = NetSsh.command("sudo host/bin/setup-vm prep :vm_name", vm_name:)
-      host.sshable.cmd("common/bin/daemonizer :d_command prep_:vm_name", d_command:, vm_name:, stdin: secrets_json)
+      host.sshable.cmd("common/bin/daemonizer :d_command prep_:vm_name", d_command:, vm_name:, stdin: secrets_json, log: :on_error)
     end
 
     nap 1
   end
 
-  label def clean_prep
-    host.sshable.cmd("common/bin/daemonizer --clean prep_:vm_name", vm_name:)
-    hop_wait_sshable
-  end
-
   def write_params_json
     host.sshable.cmd("sudo -u :vm_name tee :params_path > /dev/null", vm_name:, params_path:,
-      stdin: vm.params_json(**frame.slice("swap_size_bytes", "hugepages", "hypervisor", "ch_version", "firmware_version").transform_keys!(&:to_sym)))
+      stdin: vm.params_json(**frame.slice("swap_size_bytes", "hugepages", "hypervisor", "ch_version", "firmware_version").transform_keys!(&:to_sym)), log: :on_error)
   end
 
   label def wait_sshable
     unless vm.update_firewall_rules_set?
-      vm.incr_update_firewall_rules
+      # vm.incr rewrites schedule and strand rerun immediately instead of napping
+      Semaphore.incr(vm.id, :update_firewall_rules, wake: false)
       # This is the first time we get into this state and we know that
-      # wait_sshable will take definitely more than 6 seconds. So, we nap here
-      # to reduce the amount of load on the control plane unnecessarily.
-      nap 6
+      # wait_sshable will take at least 3 seconds on the fastest boot images.
+      # So, we nap here to reduce the amount of load on the control plane
+      # unnecessarily.
+      nap 3
     end
 
     if (addr = vm.ip4_string)
@@ -236,6 +264,19 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     vm.update(display_state: "running", provisioned_at: Time.now)
     Clog.emit("vm provisioned", [vm, {provision: {vm_ubid: vm.ubid, vm_host_ubid: host.ubid, duration: (Time.now - vm.allocated_at).round(3)}}])
 
+    hop_wait_and_wakeup_waiting_strand
+  end
+
+  label def wait_storage_catchup
+    vm.vm_storage_volumes.each do |vol|
+      next unless vol.machine_image_version_id || vol.remote_storage_server_id
+      if vol.caught_up?
+        vol.remote_storage_server&.incr_destroy
+        vol.update(machine_image_version_id: nil, remote_storage_server_id: nil)
+      else
+        nap 30
+      end
+    end
     hop_wait
   end
 
@@ -251,13 +292,13 @@ class Prog::Vm::Metal::Nexus < Prog::Base
         amount: vm.vcpus,
       )
 
-      vm.storage_volumes.each do |vol|
+      vm.vm_storage_volumes.each do |vol|
         BillingRecord.create(
           project_id: project.id,
           resource_id: vm.id,
-          resource_name: "Disk ##{vol["disk_index"]} of #{vm.name}",
+          resource_name: "Disk ##{vol.disk_index} of #{vm.name}",
           billing_rate_id: BillingRate.from_resource_properties("VmStorage", vm.family, vm.location.name)["id"],
-          amount: vol["size_gib"],
+          amount: vol.size_gib,
         )
       end
 
@@ -303,6 +344,11 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       hop_update_firewall_rules
     end
 
+    unless vm.vm_storage_volumes_dataset.exclude(machine_image_version_id: nil, remote_storage_server_id: nil).empty?
+      register_deadline("wait", 30 * 60)
+      hop_wait_storage_catchup
+    end
+
     when_update_spdk_dependency_set? do
       register_deadline("wait", 5 * 60)
       hop_update_spdk_dependency
@@ -315,13 +361,42 @@ class Prog::Vm::Metal::Nexus < Prog::Base
 
     when_checkup_set? do
       unless available?
-        update_stack("reason_determined" => false)
+        self.reason_determined = false
         hop_unavailable
       end
       decr_checkup
     end
 
+    when_clean_prep_set? do
+      host.sshable.cmd("common/bin/daemonizer --clean prep_:vm_name", vm_name:, log: :on_error)
+      decr_clean_prep
+    end
+
+    unless stale_kek_storage_volumes.empty?
+      register_deadline("wait", 10 * 60)
+      hop_rotate_storage_keys
+    end
+
     nap 6 * 60 * 60
+  end
+
+  label def rotate_storage_keys
+    stale_kek_storage_volumes.each do |volume|
+      Prog::Storage::RotateKek.assemble(volume.id, parent_id: strand.id)
+    end
+    hop_wait_rotate_storage_keys
+  end
+
+  label def wait_rotate_storage_keys
+    reap(:wait, nap: 10)
+  end
+
+  def stale_kek_storage_volumes
+    cutoff = Time.now - (Config.storage_kek_rotation_interval_days * 24 * 60 * 60)
+    vm.vm_storage_volumes_dataset
+      .where(key_encryption_key_2_id: nil)
+      .exclude(key_encryption_key_1_id: nil)
+      .where(key_encryption_key_1_id: StorageKeyEncryptionKey.where { created_at < cutoff }.select(:id))
   end
 
   label def update_firewall_rules
@@ -405,6 +480,10 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       end
     end
 
+    when_prepare_to_move_set? do
+      hop_stopped_by_admin
+    end
+
     when_start_set? do
       register_deadline("wait", 5 * 60)
       hop_start_after_stop
@@ -458,7 +537,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       decr_checkup
       Page.from_tag_parts("VmExit", vm.ubid)&.incr_resolve
       hop_wait
-    elsif !frame["reason_determined"]
+    elsif !reason_determined
       if running_map[vm_name]
         # Page due to weird situation, where VM process (generally cloud-hypervisor)
         # is running, but dnsmasq or storage process isn't. We explicitly check this,
@@ -466,16 +545,16 @@ class Prog::Vm::Metal::Nexus < Prog::Base
         Prog::PageNexus.assemble(
           "#{vm.ubid} unavailable but main process running",
           ["VmExit", vm.ubid], vm.ubid,
-          extra_data: {vm_host: host.ubid},
+          resource_id: vm.id, extra_data: {vm_host: host.ubid},
         )
-        update_stack("reason_determined" => true)
+        self.reason_determined = true
         nap 30
       end
 
       begin
         result, invocation_id = host.sshable.cmd("systemctl show -p Result -p InvocationID --value :vm_name", vm_name:).strip.split("\n")
 
-        reason = if %w[signal core-dump oom-kill timeout success].include?(result)
+        reason = if %w[signal core-dump oom-kill timeout success].freeze.include?(result)
           result
         else
           host.sshable.cmd(<<~END, invocation_id:).strip
@@ -514,9 +593,9 @@ class Prog::Vm::Metal::Nexus < Prog::Base
         Prog::PageNexus.assemble(
           "#{vm.ubid} stopped unexpectedly (#{reason})",
           ["VmExit", vm.ubid], vm.ubid,
-          extra_data: {vm_host: host.ubid, result:, reason:},
+          resource_id: vm.id, extra_data: {vm_host: host.ubid, result:, reason:},
         )
-        update_stack("reason_determined" => true)
+        self.reason_determined = true
       end
     end
 
@@ -536,17 +615,24 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       hop_prevent_destroy
     end
 
+    # Finish and reap any in-flight KEK rotation before tearing the VM down.
+    reap(nap: 10, fallthrough: :when_idle)
+
     vm.update(display_state: "deleting")
 
     unless host.nil?
+      if vm.gpu_partition
+        host.sshable.cmd("sudo host/bin/setup-vm :action :vm_name", action: "delete_gpu_partition", vm_name:)
+      end
+
       begin
-        host.sshable.cmd("sudo systemctl stop :vm_name", vm_name:, timeout: 10)
+        host.sshable.cmd("sudo systemctl stop :vm_name", vm_name:, timeout: 10, log: :on_error)
       rescue Sshable::SshError => ex
         raise unless /Failed to stop .* Unit .* not loaded\./.match?(ex.stderr)
       end
 
       begin
-        host.sshable.cmd("sudo systemctl stop :vm_name-dnsmasq", vm_name:)
+        host.sshable.cmd("sudo systemctl stop :vm_name-dnsmasq", vm_name:, log: :on_error)
       rescue Sshable::SshError => ex
         raise unless /Failed to stop .* Unit .* not loaded\./.match?(ex.stderr)
       end
@@ -554,7 +640,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       # If there is a load balancer setup, we want to keep the network setup in
       # tact for a while
       action = vm.load_balancer ? "delete_keep_net" : "delete"
-      host.sshable.cmd("sudo host/bin/setup-vm :action :vm_name", action:, vm_name:)
+      host.sshable.cmd("sudo host/bin/setup-vm :action :vm_name", action:, vm_name:, log: :on_error)
     end
 
     vm.vm_storage_volumes.each do |vol|
@@ -635,7 +721,9 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   end
 
   label def start_after_host_reboot
-    vm.update(display_state: "starting")
+    # Wait out any in-progress storage KEK rotation before restarting the VM,
+    # to avoid starting with the wrong key.
+    nap 5 if vm.vm_storage_volumes.any?(&:key_encryption_key_2_id)
 
     secrets_json = JSON.generate({
       storage: vm.storage_secrets,
@@ -649,7 +737,17 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     decr_start_after_host_reboot
 
     vm.incr_update_firewall_rules
+    hop_restore_load_balancer if vm.load_balancer
     hop_wait
+  end
+
+  # Recreating the network namespace resets its nat table, which drops the load
+  # balancer rules the namespace was serving, so they have to be reinstalled.
+  label def restore_load_balancer
+    load_balancer = vm.load_balancer
+    hop_wait if retval || load_balancer.nil?
+
+    push Prog::Vnet::UpdateLoadBalancerNode, {"load_balancer_id" => load_balancer.id}, :update_load_balancer
   end
 
   def available?

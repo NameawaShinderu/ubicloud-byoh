@@ -30,11 +30,80 @@ RSpec.describe Util do
     end
   end
 
+  describe "#aws_tags" do
+    it "uses configured tag value and merges additional tags" do
+      expect(Config).to receive(:provider_resource_tag_value).and_return("my-controlplane")
+      result = described_class.aws_tags("test-vm", Owner: "team")
+      expect(result).to eq([{key: "Ubicloud", value: "my-controlplane"}, {key: "Name", value: "test-vm"}, {key: "Owner", value: "team"}])
+    end
+  end
+
   describe "#aws_tag_specifications" do
     it "uses configured tag value" do
       expect(Config).to receive(:provider_resource_tag_value).and_return("my-controlplane")
       result = described_class.aws_tag_specifications("instance", "test-vm")
       expect(result).to eq([{resource_type: "instance", tags: [{key: "Ubicloud", value: "my-controlplane"}, {key: "Name", value: "test-vm"}]}])
+    end
+  end
+
+  describe "#send_email" do
+    it "renders 'Ubicloud' as the author name by default" do
+      described_class.send_email("user@example.com", "Hello", greeting: "Hi", body: "Welcome")
+      expect(Mail::TestMailer.deliveries.length).to eq 1
+      expect(Mail::TestMailer.deliveries.first.html_part.body.to_s).to include("Regards,").and include("Ubicloud")
+    end
+
+    it "renders a custom author name when provided" do
+      described_class.send_email("user@example.com", "Hello", greeting: "Hi", body: "Welcome", author_name: "The Ubicloud Team")
+      expect(Mail::TestMailer.deliveries.length).to eq 1
+      expect(Mail::TestMailer.deliveries.first.html_part.body.to_s).to include("The Ubicloud Team")
+    end
+
+    it "sets the reply-to address when provided" do
+      described_class.send_email("user@example.com", "Hello", greeting: "Hi", body: "Welcome", reply_to: "support@ubicloud.com")
+      expect(Mail::TestMailer.deliveries.length).to eq 1
+      expect(Mail::TestMailer.deliveries.first.reply_to).to eq ["support@ubicloud.com"]
+    end
+
+    it "leaves the reply-to address unset by default" do
+      described_class.send_email("user@example.com", "Hello", greeting: "Hi", body: "Welcome")
+      expect(Mail::TestMailer.deliveries.length).to eq 1
+      expect(Mail::TestMailer.deliveries.first.reply_to).to be_nil
+    end
+  end
+
+  describe "#create_certificate" do
+    it "verifies with roots sharing a name in either bundle order" do
+      roots = Array.new(2) { described_class.create_root_certificate(common_name: "test CA", duration: 60 * 60 * 24 * 365) }
+      root_cert, root_cert_key = roots.last
+      cert, _ = described_class.create_certificate(subject: "/CN=server", duration: 60 * 60 * 24 * 30, issuer_cert: OpenSSL::X509::Certificate.new(root_cert), issuer_key: OpenSSL::PKey::EC.new(root_cert_key))
+
+      [roots, roots.reverse].each do |bundle|
+        store = OpenSSL::X509::Store.new
+        bundle.each { |root, _| store.add_cert(OpenSSL::X509::Certificate.new(root)) }
+        expect(store.verify(cert)).to be true
+      end
+    end
+  end
+
+  describe "#cert_expires_at" do
+    let(:cert_pem) { described_class.create_root_certificate(common_name: "test CA", duration: 60 * 60 * 24 * 30)[0] }
+
+    it "returns the expiration time of the certificate" do
+      expect(described_class.cert_expires_at(cert_pem)).to be_within(5).of(Time.now + 60 * 60 * 24 * 30)
+    end
+
+    it "returns the expiration time of the first certificate in a chain" do
+      other_pem = described_class.create_root_certificate(common_name: "other CA", duration: 60 * 60 * 24 * 365)[0]
+      expect(described_class.cert_expires_at(cert_pem + other_pem)).to be_within(5).of(Time.now + 60 * 60 * 24 * 30)
+    end
+
+    it "returns nil for invalid certificate data" do
+      expect(described_class.cert_expires_at("not a cert")).to be_nil
+    end
+
+    it "returns nil for nil" do
+      expect(described_class.cert_expires_at(nil)).to be_nil
     end
   end
 
@@ -49,6 +118,45 @@ RSpec.describe Util do
 
     it "rejects unformatted information" do
       expect { described_class.parse_key("") }.to raise_error OpenSSL::PKey::RSAError
+    end
+  end
+
+  describe "#exception_to_hash" do
+    it "captures stderr for exceptions that expose it" do
+      ex = Sshable::SshError.new("cmd", "out", "boom", 1, nil)
+      hash = described_class.exception_to_hash(ex, backtrace: [])
+      expect(hash[:exception][:stderr]).to eq "boom"
+    end
+
+    it "keeps only the tail of stderr longer than STDERR_LOG_TAIL" do
+      ex = Sshable::SshError.new("cmd", "", ("x" * 3000) + "TAIL", 1, nil)
+      hash = described_class.exception_to_hash(ex, backtrace: [])
+      expect(hash[:exception][:stderr].bytesize).to eq 2003
+      expect(hash[:exception][:stderr]).to start_with "..."
+      expect(hash[:exception][:stderr]).to end_with "TAIL"
+    end
+
+    it "caps by bytes, not characters, for multibyte stderr" do
+      ex = Sshable::SshError.new("cmd", "", "é" * 1500, 1, nil)
+      hash = described_class.exception_to_hash(ex, backtrace: [])
+      expect(hash[:exception][:stderr].bytesize).to eq 2003
+    end
+
+    it "captures non-UTF-8 stderr without raising an encoding error" do
+      ex = Sshable::SshError.new("cmd", "", "\xff\xfe".b * 1600, 1, nil)
+      hash = described_class.exception_to_hash(ex, backtrace: [])
+      expect(hash[:exception][:stderr].bytesize).to eq 2003
+    end
+
+    it "omits stderr when it is empty" do
+      ex = Sshable::SshError.new("cmd", "", "", 1, nil)
+      hash = described_class.exception_to_hash(ex, backtrace: [])
+      expect(hash[:exception]).not_to have_key(:stderr)
+    end
+
+    it "omits stderr for exceptions without a stderr reader" do
+      hash = described_class.exception_to_hash(RuntimeError.new("boom"), backtrace: [])
+      expect(hash[:exception]).not_to have_key(:stderr)
     end
   end
 end

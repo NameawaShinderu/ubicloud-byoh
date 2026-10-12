@@ -23,6 +23,7 @@ RSpec.describe MetricsTargetMethods do
       expect(config[:max_file_retention]).to eq(120)
       expect(config[:interval]).to eq("15s")
       expect(config[:additional_labels]).to eq({foo: "bar"})
+      expect(config[:exclude_metrics]).to eq([])
       expect(config[:metrics_dir]).to eq("/home/ubi/metrics")
     end
   end
@@ -38,12 +39,13 @@ RSpec.describe MetricsTargetMethods do
         expect(mock_ssh_session).not_to receive(:_exec!).with(/xargs.*rm/)
 
         test_instance.export_metrics(session:, tsdb_client: mock_tsdb_client)
+        expect(session[:last_export_bytes]).to eq(0)
       end
     end
 
     context "when scrape results exist" do
-      let(:time_a) { Time.new(2023, 1, 1, 12, 0, 0) }
-      let(:time_b) { Time.new(2023, 1, 1, 12, 15, 0) }
+      let(:time_a) { Time.utc(2023, 1, 1, 12, 0, 0) }
+      let(:time_b) { Time.utc(2023, 1, 1, 12, 15, 0) }
 
       def stub_scrape_ssh_expectations
         expect(mock_ssh_session).to receive(:_exec!).with(/ls.*done/).and_return("2023-01-01T12-00-00-000000000.prom\n2023-01-01T12-15-00-000000000.prom")
@@ -80,6 +82,7 @@ RSpec.describe MetricsTargetMethods do
         expect(mock_ssh_session).to receive(:_exec!).with(/xargs.*rm/)
 
         test_instance.export_metrics(session:, tsdb_client: mock_tsdb_client)
+        expect(session[:last_export_bytes]).to eq(22)
       end
     end
   end

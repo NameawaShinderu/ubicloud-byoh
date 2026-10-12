@@ -166,7 +166,7 @@ class Prog::Ai::InferenceEndpointReplicaNexus < Prog::Base
     }
     Prog::PageNexus.assemble("Replica #{inference_endpoint_replica.ubid.to_s[0..7]} of inference endpoint #{inference_endpoint.name} is unavailable",
       ["InferenceEndpointReplicaUnavailable", inference_endpoint_replica.ubid],
-      inference_endpoint_replica.ubid, severity: "warning", extra_data:)
+      inference_endpoint_replica.ubid, resource_id: inference_endpoint_replica.id, severity: "warning", extra_data:)
   end
 
   def resolve_page
@@ -184,6 +184,7 @@ class Prog::Ai::InferenceEndpointReplicaNexus < Prog::Base
 
     eligible_projects_ds = Project.where(api_key_ds)
     free_quota_exhausted_projects_ds = FreeQuota.get_exhausted_projects("inference-tokens")
+    active_credit_projects_ds = ResourceCredit.active_project_ids_ds
     eligible_projects_ds = eligible_projects_ds.where(id: inference_endpoint.project.id) unless inference_endpoint.is_public
     valid_payment_method_ds = DB[:payment_method]
       .where(fraud: false)
@@ -191,17 +192,17 @@ class Prog::Ai::InferenceEndpointReplicaNexus < Prog::Base
       .select_append { Sequel.as(Sequel.lit("1"), :valid_payment_method) }
     eligible_projects_ds = eligible_projects_ds
       .left_outer_join(valid_payment_method_ds, [:billing_info_id])
-      .exclude(valid_payment_method: nil, credit: 0.0, id: free_quota_exhausted_projects_ds)
+      .exclude(Sequel.~(id: active_credit_projects_ds) & {valid_payment_method: nil, id: free_quota_exhausted_projects_ds})
 
     eligible_projects = eligible_projects_ds.all
       .select(&:active?)
       .map do
-        {
-          ubid: it.ubid,
-          api_keys: it.api_keys.select { |k| k.used_for == "inference_endpoint" && k.is_valid }.map { |k| Digest::SHA2.hexdigest(k.key) },
-          quota_rps: inference_endpoint.max_project_rps,
-          quota_tps: inference_endpoint.max_project_tps,
-        }
+      {
+        ubid: it.ubid,
+        api_keys: it.api_keys.select { |k| k.used_for == "inference_endpoint" && k.is_valid }.map { |k| Digest::SHA2.hexdigest(k.key) },
+        quota_rps: inference_endpoint.max_project_rps,
+        quota_tps: inference_endpoint.max_project_tps,
+      }
     end
 
     body = {

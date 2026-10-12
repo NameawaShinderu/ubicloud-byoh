@@ -1,0 +1,24 @@
+name: Cleanup GCP E2E resources
+description: Log-grep teardown of GCP resources created by the e2e suite, mirrors the AWS cleanup pattern.
+inputs:
+  credentials-base64:
+    description: Base64-encoded service account credentials JSON.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-credentials.json
+        E2E_GCP_CREDENTIALS_BASE64_JSON: ${{ inputs.credentials-base64 }}
+      run: |
+        echo "$E2E_GCP_CREDENTIALS_BASE64_JSON" | base64 -d > /tmp/gcp-credentials.json
+        GCP_PROJECT_ID=$(jq -r .project_id /tmp/gcp-credentials.json)
+        gcloud auth activate-service-account --key-file=/tmp/gcp-credentials.json --project=$GCP_PROJECT_ID
+        # The cleanup logic lives in cleanup.rb so each per-resource block
+        # reads as Ruby instead of nested shell loops + sed/grep. Runs with
+        # the system ruby; no Bundler / gem dependencies. gcloud must be
+        # already authenticated (above).
+        GCP_PROJECT_ID="$GCP_PROJECT_ID" FOREMAN_LOG=foreman.log \
+          ruby "$GITHUB_ACTION_PATH/cleanup.rb"
+        rm -f /tmp/gcp-credentials.json

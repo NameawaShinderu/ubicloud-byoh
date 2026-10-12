@@ -36,6 +36,7 @@ RSpec.describe Prog::Vm::UpdateIpv6 do
   let(:vm) {
     v = vm_strand.subject
     v.update(vm_host_id: vm_host.id)
+    v.vm_storage_volumes_dataset.destroy
     v
   }
 
@@ -47,6 +48,7 @@ RSpec.describe Prog::Vm::UpdateIpv6 do
         {"subject_id" => vm.id, "gpu_count" => 0, "hugepages" => true, "ch_version" => nil,
          "gpu_device" => nil, "hypervisor" => nil, "force_host_id" => nil, "swap_size_bytes" => nil,
          "exclude_host_ids" => [], "firmware_version" => nil, "alternative_families" => [],
+         "unsupported_azs" => [], "exclude_availability_zones" => [],
          "last_label_changed_at" => Time.now.to_s, "distinct_storage_devices" => true},
       ],
     )
@@ -57,6 +59,7 @@ RSpec.describe Prog::Vm::UpdateIpv6 do
       name: "test-lb", private_subnet_id: private_subnet.id, project_id: project.id,
       health_check_endpoint: "/health", cert_enabled:,
     )
+    Strand.create_with_id(lb, prog: "Vnet::LoadBalancerNexus", label: "wait")
     LoadBalancerVm.create(load_balancer_id: lb.id, vm_id: vm.id)
     lb
   end
@@ -109,15 +112,17 @@ RSpec.describe Prog::Vm::UpdateIpv6 do
   end
 
   it "starts vm" do
-    create_load_balancer(cert_enabled: true)
+    lb = create_load_balancer(cert_enabled: true)
     inhost_name = vm.inhost_name
     nic = vm.nics.first
     addr = nic.private_subnet.net4.nth(1).to_s + nic.private_subnet.net4.netmask.to_s
     expect(sshable).to receive(:_cmd).with("sudo ip -n #{inhost_name} addr replace #{addr} dev #{nic.ubid_to_tap_name}")
     expect(sshable).to receive(:_cmd).with("sudo systemctl start #{inhost_name}-metadata-endpoint.service")
     expect { pr.start_vm }.to exit({"msg" => "VM test updated"})
-    expect(vm.reload.update_firewall_rules_set?).to be true
-    expect(private_subnet.reload.refresh_keys_set?).to be true
+    expect(vm.update_firewall_rules_set?(cached: false)).to be true
+    expect(private_subnet.refresh_keys_set?(cached: false)).to be true
+    expect(lb.update_load_balancer_set?).to be true
+    expect(lb.rewrite_dns_records_set?).to be true
   end
 
   it "does not start metadata endpoint service if not load balancer" do
@@ -127,8 +132,8 @@ RSpec.describe Prog::Vm::UpdateIpv6 do
     expect(sshable).to receive(:_cmd).with("sudo ip -n #{inhost_name} addr replace #{addr} dev #{nic.ubid_to_tap_name}")
     expect(sshable).not_to receive(:_cmd).with(/metadata-endpoint/)
     expect { pr.start_vm }.to exit({"msg" => "VM test updated"})
-    expect(vm.reload.update_firewall_rules_set?).to be true
-    expect(private_subnet.reload.refresh_keys_set?).to be true
+    expect(vm.update_firewall_rules_set?(cached: false)).to be true
+    expect(private_subnet.refresh_keys_set?(cached: false)).to be true
   end
 
   it "does not start metadata endpoint service if load balancer is not cert enabled" do
@@ -139,8 +144,8 @@ RSpec.describe Prog::Vm::UpdateIpv6 do
     expect(sshable).to receive(:_cmd).with("sudo ip -n #{inhost_name} addr replace #{addr} dev #{nic.ubid_to_tap_name}")
     expect(sshable).not_to receive(:_cmd).with(/metadata-endpoint/)
     expect { pr.start_vm }.to exit({"msg" => "VM test updated"})
-    expect(vm.reload.update_firewall_rules_set?).to be true
-    expect(private_subnet.reload.refresh_keys_set?).to be true
+    expect(vm.update_firewall_rules_set?(cached: false)).to be true
+    expect(private_subnet.refresh_keys_set?(cached: false)).to be true
   end
 
   it "writes params json" do

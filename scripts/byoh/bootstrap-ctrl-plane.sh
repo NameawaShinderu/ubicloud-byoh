@@ -4,7 +4,7 @@
 # ====================================================================
 #
 # Bootstraps a fresh Ubuntu 24.04 LTS host into a full Ubicloud control
-# plane: Postgres + Ruby 4.0.2 + Node 24 + clover (Roda/Puma) + respirate
+# plane: Postgres + Ruby 4.0.7 + Node 24 + clover (Roda/Puma) + respirate
 # dispatcher + the bin/register-byoh-host CLI. Every step is idempotent —
 # re-running the script skips already-completed phases via marker files
 # under ~/.ubi-bootstrap/.
@@ -23,7 +23,7 @@
 #
 # Env overrides:
 #   UBI_REPO_DIR        default: $HOME/ubicloud
-#   UBI_RUBY_VERSION    default: 4.0.2
+#   UBI_RUBY_VERSION    default: 4.0.7
 #   UBI_NODE_VERSION    default: 24.12.0
 #   UBI_DB_NAME         default: clover_test
 #   UBI_RACK_ENV        default: development
@@ -33,7 +33,7 @@ set -euo pipefail
 
 # --- config ---------------------------------------------------------
 UBI_REPO_DIR="${UBI_REPO_DIR:-$HOME/ubicloud}"
-UBI_RUBY_VERSION="${UBI_RUBY_VERSION:-4.0.2}"
+UBI_RUBY_VERSION="${UBI_RUBY_VERSION:-4.0.7}"
 UBI_NODE_VERSION="${UBI_NODE_VERSION:-24.12.0}"
 UBI_DB_NAME="${UBI_DB_NAME:-clover_test}"
 UBI_RACK_ENV="${UBI_RACK_ENV:-development}"

@@ -6,10 +6,8 @@ require "aws-sdk-s3"
 class Prog::DownloadBootImage < Prog::Base
   subject_is :sshable, :vm_host
   semaphore :cancel
-
-  def image_name
-    @image_name ||= frame.fetch("image_name")
-  end
+  frame_reader :download_r2, :custom_url, :exit_on_fail, :image_name
+  frame_accessor :restarted, :current_size_gib
 
   def version
     @version ||= frame["version"] || latest_boot_image_version(image_name)
@@ -31,13 +29,16 @@ class Prog::DownloadBootImage < Prog::Base
   end
 
   def download_from_r2?
-    frame["download_r2"] || Config.production?
+    download_r2 || Config.production?
   end
+
+  UBUNTU_NICKNAME_VERSION_MAP = {"resolute" => "26.04", "noble" => "24.04", "jammy" => "22.04"}.freeze
+  DEBIAN_VERSION_NICKNAME_MAP = {"13" => "trixie", "12" => "bookworm"}.freeze
 
   def url
     @url ||=
-      if frame["custom_url"]
-        frame["custom_url"]
+      if custom_url
+        custom_url
       elsif download_from_blob_storage?
         suffixes = {
           "github" => "raw",
@@ -56,24 +57,50 @@ class Prog::DownloadBootImage < Prog::Base
         arch = image_name.start_with?("ai-model") ? "-" : "-#{vm_host.arch}-"
         key = "#{image_name}#{arch}#{version}.#{suffix}"
         download_from_r2? ? r2_signed_url(key) : minio_signed_url(key)
-      elsif image_name == "ubuntu-noble"
-        arch = vm_host.render_arch(arm64: "arm64", x64: "amd64")
-        "https://cloud-images.ubuntu.com/releases/noble/release-#{version}/ubuntu-24.04-server-cloudimg-#{arch}.img"
-      elsif image_name == "ubuntu-jammy"
-        arch = vm_host.render_arch(arm64: "arm64", x64: "amd64")
-        "https://cloud-images.ubuntu.com/releases/jammy/release-#{version}/ubuntu-22.04-server-cloudimg-#{arch}.img"
-      elsif image_name == "debian-12"
-        arch = vm_host.render_arch(arm64: "arm64", x64: "amd64")
-        "https://cloud.debian.org/images/cloud/bookworm/#{version}/debian-12-genericcloud-#{arch}-#{version}.raw"
-      elsif image_name == "almalinux-9"
-        arch = vm_host.render_arch(arm64: "aarch64", x64: "x86_64")
-        "https://repo.almalinux.org/almalinux/9/cloud/#{arch}/images/AlmaLinux-9-GenericCloud-#{version}.#{arch}.qcow2"
       else
-        fail "Unknown image name: #{image_name}"
+        self.class.upstream_url(image_name, version, vm_host.arch)
       end
   end
 
+  def self.render_arch(arch, arm64:, x64:)
+    case arch
+    when "arm64"
+      arm64
+    when "x64"
+      x64
+    else
+      fail "BUG: inexhaustive render code (arch: #{arch})"
+    end
+  end
+
+  def self.upstream_url(image_name, version, arch)
+    case image_name
+    when "ubuntu-resolute", "ubuntu-noble", "ubuntu-jammy"
+      arch = render_arch(arch, arm64: "arm64", x64: "amd64")
+      nickname = image_name.split("-").last
+      "https://cloud-images.ubuntu.com/releases/#{nickname}/release-#{version}/ubuntu-#{UBUNTU_NICKNAME_VERSION_MAP.fetch(nickname)}-server-cloudimg-#{arch}.img"
+    when "debian-13", "debian-12"
+      arch = render_arch(arch, arm64: "arm64", x64: "amd64")
+      deb_version = image_name.split("-").last
+      "https://cloud.debian.org/images/cloud/#{DEBIAN_VERSION_NICKNAME_MAP.fetch(deb_version)}/#{version}/debian-#{deb_version}-genericcloud-#{arch}-#{version}.raw"
+    when "almalinux-10", "almalinux-9"
+      arch = render_arch(arch, arm64: "aarch64", x64: "x86_64")
+      major_version = image_name.split("-").last
+      "https://repo.almalinux.org/almalinux/#{major_version}/cloud/#{arch}/images/AlmaLinux-#{major_version}-GenericCloud-#{version}.#{arch}.qcow2"
+    else
+      fail "Unknown image name: #{image_name}"
+    end
+  end
+
   BOOT_IMAGE_SHA256 = {
+    "ubuntu-resolute" => {
+      "x64" => {
+        "20260520" => "dced94c031cc1f23dee14419a3723a5b110df9938de0ac31913a2bfd07c755b4",
+      },
+      "arm64" => {
+        "20260520" => "5e091e27d60116efbb0c743b8dd5cb2d15618e414ef04db0817ed43c8e2d7c7b",
+      },
+    },
     "ubuntu-noble" => {
       "x64" => {
         "20240523.1" => "b60205f4cc48a24b999ad0bd61ceb9fe28abfe4ac3701acb7bb5d6b0b5fdc624",
@@ -98,6 +125,14 @@ class Prog::DownloadBootImage < Prog::Base
         "20250508" => "e2b20e818549db10486373927dd0feedd681a32dcbcd8a0bc2f2bd2f411c9f8b",
       },
     },
+    "debian-13" => {
+      "x64" => {
+        "20260601-2496" => "0985313c0f477d1ae1d76a2096de021bd7d2d8c78f8bd7356c98e55917983ea1",
+      },
+      "arm64" => {
+        "20260601-2496" => "87a35add5d5eff36a2ecebd6d9d88e977c0277ec93601083dca8a75f5ca3c971",
+      },
+    },
     "debian-12" => {
       "x64" => {
         "20241004-1890" => "5af3d0e134eb3560ab035021763401d1ec72a25c761fe0ce964351e1409c523d",
@@ -113,71 +148,61 @@ class Prog::DownloadBootImage < Prog::Base
         "9.5-20241120" => "abddf01589d46c841f718cec239392924a03b34c4fe84929af5d543c50e37e37",
         "9.6-20250522" => "b08cd5db79bf32860412f5837e8c7b8df9447e032376e3c622840b31aaf26bc6",
         "9.7-20251118" => "5ff9c048859046f41db4a33b1f1a96675711288078aac66b47d0be023af270d1",
+        "9.8-20260526" => "c397eed7023e92c841155831b1f47e26300e5bef0f0256c129322307c897a251",
       },
       "arm64" => {
         "9.5-20241120" => "5ede4affaad0a997a2b642f1628b6268bd8eba775f281346b75be3ed20ec369e",
         "9.6-20250522" => "47e6801d066c311c44a5ce8100bed16b5976bde610e599dd384d1dca73b31ac5",
         "9.7-20251118" => "c6c09af3b5be62e0ca82ccfafe0b1de9be90890fa8fddbd6118fa8b76b36de2d",
+        "9.8-20260526" => "b5d883c5f84c68a9828fbd3aac863f9a723b43f8965a32ff7a1c198301f42a29",
+      },
+    },
+    "almalinux-10" => {
+      "x64" => {
+        "10.2-20260526.0" => "47f2218668dd4776be140dd92fa3bea700be1766e2c7d88bdfd6a4b50f477b4d",
+      },
+      "arm64" => {
+        "10.2-20260526.0" => "336c6861fe0ba9115af00f557ed1b09385a3525612dd0cb9cce7e0486f8e74a4",
+      },
+    },
+    "github-ubuntu-2604" => {
+      "x64" => {
+        "20260801.1.1" => "0112190ab751c1dd374794780a373f857add7e8d9161e9fd19075486317286f2",
+        "20260901.1.0" => "e3ea65f2d998e7a9bf7b3278bb927c3b1f5ab140f1b9055c189e5092ad1ed27b",
+      },
+      "arm64" => {
+        "20260801.1.1" => "b2a65a26528deee5ed3a2239a9d1da6a6f72db5d1296808d68e814e6d73a4704",
+        "20260901.1.0" => "0c28ab59c6e395448b384a052af1e52e99c026d9505090b7131dba40bb0eb659",
       },
     },
     "github-ubuntu-2404" => {
       "x64" => {
-        "20260312.1.0" => "bbfc41f0db56fb28f5845d37bbe7f4ef1334557b27af68530117bb76ff1b6398",
-        "20260401.1.0" => "d0751f04ca3a3052c46aa3afcd23d7b22345adb670ad14b54522502cad6f4e7c",
+        "20260801.1.1" => "1919053fa4416bae9e77a226afe05677ea7751be9fdfe069473fff658c6a6e34",
+        "20260901.1.0" => "44ac3a4d0b80a79a7c6b4ea790bd7715101cc7fe1272ecaf6ab78e9d18a3f8fc",
       },
       "arm64" => {
-        "20260312.1.0" => "c6fb2fa0ae2912be2222a02cf8a25250d4cbaa7b876cd3b24363bb18438deb81",
-        "20260401.1.0" => "2bb2b5d40a7bb8b18f2813073e5e1954ba96c6e389f63cf140db47e2f43b6367",
+        "20260801.1.1" => "a2e21f6b04f5945333759c64d64e4af2eb4546162122be4c57ad2726cf5a0d64",
+        "20260901.1.0" => "74f6b0cf95aa8c219561c2266d234518167f5a2bb63359db679dcadb792995c1",
       },
     },
     "github-ubuntu-2204" => {
       "x64" => {
-        "20260312.1.0" => "a50f161933a8ced1018b589f49fa723d2638760366b17fb0112b1e98f1d036c5",
-        "20260401.1.0" => "a39e9ac4b7b8511cf30b24965fb14d21a456f930e9fc54c0831d67b24e24744e",
+        "20260801.1.1" => "4a96f264f8a124bd4fe87bef81b7610fcdc648a9b9655669617b1a81c024944b",
+        "20260901.1.0" => "db5f9699f6e5bb7fb8421d950416f85c00f6fb10f563e8390c4ecd43c571e6ec",
       },
       "arm64" => {
-        "20260312.1.0" => "4291d401ba6d8c0407408f6f4f7c238693c939bdfb2a2d0723dc64151e751974",
-        "20260401.1.0" => "79032108974f6f9eb22e22021f27d42e5d7ed4984758030ea5a42c0c16d03532",
+        "20260801.1.1" => "11c78971de17d77f1e75b259398e73eb066533e3141c6802f071517fc22a5539",
+        "20260901.1.0" => "3fd96907abcc8ca840da49c657ef72243b9b36b0e8567d3514369deb45b9de42",
       },
     },
     "postgres-ubuntu-2204" => {
       "x64" => {
-        "20260409.1.0" => "c1901b210c105f4e3dac60c61d6d959fa4b616a5ec05cf6234869553f64a4744",
+        "20261007.1.0" => "8c8f404307bcec1108c4c0e7d8da32180d9af7d517eca4a219181d6aabc79ca9",
       },
     },
-    "postgres16-ubuntu-2204" => {
+    "postgres-ubuntu-2604" => {
       "x64" => {
-        "20250425.1.1" => "f59622da276d646ed2a1c03de546b0a7ec3fd48aeb27c0bfe2b8b8be98c062d2",
-      },
-    },
-    "postgres17-ubuntu-2204" => {
-      "x64" => {
-        "20250425.1.1" => "ccb4bcd8197c2e230be3f485dd33f24a51041a4dc0408257e42b3fe9f1c0bfb3",
-      },
-    },
-    "postgres-paradedb-ubuntu-2204" => {
-      "x64" => {
-        "20260107.1.0" => "b60e173766eaf0b3928e69c8037d60943df4fc0314930ad9cd429405bf91b520",
-      },
-    },
-    "postgres16-paradedb-ubuntu-2204" => {
-      "x64" => {
-        "20250901.1.0" => "5f42467fad1949a16732a860fe37db381f381e25281028935a9d1b4d79058d68",
-      },
-    },
-    "postgres17-paradedb-ubuntu-2204" => {
-      "x64" => {
-        "20250901.1.0" => "671dd829c0c6682933bfcfbee702b9dde3476ea71d4145035953ad98e6cf24a1",
-      },
-    },
-    "postgres16-lantern-ubuntu-2204" => {
-      "x64" => {
-        "20250103.1.0" => "bfb56867513045bc88396d529a3cc186dc44ba4d691acb51dbf45fc5a0eeb7e6",
-      },
-    },
-    "postgres17-lantern-ubuntu-2204" => {
-      "x64" => {
-        "20250103.1.0" => "a95b2e5d03291783dc1753228d7a87949257a06c7b1eca2c94502ab21ffdecdb",
+        "20261007.1.0" => "83031340fd897412d3b0742e6dd2d5f104470b3a8ab9300b109658d5df1934b9",
       },
     },
     "ai-ubuntu-2404-nvidia" => {
@@ -280,6 +305,17 @@ class Prog::DownloadBootImage < Prog::Base
         "20250828.1.0" => "3a29122a3836109df78778df24899f864bc8beff7d92d86dc4ab8b99314f520c",
       },
     },
+    "kubernetes-v1_35" => {
+      "x64" => {
+        "20260407.1.0" => "f1a985b5b977a054cb75a0fd4437cb16394fad9777e8fe9b09a4796cc1105cdd",
+        "20260508.1.0" => "343ffdc8b53863c1f553154dda37acfa653e5cc1e854161c5dc7cf12d6ce59dd",
+      },
+    },
+    "kubernetes-v1_36" => {
+      "x64" => {
+        "20260508.1.0" => "821c03a5f7e7971c91b58839928a9fc799f790364048202586a1e9da8823c8c0",
+      },
+    },
     "gpu-ubuntu-noble" => {
       "x64" => {
         "20251017.1.0" => "b87829c6bc71718ff0dffe2948d2586ca7ff95a02dbb03f68d18ec8c223b312c",
@@ -291,9 +327,9 @@ class Prog::DownloadBootImage < Prog::Base
   end.freeze
 
   def sha256sum
-    # YYY: In future all images should be checked for sha256 sum, so the nil
-    # default will be removed.
-    BOOT_IMAGE_SHA256.dig(image_name, vm_host.arch, version)
+    sum = BOOT_IMAGE_SHA256.dig(image_name, vm_host.arch, version)
+    fail "Cannot download images without a SHA256 checksum in production" if !sum && Config.production?
+    sum
   end
 
   def r2_signed_url(key)
@@ -316,6 +352,11 @@ class Prog::DownloadBootImage < Prog::Base
       ssl_ca_data: Config.ubicloud_images_blob_storage_certs,
     )
     client.get_presigned_url("GET", Config.ubicloud_images_bucket_name, key, 60 * 60).to_s
+  end
+
+  def image_size_gib(suffix: nil)
+    image_size_bytes = sshable.cmd("stat -c %s :image_path", image_path: "#{image.path}#{suffix}").to_i
+    (image_size_bytes / 1024.0**3).ceil
   end
 
   label def start
@@ -348,31 +389,39 @@ class Prog::DownloadBootImage < Prog::Base
       params = {image_name:, url:, version:, sha256sum:, certs:, use_htcat: download_from_r2?}
       sshable.cmd("common/bin/daemonizer 'host/bin/download-boot-image' :daemon_name", daemon_name:, stdin: params.to_json)
     when "Failed"
-      restarted = frame["restarted"] || 0
+      restarted = self.restarted || 0
       if restarted < 10
         sshable.cmd("cat var/log/:daemon_name.stderr || true", daemon_name:)
         sshable.cmd("cat var/log/:daemon_name.stdout || true", daemon_name:)
         sshable.cmd("common/bin/daemonizer --clean :daemon_name", daemon_name:)
-        update_stack({"restarted" => restarted + 1})
+        self.restarted = restarted + 1
       else
         Clog.emit("Failed to download boot image", {failed_boot_image_download: [vm_host, {image_name:, version:}]})
       end
-      if cancel_set? || (frame["exit_on_fail"] && restarted >= 10)
+      if cancel_set? || (exit_on_fail && restarted >= 10)
         image.destroy
         pop "operation cancelled"
       end
+    when "InProgress"
+      self.current_size_gib = image_size_gib(suffix: ".tmp")
     end
 
     nap 15
   end
 
   label def update_available_storage_space
-    image_size_bytes = sshable.cmd("stat -c %s :image_path", image_path: image.path).to_i
-    image_size_gib = (image_size_bytes / 1024.0**3).ceil
+    if cancel_set?
+      sshable.cmd("sudo rm -f :path", path: image.path)
+      image.destroy
+      pop "operation cancelled"
+    end
+
+    size_gib = image_size_gib
+    fail "Downloaded boot image has zero size" unless size_gib > 0
     StorageDevice.where(vm_host_id: vm_host.id, name: "DEFAULT").update(
-      available_storage_gib: Sequel[:available_storage_gib] - image_size_gib,
+      available_storage_gib: Sequel[:available_storage_gib] - size_gib,
     )
-    image.update(size_gib: image_size_gib)
+    image.update(size_gib:)
     hop_activate_boot_image
   end
 
@@ -387,7 +436,7 @@ class Prog::DownloadBootImage < Prog::Base
       image,
       boot_image_download: {
         duration: (image.activated_at - image.created_at).round(2),
-        restarts: frame["restarted"] || 0,
+        restarts: restarted || 0,
         vm_host_ubid: vm_host.ubid,
         arch: vm_host.arch,
         location: vm_host.location.display_name,

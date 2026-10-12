@@ -5,7 +5,7 @@ require_relative "../../model/spec_helper"
 RSpec.describe Prog::Test::VmGroup do
   subject(:vg_test) { described_class.new(st) }
 
-  let(:st) { described_class.assemble(boot_images: ["ubuntu-noble", "debian-12"]) }
+  let(:st) { described_class.assemble(boot_images: ["ubuntu-noble", "debian-12"], base_machine_image_names: ["ubuntu-noble"]) }
   let(:prj) { Project.create(name: "project-1") }
   let(:ps1) {
     Prog::Vnet::SubnetNexus.assemble(prj.id, name: "ps1", location_id: Location::HETZNER_FSN1_ID).subject
@@ -21,17 +21,25 @@ RSpec.describe Prog::Test::VmGroup do
   end
 
   describe "#setup_vms" do
+    let(:mi_project) { Project.create(name: "mi-project") }
+    let(:miv) {
+      create_machine_image_version_metal(project_id: mi_project.id, name: "ubuntu-noble", set_latest_version: true)
+    }
+
+    before do
+      allow(Config).to receive(:machine_images_service_project_id).and_return(mi_project.id)
+    end
+
     it "hops to wait_vms" do
-      expect(vg_test).to receive(:update_stack).and_call_original
+      miv
       expect { vg_test.setup_vms }.to hop("wait_vms")
       vm_images = vg_test.strand.stack.first["vms"].map { Vm[it].boot_image }
       expect(vm_images).to eq(["ubuntu-noble", "debian-12", "ubuntu-noble"])
     end
 
     it "provisions at least one vm for each boot image" do
-      expect(vg_test).to receive(:update_stack).and_call_original
+      miv
       refresh_frame(vg_test, new_values: {
-        "test_slices" => true,
         "boot_images" => ["ubuntu-noble", "ubuntu-jammy", "debian-12", "almalinux-9"],
       })
       expect { vg_test.setup_vms }.to hop("wait_vms")
@@ -39,15 +47,36 @@ RSpec.describe Prog::Test::VmGroup do
       expect(vm_images).to eq(["ubuntu-noble", "ubuntu-jammy", "debian-12", "almalinux-9"])
     end
 
-    it "hops to wait_vms if test_slices" do
-      expect(vg_test).to receive(:update_stack).and_call_original
+    it "succeeds when UMI-backed VMs pick up a machine image" do
+      miv
+      expect { vg_test.setup_vms }.to hop("wait_vms")
+      ubuntu_noble_ids = vg_test.strand.stack.first["vms"].select { Vm[it].boot_image == "ubuntu-noble" }
+      expect(ubuntu_noble_ids).not_to be_empty
+      ubuntu_noble_ids.each do |vm_id|
+        expect(Vm[vm_id].vm_storage_volumes_dataset.first(boot: true).machine_image_version_id).to eq(miv.id)
+      end
+    end
+
+    it "fails when a UMI-backed VM does not pick up a machine image" do
+      expect { vg_test.setup_vms }.to hop("failed")
+      expect(vg_test.strand.refresh.exitval["msg"]).to include("did not use a machine image")
+    end
+
+    it "does not leak machine_image_version_id from a sibling VM sharing a storage_options slot" do
+      store = MachineImageStore.create(project_id: mi_project.id, location_id: Location::HETZNER_FSN1_ID, provider: "r2", region: "auto", endpoint: "https://r2.cloudflare.com/", bucket: "test-bucket", access_key: "ak", secret_key: "sk")
+      ["ubuntu-noble", "ubuntu-resolute"].each do |name|
+        create_machine_image_version_metal(project_id: mi_project.id, machine_image_store_id: store.id, name:, set_latest_version: true)
+      end
+
+      # 4 boot images cycle through 3 storage_options slots; almalinux-9 at
+      # index 3 reuses slot 0 after ubuntu-noble stamped its MIV id onto the
+      # shared hash.
       refresh_frame(vg_test, new_values: {
-        "test_reboot" => true,
-        "test_slices" => true,
-        "vms" => [],
-        "boot_images" => ["ubuntu-noble", "ubuntu-jammy", "debian-12", "almalinux-9"],
+        "boot_images" => ["ubuntu-noble", "debian-12", "ubuntu-resolute", "almalinux-9"],
       })
       expect { vg_test.setup_vms }.to hop("wait_vms")
+      almalinux_id = vg_test.strand.stack.first["vms"].find { Vm[it].boot_image == "almalinux-9" }
+      expect(Vm[almalinux_id].vm_storage_volumes_dataset.first(boot: true).machine_image_version_id).to be_nil
     end
   end
 
@@ -74,11 +103,37 @@ RSpec.describe Prog::Test::VmGroup do
       children = st.children_dataset.where(prog: "Test::Vm").all
       expect(children.map { it.stack.first.values_at("subject_id", "first_boot") }).to contain_exactly([vm1.id, true], [vm2.id, true])
     end
+
+    it "reaps under verify_vms_after_reboot on the post-reboot pass" do
+      vm1 = create_vm(name: "test-vm-1")
+      refresh_frame(vg_test, new_values: {"vms" => [vm1.id], "first_boot" => false})
+      expect { vg_test.verify_vms }.to hop("verify_vms_after_reboot")
+      children = st.children_dataset.where(prog: "Test::Vm").all
+      expect(children.map { it.stack.first.values_at("subject_id", "first_boot") }).to contain_exactly([vm1.id, false])
+    end
   end
 
   describe "#wait_verify_vms" do
     it "hops to verify_host_capacity" do
       expect { vg_test.wait_verify_vms }.to hop("verify_host_capacity")
+    end
+
+    it "reaps a successful VM test" do
+      Strand.create(parent_id: st.id, prog: "Test::Vm", label: "finish", stack: [{}], exitval: {"msg" => "Verified VM!"})
+      expect { vg_test.wait_verify_vms }.to hop("verify_host_capacity")
+    end
+
+    it "fails if a VM test failed" do
+      Strand.create(parent_id: st.id, prog: "Test::Vm", label: "failed", stack: [{}], exitval: {"msg" => "unexpected size after dd"})
+      expect { vg_test.wait_verify_vms }.to hop("failed")
+      expect(st.reload.exitval).to eq({"msg" => "VM test failed: unexpected size after dd"})
+    end
+
+    it "keeps the first VM test failure" do
+      refresh_frame(vg_test, new_values: {"vm_test_failure" => "unexpected size after dd"})
+      Strand.create(parent_id: st.id, prog: "Test::Vm", label: "failed", stack: [{}], exitval: {"msg" => "no written stripes reported for disk 0"})
+      expect { vg_test.wait_verify_vms }.to hop("failed")
+      expect(st.reload.exitval).to eq({"msg" => "VM test failed: unexpected size after dd"})
     end
 
     it "stays in wait_verify_vms" do
@@ -103,22 +158,28 @@ RSpec.describe Prog::Test::VmGroup do
       vm1 = create_vm(vm_host_id: vm_host.id, cores: 2, name: "test-vm-1")
       create_vm(vm_host_id: vm_host.id, cores: 0, name: "test-vm-2")
       create_vm_host_slice(vm_host_id: vm_host.id)
-      refresh_frame(vg_test, new_values: {"vms" => [vm1.id], "verify_host_capacity" => true})
+      refresh_frame(vg_test, new_values: {"vms" => [vm1.id], "verify_host_capacity?" => true})
       expect { vg_test.verify_host_capacity }.to hop("verify_vm_host_slices")
     end
 
     it "accounts for the SPDK-reserved cores in used_cores" do
       vm_host = create_vm_host(total_cpus: 16, total_cores: 8, used_cores: 4)
-      2.times { |i| VmHostCpu.create(vm_host_id: vm_host.id, cpu_number: i, spdk: true) }
+      2.times { |i| VmHostCpu.create(vm_host_id: vm_host.id, cpu_number: i, io: true) }
       vm1 = create_vm(vm_host_id: vm_host.id, cores: 2, name: "test-vm-1")
       create_vm_host_slice(vm_host_id: vm_host.id)
-      refresh_frame(vg_test, new_values: {"vms" => [vm1.id], "verify_host_capacity" => true})
+      refresh_frame(vg_test, new_values: {"vms" => [vm1.id], "verify_host_capacity?" => true})
 
       expect { vg_test.verify_host_capacity }.to hop("verify_vm_host_slices")
     end
 
     it "skips if verify_host_capacity is not set" do
-      refresh_frame(vg_test, new_values: {"verify_host_capacity" => false})
+      refresh_frame(vg_test, new_values: {"verify_host_capacity?" => false})
+      expect(vg_test).not_to receive(:vm_host)
+      expect { vg_test.verify_host_capacity }.to hop("verify_vm_host_slices")
+    end
+
+    it "skips on the post-reboot pass, when other tests may share the host" do
+      refresh_frame(vg_test, new_values: {"verify_host_capacity?" => true, "first_boot" => false})
       expect(vg_test).not_to receive(:vm_host)
       expect { vg_test.verify_host_capacity }.to hop("verify_vm_host_slices")
     end
@@ -128,10 +189,10 @@ RSpec.describe Prog::Test::VmGroup do
       vm1 = create_vm(vm_host_id: vm_host.id, cores: 2, name: "test-vm-1")
       create_vm(vm_host_id: vm_host.id, cores: 0, name: "test-vm-2")
       create_vm_host_slice(vm_host_id: vm_host.id)
-      refresh_frame(vg_test, new_values: {"vms" => [vm1.id], "verify_host_capacity" => true})
+      refresh_frame(vg_test, new_values: {"vms" => [vm1.id], "verify_host_capacity?" => true})
 
       expect { vg_test.verify_host_capacity }.to hop("failed")
-      expect(st.reload.exitval).to eq({"msg" => "Host used cores does not match the allocated VMs cores (spdk_cores=0, vm_cores=2, slice_cores=1, used_cores=5)"})
+      expect(st.reload.exitval).to eq({"msg" => "Host used cores does not match the allocated VMs cores (io_cores=0, vm_cores=2, slice_cores=1, used_cores=5)"})
     end
   end
 
@@ -143,43 +204,14 @@ RSpec.describe Prog::Test::VmGroup do
       vm1 = create_vm(vm_host_id: vm_host.id, vm_host_slice_id: slice1.id, name: "test-vm-1")
       vm2 = create_vm(vm_host_id: vm_host.id, vm_host_slice_id: slice2.id, name: "test-vm-2")
       vm3 = create_vm(vm_host_id: vm_host.id, name: "test-vm-3")
-      refresh_frame(vg_test, new_values: {"test_slices" => true, "vms" => [vm1.id, vm2.id, vm3.id]})
+      refresh_frame(vg_test, new_values: {"vms" => [vm1.id, vm2.id, vm3.id]})
 
       expect { vg_test.verify_vm_host_slices }.to hop("start", "Test::VmHostSlices")
     end
 
-    it "hops to verify_storage_rpc if tests are done" do
-      refresh_frame(vg_test, new_values: {"test_slices" => true})
+    it "hops to verify_firewall_rules if tests are done" do
       st.retval = {"msg" => "Verified VM Host Slices!"}
-      expect { vg_test.verify_vm_host_slices }.to hop("verify_storage_rpc")
-    end
-  end
-
-  describe "#verify_storage_rpc" do
-    it "verifies vhost-block-backend version for each vm using RPC" do
-      command = {command: "version"}.to_json
-      expected_response = {version: Config.vhost_block_backend_version.delete_prefix("v")}.to_json + "\n"
-      vm_host = create_vm_host
-      vm1 = create_vm(vm_host_id: vm_host.id, name: "test-vm-1")
-      vm2 = create_vm(vm_host_id: vm_host.id, name: "test-vm-2")
-      refresh_frame(vg_test, new_values: {"vms" => [vm1.id, vm2.id]})
-
-      expect(vg_test.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm1.inhost_name}/0/rpc.sock -q 0", stdin: command).and_return(expected_response)
-      expect(vg_test.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm2.inhost_name}/0/rpc.sock -q 0", stdin: command).and_return(expected_response)
-
-      expect { vg_test.verify_storage_rpc }.to hop("verify_firewall_rules")
-    end
-
-    it "fails if unable to get vhost-block-backend version using RPC" do
-      command = {command: "version"}.to_json
-      vm_host = create_vm_host
-      vm1 = create_vm(vm_host_id: vm_host.id, name: "test-vm-1")
-      refresh_frame(vg_test, new_values: {"vms" => [vm1.id]})
-
-      expect(vg_test.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm1.inhost_name}/0/rpc.sock -q 0", stdin: command).and_return("{\"error\": \"some error\"}\n")
-
-      expect { vg_test.verify_storage_rpc }.to hop("failed")
-      expect(st.reload.exitval).to eq({"msg" => "Failed to get vhost-block-backend version for VM #{vm1.id} using RPC"})
+      expect { vg_test.verify_vm_host_slices }.to hop("verify_firewall_rules")
     end
   end
 
@@ -189,9 +221,11 @@ RSpec.describe Prog::Test::VmGroup do
       expect { vg_test.verify_firewall_rules }.to hop("verify_connected_subnets")
     end
 
-    it "runs tests for the first firewall" do
-      refresh_frame(vg_test, new_values: {"subnets" => [ps1.id]})
-      expect { vg_test.verify_firewall_rules }.to hop("start", "Test::FirewallRules")
+    it "runs tests for the first firewall with the other subnet as the outside subnet" do
+      refresh_frame(vg_test, new_values: {"subnets" => [ps1.id, ps2.id]})
+      expect { vg_test.verify_firewall_rules }.to hop("start", "Test::FirewallRules") { |hop|
+        expect(hop.strand_update_args[:stack].first.values_at("subject_id", "subnet_id_outside")).to eq [ps1.firewalls.first.id, ps2.id]
+      }
     end
   end
 
@@ -203,7 +237,9 @@ RSpec.describe Prog::Test::VmGroup do
 
     it "runs tests for the first connected subnet" do
       refresh_frame(vg_test, new_values: {"subnets" => [ps1.id, ps2.id]})
-      expect { vg_test.verify_connected_subnets }.to hop("start", "Test::ConnectedSubnets")
+      expect { vg_test.verify_connected_subnets }.to hop("start", "Test::ConnectedSubnets") { |hop|
+        expect(hop.strand_update_args[:stack].first.values_at("subnet_id_multiple", "subnet_id_single")).to eq [ps2.id, ps1.id]
+      }
     end
 
     it "runs tests for the second connected subnet" do
@@ -217,17 +253,27 @@ RSpec.describe Prog::Test::VmGroup do
 
     it "hops to destroy_resources if tests are done and reboot is not set" do
       st.retval = {"msg" => "Verified Connected Subnets!"}
-      refresh_frame(vg_test, new_values: {"test_reboot" => false})
+      refresh_frame(vg_test, new_values: {"test_reboot?" => false})
       expect { vg_test.verify_connected_subnets }.to hop("destroy_resources")
     end
   end
 
   describe "#test_reboot" do
-    it "hops to wait_reboot" do
+    it "hops to wait_reboot once the reboot is allowed" do
       vm_host = create_vm_host
       vm = create_vm(vm_host_id: vm_host.id)
       refresh_frame(vg_test, new_values: {"vms" => [vm.id]})
+      vg_test.incr_allow_reboot
+
       expect { vg_test.test_reboot }.to hop("wait_reboot")
+    end
+
+    it "naps until the reboot is allowed" do
+      vm_host = create_vm_host
+      vm = create_vm(vm_host_id: vm_host.id)
+      refresh_frame(vg_test, new_values: {"vms" => [vm.id]})
+
+      expect { vg_test.test_reboot }.to nap(10)
     end
   end
 
@@ -244,9 +290,30 @@ RSpec.describe Prog::Test::VmGroup do
       expect { vg_test.wait_reboot }.to nap(20)
     end
 
-    it "runs vm tests if reboot done" do
+    it "re-verifies vms with first_boot false if reboot done" do
       vm_host.strand.update(label: "wait")
       expect { vg_test.wait_reboot }.to hop("verify_vms")
+      expect(vg_test.strand.stack.first["first_boot"]).to be(false)
+    end
+  end
+
+  describe "#verify_vms_after_reboot" do
+    it "reaps and hops to verify_host_capacity" do
+      Strand.create(parent_id: st.id, prog: "Test::Vm", label: "finish", stack: [{}], exitval: {"msg" => "Verified VM!"})
+      expect { vg_test.verify_vms_after_reboot }.to hop("verify_host_capacity")
+    end
+
+    it "fails if a VM test failed after the reboot" do
+      Strand.create(parent_id: st.id, prog: "Test::Vm", label: "failed", stack: [{}], exitval: {"msg" => "persistence test: file content mismatch"})
+      expect { vg_test.verify_vms_after_reboot }.to hop("failed")
+      expect(st.reload.exitval).to eq({"msg" => "VM test failed: persistence test: file content mismatch"})
+    end
+
+    it "keeps the first VM test failure after the reboot" do
+      refresh_frame(vg_test, new_values: {"vm_test_failure" => "persistence test: file content mismatch"})
+      Strand.create(parent_id: st.id, prog: "Test::Vm", label: "failed", stack: [{}], exitval: {"msg" => "unexpected size after dd"})
+      expect { vg_test.verify_vms_after_reboot }.to hop("failed")
+      expect(st.reload.exitval).to eq({"msg" => "VM test failed: persistence test: file content mismatch"})
     end
   end
 

@@ -12,9 +12,8 @@ RSpec.describe Clover, "Kubernetes" do
   let(:kc) do
     cluster = Prog::Kubernetes::KubernetesClusterNexus.assemble(
       name: "myk8s",
-      version: Option.kubernetes_versions.first,
+      version: Option.selectable_kubernetes_versions.first,
       project_id: project.id,
-      private_subnet_id: PrivateSubnet.create(net6: "0::0", net4: "127.0.0.1", name: "mysubnet", location_id: Location::HETZNER_FSN1_ID, project_id: project.id).id,
       location_id: Location::HETZNER_FSN1_ID,
     ).subject
 
@@ -43,17 +42,26 @@ RSpec.describe Clover, "Kubernetes" do
   end
 
   let(:kc_no_perm) do
-    Prog::Kubernetes::KubernetesClusterNexus.assemble(
+    kc = Prog::Kubernetes::KubernetesClusterNexus.assemble(
       name: "not-my-k8s",
-      version: Option.kubernetes_versions.first,
+      version: Option.selectable_kubernetes_versions.first,
       project_id: project_wo_permissions.id,
-      private_subnet_id: PrivateSubnet.create(net6: "0::0", net4: "127.0.0.1", name: "othersubnet", location_id: Location::HETZNER_FSN1_ID, project_id: project_wo_permissions.id).id,
       location_id: Location::HETZNER_FSN1_ID,
     ).subject
+    Prog::Kubernetes::KubernetesNodepoolNexus.assemble(
+      name: "np-no-perm",
+      node_count: 2,
+      kubernetes_cluster_id: kc.id,
+    ).subject
+    kc
   end
 
   before do
     allow(Config).to receive(:kubernetes_service_project_id).and_return(Project.create(name: "UbicloudKubernetesService").id)
+  end
+
+  def assemble_worker_node(cluster, name)
+    Prog::Kubernetes::KubernetesNodeNexus.assemble(cluster.project_id, sshable_unix_user: "ubi", name:, location_id: cluster.location_id, size: "standard-2", storage_volumes: [{encrypted: true, size_gib: 40}], boot_image: "kubernetes-#{cluster.version.tr(".", "_")}", enable_ip4: true, kubernetes_cluster_id: cluster.id, kubernetes_nodepool_id: cluster.nodepools.first.id).subject
   end
 
   describe "unauthenticated" do
@@ -75,14 +83,12 @@ RSpec.describe Clover, "Kubernetes" do
     end
 
     describe "list" do
-      it "works with 0 kubernetes clusters" do
+      it "shows the creation form with 0 kubernetes clusters" do
         visit "#{project.path}/kubernetes-cluster"
-        expect(page.title).to eq("Ubicloud - Kubernetes Clusters")
-        expect(page).to have_content "No Kubernetes Clusters"
-        expect(page).to have_content "Create Kubernetes Cluster"
 
-        click_link "Create Kubernetes Cluster"
         expect(page.title).to eq("Ubicloud - Create Kubernetes Cluster")
+        expect(page).to have_field "Cluster Name"
+        expect(page).to have_button "Create"
       end
 
       it "lists existing permissible clusters" do
@@ -241,7 +247,7 @@ RSpec.describe Clover, "Kubernetes" do
 
         kn = kc.nodepools.first
 
-        KubernetesNode.create(vm_id: create_vm(name: "node1").id, kubernetes_cluster_id: kc.id, kubernetes_nodepool_id: kn.id)
+        assemble_worker_node(kc, "node1")
 
         kc.reload
         expect(kc.display_state).to eq("creating")
@@ -252,17 +258,16 @@ RSpec.describe Clover, "Kubernetes" do
 
         kc.strand.update(label: "wait")
         kn.strand.update(label: "wait")
+        kc.update(kubeconfig: "kubeconfig content")
         page.refresh
         expect(page.body).not_to include "auto-refresh hidden"
         expect(page.body).to include "running"
         expect(page).to have_no_content "Waiting for cluster to be ready..."
         expect(page).to have_content "Download"
 
-        within("#kubernetes-cluster-submenu") { click_link "Nodes" }
+        within("#kubernetes-cluster-submenu") { click_link "Nodepools" }
 
-        expect(page).to have_content "cp1"
-        expect(page).to have_content "cp2"
-        expect(page).to have_content "node1"
+        expect(page).to have_content kn.name
 
         kc.incr_destroy
         kc.reload
@@ -275,7 +280,7 @@ RSpec.describe Clover, "Kubernetes" do
 
       it "shows up on customer private subnet vms page" do
         visit "#{project.path}/location/#{kc.display_location}/private-subnet/#{kc.private_subnet.ubid}/vms"
-        expect(page.title).to eq "Ubicloud - mysubnet"
+        expect(page.title).to eq "Ubicloud - #{kc.private_subnet.name}"
         expect(page.all("#private-subnet-nics h3").map(&:text)).to eq ["Attached VMs", "Other Attached Resources"]
         expect(page.all("#private-subnet-nics td").map(&:text)).to eq ["No VM attached", "Kubernetes Cluster", kc.name, kc.ubid]
         click_link kc.name
@@ -325,7 +330,7 @@ RSpec.describe Clover, "Kubernetes" do
       end
 
       it "returns kubeconfig content for authorized users" do
-        expect(KubernetesCluster).to receive(:kubeconfig).and_return "kubeconfig content"
+        kc.update(kubeconfig: "kubeconfig content")
 
         visit "#{project.path}#{kc.path}/kubeconfig"
 
@@ -334,15 +339,16 @@ RSpec.describe Clover, "Kubernetes" do
         expect(page.body).to eq("kubeconfig content")
       end
 
-      it "shows error page if there is an error getting kubeconfig file from control plane node" do
-        expect(KubernetesCluster).to receive(:kubeconfig).and_raise(IOError)
+      it "shows error page if the kubeconfig has not been populated yet" do
+        kc.update(kubeconfig: nil)
 
         visit "#{project.path}#{kc.path}/kubeconfig"
 
+        expect(page.status_code).to eq(422)
         expect(page.response_headers["Content-Type"]).to include("text/html")
         expect(page.response_headers["Content-Disposition"]).to be_nil
         expect(page.title).to eq "Ubicloud - myk8s"
-        expect(page).to have_flash_error("Temporary error downloading kubeconfig.yaml. Please try again.")
+        expect(page).to have_flash_error("Cluster is not ready, kubeconfig is not available yet")
       end
 
       it "raises forbidden error when user does not have permission" do
@@ -362,7 +368,7 @@ RSpec.describe Clover, "Kubernetes" do
       end
 
       it "returns proper content headers and content" do
-        expect(KubernetesCluster).to receive(:kubeconfig).and_return "mocked kubeconfig content"
+        kc.update(kubeconfig: "mocked kubeconfig content")
 
         visit "#{project.path}#{kc.path}/kubeconfig"
         expect(page.response_headers["Content-Type"]).to eq("text/yaml")
@@ -404,20 +410,653 @@ RSpec.describe Clover, "Kubernetes" do
     end
 
     describe "resize" do
-      it "can resize kubernetes cluster" do
-        visit "#{project.path}#{kc.path}/settings"
-        expect(kc.nodepools.first.reload.node_count).not_to eq(4)
+      it "can resize a nodepool from its settings page" do
+        kn = kc.nodepools.first
+        kc.strand.update(label: "wait")
+        kn.strand.update(label: "wait")
+        visit "#{project.path}#{kn.path}/settings"
+        expect(kn.reload.node_count).not_to eq(4)
         find('select#node_count option[value="4"]:not([disabled])').select_option
         click_button "Resize"
 
         expect(page).to have_flash_notice("myk8s node pool kn will be resized")
-        expect(kc.nodepools.first.reload.node_count).to eq(4)
+        expect(page).to have_current_path("#{project.path}#{kn.path}/settings")
+        expect(kn.reload.node_count).to eq(4)
+      end
+
+      it "shows a message instead of the resize form while the nodepool is busy" do
+        visit "#{project.path}#{kc.nodepools.first.path}/settings"
+
+        expect(page).to have_content("The nodepool is not ready to be resized. Please wait for ongoing operations to complete.")
+        expect(page).to have_no_button("Resize")
       end
 
       it "does not show resize option without permissions" do
         AccessControlEntry.create(project_id: project_wo_permissions.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
-        visit "#{project_wo_permissions.path}#{kc_no_perm.path}/settings"
+        visit "#{project_wo_permissions.path}#{kc_no_perm.nodepools.first.path}/settings"
         expect(page).to have_no_content("Resize")
+      end
+    end
+
+    describe "charts" do
+      it "shows a chart for every kubernetes metric once the cluster is running" do
+        kc.strand.update(label: "wait")
+        kc.update(kubeconfig: "stored")
+
+        visit "#{project.path}#{kc.path}/charts"
+
+        expect(page.title).to eq "Ubicloud - #{kc.name}"
+        Metrics::KUBERNETES_METRICS.each_value do |metric|
+          expect(page).to have_content metric.name
+        end
+      end
+
+      it "offers a node filter listing the control plane and worker nodes" do
+        kc.strand.update(label: "wait")
+        kc.update(kubeconfig: "stored")
+        Prog::Kubernetes::KubernetesNodeNexus.assemble(kc.project_id, sshable_unix_user: "ubi", name: "cp1", location_id: kc.location_id, size: "standard-2", storage_volumes: [{encrypted: true, size_gib: 40}], boot_image: "kubernetes-#{kc.version.tr(".", "_")}", enable_ip4: true, kubernetes_cluster_id: kc.id)
+        assemble_worker_node(kc, "worker1")
+
+        visit "#{project.path}#{kc.path}/charts"
+
+        options = find_by_id("node-filter").all("option").map(&:value)
+        expect(options).to eq ["all", "cp1", "worker1"]
+      end
+
+      it "tells the user metrics are unavailable while the cluster is creating" do
+        visit "#{project.path}#{kc.path}/charts"
+
+        expect(page).to have_content "No metrics available"
+      end
+    end
+
+    describe "nodepools" do
+      it "lists nodepools with a link to their overview page" do
+        kn = kc.nodepools.first
+        visit "#{project.path}#{kc.path}/nodepools"
+
+        within("#nodepool-#{kn.ubid}") do
+          expect(page).to have_content(kn.target_node_size)
+          expect(page).to have_content(kn.version)
+          click_link kn.name
+        end
+
+        expect(page).to have_current_path("#{project.path}#{kn.path}/overview")
+        expect(page).to have_link(kc.name, href: "#{project.path}#{kc.path}/overview")
+        expect(page).to have_link("Nodepools", href: "#{project.path}#{kc.path}/nodepools")
+        expect(page).to have_content(kn.ubid)
+        expect(page).to have_content(kn.node_count)
+        expect(page).to have_content(kn.target_node_size)
+        expect(page).to have_content(kn.version)
+        expect(page).to have_css(".auto-refresh", visible: :all)
+
+        kn.strand.update(label: "wait")
+        page.refresh
+        expect(page).to have_content(kn.ubid)
+        expect(page).to have_no_css(".auto-refresh", visible: :all)
+      end
+
+      it "can rename a nodepool" do
+        kn = kc.nodepools.first
+        visit "#{project.path}#{kn.path}/settings"
+        fill_in "name", with: "kn-renamed"
+        click_button "Rename"
+
+        expect(page).to have_flash_notice("Name updated")
+        expect(kn.reload.name).to eq("kn-renamed")
+      end
+
+      it "shows an error when renaming to an existing nodepool name" do
+        kn = kc.nodepools.first
+        Prog::Kubernetes::KubernetesNodepoolNexus.assemble(name: "kn2", node_count: 1, kubernetes_cluster_id: kc.id)
+        visit "#{project.path}#{kn.path}/settings"
+        fill_in "name", with: "kn2"
+        click_button "Rename"
+
+        expect(page).to have_content("kubernetes_cluster_id and name is already taken")
+        expect(kn.reload.name).to eq("kn")
+      end
+
+      it "can delete a nodepool" do
+        kn2 = Prog::Kubernetes::KubernetesNodepoolNexus.assemble(name: "kn2", node_count: 1, kubernetes_cluster_id: kc.id).subject
+        visit "#{project.path}#{kn2.path}/settings"
+
+        within("#kn-delete-#{kn2.ubid}") do
+          click_button "Delete"
+        end
+
+        expect(page).to have_flash_notice("kn2 nodepool is scheduled for deletion")
+        expect(page).to have_current_path("#{project.path}#{kc.path}/nodepools")
+        expect(kn2.destroy_set?).to be true
+      end
+
+      it "does not show the deletion section for the last nodepool" do
+        kn = kc.nodepools.first
+        visit "#{project.path}#{kn.path}/settings"
+
+        expect(page).to have_no_content("Danger Zone")
+        expect(page).to have_no_button("Delete")
+      end
+
+      it "can create a nodepool from the nodepools page" do
+        kc.strand.update(label: "wait")
+        kc.nodepools.first.strand.update(label: "wait")
+        visit "#{project.path}#{kc.path}/nodepools"
+
+        fill_in "name", with: "kn2"
+        find('select#node_count option[value="3"]:not([disabled])').select_option
+        click_button "Create"
+
+        expect(page).to have_flash_notice("'kn2' nodepool will be added to the cluster")
+        kn2 = kc.nodepools_dataset.first(name: "kn2")
+        expect(page).to have_current_path("#{project.path}#{kn2.path}/overview")
+        expect(kn2.node_count).to eq(3)
+        expect(kn2.target_node_size).to eq("standard-2")
+        expect(kn2.start_bootstrapping_set?).to be true
+      end
+
+      it "shows an error when creating a nodepool with a taken name" do
+        kc.strand.update(label: "wait")
+        kc.nodepools.first.strand.update(label: "wait")
+        visit "#{project.path}#{kc.path}/nodepools"
+
+        fill_in "name", with: "kn"
+        find('select#node_count option[value="1"]:not([disabled])').select_option
+        click_button "Create"
+
+        expect(page).to have_content("A nodepool with the name \"kn\" already exists in this cluster")
+        expect(kc.nodepools_dataset.count).to eq(1)
+      end
+
+      it "shows a message instead of the create form while the cluster is busy" do
+        visit "#{project.path}#{kc.path}/nodepools"
+
+        expect(page).to have_content("The cluster is not ready to add a nodepool. Please wait for ongoing operations to complete.")
+        expect(page).to have_no_button("Create")
+      end
+
+      it "does not show the create nodepool form without permissions" do
+        AccessControlEntry.create(project_id: project_wo_permissions.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+        visit "#{project_wo_permissions.path}#{kc_no_perm.path}/nodepools"
+
+        expect(page).to have_content(kc_no_perm.nodepools.first.name)
+        expect(page).to have_no_button("Create")
+      end
+
+      it "can upgrade a nodepool from its settings page" do
+        kn = kc.nodepools.first
+        kn.update(version: Option.kubernetes_versions[1])
+        kc.strand.update(label: "wait")
+        kn.strand.update(label: "wait")
+
+        visit "#{project.path}#{kn.path}/settings"
+        expect(page).to have_content "can be upgraded to version"
+        click_button "Upgrade"
+
+        expect(page).to have_flash_notice("myk8s node pool kn will be upgraded to #{Option.kubernetes_versions[0]}")
+        expect(page).to have_current_path("#{project.path}#{kn.path}/settings")
+        expect(page).to have_content "is currently in progress"
+        expect(kn.reload.version).to eq(Option.kubernetes_versions[0])
+        expect(kn.upgrade_requested_set?).to be true
+        expect(kc.upgrade_nodepools_set?).to be true
+      end
+
+      it "shows upgrading in progress while the nodepool strand is upgrading" do
+        kn = kc.nodepools.first
+        kn.strand.update(label: "upgrade")
+
+        visit "#{project.path}#{kn.path}/settings"
+        expect(page).to have_content "is currently in progress"
+      end
+
+      it "shows not ready when an upgrade is available but the cluster is busy" do
+        kn = kc.nodepools.first
+        kn.update(version: Option.kubernetes_versions[1])
+        kc.strand.update(label: "upgrade")
+        kn.strand.update(label: "wait")
+
+        visit "#{project.path}#{kn.path}/settings"
+        expect(page).to have_content "Nodepool is not ready for upgrade"
+        expect(page).to have_no_button "Upgrade"
+      end
+
+      it "shows up to date when the nodepool matches the cluster version" do
+        kn = kc.nodepools.first
+        kc.strand.update(label: "wait")
+        kn.strand.update(label: "wait")
+
+        visit "#{project.path}#{kn.path}/settings"
+        expect(page).to have_content "Your nodepool is up to date on version"
+        expect(page).to have_content kn.version
+      end
+
+      it "points to the control plane upgrade when the nodepool matches a cluster that can be upgraded" do
+        kn = kc.nodepools.first
+        kc.update(version: Option.selectable_kubernetes_versions[1])
+        kn.update(version: Option.selectable_kubernetes_versions[1])
+        kc.strand.update(label: "wait")
+        kn.strand.update(label: "wait")
+
+        visit "#{project.path}#{kn.path}/settings"
+        expect(page).to have_content "A newer kubernetes version becomes available for the nodepool once the control plane is upgraded."
+        expect(page).to have_no_button "Upgrade"
+      end
+    end
+
+    describe "retire node" do
+      it "can retire a worker node from the nodepool nodes tab" do
+        node = assemble_worker_node(kc, "node1")
+        kn = kc.nodepools.first
+        kn.strand.update(label: "wait")
+
+        visit "#{project.path}#{kn.path}/nodes"
+        expect(page).to have_content("node1")
+
+        click_button "Retire"
+
+        expect(page).to have_flash_notice("Node node1 is scheduled to be retired")
+        expect(page).to have_current_path("#{project.path}#{kn.path}/nodes")
+        expect(node.retire_set?(cached: false)).to be true
+        expect(kn.reload.node_count).to eq(1)
+      end
+
+      it "does not show a retire button until the nodepool finishes bootstrapping" do
+        assemble_worker_node(kc, "node1")
+
+        visit "#{project.path}#{kc.nodepools.first.path}/nodes"
+        expect(page).to have_content("node1")
+        expect(page).to have_no_button("Retire")
+      end
+
+      it "does not show a retire button when the nodepool has a single node" do
+        kc.nodepools.first.update(node_count: 1)
+        assemble_worker_node(kc, "node1")
+        kc.nodepools.first.strand.update(label: "wait")
+
+        visit "#{project.path}#{kc.nodepools.first.path}/nodes"
+        expect(page).to have_content("node1")
+        expect(page).to have_no_button("Retire")
+      end
+
+      it "shows the retiring state for a node that is already retiring" do
+        assemble_worker_node(kc, "node1").update(state: "draining")
+
+        visit "#{project.path}#{kc.nodepools.first.path}/nodes"
+        expect(page).to have_content("Retiring...")
+        expect(page).to have_no_button("Retire")
+      end
+
+      it "does not show retire option without permissions" do
+        AccessControlEntry.create(project_id: project_wo_permissions.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+        assemble_worker_node(kc_no_perm, "node1")
+
+        visit "#{project_wo_permissions.path}#{kc_no_perm.nodepools.first.path}/nodes"
+        expect(page).to have_content("node1")
+        expect(page).to have_no_button("Retire")
+      end
+    end
+
+    describe "upgrade" do
+      it "shows upgrade button when upgrade is available and cluster is ready" do
+        kc.update(version: Option.selectable_kubernetes_versions[1])
+        kc.strand.update(label: "wait")
+        kc.nodepools.first.strand.update(label: "wait")
+
+        visit "#{project.path}#{kc.path}/settings"
+        expect(page).to have_content "Upgrade Control Plane"
+        expect(page).to have_content "can be upgraded to version"
+        expect(page).to have_content Option.selectable_kubernetes_versions.first
+        expect(page).to have_button "Upgrade"
+      end
+
+      it "shows upgrading in progress when cluster strand is upgrading" do
+        kc.strand.update(label: "upgrade")
+        kc.nodepools.first.strand.update(label: "wait")
+
+        visit "#{project.path}#{kc.path}/settings"
+        expect(page).to have_content "Upgrade Control Plane"
+        expect(page).to have_content "is currently in progress"
+      end
+
+      it "shows upgrading in progress when nodepools are being upgraded" do
+        kc.strand.update(label: "wait")
+        kc.incr_upgrade_nodepools
+        kc.nodepools.first.strand.update(label: "wait_upgrade")
+
+        visit "#{project.path}#{kc.path}/settings"
+        expect(page).to have_content "is currently in progress"
+      end
+
+      it "shows a nodepool skew warning when a nodepool is more than two minor versions behind" do
+        kc.update(version: Option.selectable_kubernetes_versions[1])
+        kn = kc.nodepools.first
+        kn.update(version: "v1.#{Option.kubernetes_minor_version(kc.version) - 3}")
+        kc.strand.update(label: "wait")
+        kn.strand.update(label: "wait")
+
+        visit "#{project.path}#{kc.path}/settings"
+        expect(page).to have_content "all nodepools must be upgraded to within two minor versions of the cluster first"
+        expect(page).to have_no_button "Upgrade"
+      end
+
+      it "shows not ready when upgrade is available but strands are busy" do
+        kc.update(version: Option.selectable_kubernetes_versions.last)
+        kc.strand.update(label: "wait")
+        kc.nodepools.first.strand.update(label: "bootstrap_worker_nodes")
+
+        visit "#{project.path}#{kc.path}/settings"
+        expect(page).to have_content "Cluster is not ready for upgrade"
+        expect(page).to have_no_button "Upgrade"
+      end
+
+      it "shows up to date when no upgrade is available" do
+        kc.strand.update(label: "wait")
+        kc.nodepools.first.strand.update(label: "wait")
+
+        visit "#{project.path}#{kc.path}/settings"
+        expect(page).to have_content "Your cluster is up to date on version"
+        expect(page).to have_content Option.selectable_kubernetes_versions.first
+      end
+
+      it "can upgrade kubernetes cluster" do
+        kc.update(version: Option.selectable_kubernetes_versions[1])
+        kc.strand.update(label: "wait")
+        kc.nodepools.first.strand.update(label: "wait")
+
+        visit "#{project.path}#{kc.path}/settings"
+        click_button "Upgrade"
+
+        expect(page).to have_flash_notice("myk8s will be upgraded to #{Option.selectable_kubernetes_versions.first}")
+        expect(kc.reload.version).to eq Option.selectable_kubernetes_versions.first
+        expect(kc.upgrade_set?).to be true
+      end
+    end
+
+    describe "networking" do
+      let(:kc_ps) { kc.private_subnet }
+
+      let(:pg_subnet) {
+        Prog::Vnet::SubnetNexus.assemble(project.id, name: "pg-subnet", location_id: Location::HETZNER_FSN1_ID).subject
+      }
+
+      let(:pg) {
+        resource = create_postgres_resource(project:, location_id: Location::HETZNER_FSN1_ID)
+        resource.update(private_subnet_id: pg_subnet.id)
+        resource.reload
+      }
+
+      before do
+        kc
+      end
+
+      it "can navigate to networking page via tab" do
+        visit "#{project.path}#{kc.path}"
+        within("#kubernetes-cluster-submenu") { click_link "Networking" }
+        expect(page.title).to eq("Ubicloud - #{kc.name}")
+        expect(page).to have_content kc_ps.name
+      end
+
+      it "shows private subnet with networking link when user has PrivateSubnet:view" do
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_link(kc_ps.name, href: "#{project.path}#{kc_ps.path}/networking")
+      end
+
+      it "shows private subnet without link when user lacks PrivateSubnet:view" do
+        AccessControlEntry.dataset.destroy
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_content kc_ps.name
+        expect(page).to have_no_link(kc_ps.name)
+      end
+
+      it "shows attached firewall with networking link when user has Firewall:view" do
+        fw = Firewall.create(name: "kc-fw", description: "kc firewall", location_id: Location::HETZNER_FSN1_ID, project_id: project.id)
+        fw.associate_with_private_subnet(kc_ps)
+
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_link(fw.name, href: "#{project.path}#{fw.path}/networking")
+      end
+
+      it "shows attached firewall without link when user lacks Firewall:view" do
+        fw = Firewall.create(name: "kc-fw", description: "kc firewall", location_id: Location::HETZNER_FSN1_ID, project_id: project.id)
+        fw.associate_with_private_subnet(kc_ps)
+
+        AccessControlEntry.dataset.destroy
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_content fw.name
+        expect(page).to have_no_link(fw.name)
+      end
+
+      it "shows no firewall section content when no firewalls attached" do
+        kc.private_subnet.remove_all_firewalls
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_content "No firewall attached"
+      end
+
+      it "does not show postgres section when no postgres databases exist" do
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_no_content "PostgreSQL Databases"
+      end
+
+      it "shows postgres databases when user has Postgres:view" do
+        pg
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_content "PostgreSQL Databases"
+        expect(page).to have_content pg.name
+        expect(page).to have_content "Not connected"
+      end
+
+      it "does not show postgres databases when user lacks Postgres:view" do
+        pg
+        AccessControlEntry.dataset.destroy
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_no_content "PostgreSQL Databases"
+        expect(page).to have_no_content pg.name
+      end
+
+      it "shows connect button when subnets are not connected and user has admin permissions" do
+        pg
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_button("Connect")
+      end
+
+      it "does not shows connect button when all of the subnet's firewalls are connected to other subnets" do
+        ps = PrivateSubnet.create(net6: "1::0", net4: "128.0.0.1", name: "mysubnet2", location_id: Location::HETZNER_FSN1_ID, project_id: project.id)
+        ps.add_firewall(pg.private_subnet.firewalls.first)
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_no_button("Connect")
+      end
+
+      it "does not shows connect button when the postgres subnet does not have a firewall" do
+        pg.private_subnet.remove_all_firewalls
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_no_button("Connect")
+      end
+
+      it "does not show connect button when user lacks PrivateSubnet:connect" do
+        pg
+        AccessControlEntry.dataset.destroy
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Postgres:view"])
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Firewall:view"])
+
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_content pg.name
+        expect(page).to have_no_button("Connect")
+      end
+
+      it "does not show connect button when user lacks Firewall:edit on postgres subnet firewalls" do
+        pg
+        AccessControlEntry.dataset.destroy
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Postgres:view"])
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["PrivateSubnet:connect"])
+
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_content pg.name
+        expect(page).to have_no_button("Connect")
+      end
+
+      it "shows connect button when user has all necessary permissions" do
+        pg
+        AccessControlEntry.dataset.destroy
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Postgres:view"])
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["PrivateSubnet:connect"])
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Firewall:edit"])
+
+        visit "#{project.path}#{kc.path}/networking"
+        expect(page).to have_content pg.name
+        expect(page).to have_button("Connect")
+      end
+
+      context "when subnets are already connected" do
+        before do
+          @kc_connected = Prog::Kubernetes::KubernetesClusterNexus.assemble(
+            name: "kc-connected",
+            version: Option.kubernetes_versions.first,
+            project_id: project.id,
+            location_id: Location::HETZNER_FSN1_ID,
+          ).subject
+          pg
+          @kc_connected.private_subnet.connect_subnet(pg_subnet)
+        end
+
+        it "shows Connected status with links to postgres subnet and firewalls when user has all permissions" do
+          visit "#{project.path}#{@kc_connected.path}/networking"
+          expect(page).to have_content pg.name
+          expect(page).to have_link("Connected", href: "#{project.path}#{pg_subnet.path}/networking")
+
+          pg_fw = pg_subnet.firewalls.first
+          expect(page).to have_link(pg_fw.name, href: "#{project.path}#{pg_fw.path}/networking")
+        end
+
+        it "shows Connected status without links when user lacks PrivateSubnet:view on postgres subnet" do
+          AccessControlEntry.dataset.destroy
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Postgres:view"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Firewall:view"])
+
+          visit "#{project.path}#{@kc_connected.path}/networking"
+          expect(page).to have_content pg.name
+          expect(page).to have_content "Connected"
+          expect(page).to have_no_link("Connected")
+        end
+
+        it "shows Connected status without firewall links when user lacks Firewall:view on postgres subnet firewalls" do
+          AccessControlEntry.dataset.destroy
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Postgres:view"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["PrivateSubnet:view"])
+
+          visit "#{project.path}#{@kc_connected.path}/networking"
+          expect(page).to have_content pg.name
+          expect(page).to have_link("Connected", href: "#{project.path}#{pg_subnet.path}/networking")
+          pg_fw = pg_subnet.firewalls.first
+          expect(page).to have_no_link(pg_fw.name)
+        end
+      end
+
+      context "when connecting postgres subnet" do
+        before do
+          @kc_connectable = Prog::Kubernetes::KubernetesClusterNexus.assemble(
+            name: "kc-connectable",
+            version: Option.kubernetes_versions.first,
+            project_id: project.id,
+            location_id: Location::HETZNER_FSN1_ID,
+          ).subject
+          pg
+        end
+
+        it "connects the private subnets and adds firewall rules when button is clicked" do
+          visit "#{project.path}#{@kc_connectable.path}/networking"
+          expect(page).to have_content pg.name
+          expect(page).to have_button("Connect")
+
+          expect(DB[:audit_log].count).to eq 0
+          click_button "Connect"
+
+          expect(page).to have_flash_notice("Connecting to #{pg.name}. Firewall rules will be updated in a few seconds.")
+          expect(page).to have_current_path("#{project.path}#{@kc_connectable.path}/networking", ignore_query: true)
+          expect(DB[:audit_log].count).to eq 2
+
+          @kc_connectable.private_subnet.reload
+          expect(@kc_connectable.private_subnet.connected_subnets.map(&:id)).to include pg_subnet.id
+
+          pg_fw = pg_subnet.firewalls.first
+          pg_fw.reload
+          kc_cidr4 = @kc_connectable.private_subnet.net4.to_s
+          kc_cidr6 = @kc_connectable.private_subnet.net6.to_s
+          rule_summaries = pg_fw.firewall_rules.map { |r| [r.cidr.to_s, r.display_port_range] }
+          expect(rule_summaries).to include([kc_cidr4, "5432"])
+          expect(rule_summaries).to include([kc_cidr4, "6432"])
+          expect(rule_summaries).to include([kc_cidr6, "5432"])
+          expect(rule_summaries).to include([kc_cidr6, "6432"])
+
+          # Check that connection works even if some firewall rules already exist
+          path = page.current_path
+          click_link "Connected"
+          click_button "Disconnect"
+          expect(DB[:audit_log].count).to eq 3
+          visit path
+          click_button "Connect"
+          expect(page).to have_flash_notice("Connecting to #{pg.name}. Firewall rules will be updated in a few seconds.")
+          expect(DB[:audit_log].count).to eq 4
+        end
+
+        it "shows error if firewall used is associated with more than one subnet" do
+          visit "#{project.path}#{@kc_connectable.path}/networking"
+          ps = PrivateSubnet.create(net6: "1::0", net4: "128.0.0.1", name: "mysubnet2", location_id: Location::HETZNER_FSN1_ID, project_id: project.id)
+          ps.add_firewall(pg.private_subnet.firewalls.first)
+          click_button "Connect"
+          expect(page).to have_flash_error("Unable to connect to #{pg.name} as the requested firewall is used by other subnets.")
+        end
+
+        it "returns forbidden when user lacks KubernetesCluster:view" do
+          visit "#{project.path}#{@kc_connectable.path}/networking"
+          AccessControlEntry.dataset.destroy
+          click_button "Connect"
+          expect(page.status_code).to eq(403)
+          expect(page).to have_no_button("Connect")
+        end
+
+        it "returns forbidden when user lacks Postgres:view" do
+          visit "#{project.path}#{@kc_connectable.path}/networking"
+          AccessControlEntry.dataset.destroy
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["PrivateSubnet:connect"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Firewall:edit"])
+          click_button "Connect"
+          expect(page.status_code).to eq(403)
+          expect(page).to have_no_button("Connect")
+        end
+
+        it "returns forbidden when user lacks PrivateSubnet:connect" do
+          visit "#{project.path}#{@kc_connectable.path}/networking"
+          AccessControlEntry.dataset.destroy
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Postgres:view"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Firewall:edit"])
+          click_button "Connect"
+          expect(page.status_code).to eq(403)
+          expect(page).to have_no_button("Connect")
+        end
+
+        it "returns forbidden when user lacks Firewall:edit on postgres subnet firewalls" do
+          visit "#{project.path}#{@kc_connectable.path}/networking"
+          AccessControlEntry.dataset.destroy
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["KubernetesCluster:view"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Postgres:view"])
+          AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["PrivateSubnet:connect"])
+          click_button "Connect"
+          expect(page.status_code).to eq(403)
+          expect(page).to have_no_button("Connect")
+        end
       end
     end
 
@@ -431,7 +1070,7 @@ RSpec.describe Clover, "Kubernetes" do
         end
         expect(page).to have_flash_notice("Kubernetes cluster scheduled for deletion.")
 
-        expect(SemSnap.new(kc.id).set?("destroy")).to be true
+        expect(kc.destroy_set?).to be true
       end
 
       it "can not delete kubernetes cluster when does not have permissions" do

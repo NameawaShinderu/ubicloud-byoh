@@ -2,13 +2,12 @@
 
 <% if !data || data.empty? %>
   <p>
-    No data available for
-    <strong><%= title %></strong>
-    table
+    No data available for <strong><%= title %></strong> table
   </p>
 <% else %>
   <table class="<%= table_class %>">
     <caption><%= title %></caption>
+
     <thead>
       <tr>
         <% data.first.each_key do |k| %>
@@ -16,6 +15,7 @@
         <% end %>
       </tr>
     </thead>
+
     <tbody>
       <% data.each do |row| %>
         <tr>
@@ -23,10 +23,16 @@
             <td>
               <% if use_admin_label && v.is_a?(String) && v.bytesize == 26 && (column_class = UBID.class_for_ubid(v)) && column_class.method_defined?(:ubid) && (obj = UBID.decode(v)) %>
                 <a href="/model/<%= column_class %>/<%= v %>" title="<%= v %>"><%= obj.admin_label %></a>
-              <% elsif v&.is_a?(Sequel::Postgres::JSONBHash) %>
+              <% elsif v&.is_a?(Sequel::Postgres::JSONBHash) || v&.is_a?(Sequel::Postgres::JSONBArray) %>
                 <pre><%== linkify_ubids(JSON.pretty_generate(v)) %></pre>
               <% elsif v.is_a?(CloverAdmin::TableLink) %>
                 <a href="<%= v.link %>"><%= v.value %></a>
+              <% elsif v.is_a?(CloverAdmin::TableFormButton) %>
+                <%== form(v.attributes, button: v.text) %>
+              <% elsif v.is_a?(CloverAdmin::TableCost) %>
+                <span class="cost"><%= v %></span>
+              <% elsif v.is_a?(Time) %>
+                <%= v.strftime("%F %T") %>
               <% else %>
                 <%== linkify_ubids(v.to_s) %>
               <% end %>

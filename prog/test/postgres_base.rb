@@ -1,0 +1,222 @@
+# frozen_string_literal: true
+
+class Prog::Test::PostgresBase < Prog::Test::Base
+  frame_reader :provider, :family, :aws_location_name, :gcp_location_name, :postgres_test_project_id, :local_e2e
+  frame_accessor :postgres_resource_id, :private_subnet_id, :location_id, :fail_message, :timeline_ids
+
+  def self.assemble(provider:, project_name:, family: nil, aws_location_name: "us-west-2", gcp_location_name: "gcp-us-central1", local_e2e: false, gcp_dedicated_subnet_vpcs: true)
+    postgres_test_project = if Config.local_e2e_postgres_test_project_id
+      Project.with_pk!(Config.local_e2e_postgres_test_project_id)
+    else
+      Project.create(name: project_name, gcp_dedicated_subnet_vpcs:)
+    end
+
+    postgres_test_project.set_ff_aws_cloudwatch_logs(true)
+
+    Project[Config.postgres_service_project_id] ||
+      Project.create_with_id(Config.postgres_service_project_id || Project.generate_uuid, name: "Postgres-Service-Project")
+
+    Strand.create(
+      prog: name.delete_prefix("Prog::"),
+      label: "start",
+      stack: [{
+        "provider" => provider,
+        "family" => family,
+        "aws_location_name" => aws_location_name,
+        "gcp_location_name" => gcp_location_name,
+        "postgres_test_project_id" => postgres_test_project.id,
+        "local_e2e" => local_e2e,
+      }],
+    )
+  end
+
+  def self.postgres_test_location_options(provider, family: nil, aws_location_name: "us-west-2", gcp_location_name: "gcp-us-central1")
+    case provider
+    when "aws"
+      location = Location[provider: "aws", project_id: Config.local_e2e_postgres_test_project_id, name: aws_location_name]
+      Prog::Test::Base.ensure_aws_e2e_credential(location)
+      family = "m8gd"
+      vcpus = 2
+      [location.id, Option.aws_instance_type_name(family, vcpus), Option::AWS_STORAGE_SIZE_OPTIONS[family][vcpus].first.to_i]
+    when "gcp"
+      location = Location[provider: "gcp", project_id: nil, name: gcp_location_name]
+      Prog::Test::Base.ensure_gcp_e2e_credential(location)
+      family ||= "c4a-standard"
+      vcpus = Option::GCP_STORAGE_SIZE_OPTIONS[family].keys.first
+      [location.id, "#{family}-#{vcpus}", Option::GCP_STORAGE_SIZE_OPTIONS[family][vcpus].first.to_i]
+    else
+      [Location::HETZNER_FSN1_ID, "standard-2", 64]
+    end
+  end
+
+  def before_run
+    super
+
+    if pause_set?
+      nap(60 * 60)
+    end
+  end
+
+  def start(**)
+    location_id, target_vm_size, target_storage_size_gib = self.class.postgres_test_location_options(
+      provider,
+      family:,
+      aws_location_name: aws_location_name || "us-west-2",
+      gcp_location_name: gcp_location_name || "gcp-us-central1",
+    )
+
+    st = Prog::Postgres::PostgresResourceNexus.assemble(
+      project_id: postgres_test_project_id,
+      location_id:,
+      target_vm_size:,
+      target_storage_size_gib:,
+      **,
+    )
+
+    self.postgres_resource_id = st.id
+    self.private_subnet_id = st.subject.private_subnet_id
+    self.location_id = location_id
+    yield st.subject if block_given?
+    hop_wait_postgres_resource
+  end
+
+  def postgres_test_project
+    @postgres_test_project ||= Project[postgres_test_project_id]
+  end
+
+  def postgres_resource
+    @postgres_resource ||= PostgresResource[postgres_resource_id]
+  end
+
+  def representative_server
+    @representative_server ||= postgres_resource.representative_server
+  end
+
+  # Both CloudWatch streams moved from the agent to the collector, and
+  # configure-logs disables the agent in the same run that adds the
+  # pipelines. Servers where aws_cloudwatch_logs? is false are skipped.
+  def verify_cloudwatch_cutover
+    failure = postgres_resource.servers.lazy.filter_map { cloudwatch_cutover_failure(it) }.first
+    self.fail_message = failure if failure
+  end
+
+  def cloudwatch_cutover_failure(server)
+    return unless server.aws_cloudwatch_logs?
+    sshable = server.vm.sshable
+
+    unless (agent_state = sshable.cmd("systemctl is-active amazon-cloudwatch-agent || true").strip) == "inactive"
+      return "CloudWatch agent is #{agent_state} on #{server.ubid}, expected inactive"
+    end
+
+    unless (collector_state = sshable.cmd("systemctl is-active otelcol-contrib || true").strip) == "active"
+      return "Collector is #{collector_state} on #{server.ubid}, expected active"
+    end
+
+    pipelines = sshable.cmd("sudo grep -c -e logs/auth/cloudwatch -e logs/postgresql/cloudwatch /etc/otelcol-contrib/config.yaml || true").strip
+    unless pipelines == "2"
+      "Collector config on #{server.ubid} has #{pipelines} cloudwatch pipelines, expected 2"
+    end
+  end
+
+  def verify_guardduty_agent
+    failure = postgres_resource.servers.lazy.filter_map { guardduty_agent_failure(it) }.first
+    self.fail_message = failure if failure
+  end
+
+  def guardduty_agent_failure(server)
+    return unless server.aws_cloudwatch_logs?
+
+    status = server.vm.sshable.cmd("dpkg-query --show --showformat='${Status}' amazon-guardduty-agent || true")
+    "GuardDuty agent is not installed on #{server.ubid}" unless status == "install ok installed"
+  end
+
+  def test_queries_sql
+    File.read("./prog/test/testdata/order_analytics_queries.sql").freeze
+  end
+
+  def read_queries_sql
+    File.read("./prog/test/testdata/order_analytics_read_queries.sql").freeze
+  end
+
+  def nap_if_private_subnet(subnet_id = private_subnet_id)
+    if subnet_id && PrivateSubnet[subnet_id]
+      Clog.emit("Waiting for private subnet to be destroyed")
+      nap 5
+    end
+  end
+
+  def nap_if_gcp_vpc(subnet_id = private_subnet_id)
+    has_gcp_vpc = if postgres_test_project.gcp_dedicated_subnet_vpcs
+      subnet_id && GcpVpc[dedicated_for_subnet_id: subnet_id]
+    else
+      GcpVpc[project_id: postgres_test_project_id]
+    end
+
+    if has_gcp_vpc
+      Clog.emit("Waiting for GCP VPC to be destroyed")
+      nap 5
+    end
+  end
+
+  def verify_timelines_destroyed(timeline_ids)
+    remaining = PostgresTimeline.where(id: timeline_ids).select_map(:id)
+    return if remaining.empty?
+    PostgresTimeline.incr_destroy(remaining)
+    Clog.emit("Verifying timelines are retained after resource destroy (found #{remaining.count})")
+    nap 5
+  end
+
+  label def finish
+    postgres_test_project.destroy unless Config.local_e2e_postgres_test_project_id
+    if fail_message
+      if local_e2e
+        pop fail_message
+      else
+        fail_test(fail_message)
+      end
+    end
+    pop "Postgres tests are finished!"
+  end
+
+  label def failed
+    nap 15
+  end
+
+  label def destroy
+    if fail_message && local_e2e
+      unless destroy_set?
+        Prog::PageNexus.assemble("Local E2E Failure: #{self.class.name}", ["LocalE2eFailure", strand.ubid], strand.ubid, resource_id: strand.id, severity: "info")
+        nap 60 * 60 * 24 * 365
+      end
+
+      Page.from_tag_parts("LocalE2eFailure", strand.ubid)&.incr_resolve
+    end
+
+    hop_destroy_postgres
+  end
+
+  label def destroy_postgres
+    if postgres_resource
+      self.timeline_ids ||= postgres_resource.servers_dataset.distinct.select_map(:timeline_id)
+      postgres_resource.incr_destroy
+    end
+    hop_wait_resources_destroyed
+  end
+
+  # Rule edits fan out differently per provider. On GCP, Firewall bumps
+  # update_firewall_rules on the subnet; SubnetNexus#wait then forwards
+  # to the GcpVpc, whose VpcNexus runs the shared policy sync. On
+  # metal/AWS, the subnet fans the semaphore out to its VMs. Wait for
+  # the target chain to drain end-to-end: on GCP both subnet and VPC
+  # must be back in `wait` with no pending semaphore, since the subnet
+  # holds the semaphore until SubnetNexus wakes and forwards it.
+  def wait_firewall_rules_applied
+    ps = postgres_resource.private_subnet
+    if (vpc = ps.gcp_vpc)
+      nap 5 if ps.update_firewall_rules_set? || ps.strand.label != "wait" ||
+        vpc.update_firewall_rules_set? || vpc.strand.label != "wait"
+    elsif ps.update_firewall_rules_set? || ps.vms.any?(&:update_firewall_rules_set?)
+      nap 5
+    end
+  end
+end

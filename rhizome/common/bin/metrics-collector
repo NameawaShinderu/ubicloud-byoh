@@ -30,25 +30,55 @@ metrics_config_hash = JSON.parse(File.read("#{metrics_dir}/config.json"))
 endpoints = metrics_config_hash["endpoints"]
 max_file_retention = metrics_config_hash["max_file_retention"] || 100
 
+# Optional list of regexps. Any scraped line matching one is dropped before it
+# is written to disk, keeping high-cardinality timeseries out of the buffer,
+# the export, and the metrics store.
+exclude_metrics = metrics_config_hash["exclude_metrics"] || []
+exclude_regex = Regexp.union(exclude_metrics.map { Regexp.new(_1) }) unless exclude_metrics.empty?
+
 filename = Time.now.utc.strftime("%Y-%m-%dT%H-%M-%S-%6N")
 pending_file_path = "#{metrics_dir}/pending/#{filename}.txt"
 
 # Download content directly to the pending directory
 File.open(pending_file_path, "w") do |file|
   endpoints.each do |endpoint|
-    uri = URI(endpoint)
+    # An endpoint can be a plain URL string, or a hash carrying basic auth
+    # credentials: {"url" => ..., "username" => ..., "password" => ...}.
+    endpoint = {"url" => endpoint} if endpoint.is_a?(String)
+    uri = URI(endpoint["url"])
     http = Net::HTTP.new(uri.host, uri.port)
+    http.open_timeout = 5
+    http.read_timeout = 10
     http.use_ssl = uri.scheme == "https"
     http.verify_mode = OpenSSL::SSL::VERIFY_NONE # Equivalent to --insecure
 
-    response = http.get(uri.request_uri)
-    fail "HTTP request failed with status: #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+    request = Net::HTTP::Get.new(uri.request_uri)
+    request["Accept-Encoding"] = "identity" # don't compress over localhost
+    request.basic_auth(endpoint["username"], endpoint["password"]) if endpoint["username"]
 
-    file.write(response.body)
+    http.request(request) do |response|
+      fail "HTTP request failed with status: #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+      if exclude_regex
+        carry = +""
+        response.read_body do |chunk|
+          carry << chunk
+          next unless (last_nl = carry.rindex("\n"))
+          carry.slice!(0, last_nl + 1).each_line { file.write(_1) unless exclude_regex.match?(_1) }
+        end
+        file.write(carry) unless carry.empty? || exclude_regex.match?(carry)
+      else
+        response.read_body { file.write(_1) }
+      end
+    end
   end
   file.flush
   file.fsync
 end
+
+# The done directory mtime is how the control plane sees that a scrape landed.
+# An empty response must not move it.
+fail "All endpoints returned an empty response" if File.empty?(pending_file_path)
 
 # Move complete file to "done" and make confirm rename persistence via
 # directory fsync.

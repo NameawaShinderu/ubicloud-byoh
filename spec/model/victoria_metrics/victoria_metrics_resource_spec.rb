@@ -42,6 +42,57 @@ RSpec.describe VictoriaMetricsResource do
     expect(vmr.hostname).to eq("victoria-metrics-name.victoria.ubicloud.com")
   end
 
+  describe "#client_for_project" do
+    it "returns nil when the resource has no representative server outside development" do
+      vmr # ensure the resource exists for the lookup
+      expect(described_class.client_for_project(project.id)).to be_nil
+    end
+
+    it "returns the representative server's client unwrapped when there is only one server" do
+      vm = create_vm
+      VictoriaMetricsServer.create(victoria_metrics_resource_id: vmr.id, vm_id: vm.id, is_representative: true)
+      client = instance_double(VictoriaMetrics::Client)
+      expect(VictoriaMetrics::Client).to receive(:new).and_return(client)
+      expect(described_class.client_for_project(project.id)).to be(client)
+    end
+
+    it "wraps the client in a TeeClient pointed at every non-representative server's IPv4 when there are multiple servers" do
+      representative_vm = create_vm
+      VictoriaMetricsServer.create(victoria_metrics_resource_id: vmr.id, vm_id: representative_vm.id, is_representative: true)
+      secondary_vm = create_vm
+      VictoriaMetricsServer.create(victoria_metrics_resource_id: vmr.id, vm_id: secondary_vm.id, is_representative: false)
+
+      primary_client = instance_double(VictoriaMetrics::Client)
+      secondary_client = instance_double(VictoriaMetrics::Client)
+      expect(VictoriaMetrics::Client).to receive(:new).with(hash_including(verify_host: nil)).and_return(primary_client)
+      expect(VictoriaMetrics::Client).to receive(:new).with(hash_including(
+        endpoint: a_string_matching(%r{\Ahttps://[^\[\]]*:8427\z}),
+        ssl_ca_data: vmr.root_certs,
+        verify_host: vmr.hostname,
+        username: vmr.admin_user,
+        password: vmr.admin_password,
+      )).and_return(secondary_client)
+
+      tee_client = described_class.client_for_project(project.id)
+      expect(tee_client).to be_a(VictoriaMetrics::TeeClient)
+      expect(tee_client.__getobj__).to be(primary_client)
+      expect(tee_client.instance_variable_get(:@secondaries)).to eq([secondary_client])
+    end
+  end
+
+  describe "#dns_zone" do
+    it "returns the DnsZone matching victoria_metrics_service_project_id and victoria_metrics_host_name" do
+      dns_zone = DnsZone.create(project_id: vmr.project_id, name: "victoria.example.com")
+      expect(Config).to receive_messages(victoria_metrics_service_project_id: vmr.project_id, victoria_metrics_host_name: "victoria.example.com")
+      expect(vmr.dns_zone).to eq(dns_zone)
+    end
+
+    it "returns nil when no matching DnsZone exists" do
+      expect(Config).to receive_messages(victoria_metrics_service_project_id: vmr.project_id, victoria_metrics_host_name: "victoria.example.com")
+      expect(vmr.dns_zone).to be_nil
+    end
+  end
+
   it "returns root_certs properly when both certificates are present" do
     expect(vmr.root_certs).to eq("dummy-root-cert-1\ndummy-root-cert-2")
   end
@@ -65,6 +116,21 @@ RSpec.describe VictoriaMetricsResource do
     expect(vmr).to respond_to(:project)
     expect(vmr).to respond_to(:location)
     expect(vmr).to respond_to(:servers)
+    expect(vmr).to respond_to(:representative_server)
+  end
+
+  describe "#representative_server" do
+    it "returns the server with is_representative set" do
+      vm = create_vm
+      server = VictoriaMetricsServer.create(victoria_metrics_resource_id: vmr.id, vm_id: vm.id, is_representative: true)
+      expect(vmr.reload.representative_server).to eq(server)
+    end
+
+    it "returns nil when no server is representative" do
+      vm = create_vm
+      VictoriaMetricsServer.create(victoria_metrics_resource_id: vmr.id, vm_id: vm.id, is_representative: false)
+      expect(vmr.reload.representative_server).to be_nil
+    end
   end
 
   it "has encrypted columns" do

@@ -13,6 +13,8 @@ module Csi
 
       OneGB = 1024 * 1024 * 1024
 
+      UNSUPPORTED_CAPABILITY_MESSAGE = "Only mount volumes with the SINGLE_NODE_WRITER access mode are supported"
+
       def max_volume_size
         @max_volume_size ||= begin
           limit_gb_str = ENV.fetch("DISK_LIMIT_GB", "10")
@@ -21,15 +23,30 @@ module Csi
         end
       end
 
+      def reserve_percent
+        @reserve_percent ||= begin
+          percent = Integer(ENV.fetch("RESERVE_PERCENT", CapacityManager::DEFAULT_RESERVE_PERCENT.to_s), 10)
+          raise "RESERVE_PERCENT (#{percent}) must be between 10 and 50" unless (10..50).cover?(percent)
+          percent
+        end
+      end
+
       def initialize(logger:)
         @logger = logger
         @volume_store = {} # Maps volume name to volume details
         @mutex = Mutex.new
+        start_capacity_manager
         start_stuck_volume_detector
       end
 
       def shutdown!
+        @capacity_manager&.shutdown!
         @stuck_volume_detector&.shutdown!
+      end
+
+      def start_capacity_manager
+        @capacity_manager = Csi::CapacityManager.new(logger: @logger, max_volume_size:, reserve_percent:)
+        @capacity_manager.start
       end
 
       def start_stuck_volume_detector
@@ -59,18 +76,24 @@ module Csi
       # This function will be used in CreateVolume method,
       # Telling the kubernetes cluster first to not select control-plane nodes,
       # then selecting any of the nodes which might can host the PV.
-      def select_worker_topology(req)
-        preferred = req.accessibility_requirements.preferred
-        requisite = req.accessibility_requirements.requisite
+      def select_worker_topology(req, req_id)
+        control_plane_nodes = KubernetesClient.new(req_id:, logger: @logger).list_control_plane_nodes
+        requirements = req.accessibility_requirements
 
-        selected = preferred.find { |topo| !topo.segments["kubernetes.io/hostname"].start_with?("kc") }
-        selected ||= requisite.find { |topo| !topo.segments["kubernetes.io/hostname"].start_with?("kc") }
+        # Scanning preferred before requisite keeps the scheduler's preference.
+        selected = (requirements.preferred + requirements.requisite).find { |topo| !control_plane_nodes.include?(topo.segments["kubernetes.io/hostname"]) }
 
         if selected.nil?
-          raise GRPC::FailedPrecondition.new("No suitable worker node topology found", GRPC::Core::StatusCodes::FAILED_PRECONDITION)
+          raise GRPC::FailedPrecondition.new("No suitable worker node topology found")
         end
 
         selected
+      end
+
+      def supported_volume_capabilities?(capabilities)
+        capabilities.all? do |capability|
+          capability.access_type == :mount && capability.access_mode&.mode == :SINGLE_NODE_WRITER
+        end
       end
 
       def validate_create_volume_request(req)
@@ -99,6 +122,10 @@ module Csi
           raise GRPC::InvalidArgument.new("Volume capabilities are required")
         end
 
+        unless supported_volume_capabilities?(req.volume_capabilities)
+          raise GRPC::InvalidArgument.new(UNSUPPORTED_CAPABILITY_MESSAGE)
+        end
+
         if req.accessibility_requirements.nil? || req.accessibility_requirements.requisite.empty?
           raise GRPC::InvalidArgument.new("Topology requirement is required")
         end
@@ -114,7 +141,7 @@ module Csi
 
           @mutex.synchronize do
             unless (existing = @volume_store[req.name])
-              selected_topology = select_worker_topology(req)
+              selected_topology = select_worker_topology(req, req_id)
               new_volume_id = "vol-#{SecureRandom.uuid}"
               @volume_store[req.name] = {
                 volume_id: new_volume_id,
@@ -129,19 +156,29 @@ module Csi
 
           if existing
             if req.accessibility_requirements.requisite.first != existing[:accessible_topology]
-              raise GRPC::FailedPrecondition.new("Existing volume has incompatible topology", GRPC::Core::StatusCodes::FAILED_PRECONDITION)
+              raise GRPC::FailedPrecondition.new("Existing volume has incompatible topology")
             end
             if existing[:capacity_bytes] != req.capacity_range.required_bytes
-              raise GRPC::FailedPrecondition.new("Volume with same name but different size exists", GRPC::Core::StatusCodes::FAILED_PRECONDITION)
+              raise GRPC::FailedPrecondition.new("Volume with same name but different size exists")
             end
             if existing[:parameters] != req.parameters.to_h
-              raise GRPC::FailedPrecondition.new("Volume with same name but different parameters exists", GRPC::Core::StatusCodes::FAILED_PRECONDITION)
+              raise GRPC::FailedPrecondition.new("Volume with same name but different parameters exists")
             end
 
             existing_capabilities = existing[:capabilities].sort_by(&:to_json)
             new_capabilities = req.volume_capabilities.map(&:to_h).sort_by(&:to_json)
             if existing_capabilities != new_capabilities
-              raise GRPC::FailedPrecondition.new("Volume with same name but different capabilities exists", GRPC::Core::StatusCodes::FAILED_PRECONDITION)
+              raise GRPC::FailedPrecondition.new("Volume with same name but different capabilities exists")
+            end
+          else
+            reserved = @capacity_manager.reserve(
+              hostname: selected_topology.segments["kubernetes.io/hostname"],
+              vol_id: new_volume_id,
+              size_bytes: req.capacity_range.required_bytes,
+            )
+            unless reserved
+              @mutex.synchronize { @volume_store.delete(req.name) }
+              raise GRPC::ResourceExhausted.new("Insufficient capacity on node")
             end
           end
 
@@ -160,7 +197,7 @@ module Csi
 
       def delete_volume(req, _call)
         log_request_response(req, "delete_volume") do |req_id|
-          raise GRPC::InvalidArgument.new("Volume ID is required", GRPC::Core::StatusCodes::INVALID_ARGUMENT) if req.volume_id.nil? || req.volume_id.empty?
+          raise GRPC::InvalidArgument.new("Volume ID is required") if req.volume_id.nil? || req.volume_id.empty?
 
           client = KubernetesClient.new(req_id:, logger: @logger)
           # Since we would have at most 8 PVCs per node, searching by value will not cause overhead
@@ -187,6 +224,7 @@ module Csi
             raise GRPC::Internal, "Could not delete the PV's backing file"
           end
           @mutex.synchronize { @volume_store.delete(pv_name) }
+          @capacity_manager.release(vol_id: req.volume_id)
 
           DeleteVolumeResponse.new
         rescue GRPC::BadStatus => e
@@ -195,6 +233,25 @@ module Csi
         rescue => e
           log_with_id(req_id, "Internal error in delete_volume: #{e.class} - #{e.message}\n#{e.backtrace.join("\n")}")
           raise GRPC::Internal, "DeleteVolume error: #{e.message}"
+        end
+      end
+
+      def validate_volume_capabilities(req, _call)
+        log_request_response(req, "validate_volume_capabilities") do |req_id|
+          raise GRPC::InvalidArgument.new("Volume ID is required") if req.volume_id.empty?
+          raise GRPC::InvalidArgument.new("Volume capabilities are required") if req.volume_capabilities.empty?
+
+          if supported_volume_capabilities?(req.volume_capabilities)
+            ValidateVolumeCapabilitiesResponse.new(
+              confirmed: ValidateVolumeCapabilitiesResponse::Confirmed.new(
+                volume_context: req.volume_context.to_h,
+                volume_capabilities: req.volume_capabilities.to_a,
+                parameters: req.parameters.to_h,
+              ),
+            )
+          else
+            ValidateVolumeCapabilitiesResponse.new(message: UNSUPPORTED_CAPABILITY_MESSAGE)
+          end
         end
       end
     end

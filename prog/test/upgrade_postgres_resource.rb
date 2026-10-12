@@ -1,49 +1,81 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/util"
+class Prog::Test::UpgradePostgresResource < Prog::Test::PostgresBase
+  semaphore :pause, :destroy
+  frame_reader :start_version
+  frame_accessor :pre_upgrade_postgres_timeline_id, :read_replica_id
 
-class Prog::Test::UpgradePostgresResource < Prog::Test::Base
-  def self.assemble(provider: "metal")
-    postgres_test_project = Project.create(name: "Postgres-Upgrade-Test-Project")
-    Project[Config.postgres_service_project_id] ||
-      Project.create_with_id(Config.postgres_service_project_id || Project.generate_uuid, name: "Postgres-Service-Project")
-
-    Strand.create(
-      prog: "Test::UpgradePostgresResource",
-      label: "start",
-      stack: [{"provider" => provider, "postgres_test_project_id" => postgres_test_project.id}],
-    )
+  def self.assemble(provider: "metal", start_version: "17", **)
+    st = super(provider:, project_name: "Postgres-Upgrade-Test-Project", **)
+    st.update(stack: [st.stack.first.merge("start_version" => start_version)])
+    st
   end
 
   label def start
-    location_id, target_vm_size, target_storage_size_gib = self.class.postgres_test_location_options(frame["provider"])
+    # wal_level=logical needed to create the logical replication slot under test
+    user_config = {"wal_level" => "logical"}
+    if start_version.to_i >= 17
+      # sync_replication_slots is PG17+; PG16 would reject config
+      # hot_standby_feedback=on required on standby for PG17 logical slot sync
+      user_config["sync_replication_slots"] = "on"
+      user_config["hot_standby_feedback"] = "on"
+    end
 
-    st = Prog::Postgres::PostgresResourceNexus.assemble(
-      project_id: frame["postgres_test_project_id"],
-      location_id:,
-      name: "postgres-test-upgrade",
-      target_vm_size:,
-      target_storage_size_gib:,
-      ha_type: "async",
-      target_version: "17",
-    )
-
-    update_stack({"postgres_resource_id" => st.id})
-    update_stack({"pre_upgrade_postgres_timeline_id" => PostgresResource[st.id].timeline.id})
-    hop_wait_postgres_resource
+    super(name: "postgres-test-upgrade-pg#{start_version}", ha_type: "async", target_version: start_version, user_config:) do |resource, frame|
+      self.pre_upgrade_postgres_timeline_id = resource.timeline.id
+    end
   end
 
   label def wait_postgres_resource
     servers = postgres_resource.servers
     nap 10 if servers.count != postgres_resource.target_server_count || servers.filter { it.strand.label != "wait" }.any?
+    hop_setup_failover_slot
+  end
+
+  label def setup_failover_slot
+    # PG17+ preserves logical slots across pg_upgrade & adds failover plus sync on standbys
+    # PG16 logical slots are dropped by pg_upgrade, still create one to assert upgrade does not hang
+    unless (standby = postgres_resource.servers.find { !it.is_representative })
+      self.fail_message = "No standby found to verify failover slot sync"
+      hop_destroy
+    end
+
+    existing = representative_server.run_query("SELECT 1 FROM pg_replication_slots WHERE slot_name = 'upgrade_test_slot'").strip
+    if existing.empty?
+      Clog.emit("Creating logical replication slot", {failover: start_version.to_i >= 17})
+      create_sql = if start_version.to_i >= 17
+        "SELECT pg_create_logical_replication_slot('upgrade_test_slot', 'pgoutput', false, false, true)"
+      else
+        "SELECT pg_create_logical_replication_slot('upgrade_test_slot', 'pgoutput', false, false)"
+      end
+      representative_server.run_query(create_sql)
+    end
+
+    # PG16 does not sync replication slots to standbys; skip the wait.
+    hop_test_postgres_before_read_replica if start_version.to_i < 17
+
+    # Idle slot stays temporary on standby; advance it & emit standby snapshots each pass so
+    # restart_lsn passes the standby's reserved point, letting the sync worker persist the slot
+    representative_server.run_query(<<SQL)
+SELECT pg_log_standby_snapshot();
+SELECT pg_replication_slot_advance('upgrade_test_slot', pg_current_wal_lsn());
+SELECT pg_log_standby_snapshot();
+SQL
+
+    synced = standby.run_query("SELECT 1 FROM pg_replication_slots WHERE slot_name = 'upgrade_test_slot' AND synced AND NOT temporary").strip
+    if synced.empty?
+      Clog.emit("Waiting for failover slot sync on standby", {standby: standby.ubid})
+      nap 10
+    end
+
     hop_test_postgres_before_read_replica
   end
 
   label def test_postgres_before_read_replica
     Clog.emit("Testing Postgres before read replica creation")
     unless representative_server.run_query(test_queries_sql) == "DROP TABLE\nCREATE TABLE\nINSERT 0 10\n4159.90\n415.99\n4.1"
-      update_stack({"fail_message" => "Failed to run test queries before read replica"})
-      hop_destroy_postgres
+      self.fail_message = "Failed to run test queries before read replica"
+      hop_destroy
     end
 
     hop_create_read_replica
@@ -52,21 +84,20 @@ class Prog::Test::UpgradePostgresResource < Prog::Test::Base
   label def create_read_replica
     Clog.emit("Creating read replica for upgrade test")
 
-    location_id, target_vm_size, target_storage_size_gib = self.class.postgres_test_location_options(frame["provider"])
-
     # Create read replica using the PostgresResourceNexus with parent_id
     st = Prog::Postgres::PostgresResourceNexus.assemble(
-      project_id: frame["postgres_test_project_id"],
+      project_id: postgres_test_project_id,
       location_id:,
       parent_id: postgres_resource.id,
       name: "postgres-test-upgrade-replica",
-      target_vm_size:,
-      target_storage_size_gib:,
+      target_version: postgres_resource.version,
+      target_vm_size: postgres_resource.target_vm_size,
+      target_storage_size_gib: postgres_resource.target_storage_size_gib,
       user_config: {},
       pgbouncer_user_config: {},
     )
 
-    update_stack({"read_replica_id" => st.id})
+    self.read_replica_id = st.id
     hop_wait_read_replica
   end
 
@@ -80,14 +111,14 @@ class Prog::Test::UpgradePostgresResource < Prog::Test::Base
 
     # Test primary
     unless representative_server.run_query(read_queries_sql) == "4159.90\n415.99\n4.1"
-      update_stack({"fail_message" => "Failed to run read queries on primary before upgrade"})
-      hop_destroy_postgres
+      self.fail_message = "Failed to run read queries on primary before upgrade"
+      hop_destroy
     end
 
     # Test read replica
     unless read_replica.representative_server.run_query(read_queries_sql) == "4159.90\n415.99\n4.1"
-      update_stack({"fail_message" => "Failed to run read queries on replica before upgrade"})
-      hop_destroy_postgres
+      self.fail_message = "Failed to run read queries on replica before upgrade"
+      hop_destroy
     end
 
     Clog.emit("Verified both primary and read replica are working correctly")
@@ -95,12 +126,19 @@ class Prog::Test::UpgradePostgresResource < Prog::Test::Base
   end
 
   label def trigger_upgrade
-    Clog.emit("Starting upgrade from version 17 to 18")
+    Clog.emit("Starting upgrade from version #{start_version} to #{target_version}")
     Clog.emit("Postgres servers before upgrade: #{postgres_resource.servers.map { [it.ubid, it.version, it.timeline_access, it.strand.label].inspect }.join(", ")}")
     Clog.emit("Read replica servers before upgrade: #{read_replica.servers.map { [it.ubid, it.version, it.timeline_access, it.strand.label].inspect }.join(", ")}")
 
-    postgres_resource.update(target_version: "18")
-    postgres_resource.read_replicas_dataset.update(target_version: "18")
+    # pg_upgrade rejects logical slots with unconsumed (decodable) WAL after confirmed_flush.
+    # Real upgrades rely on the subscriber draining the slot; the test has none, so advance it
+    # to the WAL tip. Convergence waits for the candidate's synced copy to catch up before fencing.
+    if start_version.to_i >= 17
+      representative_server.run_query("SELECT pg_replication_slot_advance('upgrade_test_slot', pg_current_wal_lsn())")
+    end
+
+    postgres_resource.update(target_version:)
+    postgres_resource.read_replicas_dataset.update(target_version:)
 
     hop_check_upgrade_progress
   end
@@ -144,9 +182,9 @@ class Prog::Test::UpgradePostgresResource < Prog::Test::Base
       end
     end
 
-    # Check if all servers have been upgraded to version 18
-    primary_upgraded = postgres_resource.servers.all? { |s| s.version == "18" && s.strand.label == "wait" }
-    replica_upgraded = read_replica.servers.all? { |s| s.version == "18" && s.strand.label == "wait" }
+    # Check if all servers have been upgraded
+    primary_upgraded = postgres_resource.servers.all? { |s| s.version == target_version && s.strand.label == "wait" }
+    replica_upgraded = read_replica.servers.all? { |s| s.version == target_version && s.strand.label == "wait" }
 
     if primary_upgraded && replica_upgraded
       Clog.emit("Upgrade completed successfully!")
@@ -156,115 +194,95 @@ class Prog::Test::UpgradePostgresResource < Prog::Test::Base
     # Check for any failed states
     failed_servers = (postgres_resource.servers + read_replica.servers).filter { |s| s.strand.label == "failed" }
     if failed_servers.any?
-      update_stack({"fail_message" => "Upgrade failed: some servers are in failed state"})
+      self.fail_message = "Upgrade failed: some servers are in failed state"
       failed_servers.each do |server|
         Clog.emit("Failed server: #{server.ubid}, version=#{server.version}, state=#{server.strand.label}")
       end
-      hop_destroy_postgres
+      hop_destroy
     end
 
     nap 60
   end
 
   label def test_postgres_after_upgrade
-    Clog.emit("Testing Postgres after upgrade to version 18")
+    Clog.emit("Testing Postgres after upgrade to version #{target_version}")
     Clog.emit("Final server states:")
     Clog.emit("Primary servers: #{postgres_resource.servers.map { |s| "[#{s.ubid}, v#{s.version}, #{s.timeline_access}, #{s.strand.label}]" }.join(", ")}")
     Clog.emit("Replica servers: #{read_replica.servers.map { |s| "[#{s.ubid}, v#{s.version}, #{s.timeline_access}, #{s.strand.label}]" }.join(", ")}")
 
-    # Verify all servers are at version 18
-    unless postgres_resource.servers.all? { |s| s.version == "18" }
-      update_stack({"fail_message" => "Not all primary servers upgraded to version 18"})
-      hop_destroy_postgres
+    unless postgres_resource.servers.all? { |s| s.version == target_version }
+      self.fail_message = "Not all primary servers upgraded to version #{target_version}"
+      hop_destroy
     end
 
-    unless read_replica.servers.all? { |s| s.version == "18" }
-      update_stack({"fail_message" => "Not all replica servers upgraded to version 18"})
-      hop_destroy_postgres
+    unless read_replica.servers.all? { |s| s.version == target_version }
+      self.fail_message = "Not all replica servers upgraded to version #{target_version}"
+      hop_destroy
     end
 
     # Test read queries on primary (data should still be there)
     Clog.emit("Running read queries on primary after upgrade")
     unless representative_server.run_query(read_queries_sql) == "4159.90\n415.99\n4.1"
-      update_stack({"fail_message" => "Failed to run read queries on primary after upgrade"})
-      hop_destroy_postgres
+      self.fail_message = "Failed to run read queries on primary after upgrade"
+      hop_destroy
     end
 
     # Test read queries on read replica
     Clog.emit("Running read queries on replica after upgrade")
     unless read_replica.representative_server.run_query(read_queries_sql) == "4159.90\n415.99\n4.1"
-      update_stack({"fail_message" => "Failed to run read queries on replica after upgrade"})
-      hop_destroy_postgres
+      self.fail_message = "Failed to run read queries on replica after upgrade"
+      hop_destroy
     end
 
-    # Test write queries on primary (should work on v18)
+    # Test write queries on primary
     Clog.emit("Running write queries on primary after upgrade")
     unless representative_server.run_query(test_queries_sql) == "DROP TABLE\nCREATE TABLE\nINSERT 0 10\n4159.90\n415.99\n4.1"
-      update_stack({"fail_message" => "Failed to run write queries after upgrade"})
-      hop_destroy_postgres
+      self.fail_message = "Failed to run write queries after upgrade"
+      hop_destroy
     end
 
     # Verify replica can still read the new data
     Clog.emit("Verifying replica can read updated data")
     unless read_replica.representative_server.run_query(read_queries_sql) == "4159.90\n415.99\n4.1"
-      update_stack({"fail_message" => "Failed to read updated data on replica after upgrade"})
-      hop_destroy_postgres
+      self.fail_message = "Failed to read updated data on replica after upgrade"
+      hop_destroy
+    end
+
+    # PG17+ pg_upgrade preserves failover-enabled logical slots
+    # PG16 pg_upgrade drops logical slots, assert slot is gone
+    Clog.emit("Verifying logical slot state after upgrade")
+    slot_row = representative_server.run_query("SELECT failover FROM pg_replication_slots WHERE slot_name = 'upgrade_test_slot'").strip
+    expected_row = (start_version.to_i >= 17) ? "t" : ""
+    unless slot_row == expected_row
+      self.fail_message = "Unexpected slot state after upgrade from v#{start_version}: expected #{expected_row.inspect}, got #{slot_row.inspect}"
+      hop_destroy
     end
 
     Clog.emit("All upgrade tests passed successfully!")
-    hop_destroy_postgres
+    hop_destroy
   end
 
   label def destroy_postgres
-    pre_upgrade_timeline.incr_destroy
-    postgres_resource.timeline.incr_destroy
-    read_replica.incr_destroy
-    postgres_resource.incr_destroy
-    hop_wait_resources_destroyed
+    primary_timeline_ids = postgres_resource.servers.map(&:timeline_id)
+    replica_timeline_ids = read_replica ? read_replica.servers.map(&:timeline_id) : []
+    self.timeline_ids = (primary_timeline_ids + replica_timeline_ids).uniq
+    read_replica&.incr_destroy
+    super
   end
 
   label def wait_resources_destroyed
-    nap 5 if read_replica || postgres_resource || pre_upgrade_timeline
+    nap 5 if read_replica || postgres_resource
+    nap_if_gcp_vpc
+    nap_if_private_subnet
+    verify_timelines_destroyed(timeline_ids) if timeline_ids
     hop_finish
   end
 
-  label def finish
-    postgres_test_project.destroy
-
-    fail_test(frame["fail_message"]) if frame["fail_message"]
-
-    pop "Postgres upgrade tests are finished!"
-  end
-
-  label def failed
-    nap 15
-  end
-
-  def postgres_test_project
-    Project[frame["postgres_test_project_id"]]
-  end
-
-  def postgres_resource
-    PostgresResource[frame["postgres_resource_id"]]
-  end
-
   def read_replica
-    @read_replica ||= PostgresResource[frame["read_replica_id"]]
+    @read_replica ||= PostgresResource[read_replica_id]
   end
 
-  def representative_server
-    @representative_server ||= postgres_resource.representative_server
-  end
-
-  def pre_upgrade_timeline
-    PostgresTimeline[frame["pre_upgrade_postgres_timeline_id"]]
-  end
-
-  def test_queries_sql
-    File.read("./prog/test/testdata/order_analytics_queries.sql").freeze
-  end
-
-  def read_queries_sql
-    File.read("./prog/test/testdata/order_analytics_read_queries.sql").freeze
+  def target_version
+    (start_version.to_i + 1).to_s
   end
 end

@@ -290,9 +290,29 @@ RSpec.describe Ubicloud do
     expect(params).to eq({private_subnet_id: "ps345678901234567890123456"})
   end
 
-  it "Firewall#detach_subnet raises if private subnet id includes a slash" do
+  it "PrivateSubnet#disconnect raises if private subnet id includes a slash" do
     ps = ubi.private_subnet.new("eu-central-h1/test-ps")
     expect { ps.disconnect("foo/bar") }.to raise_error(Ubicloud::Error, "invalid private subnet id format")
+  end
+
+  it "KubernetesCluster#retire_node raises if the node name includes a slash" do
+    kc = ubi.kubernetes_cluster.new("eu-central-h1/test-kc")
+    expect { kc.retire_node("foo/bar") }.to raise_error(Ubicloud::Error, "invalid node name")
+  end
+
+  it "KubernetesCluster#upgrade_nodepool raises if the nodepool reference includes a slash" do
+    kc = ubi.kubernetes_cluster.new("eu-central-h1/test-kc")
+    expect { kc.upgrade_nodepool("foo/bar") }.to raise_error(Ubicloud::Error, "invalid nodepool reference")
+  end
+
+  it "KubernetesCluster#destroy_nodepool raises if the nodepool reference includes a slash" do
+    kc = ubi.kubernetes_cluster.new("eu-central-h1/test-kc")
+    expect { kc.destroy_nodepool("foo/bar") }.to raise_error(Ubicloud::Error, "invalid nodepool reference")
+  end
+
+  it "KubernetesCluster#resize_nodepool raises if the nodepool reference includes a slash" do
+    kc = ubi.kubernetes_cluster.new("eu-central-h1/test-kc")
+    expect { kc.resize_nodepool("foo/bar", 3) }.to raise_error(Ubicloud::Error, "invalid nodepool reference")
   end
 
   it "SshPublicKey.new raises if given bad values" do
@@ -319,6 +339,33 @@ RSpec.describe Ubicloud do
 
     expect(ubi.vm.create(location: "eu-central-h1", name: "test-vm")).to be_a(Ubicloud::Vm)
     expect(public_key).to be_nil
+  end
+
+  it "Vm#serial_log fetches the status/output of the vm's serial console log" do
+    vm = ubi.vm.new(location: "eu-central-h1", name: "test-vm")
+    request_method = nil
+    request_query = nil
+    expect(Clover).to receive(:call).and_invoke(proc do |env|
+      request_method = env["REQUEST_METHOD"]
+      request_query = env["QUERY_STRING"]
+      [202, {"content-type" => "application/json"}, ['{"status": "created", "output": null, "timestamp": "2025-01-01T00:00:00Z"}']]
+    end)
+
+    expect(vm.serial_log).to eq(status: "created", output: nil, timestamp: "2025-01-01T00:00:00Z")
+    expect(request_method).to eq "GET"
+    expect(request_query).to eq ""
+  end
+
+  it "Vm#serial_log passes refresh: true as a query parameter when requested" do
+    vm = ubi.vm.new(location: "eu-central-h1", name: "test-vm")
+    request_query = nil
+    expect(Clover).to receive(:call).and_invoke(proc do |env|
+      request_query = env["QUERY_STRING"]
+      [202, {"content-type" => "application/json"}, ['{"status": "created", "output": null, "timestamp": "2025-01-01T00:00:00Z"}']]
+    end)
+
+    vm.serial_log(refresh: true)
+    expect(request_query).to eq "refresh=true"
   end
 
   it "Firewall#add_rule, #modify_rule, and #delete_rule work without firewall rules loaded" do
@@ -433,6 +480,32 @@ RSpec.describe Ubicloud do
     expect(pg.values[:metric_destinations]).to eq([])
   end
 
+  it "Postgres#add_syslog_log_destination and #delete_log_destination work without log destinations loaded" do
+    expect(Clover).to receive(:call).twice.and_invoke(proc do |env|
+      [200, {"content-type" => "application/json"}, ["{}"]]
+    end)
+
+    pg = ubi.postgres.new("foo/bar")
+    expect(pg.values[:log_destinations]).to be_nil
+    pg.add_syslog_log_destination(name: "my-dest", host: "logs.example.com")
+    expect(pg.values[:log_destinations]).to be_nil
+    pg.delete_log_destination("p1345678901234567890123456")
+    expect(pg.values[:log_destinations]).to be_nil
+  end
+
+  it "Postgres#add_otlp_log_destination and #delete_log_destination modify log destinations if loaded" do
+    expect(Clover).to receive(:call).twice.and_invoke(proc do |env|
+      [200, {"content-type" => "application/json"}, ["{\"id\": \"p1345678901234567890123456\"}"]]
+    end)
+
+    pg = ubi.postgres.new(location: "foo", name: "bar", log_destinations: [])
+    expect(pg.values[:log_destinations]).to eq([])
+    pg.add_otlp_log_destination(name: "my-dest", url: "https://otlp.nr-data.net")
+    expect(pg.values[:log_destinations]).to eq([{id: "p1345678901234567890123456"}])
+    pg.delete_log_destination("p1345678901234567890123456")
+    expect(pg.values[:log_destinations]).to eq([])
+  end
+
   it "AuditLog.search result is a page supporting pagination" do
     called = 0
     expect(Clover).to receive(:call).twice.and_invoke(proc do |env|
@@ -443,6 +516,25 @@ RSpec.describe Ubicloud do
     expect(page).to be_a Ubicloud::AuditLog::Page
     next_page = page.next_page
     expect(next_page).to be_a Ubicloud::AuditLog::Page
+    expect(next_page.next_page).to be_nil
+  end
+
+  it "Postgres#logs result is a LogPage supporting pagination" do
+    called = 0
+    log_entry = {timestamp: "1000", stream: "postgres", level: "INFO", message: "started", server_role: "primary"}.to_json
+    expect(Clover).to receive(:call).twice.and_invoke(proc do |env|
+      called += 1
+      body = (called == 2) ? "{\"logs\": [#{log_entry}]}" : "{\"logs\": [], \"pagination_key\": \"50\"}"
+      [200, {"content-type" => "application/json"}, [body]]
+    end)
+    pg = ubi.postgres.new("foo/bar")
+    page = pg.logs
+    expect(page).to be_a Ubicloud::Postgres::LogPage
+    expect(page).to eq []
+    expect(page.next_page_args).to include(pagination_key: "50")
+    next_page = page.next_page
+    expect(next_page).to be_a Ubicloud::Postgres::LogPage
+    expect(next_page).to eq [{timestamp: "1000", stream: "postgres", level: "INFO", message: "started", server_role: "primary"}]
     expect(next_page.next_page).to be_nil
   end
 

@@ -11,9 +11,10 @@ class Prog::Vm::Nexus < Prog::Base
     enable_ip4: false, pool_id: nil, arch: "x64", swap_size_bytes: nil,
     distinct_storage_devices: false, force_host_id: nil, exclude_host_ids: [], gpu_count: 0, gpu_device: nil,
     hugepages: true, hypervisor: nil, ch_version: nil, firmware_version: nil, new_private_subnet_name: nil,
-    exclude_availability_zones: [], availability_zone: nil, alternative_families: [],
+    exclude_availability_zones: [], availability_zone: nil, availability_zone_required: false, alternative_families: [],
     allow_private_subnet_in_other_project: false, init_script: nil, exclude_data_centers: [],
-    machine_image_version_id: nil)
+    use_separate_management_nic: false, use_eip: true, management_nic_use_eip: true, remote_storage_server_id: nil,
+    waiting_strand_id: nil, allocated_waiting_strand_id: nil)
 
     unless (project = Project[project_id])
       fail "No existing project"
@@ -24,11 +25,6 @@ class Prog::Vm::Nexus < Prog::Base
 
     unless (location = (allow_private_subnet_in_other_project ? Location : Location.for_project(project_id)).with_pk(location_id))
       fail "No existing location in project"
-    end
-
-    if machine_image_version_id
-      fail "Machine images are only supported for metal locations" unless location.provider_dispatcher_group_name == "metal"
-      fail "No existing machine image version metal" unless MachineImageVersionMetal[machine_image_version_id]
     end
 
     vm_size = Validation.validate_vm_size(size, arch)
@@ -43,9 +39,10 @@ class Prog::Vm::Nexus < Prog::Base
       volume[:max_write_mbytes_per_sec] ||= vm_size.io_limits.max_write_mbytes_per_sec
       volume[:vring_workers] ||= vm_size.vring_workers
       volume[:encrypted] = true if !volume.has_key? :encrypted
-      volume[:track_written] = false if !volume.has_key? :track_written
+      if !volume.has_key? :track_written
+        volume[:track_written] = !volume[:read_only]
+      end
       volume[:boot] = disk_index == boot_disk_index
-      volume[:machine_image_version_id] = machine_image_version_id if volume[:boot] && machine_image_version_id
 
       if volume[:read_only]
         volume[:size_gib] = 0
@@ -56,11 +53,36 @@ class Prog::Vm::Nexus < Prog::Base
 
     Validation.validate_storage_volumes(storage_volumes, boot_disk_index)
 
+    metal_vm = location.provider_dispatcher_group_name == "metal"
+    boot_volume = storage_volumes[boot_disk_index]
+
+    if remote_storage_server_id
+      fail "Booting from a remote storage server is only supported for metal locations" unless metal_vm
+      boot_volume[:remote_storage_server_id] = remote_storage_server_id
+    elsif boot_volume[:machine_image_version_id]
+      # The caller already resolved the version, so no lookup by name is done.
+      # This is only reachable internally, as storage volumes are built by the
+      # routes rather than accepted from the request.
+      fail "Machine images are only supported for metal locations" unless metal_vm
+    elsif boot_image.include?("@")
+      fail "Machine images are only supported for metal locations" unless metal_vm
+      image_name, image_version = boot_image.split("@", 2)
+      machine_image_version = lookup_machine_image_version(project_id, location_id, image_name, image_version, boot_volume[:size_gib], false)
+      boot_volume[:machine_image_version_id] = machine_image_version.id
+    elsif metal_vm && (mi_project_id = Config.machine_images_service_project_id)
+      # We want to eventually use machine images for base images. If a suitable
+      # machine image version isn't found, we'll fall back to using the
+      # boot_image as a name of a BootImage for now.
+      machine_image_version = lookup_machine_image_version(mi_project_id, location_id, boot_image, "latest", boot_volume[:size_gib], true)
+      boot_volume[:machine_image_version_id] = machine_image_version.id if machine_image_version
+    end
+
     ubid = Vm.generate_ubid
     name ||= Vm.ubid_to_name(ubid)
 
     Validation.validate_name(name)
     Validation.validate_os_user_name(unix_user)
+    create_network_interface = use_eip
 
     DB.transaction do
       subnet = nil
@@ -90,7 +112,8 @@ class Prog::Vm::Nexus < Prog::Base
         else
           subnet = project.default_private_subnet(location)
         end
-        nic = Prog::Vnet::NicNexus.assemble(subnet.id, name: "#{name}-nic", exclude_availability_zones:, availability_zone:).subject
+        availability_zone = Prog::Vnet::NicNexus.select_aws_subnet(subnet, availability_zone, exclude_availability_zones, availability_zone_required:).az_suffix if use_separate_management_nic
+        nic = Prog::Vnet::NicNexus.assemble(subnet.id, name: "#{name}-nic", exclude_availability_zones:, availability_zone:, availability_zone_required:, use_eip:, create_network_interface:).subject
       end
 
       vm = Vm.create(
@@ -109,51 +132,44 @@ class Prog::Vm::Nexus < Prog::Base
         pool_id:,
         arch:,
         project_id:,
+        hypervisor_id: ch_version && Hypervisor.first(name: "ch", version: ch_version)&.id,
       ) { it.id = ubid.to_uuid }
+      subnet.lock! if location.gcp?
+      vm.validate_subnet_firewall_cap(subnet)
       nic.update(vm_id: vm.id)
+
+      if use_separate_management_nic
+        Prog::Vnet::NicNexus.assemble(
+          subnet.id, name: "#{name}-mgmt-nic", exclude_availability_zones:, availability_zone:, availability_zone_required:, is_management: true, use_eip: management_nic_use_eip,
+        ).subject.update(vm_id: vm.id)
+      end
 
       if init_script && !init_script.empty?
         VmInitScript.create_with_id(vm, init_script:)
       end
 
-      if vm_size.family == "standard-gpu"
-        gpu_count = 1
-        gpu_device = "27b0"
-      end
-
       prog = if location.aws?
-        disk_index = 0
-        storage_volumes.each do |volume|
-          max_disk_size =
-            case vm_size.family
-            when "i8ge", "i7ie"
-              case vm_size.vcpus
-              when 2, 4, 8
-                2500.0
-              else
-                7500.0
-              end
-            when "i8g", "i7i"
-              3750.0
-            else
-              1900.0
-            end
-          disk_count = (volume[:size_gib] / max_disk_size).ceil
-
-          disk_count.times do
-            VmStorageVolume.create(
-              vm_id: vm.id,
-              size_gib: volume[:size_gib] / disk_count,
-              boot: volume[:boot],
-              use_bdev_ubi: false,
-              disk_index:,
-            )
-
-            disk_index += 1
-          end
+        # On AWS, one VmStorageVolume per requested storage_volume — AWS attaches
+        # instance-store NVMes per the instance type, not per record. Device
+        # discovery for mdadm is done at provisioning time via lsblk (see
+        # PostgresServer::Aws#aws_storage_device_paths), so record count doesn't
+        # drive disk count.
+        storage_volumes.each_with_index do |volume, disk_index|
+          create_storage_volume(vm, volume, disk_index)
         end
         "Vm::Aws::Nexus"
+      elsif location.gcp?
+        # As above, but GCE attaches the disks bundled with the -lssd machine type.
+        disk_index = 0
+        storage_volumes.each do |volume|
+          next unless volume[:boot] || volume[:size_gib] > 0
+
+          create_storage_volume(vm, volume, disk_index)
+          disk_index += 1
+        end
+        "Vm::Gcp::Nexus"
       else
+        vm.create_storage_volumes(storage_volumes)
         "Vm::Metal::Nexus"
       end
 
@@ -175,9 +191,31 @@ class Prog::Vm::Nexus < Prog::Base
           "firmware_version" => firmware_version,
           "alternative_families" => alternative_families,
           "private_subnet_id" => subnet.id,
+          "waiting_strand_id" => waiting_strand_id,
+          "allocated_waiting_strand_id" => allocated_waiting_strand_id,
+          "use_separate_management_nic" => use_separate_management_nic,
+          "use_eip" => use_eip,
+          "create_network_interface" => create_network_interface,
+          # AZs permanently excluded: seeded from multi-AZ policy (use_different_az),
+          # grows with Unsupported errors at runtime. Never cleared during retries.
+          "unsupported_azs" => exclude_availability_zones,
+          # AZs transiently excluded: InsufficientInstanceCapacity errors only.
+          # Cleared when all AZs are exhausted, then retried after a wait.
+          "exclude_availability_zones" => [],
+          "required_availability_zone" => (availability_zone if availability_zone_required),
         }],
       ) { it.id = vm.id }
     end
+  end
+
+  def self.create_storage_volume(vm, volume, disk_index)
+    VmStorageVolume.create(
+      vm_id: vm.id,
+      size_gib: volume[:size_gib],
+      boot: volume[:boot],
+      use_bdev_ubi: false,
+      disk_index:,
+    )
   end
 
   def self.assemble_with_sshable(*, sshable_unix_user: "rhizome", **kwargs)
@@ -185,5 +223,54 @@ class Prog::Vm::Nexus < Prog::Base
     st = assemble(ssh_key.public_key, *, **kwargs)
     Sshable.create_with_id(st, unix_user: sshable_unix_user, host: "temp_#{st.id}", raw_private_key_1: ssh_key.keypair)
     st
+  end
+
+  def self.miv_validation_failed(name, location_id, is_base_boot_image, details)
+    if is_base_boot_image
+      # For base boot images, we fall back to using a BootImage if no suitable
+      # machine image version is found. So, just log the error and return nil
+      # here.
+      Clog.emit("No suitable machine image version found for boot image, falling back to using boot image as BootImage name", {
+        base_machine_image_version_not_found: {
+          boot_image: name,
+          location_id:,
+          error: details,
+        },
+      })
+      nil
+    else
+      fail Validation::ValidationFailed.new(details)
+    end
+  end
+
+  def self.lookup_machine_image_version(project_id, location_id, name, version, vm_boot_disk_size_gib, is_base_boot_image)
+    search_ids = Option.machine_image_search_locations(location_id)
+    mi = MachineImage
+      .order(Sequel.function(:array_position, Sequel.pg_array(search_ids, :uuid), :location_id))
+      .first(project_id:, location_id: search_ids, name:)
+
+    unless mi
+      search_locations = Location
+        .where(id: search_ids)
+        .order(Sequel.function(:array_position, Sequel.pg_array(search_ids, :uuid), :id))
+        .select_map(:display_name)
+        .join(", ")
+      return miv_validation_failed(name, location_id, is_base_boot_image, {machine_image: "Machine image with name \"#{name}\" does not exist in the specified project and any of the following locations: #{search_locations}"})
+    end
+
+    miv = if version == "latest"
+      mi.latest_version
+    else
+      MachineImageVersion.first(machine_image_id: mi.id, version:)
+    end
+
+    return miv_validation_failed(name, location_id, is_base_boot_image, {machine_image: "Version \"#{version}\" does not exist for machine image \"#{name}\""}) unless miv
+    return miv_validation_failed(name, location_id, is_base_boot_image, {machine_image: "Machine image version \"#{version}\" does not have an active metal version"}) unless miv.metal&.status == "ready"
+    if miv.actual_size_mib > vm_boot_disk_size_gib * 1024
+      required_gib = (miv.actual_size_mib/1024r).ceil
+      return miv_validation_failed(name, location_id, is_base_boot_image, {storage_size: "Machine image \"#{name}@#{version}\" requires at least #{required_gib} GiB of storage"})
+    end
+
+    miv
   end
 end

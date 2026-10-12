@@ -2,14 +2,16 @@ name: Daily CI
 
 permissions:
   contents: read
+  actions: read
+  security-events: write # Required for upload-sarif (used by zizmor-action) to upload SARIF files.
 
 on:
   workflow_dispatch:
   schedule:
     - cron:  '42 9 * * 1-5'
-
-env:
-  CLOVER_DATABASE_URL: postgres:///clover_test?user=clover
+  pull_request:
+    paths:
+      - '.github/workflows/daily-ci.yml'
 
 jobs:
   daily-ci:
@@ -17,14 +19,16 @@ jobs:
       fail-fast: false
     name: Daily CI
     runs-on: ubicloud-standard-8
-    timeout-minutes: 25
+    timeout-minutes: 45
 
     steps:
     - name: Check out code
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
 
     - name: Set up Clover
-      uses: ./.github/actions/setup-clover
+      uses: $/.github/actions/setup-clover
       with:
         setup-node: true
 
@@ -37,9 +41,18 @@ jobs:
     - name: Run each spec file in separate process
       run: bundle exec rake spec_separate
 
+    - name: Run route specs checking no SSH access from web process
+      run: bundle exec rake route_spec
+
+    - name: Run zizmor
+      uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+      with:
+        inputs: |
+          .github/
+
     - name: Send notification if failed
       if: ${{ failure() && github.ref_name == 'main' }}
-      uses: slackapi/slack-github-action@v3.0.1
+      uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
       with:
         webhook: ${{ secrets.SLACK_WEBHOOK_PAGER_URL }}
         webhook-type: incoming-webhook

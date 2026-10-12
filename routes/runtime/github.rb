@@ -10,8 +10,9 @@ class Clover
     r.get "cache" do
       next 204 unless repository.access_key
 
-      keys, version = typecast_params.nonempty_str!(%w[keys version])
+      keys, version = typecast_params.nonempty_str!(%w[keys version].freeze)
       keys = keys.split(",")
+      next 204 if keys.empty?
 
       dataset = repository.cache_entries_dataset.exclude(committed_at: nil).where(version:)
 
@@ -23,6 +24,8 @@ class Clover
         scopes = [runner.workflow_job&.dig("head_branch") || get_scope_from_github(runner, typecast_params.str("runId")), repository.default_branch]
         scopes.compact!
         scopes.uniq!
+
+        next 204 if scopes.empty?
 
         dataset = dataset.where(scope: scopes)
           .order(Sequel.case(scopes.map.with_index { |scope, idx| [{scope:}, idx] }.to_h, scopes.length))
@@ -98,7 +101,7 @@ class Clover
             fail CloverError.new(400, "InvalidRequest", "unable to setup blob storage")
           end
 
-          key, version = typecast_params.nonempty_str!(%w[key version])
+          key, version = typecast_params.nonempty_str!(%w[key version].freeze)
           size = typecast_params.pos_int("cacheSize")
 
           unless (scope = runner.workflow_job&.dig("head_branch") || get_scope_from_github(runner, typecast_params.nonempty_str("runId")))
@@ -128,12 +131,12 @@ class Clover
           retries = 0
           begin
             upload_id = blob_storage_client.create_multipart_upload(bucket:, key: blob_key).upload_id
-          rescue Aws::S3::Errors::Unauthorized, Aws::S3::Errors::InternalError, Aws::S3::Errors::NoSuchBucket => ex
+          rescue Aws::S3::Errors::Unauthorized, Aws::S3::Errors::InternalError, Aws::S3::Errors::NoSuchBucket, Seahorse::Client::NetworkingError => ex
             retries += 1
             if retries < 3
-              # :nocov:
+              # simplecov:disable
               sleep(1) unless Config.test?
-              # :nocov:
+              # simplecov:enable
               retry
             else
               Clog.emit("Could not authorize multipart upload", {could_not_authorize_multipart_upload: Util.exception_to_hash(ex, into: {ubid: runner.ubid, repository_ubid: repository.ubid})})
@@ -186,7 +189,7 @@ class Clover
         rescue Aws::S3::Errors::InvalidPart, Aws::S3::Errors::NoSuchUpload, Aws::S3::Errors::EntityTooSmall => ex
           Clog.emit("could not complete multipart upload", {failed_multipart_upload: Util.exception_to_hash(ex, into: {ubid: runner.ubid, repository_ubid: repository.ubid})})
           fail CloverError.new(400, "InvalidRequest", "Wrong parameters")
-        rescue Aws::S3::Errors::ServiceUnavailable, Aws::S3::Errors::InternalError, Aws::S3::Errors::Unauthorized => ex
+        rescue Aws::S3::Errors::ServiceUnavailable, Aws::S3::Errors::InternalError, Aws::S3::Errors::Unauthorized, Seahorse::Client::NetworkingError => ex
           Clog.emit("s3 service unavailable", {failed_multipart_upload: Util.exception_to_hash(ex, into: {ubid: runner.ubid, repository_ubid: repository.ubid})})
           fail CloverError.new(503, "ServiceUnavailable", "Service unavailable")
         end

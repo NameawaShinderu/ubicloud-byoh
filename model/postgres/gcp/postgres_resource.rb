@@ -1,0 +1,66 @@
+# frozen_string_literal: true
+
+class PostgresResource < Sequel::Model
+  module Gcp
+    # c4a predates per-family gating and stays on unless a project opts out.
+    DEFAULT_ENABLED_FAMILIES = ["c4a-standard", "c4a-highmem"].freeze
+
+    def self.available_families_and_sizes(location, project)
+      Set.new(
+        OptionTreeFilter.filter(provider: "gcp", location: location.name)
+          .filter_map { |e| [e[:family], e[:size]] if family_enabled?(e[:family], project) },
+      )
+    end
+
+    # ProviderDispatcher requires every public class method to exist in all
+    # provider modules, so this stays private.
+    def self.family_enabled?(family, project)
+      flag = project.send(:"get_ff_enable_#{family.tr("-", "_")}")
+      DEFAULT_ENABLED_FAMILIES.include?(family) ? flag != false : !!flag
+    end
+    private_class_method :family_enabled?
+
+    def self.storage_sizes(_location, family, vcpu_count)
+      Option::GCP_STORAGE_SIZE_OPTIONS[family][vcpu_count]
+    end
+
+    private
+
+    def gcp_boot_image(pg_version, arch, family)
+      location.pg_gce_image(arch, pg_version, family, target_version:)
+    end
+
+    def gcp_upgrade_candidate_server
+      eligible_image_names = PgGceImage
+        .where(Sequel.pg_array_op(:pg_versions).contains(Sequel.pg_array([target_version], :text)))
+        .select_map(:gce_image_name)
+      servers
+        .reject(&:is_representative)
+        .select { |server| eligible_image_names.include?(server.vm.boot_image.split("/").last) }
+        .max_by(&:created_at)
+    end
+
+    def gcp_lockout_mechanisms
+      ["pg_stop", "hba"].freeze
+    end
+
+    def gcp_new_server_exclusion_filters
+      exclude_availability_zones, availability_zone = if use_different_az_set?
+        # Only exclude AZs of servers that will remain after convergence. Servers
+        # that need recycling or are being destroyed will leave their AZ, so it
+        # should be available for the replacement.
+        active_vm_ids = servers.reject { |s| s.needs_recycling? || s.destroy_set? }.map(&:vm_id)
+        zone_suffixes = VmGcpResource
+          .join(:location_az, id: :location_az_id)
+          .where(Sequel[:vm_gcp_resource][:id] => active_vm_ids)
+          .distinct
+          .select_map(Sequel[:location_az][:az])
+
+        [zone_suffixes, nil]
+      else
+        [[], representative_server.vm.vm_gcp_resource.location_az.az]
+      end
+      ServerExclusionFilters.new(exclude_host_ids: [], exclude_data_centers: [], exclude_availability_zones:, availability_zone:, availability_zone_required: false)
+    end
+  end
+end

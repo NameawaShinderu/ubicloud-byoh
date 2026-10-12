@@ -1,39 +1,14 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/util"
+class Prog::Test::PostgresResource < Prog::Test::PostgresBase
+  semaphore :pause, :destroy
 
-class Prog::Test::PostgresResource < Prog::Test::Base
-  def self.assemble(provider: "metal")
-    postgres_test_project = Project.create(name: "Postgres-Test-Project")
-    postgres_service_project = Project[Config.postgres_service_project_id] ||
-      Project.create_with_id(Config.postgres_service_project_id || Project.generate_uuid, name: "Postgres-Service-Project")
-
-    frame = {
-      "provider" => provider,
-      "postgres_service_project_id" => postgres_service_project.id,
-      "postgres_test_project_id" => postgres_test_project.id,
-    }
-
-    Strand.create(
-      prog: "Test::PostgresResource",
-      label: "start",
-      stack: [frame],
-    )
+  def self.assemble(provider: "metal", **)
+    super(provider:, project_name: "Postgres-Test-Project", **)
   end
 
   label def start
-    location_id, target_vm_size, target_storage_size_gib = self.class.postgres_test_location_options(frame["provider"])
-
-    st = Prog::Postgres::PostgresResourceNexus.assemble(
-      project_id: frame["postgres_test_project_id"],
-      location_id:,
-      name: "postgres-test-standard",
-      target_vm_size:,
-      target_storage_size_gib:,
-    )
-
-    update_stack({"postgres_resource_id" => st.id})
-    hop_wait_postgres_resource
+    super(name: "postgres-test-standard")
   end
 
   label def wait_postgres_resource
@@ -47,53 +22,21 @@ class Prog::Test::PostgresResource < Prog::Test::Base
 
   label def test_postgres
     unless representative_server.run_query(test_queries_sql) == "DROP TABLE\nCREATE TABLE\nINSERT 0 10\n4159.90\n415.99\n4.1"
-      update_stack({"fail_message" => "Failed to run test queries"})
+      self.fail_message = "Failed to run test queries"
     end
 
-    hop_destroy_postgres
-  end
+    verify_cloudwatch_cutover unless fail_message
+    verify_guardduty_agent unless fail_message
 
-  label def destroy_postgres
-    postgres_resource.timeline.incr_destroy
-    postgres_resource.incr_destroy
-    hop_wait_resources_destroyed
+    hop_destroy
   end
 
   label def wait_resources_destroyed
     nap 5 if postgres_resource
-    if PrivateSubnet[project_id: frame["postgres_test_project_id"]]
-      Clog.emit("Waiting for private subnet to be destroyed")
-      nap 5
-    end
+    nap_if_gcp_vpc
+    nap_if_private_subnet
+    verify_timelines_destroyed(timeline_ids) if timeline_ids
 
     hop_finish
-  end
-
-  label def finish
-    postgres_test_project.destroy
-
-    fail_test(frame["fail_message"]) if frame["fail_message"]
-
-    pop "Postgres tests are finished!"
-  end
-
-  label def failed
-    nap 15
-  end
-
-  def postgres_test_project
-    @postgres_test_project ||= Project[frame["postgres_test_project_id"]]
-  end
-
-  def postgres_resource
-    @postgres_resource ||= PostgresResource[frame["postgres_resource_id"]]
-  end
-
-  def representative_server
-    @representative_server ||= postgres_resource.representative_server
-  end
-
-  def test_queries_sql
-    File.read("./prog/test/testdata/order_analytics_queries.sql").freeze
   end
 end

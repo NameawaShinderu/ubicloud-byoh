@@ -1,9 +1,12 @@
 # frozen_string_literal: true
 
-require "bundler/setup"
+# simplecov:disable
+require "bundler/setup" if File.directory?(File.expand_path("../../host", __dir__))
+# simplecov:enable
 require "open3"
 require "shellwords"
-require "digest"
+require "openssl"
+require_relative "command"
 
 class CommandFail < RuntimeError
   attr_reader :stdout, :stderr
@@ -24,17 +27,63 @@ class FsyncFail < Exception
 end
 # rubocop:enable Lint/InheritException
 
-def r(*command, stdin: "", expect: [0])
-  stdout, stderr, status = Open3.capture3(*command, stdin_data: stdin)
-  fail CommandFail.new("command failed: " + command.join(" "), stdout, stderr) unless expect.include?(status.exitstatus)
+PotentialInsecurity = Command::PotentialInsecurity
 
-  stdout
+# Safely build a shell command string from a template containing
+# :placeholder tokens, substituting each with the corresponding keyword
+# argument, shell-escaped. See Command.build for details.
+def cmd(command, **kw)
+  Command.build(command, "cmd", __FILE__, true, **kw)
+end
+
+# simplecov:disable
+if defined?(RSpec)
+  class MissingMock < StandardError
+  end
+
+  # simplecov:enable
+  class Object
+    private
+
+    def _run_command(*command, _skip_command_checking: false, **kw)
+      unless _skip_command_checking
+        raise MissingMock, "_run_command not mocked. You must add a spec that checks for the expected command. Command: #{command.inspect}"
+      end
+
+      super(*command, **kw)
+    end
+  end
+end
+
+module Kernel
+  def _run_command(*command, stdin: "", expect: [0])
+    stdout, stderr, status = Open3.capture3(*command, stdin_data: stdin)
+    fail CommandFail.new("command failed: " + command.join(" "), stdout, stderr) unless expect.include?(status.exitstatus)
+
+    stdout
+  end
+end
+
+def r(*command, stdin: nil, expect: nil, **kw)
+  unless kw.empty?
+    raise ArgumentError, "placeholder keywords require a single shell command string" unless command.length == 1 && command[0].is_a?(String)
+    command = [cmd(command[0], **kw)]
+  end
+
+  if command.length == 1 && command[0].is_a?(String) && !command[0].frozen?
+    raise PotentialInsecurity, "Interpolated string passed to r at #{caller(1, 1).first}\nReplace interpolation with :placeholders passed directly to r, or use separate positional arguments instead."
+  end
+
+  kw = {stdin: stdin, expect: expect}
+  kw.compact!
+  _run_command(*command, **kw)
 end
 
 def rm_if_exists(path)
   FileUtils.rm_r(path)
 rescue Errno::ENOENT
   # ignore if path doesn't exist, otherwise raise error
+  nil
 end
 
 def fsync_or_fail(f)
@@ -59,26 +108,35 @@ def sync_parent_dir(f)
   }
 end
 
-def safe_write_to_file(filename, content = nil)
-  raise ArgumentError, "must provide either content or block" if (content.nil? && !block_given?) || (!content.nil? && block_given?)
+def safe_write_to_file(filename, content = nil, perm: nil)
+  raise ArgumentError, "must provide either content or block" if content.nil? ^ block_given?
 
   temp_filename = filename + ".tmp"
-  lock_filename = "/tmp/#{Digest::SHA256.hexdigest(temp_filename)}.lock"
+  lock_filename = "#{temp_filename}.lock"
   File.open(lock_filename, File::RDWR | File::CREAT) do |lock_file|
     lock_file.flock(File::LOCK_EX)
+    # Create the temp at its final mode so content is never written through the
+    # default 0644 nor left there on a mid-write crash. A mode only lands on a
+    # freshly created file, so unlink a temp a crashed run left behind first;
+    # else our content inherits its stale mode. nil perm keeps prior behavior.
+    File.unlink(temp_filename) if perm && File.exist?(temp_filename)
     if block_given?
-      File.open(temp_filename, File::RDWR | File::CREAT) do |f|
+      open_args = perm ? [File::RDWR | File::CREAT, perm] : ["w"]
+      File.open(temp_filename, *open_args) do |f|
         yield f
       end
     else
-      File.write(temp_filename, content)
+      File.write(temp_filename, content, perm: perm)
     end
+    # Creation masks the mode by umask; force the exact perm before publishing.
+    File.chmod(perm, temp_filename) if perm
     File.rename(temp_filename, filename)
   end
 end
 
 def curl_file(url, path)
-  r("bash -c 'curl -f -L3 #{url.shellescape} | tee >(openssl dgst -sha256) > #{path.shellescape}'").split(" ").last
+  inner = cmd("curl -f -L3 :url | tee >(openssl dgst -sha256) > :path", url: url, path: path)
+  r("bash -c :inner", inner: inner).split(" ").last
 end
 
 def validate_keys(context, required_keys, optional_keys, hash)

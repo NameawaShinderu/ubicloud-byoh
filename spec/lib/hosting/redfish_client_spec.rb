@@ -83,6 +83,20 @@ RSpec.describe Hosting::RedfishClient do
     end
   end
 
+  describe "#power_state" do
+    it "reads PowerState from the system" do
+      Excon.stub({path: "/redfish/v1/Systems", method: :get}, {status: 200, body: single_system_body})
+      Excon.stub({path: "/redfish/v1/Systems/1", method: :get}, {status: 200, body: {"PowerState" => "On"}.to_json})
+      expect(client.power_state).to eq("On")
+    end
+
+    it "reports unknown when the BMC omits PowerState" do
+      client_with_id = described_class.new(endpoint, username: "admin", password: "secret", verify_ssl: false, system_id: "1")
+      Excon.stub({path: "/redfish/v1/Systems/1", method: :get}, {status: 200, body: system_detail_body})
+      expect(client_with_id.power_state).to eq("unknown")
+    end
+  end
+
   describe "#discover_system_id" do
     it "returns the SystemId from a single-member collection" do
       Excon.stub({path: "/redfish/v1/Systems", method: :get}, {status: 200, body: single_system_body})
@@ -116,7 +130,7 @@ RSpec.describe Hosting::RedfishClient do
 
   describe "connection" do
     it "bounds every BMC request with timeouts so a dead BMC cannot hang a strand" do
-      expect(Excon).to receive(:new).with(endpoint, hash_including(connect_timeout: 10, read_timeout: 60, write_timeout: 60)).and_call_original
+      expect(Excon).to receive(:new).with(endpoint, hash_including(connect_timeout: 5, read_timeout: 20, write_timeout: 20)).and_call_original
       Excon.stub({path: "/redfish/v1/Systems", method: :get}, {status: 200, body: single_system_body})
       expect(client.discover_system_id).to eq("1")
     end

@@ -19,39 +19,25 @@ RSpec.describe Prog::Vnet::NicNexus do
     end
 
     it "uses ipv6_addr if passed" do
-      expect(PrivateSubnet).to receive(:[]).with("57afa8a7-2357-4012-9632-07fbe13a3133").and_return(ps)
-      expect(ps).to receive(:random_private_ipv4).and_return("10.0.0.12/32")
-      expect(ps).not_to receive(:random_private_ipv6)
-      expect(described_class).to receive(:rand).and_return(123).exactly(6).times
-      id = "0a9a166c-e7e7-4447-ab29-7ea442b5bb0e"
-      expect(Nic).to receive(:generate_ubid).and_return(UBID.from_uuidish(id))
-      nic = instance_double(Nic, private_subnet: ps, id:)
-      expect(Nic).to receive(:create_with_id).with(id,
-        private_ipv6: "fd10:9b0b:6b4b:8fbb::/128",
-        private_ipv4: "10.0.0.12/32",
-        mac: "7a:7b:7b:7b:7b:7b",
-        private_subnet_id: "57afa8a7-2357-4012-9632-07fbe13a3133",
-        name: "demonic", state: "initializing").and_return(nic)
-      expect(Strand).to receive(:create_with_id).with(id, prog: "Vnet::Metal::NicNexus", label: "start", stack: [{"exclude_availability_zones" => [], "availability_zone" => nil, "ipv4_addr" => "10.0.0.12/32", "aws_subnet_id" => nil}]).and_return(Strand.new)
-      described_class.assemble(ps.id, ipv6_addr: "fd10:9b0b:6b4b:8fbb::/128", name: "demonic")
+      subnet = PrivateSubnet.create(name: "ps6", location_id: Location::HETZNER_FSN1_ID, net6: "fd10:9b0b:6b4b:8fbb::/64",
+        net4: "10.0.0.0/26", state: "waiting", project_id: Project.create(name: "test6").id)
+      strand = described_class.assemble(subnet.id, ipv6_addr: "fd10:9b0b:6b4b:8fbb::/128", name: "demonic")
+      nic = strand.subject
+      expect(nic.private_ipv6.to_s).to eq("fd10:9b0b:6b4b:8fbb::/128")
+      expect(nic.private_ipv4).not_to be_nil
+      expect(strand.prog).to eq("Vnet::Metal::NicNexus")
+      expect(strand.stack.first).to include("use_eip" => true, "create_network_interface?" => true)
     end
 
     it "uses ipv4_addr if passed" do
-      expect(PrivateSubnet).to receive(:[]).with("57afa8a7-2357-4012-9632-07fbe13a3133").and_return(ps)
-      expect(ps).to receive(:random_private_ipv6).and_return("fd10:9b0b:6b4b:8fbb::/128")
-      expect(ps).not_to receive(:random_private_ipv4)
-      id = "0a9a166c-e7e7-4447-ab29-7ea442b5bb0e"
-      expect(described_class).to receive(:gen_mac).and_return("00:11:22:33:44:55")
-      expect(Nic).to receive(:generate_ubid).and_return(UBID.from_uuidish(id))
-      nic = instance_double(Nic, private_subnet: ps, id:)
-      expect(Nic).to receive(:create_with_id).with(id,
-        private_ipv6: "fd10:9b0b:6b4b:8fbb::/128",
-        private_ipv4: "10.0.0.12/32",
-        mac: "00:11:22:33:44:55",
-        private_subnet_id: "57afa8a7-2357-4012-9632-07fbe13a3133",
-        name: "demonic", state: "initializing").and_return(nic)
-      expect(Strand).to receive(:create_with_id).with(id, prog: "Vnet::Metal::NicNexus", label: "start", stack: [{"exclude_availability_zones" => [], "availability_zone" => nil, "ipv4_addr" => "10.0.0.12/32", "aws_subnet_id" => nil}]).and_return(Strand.new)
-      described_class.assemble(ps.id, ipv4_addr: "10.0.0.12/32", name: "demonic")
+      subnet = PrivateSubnet.create(name: "ps4", location_id: Location::HETZNER_FSN1_ID, net6: "fd10:9b0b:6b4b:8fbb::/64",
+        net4: "10.0.0.0/26", state: "waiting", project_id: Project.create(name: "test4").id)
+      strand = described_class.assemble(subnet.id, ipv4_addr: "10.0.0.12/32", name: "demonic")
+      nic = strand.subject
+      expect(nic.private_ipv4.to_s).to eq("10.0.0.12/32")
+      expect(nic.private_ipv6).not_to be_nil
+      expect(strand.prog).to eq("Vnet::Metal::NicNexus")
+      expect(strand.stack.first).to include("use_eip" => true, "create_network_interface?" => true)
     end
 
     it "assembles AWS NIC with correct prog and state" do
@@ -75,6 +61,53 @@ RSpec.describe Prog::Vnet::NicNexus do
       expect(strand.prog).to eq("Vnet::Aws::NicNexus")
       expect(strand.label).to eq("start")
       expect(strand.stack.first["aws_subnet_id"]).not_to be_nil
+    end
+
+    it "leaves the private IPv4 of an AWS NIC created at launch to AWS" do
+      project = Project.create(name: "test-aws-launch-nic")
+      aws_location = Location.create(name: "us-west-2", provider: "aws", project_id: project.id, display_name: "aws-us-west-2", ui_name: "AWS US West 2", visible: true)
+      LocationCredentialAws.create_with_id(aws_location.id, access_key: "stubbed-akid", secret_key: "stubbed-secret")
+      LocationAz.create(location_id: aws_location.id, az: "a", zone_id: "usw2-az1")
+      aws_ps = Prog::Vnet::SubnetNexus.assemble(project.id, name: "test-aws-ps", location_id: aws_location.id).subject
+
+      strand = described_class.assemble(aws_ps.id, name: "demonic", use_eip: false, create_network_interface: false)
+
+      expect(strand.subject.private_ipv4).to be_nil
+      expect(strand.stack.first).to eq("exclude_availability_zones" => [], "availability_zone" => nil, "ipv4_addr" => nil, "aws_subnet_id" => aws_ps.private_subnet_aws_resource.aws_subnets.first.id, "use_eip" => false, "create_network_interface?" => false)
+    end
+
+    it "raises if the required availability zone is not available" do
+      project = Project.create(name: "test-aws-required-az")
+      aws_location = Location.create(name: "us-west-2", provider: "aws", project_id: project.id, display_name: "aws-us-west-2", ui_name: "AWS US West 2", visible: true)
+      LocationCredentialAws.create_with_id(aws_location.id, access_key: "stubbed-akid", secret_key: "stubbed-secret")
+      LocationAz.create(location_id: aws_location.id, az: "a", zone_id: "usw2-az1")
+      aws_credentials = Aws::Credentials.new("stubbed-akid", "stubbed-secret")
+      allow(Aws::Credentials).to receive(:new).with("stubbed-akid", "stubbed-secret").and_return(aws_credentials)
+      allow(Aws::EC2::Client).to receive(:new).and_return(Aws::EC2::Client.new(stub_responses: true))
+      aws_ps = Prog::Vnet::SubnetNexus.assemble(project.id, name: "test-aws-ps", location_id: aws_location.id).subject
+
+      expect {
+        described_class.assemble(aws_ps.id, name: "demonic", availability_zone: "b", availability_zone_required: true)
+      }.to raise_error RuntimeError, "No subnet in required availability zone b of #{aws_ps.ubid}"
+      expect(Nic.where(name: "demonic")).to be_empty
+    end
+
+    it "creates a GCP nic if location is gcp" do
+      gcp_project = Project.create(name: "test-gcp-assemble")
+      gcp_location = Location.create(name: "gcp-us-central1", provider: "gcp", project_id: gcp_project.id,
+        display_name: "GCP US Central 1", ui_name: "GCP US Central 1", visible: true)
+      gcp_ps = Prog::Vnet::SubnetNexus.assemble(gcp_project.id, name: "test-gcp-ps", location_id: gcp_location.id).subject
+
+      strand = described_class.assemble(gcp_ps.id, name: "demonic")
+      nic = strand.subject
+
+      expect(nic.name).to eq("demonic")
+      expect(nic.mac).to be_nil
+      expect(nic.state).to eq("active")
+      expect(nic.private_ipv4).not_to be_nil
+      expect(nic.private_ipv6).not_to be_nil
+      expect(strand.prog).to eq("Vnet::Gcp::NicNexus")
+      expect(strand.label).to eq("start")
     end
   end
 
@@ -126,6 +159,22 @@ RSpec.describe Prog::Vnet::NicNexus do
       result = described_class.select_aws_subnet(aws_ps, "b", [])
       expect(result).to be_an(AwsSubnet)
       expect(result.location_aws_az_id).to eq(az_a.id)
+    end
+
+    it "returns the required AZ subnet when availability_zone is required" do
+      az_b  # Create AZ b before assembling so assemble creates AwsSubnet for both AZs
+      aws_ps
+      result = described_class.select_aws_subnet(aws_ps, "b", [], availability_zone_required: true)
+      expect(result.location_aws_az_id).to eq(az_b.id)
+    end
+
+    it "raises when the required AZ has no subnet instead of falling back" do
+      aws_ps
+      # Create AZ b AFTER assemble so no AwsSubnet record exists for it
+      az_b
+      expect {
+        described_class.select_aws_subnet(aws_ps, "b", [], availability_zone_required: true)
+      }.to raise_error RuntimeError, "No subnet in required availability zone b of #{aws_ps.ubid}"
     end
 
     it "excludes specified availability zones" do

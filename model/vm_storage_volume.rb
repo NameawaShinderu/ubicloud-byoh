@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../model"
+require "json"
 
 class VmStorageVolume < Sequel::Model
   many_to_one :vm
@@ -8,9 +9,10 @@ class VmStorageVolume < Sequel::Model
   many_to_one :vhost_block_backend, read_only: true
   many_to_one :storage_device
   many_to_one :key_encryption_key_1, class: :StorageKeyEncryptionKey
-  many_to_one :key_encryption_key_2, class: :StorageKeyEncryptionKey
+  many_to_one :key_encryption_key_2, class: :StorageKeyEncryptionKey, read_only: true
   many_to_one :boot_image, read_only: true
   many_to_one :machine_image_version, read_only: true
+  many_to_one :remote_storage_server, read_only: true
 
   plugin :association_dependencies, key_encryption_key_1: :destroy, key_encryption_key_2: :destroy
 
@@ -54,6 +56,57 @@ class VmStorageVolume < Sequel::Model
       256
     end
   end
+
+  def path
+    @path ||= File.join(storage_device.path, vm.inhost_name, disk_index.to_s)
+  end
+
+  def rpc(payload)
+    # The rpc server sends each response in a separate line. The pipe through
+    # `head -n 1` is to close the connection after receiving the first response,
+    # otherwise the rpc server will keep the connection open waiting for the 2nd
+    # request, until the timeout is reached.
+    #
+    # `-q 2`: after stdin EOF, wait up to 2s for the response before exiting
+    # `-w 2`: connection timeout
+    rpc_socket = File.join(path, "rpc.sock")
+    vm.vm_host.sshable.cmd_json("sudo nc -U :rpc_socket -q 2 -w 2 | head -n 1", stdin: payload.to_json, rpc_socket:)
+  end
+
+  def caught_up?
+    stripes = rpc(command: "status").dig("status", "stripes")
+    stripes.fetch("fetched") == stripes.fetch("source")
+  end
+
+  def dump_metadata
+    fail "dump_metadata only supported for vm storage volumes with vhost block backend version v0.4.0+" unless vhost_block_backend&.supports_dump_metadata?
+    fail "dump_metadata requires an encrypted vm storage volume" unless key_encryption_key_1
+
+    vm.vm_host.sshable.cmd(
+      "sudo host/bin/storage-dump-metadata :vm_name :storage_device :disk_index :vhost_block_backend_version",
+      vm_name: vm.inhost_name,
+      storage_device: storage_device.name,
+      disk_index:,
+      vhost_block_backend_version:,
+      stdin: key_encryption_key_1.secret_key_material_hash.to_json,
+    )
+  end
+
+  def restart_daemon
+    fail "restart_daemon only supported for vm storage volumes with vhost block backend" unless vhost_block_backend
+    fail "restart_daemon requires an encrypted vm storage volume" unless key_encryption_key_1
+    fail "cannot restart the vhost backend daemon while a storage key rotation is in progress" if key_encryption_key_2_id
+    fail "VM must be stopped before restarting the vhost backend daemon" unless ["stopped", "stopped by admin"].include?(vm.display_state)
+
+    vm.vm_host.sshable.cmd(
+      "sudo host/bin/storage-restart-daemon :vm_name :storage_device :disk_index :vhost_block_backend_version",
+      vm_name: vm.inhost_name,
+      storage_device: storage_device.name,
+      disk_index:,
+      vhost_block_backend_version: vhost_block_backend.version,
+      stdin: key_encryption_key_1.secret_key_material_hash.to_json,
+    )
+  end
 end
 
 # Table: vm_storage_volume
@@ -75,11 +128,14 @@ end
 #  vring_workers            | integer |
 #  machine_image_version_id | uuid    |
 #  track_written            | boolean | NOT NULL DEFAULT false
+#  remote_storage_server_id | uuid    |
+#  network_volume_id        | uuid    |
 # Indexes:
-#  vm_storage_volume_pkey                 | PRIMARY KEY btree (id)
-#  vm_storage_volume_vm_id_disk_index_key | UNIQUE btree (vm_id, disk_index)
+#  vm_storage_volume_pkey                    | PRIMARY KEY btree (id)
+#  vm_storage_volume_network_volume_id_index | UNIQUE btree (network_volume_id)
+#  vm_storage_volume_vm_id_disk_index_key    | UNIQUE btree (vm_id, disk_index)
 # Check constraints:
-#  vm_storage_volume_single_source  | (boot_image_id IS NULL OR machine_image_version_id IS NULL)
+#  vm_storage_volume_single_source  | (((boot_image_id IS NOT NULL)::integer + (machine_image_version_id IS NOT NULL)::integer + (remote_storage_server_id IS NOT NULL)::integer) <= 1)
 #  vring_workers_null_if_not_ubiblk | (vhost_block_backend_id IS NOT NULL OR vring_workers IS NULL)
 #  vring_workers_positive_if_ubiblk | (vhost_block_backend_id IS NULL OR vring_workers IS NOT NULL AND vring_workers > 0)
 # Foreign key constraints:
@@ -87,7 +143,11 @@ end
 #  vm_storage_volume_key_encryption_key_1_id_fkey  | (key_encryption_key_1_id) REFERENCES storage_key_encryption_key(id)
 #  vm_storage_volume_key_encryption_key_2_id_fkey  | (key_encryption_key_2_id) REFERENCES storage_key_encryption_key(id)
 #  vm_storage_volume_machine_image_version_id_fkey | (machine_image_version_id) REFERENCES machine_image_version(id)
+#  vm_storage_volume_network_volume_id_fkey        | (network_volume_id) REFERENCES network_volume(id)
+#  vm_storage_volume_remote_storage_server_id_fkey | (remote_storage_server_id) REFERENCES remote_storage_server(id)
 #  vm_storage_volume_spdk_installation_id_fkey     | (spdk_installation_id) REFERENCES spdk_installation(id)
 #  vm_storage_volume_storage_device_id_fkey        | (storage_device_id) REFERENCES storage_device(id)
 #  vm_storage_volume_vhost_block_backend_id_fkey   | (vhost_block_backend_id) REFERENCES vhost_block_backend(id)
 #  vm_storage_volume_vm_id_fkey                    | (vm_id) REFERENCES vm(id)
+# Referenced By:
+#  remote_storage_server | remote_storage_server_source_vm_storage_volume_id_fkey | (source_vm_storage_volume_id) REFERENCES vm_storage_volume(id)

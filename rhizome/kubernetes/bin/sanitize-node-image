@@ -1,0 +1,6 @@
+#!/bin/env ruby
+# frozen_string_literal: true
+
+require_relative "../lib/kubernetes_sanitize_node_image"
+
+KubernetesSanitizeNodeImage.new.run

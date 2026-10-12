@@ -67,13 +67,13 @@ RSpec.describe Prog::Test::VmHostSlices do
     it "fails the test if the slices are the same" do
       allow(vm_host_slices).to receive_messages(slices: [slice1, slice1, slice2])
       expect { vm_host_slices.verify_separation }.to hop("failed")
-      expect(strand.reload.exitval["msg"]).to match(/Two Vm instances placed in the same slice;/)
+      expect(strand.reload.exitval["msg"]).to include("Two Vm instances placed in the same slice;")
     end
 
     it "fails the test if the slices are on the same CPUs" do
       allow(vm_host_slices).to receive_messages(slices: [slice2, slice3, slice2_overlap])
       expect { vm_host_slices.verify_separation }.to hop("failed")
-      expect(strand.reload.exitval["msg"]).to match(/Two Vm instances are sharing at least one cpu;/)
+      expect(strand.reload.exitval["msg"]).to include("Two Vm instances are sharing at least one cpu;")
     end
 
     it "handles burstable slices" do
@@ -129,7 +129,7 @@ RSpec.describe Prog::Test::VmHostSlices do
 
   describe "slices access method" do
     it "returns slices" do
-      expect(vm_host_slices).to receive(:frame).and_return({"slices" => [slice1.id, slice2.id, slice3.id]})
+      expect(vm_host_slices).to receive(:frame).and_return({"slice_ids" => [slice1.id, slice2.id, slice3.id]})
 
       [slice1, slice2, slice3].each do |slice|
         expect(VmHostSlice).to receive(:[]).with(slice.id).and_return(slice)

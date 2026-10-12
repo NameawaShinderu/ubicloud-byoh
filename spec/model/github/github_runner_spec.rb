@@ -7,7 +7,7 @@ RSpec.describe GithubRunner do
     ins = GithubInstallation.create(installation_id: 123, name: "test-installation", type: "User")
     vm = create_vm(vm_host: create_vm_host, boot_image: "github-ubuntu-2204")
     Sshable.create_with_id(vm)
-    described_class.create(repository_name: "test-repo", label: "ubicloud", vm_id: vm.id, installation_id: ins.id)
+    described_class.create(repository_name: "test-repo", label: "ubicloud", vm_id: vm.id, location_id: vm.location_id, installation_id: ins.id)
   }
 
   def clog_emit_hash
@@ -38,6 +38,26 @@ RSpec.describe GithubRunner do
       vcpus: vm.vcpus,
       vm_host_ubid: vm.vm_host.ubid,
       data_center: vm.vm_host.data_center,
+    })
+  end
+
+  it "can log duration with ch_version if the vm's strand has one" do
+    vm = github_runner.vm
+    Strand.create(prog: "Vm::Metal::Nexus", label: "start", stack: [{"ch_version" => "53.0"}]) { it.id = vm.id }
+    expect(clog_emit_hash).to eq({
+      repository_name: "test-repo",
+      ubid: github_runner.ubid,
+      label: github_runner.label,
+      duration: 10,
+      conclusion: nil,
+      vm_ubid: vm.ubid,
+      arch: vm.arch,
+      boot_image: vm.boot_image,
+      cores: vm.cores,
+      vcpus: vm.vcpus,
+      vm_host_ubid: vm.vm_host.ubid,
+      data_center: vm.vm_host.data_center,
+      ch_version: "53.0",
     })
   end
 
@@ -113,7 +133,7 @@ RSpec.describe GithubRunner do
   end
 
   it "can log duration without a vm" do
-    github_runner.update(vm_id: nil)
+    github_runner.update(vm_id: nil, location_id: nil)
     expect(clog_emit_hash).to eq({
       repository_name: "test-repo",
       ubid: github_runner.ubid,
@@ -123,18 +143,43 @@ RSpec.describe GithubRunner do
     })
   end
 
-  it "provisions a spare runner" do
+  it "provisions a spare runner and increments the spare_runner_provisioned semaphore" do
+    Strand.create_with_id(github_runner, prog: "Github::GithubRunnerNexus", label: "start")
+
     spare_runner = github_runner.provision_spare_runner
 
     expect(spare_runner).to be_a(described_class)
     expect(spare_runner.installation_id).to eq(github_runner.installation_id)
     expect(spare_runner.repository_name).to eq(github_runner.repository_name)
     expect(spare_runner.label).to eq(github_runner.label)
+    expect(github_runner.spare_runner_provisioned_set?(cached: false)).to be(true)
+  end
+
+  it "does not provision another spare runner once one has been provisioned" do
+    Strand.create_with_id(github_runner, prog: "Github::GithubRunnerNexus", label: "start")
+    github_runner.incr_spare_runner_provisioned
+
+    expect {
+      expect(github_runner.provision_spare_runner).to be_nil
+    }.not_to change(described_class, :count)
+  end
+
+  it "provisions a spare runner regardless of the semaphore when force is true" do
+    Strand.create_with_id(github_runner, prog: "Github::GithubRunnerNexus", label: "start")
+    github_runner.incr_spare_runner_provisioned
+
+    expect {
+      expect(github_runner.provision_spare_runner(force: true)).to be_a(described_class)
+    }.to change(described_class, :count).from(1).to(2)
   end
 
   it "initiates a new health monitor session" do
     expect(github_runner.vm.sshable).to receive(:start_fresh_session)
     github_runner.init_health_monitor_session
+  end
+
+  it "does not page on sshable failure" do
+    expect(github_runner.page_on_sshable_failure?).to be false
   end
 
   it "checks pulse" do

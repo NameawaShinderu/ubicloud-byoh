@@ -3,19 +3,42 @@
 class Prog::Base
   attr_reader :strand, :subject_id
 
-  # :nocov:
+  # simplecov:disable
   if Config.override_dir
     Overrider.setup_overrides(self, Config.override_dir)
   elsif Config.unfrozen_test?
     Overrider.setup_overrides(self, "spec/overrider_test")
   end
-  # :nocov:
+  # simplecov:enable
 
   def initialize(strand, snap = nil)
     @snap = snap || SemSnap.new(strand.id)
     @strand = strand
     @subject_id = frame.dig("subject_id") || @strand.id
   end
+
+  def self.frame_reader(*attr)
+    attr.each do |attr|
+      attr = attr.to_s
+      define_method(attr) { frame[attr] }
+    end
+  end
+
+  def self.frame_accessor(*attr)
+    frame_reader(*attr)
+
+    attr.each do |attr|
+      attr = attr.to_s
+      define_method(:"#{attr}=") do |v|
+        strand.modified!(:stack)
+        @frame = nil
+        strand.stack[0][attr] = v
+      end
+    end
+  end
+
+  frame_reader :link
+  frame_accessor :deadline_at, :deadline_target, :deadline_start, :deadline_page
 
   # Searches the stack for the Prog that caused execution of the code,
   # which can be useful in logging from nested method calls.
@@ -64,12 +87,16 @@ end
     end
   end
 
-  def self.labels
-    @labels || []
+  @labels = []
+  singleton_class.attr_reader :labels
+
+  def self.inherited(subclass)
+    subclass.instance_variable_set(:@labels, @labels.dup)
+    super
   end
 
   def self.label(label)
-    (@labels ||= []) << label
+    @labels << label unless @labels.include?(label)
 
     if label == :destroy
       define_method :"hop_#{label}" do
@@ -106,8 +133,16 @@ end
     end
   end
 
+  def prog_return(flow_control)
+    throw(:prog_return, flow_control)
+  end
+
+  def hibernate
+    nap(60 * 60 * 24 * 365 * 1000)
+  end
+
   def nap(seconds = 30)
-    fail Nap.new(seconds)
+    prog_return Nap.new(seconds)
   end
 
   def pop(arg)
@@ -122,85 +157,79 @@ end
       end,
     )
 
-    if strand.stack.length > 0 && (link = frame["link"])
+    if strand.stack.length > 0 && link
       # This is a multi-level stack with a back-link, i.e. one prog
       # calling another in the same Strand of execution.  The thing to
       # do here is pop the stack entry.
-      pg = Page.from_tag_parts("Deadline", strand.id, strand.prog, strand.stack.first["deadline_target"])
+      pg = Page.from_tag_parts("Deadline", strand.id, strand.prog, deadline_target)
       pg&.incr_resolve
 
       old_prog = strand.prog
       old_label = strand.label
       prog, label = link
 
-      fail Hop.new(old_prog, old_label,
+      prog_return Hop.new(old_prog, old_label,
         {retval: outval,
          stack: Sequel.pg_jsonb_wrap(@strand.stack[1..]),
          prog:, label:})
     else
       raise Strand::InternalError, "BUG: expect no stacks exceeding depth 1 with no back-link" if strand.stack.length > 1
 
-      pg = Page.from_tag_parts("Deadline", strand.id, strand.prog, strand.stack.first["deadline_target"])
+      pg = Page.from_tag_parts("Deadline", strand.id, strand.prog, deadline_target)
       pg&.incr_resolve
 
       # Child strand with zero or one stack frames, set exitval. Clear
       # retval to avoid confusion, as it would have been set in a
       # previous intra-strand stack pop.
-      fail Exit.new(strand, outval)
+      prog_return Exit.new(strand, outval)
     end
   end
 
-  class FlowControl < RuntimeError; end
-
-  EMPTY_ARRAY = [].freeze
-
-  class Exit < FlowControl
-    attr_reader :exitval
-
-    def initialize(strand, exitval)
-      @strand = strand
-      @exitval = exitval
-      set_backtrace EMPTY_ARRAY
-    end
-
+  Exit = Data.define(:strand, :exitval) do
     def to_s
-      "Strand exits from #{@strand.prog}##{@strand.label} with #{@exitval}"
+      "Strand exits from #{strand.prog}##{strand.label} with #{exitval}"
     end
   end
 
-  class Hop < FlowControl
-    attr_reader :strand_update_args, :old_prog
-
-    def initialize(old_prog, old_label, strand_update_args)
-      @old_prog = old_prog
-      @old_label = old_label
-      @strand_update_args = strand_update_args
-      set_backtrace EMPTY_ARRAY
-    end
-
+  Hop = Data.define(:old_prog, :old_label, :strand_update_args) do
     def new_label
-      @strand_update_args[:label] || @old_label
+      strand_update_args[:label] || old_label
     end
 
     def new_prog
-      @strand_update_args[:prog] || @old_prog
+      strand_update_args[:prog] || old_prog
     end
 
     def to_s
-      "hop #{@old_prog}##{@old_label} -> #{new_prog}##{new_label}"
+      "hop #{old_prog}##{old_label} -> #{new_prog}##{new_label}"
     end
   end
 
-  class Nap < FlowControl
+  class Nap
     attr_reader :seconds
 
     def initialize(seconds)
       @seconds = seconds
-      set_backtrace EMPTY_ARRAY
+      freeze
     end
 
     def to_s
       "nap for #{seconds} seconds"
+    end
+  end
+
+  # Subclass of Nap used by #reap to pass the exception raised by a child strand
+  # run through as a Nap, and have it later be reraised inside Strand#run.
+  class ChildRunError < Nap
+    attr_reader :exception
+
+    def initialize(seconds, exception)
+      @exception = exception
+      super(seconds)
+    end
+
+    def to_s
+      "error running child strand: #{exception.class}: #{exception.message}, #{super}"
     end
   end
 
@@ -217,7 +246,7 @@ end
     old_label = strand.label
     new_frame = {"subject_id" => @subject_id, "link" => [strand.prog, old_label]}.merge(new_frame)
 
-    fail Hop.new(old_prog, old_label,
+    prog_return Hop.new(old_prog, old_label,
       {prog: Strand.prog_verify(prog), label:,
        stack: [new_frame] + strand.stack, retval: nil})
   end
@@ -245,9 +274,13 @@ end
   #
   # If there are still active children:
   #
-  # * If fallthrough is given: returns nil
+  # * If fallthrough is true: returns nil
   # * If nap is given: naps for given time
   # * Otherwise, donates to run a child process
+  #
+  # fallthrough: :when_idle naps or donates while children are active,
+  # then returns nil once none remain, so a caller can wait for children
+  # and continue in place.
   def reap(hop = nil, reaper: nil, nap: nil, fallthrough: false, strand: self.strand, prog: nil)
     dataset = strand.children_dataset
     dataset = dataset.where(prog:) if prog
@@ -283,6 +316,7 @@ end
       end
     end
 
+    fallthrough = false if fallthrough == :when_idle && !active_children.empty?
     unless fallthrough
       # Parent is not a leaf, nap for given time, or donate if no
       # nap time is given.
@@ -290,33 +324,45 @@ end
         nap(nap)
       else
         active_children.each do |child|
-          if (result = child.run)
-            if result.is_a?(Nap)
-              seconds = if active_children.length == 1
-                # For a single active child napping, parent can nap for as long as the child naps,
-                # since the expectation is there will not be anything to do until then.
-                result.seconds
-              else
-                # For multiple active children, if a single child is napping, it's possible the
-                # other children are immediately runnable. However, you don't want to busy
-                # wait on multiple children. Nap until the time of the earliest scheduled child
-                # that isn't currently running. If all children are running, nap for 120 seconds
-                strand.children_dataset
-                  .where(Sequel[:lease] < Sequel::CURRENT_TIMESTAMP)
-                  .min(Sequel.extract(:epoch, Sequel[:schedule] - Sequel::CURRENT_TIMESTAMP)) || 121
-              end
+          begin
+            result = child.run
+          rescue => ex
+            nil
+          else
+            next unless result
+          end
 
-              # Remove a 10th of a second so it is likely the parent will run the child.
-              seconds -= 0.1
-
-              # Nap for a minimum of 0.1 seconds and a maximum of 120 seconds in any case.
-              # The 0.1 seconds is to avoid busy waiting.
-              nap(seconds.clamp(0.1, 120))
+          if result.is_a?(Nap) || ex
+            seconds = if active_children.length == 1 && ex.nil?
+              # For a single active child napping, parent can nap for as long as the child naps,
+              # since the expectation is there will not be anything to do until then.
+              result.seconds
             else
-              # A non-nap (e.g. Exit or Hop) happened, so the state changed, and
-              # it makes sense to rerun the strand immediately.
-              nap 0
+              # For multiple active children, if a single child is napping, it's possible the
+              # other children are immediately runnable. However, you don't want to busy
+              # wait on multiple children. Nap until the time of the earliest scheduled child
+              # that isn't currently running. If all children are running, nap for 120 seconds
+              strand.children_dataset
+                .where(Sequel[:lease] < Sequel::CURRENT_TIMESTAMP)
+                .min(Sequel.extract(:epoch, Sequel[:schedule] - Sequel::CURRENT_TIMESTAMP)) || 121
             end
+
+            # Remove a 10th of a second so it is likely the parent will run the child.
+            seconds -= 0.1
+
+            # Nap for a minimum of 0.1 seconds and a maximum of 120 seconds in any case.
+            # The 0.1 seconds is to avoid busy waiting.
+            seconds = seconds.clamp(0.1, 120)
+
+            if ex
+              prog_return(ChildRunError.new(seconds, ex))
+            else
+              nap(seconds)
+            end
+          else
+            # A non-nap (e.g. Exit or Hop) happened, so the state changed, and
+            # it makes sense to rerun the strand immediately.
+            nap 0
           end
         end
 
@@ -340,16 +386,24 @@ end
     end
   end
 
-  def update_stack(new_frame)
-    strand.stack.first.merge!(new_frame)
+  def delete_from_stack(*keys)
+    frame = strand.stack.first
+    keys.flatten!
+    keys.each { frame.delete(it) }
     strand.modified!(:stack)
-    strand.save_changes
+    @frame = nil
   end
 
-  def delete_from_stack(*keys)
-    keys.flatten.each { |key| strand.stack.first.delete(key) }
-    strand.modified!(:stack)
-    strand.save_changes
+  def hop_wait_and_wakeup_waiting_strand
+    strand.wakeup_waiting_strand
+    hop_wait
+  end
+
+  # A non-terminal wake for a waiter that overlaps work with this strand
+  # rather than waiting for it to reach wait. It takes the frame key so its
+  # signal does not consume the waiting_strand_id that the wait wake uses.
+  def wakeup_waiting_strand(key)
+    strand.wakeup_waiting_strand(key)
   end
 
   # A hop is a kind of jump, as in, like a jump instruction.
@@ -358,52 +412,48 @@ end
     raise Strand::InternalError, "BUG: not valid hop target" unless self.class.labels.include? label
 
     label = label.to_s
-    fail Hop.new(@strand.prog, @strand.label, {label:, retval: nil})
+    prog_return Hop.new(@strand.prog, @strand.label, {label:, retval: nil})
   end
 
   private def time_string(time)
     strand.time_string(time)
   end
 
-  def register_deadline(deadline_target, deadline_in, allow_extension: false)
-    current_frame = strand.stack.first
+  def register_deadline(new_deadline_target, deadline_in, allow_extension: false, page: true)
+    if page.is_a?(String) && !Page::SEVERITY_ORDER.key?(page)
+      raise Strand::InternalError, "BUG: invalid deadline page severity: #{page.inspect}"
+    end
+
     time = Time.now
     new_deadline = time + deadline_in
 
-    if (deadline_at = current_frame["deadline_at"]).nil? ||
-        (old_deadline_target = current_frame["deadline_target"]) != deadline_target ||
+    if deadline_at.nil? ||
+        deadline_target != new_deadline_target ||
         allow_extension ||
-        Time.parse(deadline_at) > new_deadline
+        Time.new(deadline_at) > new_deadline
 
-      if old_deadline_target != deadline_target && (pg = Page.from_tag_parts("Deadline", strand.id, strand.prog, old_deadline_target))
-        pg.incr_resolve
-      end
+      resolve_deadline_target(deadline_target) if deadline_target != new_deadline_target
 
-      current_frame["deadline_target"] = deadline_target
+      self.deadline_target = new_deadline_target
+      self.deadline_page = page
 
       if allow_extension.is_a?(Integer)
-        current_frame["deadline_start"] ||= time_string(time)
-        cap = Time.parse(current_frame["deadline_start"]) + allow_extension
-        current_frame["deadline_at"] = time_string([new_deadline, cap].min)
-      else
-        current_frame["deadline_at"] = time_string(new_deadline)
+        self.deadline_start ||= time_string(time)
+        cap = Time.new(deadline_start) + allow_extension
+        new_deadline = [new_deadline, cap].min
       end
 
-      strand.modified!(:stack)
+      self.deadline_at = time_string(new_deadline)
     end
   end
 
   def unregister_deadline(deadline_target)
-    current_frame = strand.stack.first
+    resolve_deadline_target(deadline_target)
+    delete_from_stack("deadline_at", "deadline_target", "deadline_start", "deadline_page")
+  end
 
-    if (pg = Page.from_tag_parts("Deadline", strand.id, strand.prog, deadline_target))
-      pg.incr_resolve
-    end
-
-    current_frame.delete("deadline_at")
-    current_frame.delete("deadline_target")
-    current_frame.delete("deadline_start")
-    strand.modified!(:stack)
+  def resolve_deadline_target(deadline_target)
+    Page.from_tag_parts("Deadline", strand.id, strand.prog, deadline_target)&.incr_resolve
   end
 
   # Copied from sequel/model/inflections.rb's camelize, to convert

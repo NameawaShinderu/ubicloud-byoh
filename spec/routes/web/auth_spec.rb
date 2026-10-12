@@ -4,13 +4,30 @@ require_relative "spec_helper"
 require "webauthn/fake_client"
 
 RSpec.describe Clover, "auth" do
+  def mock_provider(provider, email = TEST_USER_EMAIL, name: "John Doe", mock_config: true)
+    expect(Config).to receive("omniauth_#{provider}_id").and_return("12345").at_least(:once) if mock_config
+    OmniAuth.config.add_mock(provider, {
+      provider:,
+      uid: "123456790",
+      info: {
+        name:,
+        email:,
+      },
+    })
+  end
+
   def ip_hash(into = {})
     into["ip"] = "127.0.0.1"
     into
   end
 
   def audit_log_hash
-    DB[:account_authentication_audit_log].select_hash(:message, :metadata)
+    DB[:account_authentication_audit_log]
+      .order(:metadata)
+      .select_hash_groups(:message, :metadata)
+      .transform_values do |v|
+        (v.length == 1) ? v[0] : v
+      end
   end
 
   before do
@@ -41,6 +58,48 @@ RSpec.describe Clover, "auth" do
     click_button "Sign in"
     expect(page).to have_flash_error("The account you tried to login with is currently awaiting verification")
     expect(page.title).to eq("Ubicloud - Resend Verification")
+    expect(audit_log_hash).to eq({"create_account" => ip_hash})
+  end
+
+  it "tracks valid source provided to root route and stores in database" do
+    visit "/?source=foo-bar&source_detail=Baz-quux"
+    visit "/create-account"
+    fill_in "Email Address", with: TEST_USER_EMAIL
+    fill_in "Full Name", with: "John Doe"
+    fill_in "Password", with: TEST_USER_PASSWORD
+    fill_in "Password Confirmation", with: TEST_USER_PASSWORD
+    click_button "Create Account"
+
+    expect(Mail::TestMailer.deliveries.length).to eq 1
+    expect(DB[:account_source].all).to eq [{account_id: Account.get(:id), source: "foo-bar", detail: "Baz-quux"}]
+    expect(audit_log_hash).to eq({"create_account" => ip_hash})
+  end
+
+  it "tracks valid source without detail provided to root route and stores in database" do
+    visit "/?source=foo-bar"
+    visit "/create-account"
+    fill_in "Email Address", with: TEST_USER_EMAIL
+    fill_in "Full Name", with: "John Doe"
+    fill_in "Password", with: TEST_USER_PASSWORD
+    fill_in "Password Confirmation", with: TEST_USER_PASSWORD
+    click_button "Create Account"
+
+    expect(Mail::TestMailer.deliveries.length).to eq 1
+    expect(DB[:account_source].all).to eq [{account_id: Account.get(:id), source: "foo-bar", detail: nil}]
+    expect(audit_log_hash).to eq({"create_account" => ip_hash})
+  end
+
+  it "ignores source that doesn't meet requirements" do
+    visit "/?source=f,"
+    visit "/create-account"
+    fill_in "Email Address", with: TEST_USER_EMAIL
+    fill_in "Full Name", with: "John Doe"
+    fill_in "Password", with: TEST_USER_PASSWORD
+    fill_in "Password Confirmation", with: TEST_USER_PASSWORD
+    click_button "Create Account"
+
+    expect(Mail::TestMailer.deliveries.length).to eq 1
+    expect(DB[:account_source].all).to eq []
     expect(audit_log_hash).to eq({"create_account" => ip_hash})
   end
 
@@ -125,6 +184,10 @@ RSpec.describe Clover, "auth" do
     expect(page).to have_flash_notice("An email has been sent to you with a link to verify your account")
     expect(Mail::TestMailer.deliveries.length).to eq 1
     verify_link = Mail::TestMailer.deliveries.first.html_part.body.match(/(\/verify-account.+?)"/)[1]
+
+    visit verify_link.sub(Account.get(:id), "test")
+    expect(page.title).to eq("Ubicloud - Login")
+    expect(page).to have_flash_error("There was an error verifying your account: invalid verify account key")
 
     visit verify_link
     expect(page.title).to eq("Ubicloud - Verify Account")
@@ -227,6 +290,9 @@ RSpec.describe Clover, "auth" do
     expect(page).to have_flash_notice("An email has been sent to you with a link to reset the password for your account")
     expect(Mail::TestMailer.deliveries.length).to eq 1
     reset_link = Mail::TestMailer.deliveries.first.html_part.body.match(/(\/reset-password.+?)"/)[1]
+
+    visit "/reset-password?key="
+    expect(page.title).to eq("Ubicloud - Login")
 
     visit reset_link
     expect(page.title).to eq("Ubicloud - Reset Password")
@@ -429,7 +495,9 @@ RSpec.describe Clover, "auth" do
 
         expect(page).to have_flash_notice("An email has been sent to you with a link to verify your login change")
         expect(Mail::TestMailer.deliveries.length).to eq 1
-        verify_link = Mail::TestMailer.deliveries.first.html_part.body.match(/(\/verify-login-change.+?)"/)[1]
+        mail = Mail::TestMailer.deliveries.first
+        expect(mail.to).to eq [new_email]
+        verify_link = mail.html_part.body.match(/(\/verify-login-change.+?)"/)[1]
 
         click_button "Log out" unless logged_in
         visit verify_link
@@ -490,36 +558,22 @@ RSpec.describe Clover, "auth" do
       })
     end
 
-    it "does not allow duplicate passwords" do
-      # Update account_previous_password_hashes, which isn't done by default in the specs
-      password_hash = Argon2::Password.new({
-        t_cost: 1,
-        m_cost: 5,
-        secret: Config.clover_session_secret,
-      }).create(TEST_USER_PASSWORD)
-      DB[:account_previous_password_hashes].insert(account_id: Account.get(:id), password_hash:)
-
+    it "does not allow same password as current password" do
       visit "/account/change-password"
-      passwords = [TEST_USER_PASSWORD]
-      3.times do
-        passwords.each do |password|
-          fill_in "New Password", with: password
-          fill_in "New Password Confirmation", with: password
+      fill_in "New Password", with: TEST_USER_PASSWORD
+      fill_in "New Password Confirmation", with: TEST_USER_PASSWORD
 
-          click_button "Change Password"
-          expect(page.title).to eq("Ubicloud - Change Password")
-          expect(page).to have_flash_error("There was an error changing your password")
-          expect(page).to have_text(/invalid password, same as current password|Password cannot be the same as a previous password/)
-        end
+      click_button "Change Password"
+      expect(page.title).to eq("Ubicloud - Change Password")
+      expect(page).to have_flash_error("There was an error changing your password")
+      expect(page).to have_text(/invalid password, same as current password|Password cannot be the same as your current password/)
 
-        new_password = passwords.last + "_new"
-        passwords << new_password
-        fill_in "New Password", with: new_password
-        fill_in "New Password Confirmation", with: new_password
-        click_button "Change Password"
-        expect(page.title).to eq("Ubicloud - Change Password")
-        expect(page).to have_flash_notice("Your password has been changed")
-      end
+      new_password = TEST_USER_PASSWORD + "_new"
+      fill_in "New Password", with: new_password
+      fill_in "New Password Confirmation", with: new_password
+      click_button "Change Password"
+      expect(page.title).to eq("Ubicloud - Change Password")
+      expect(page).to have_flash_notice("Your password has been changed")
       expect(audit_log_hash).to eq({"change_password" => ip_hash})
     end
 
@@ -575,6 +629,8 @@ RSpec.describe Clover, "auth" do
 
         expect(page.title).to eq("Ubicloud - Login")
         expect(page).to have_flash_notice("Your account has been closed")
+        expect(Mail::TestMailer.deliveries.length).to eq 1
+        expect(Mail::TestMailer.deliveries.first.subject).to eq "Ubicloud Account Closed"
 
         expect(Account[email: TEST_USER_EMAIL]).to be_nil
         expect(DB[:access_tag].where(hyper_tag_id: account.id).count).to eq 0
@@ -596,12 +652,99 @@ RSpec.describe Clover, "auth" do
       expect(audit_log_hash).to eq({})
     end
 
+    it "cannot close account if the project has GithubInstallation" do
+      project = Account[email: TEST_USER_EMAIL].projects.first
+      GithubInstallation.create(name: "unique-gh-install", installation_id: 999, type: "User", project_id: project.id)
+
+      visit "/account/close-account"
+
+      click_button "Close Account"
+
+      expect(page.title).to eq("Ubicloud - Close Account")
+      expect(page).to have_flash_error("'Default' project has some resources. Delete all related resources first.")
+      expect(audit_log_hash).to eq({})
+    end
+
+    it "can close account if the project with resources has another admin" do
+      vm = create_vm
+      account = Account[email: TEST_USER_EMAIL]
+      project = account.projects.first
+      vm.update(project_id: project.id)
+
+      account2 = Account.create(email: "test2@example.com")
+      project.add_account(account2)
+
+      visit "/account/close-account"
+      click_button "Close Account"
+      expect(page.title).to eq("Ubicloud - Close Account")
+      expect(page).to have_flash_error("'Default' project has some resources. Delete all related resources first.")
+
+      project.subject_tags_dataset.first(name: "Admin").add_member(account2.id)
+
+      click_button "Close Account"
+      expect(page.title).to eq("Ubicloud - Login")
+      expect(page).to have_flash_notice("Your account has been closed")
+      expect(Account[email: TEST_USER_EMAIL]).to be_nil
+      expect(DB[:access_tag].where(hyper_tag_id: account.id).count).to eq 0
+      expect(audit_log_hash).to eq({"close_account" => ip_hash})
+    end
+
     it "show password change page" do
       visit "/account/change-password"
 
       expect(page.title).to eq("Ubicloud - Change Password")
       expect(page).to have_content "Change Password"
       expect(audit_log_hash).to eq({})
+    end
+
+    describe "with require_mfa_or_omniauth feature flag" do
+      let(:account) { Account[email: TEST_USER_EMAIL] }
+      let(:project) do
+        project = account.projects.first
+        project.set_ff_require_mfa_or_omniauth(true)
+        project
+      end
+
+      before do
+        project
+      end
+
+      it "allows access if account is multifactor authenticated" do
+        path = page.current_path
+        visit "/account/multifactor-manage"
+        click_link "Enable"
+        totp = ROTP::TOTP.new(find_by_id("otp-secret").text)
+        fill_in "Authentication Code", with: totp.now
+        click_button "Enable One-Time Password Authentication"
+        visit path
+        expect(page.title).to eq "Ubicloud - Default Dashboard"
+        expect(audit_log_hash).to eq({"otp_setup" => ip_hash})
+      end
+
+      it "allows access if account is logged in via omniauth" do
+        OmniAuth.config.logger = Logger.new(IO::NULL)
+        OmniAuth.config.test_mode = true
+        mock_provider(:google)
+        account.add_identity(provider: "google", uid: "123456790")
+
+        visit "/logout"
+        click_button "Logout"
+
+        visit "/login"
+        click_button "Google"
+        expect(page.title).to eq "Ubicloud - Default Dashboard"
+        expect(audit_log_hash).to eq({
+          "logout" => ip_hash,
+          "login" => ip_hash({"via" => "Google"}),
+        })
+      end
+
+      it "denies access if account is logged in via password without multifactor authentication" do
+        page.refresh
+        expect(page).to have_current_path "/project", ignore_query: true
+        expect(page).to have_flash_error "Project #{project.ubid} requires multifactor authentication enabled or login via external provider"
+        expect(audit_log_hash).to eq({})
+      end
     end
 
     [true, false].each do |clear_last_password_entry|
@@ -686,13 +829,13 @@ RSpec.describe Clover, "auth" do
         expect(page).to have_flash_notice "One-time password authentication has been disabled"
         if clear_last_password_entry
           expect(audit_log_hash).to eq({
-            "login" => ip_hash("via" => "password"),
-            "logout" => ip_hash,
-            "otp_authentication_failure" => ip_hash,
+            "login" => [ip_hash("via" => "password")] * 2,
+            "logout" => [ip_hash] * 2,
+            "otp_authentication_failure" => [ip_hash] * 5,
             "otp_disable" => ip_hash,
             "otp_setup" => ip_hash,
-            "otp_unlock_auth_success" => ip_hash,
-            "two_factor_authentication" => ip_hash("via" => "totp"),
+            "otp_unlock_auth_success" => [ip_hash] * 3,
+            "two_factor_authentication" => [ip_hash("via" => "totp")] * 2,
           })
         else
           expect(audit_log_hash).to eq({"otp_setup" => ip_hash, "otp_disable" => ip_hash})
@@ -755,12 +898,15 @@ RSpec.describe Clover, "auth" do
           expect(audit_log_hash).to eq({
             "login" => ip_hash("via" => "password"),
             "logout" => ip_hash,
-            "webauthn_setup" => ip_hash("key_name" => "My Key 1"),
+            "webauthn_setup" => [ip_hash("key_name" => "My Key 0"), ip_hash("key_name" => "My Key 1")],
             "webauthn_remove" => ip_hash("key_name" => "My Key 1"),
             "two_factor_authentication" => ip_hash("via" => "webauthn", "key_name" => "My Key 0"),
           })
         else
-          expect(audit_log_hash).to eq({"webauthn_setup" => ip_hash("key_name" => "My Key 1"), "webauthn_remove" => ip_hash("key_name" => "My Key 1")})
+          expect(audit_log_hash).to eq({
+            "webauthn_setup" => [ip_hash("key_name" => "My Key 0"), ip_hash("key_name" => "My Key 1")],
+            "webauthn_remove" => ip_hash("key_name" => "My Key 1"),
+          })
         end
       end
     end
@@ -821,20 +967,8 @@ RSpec.describe Clover, "auth" do
   end
 
   describe "social login" do
-    def mock_provider(provider, email = TEST_USER_EMAIL, name: "John Doe", mock_config: true)
-      expect(Config).to receive("omniauth_#{provider}_id").and_return("12345").at_least(:once) if mock_config
-      OmniAuth.config.add_mock(provider, {
-        provider:,
-        uid: "123456790",
-        info: {
-          name:,
-          email:,
-        },
-      })
-    end
-
     let(:oidc_provider) do
-      OidcProvider.create(
+      op = OidcProvider.create(
         display_name: "TestOIDC",
         client_id: "123",
         client_secret: "456",
@@ -844,6 +978,8 @@ RSpec.describe Clover, "auth" do
         userinfo_endpoint: "/ui",
         jwks_uri: "https://host/jw",
       )
+      op.add_allowed_domain("example.com")
+      op
     end
 
     before do
@@ -1036,6 +1172,7 @@ RSpec.describe Clover, "auth" do
         userinfo_endpoint: "/ui",
         jwks_uri: "https://host/jw",
       )
+      provider.add_allowed_domain("example.com")
 
       visit "/auth/#{provider.ubid}"
       OmniAuth.config.add_mock(provider.ubid.to_sym, provider: provider.ubid, uid: "789",
@@ -1107,6 +1244,109 @@ RSpec.describe Clover, "auth" do
       expect(audit_log_hash).to eq({"create_account" => ip_hash("provider" => "GitHub"), "login" => ip_hash("via" => "GitHub")})
     end
 
+    it "can create new account, add repositories, and add payment method using github actions setup workflow" do
+      expect(Config).to receive(:github_app_name).and_return("test").at_least(:once)
+      expect(Config).to receive(:stripe_secret_key).and_return("test").at_least(:once)
+      mock_provider(:github, name: "foobar")
+
+      visit "/?setup=github_actions&source=mysource&source_detail=^"
+      expect(page).to have_content("Step 1 of 4")
+      expect(page).to have_no_content("Step 2 of 4")
+      click_button "Continue with GitHub"
+
+      account = Account[email: TEST_USER_EMAIL]
+      project = account.default_project
+      expect(account.name).to eq "foobar"
+      expect(DB[:account_source].order(:source).all).to eq [
+        {account_id: account.id, source: "github-actions-setup", detail: "standard"},
+        {account_id: account.id, source: "mysource", detail: nil},
+      ]
+      expect(audit_log_hash).to eq({"create_account" => ip_hash("provider" => "GitHub"), "login" => ip_hash("via" => "GitHub")})
+
+      expect(page).to have_content("Step 2 of 4")
+      expect(page).to have_no_content("Step 3 of 4")
+
+      click_link "Install the Ubicloud GitHub app"
+      expect(page.status_code).to eq(200)
+      expect(page.driver.request.session["login_redirect"]).to eq("/apps/test/installations/new")
+
+      require "octokit"
+      oauth_client = instance_double(Octokit::Client)
+      adhoc_client = instance_double(Octokit::Client)
+      expect(Github).to receive(:oauth_client).and_return(oauth_client)
+      expect(Octokit::Client).to receive(:new).and_return(adhoc_client)
+      expect(oauth_client).to receive(:exchange_code_for_token).with("123123").and_return({access_token: "123"})
+      expect(adhoc_client).to receive(:get).with("/user/installations").and_return({installations: [{id: 345, account: {login: "test-user", type: "User"}}]})
+
+      visit "/set_github_installation_project_id/#{project.ubid}"
+      GithubInstallation.create(installation_id: 0, name: "bogus", type: "bogus", project_id: project.id)
+      visit "/github/callback?code=123123&installation_id=345"
+      expect(page).to have_content("Step 3 of 4")
+      expect(page).to have_no_content("Step 4 of 4")
+
+      require "stripe"
+      customers_service = instance_double(Stripe::CustomerService)
+      payment_methods_service = instance_double(Stripe::PaymentMethodService)
+      payment_intents_service = instance_double(Stripe::PaymentIntentService)
+      setup_intents_service = instance_double(Stripe::SetupIntentService)
+      checkout_sessions_service = instance_double(Stripe::Checkout::SessionService)
+
+      expect(StripeClient).to receive_messages(
+        customers: customers_service,
+        payment_methods: payment_methods_service,
+        payment_intents: payment_intents_service,
+        setup_intents: setup_intents_service,
+        checkout: instance_double(Stripe::CheckoutService, sessions: checkout_sessions_service),
+      )
+
+      # rubocop:disable RSpec/VerifiedDoubles
+      expect(checkout_sessions_service).to receive(:create).and_return(double(Stripe::Checkout::Session, url: "#{project.path}/billing/success?session_id=session_123"))
+      expect(payment_intents_service).to receive(:create).and_return(double(Stripe::PaymentIntent, status: "requires_capture", id: "pi_1234567890"))
+      # rubocop:enable RSpec/VerifiedDoubles
+      expect(checkout_sessions_service).to receive(:retrieve).with("session_123").and_return({"setup_intent" => "st_123456790"})
+      expect(setup_intents_service).to receive(:retrieve).with("st_123456790").and_return({"customer" => "cs_1234567890", "payment_method" => "pm_1234567890"})
+      expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "ACME Inc.", "address" => {"line1" => "Test Rd", "country" => "NL"}, "metadata" => {"company_name" => "Foo Company Name"}})
+      def self.stripe_object(hash)
+        Stripe::StripeObject.construct_from(hash.transform_values { it.is_a?(Hash) ? stripe_object(it) : it })
+      end
+      expect(payment_methods_service).to receive(:retrieve).with("pm_1234567890").and_return(stripe_object("card" => {"brand" => "visa"}, "billing_details" => {}))
+
+      click_button "Add payment method"
+      expect(page).to have_content("Step 4 of 4")
+      expect(page).to have_flash_notice(/Payment method added successfully/)
+
+      click_link "Go to your runners"
+      expect(page.title).to eq "Ubicloud - Active Runners"
+    end
+
+    it "can use github actions setup workflow even if github account already linked to Ubicloud account" do
+      expect(Config).to receive(:github_app_name).and_return("test").at_least(:once)
+      expect(Config).to receive(:stripe_secret_key).and_return("test").at_least(:once)
+      mock_provider(:github, name: "foobar")
+
+      visit "/login"
+      click_button "GitHub"
+      click_button "Log out"
+
+      visit "/?setup=github_actions"
+      expect(page).to have_content("Step 1 of 4")
+      click_button "Continue with GitHub"
+
+      account = Account[email: TEST_USER_EMAIL]
+      expect(account.name).to eq "foobar"
+      expect(audit_log_hash).to eq({
+        "create_account" => ip_hash("provider" => "GitHub"),
+        "login" => [ip_hash("via" => "GitHub")] * 2,
+        "logout" => ip_hash,
+      })
+
+      expect(page).to have_content("Step 2 of 4")
+
+      account.default_project.destroy
+      visit "/?setup=github_actions"
+      expect(page).to have_current_path "/project", ignore_query: true
+    end
+
     it "can create new account even if social account has a name that isn't a valid Ubicloud name" do
       mock_provider(:github, name: "123Foo..\u1234Bar")
 
@@ -1152,6 +1392,19 @@ RSpec.describe Clover, "auth" do
       expect(audit_log_hash).to eq({"create_account" => ip_hash("provider" => "GitHub"), "login" => ip_hash("via" => "GitHub")})
     end
 
+    it "can track source for account created via social login" do
+      mock_provider(:github)
+      visit "/?source=foobar&source_detail=^#{"f" * 37}"
+      click_button "GitHub"
+      account = Account[email: TEST_USER_EMAIL]
+      expect(account).not_to be_nil
+      expect(account.identities_dataset.first(provider: "github", uid: "123456790")).not_to be_nil
+      expect(page.status_code).to eq(200)
+      expect(page.title).to eq("Ubicloud - Default Dashboard")
+      expect(DB[:account_source].all).to eq [{account_id: account.id, source: "foobar", detail: "f" * 36}]
+      expect(audit_log_hash).to eq({"create_account" => ip_hash("provider" => "GitHub"), "login" => ip_hash("via" => "GitHub")})
+    end
+
     it "can login existing account" do
       mock_provider(:google)
       account = create_account
@@ -1164,6 +1417,21 @@ RSpec.describe Clover, "auth" do
       expect(AccountIdentity.count).to eq(1)
       expect(page.status_code).to eq(200)
       expect(page.title).to eq("Ubicloud - Default Dashboard")
+      expect(audit_log_hash).to eq({"login" => ip_hash("via" => "Google")})
+    end
+
+    it "can login existing account after its email has been changed" do
+      mock_provider(:google)
+      account = create_account
+      account.add_identity(provider: "google", uid: "123456790")
+      account.update(email: "renamed@example.com")
+      account.projects.first.update(name: "Renamed")
+      create_account("user@example.com")
+
+      visit "/login"
+      click_button "Google"
+
+      expect(page.title).to eq("Ubicloud - Renamed Dashboard")
       expect(audit_log_hash).to eq({"login" => ip_hash("via" => "Google")})
     end
 
@@ -1292,18 +1560,18 @@ RSpec.describe Clover, "auth" do
       end
 
       it "can login via OIDC flow with with OIDC groups" do
-        oidc_provider.update(group_prefix: "foo-")
+        oidc_provider.update(group_prefix: "foo-", groups_claim: "groups")
         omniauth_key = oidc_provider.ubid.to_sym
         AccountIdentity.create(account_id: Account.first.id, provider: oidc_provider.ubid, uid: "789")
         OmniAuth.config.add_mock(omniauth_key, provider: oidc_provider.ubid, uid: "789",
-          info: {email: "user@example.com", groups: %w[group1 group2]})
+          info: {email: "user@example.com", groups: %w[group1 group2].freeze})
         click_button "Log out"
 
         fill_in "Email Address", with: TEST_USER_EMAIL
         click_button "Sign in"
         expect(page).to have_content("Password")
         expect(page).to have_content("Or login with:")
-        expect(Clog).to receive(:emit).with("OIDC groups login", oidc_groups_login: {groups: %w[group1 group2], group_prefix: "foo-"})
+        expect(Clog).to receive(:emit).with("OIDC groups login", oidc_groups_login: {groups: %w[group1 group2].freeze, group_prefix: "foo-"})
         click_button "TestOIDC"
 
         expect(page.title).to eq("Ubicloud - Default Dashboard")

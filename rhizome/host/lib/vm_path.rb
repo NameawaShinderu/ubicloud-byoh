@@ -28,8 +28,7 @@ class VmPath
   end
 
   def systemd_service
-    File.join("/etc/systemd/system",
-      IO.popen(["systemd-escape", @vm_name + ".service"]) { _1.read.chomp })
+    "/etc/systemd/system/#{@vm_name}.service"
   end
 
   def write_systemd_service(s)
@@ -40,7 +39,12 @@ class VmPath
     File.join("", "vm", @vm_name, n)
   end
 
-  # Define path, q_path, read, write methods for files in
+  def self.define_new_method(m, &block)
+    fail "BUG" if method_defined?(m)
+    define_method(m, &block)
+  end
+
+  # Define path, read, write methods for files in
   # `/vm/#{vm_name}`
   %w[
     guest_ephemeral
@@ -57,46 +61,29 @@ class VmPath
     nftables_conf
     prep.json
     cert
-  ].each do |file_name|
+  ].freeze.each do |file_name|
     method_name = file_name.tr(".-", "_")
-    fail "BUG" if method_defined?(method_name)
 
     # Method producing a path, e.g. #user_data
-    define_method method_name do
+    define_new_method method_name do
       home(file_name)
-    end
-
-    # Method producing a shell-quoted path, e.g. #q_user_data.
-    quoted_method_name = "q_" + method_name
-    fail "BUG" if method_defined?(quoted_method_name)
-
-    define_method quoted_method_name do
-      home(file_name).shellescape
     end
 
     # Method reading the file's contents, e.g. #read_user_data
     #
     # Trailing newlines are removed.
-    read_method_name = "read_" + method_name
-    fail "BUG" if method_defined?(read_method_name)
-
-    define_method read_method_name do
+    define_new_method("read_" + method_name) do
       read(home(file_name))
     end
 
     # Method overwriting the file's contents, e.g. #write_user_data
     write_method_name = "write_" + method_name
-    fail "BUG" if method_defined?(write_method_name)
-
-    define_method write_method_name do |s|
+    define_new_method(write_method_name) do |s|
       write(home(file_name), s)
     end
 
     # Method serializing data to YAML and writing, e.g. #write_yaml_user_data
-    yaml_write_method_name = "write_yaml_" + method_name
-    fail "BUG" if method_defined?(yaml_write_method_name)
-
-    define_method yaml_write_method_name do |data, prefix: nil|
+    define_method("write_yaml_" + method_name) do |data, prefix: nil|
       s = YAML.dump(data, line_width: -1)
       s.sub!(/\A---/, prefix) if prefix
       send(write_method_name, s)

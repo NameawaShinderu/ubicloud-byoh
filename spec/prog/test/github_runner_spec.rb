@@ -19,13 +19,29 @@ RSpec.describe Prog::Test::GithubRunner do
     it "assemble with aws provider" do
       location_id = "5f0db214-de30-8420-8a11-98014b01c5b5"
       expect(Config).to receive(:github_runner_aws_location_id).and_return(location_id)
+      expect(Config).to receive(:e2e_aws_assume_role).and_return(nil)
       expect(Config).to receive(:e2e_aws_access_key).and_return("access_key")
       expect(Config).to receive(:e2e_aws_secret_key).and_return("secret_key")
       expect(Config).to receive(:e2e_cache_proxy_download_url).and_return("http://example.com/cache-proxy")
       described_class.assemble([], provider: "aws")
       expect(Location[location_id]).not_to be_nil
       expect(LocationCredentialAws[location_id].access_key).to eq("access_key")
-      expect(GithubInstallation.first.project.get_ff_cache_proxy_download_url).to eq({"x64" => "http://example.com/cache-proxy"})
+      project = GithubInstallation.first.project
+      expect(project.get_ff_cache_proxy_download_url).to eq({"x64" => "http://example.com/cache-proxy"})
+      expect(project.get_ff_aws_alien_runners_shared_vpc).to be(true)
+      expect(project.billing_info.stripe_id).to eq "0"
+    end
+
+    it "assemble with aws provider using assume_role" do
+      location_id = "5f0db214-de30-8420-8a11-98014b01c5b5"
+      expect(Config).to receive(:github_runner_aws_location_id).and_return(location_id)
+      expect(Config).to receive(:e2e_aws_assume_role).and_return("arn:aws:iam::123:role/e2e").at_least(:once)
+      expect(Config).to receive(:e2e_aws_access_key).and_return(nil)
+      expect(Config).to receive(:e2e_aws_secret_key).and_return(nil)
+      expect(Config).to receive(:e2e_cache_proxy_download_url).and_return("")
+      described_class.assemble([], provider: "aws")
+      expect(LocationCredentialAws[location_id].assume_role).to eq("arn:aws:iam::123:role/e2e")
+      expect(LocationCredentialAws[location_id].access_key).to be_nil
     end
 
     it "assembles labels based on test case names" do
@@ -33,28 +49,76 @@ RSpec.describe Prog::Test::GithubRunner do
       expect(strand.stack.first["labels"]).to eq(["ubicloud-standard-2-ubuntu-2204", "ubicloud-standard-2-ubuntu-2404"])
     end
 
+    it "stores boot images and vm host id to download on the metal host" do
+      strand = described_class.assemble([
+        {"name" => "github_runner_ubuntu_2204", "images" => ["github-ubuntu-2204"]},
+        {"name" => "github_runner_ubuntu_2404", "images" => ["github-ubuntu-2404"]},
+      ], vm_host_id: "f3b2d3e0-0000-0000-0000-000000000000")
+      expect(strand.stack.first["boot_images"]).to eq(["github-ubuntu-2204", "github-ubuntu-2404"])
+      expect(strand.stack.first["vm_host_id"]).to eq("f3b2d3e0-0000-0000-0000-000000000000")
+    end
+
+    it "does not store boot images when no vm host id is given" do
+      strand = described_class.assemble([{"name" => "github_runner_ubuntu_2204", "images" => ["github-ubuntu-2204"]}])
+      expect(strand.stack.first["boot_images"]).to eq([])
+    end
+
     it "includes arm64 labels for aws provider" do
       location_id = "5f0db214-de30-8420-8a11-98014b01c5b5"
       expect(Config).to receive(:github_runner_aws_location_id).and_return(location_id)
+      expect(Config).to receive(:e2e_aws_assume_role).and_return(nil)
       expect(Config).to receive(:e2e_aws_access_key).and_return("access_key")
       expect(Config).to receive(:e2e_aws_secret_key).and_return("secret_key")
       expect(Config).to receive(:e2e_cache_proxy_download_url).and_return("")
-      strand = described_class.assemble([{"name" => "github_runner_ubuntu_2204"}, {"name" => "github_runner_ubuntu_2404"}], provider: "aws")
+      strand = described_class.assemble([{"name" => "github_runner_ubuntu_2204"}, {"name" => "github_runner_ubuntu_2404"}, {"name" => "github_runner_ubuntu_2604"}], provider: "aws")
       expect(strand.stack.first["labels"]).to eq([
-        "ubicloud-standard-2-ubuntu-2204", "ubicloud-standard-2-ubuntu-2404",
-        "ubicloud-standard-2-arm-ubuntu-2204", "ubicloud-standard-2-arm-ubuntu-2404",
+        "ubicloud-standard-2-ubuntu-2204", "ubicloud-standard-2-ubuntu-2404", "ubicloud-standard-2-ubuntu-2604",
+        "ubicloud-standard-2-arm-ubuntu-2204", "ubicloud-standard-2-arm-ubuntu-2404", "ubicloud-standard-2-arm-ubuntu-2604",
       ])
     end
   end
 
   describe "#start" do
-    it "hops to create_vm_pool" do
-      expect { gr_test.start }.to hop("create_vm_pool")
-    end
-
     it "hops to trigger_test_run when provider is aws" do
       expect(gr_test).to receive(:frame).and_return({"provider" => "aws"})
       expect { gr_test.start }.to hop("trigger_test_run")
+    end
+
+    it "hops to wait_image_downloads without downloading when there are no images" do
+      expect { gr_test.start }.to hop("wait_image_downloads")
+      expect(Strand.where(prog: "DownloadBootImage")).to be_empty
+    end
+
+    it "triggers the runner image downloads and hops to wait_image_downloads" do
+      vm_host = create_vm_host
+      refresh_frame(gr_test, new_values: {"vm_host_id" => vm_host.id, "boot_images" => ["github-ubuntu-2204"]})
+      expect { gr_test.start }.to hop("wait_image_downloads")
+      expect(Strand.where(prog: "DownloadBootImage").count).to eq(1)
+    end
+  end
+
+  describe "#wait_image_downloads" do
+    let(:vm_host) { create_vm_host }
+
+    it "hops to create_vm_pool when there are no images to wait for" do
+      refresh_frame(gr_test, new_values: {"vm_host_id" => vm_host.id, "boot_images" => []})
+      expect { gr_test.wait_image_downloads }.to hop("create_vm_pool")
+    end
+
+    context "with runner images on the metal host" do
+      before do
+        refresh_frame(gr_test, new_values: {"vm_host_id" => vm_host.id, "boot_images" => ["github-ubuntu-2204"]})
+      end
+
+      it "naps until the image is activated" do
+        BootImage.create(vm_host_id: vm_host.id, name: "github-ubuntu-2204", version: "1", activated_at: nil, size_gib: 0)
+        expect { gr_test.wait_image_downloads }.to nap(5)
+      end
+
+      it "hops to create_vm_pool once the image is activated" do
+        BootImage.create(vm_host_id: vm_host.id, name: "github-ubuntu-2204", version: "1", activated_at: Time.now, size_gib: 0)
+        expect { gr_test.wait_image_downloads }.to hop("create_vm_pool")
+      end
     end
   end
 
@@ -160,12 +224,22 @@ RSpec.describe Prog::Test::GithubRunner do
       expect(repo.destroy_set?).to be(true)
     end
 
+    it "waits private subnets of the installation to be destroyed" do
+      refresh_frame(gr_test, new_values: {"test_run_id" => 10})
+      expect(client).to receive(:cancel_workflow_run).with("tahcloud/github-e2e-tests-metal", 10)
+      installation = GithubInstallation.first(project_id: gr_test.customer_project_id)
+      ps = Prog::Vnet::SubnetNexus.assemble(installation.project_id, allow_only_ssh: true).subject
+      installation.add_private_subnet(ps)
+      expect { gr_test.clean_resources }.to nap(15)
+      expect(ps.destroy_set?).to be(true)
+    end
+
     it "cleans resources and hop finish" do
       refresh_frame(gr_test, new_values: {"test_run_id" => 10})
       expect(client).to receive(:cancel_workflow_run).with("tahcloud/github-e2e-tests-metal", 10)
       expect(GithubRunner).to receive(:any?).and_return(false)
       expect(VmPool).to receive(:[]).with(anything).and_return(instance_double(VmPool, vms: [], incr_destroy: nil))
-      expect(Project).to receive(:[]).with(anything).and_return(instance_double(Project, destroy: nil)).at_least(:once)
+      expect(Project).to receive(:[]).with(anything).and_return(instance_double(Project, destroy: nil, update: nil, billing_info: instance_double(BillingInfo, delete: nil))).at_least(:once)
       expect { gr_test.clean_resources }.to hop("finish")
     end
 

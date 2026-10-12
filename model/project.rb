@@ -22,16 +22,49 @@ class Project < Sequel::Model
   one_to_many :load_balancers, read_only: true
   one_to_many :inference_endpoints, read_only: true
   one_to_many :kubernetes_clusters, read_only: true
+  one_to_many :machine_images, read_only: true
+  one_to_many :machine_image_stores, read_only: true
   one_to_many :ssh_public_keys, order: :name, remover: nil, clearer: nil
 
-  RESOURCE_ASSOCIATIONS = %i[vms minio_clusters private_subnets postgres_resources firewalls load_balancers kubernetes_clusters github_runners]
-  RESOURCE_ASSOCIATION_DATASET_METHODS = RESOURCE_ASSOCIATIONS.map { :"#{it}_dataset" }
+  RESOURCE_ASSOCIATIONS = %i[vms minio_clusters private_subnets postgres_resources firewalls load_balancers kubernetes_clusters github_runners github_installations]
+
+  SERVICE_PROJECT_ID_CONFIGS = %i[
+    dns_service_project_id
+    github_runner_service_project_id
+    inference_endpoint_service_project_id
+    kubernetes_service_project_id
+    load_balancer_service_project_id
+    machine_images_service_project_id
+    minio_service_project_id
+    monitoring_service_project_id
+    parseable_service_project_id
+    postgres_service_project_id
+    victoria_metrics_service_project_id
+  ].freeze
+
+  def self.service_project?(id)
+    SERVICE_PROJECT_ID_CONFIGS.any? do
+      sp_id = Config.send(it)
+      sp_id && sp_id == id
+    end
+  end
+
+  # Only used for #has_resources?, which is only used for project deletion,
+  # and we allow deleting projects with github installations, since
+  # Project#soft_delete removes the github installation.
+  RESOURCE_ASSOCIATION_DATASET_METHODS = (RESOURCE_ASSOCIATIONS - [:github_installations]).map { :"#{it}_dataset" }
 
   one_to_many :invoices, order: Sequel.desc(:created_at), read_only: true
   one_to_many :quotas, class: :ProjectQuota, remover: nil, clearer: nil
   one_to_many :invitations, class: :ProjectInvitation, remover: nil, clearer: nil
   one_to_many :api_keys, key: :owner_id, conditions: {owner_table: "project"}, read_only: true
   one_to_many :locations, read_only: true
+  one_to_many :active_resource_discounts, class: :ResourceDiscount, read_only: true do |ds|
+    ds.active_during(Sequel::CURRENT_TIMESTAMP, Sequel::CURRENT_TIMESTAMP)
+  end
+  one_to_many :active_resource_credits, class: :ResourceCredit, order: [:active_from, :created_at], remover: nil, clearer: nil do |ds|
+    ds.active_during(Sequel::CURRENT_TIMESTAMP, Sequel::CURRENT_TIMESTAMP)
+  end
   many_to_many :payment_methods, join_table: :billing_info, left_primary_key: :billing_info_id, left_key: :id, right_key: :id, right_primary_key: :billing_info_id, read_only: true
 
   dataset_module Pagination
@@ -46,6 +79,19 @@ class Project < Sequel::Model
       end
 
       nil
+    end
+
+    def where_sole_admin_is(account)
+      account_array = Sequel.pg_array([account.id], :uuid)
+      project_id = Sequel[:project][:id]
+      ds = select(project_id)
+        .from_self(alias: :project)
+        .join(:subject_tag, project_id: :id, name: "Admin")
+        .join(:applied_subject_tag, tag_id: :id)
+        .join(:access_tag, hyper_tag_id: :subject_id, project_id:)
+        .select_group(project_id)
+        .having { {array_agg(:hyper_tag_id) => account_array} }
+      where(project_id => ds)
     end
   end
 
@@ -63,13 +109,22 @@ class Project < Sequel::Model
     ssh_public_keys: :destroy,
     subject_tags: :destroy
 
-  plugin ResourceMethods
+  plugin ResourceMethods, define_project_id_match: false
+
+  def project_id_match?(project_id)
+    id == project_id
+  end
 
   def has_valid_payment_method?
     return true unless Config.stripe_secret_key
-    return true if discount == 100
-
-    !!billing_info&.payment_methods&.any? || (!!billing_info && credit > 0)
+    return true unless payment_methods_dataset.empty?
+    return true unless active_resource_discounts_dataset
+      .where(resource_id: nil, resource_type: nil, resource_family: nil, location: nil, byoc: nil, discount_percent: 100)
+      .empty?
+    return true if billing_info && !active_resource_credits_dataset
+      .remaining
+      .empty?
+    false
   end
 
   def default_location
@@ -93,6 +148,17 @@ class Project < Sequel::Model
     "/project/#{ubid}"
   end
 
+  def sole_admin?(account)
+    !this.where_sole_admin_is(account).empty?
+  end
+
+  # Returns the MachineImageStore to use for the given location, falling
+  # back to the platform default store if the project has none of its own.
+  def machine_image_store_for(location_id)
+    machine_image_stores_dataset.first(location_id:) ||
+      MachineImageStore.first(project_id: Config.machine_images_service_project_id, location_id:)
+  end
+
   def has_resources?
     RESOURCE_ASSOCIATION_DATASET_METHODS.any? { !send(it).empty? }
   end
@@ -110,7 +176,7 @@ class Project < Sequel::Model
     DB.transaction do
       DB[:access_tag].where(project_id: id).delete
       access_control_entries_dataset.destroy
-      %w[subject action object].each do |tag_type|
+      %w[subject action object].freeze.each do |tag_type|
         dataset = send(:"#{tag_type}_tags_dataset")
         DB[:"applied_#{tag_type}_tag"].where(tag_id: dataset.select(:id)).delete
         dataset.destroy
@@ -130,34 +196,40 @@ class Project < Sequel::Model
     visible && accounts_dataset.exclude(suspended_at: nil).empty?
   end
 
-  def current_invoice(since: nil)
-    begin_time = since || invoices_dataset.get(:end_time) || Time.new(Time.now.year, Time.now.month, 1)
-    end_time = Time.now
+  def current_invoice(since: nil, discounts_and_credits_hashes: nil)
+    end_time = Time.now.utc
+    begin_time = since || invoices_dataset.where(Sequel[:end_time] < end_time).get(:end_time) || Time.utc(end_time.year, end_time.month)
 
-    if (invoice = InvoiceGenerator.new(begin_time, end_time, project_ids: [id]).run.first)
+    if (invoice = InvoiceGenerator.new(begin_time, end_time, project_ids: [id], discounts_and_credits_hashes:).run.first)
       return invoice
     end
 
     content = {
+      "invoice_version" => 2,
       "resources" => [],
       "subtotal" => 0.0,
       "credit" => 0.0,
+      "credits" => [],
       "discount" => 0.0,
+      "discounts" => [],
       "cost" => 0.0,
     }
 
-    Invoice.new(project_id: id, content:, begin_time:, end_time:, created_at: Time.now, status: "current")
+    Invoice.new(project_id: id, content:, begin_time:, end_time:, created_at: end_time, status: "current")
   end
 
   def current_resource_usage(resource_type)
     case resource_type
     when "VmVCpu" then vms_dataset.sum(:vcpus) || 0
-    when "GithubRunnerVCpu" then GithubRunner.where(installation_id: github_installations_dataset.select(:id)).exclude(Sequel.like(Sequel[:github_runner][:label], "%-arm%")).total_active_runner_vcpus
-    when "GithubRunnerVCpuArm" then GithubRunner.where(installation_id: github_installations_dataset.select(:id)).where(Sequel.like(Sequel[:github_runner][:label], "%-arm%")).total_active_runner_vcpus
+    when "GithubRunnerVCpu" then GithubRunner.where(installation_id: github_installations_dataset.select(:id)).exclude(Sequel.like(Sequel[:github_runner][:label], "%-arm%")).metal_active_runner_vcpus
+    when "GithubRunnerVCpuArm" then GithubRunner.where(installation_id: github_installations_dataset.select(:id)).where(Sequel.like(Sequel[:github_runner][:label], "%-arm%")).metal_active_runner_vcpus
+    when "GithubRunnerVCpuAws" then GithubRunner.where(installation_id: github_installations_dataset.select(:id)).exclude(Sequel.like(Sequel[:github_runner][:label], "%-arm%")).aws_active_runner_vcpus
+    when "GithubRunnerVCpuArmAws" then GithubRunner.where(installation_id: github_installations_dataset.select(:id)).where(Sequel.like(Sequel[:github_runner][:label], "%-arm%")).aws_active_runner_vcpus
     when "PostgresVCpu" then postgres_resources_dataset.association_join(servers: :vm).sum(:vcpus) || 0
     when "KubernetesVCpu" then kubernetes_clusters_dataset.select(Sequel[:kubernetes_cluster][:cp_node_count].as(:node_count), Sequel[:kubernetes_cluster][:target_node_size])
       .union(kubernetes_clusters_dataset.association_join(:nodepools).select(:node_count, Sequel[:nodepools][:target_node_size]), all: true)
       .all.sum { it[:node_count] * Validation.validate_vm_size(it[:target_node_size], "x64").vcpus } || 0
+    when "MachineImageVersion" then MachineImageVersion.where(machine_image_id: machine_images_dataset.select(:id)).count
     else
       raise "Unknown resource type: #{resource_type}"
     end
@@ -191,7 +263,7 @@ class Project < Sequel::Model
 
   def total_github_amount(begin_time, end_time)
     BillingRecord.total_amount_by_rate(project_id: id, billing_rate_id: Github::MINUTE_BILLING_RATE_IDS, begin_time:, end_time:)
-      .sum { |billing_rate_id, total_amount| (total_amount * BillingRate.from_id(billing_rate_id)["unit_price"]) }
+      .sum { |billing_rate_id, total_amount| total_amount * BillingRate.from_id(billing_rate_id)["unit_price"] }
   end
 
   def self.feature_flag(*flags, into: self)
@@ -212,45 +284,76 @@ class Project < Sequel::Model
     :allocator_diagnostics,
     :authentication_audit_log,
     :aws_alien_runners_ratio,
+    :aws_alien_runners_shared_vpc,
     :aws_cloudwatch_logs,
+    :early_jit_registration,
+    :enable_aws_48xlarge,
+    :enable_c3_standard,
+    :enable_c3d_highmem,
+    :enable_c3d_standard,
+    :enable_c4_highmem,
+    :enable_c4_standard,
+    :enable_c4a_highmem,
+    :enable_c4a_standard,
+    :enable_c4d_highmem,
+    :enable_c4d_standard,
     :enable_c6gd,
+    :enable_c6id,
+    :enable_c7gd,
+    :enable_c8gd,
+    :enable_c8id,
     :enable_i7i,
     :enable_i7ie,
     :enable_i8ge,
     :enable_m6id,
     :enable_m6gd,
-    :enable_r8gd,
+    :enable_m7gd,
+    :enable_m8id,
     :enable_r6gd,
     :enable_r6id,
+    :enable_r7gd,
+    :enable_r8gd,
+    :enable_r8id,
+    :enable_z3_highlssd,
+    :enable_z3_standardlssd,
     :free_runner_upgrade_until,
+    :github_billing_by_repository,
     :gpu_vm,
     :ipv6_disabled,
+    :postgres_enable_maintenance_window_days,
     :postgres_hostname_override,
     :postgres_init_script,
-    :postgres_lantern,
-    :postgres_paradedb,
+    :postgres_maintenance_window_platform_only,
     :private_locations,
+    :require_mfa_or_omniauth,
     :skip_runner_pool,
     :spill_to_alien_runners,
     :visible_locations,
+    :visible_postgres_locations,
     :vm_public_ssh_keys,
     :postgres_aws_use_different_azs_for_standbys,
+    :postgres_backup_download_minio,
+    :postgres_instance_type_fallback,
+    :postgres_walg_optimized_config_disabled,
+    :postgres_walg_direct_io_disabled,
     :cache_proxy_download_url,
+    :postgres_aws_ssh_ipv6,
   )
 end
 
 # Table: project
 # Columns:
-#  id              | uuid                     | PRIMARY KEY
-#  name            | text                     | NOT NULL
-#  visible         | boolean                  | NOT NULL DEFAULT true
-#  billing_info_id | uuid                     |
-#  credit          | numeric                  | NOT NULL DEFAULT 0
-#  discount        | integer                  | NOT NULL DEFAULT 0
-#  created_at      | timestamp with time zone | NOT NULL DEFAULT now()
-#  feature_flags   | jsonb                    | NOT NULL DEFAULT '{}'::jsonb
-#  billable        | boolean                  | NOT NULL DEFAULT true
-#  reputation      | text                     | NOT NULL DEFAULT 'new'::text
+#  id                        | uuid                     | PRIMARY KEY
+#  name                      | text                     | NOT NULL
+#  visible                   | boolean                  | NOT NULL DEFAULT true
+#  billing_info_id           | uuid                     |
+#  credit                    | numeric                  | NOT NULL DEFAULT 0
+#  discount                  | integer                  | NOT NULL DEFAULT 0
+#  created_at                | timestamp with time zone | NOT NULL DEFAULT now()
+#  feature_flags             | jsonb                    | NOT NULL DEFAULT '{}'::jsonb
+#  billable                  | boolean                  | NOT NULL DEFAULT true
+#  reputation                | text                     | NOT NULL DEFAULT 'new'::text
+#  gcp_dedicated_subnet_vpcs | boolean                  | NOT NULL DEFAULT false
 # Indexes:
 #  project_pkey                      | PRIMARY KEY btree (id)
 #  project_right(id::text, 10)_index | UNIQUE btree ("right"(id::text, 10))
@@ -268,6 +371,7 @@ end
 #  api_key                   | api_key_project_id_fkey                   | (project_id) REFERENCES project(id)
 #  dns_zone                  | dns_zone_project_id_fkey                  | (project_id) REFERENCES project(id)
 #  firewall                  | firewall_project_id_fkey                  | (project_id) REFERENCES project(id)
+#  gcp_vpc                   | gcp_vpc_project_id_fkey                   | (project_id) REFERENCES project(id)
 #  github_installation       | github_installation_project_id_fkey       | (project_id) REFERENCES project(id)
 #  inference_endpoint        | inference_endpoint_project_id_fkey        | (project_id) REFERENCES project(id)
 #  inference_router          | inference_router_project_id_fkey          | (project_id) REFERENCES project(id)
@@ -278,10 +382,13 @@ end
 #  machine_image_store       | machine_image_store_project_id_fkey       | (project_id) REFERENCES project(id)
 #  minio_cluster             | minio_cluster_project_id_fkey             | (project_id) REFERENCES project(id)
 #  object_tag                | object_tag_project_id_fkey                | (project_id) REFERENCES project(id)
+#  parseable_resource        | parseable_resource_project_id_fkey        | (project_id) REFERENCES project(id)
 #  private_subnet            | private_subnet_project_id_fkey            | (project_id) REFERENCES project(id)
 #  project_discount_code     | project_discount_code_project_id_fkey     | (project_id) REFERENCES project(id)
 #  project_invitation        | project_invitation_project_id_fkey        | (project_id) REFERENCES project(id)
 #  project_quota             | project_quota_project_id_fkey             | (project_id) REFERENCES project(id)
+#  resource_credit           | resource_credit_project_id_fkey           | (project_id) REFERENCES project(id)
+#  resource_discount         | resource_discount_project_id_fkey         | (project_id) REFERENCES project(id)
 #  ssh_public_key            | ssh_public_key_project_id_fkey            | (project_id) REFERENCES project(id)
 #  subject_tag               | subject_tag_project_id_fkey               | (project_id) REFERENCES project(id)
 #  usage_alert               | usage_alert_project_id_fkey               | (project_id) REFERENCES project(id)

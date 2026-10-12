@@ -14,7 +14,7 @@ module PostgresTestHelpers
       name: "pg-test-#{SecureRandom.hex(4)}",
       target_vm_size: "standard-2",
       target_storage_size_gib: 64,
-      target_version: PostgresResource::DEFAULT_VERSION,
+      target_version: PostgresResource.default_version,
       flavor: "standard",
       ha_type: "none",
       parent_id: nil,
@@ -46,12 +46,12 @@ module PostgresTestHelpers
 
     ip_rand = SecureRandom.random_number(0xFFFFFF)
     AssignedVmAddress.create(dst_vm_id: vm.id, ip: "10.#{(ip_rand >> 16) & 0xFF}.#{(ip_rand >> 8) & 0xFF}.#{ip_rand & 0xFF}/32")
-    vm.update(ephemeral_net6: "fd10:9b0b:6b4b:#{SecureRandom.hex(2)}::/79")
+    vm.update(ephemeral_net6: "#{SecureRandom.hex(2)}:#{SecureRandom.hex(2)}:#{SecureRandom.hex(2)}:#{SecureRandom.hex(2)}::/79")
 
     s = PostgresServer.create(
       timeline:, resource:, vm_id: vm.id,
       is_representative:, synchronization_status: "ready",
-      timeline_access:, version: PostgresResource::DEFAULT_VERSION,
+      timeline_access:, version: PostgresResource.default_version,
     )
     Strand.create_with_id(s, prog: "Postgres::PostgresServerNexus", label: "start")
     s

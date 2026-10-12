@@ -81,8 +81,8 @@ RSpec.describe PgBouncerSetup do
   describe "#socket_template_content" do
     let(:content) { pgbouncer_setup.socket_template_content }
 
-    it "listens on port 6432" do
-      expect(content).to include("ListenStream=6432")
+    it "listens on port 6432 and the peer Unix socket only" do
+      expect(content.scan(/^ListenStream=.*$/)).to eq(["ListenStream=6432", "ListenStream=/tmp/.s.PGSQL.%i"])
     end
 
     it "enables ReusePort" do
@@ -102,8 +102,62 @@ RSpec.describe PgBouncerSetup do
       config = pgbouncer_setup.peer_config
 
       expect(config).to include("[peers]")
-      expect(config).to include("1 = host=/tmp/.s.PGSQL.50001")
-      expect(config).to include("2 = host=/tmp/.s.PGSQL.50002")
+      expect(config).to include("1 = host=/tmp port=50001")
+      expect(config).to include("2 = host=/tmp port=50002")
+    end
+  end
+
+  describe "#pgbouncer_service_file_path" do
+    it "returns the correct service template path" do
+      expect(pgbouncer_setup.pgbouncer_service_file_path).to eq("/etc/systemd/system/pgbouncer@.service")
+    end
+  end
+
+  describe "#socket_service_file_path" do
+    it "returns the correct socket template path" do
+      expect(pgbouncer_setup.socket_service_file_path).to eq("/etc/systemd/system/pgbouncer@.socket")
+    end
+  end
+
+  describe "#create_service_templates" do
+    it "writes service and socket templates and reloads systemd" do
+      expect(File).to receive(:write).with("/etc/systemd/system/pgbouncer@.service", pgbouncer_setup.service_template_content)
+      expect(File).to receive(:write).with("/etc/systemd/system/pgbouncer@.socket", pgbouncer_setup.socket_template_content)
+      expect(pgbouncer_setup).to receive(:_run_command).with("systemctl daemon-reload")
+      pgbouncer_setup.create_service_templates
+    end
+  end
+
+  describe "#create_pgbouncer_config" do
+    it "writes config files for each instance" do
+      expect(File).to receive(:write).with("/etc/pgbouncer/pgbouncer_50001.ini", pgbouncer_setup.pgbouncer_ini_content(1))
+      expect(File).to receive(:write).with("/etc/pgbouncer/pgbouncer_50002.ini", pgbouncer_setup.pgbouncer_ini_content(2))
+      pgbouncer_setup.create_pgbouncer_config
+    end
+  end
+
+  describe "#disable_default_pgbouncer" do
+    it "disables and stops the default pgbouncer service" do
+      expect(pgbouncer_setup).to receive(:_run_command).with("systemctl disable --now pgbouncer")
+      pgbouncer_setup.disable_default_pgbouncer
+    end
+  end
+
+  describe "#enable_and_start_service" do
+    it "reloads or enables and starts each pgbouncer instance" do
+      expect(pgbouncer_setup).to receive(:_run_command).with("systemctl reload pgbouncer@50001 || systemctl enable --now pgbouncer@50001")
+      expect(pgbouncer_setup).to receive(:_run_command).with("systemctl reload pgbouncer@50002 || systemctl enable --now pgbouncer@50002")
+      pgbouncer_setup.enable_and_start_service
+    end
+  end
+
+  describe "#setup" do
+    it "creates service templates, config, disables default, and enables instances" do
+      expect(pgbouncer_setup).to receive(:create_service_templates).ordered
+      expect(pgbouncer_setup).to receive(:create_pgbouncer_config).ordered
+      expect(pgbouncer_setup).to receive(:disable_default_pgbouncer).ordered
+      expect(pgbouncer_setup).to receive(:enable_and_start_service).ordered
+      pgbouncer_setup.setup
     end
   end
 end

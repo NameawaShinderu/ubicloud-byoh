@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require_relative "../../model"
-require_relative "../../lib/net_ssh"
 
 class MinioServer < Sequel::Model
   one_to_one :strand, key: :id, read_only: true
@@ -10,7 +9,7 @@ class MinioServer < Sequel::Model
   one_through_one :cluster, join_table: :minio_pool, left_primary_key: :minio_pool_id, left_key: :id, class: :MinioCluster, read_only: true
 
   plugin ResourceMethods, redacted_columns: :cert, encrypted_columns: :cert_key
-  plugin SemaphoreMethods, :checkup, :destroy, :restart, :reconfigure, :refresh_certificates, :initial_provisioning
+  plugin SemaphoreMethods, :checkup, :destroy, :restart, :reconfigure, :refresh_certificates, :initial_provisioning, :switch_to_public_certs, :pin_net_threads
   include HealthMonitorMethods
 
   def generate_etc_hosts_entry
@@ -78,7 +77,7 @@ class MinioServer < Sequel::Model
     end
     pulse = aggregate_readings(previous_pulse:, reading:)
 
-    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !reload.checkup_set?
+    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !checkup_set?(cached: false)
       incr_checkup
     end
 

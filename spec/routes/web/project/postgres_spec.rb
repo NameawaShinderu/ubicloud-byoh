@@ -47,19 +47,6 @@ RSpec.describe Clover, "postgres" do
   describe "authenticated" do
     let(:postgres_project) { Project.create(name: "default") }
 
-    def create_minio_cluster_for_blob_storage
-      allow(Config).to receive(:minio_host_name).and_return("minio.test")
-      DnsZone.create(project_id: postgres_project.id, name: "minio.test")
-      MinioCluster.create(
-        project_id: postgres_project.id,
-        location_id: Location::HETZNER_FSN1_ID,
-        name: "walg-minio",
-        admin_user: "admin",
-        admin_password: "password",
-        root_cert_1: "dummy-certs",
-      )
-    end
-
     before do
       allow(Config).to receive(:postgres_service_project_id).and_return(postgres_project.id)
       login(user.email)
@@ -72,13 +59,19 @@ RSpec.describe Clover, "postgres" do
     end
 
     describe "list" do
-      it "can list flavors when there is no pg databases" do
-        project.set_ff_postgres_paradedb(true)
+      it "offers to create a database when there are none" do
         visit "#{project.path}/postgres"
 
         expect(page.title).to eq("Ubicloud - PostgreSQL Databases")
-        expect(page).to have_content "Create PostgreSQL Database"
-        expect(page).to have_content "Create ParadeDB PostgreSQL Database"
+        expect(page).to have_content "No PostgreSQL databases"
+
+        click_link "Create PostgreSQL Database"
+        expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
+      end
+
+      it "offers to create a database next to the list" do
+        pg
+        visit "#{project.path}/postgres"
 
         click_link "Create PostgreSQL Database"
         expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
@@ -101,11 +94,18 @@ RSpec.describe Clover, "postgres" do
 
         expect(page).to have_content pg_wo_permission.name
       end
+
+      it "shows the creation time on the list page" do
+        pg
+        visit "#{project.path}/postgres"
+
+        expect(page).to have_content pg.created_at.utc.strftime("%b %d, %Y")
+      end
     end
 
     describe "create" do
       it "can create new PostgreSQL database" do
-        visit "#{project.path}/postgres/create?flavor=#{PostgresResource::Flavor::STANDARD}"
+        visit "#{project.path}/postgres/create"
 
         expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
         name = "new-pg-db"
@@ -120,6 +120,7 @@ RSpec.describe Clover, "postgres" do
         expect(page).to have_flash_notice("'#{name}' will be ready in a few minutes")
         expect(PostgresResource.count).to eq(1)
         expect(PostgresResource.first.project_id).to eq(project.id)
+        expect(PostgresResource.first.flavor).to eq(PostgresResource::Flavor::STANDARD)
       end
 
       it "can create new PostgreSQL database in a custom AWS region" do
@@ -136,7 +137,7 @@ RSpec.describe Clover, "postgres" do
         # Delete seeded aws-us-west-2 location to avoid display_name conflict
         Location.where(display_name: "aws-us-west-2", project_id: nil).destroy
 
-        visit "#{project.path}/postgres/create?flavor=#{PostgresResource::Flavor::STANDARD}"
+        visit "#{project.path}/postgres/create"
 
         expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
         name = "new-pg-db"
@@ -156,9 +157,16 @@ RSpec.describe Clover, "postgres" do
         expect(pg.target_storage_size_gib).to eq(118)
       end
 
+      it "pre-selects the default version rather than the newest one offered" do
+        visit "#{project.path}/postgres/create"
+
+        checked = all("input[name=version]", visible: false).select(&:checked?).map { |input| input.value }
+        expect(checked).to eq([PostgresResource.default_version])
+      end
+
       it "can specify an init script when creating new PostgreSQL database" do
         project.set_ff_postgres_init_script(true)
-        visit "#{project.path}/postgres/create?flavor=#{PostgresResource::Flavor::STANDARD}"
+        visit "#{project.path}/postgres/create"
 
         expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
         name = "new-pg-db"
@@ -177,8 +185,29 @@ RSpec.describe Clover, "postgres" do
         expect(PostgresResource.first.init_script.init_script).to eq("sudo whoami")
       end
 
+      it "can create new PostgreSQL database without firewall rules" do
+        visit "#{project.path}/postgres/create"
+
+        expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
+        name = "new-pg-db"
+        fill_in "Name", with: name
+        choose option: Location::HETZNER_FSN1_UBID
+        choose option: "standard-2"
+        choose option: PostgresResource::HaType::NONE
+        choose "No access yet No firewall rules"
+
+        click_button "Create"
+
+        expect(page.title).to eq("Ubicloud - #{name}")
+        expect(page).to have_flash_notice("'#{name}' will be ready in a few minutes")
+        expect(PostgresResource.count).to eq(1)
+        pg = PostgresResource.first
+        expect(pg.project_id).to eq(project.id)
+        expect(pg.pg_firewall_rules_dataset.count).to eq(0)
+      end
+
       it "handles errors when creating new PostgreSQL database" do
-        visit "#{project.path}/postgres/create?flavor=#{PostgresResource::Flavor::STANDARD}"
+        visit "#{project.path}/postgres/create"
 
         expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
         name = "new-pg-db"
@@ -196,7 +225,7 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "cannot create new PostgreSQL database with invalid location" do
-        visit "#{project.path}/postgres/create?flavor=#{PostgresResource::Flavor::STANDARD}"
+        visit "#{project.path}/postgres/create"
         expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
         name = "new-pg-db"
         fill_in "Name", with: name
@@ -214,86 +243,6 @@ RSpec.describe Clover, "postgres" do
         click_button "Create"
         expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
         expect(page).to have_flash_error("Validation failed for following fields: location")
-      end
-
-      it "can create new ParadeDB PostgreSQL database" do
-        project.set_ff_postgres_paradedb(true)
-        expect(Config).to receive(:postgres_paradedb_notification_email).and_return("dummy@mail.com")
-        expect(Util).to receive(:send_email)
-        visit "#{project.path}/postgres/create?flavor=#{PostgresResource::Flavor::PARADEDB}"
-
-        expect(page.title).to eq("Ubicloud - Create ParadeDB PostgreSQL Database")
-        name = "new-pg-db"
-        fill_in "Name", with: name
-        choose option: Location::HETZNER_FSN1_UBID
-        choose option: "standard-2"
-        choose option: PostgresResource::HaType::NONE
-        check "Accept Terms of Service and Privacy Policy"
-
-        click_button "Create"
-
-        expect(page.title).to eq("Ubicloud - #{name}")
-        expect(page).to have_flash_notice("'#{name}' will be ready in a few minutes")
-        expect(PostgresResource.count).to eq(1)
-        expect(PostgresResource.first.project_id).to eq(project.id)
-      end
-
-      it "can create new Lantern PostgreSQL database when the feature flag is enabled" do
-        project.set_ff_postgres_lantern(true)
-        visit "#{project.path}/postgres/create?flavor=#{PostgresResource::Flavor::LANTERN}"
-
-        expect(page.title).to eq("Ubicloud - Create Lantern PostgreSQL Database")
-        name = "new-pg-db"
-        fill_in "Name", with: name
-        choose option: Location::HETZNER_FSN1_UBID
-        choose option: "standard-2"
-        choose option: PostgresResource::HaType::NONE
-        check "Accept Terms of Service and Privacy Policy"
-
-        click_button "Create"
-        expect(page.title).to eq("Ubicloud - #{name}")
-        expect(page).to have_flash_notice("'#{name}' will be ready in a few minutes")
-        expect(PostgresResource.count).to eq(1)
-        expect(PostgresResource.first.project_id).to eq(project.id)
-      end
-
-      it "can create new ParadeDB PostgreSQL database when the feature flag is enabled" do
-        project.set_ff_postgres_paradedb(true)
-        visit "#{project.path}/postgres/create?flavor=#{PostgresResource::Flavor::PARADEDB}"
-
-        expect(page.title).to eq("Ubicloud - Create ParadeDB PostgreSQL Database")
-        name = "new-pg-db"
-        fill_in "Name", with: name
-        choose option: Location::HETZNER_FSN1_UBID
-        choose option: "standard-2"
-        choose option: PostgresResource::HaType::NONE
-        check "Accept Terms of Service and Privacy Policy"
-
-        click_button "Create"
-        expect(page.title).to eq("Ubicloud - #{name}")
-        expect(page).to have_flash_notice("'#{name}' will be ready in a few minutes")
-        expect(PostgresResource.count).to eq(1)
-        expect(PostgresResource.first.project_id).to eq(project.id)
-      end
-
-      it "can not create new ParadeDB PostgreSQL database in a customer specific location" do
-        project.set_ff_postgres_paradedb(true)
-        private_location = create_private_location(project:)
-
-        visit "#{project.path}/postgres/create?flavor=#{PostgresResource::Flavor::PARADEDB}"
-
-        expect(page.title).to eq("Ubicloud - Create ParadeDB PostgreSQL Database")
-        expect(page).to have_no_content private_location.name
-      end
-
-      it "treats invalid flavor as standard flavor when creating" do
-        default_project = Project[name: "Default"]
-        url = "#{default_project.path}/dashboard"
-        Capybara.current_session.driver.header "Referer", url
-        visit "#{project.path}/postgres/create?flavor=invalid"
-
-        expect(page.title).to eq("Ubicloud - Create PostgreSQL Database")
-        expect(find("input[name=flavor]", visible: false)[:value]).to eq "standard"
       end
 
       it "can not create PostgreSQL database with same name" do
@@ -371,7 +320,6 @@ RSpec.describe Clover, "postgres" do
 
       it "can show disk usage details" do
         pg
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
 
         vmc = instance_double(VictoriaMetrics::Client, query_range: [{"values" => [[Time.now.utc.to_i, "50"]]}])
         expect(VictoriaMetricsResource).to receive(:client_for_project).and_return(vmc)
@@ -380,9 +328,20 @@ RSpec.describe Clover, "postgres" do
         expect(page).to have_content "64.0 GB is used (50.0%)"
       end
 
+      it "annotates the CPU subtext when the representative is on a fallback type" do
+        pg.update(target_vm_size: "r8gd.large")
+        pg.representative_server.incr_ignore_instance_size_mismatch
+        visit "#{project.path}#{pg.path}/overview"
+        expect(page).to have_content("Fallback from r8gd.large")
+      end
+
+      it "does not annotate the CPU subtext when the representative is on its intended type" do
+        visit "#{project.path}#{pg.path}/overview"
+        expect(page).to have_no_content("Fallback from")
+      end
+
       it "shows the disk usage in red if usage is high" do
         pg
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
 
         vmc = instance_double(VictoriaMetrics::Client, query_range: [{"values" => [[Time.now.utc.to_i, "90"]]}])
         expect(VictoriaMetricsResource).to receive(:client_for_project).and_return(vmc)
@@ -393,7 +352,6 @@ RSpec.describe Clover, "postgres" do
 
       it "shows total disk if there is no VictoriaMetricsResource" do
         pg
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
 
         expect(VictoriaMetricsResource).to receive(:client_for_project).at_least(:once).and_return(nil)
 
@@ -408,9 +366,14 @@ RSpec.describe Clover, "postgres" do
         expect(page).to have_content "usw2-az2 (AWS)"
       end
 
+      it "shows the creation time on the overview page" do
+        visit "#{project.path}#{pg.path}/overview"
+        expect(page).to have_content "Created #{pg.created_at.utc.strftime("%b %d, %Y")}"
+        expect(page).to have_content pg.created_at.utc.strftime("%H:%M UTC")
+      end
+
       it "shows total disk if VictoriaMetricsResource is not accessible" do
         pg
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
 
         vmc = instance_double(VictoriaMetrics::Client)
         expect(vmc).to receive(:query_range).and_raise(Excon::Error::Socket)
@@ -426,16 +389,98 @@ RSpec.describe Clover, "postgres" do
         expect(page).to have_css(".metric-chart")
       end
 
-      it "shows connections if the resource is running" do
+      it "shows connection information if the resource is running" do
+        ps = Prog::Vnet::SubnetNexus.assemble(project.id, name: "test-ps").subject
+        expect(Config).to receive(:postgres_service_hostname).and_return("pg.ubicloud.com").at_least(:once)
+        DnsZone.create(project_id: Config.postgres_service_project_id, name: Config.postgres_service_hostname)
+        pg.update(hostname_version: "v2")
         pg.strand.update(label: "wait")
         visit "#{project.path}#{pg.path}/connection"
         expect(page).to have_no_content "No connection information available"
+        expect(page).to have_no_content "Use Private DNS?"
+        password = pg.superuser_password
+        expect(page.all(".connection-info-box div[data-content]").map { it["data-content"] }).to eq [
+          "postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.com:5432/postgres?sslmode=require&channel_binding=require",
+          "psql 'postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.com:5432/postgres?sslmode=require&channel_binding=require'",
+          "PGHOST=pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nPGPORT=5432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=require\nPGCHANNELBINDING=require",
+          "host: pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nport: 5432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: require\nchannel_binding: require",
+          "jdbc:postgresql://pg-with-permission.#{pg.ubid}.pg.ubicloud.com:5432/postgres?user=postgres&password=#{password}&ssl=true&channelBinding=require",
+
+          "postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.com:6432/postgres?sslmode=require",
+          "psql 'postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.com:6432/postgres?sslmode=require'",
+          "PGHOST=pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nPGPORT=6432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=require",
+          "host: pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nport: 6432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: require",
+          "jdbc:postgresql://pg-with-permission.#{pg.ubid}.pg.ubicloud.com:6432/postgres?user=postgres&password=#{password}&ssl=true",
+        ]
+
+        # Show private DNS information if private subnet is connected to anything
+        pg.private_subnet.connect_subnet(ps)
+        page.refresh
+        expect(page).to have_content "Use Private DNS?"
+        expect(page.all(".connection-info-box div[data-content]").map { it["data-content"] }).to eq [
+          "postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.com:5432/postgres?sslmode=require&channel_binding=require",
+          "psql 'postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.com:5432/postgres?sslmode=require&channel_binding=require'",
+          "PGHOST=pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nPGPORT=5432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=require\nPGCHANNELBINDING=require",
+          "host: pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nport: 5432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: require\nchannel_binding: require",
+          "jdbc:postgresql://pg-with-permission.#{pg.ubid}.pg.ubicloud.com:5432/postgres?user=postgres&password=#{password}&ssl=true&channelBinding=require",
+
+          "postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.com:6432/postgres?sslmode=require",
+          "psql 'postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.com:6432/postgres?sslmode=require'",
+          "PGHOST=pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nPGPORT=6432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=require",
+          "host: pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nport: 6432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: require",
+          "jdbc:postgresql://pg-with-permission.#{pg.ubid}.pg.ubicloud.com:6432/postgres?user=postgres&password=#{password}&ssl=true",
+
+          "postgresql://postgres:#{password}@private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com:5432/postgres?sslmode=require&channel_binding=require",
+          "psql 'postgresql://postgres:#{password}@private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com:5432/postgres?sslmode=require&channel_binding=require'",
+          "PGHOST=private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nPGPORT=5432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=require\nPGCHANNELBINDING=require",
+          "host: private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nport: 5432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: require\nchannel_binding: require",
+          "jdbc:postgresql://private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com:5432/postgres?user=postgres&password=#{password}&ssl=true&channelBinding=require",
+
+          "postgresql://postgres:#{password}@private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com:6432/postgres?sslmode=require",
+          "psql 'postgresql://postgres:#{password}@private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com:6432/postgres?sslmode=require'",
+          "PGHOST=private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nPGPORT=6432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=require",
+          "host: private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com\nport: 6432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: require",
+          "jdbc:postgresql://private.pg-with-permission.#{pg.ubid}.pg.ubicloud.com:6432/postgres?user=postgres&password=#{password}&ssl=true",
+        ]
+
+        # Show correct information for hostname version v3 with publicly signed certificates
+        pg.update(hostname_version: "v3")
+        expect(Config).to receive(:acme_email).and_return("acme@example.com").at_least(:once)
+        DnsZone.create(project_id: postgres_project.id, name: "pg.ubicloud.app")
+        page.refresh
+        expect(page).to have_content "Use Private DNS?"
+        expect(page.all(".connection-info-box div[data-content]").map { it["data-content"] }).to eq [
+          "postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.app:5432/postgres?sslmode=verify-full&channel_binding=require&sslrootcert=system",
+          "psql 'postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.app:5432/postgres?sslmode=verify-full&channel_binding=require&sslrootcert=system'",
+          "PGHOST=pg-with-permission.#{pg.ubid}.pg.ubicloud.app\nPGPORT=5432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=verify-full\nPGCHANNELBINDING=require\nPGSSLROOTCERT=system",
+          "host: pg-with-permission.#{pg.ubid}.pg.ubicloud.app\nport: 5432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: verify-full\nchannel_binding: require\nsslrootcert: system",
+          "jdbc:postgresql://pg-with-permission.#{pg.ubid}.pg.ubicloud.app:5432/postgres?user=postgres&password=#{password}&ssl=true&channelBinding=require",
+
+          "postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.app:6432/postgres?sslmode=verify-full&sslrootcert=system",
+          "psql 'postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.pg.ubicloud.app:6432/postgres?sslmode=verify-full&sslrootcert=system'",
+          "PGHOST=pg-with-permission.#{pg.ubid}.pg.ubicloud.app\nPGPORT=6432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=verify-full\nPGSSLROOTCERT=system",
+          "host: pg-with-permission.#{pg.ubid}.pg.ubicloud.app\nport: 6432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: verify-full\nsslrootcert: system",
+          "jdbc:postgresql://pg-with-permission.#{pg.ubid}.pg.ubicloud.app:6432/postgres?user=postgres&password=#{password}&ssl=true",
+
+          "postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app:5432/postgres?sslmode=verify-full&channel_binding=require&sslrootcert=system",
+          "psql 'postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app:5432/postgres?sslmode=verify-full&channel_binding=require&sslrootcert=system'",
+          "PGHOST=pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app\nPGPORT=5432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=verify-full\nPGCHANNELBINDING=require\nPGSSLROOTCERT=system",
+          "host: pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app\nport: 5432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: verify-full\nchannel_binding: require\nsslrootcert: system",
+          "jdbc:postgresql://pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app:5432/postgres?user=postgres&password=#{password}&ssl=true&channelBinding=require",
+
+          "postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app:6432/postgres?sslmode=verify-full&sslrootcert=system",
+          "psql 'postgresql://postgres:#{password}@pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app:6432/postgres?sslmode=verify-full&sslrootcert=system'",
+          "PGHOST=pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app\nPGPORT=6432\nPGUSER=postgres\nPGPASSWORD=#{password}\nPGDATABASE=postgres\nPGSSLMODE=verify-full\nPGSSLROOTCERT=system",
+          "host: pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app\nport: 6432\nuser: postgres\npassword: #{password}\ndatabase: postgres\nsslmode: verify-full\nsslrootcert: system",
+          "jdbc:postgresql://pg-with-permission.#{pg.ubid}.private.pg.ubicloud.app:6432/postgres?user=postgres&password=#{password}&ssl=true",
+        ]
       end
 
-      it "does not show connections if the resource is creating" do
+      it "does not show connection information if the resource is creating" do
         pg.strand.update(label: "wait_servers")
         visit "#{project.path}#{pg.path}/connection"
         expect(page).to have_content "No connection information available"
+        expect(page.all(".connection-info-box div[data-content]").to_a).to eq []
       end
 
       it "shows 404 for invalid pages for read replicas" do
@@ -492,6 +537,15 @@ RSpec.describe Clover, "postgres" do
         expect(pg.init_script.init_script).to eq("sudo ls")
       end
 
+      it "shows an initialization script that contains non-ASCII characters" do
+        PostgresInitScript.create_with_id(pg, init_script: "echo 'héllo wörld'")
+        project.set_ff_postgres_init_script(true)
+        visit "#{project.path}#{pg.path}/settings"
+
+        expect(page.status_code).to eq(200)
+        expect(page).to have_field("init_script", with: "echo 'héllo wörld'")
+      end
+
       it "raises forbidden when does not have permissions" do
         visit "#{project_wo_permissions.path}#{pg_wo_permission.path}/overview"
 
@@ -509,8 +563,9 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "can update PostgreSQL instance size configuration" do
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
-
+        # Low disk usage, so that no storage option is disabled for not
+        # holding the data in use.
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].insert(postgres_server_id: pg.representative_server.id, data_disk_usage_percent: 5, observed_at: Time.now)
         visit "#{project.path}#{pg.path}/resize"
 
         choose option: "standard-8"
@@ -524,11 +579,68 @@ RSpec.describe Clover, "postgres" do
         pg.reload
         expect(pg.target_vm_size).to eq("standard-8")
         expect(pg.target_storage_size_gib).to eq(256)
+      ensure
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].where(postgres_server_id: pg.representative_server.id).delete
+      end
+
+      it "disables the storage sizes that cannot hold the data in use" do
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].insert(postgres_server_id: pg.representative_server.id, data_disk_usage_percent: 60, observed_at: Time.now)
+        visit "#{project.path}#{pg.path}/resize"
+
+        expect(page).to have_content "76.8 GB of 128 GB is used"
+        expect(page).to have_content "Too small for 76.8 GB used"
+        expect(page).to have_css("label.form_size_standard-2.option-unavailable input[value='64'][disabled]")
+        expect(page).to have_no_css("label.form_size_standard-2.option-unavailable input[value='128']")
+      ensure
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].where(postgres_server_id: pg.representative_server.id).delete
+      end
+
+      it "disables the smaller storage sizes when the disk usage is unknown" do
+        visit "#{project.path}#{pg.path}/resize"
+
+        expect(page).to have_content "Current disk usage is unavailable"
+        expect(page).to have_css("label.form_size_standard-2.option-unavailable input[value='64'][disabled]")
+        # The reason is the same for every size, so it is not repeated per card.
+        expect(page).to have_no_content "Too small for"
+      end
+
+      it "shows the maintenance window in the resize failover steps" do
+        pg.update(maintenance_window_start_at: 22, maintenance_window_days_bitmask: PostgresResource.maintenance_window_days_mask(["mon", "thu"]))
+        visit "#{project.path}#{pg.path}/resize"
+
+        expect(page).to have_content "Wait for the maintenance window"
+        expect(page).to have_content "Mon, Thu, 22:00 - 00:00 (UTC)"
+      end
+
+      it "links to the settings page when resizing without a maintenance window" do
+        visit "#{project.path}#{pg.path}/resize"
+
+        expect(page).to have_content "No maintenance window"
+        expect(page).to have_link "Set a maintenance window", href: "#{project.path}#{pg.path}/settings"
+      end
+
+      it "shows fallback information on the resize page" do
+        pg.update(target_vm_size: "standard-4")
+        pg.representative_server.incr_ignore_instance_size_mismatch
+        visit "#{project.path}#{pg.path}/resize"
+
+        expect(page).to have_content("Fallback from standard-4")
+        expect(page).to have_no_content("Resizing to")
+      end
+
+      it "shows pending resize and high disk usage on the resize page" do
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].insert(postgres_server_id: pg.representative_server.id, data_disk_usage_percent: 90, observed_at: Time.now)
+        pg.update(target_vm_size: "standard-4", target_storage_size_gib: 256)
+        visit "#{project.path}#{pg.path}/resize"
+
+        expect(page).to have_content("Resizing to standard-4")
+        expect(page).to have_content("Resizing to 256 GB")
+        expect(page).to have_css("span.text-red-600", text: "115.2 GB is used (90%)")
+      ensure
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].where(postgres_server_id: pg.representative_server.id).delete
       end
 
       it "can update PostgreSQL high availability" do
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
-
         visit "#{project.path}#{pg.path}"
         click_link "High Availability"
 
@@ -567,9 +679,45 @@ RSpec.describe Clover, "postgres" do
         expect(page).to have_content "No backups available for this PostgreSQL database."
       end
 
+      it "generates backup download credentials once the minio flag is set" do
+        project.set_ff_postgres_backup_download_minio(true)
+        create_minio_cluster_for_blob_storage
+        allow(Config).to receive(:minio_service_project_id).and_return(Config.postgres_service_project_id)
+        expiration = Time.now.utc + 36 * 60 * 60
+        expect(Minio::Client).to receive(:new).and_return(instance_double(Minio::Client, list_objects: [], assume_role: {access_key_id: "AKID", secret_access_key: "SECRET", session_token: "TOKEN", expiration:})).at_least(:once)
+
+        visit "#{project.path}#{pg.path}/backup-restore"
+        expect(page).to have_content "Backup Download Access"
+
+        click_button "Create download credentials"
+
+        expect(page.status_code).to eq(200)
+        expect(page).to have_content "Access Key ID"
+        expect(page).to have_content "AKID"
+        expect(page).to have_content "https://walg-minio.minio.test:9000"
+        expect(page).to have_content "aws s3 sync"
+        expect(page).to have_css(".backup-example-box.copyable-content .copy-button")
+      end
+
+      it "hides the backup download section for non-aws databases without the minio flag" do
+        visit "#{project.path}#{pg.path}/backup-restore"
+        expect(page).to have_no_content "Backup Download Access"
+        expect(page).to have_no_button "Create download credentials"
+      end
+
+      it "shows proper message when a backup exists but the restore window is not open yet" do
+        create_minio_cluster_for_blob_storage
+        backup = Struct.new(:key, :last_modified)
+        expect(Minio::Client).to receive(:new).and_return(instance_double(Minio::Client, list_objects: [backup.new("basebackups_005/backup_stop_sentinel.json", Time.now.utc)])).at_least(:once)
+
+        visit "#{project.path}#{pg.path}/backup-restore"
+        expect(page).to have_no_content "Fork PostgreSQL database"
+        expect(page).to have_content "Point-in-time restore is not available yet."
+        expect(page).to have_content "Backups"
+      end
+
       it "can create a read replica of a PostgreSQL database" do
         pg.timeline.update(cached_earliest_backup_at: Time.now.utc.to_datetime.rfc3339)
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         visit "#{project.path}#{pg.path}/read-replica"
 
         fill_in "#{pg.name}-read-replica", with: "my-read-replica"
@@ -597,8 +745,8 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "can promote a read replica" do
+        create_minio_cluster_for_blob_storage
         pg.timeline.update(cached_earliest_backup_at: Time.now.utc.to_datetime.rfc3339)
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         visit "#{project.path}#{pg.path}/read-replica"
 
         fill_in "#{pg.name}-read-replica", with: "my-read-replica"
@@ -615,7 +763,6 @@ RSpec.describe Clover, "postgres" do
 
       it "fails to promote if not a read replica" do
         pg.timeline.update(cached_earliest_backup_at: Time.now.utc.to_datetime.rfc3339)
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         visit "#{project.path}#{pg.path}/read-replica"
         expect(page).to have_content "Read Replicas"
 
@@ -636,14 +783,12 @@ RSpec.describe Clover, "postgres" do
 
       describe "add-aaaa-record" do
         before do
-          allow(Config).to receive(:postgres_service_hostname).and_return("pg.example.com")
+          allow(Config).to receive_messages(postgres_service_hostname: "pg.example.com", postgres_service_hostname_v3: "pg.example.com")
           @dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
           pg.representative_server.vm.update(ephemeral_net6: "::/64")
         end
 
-        it "can add AAAA record if database was created before cutoff and no AAAA exists" do
-          pg.update(created_at: PostgresResource::AAAA_CUTOFF - 86400)
-
+        it "can add AAAA record if no AAAA exists" do
           visit "#{project.path}#{pg.path}/settings"
 
           expect(page).to have_content "Add IPv6 (AAAA) DNS record"
@@ -655,7 +800,6 @@ RSpec.describe Clover, "postgres" do
         end
 
         it "does not show button if AAAA record already exists" do
-          pg.update(created_at: PostgresResource::AAAA_CUTOFF - 86400)
           @dns_zone.insert_record(record_name: pg.hostname, type: "AAAA", ttl: 10, data: "::1")
 
           visit "#{project.path}#{pg.path}/settings"
@@ -664,8 +808,6 @@ RSpec.describe Clover, "postgres" do
         end
 
         it "handles race condition when AAAA is added between page load and button click" do
-          pg.update(created_at: PostgresResource::AAAA_CUTOFF - 86400)
-
           visit "#{project.path}#{pg.path}/settings"
 
           @dns_zone.insert_record(record_name: pg.hostname, type: "AAAA", ttl: 10, data: "::1")
@@ -675,15 +817,6 @@ RSpec.describe Clover, "postgres" do
           expect(page).to have_flash_error("Cannot add AAAA record for this database")
           expect(page.status_code).to eq(200)
 
-          expect(page).to have_no_content "Add AAAA Record"
-        end
-
-        it "does not show button for databases created after cutoff" do
-          pg.update(created_at: PostgresResource::AAAA_CUTOFF + 86400)
-
-          visit "#{project.path}#{pg.path}/settings"
-
-          expect(page).to have_no_content "Add IPv6 (AAAA) DNS record"
           expect(page).to have_no_content "Add AAAA Record"
         end
 
@@ -701,7 +834,6 @@ RSpec.describe Clover, "postgres" do
             target_storage_size_gib: 128,
             target_version: "16",
           ).subject
-          pg_aws.update(created_at: PostgresResource::AAAA_CUTOFF - 86400)
 
           visit "#{project.path}#{pg_aws.path}/settings"
 
@@ -710,8 +842,6 @@ RSpec.describe Clover, "postgres" do
         end
 
         it "does not show button when user does not have edit permissions" do
-          pg.update(created_at: PostgresResource::AAAA_CUTOFF - 86400)
-
           AccessControlEntry.create(project_id: project_wo_permissions.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Postgres:view"])
 
           visit "#{project_wo_permissions.path}#{pg_wo_permission.path}/settings"
@@ -756,7 +886,6 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "can cancel storage auto-scale" do
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         pg.incr_storage_auto_scale_action_performed_90
         Strand.create(prog: "Postgres::ConvergePostgresResource", label: "start", parent_id: pg.strand.id)
         allow(Util).to receive(:send_email)
@@ -768,7 +897,6 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "shows error when cancel storage auto-scale fails" do
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         pg.incr_storage_auto_scale_action_performed_90
         st = Strand.create(prog: "Postgres::ConvergePostgresResource", label: "start", parent_id: pg.strand.id)
         allow(Util).to receive(:send_email)
@@ -893,8 +1021,330 @@ RSpec.describe Clover, "postgres" do
       end
     end
 
+    describe "logs" do
+      let(:parseable_client) { instance_double(Parseable::Client) }
+
+      before do
+        pg.strand.update(label: "wait")
+      end
+
+      it "does not show logs if the resource is creating" do
+        pg.strand.update(label: "wait_servers")
+        visit "#{project.path}#{pg.path}/logs"
+        expect(page).to have_content "Logs are not available"
+      end
+
+      it "shows database logs with filters and context" do
+        allow(ParseableResource).to receive(:client_for_project).and_return(parseable_client)
+        rows = [{
+          "log_id" => "0196a9f7-0000-7000-8000-000000000001",
+          "time_unix_nano" => "2026-05-08T10:00:00.123",
+          "stream" => "postgres",
+          "severity_text" => "ERROR",
+          "body" => "foo failed",
+          "instance" => "ps123456",
+          "server_role" => "primary",
+          "remote_host_port" => "10.0.0.1:5432",
+          "dbname" => "app",
+          "pid" => "1234",
+          "user" => "alice",
+        }]
+        start_str = (Time.now.utc - 30 * 60).iso8601
+        end_str = Time.now.utc.iso8601
+        expect(parseable_client).to receive(:query).with(
+          a_string_including("\"stream\" = 'postgres'", "\"server_role\" = 'primary'", "\"severity_text\" = 'ERROR'", "\"message\" LIKE '%foo|bar%'"),
+          start_time: anything, end_time: anything,
+        ).and_return(rows)
+
+        visit "#{project.path}#{pg.path}/logs?start=#{CGI.escape(start_str)}&end=#{CGI.escape(end_str)}&stream_name=postgres&server_role=primary&severity_level=ERROR&query_pattern=foo%7Cbar&max_log_lines=100"
+
+        expect(page).to have_select("stream_name", selected: "postgres")
+        expect(page).to have_select("server_role", selected: "primary")
+        expect(page).to have_select("severity_level", selected: "ERROR")
+        expect(page).to have_content("2026-05-08 10:00:00.123")
+        expect(page).to have_content("foo failed")
+        expect(page).to have_content("1234")
+        expect(page).to have_content("app")
+        expect(page).to have_content("alice")
+        expect(page).to have_content("10.0.0.1:5432")
+      end
+
+      it "shows pagination link preserving current filters" do
+        allow(ParseableResource).to receive(:client_for_project).and_return(parseable_client)
+        rows = Array.new(51) { |i|
+          {
+            "log_id" => "0196a9f7-0000-7000-8000-#{i.to_s.rjust(12, "0")}",
+            "time_unix_nano" => "2026-05-08T10:00:00",
+            "stream" => "postgres",
+            "severity_text" => "INFO",
+            "body" => "msg",
+            "instance" => "ps123456",
+            "server_role" => "primary",
+          }
+        }
+        expect(parseable_client).to receive(:query).and_return(rows)
+
+        start_str = (Time.now.utc - 30 * 60).iso8601
+        end_str = Time.now.utc.iso8601
+        visit "#{project.path}#{pg.path}/logs?start=#{CGI.escape(start_str)}&end=#{CGI.escape(end_str)}&stream_name=postgres&severity_level=INFO&query_pattern=foo&max_log_lines=50"
+
+        expect(page).to have_content("Showing 50 most recent log lines. More logs are available")
+        expect(page).to have_content("increase the limit above.")
+        href = find("a", text: /load the next page/)[:href]
+        expect(href).to include("start=#{CGI.escape(start_str)}")
+        expect(href).to include("stream_name=postgres")
+        expect(href).to include("severity_level=INFO")
+        expect(href).to include("query_pattern=foo")
+        expect(href).to include("pagination_key=0196a9f7-0000-7000-8000-000000000049")
+      end
+
+      it "does not ask to increase limit if already at max" do
+        allow(ParseableResource).to receive(:client_for_project).and_return(parseable_client)
+        rows = Array.new(501) { |i|
+          {
+            "log_id" => "0196a9f7-0000-7000-8000-#{i.to_s.rjust(12, "0")}",
+            "time_unix_nano" => "2026-05-08T10:00:00",
+            "stream" => "postgres",
+            "severity_text" => "INFO",
+            "body" => "msg",
+            "instance" => "ps123456",
+            "server_role" => "primary",
+          }
+        }
+        expect(parseable_client).to receive(:query).and_return(rows)
+
+        start_str = (Time.now.utc - 30 * 60).iso8601
+        end_str = Time.now.utc.iso8601
+        visit "#{project.path}#{pg.path}/logs?start=#{CGI.escape(start_str)}&end=#{CGI.escape(end_str)}&stream_name=postgres&severity_level=INFO&query_pattern=foo&max_log_lines=500"
+
+        expect(page).to have_content("Showing 500 most recent log lines. More logs are available")
+        expect(page).to have_no_content("increase the limit above.")
+        href = find("a", text: /load the next page/)[:href]
+        expect(href).to include("start=#{CGI.escape(start_str)}")
+        expect(href).to include("stream_name=postgres")
+        expect(href).to include("severity_level=INFO")
+        expect(href).to include("query_pattern=foo")
+        expect(href).to include("pagination_key=0196a9f7-0000-7000-8000-000000000499")
+      end
+
+      it "shows inline error for invalid log query" do
+        allow(ParseableResource).to receive(:client_for_project).and_return(parseable_client)
+        expect(parseable_client).not_to receive(:query)
+
+        start_str = Time.now.utc.iso8601
+        end_str = (Time.now.utc - 30 * 60).iso8601
+        visit "#{project.path}#{pg.path}/logs?start=#{CGI.escape(start_str)}&end=#{CGI.escape(end_str)}"
+
+        expect(page).to have_content("End time must be after start time")
+        expect(page).to have_content("Log Destinations")
+      end
+
+      it "shows a message when no logs are found" do
+        allow(ParseableResource).to receive(:client_for_project).and_return(parseable_client)
+        expect(parseable_client).to receive(:query).and_return([])
+
+        visit "#{project.path}#{pg.path}/logs"
+
+        expect(page).to have_content("No logs found in the selected time range.")
+      end
+
+      it "shows logs with unparseable timestamps, various severity levels, and no context" do
+        allow(ParseableResource).to receive(:client_for_project).and_return(parseable_client)
+        rows = [
+          ["invalid", "WARN"],
+          ["2026-05-08T10:00:01", "DEBUG"],
+          ["2026-05-08T10:00:02", "UNSPECIFIED"],
+          ["2026-05-08T10:00:03", nil],
+          ["2026-05-08T10:00:04", "INFO"],
+        ].map.with_index { |(time, severity), i|
+          {
+            "log_id" => "0196a9f7-0000-7000-8000-#{i.to_s.rjust(12, "0")}",
+            "time_unix_nano" => time,
+            "stream" => "postgres",
+            "severity_text" => severity,
+            "body" => "msg-#{i}",
+            "server_role" => "primary",
+          }
+        }
+        expect(parseable_client).to receive(:query).and_return(rows)
+
+        visit "#{project.path}#{pg.path}/logs"
+
+        expect(page).to have_content("invalidZ")
+        expect(page).to have_css("span.text-yellow-600", text: "WARN")
+        expect(page).to have_css("span.text-gray-400", text: "DEBUG")
+        expect(page).to have_css("span.text-gray-400", text: "NONE", count: 2)
+        expect(page).to have_css("span.text-sky-600", text: "INFO")
+        expect(page).to have_no_css("details")
+      end
+
+      it "does not show log destination edit options without edit permission" do
+        AccessControlEntry.dataset.destroy
+        AccessControlEntry.create(project_id: project.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Postgres:view"])
+
+        visit "#{project.path}#{pg.path}/logs"
+        expect(page).to have_content("No log destinations configured.")
+        expect(page).to have_css("td[colspan='3']")
+        expect(page).to have_no_content("Add Log Destination")
+
+        ld = PostgresLogDestination.create(postgres_resource_id: pg.id, name: "graylog", type: "syslog", url: "tcp://logs.example.com:6514")
+        visit "#{project.path}#{pg.path}/logs"
+        expect(page).to have_content("graylog")
+        expect(page).to have_no_css("#ld-delete-#{ld.ubid}")
+      end
+
+      it "redisplays otlp log destination form on validation failure" do
+        visit "#{project.path}#{pg.path}/logs"
+        _csrf = all("input[name='_csrf']", visible: false).last.value
+        page.driver.post "#{project.path}#{pg.path}/log-destination", {
+          name: "nr", type: "otlp", url: "not-a-url",
+          header_keys: ["api-key", ""],
+          header_values: ["secret", "ignored"],
+          _csrf:,
+        }
+        expect(page.status_code).to eq(400)
+        expect(page.body).to include("OTLP Endpoint URL")
+        expect(page.body).to include('value="api-key"')
+        expect(page.body).not_to include('value="ignored"')
+        expect(page.body).not_to include("No logs found")
+        expect(pg.reload.log_destinations).to be_empty
+      end
+
+      it "redisplays syslog log destination form on validation failure" do
+        visit "#{project.path}#{pg.path}/logs"
+        _csrf = all("input[name='_csrf']", visible: false).last.value
+        page.driver.post "#{project.path}#{pg.path}/log-destination", {
+          name: "mezmo", type: "syslog", url: "https://logs.example.com",
+          structured_data_ids: ["honeybadger@61642", "", "honeybadger@61642"],
+          structured_data_keys: ["api_key", "ignored", ""],
+          structured_data_values: ["secret", "ignored", "ignored"],
+          _csrf:,
+        }
+        expect(page.status_code).to eq(400)
+        expect(page.body).to include("Syslog TCP Endpoint")
+        expect(page.body).to include('data-sd-id="honeybadger@61642"')
+        expect(page.body).to include('value="secret"')
+        expect(page.body).not_to include('value="ignored"')
+
+        page.driver.post "#{project.path}#{pg.path}/log-destination", {
+          name: "mezmo", type: "syslog", url: "https://logs.example.com",
+          structured_data_ids: [""],
+          structured_data_keys: [""],
+          structured_data_values: [""],
+          _csrf:,
+        }
+        expect(page.status_code).to eq(400)
+        expect(page.body).to include("Syslog TCP Endpoint")
+        expect(page.body).not_to include('data-sd-id="honeybadger@61642"')
+        expect(pg.reload.log_destinations).to be_empty
+      end
+
+      it "can create an otlp log destination" do
+        visit "#{project.path}#{pg.path}/logs"
+        _csrf = all("input[name='_csrf']", visible: false).last.value
+        page.driver.post "#{project.path}#{pg.path}/log-destination", {
+          name: "nr", type: "otlp", url: "https://otlp.nr-data.net",
+          _csrf:,
+        }
+        expect(page.status_code).to eq(302)
+        ld = pg.reload.log_destinations.first
+        expect(ld.name).to eq "nr"
+        expect(ld.type).to eq "otlp"
+        expect(ld.url).to eq "https://otlp.nr-data.net"
+        expect(ld.options).to be_nil
+      end
+
+      it "can create an otlp log destination with headers, ignoring rows with empty keys" do
+        visit "#{project.path}#{pg.path}/logs"
+        _csrf = all("input[name='_csrf']", visible: false).last.value
+        page.driver.post "#{project.path}#{pg.path}/log-destination", {
+          name: "nr", type: "otlp", url: "https://otlp.nr-data.net",
+          header_keys: ["api-key", ""],
+          header_values: ["secret", "ignored"],
+          _csrf:,
+        }
+        expect(page.status_code).to eq(302)
+        expect(pg.reload.log_destinations.first.options).to eq({"headers" => {"api-key" => "secret"}})
+      end
+
+      it "can create a syslog log destination without structured_data" do
+        visit "#{project.path}#{pg.path}/logs"
+        _csrf = all("input[name='_csrf']", visible: false).last.value
+        page.driver.post "#{project.path}#{pg.path}/log-destination", {
+          name: "mezmo", type: "syslog", url: "tcp://syslog-a.logdna.com:6514",
+          structured_data_ids: [""],
+          structured_data_keys: [""],
+          structured_data_values: [""],
+          _csrf:,
+        }
+        expect(page.status_code).to eq(302)
+        ld = pg.reload.log_destinations.first
+        expect(ld.name).to eq "mezmo"
+        expect(ld.type).to eq "syslog"
+        expect(ld.url).to eq "tcp://syslog-a.logdna.com:6514"
+        expect(ld.options).to be_nil
+      end
+
+      it "can create a syslog log destination with structured_data, ignoring rows with empty sd_id or key" do
+        visit "#{project.path}#{pg.path}/logs"
+        _csrf = all("input[name='_csrf']", visible: false).last.value
+        page.driver.post "#{project.path}#{pg.path}/log-destination", {
+          name: "mezmo", type: "syslog", url: "tcp://logs.example.com:6514",
+          structured_data_ids: ["honeybadger@61642", "honeybadger@61642", "", "honeybadger@61642"],
+          structured_data_keys: ["api_key", "env", "ignored", ""],
+          structured_data_values: ["secret", "prod", "ignored", "ignored"],
+          _csrf:,
+        }
+        expect(page.status_code).to eq(302)
+        expect(pg.reload.log_destinations.first.options).to eq({"structured_data" => {"honeybadger@61642" => {"api_key" => "secret", "env" => "prod"}}})
+      end
+
+      it "can delete log destination" do
+        ld = PostgresLogDestination.create(
+          postgres_resource_id: pg.id,
+          name: "graylog",
+          type: "syslog",
+          url: "tcp://logs.example.com:6514",
+        )
+        visit "#{project.path}#{pg.path}/logs"
+
+        find("#ld-delete-#{ld.ubid} .delete-btn").click
+        expect(page).to have_flash_notice("PostgreSQL log destination deleted.")
+        expect(pg.reload.log_destinations.count).to eq(0)
+      end
+
+      it "shows success notice when log destination was already deleted" do
+        ld = PostgresLogDestination.create(
+          postgres_resource_id: pg.id,
+          name: "graylog",
+          type: "syslog",
+          url: "tcp://logs.example.com:6514",
+        )
+        visit "#{project.path}#{pg.path}/logs"
+        ld.this.update(id: PostgresLogDestination.generate_uuid)
+
+        find("#ld-delete-#{ld.ubid} .delete-btn").click
+        expect(page).to have_flash_notice("PostgreSQL log destination deleted.")
+        expect(pg.reload.log_destinations.count).to eq(1)
+      end
+    end
+
     describe "ca-certificates" do
-      it "sets maintenance window to nil when empty string is passed" do
+      it "does not show link if certificates are not available, and shows error if they are requested" do
+        visit "#{project.path}#{pg.path}/connection"
+        expect(page).to have_no_content "CA Certificates"
+
+        visit "#{project.path}#{pg.path}/ca-certificates"
+        expect(page).to have_flash_error "Certificate authority certificates for this database have not yet been generated"
+
+        pg.update(hostname_version: "v3")
+        expect(Config).to receive(:acme_email).and_return("acme@example.com").at_least(:once)
+        DnsZone.create(project_id: postgres_project.id, name: "pg.ubicloud.app")
+        visit "#{project.path}#{pg.path}/ca-certificates"
+        expect(page).to have_flash_error "This database uses certificates from a public signed certificate authority"
+      end
+
+      it "downloads certificates if available" do
         pg.update(root_cert_1: "a", root_cert_2: "b")
         pg.strand.update(label: "wait")
         visit "#{project.path}#{pg.path}/connection"
@@ -914,6 +1364,7 @@ RSpec.describe Clover, "postgres" do
         select "No Maintenance Window", from: "maintenance_window_start_at"
         click_button "Set"
         expect(pg.reload.maintenance_window_start_at).to be_nil
+        expect(page).to have_flash_notice "Maintenance window is unset"
       end
 
       it "sets maintenance window to 0 when 0 is passed" do
@@ -922,12 +1373,43 @@ RSpec.describe Clover, "postgres" do
 
         select "00:00 - 02:00 (UTC)", from: "maintenance_window_start_at"
         click_button "Set"
+        expect(page).to have_flash_notice "Maintenance window is set"
         expect(pg.reload.maintenance_window_start_at).to eq(0)
+      end
+
+      it "sets maintenance window days" do
+        project.set_ff_postgres_enable_maintenance_window_days(true)
+        visit "#{project.path}#{pg.path}/settings"
+
+        select "09:00 - 11:00 (UTC)", from: "maintenance_window_start_at"
+        check "Monday"
+        check "Wednesday"
+        click_button "Set"
+        expect(page).to have_flash_notice "Maintenance window is set"
+
+        pg.reload
+        expect(pg.maintenance_window_start_at).to eq(9)
+        expect(pg.maintenance_window_day_names).to eq(["mon", "wed"])
+      end
+
+      it "clears maintenance window days when unchecked" do
+        project.set_ff_postgres_enable_maintenance_window_days(true)
+        pg.update(maintenance_window_start_at: 9, maintenance_window_days_bitmask: (1 << 0))
+        visit "#{project.path}#{pg.path}/settings"
+
+        expect(page).to have_checked_field("Monday")
+        uncheck "Monday"
+        click_button "Set"
+        expect(page).to have_flash_notice "Maintenance window is set"
+
+        pg.reload
+        expect(pg.maintenance_window_days_bitmask).to eq(0)
       end
     end
 
     describe "rename" do
       it "can rename PostgreSQL database" do
+        pg.update(hostname_version: "v2")
         old_name = pg.name
         visit "#{project.path}#{pg.path}/settings"
         expect(page).to have_content("Renaming a PostgreSQL database changes the connection info")
@@ -944,7 +1426,19 @@ RSpec.describe Clover, "postgres" do
         expect(page).to have_flash_notice("Name updated")
         expect(pg.reload.name).to eq "new-name"
         expect(page).to have_content("new-name")
-        expect(pg.semaphores_dataset.select_order_map(:name)).to eq %w[refresh_certificates refresh_dns_record]
+        expect(pg.semaphores_dataset.select_order_map(:name)).to eq %w[refresh_certificates refresh_dns_record].freeze
+        expect(pg.representative_server.semaphores_dataset.select_order_map(:name)).to eq %w[configure_logs configure_metrics initial_provisioning].freeze
+      end
+
+      it "does not refresh certificates when renaming PostgreSQL database with hostname version v3" do
+        pg.update(hostname_version: "v3")
+        visit "#{project.path}#{pg.path}/settings"
+        expect(pg.semaphores_dataset.all).to eq []
+        fill_in "name", with: "new-name"
+        click_button "Rename"
+        expect(page).to have_flash_notice("Name updated")
+        expect(pg.reload.name).to eq "new-name"
+        expect(pg.semaphores_dataset.select_map(:name)).to eq %w[refresh_dns_record].freeze
       end
 
       it "does not show rename option without permissions" do
@@ -1113,10 +1607,35 @@ RSpec.describe Clover, "postgres" do
         expect(page).to have_button "Start Upgrade"
       end
 
+      it "shows the maintenance window in the upgrade steps" do
+        pg.strand.update(label: "wait")
+        pg.update(maintenance_window_start_at: 22, maintenance_window_days_bitmask: PostgresResource.maintenance_window_days_mask(["mon", "thu"]))
+        visit "#{project.path}#{pg.path}/upgrade"
+
+        expect(page).to have_content "Wait for the maintenance window"
+        expect(page).to have_content "Mon, Thu, 22:00 - 00:00 (UTC)"
+        expect(page).to have_no_content "Upgrade the read replicas"
+      end
+
+      it "adds a read replica step when the database has read replicas" do
+        pg.strand.update(label: "wait")
+        Prog::Postgres::PostgresResourceNexus.assemble(
+          project_id: project.id,
+          location_id: Location::HETZNER_FSN1_ID,
+          name: "pg-read-replica",
+          target_vm_size: "standard-2",
+          target_storage_size_gib: 128,
+          parent_id: pg.id,
+        )
+        visit "#{project.path}#{pg.path}/upgrade"
+
+        expect(page).to have_content "No maintenance window"
+        expect(page).to have_content "Upgrade the read replicas"
+      end
+
       it "starts the upgrade when user clicks on start upgrade button" do
         old_version_int = pg.version.to_i
         pg.strand.update(label: "wait")
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         visit "#{project.path}#{pg.path}/upgrade"
         click_button "Start Upgrade"
         expect(page).to have_content "Database upgrade is in progress"

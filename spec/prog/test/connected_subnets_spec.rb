@@ -59,8 +59,8 @@ ExecStart=nc -l 8080 -6
       expect(sshable).to receive(:_cmd).with("sudo systemctl daemon-reload")
       expect(sshable).to receive(:_cmd).with("sudo systemctl enable listening_ipv4.service")
       expect(sshable).to receive(:_cmd).with("sudo systemctl enable listening_ipv6.service")
-      expect(connected_subnets_test).to receive(:update_stack).with({"vm_to_be_connected_id" => vm1.id})
       expect { connected_subnets_test.start }.to nap(5)
+      expect(connected_subnets_test.strand.stack[0]["vm_to_be_connected_id"]).to eq vm1.id
     end
 
     it "hops to perform_tests_public_blocked" do
@@ -94,16 +94,16 @@ ExecStart=nc -l 8080 -6
     it "updates firewall rules, updates the stack, and naps" do
       expect(connected_subnets_test).to receive(:ps_multiple).and_return(ps_multiple).at_least(:once)
       expect(connected_subnets_test).to receive(:update_firewall_rules).with(ps_multiple, ps_single, config: :perform_connected_private_ipv4)
-      expect(connected_subnets_test).to receive(:update_stack).with({"firewalls" => "connected_private_ipv4"})
       expect(ps_multiple).to receive(:update_firewall_rules_set?).and_return(true)
       expect { connected_subnets_test.perform_tests_private_ipv4 }.to nap(5)
+      expect(connected_subnets_test.strand.stack[0]["firewalls"]).to eq "connected_private_ipv4"
     end
 
     it "tests connection between the two subnets and hops to perform_tests_private_ipv6" do
       expect(connected_subnets_test).to receive(:frame).and_return({"firewalls" => "connected_private_ipv4"})
       expect(connected_subnets_test).to receive(:ps_multiple).and_return(ps_multiple).at_least(:once)
 
-      vm1 = instance_double(Vm, sshable:, nics: [instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.0/26"))])
+      vm1 = instance_double(Vm, sshable:, user_nic: instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.0/26")))
       vm2 = instance_double(Vm)
       expect(connected_subnets_test).to receive(:vm_to_be_connected).and_return(vm1).at_least(:once)
       expect(connected_subnets_test).to receive(:vm_to_connect).and_return(vm2).at_least(:once)
@@ -111,8 +111,8 @@ ExecStart=nc -l 8080 -6
 
       expect(sshable).to receive(:_cmd).with("sudo systemctl start listening_ipv4.service")
       expect(sshable).to receive(:_cmd).with("sudo systemctl stop listening_ipv6.service")
-      expect(connected_subnets_test).to receive(:test_connection).with(vm1.nics.first.private_ipv4.nth(0).to_s, vm2, should_fail: false, ipv4: true)
-      expect(connected_subnets_test).to receive(:test_connection).with(vm1.nics.first.private_ipv4.nth(0).to_s, vm2, should_fail: true, ipv4: true)
+      expect(connected_subnets_test).to receive(:test_connection).with(vm1.user_nic.private_ipv4.nth(0).to_s, vm2, should_fail: false, ipv4: true)
+      expect(connected_subnets_test).to receive(:test_connection).with(vm1.user_nic.private_ipv4.nth(0).to_s, vm2, should_fail: true, ipv4: true)
 
       expect { connected_subnets_test.perform_tests_private_ipv4 }.to hop("perform_tests_private_ipv6")
     end
@@ -122,14 +122,14 @@ ExecStart=nc -l 8080 -6
     it "updates firewall rules, updates the stack, and naps" do
       expect(connected_subnets_test).to receive(:ps_multiple).and_return(ps_multiple).at_least(:once)
       expect(connected_subnets_test).to receive(:update_firewall_rules).with(ps_multiple, ps_single, config: :perform_connected_private_ipv6)
-      expect(connected_subnets_test).to receive(:update_stack).with({"firewalls" => "connected_private_ipv6"})
       expect(ps_multiple).to receive(:update_firewall_rules_set?).and_return(true)
       expect { connected_subnets_test.perform_tests_private_ipv6 }.to nap(5)
+      expect(connected_subnets_test.strand.stack[0]["firewalls"]).to eq "connected_private_ipv6"
     end
 
     it "tests connection between the two subnets and hops to perform_blocked_private_ipv4" do
       expect(connected_subnets_test).to receive(:frame).and_return({"firewalls" => "connected_private_ipv6"})
-      vm1 = instance_double(Vm, sshable:, nics: [instance_double(Nic, private_ipv6: NetAddr::IPv6Net.parse("2001:db8::/64"))], private_ipv6: NetAddr::IPv6.parse("2001:db8::2"))
+      vm1 = instance_double(Vm, sshable:, user_nic: instance_double(Nic, private_ipv6: NetAddr::IPv6Net.parse("2001:db8::/64")), private_ipv6: NetAddr::IPv6.parse("2001:db8::2"))
       vm2 = instance_double(Vm)
       expect(connected_subnets_test).to receive(:vm_to_be_connected).and_return(vm1).at_least(:once)
       expect(connected_subnets_test).to receive(:vm_to_connect).and_return(vm2).at_least(:once)
@@ -137,8 +137,8 @@ ExecStart=nc -l 8080 -6
 
       expect(sshable).to receive(:_cmd).with("sudo systemctl start listening_ipv6.service")
       expect(sshable).to receive(:_cmd).with("sudo systemctl stop listening_ipv4.service")
-      expect(connected_subnets_test).to receive(:test_connection).with(vm1.nics.first.private_ipv6.nth(2).to_s, vm2, should_fail: false, ipv4: false)
-      expect(connected_subnets_test).to receive(:test_connection).with(vm1.nics.first.private_ipv6.nth(2).to_s, vm2, should_fail: true, ipv4: false)
+      expect(connected_subnets_test).to receive(:test_connection).with(vm1.user_nic.private_ipv6.nth(2).to_s, vm2, should_fail: false, ipv4: false)
+      expect(connected_subnets_test).to receive(:test_connection).with(vm1.user_nic.private_ipv6.nth(2).to_s, vm2, should_fail: true, ipv4: false)
 
       expect { connected_subnets_test.perform_tests_private_ipv6 }.to hop("perform_blocked_private_ipv4")
     end
@@ -148,14 +148,14 @@ ExecStart=nc -l 8080 -6
     it "updates firewall rules, updates the stack, and naps" do
       expect(connected_subnets_test).to receive(:ps_multiple).and_return(ps_multiple).at_least(:once)
       expect(connected_subnets_test).to receive(:update_firewall_rules).with(ps_multiple, ps_multiple, config: :perform_blocked_private_ipv4)
-      expect(connected_subnets_test).to receive(:update_stack).with({"firewalls" => "blocked_private_ipv4"})
       expect(ps_multiple).to receive(:update_firewall_rules_set?).and_return(true)
       expect { connected_subnets_test.perform_blocked_private_ipv4 }.to nap(5)
+      expect(connected_subnets_test.strand.stack[0]["firewalls"]).to eq "blocked_private_ipv4"
     end
 
     it "tests connection between the two subnets and hops to perform_blocked_private_ipv6" do
       expect(connected_subnets_test).to receive(:frame).and_return({"firewalls" => "blocked_private_ipv4"})
-      vm1 = instance_double(Vm, sshable:, nics: [instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.0/26"))])
+      vm1 = instance_double(Vm, sshable:, user_nic: instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.0/26")))
       vm2 = instance_double(Vm)
       expect(connected_subnets_test).to receive(:vm_to_be_connected).and_return(vm1).at_least(:once)
       expect(connected_subnets_test).to receive(:vm_to_connect).and_return(vm2).at_least(:once)
@@ -163,8 +163,8 @@ ExecStart=nc -l 8080 -6
 
       expect(sshable).to receive(:_cmd).with("sudo systemctl start listening_ipv4.service")
       expect(sshable).to receive(:_cmd).with("sudo systemctl stop listening_ipv6.service")
-      expect(connected_subnets_test).to receive(:test_connection).with(vm1.nics.first.private_ipv4.nth(0).to_s, vm2, should_fail: false, ipv4: true)
-      expect(connected_subnets_test).to receive(:test_connection).with(vm1.nics.first.private_ipv4.nth(0).to_s, vm2, should_fail: true, ipv4: true)
+      expect(connected_subnets_test).to receive(:test_connection).with(vm1.user_nic.private_ipv4.nth(0).to_s, vm2, should_fail: false, ipv4: true)
+      expect(connected_subnets_test).to receive(:test_connection).with(vm1.user_nic.private_ipv4.nth(0).to_s, vm2, should_fail: true, ipv4: true)
 
       expect { connected_subnets_test.perform_blocked_private_ipv4 }.to hop("perform_blocked_private_ipv6")
     end
@@ -174,14 +174,14 @@ ExecStart=nc -l 8080 -6
     it "updates firewall rules, updates the stack, and naps" do
       expect(connected_subnets_test).to receive(:ps_multiple).and_return(ps_multiple).at_least(:once)
       expect(connected_subnets_test).to receive(:update_firewall_rules).with(ps_multiple, ps_multiple, config: :perform_blocked_private_ipv6)
-      expect(connected_subnets_test).to receive(:update_stack).with({"firewalls" => "blocked_private_ipv6"})
       expect(ps_multiple).to receive(:update_firewall_rules_set?).and_return(true)
       expect { connected_subnets_test.perform_blocked_private_ipv6 }.to nap(5)
+      expect(connected_subnets_test.strand.stack[0]["firewalls"]).to eq "blocked_private_ipv6"
     end
 
     it "tests connection between the two subnets and hops to perform_tests_public_blocked" do
       expect(connected_subnets_test).to receive(:frame).and_return({"firewalls" => "blocked_private_ipv6"})
-      vm1 = instance_double(Vm, sshable:, nics: [instance_double(Nic, private_ipv6: NetAddr::IPv6Net.parse("2001:db8::/64"))], private_ipv6: NetAddr::IPv6.parse("2001:db8::2"))
+      vm1 = instance_double(Vm, sshable:, user_nic: instance_double(Nic, private_ipv6: NetAddr::IPv6Net.parse("2001:db8::/64")), private_ipv6: NetAddr::IPv6.parse("2001:db8::2"))
       vm2 = instance_double(Vm)
       expect(connected_subnets_test).to receive(:vm_to_be_connected).and_return(vm1).at_least(:once)
       expect(connected_subnets_test).to receive(:vm_to_connect).and_return(vm2).at_least(:once)
@@ -189,8 +189,8 @@ ExecStart=nc -l 8080 -6
 
       expect(sshable).to receive(:_cmd).with("sudo systemctl start listening_ipv6.service")
       expect(sshable).to receive(:_cmd).with("sudo systemctl stop listening_ipv4.service")
-      expect(connected_subnets_test).to receive(:test_connection).with(vm1.nics.first.private_ipv6.nth(2).to_s, vm2, should_fail: false, ipv4: false)
-      expect(connected_subnets_test).to receive(:test_connection).with(vm1.nics.first.private_ipv6.nth(2).to_s, vm2, should_fail: true, ipv4: false)
+      expect(connected_subnets_test).to receive(:test_connection).with(vm1.user_nic.private_ipv6.nth(2).to_s, vm2, should_fail: false, ipv4: false)
+      expect(connected_subnets_test).to receive(:test_connection).with(vm1.user_nic.private_ipv6.nth(2).to_s, vm2, should_fail: true, ipv4: false)
 
       expect { connected_subnets_test.perform_blocked_private_ipv6 }.to hop("finish")
     end

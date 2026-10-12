@@ -1,7 +1,16 @@
-- { name: vm,                        images: ["ubuntu-noble", "ubuntu-jammy", "debian-12", "almalinux-9"] }
+- { name: vm,                        images: ["ubuntu-resolute", "ubuntu-noble", "debian-12", "almalinux-9"] }
+- { name: github_runner_ubuntu_2604, images: ["github-ubuntu-2604"] }
 - { name: github_runner_ubuntu_2404, images: ["github-ubuntu-2404"] }
 - { name: github_runner_ubuntu_2204, images: ["github-ubuntu-2204"] }
 - { name: postgres_standard,         images: ["postgres-ubuntu-2204"] }
+- { name: postgres_ubuntu_2604,      images: ["postgres-ubuntu-2204", "postgres-ubuntu-2604"] }
 - { name: postgres_ha,               images: ["postgres-ubuntu-2204", "ubuntu-jammy"] }
 - { name: postgres_upgrade,          images: ["postgres-ubuntu-2204", "ubuntu-jammy"] }
-- { name: kubernetes,                images: ["kubernetes-v1_34"]}
+- { name: postgres_upgrade16,        images: ["postgres-ubuntu-2204", "ubuntu-jammy"] }
+- { name: postgres_firewall,         images: ["postgres-ubuntu-2204"] }
+- { name: postgres_unarchive,        images: ["postgres-ubuntu-2204"] }
+- { name: kubernetes,                images: ["ubuntu-noble"] }
+- { name: kubernetes_upgrade,        images: ["ubuntu-noble"] }
+- { name: kubernetes_firewall,       images: ["ubuntu-noble"] }
+- { name: machine_image_vm_capture,  images: ["ubuntu-noble"] }
+- { name: move_vm,                   images: ["ubuntu-noble"] }

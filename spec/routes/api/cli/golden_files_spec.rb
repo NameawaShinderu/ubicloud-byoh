@@ -14,7 +14,6 @@ RSpec.describe Clover, "cli" do
     diff_file = "cli-golden-files.diff"
     Dir.mkdir(output_dir) unless File.directory?(output_dir)
 
-    @project.set_ff_postgres_paradedb(true)
     postgres_project = Project.create(name: "postgres")
     expect(Config).to receive(:postgres_service_project_id).and_return(postgres_project.id).at_least(:once)
     expect(Config).to receive(:kubernetes_service_project_id).and_return(postgres_project.id).at_least(:once)
@@ -23,7 +22,7 @@ RSpec.describe Clover, "cli" do
     expect(PrivateSubnet).to receive(:generate_ubid).and_return(UBID.parse("psfzm9e26xky5m9ggetw4dpqe2"))
     expect(Nic).to receive(:generate_ubid).and_return(UBID.parse("nc69z0cda8jt0g5b120hamn4vf"), UBID.parse("nchfcq5bmsae7mc7bm6nx82d2n"))
     expect(Firewall).to receive(:generate_uuid).and_return("24242d92-217b-85fc-b891-7046af3c1150", "f6965763-2e93-8dfc-83fa-abe25e328716")
-    expect(FirewallRule).to receive(:generate_uuid).and_return("51e5bc7d-245b-8df8-bf91-7c5d150cb160", "3b367895-7f18-89f8-a295-ff247e9d5192", "305d838d-a3cd-85f8-aa08-9a66e71a5877", "5aa5b086-37bd-81f8-8d03-dd4b0e09a436", "20c360fa-bc06-8df8-b067-33f4a1ebdbbd", "2b628450-25bd-8df8-8b42-fb5cc5d01ad1", "da42e2ef-b5f1-8df8-966d-1387afb1b2f4", "bc9b093a-0e00-89f8-991a-5e0cd15a7942", "b5e13849-a04f-89f8-b564-ab8ad37298aa", "e46b8b76-88e2-89f8-972b-692232699d16", "e0804078-98cf-85f8-bf74-702ec92c91e8", "d62c8465-7f9b-85f8-a548-5a8772352988", "ff48a299-529c-8df8-993a-ddb0450be4a4", "ce327a30-12cb-8df8-86c3-d2db53a4b837")
+    expect(FirewallRule).to receive(:generate_uuid).and_return("51e5bc7d-245b-8df8-bf91-7c5d150cb160", "3b367895-7f18-89f8-a295-ff247e9d5192", "74d389ba-5d08-85f8-9b78-7bcd36e59380", "87bb24eb-ec67-81f8-9b79-be823efc6b55", "305d838d-a3cd-85f8-aa08-9a66e71a5877", "5aa5b086-37bd-81f8-8d03-dd4b0e09a436", "20c360fa-bc06-8df8-b067-33f4a1ebdbbd", "2b628450-25bd-8df8-8b42-fb5cc5d01ad1", "da42e2ef-b5f1-8df8-966d-1387afb1b2f4", "bc9b093a-0e00-89f8-991a-5e0cd15a7942", "b5e13849-a04f-89f8-b564-ab8ad37298aa", "e46b8b76-88e2-89f8-972b-692232699d16", "e0804078-98cf-85f8-bf74-702ec92c91e8", "b9af944c-6d1f-85f8-952e-534b2c02130f", "0f82609b-d03f-81f8-92f7-b19258f6b9cc", "d62c8465-7f9b-85f8-a548-5a8772352988", "ff48a299-529c-8df8-993a-ddb0450be4a4", "ce327a30-12cb-8df8-86c3-d2db53a4b837", "9c2a0f20-850d-8df8-a67f-46dc6fda3935", "5d4ba3b9-6001-81f8-83a6-6f954b0417f6")
     expect(PostgresResource).to receive(:generate_uuid).and_return("dd0375a6-1c66-82d0-a5e8-af1e8527a8a2")
     expect(PostgresMetricDestination).to receive(:generate_uuid).and_return("45754ea1-c139-8a8d-af18-7b24e0dbc7de")
     SshPublicKey.create_with_id("32092997-2a00-8f33-8129-4c0f18e5153c", project_id: @project.id, name: "spk", public_key: "a a")
@@ -31,7 +30,7 @@ RSpec.describe Clover, "cli" do
     @vm = Vm.first
     @vm.update(display_state: "running")
     add_ipv4_to_vm(@vm, "128.0.0.1")
-    @vm.nics.first.update(private_ipv4: "10.67.141.133/32", private_ipv6: "fda0:d79a:93e7:d4fd:1c2::0/80")
+    @vm.user_nic.update(private_ipv4: "10.67.141.133/32", private_ipv6: "fda0:d79a:93e7:d4fd:1c2::0/80")
     @ps = PrivateSubnet.first
     @ps.update(net4: "172.27.99.128/26", net6: "fdd9:1ea7:125d:5fa4::/64")
     Prog::Vm::Nexus.assemble("some_ssh key", postgres_project.id, private_subnet_id: @ps.id, allow_private_subnet_in_other_project: true)
@@ -40,7 +39,7 @@ RSpec.describe Clover, "cli" do
     gp = GithubRepository.create_with_id("a58006b6-0879-8616-936a-62234e244f2f", installation_id: gi.id, name: "test-installation-name/test-repository-name")
     GithubCacheEntry.create_with_id("967f7e02-68f8-8a0e-9917-fd13d5f33501", repository_id: gp.id, key: "test-key", version: "test-version", scope: "test-scope", size: 10987654321, created_by: gp.id, created_at: now, last_accessed_at: now)
 
-    expect(Config).to receive(:postgres_service_hostname).and_return("pg.example.com").at_least(:once)
+    expect(Config).to receive(:postgres_service_hostname_v3).and_return("pg.example.com").at_least(:once)
     expect(Vm).to receive(:generate_ubid).and_return(UBID.parse("vma9rnygexga6jns6x3yj9a6b2"))
     DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
     expect(PrivateSubnet).to receive(:generate_ubid).and_return(UBID.parse("psnqtahcasrj1hn16kh1ygekmn"))
@@ -51,7 +50,6 @@ RSpec.describe Clover, "cli" do
     pg = PostgresResource.first(name: "test-pg")
     pg.pg_firewall_rules.find { it.ubid == "frpqgkgjd09y4pnjaq2pkeacam" }.update(description: "pg-fw-desc")
     pg.update(user_config: {allow_in_place_tablespaces: "on", max_connections: "1000"}, pgbouncer_user_config: {server_round_robin: "1", disable_pqexec: "1"})
-    pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 64, disk_index: 0)
     backup = Struct.new(:key, :last_modified)
     expect(MinioCluster).to receive(:first).and_return(instance_double(MinioCluster, url: "dummy-url", root_certs: "dummy-certs")).at_least(:once)
     expect(Minio::Client).to receive(:new).and_return(instance_double(Minio::Client, list_objects: [backup.new("basebackups_005/backup_stop_sentinel.json", now - 5 * 60 * 60)])).at_least(:once)
@@ -70,16 +68,16 @@ RSpec.describe Clover, "cli" do
     lb.add_vm(@vm)
 
     expect(KubernetesCluster).to receive(:generate_ubid).and_return(UBID.parse("kcnzrctjjg4j4g6eqvdsvzthwp"))
-    expect(KubernetesNodepool).to receive(:generate_uuid).and_return("2432784b-3c9e-8a75-900d-df23880643ec")
+    expect(KubernetesNodepool).to receive(:generate_uuid).and_return("2432784b-3c9e-8a75-900d-df23880643ec", "0a93e588-f81d-8e75-bc3a-4c5a96c319cc", "59c8ad4f-7150-8a75-a431-d2e0978ab018")
     expect(Firewall).to receive(:generate_uuid).and_return("850f5687-1a76-8dfc-8949-a115826d20e7", "f26fd163-5a81-8dfc-a7f7-0802917b40c2", "0ec68714-d66c-81fc-ab4d-33235e8daea3")
     expect(FirewallRule).to receive(:generate_uuid).and_return("d5889073-4aed-89f8-8894-1c376ebea8f6", "0803b040-d565-81f8-b2ed-f4d28df19f7c", "753678ce-8c3c-8dfc-83ce-00abd4f0f3fe", "45b6f212-bedb-8dfc-b8f2-0bcbe963d5bb", "04dd799d-ef69-8dfc-b58a-1bef3dd69f86", "0acdc686-2462-85fc-9adb-cbd713cb33dd", "b62d8f1b-2c71-89fc-a087-fa4193dcd90b", "4fed0d91-99a9-8dfc-b392-36ad164bd580", "17bd4390-d26e-85fc-a2df-b22a6a0bb697", "32e35994-9dde-89fc-861a-44582c6528be", "ab1ceb1f-faec-81fc-8b4f-a17d15e17da0", "ffbcca2e-550e-81fc-a60d-b39e665c6aeb")
     expect(PrivateSubnet).to receive(:generate_ubid).and_return(UBID.parse("ps788q81w5w26h900k13ad8bkx"))
-    cli(%W[kc eu-central-h1/test-kc create -c 1 -z standard-2 -w 1 -v #{Option.kubernetes_versions.first}])
+    cli(%W[kc eu-central-h1/test-kc create -c 1 -z standard-2 -w 1 -v #{Option.selectable_kubernetes_versions[1]}])
 
-    expect(Vm).to receive(:generate_ubid).and_return(UBID.parse("vmgbbazmznfa0mp49nzh5v0z25"), UBID.parse("vmnwfmjk5k462kkzsfa4n1h4xm"))
-    expect(Nic).to receive(:generate_ubid).and_return(UBID.parse("ncnqx1bbxgra7k8r9k9qwvspwd"), UBID.parse("nc1c3bggqpxt5kqqrdtkym1g03"))
+    expect(Vm).to receive(:generate_ubid).and_return(UBID.parse("vmgbbazmznfa0mp49nzh5v0z25"), UBID.parse("vmnwfmjk5k462kkzsfa4n1h4xm"), UBID.parse("vm83agwbp1j60jwakbbmsxmzbe"))
+    expect(Nic).to receive(:generate_ubid).and_return(UBID.parse("ncnqx1bbxgra7k8r9k9qwvspwd"), UBID.parse("nc1c3bggqpxt5kqqrdtkym1g03"), UBID.parse("ncasemdftr1y2pqrp2qx240tjq"))
     kubernetes_cluster = KubernetesCluster.first
-    vms = ["kc-cp-vm", "kc-np-vm"].map do |vm_name|
+    vms = ["kc-cp-vm", "kc-np-vm", "kc-np-vm-2"].map do |vm_name|
       Prog::Vm::Nexus.assemble_with_sshable(
         Config.kubernetes_service_project_id,
         sshable_unix_user: "ubi",
@@ -96,13 +94,20 @@ RSpec.describe Clover, "cli" do
     PrivateSubnet.first(name: "#{kubernetes_cluster.ubid}-subnet").update(net4: "10.147.206.0/26", net6: "fdab:de77:9a94:fa71::/64")
     vms[0].update(ephemeral_net6: "ccab:de77:9a94:fa69::/64")
     vms[1].update(ephemeral_net6: "bbab:de77:9a94:fa69::/64")
+    vms[2].update(ephemeral_net6: "abab:de77:9a94:fa69::/64")
     add_ipv4_to_vm(vms[0], "129.0.0.2")
     add_ipv4_to_vm(vms[1], "130.0.0.3")
+    add_ipv4_to_vm(vms[2], "131.0.0.4")
     KubernetesNode.create(vm_id: vms[0].id, kubernetes_cluster_id: kubernetes_cluster.id)
     KubernetesNode.create(vm_id: vms[1].id, kubernetes_cluster_id: kubernetes_cluster.id, kubernetes_nodepool_id: KubernetesNodepool.first.id)
-    expect(KubernetesCluster).to receive(:kubeconfig).and_return("example-kubeconfig").at_least(:once)
+    KubernetesNode.create(vm_id: vms[2].id, kubernetes_cluster_id: kubernetes_cluster.id, kubernetes_nodepool_id: KubernetesNodepool.first.id)
+    KubernetesNodepool.first.update(node_count: 2, version: Option.kubernetes_versions[2])
+    kubernetes_cluster.update(kubeconfig: "example-kubeconfig")
+    Prog::Kubernetes::KubernetesNodepoolNexus.assemble(name: "test-kc-np2", node_count: 1, kubernetes_cluster_id: kubernetes_cluster.id)
+    kubernetes_cluster.strand.update(label: "wait")
+    Strand.where(id: KubernetesNodepool.select(:id)).update(label: "wait")
 
-    ie_lb = LoadBalancer.create_with_id("5294a529-4a52-942b-5294-a5294a5294a5", private_subnet_id: @ps.id, name: "ie-lb", health_check_endpoint: "/up", project_id: postgres_project.id)
+    ie_lb = LoadBalancer.create_with_id("5294a529-4a52-942b-5294-a5294a5294a5", private_subnet_id: @ps.id, name: "ie-lb", health_check_endpoint: "/up", project_id: postgres_project.id, hostname_version: 2)
     InferenceEndpoint.create(
       name: "test-model", model_name: "test-model", project_id: postgres_project.id,
       is_public: true, visible: true, load_balancer_id: ie_lb.id,
@@ -151,7 +156,7 @@ RSpec.describe Clover, "cli" do
     cli_commands.concat File.readlines("spec/routes/api/cli/golden-file-commands/confirm.txt").map { [it, {confirm_prompt: "Confirmation"}] }
     Dir["spec/routes/api/cli/golden-file-commands/execute/*.txt"].each do |f|
       cmd = File.basename(f).delete_suffix(".txt")
-      cli_commands.concat File.readlines(f).map { [it, {command_execute: cmd}] }
+      cli_commands.concat File.readlines(f).map { [it, {command_execute: cmd, ubi_version: "1.1.0"}] }
     end
 
     cli_commands_hash = {}
@@ -164,7 +169,8 @@ RSpec.describe Clover, "cli" do
 
       cli_commands_hash[lowercase_cmd] = cmd
       body = DB.transaction(savepoint: true, rollback: :always) do
-        cli(cmd.shellsplit, **kws)
+        args = cmd.shellsplit
+        cli(args, ubi_version: args.include?("help") ? "1.1.0" : "1.0.0", **kws)
       end
       File.write(File.join(output_dir, "#{cmd.tr("/", "_")}.txt"), body)
     end

@@ -27,6 +27,9 @@ secret_name = service_account_name
 init_config = {
   "apiVersion" => "kubeadm.k8s.io/v1beta4",
   "kind" => "InitConfiguration",
+  "timeouts" => {
+    "kubernetesAPICall" => "5m0s",
+  },
   "nodeRegistration" => {
     "name" => node_name,
     "kubeletExtraArgs" => [
@@ -75,6 +78,9 @@ kubelet_config = {
   "apiVersion" => "kubelet.config.k8s.io/v1beta1",
   "kind" => "KubeletConfiguration",
   "serverTLSBootstrap" => true,
+  "imageGCHighThresholdPercent" => 60,
+  "imageGCLowThresholdPercent" => 50,
+  "imageMaximumGCAge" => "168h",
 }
 
 config_path = "/tmp/kubeadm-config.yaml"
@@ -86,34 +92,20 @@ File.open(config_path, "w") do |file|
   file.write(kubelet_config.to_yaml)
 end
 
-r("sudo kubeadm init --config #{config_path} --node-name #{node_name}")
+puts r("sudo", "kubeadm", "init", "--config", config_path, "--node-name", node_name)
 r("sudo /home/ubi/kubernetes/bin/setup-cni")
 
-api_server_up = false
-5.times do
-  r("kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/healthz'")
-  api_server_up = true
-  break
-rescue CommandFail
-  puts "API server is not up yet, retrying in 5 seconds..."
-  sleep 5
-end
+kubectl = ["kubectl", "--kubeconfig", "/etc/kubernetes/admin.conf", "--server", "https://#{node_ipv4}:6443"]
 
-unless api_server_up
-  puts "API server is not healthy. Could not create customer credentials."
-  exit 1
-end
-
-r "kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system create serviceaccount #{service_account_name}"
-r "kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system create clusterrolebinding #{service_account_name}-binding --clusterrole=cluster-admin --serviceaccount=kube-system:#{service_account_name}"
-r "kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: #{secret_name}
-  namespace: kube-system
-  annotations:
-    kubernetes.io/service-account.name: #{service_account_name}
-type: kubernetes.io/service-account-token
-EOF
-"
+r(*kubectl, "-n", "kube-system", "create", "serviceaccount", service_account_name)
+r(*kubectl, "-n", "kube-system", "create", "clusterrolebinding", "#{service_account_name}-binding", "--clusterrole=cluster-admin", "--serviceaccount=kube-system:#{service_account_name}")
+r(*kubectl, "apply", "-f", "-", stdin: <<~YAML)
+  apiVersion: v1
+  kind: Secret
+  metadata:
+    name: #{secret_name}
+    namespace: kube-system
+    annotations:
+      kubernetes.io/service-account.name: #{service_account_name}
+  type: kubernetes.io/service-account-token
+YAML

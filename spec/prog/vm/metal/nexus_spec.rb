@@ -51,6 +51,28 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       state: "active")
   }
 
+  def create_load_balancer
+    lb = LoadBalancer.create(name: "test-lb", private_subnet_id: private_subnet.id, project_id: project.id, health_check_endpoint: "/up")
+    LoadBalancerVm.create(load_balancer_id: lb.id, vm_id: vm.id)
+    lb
+  end
+
+  def create_stale_kek_volume(disk_index: 0)
+    sd = StorageDevice.create(name: "nvme#{disk_index}", total_storage_gib: 100, available_storage_gib: 50)
+    kek = StorageKeyEncryptionKey.create(
+      algorithm: "aes-256-gcm", key: "k", init_vector: "iv", auth_data: "ad",
+      created_at: Time.now - (800 * 24 * 60 * 60), # past the 700-day rotation interval
+    )
+    VmStorageVolume.create(vm_id: vm.id, boot: disk_index == 0, size_gib: 20, disk_index:,
+      storage_device_id: sd.id, key_encryption_key_1_id: kek.id)
+  end
+
+  def create_rotate_kek_strand(volume, finished: false)
+    strand = Prog::Storage::RotateKek.assemble(volume.id, parent_id: st.id)
+    strand.update(exitval: Sequel.pg_jsonb_wrap({"msg" => "rotated"}), lease: Time.now - 60) if finished
+    strand
+  end
+
   describe ".assemble" do
     it "fails if there is no project" do
       expect {
@@ -94,20 +116,183 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(st.stack.first["storage_volumes"].first["size_gib"]).to eq(40)
     end
 
-    it "sets machine_image_version_id if provided" do
-      miv = create_machine_image_version_metal
-      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, storage_volumes: [{size_gib: 20}, {size_gib: 10, read_only: true, image: "model"}], machine_image_version_id: miv.id)
+    it "sets track_written for a single writeable volume" do
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, storage_volumes: [{size_gib: 20}])
+      expect(st.stack.first["storage_volumes"].first["track_written"]).to be(true)
+    end
+
+    it "sets track_written on every writeable volume when there are multiple" do
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, storage_volumes: [{size_gib: 20}, {size_gib: 10}])
+      expect(st.stack.first["storage_volumes"].map { it["track_written"] }).to eq([true, true])
+    end
+
+    it "does not set track_written for a read-only volume" do
+      create_machine_image_version_metal(project_id: project.id)
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "test-mi@v1",
+        storage_volumes: [{size_gib: 20}, {size_gib: 10, read_only: true}])
+      _, rov = st.stack.first["storage_volumes"]
+      expect(rov["read_only"]).to be(true)
+      expect(rov["track_written"]).to be(false)
+    end
+
+    it "preserves an explicitly-provided track_written value" do
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, storage_volumes: [{size_gib: 20, track_written: false}])
+      expect(st.stack.first["storage_volumes"].first["track_written"]).to be(false)
+    end
+
+    it "sets hypervisor_id from ch_version" do
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, ch_version: "53.0")
+      expect(st.subject.hypervisor).to eq Hypervisor.first(name: "ch", version: "53.0")
+    end
+
+    it "leaves hypervisor_id unset if ch_version is not given" do
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id)
+      expect(st.subject.hypervisor).to be_nil
+    end
+
+    it "leaves hypervisor_id unset if ch_version has no matching Hypervisor row" do
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, ch_version: "0.1")
+      expect(st.subject.hypervisor).to be_nil
+    end
+
+    it "supports remote_storage_server_id argument, but only if metal vm" do
+      vm = create_archive_ready_vm
+      source_volume = VmStorageVolume.first(vm_id: vm.id)
+      rss = RemoteStorageServer.create(
+        source_vm_storage_volume_id: source_volume.id, vm_host_id: vm.vm_host_id,
+        psk: "supersecretpsk", psk_identity: "ubiblk-rss", port: 5500,
+      )
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, remote_storage_server_id: rss.id)
+      expect(st.stack.first["storage_volumes"].first["remote_storage_server_id"]).to eq rss.id
+
+      vm.location.update(provider: "aws")
+      expect do
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, remote_storage_server_id: rss.id)
+      end.to raise_error(RuntimeError, "Booting from a remote storage server is only supported for metal locations")
+    end
+
+    it "sets machine_image_version_id on boot volume when boot_image is name@version" do
+      miv = create_machine_image_version_metal(project_id: project.id).machine_image_version
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "test-mi@v1", storage_volumes: [{size_gib: 20}, {size_gib: 10, read_only: true}])
       vols = st.stack.first["storage_volumes"]
       expect(vols[0]["machine_image_version_id"]).to eq(miv.id)
       expect(vols[1]).not_to have_key("machine_image_version_id")
     end
 
-    it "fails if MachineImageVersionMetal with given machine_image_version_id does not exist" do
+    it "uses a machine image version supplied by the caller without looking it up by name" do
       miv = create_machine_image_version_metal.machine_image_version
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "ubuntu-noble", storage_volumes: [{size_gib: 20, machine_image_version_id: miv.id}])
+      expect(st.stack.first["storage_volumes"].first["machine_image_version_id"]).to eq(miv.id)
+    end
+
+    it "fails if machine image name does not exist in project/location" do
+      expect {
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "missing-mi@v1")
+      }.to raise_error(Validation::ValidationFailed) { |e|
+        expect(e.details[:machine_image]).to eq("Machine image with name \"missing-mi\" does not exist in the specified project and any of the following locations: eu-central-h1, eu-north-h1")
+      }
+    end
+
+    it "fails if machine image has no latest version for boot_image name@latest" do
+      create_machine_image_version_metal(project_id: project.id)
+      expect {
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "test-mi@latest")
+      }.to raise_error(Validation::ValidationFailed) { |e| expect(e.details[:machine_image]).to eq('Version "latest" does not exist for machine image "test-mi"') }
+    end
+
+    it "fails if machine image version has no metal record" do
+      miv = create_machine_image_version_metal(project_id: project.id).machine_image_version
       miv.metal.destroy
       expect {
-        Prog::Vm::Nexus.assemble("some_ssh key", project.id, machine_image_version_id: miv.id)
-      }.to raise_error RuntimeError, "No existing machine image version metal"
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "test-mi@v1")
+      }.to raise_error(Validation::ValidationFailed) { |e| expect(e.details[:machine_image]).to eq('Machine image version "v1" does not have an active metal version') }
+    end
+
+    it "fails if machine image version metal is destroying" do
+      miv = create_machine_image_version_metal(project_id: project.id)
+      miv.update(status: "destroying")
+      expect {
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "test-mi@v1")
+      }.to raise_error(Validation::ValidationFailed) { |e| expect(e.details[:machine_image]).to eq('Machine image version "v1" does not have an active metal version') }
+    end
+
+    it "fails if machine image version size exceeds VM boot disk size" do
+      miv = create_machine_image_version_metal(project_id: project.id).machine_image_version
+      miv.update(actual_size_mib: 21 * 1024)
+      expect {
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "test-mi@v1", storage_volumes: [{size_gib: 20}])
+      }.to raise_error(Validation::ValidationFailed) { |e| expect(e.details[:storage_size]).to eq('Machine image "test-mi@v1" requires at least 21 GiB of storage') }
+    end
+
+    it "fails if machine image version size exceeds the selected boot disk size for non-default boot_disk_index" do
+      miv = create_machine_image_version_metal(project_id: project.id).machine_image_version
+      miv.update(actual_size_mib: 21 * 1024)
+      expect {
+        Prog::Vm::Nexus.assemble(
+          "some_ssh key",
+          project.id,
+          boot_image: "test-mi@v1",
+          storage_volumes: [{size_gib: 30}, {size_gib: 20}],
+          boot_disk_index: 1,
+        )
+      }.to raise_error(Validation::ValidationFailed) { |e| expect(e.details[:storage_size]).to eq('Machine image "test-mi@v1" requires at least 21 GiB of storage') }
+    end
+
+    it "uses a machine image in hetzner-hel1 if it doesn't exist in hetzner-fsn1" do
+      miv = create_machine_image_version_metal(project_id: project.id, location_id: Location::HETZNER_HEL1_ID, name: "some-mi-name", version: "20200202").machine_image_version
+      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "some-mi-name@20200202", location_id: Location::HETZNER_FSN1_ID).subject
+      expect(vm.vm_storage_volumes.first.machine_image_version_id).to eq(miv.id)
+    end
+
+    it "uses a machine image in hetzner-fsn1 if it doesn't exist in hetzner-hel1" do
+      miv = create_machine_image_version_metal(project_id: project.id, location_id: Location::HETZNER_FSN1_ID, name: "some-mi-name", version: "20200202").machine_image_version
+      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "some-mi-name@20200202", location_id: Location::HETZNER_HEL1_ID).subject
+      expect(vm.vm_storage_volumes.first.machine_image_version_id).to eq(miv.id)
+    end
+
+    it "uses the primary machine image location if it exists in both primary and fallback locations" do
+      miv_primary = create_machine_image_version_metal(project_id: project.id, location_id: Location::HETZNER_FSN1_ID, name: "some-mi-name", version: "20200202").machine_image_version
+      create_machine_image_version_metal(project_id: project.id, location_id: Location::HETZNER_HEL1_ID, name: "some-mi-name", version: "20200202").machine_image_version
+      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "some-mi-name@20200202", location_id: Location::HETZNER_FSN1_ID).subject
+      expect(vm.vm_storage_volumes.first.machine_image_version_id).to eq(miv_primary.id)
+    end
+
+    it "uses a machine image if a base boot image is requested and boot_image@latest exists in the machine images service project" do
+      mi_project = Project.create(name: "machine-images-service-project")
+      expect(Config).to receive(:machine_images_service_project_id).at_least(:once).and_return(mi_project.id)
+      miv = create_machine_image_version_metal(project_id: mi_project.id, location_id: Location::HETZNER_FSN1_ID, name: "ubuntu-jammy", set_latest_version: true).machine_image_version
+      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "ubuntu-jammy", location_id: Location::HETZNER_FSN1_ID).subject
+      expect(vm.vm_storage_volumes.first.machine_image_version_id).to eq(miv.id)
+    end
+
+    it "falls back to using boot_image as a BootImage name if machine image lookup fails" do
+      mi_project = Project.create(name: "machine-images-service-project")
+      expect(Config).to receive(:machine_images_service_project_id).at_least(:once).and_return(mi_project.id)
+      emit_args = []
+      expect(Clog).to receive(:emit).at_least(:once).and_wrap_original do |m, *args|
+        emit_args << args.map(&:dup)
+        m.call(*args)
+      end
+      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "ubuntu-jammy", location_id: Location::HETZNER_FSN1_ID).subject
+      expect(vm.vm_storage_volumes.first.machine_image_version_id).to be_nil
+      expect(vm.boot_image).to eq("ubuntu-jammy")
+      expect(emit_args).to include([
+        "No suitable machine image version found for boot image, falling back to using boot image as BootImage name",
+        {
+          base_machine_image_version_not_found: {
+            boot_image: "ubuntu-jammy",
+            location_id: Location::HETZNER_FSN1_ID,
+            error: {machine_image: "Machine image with name \"ubuntu-jammy\" does not exist in the specified project and any of the following locations: eu-central-h1, eu-north-h1"},
+          },
+        },
+      ])
+    end
+
+    it "falls back to using boot_image as a BootImage name if machine images service project is not configured" do
+      expect(Config).to receive(:machine_images_service_project_id).at_least(:once).and_return(nil)
+      vm = Prog::Vm::Nexus.assemble("some_ssh key", project.id, boot_image: "ubuntu-jammy", location_id: Location::HETZNER_FSN1_ID).subject
+      expect(vm.vm_storage_volumes.first.machine_image_version_id).to be_nil
+      expect(vm.boot_image).to eq("ubuntu-jammy")
     end
 
     it "fails if given nic_id is not valid" do
@@ -167,11 +352,6 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(st.stack.first["gpu_count"]).to eq(2)
     end
 
-    it "requests at least a single gpu for standard-gpu-6" do
-      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, size: "standard-gpu-6")
-      expect(st.stack.first["gpu_count"]).to eq(1)
-    end
-
     it "requests no gpus by default" do
       st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, size: "standard-2")
       expect(st.stack.first["gpu_count"]).to eq(0)
@@ -202,10 +382,69 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
   end
 
+  describe ".lookup_machine_image_version" do
+    let(:project_id) { Project.create(name: "test").id }
+    let(:miv) { create_machine_image_version_metal(project_id:, location_id: Location::HETZNER_FSN1_ID, name: "ubuntu-jammy", set_latest_version: true).machine_image_version }
+
+    it "looks up the machine image version for the VM's location and image" do
+      miv
+      expect(Prog::Vm::Nexus.lookup_machine_image_version(project_id, Location::HETZNER_FSN1_ID, "ubuntu-jammy", "latest", 10, false)).to eq(miv)
+      expect(Prog::Vm::Nexus.lookup_machine_image_version(project_id, Location::HETZNER_FSN1_ID, "ubuntu-jammy", "latest", 10, true)).to eq(miv)
+    end
+
+    it "returns nil if is_base_boot_image and the machine image exists but no version is found" do
+      MachineImage.create(project_id:, location_id: Location::HETZNER_FSN1_ID, name: "ubuntu-noble", arch: "x64")
+      expect(Clog).to receive(:emit).with("No suitable machine image version found for boot image, falling back to using boot image as BootImage name", {
+        base_machine_image_version_not_found: {
+          boot_image: "ubuntu-noble",
+          location_id: Location::HETZNER_FSN1_ID,
+          error: {machine_image: "Version \"latest\" does not exist for machine image \"ubuntu-noble\""},
+        },
+      }).and_call_original
+      expect(Prog::Vm::Nexus.lookup_machine_image_version(project_id, Location::HETZNER_FSN1_ID, "ubuntu-noble", "latest", 10, true)).to be_nil
+    end
+
+    it "returns nil if is_base_boot_image and the requested version is destroying" do
+      miv.metal.update(status: "destroying")
+      expect(Clog).to receive(:emit).with("No suitable machine image version found for boot image, falling back to using boot image as BootImage name", {
+        base_machine_image_version_not_found: {
+          boot_image: "ubuntu-jammy",
+          location_id: Location::HETZNER_FSN1_ID,
+          error: {machine_image: "Machine image version \"latest\" does not have an active metal version"},
+        },
+      }).and_call_original
+      expect(Prog::Vm::Nexus.lookup_machine_image_version(project_id, Location::HETZNER_FSN1_ID, "ubuntu-jammy", "latest", 10, true)).to be_nil
+    end
+
+    it "returns nil if is_base_boot_image and the requested version is still being created" do
+      miv.metal.update(status: "creating", archive_size_mib: nil)
+      expect(Clog).to receive(:emit).with("No suitable machine image version found for boot image, falling back to using boot image as BootImage name", {
+        base_machine_image_version_not_found: {
+          boot_image: "ubuntu-jammy",
+          location_id: Location::HETZNER_FSN1_ID,
+          error: {machine_image: "Machine image version \"latest\" does not have an active metal version"},
+        },
+      }).and_call_original
+      expect(Prog::Vm::Nexus.lookup_machine_image_version(project_id, Location::HETZNER_FSN1_ID, "ubuntu-jammy", "latest", 10, true)).to be_nil
+    end
+
+    it "returns nil if is_base_boot_image and the requested version is too large" do
+      miv.update(actual_size_mib: 20 * 1024)
+      expect(Clog).to receive(:emit).with("No suitable machine image version found for boot image, falling back to using boot image as BootImage name", {
+        base_machine_image_version_not_found: {
+          boot_image: "ubuntu-jammy",
+          location_id: Location::HETZNER_FSN1_ID,
+          error: {storage_size: "Machine image \"ubuntu-jammy@latest\" requires at least 20 GiB of storage"},
+        },
+      }).and_call_original
+      expect(Prog::Vm::Nexus.lookup_machine_image_version(project_id, Location::HETZNER_FSN1_ID, "ubuntu-jammy", "latest", 10, true)).to be_nil
+    end
+  end
+
   describe "#create_unix_user" do
     it "runs adduser" do
       expect(nx).to receive(:rand).and_return(1111)
-      expect(sshable).to receive(:_cmd).with(<<~COMMAND)
+      expect(sshable).to receive(:_cmd).with(<<~COMMAND, log: :on_error)
         set -ueo pipefail
         if id #{nx.vm_name} &>/dev/null; then
           procs=$(ps -u #{nx.vm_name} -o pid,comm,args --no-headers) || [ $? -eq 1 ]
@@ -228,9 +467,11 @@ RSpec.describe Prog::Vm::Metal::Nexus do
   end
 
   describe "#prep" do
-    it "hops to clean_prep if prep command succeeds" do
+    it "hops to wait_sshable if prep command succeeds" do
       expect(sshable).to receive(:_cmd).with("common/bin/daemonizer --check prep_#{nx.vm_name}").and_return("Succeeded")
-      expect { nx.prep }.to hop("clean_prep")
+      expect { nx.prep }.to hop("wait_sshable")
+        .and change { vm.clean_prep_set?(cached: false) }.from(false).to(true)
+      expect(Strand.where(prog: "LearnHypervisor").count).to eq(1)
     end
 
     [
@@ -253,7 +494,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         vm.local_vetho_ip = NetAddr::IPv4Net.parse("169.254.0.0/32")
         private_subnet.update(net4: NetAddr::IPv4Net.parse("10.0.0.0/26"))
         nic.update(vm_id: vm.id, private_ipv6: "fd10:9b0b:6b4b:8fbb::/64", private_ipv4: "10.0.0.3/32", mac: "5a:0f:75:80:c3:64")
-        expect(vm.nic.private_subnet).to receive(:random_private_ipv6).and_return("fd10:9b0b:6b4b:8fbb::/64")
+        expect(vm.user_nic.private_subnet).to receive(:random_private_ipv6).and_return("fd10:9b0b:6b4b:8fbb::/64")
         PciDevice.create(vm_id: vm.id, vm_host_id: vm_host.id, slot: "01:00.0", device_class: "dc", vendor: "vd", device: "dv", numa_node: 0, iommu_group: 23)
         expect(vm).to receive(:cloud_hypervisor_cpu_topology).and_return(Vm::CloudHypervisorCpuTopo.new(2, 1, 1, 1))
 
@@ -261,7 +502,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         project.set_ff_ipv6_disabled(true)
 
         expect(sshable).to receive(:_cmd).with("common/bin/daemonizer --check prep_#{nx.vm_name}").and_return("NotStarted")
-        expect(sshable).to receive(:_cmd).with(/sudo -u vm[0-9a-z]+ tee/, stdin: String) do |**kwargs|
+        expect(sshable).to receive(:_cmd).with(/sudo -u vm[0-9a-z]+ tee/, stdin: String, log: :on_error) do |**kwargs|
           require "json"
           params = JSON(kwargs.fetch(:stdin))
           expect(params).to include(
@@ -282,7 +523,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
             **frame_update,
           )
         end
-        expect(sshable).to receive(:_cmd).with("common/bin/daemonizer sudo\\ host/bin/setup-vm\\ prep\\ vm4hjdwr prep_vm4hjdwr", {stdin: /{"storage":{"vm.*_0":{"key":"key","init_vector":"iv","algorithm":"aes-256-gcm","auth_data":"somedata"}}}/})
+        expect(sshable).to receive(:_cmd).with("common/bin/daemonizer sudo\\ host/bin/setup-vm\\ prep\\ vm4hjdwr prep_vm4hjdwr", {stdin: /{"storage":{"vm.*_0":{"key":"key","init_vector":"iv","algorithm":"aes-256-gcm","auth_data":"somedata"}}}/, log: :on_error})
 
         expect { nx.prep }.to nap(1)
       end
@@ -294,13 +535,6 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
   end
 
-  describe "#clean_prep" do
-    it "cleans and hops" do
-      expect(sshable).to receive(:_cmd).with(/common\/bin\/daemonizer --clean prep_/)
-      expect { nx.clean_prep }.to hop("wait_sshable")
-    end
-  end
-
   describe "#start" do
     let(:storage_volumes) {
       [{
@@ -309,9 +543,28 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         "boot" => true,
       }]
     }
+    let(:service_project) { Project.create(name: "machine-images") }
 
     before do
       st.stack = [{"storage_volumes" => storage_volumes}]
+      allow(Config).to receive(:machine_images_service_project_id).and_return(service_project.id)
+    end
+
+    def make_allocatable_host(**args)
+      args = {total_cpus: 96, total_cores: 48, used_cores: 2, total_hugepages_1g: 375, used_hugepages_1g: 16, location_id: Location::HETZNER_FSN1_ID, arch: "x64", family: "standard"}.merge(args)
+      vmh = create_vm_host(**args)
+      BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+      StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+      create_vhost_block_backend(vm_host_id: vmh.id, version: "v0.4.1", allocation_weight: 100)
+      vmh
+    end
+
+    def provision_boot_volume(metal: nil)
+      make_allocatable_host
+      volume = {size_gib: 11, boot: true, use_bdev_ubi: false, encrypted: false, vring_workers: 1}
+      volume[:machine_image_version_id] = metal.id if metal
+      vm.create_storage_volumes([volume])
+      st.stack = [{"storage_volumes" => [volume].map { it.transform_keys(&:to_s) }}]
     end
 
     it "creates a page if no capacity left and naps" do
@@ -320,14 +573,15 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(vm.waiting_for_capacity_set?).to be(false)
       expect { nx.start }.to nap(5)
       expect(vm.reload.waiting_for_capacity_set?).to be(true)
-      expect(Page.count).to eq(1)
-      expect(Page.from_tag_parts("NoCapacity", Location[vm.location_id].display_name, vm.arch, vm.family)).not_to be_nil
+      expect(Page.active.count).to eq(1)
+      page = Page.from_tag_parts("NoCapacity", Location[vm.location_id].display_name, vm.arch, vm.family)
+      expect(page.resource_id).to be_nil
 
       # Second run does not generate another page
       vm.created_at = Time.now - 11 * 60
       expect(nx).not_to receive(:incr_waiting_for_capacity)
       expect { nx.start }.to nap(5)
-      expect(Page.count).to eq(1)
+      expect(Page.active.count).to eq(1)
     end
 
     it "lists the free capacity of every candidate host in the page" do
@@ -336,6 +590,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       StorageDevice.create(vm_host_id: vm_host.id, name: "stor2", available_storage_gib: 12, total_storage_gib: 50)
       StorageDevice.create(vm_host_id: vm_host.id, name: "stor3", available_storage_gib: 99, total_storage_gib: 99, enabled: false)
       address = Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vm_host.id)
+      address.populate_ipv4_addresses
       AssignedVmAddress.create(dst_vm_id: vm.id, ip: "1.1.1.1", address_id: address.id)
       # Excluded: other location, other arch, not accepting, other family
       create_vm_host(location_id: Location::HETZNER_HEL1_ID)
@@ -364,6 +619,19 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect { nx.start }.to nap(5)
 
       expect(Page.first.details["hosts"].map { it["host"] }).to eq([roomy.ubid, vm_host.ubid])
+    end
+
+    it "applies the data center and OS filters of the allocation to the page" do
+      expect(Scheduling::Allocator).to receive(:allocate).and_raise(Scheduling::Allocator::NoSpaceLeft.new("no space left on any eligible host"))
+      vm_host.update(os_version: "ubuntu-24.04", data_center: "dc-ok")
+      create_vm_host(os_version: "ubuntu-24.04", data_center: "dc-excluded")
+      create_vm_host(os_version: "ubuntu-22.04", data_center: "dc-ok")
+      st.stack = [{"storage_volumes" => storage_volumes, "exclude_data_centers" => ["dc-excluded"], "ch_version" => "53.0"}]
+
+      vm.created_at = Time.now - 11 * 60
+      expect { nx.start }.to nap(5)
+
+      expect(Page.first.details["hosts"].map { it["host"] }).to eq([vm_host.ubid])
     end
 
     it "lists only the forced host in the page, even when it is not accepting" do
@@ -400,9 +668,9 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         .and_raise(Scheduling::Allocator::CounterDrift.new("failed to allocate cpus on #{drifted.ubid}", drifted.id))
 
       vm.created_at = Time.now - 11 * 60
-      expect(nx).not_to receive(:update_stack)
       expect { nx.start }.to nap(5)
 
+      expect(nx.exclude_host_ids).to eq([excluded.id])
       expect(vm.reload.waiting_for_capacity_set?).to be(true)
       expect(Page.first.details["hosts"].map { it["host"] }).to contain_exactly(vm_host.ubid, drifted.ubid)
     end
@@ -412,7 +680,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
 
       vm.created_at = Time.now + 10
       expect { nx.start }.to nap(30)
-      expect(Page.count).to eq(0)
+      expect(Page.active.count).to eq(0)
     end
 
     it "waits 1 hour before creating a page for github-runners" do
@@ -457,27 +725,36 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       vm.created_at = Time.now - 11 * 60
       expect(Scheduling::Allocator).to receive(:allocate).and_raise(Scheduling::Allocator::NoSpaceLeft.new("no space left on any eligible host"))
       expect { nx.start }.to nap(5)
-      expect(Page.count).to eq(1)
+      expect(Page.active.count).to eq(1)
 
       # Second run is able to allocate, but there are still vms in the queue, so we don't resolve the page
       expect(Scheduling::Allocator).to receive(:allocate)
       expect { nx.start }.to hop("create_unix_user")
-        .and change { vm.reload.waiting_for_capacity_set? }.from(true).to(false)
-      expect(Page.count).to eq(1)
-      expect(Page.first.resolve_set?).to be false
+        .and change { vm.waiting_for_capacity_set?(cached: false) }.from(true).to(false)
+      expect(Page.active.count).to eq(1)
+      expect(Page.active.first.resolve_set?).to be false
 
       # Third run is able to allocate and there are no vms left in the queue, but it's not 15 minutes yet, so we don't resolve the page
       expect(Scheduling::Allocator).to receive(:allocate)
       expect { nx.start }.to hop("create_unix_user")
-      expect(Page.count).to eq(1)
-      expect(Page.first.resolve_set?).to be false
+      expect(Page.active.count).to eq(1)
+      expect(Page.active.first.resolve_set?).to be false
 
       # Fourth run is able to allocate and there are no vms left in the queue after 15 minutes, so we resolve the page
-      Page.first.update(created_at: Time.now - 16 * 60)
+      Page.active.first.update(created_at: Time.now - 16 * 60)
       expect(Scheduling::Allocator).to receive(:allocate)
       expect { nx.start }.to hop("create_unix_user")
-      expect(Page.count).to eq(1)
-      expect(Page.first.resolve_set?).to be true
+      expect(Page.active.count).to eq(1)
+      expect(Page.active.first.resolve_set?).to be true
+    end
+
+    it "schedules the allocation waiting strand when the vm is allocated" do
+      waiting_strand = Strand.create(prog: "Test", label: "start", schedule: Time.now + 10000)
+      st.stack = [{"storage_volumes" => storage_volumes, "allocated_waiting_strand_id" => waiting_strand.id}]
+      expect(Scheduling::Allocator).to receive(:allocate)
+
+      expect { nx.start }.to hop("create_unix_user")
+      expect(waiting_strand.reload.schedule).to be_within(10).of(Time.now)
     end
 
     it "re-raises exceptions other than lack of capacity" do
@@ -499,9 +776,57 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
+    end
+
+    it "requires an ubuntu-24.04 host when allocating a vm with a pinned CloudHypervisor version" do
+      st.stack = [{
+        "ch_version" => "53.0",
+        "storage_volumes" => storage_volumes,
+      }]
+
+      expect(Scheduling::Allocator).to receive(:allocate).with(
+        vm, storage_volumes,
+        allocation_state_filter: ["accepting"],
+        distinct_storage_devices: false,
+        host_filter: [],
+        host_exclusion_filter: [],
+        data_center_exclusion_filter: [],
+        location_filter: [Location::HETZNER_FSN1_ID],
+        location_preference: [],
+        gpu_count: 0,
+        gpu_device: nil,
+        os_filter: "ubuntu-24.04",
+        family_filter: ["standard"],
+      )
+      expect { nx.start }.to hop("create_unix_user")
+    end
+
+    it "registers the wait deadline with page: false for a customer machine image vm" do
+      metal = create_machine_image_version_metal
+      expect(metal.machine_image_version.machine_image.project_id).not_to eq(service_project.id)
+      provision_boot_volume(metal:)
+
+      expect { nx.start }.to hop("create_unix_user")
+      expect(st.stack.first["deadline_page"]).to be false
+    end
+
+    it "registers the wait deadline with page: true for a base image vm" do
+      metal = create_machine_image_version_metal(project_id: service_project.id)
+      provision_boot_volume(metal:)
+
+      expect { nx.start }.to hop("create_unix_user")
+      expect(st.stack.first["deadline_page"]).to be true
+    end
+
+    it "registers the wait deadline with page: true when the vm does not boot from a machine image" do
+      provision_boot_volume
+
+      expect { nx.start }.to hop("create_unix_user")
+      expect(st.stack.first["deadline_page"]).to be true
     end
 
     it "considers EU locations for github-runners" do
@@ -517,6 +842,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [Location::GITHUB_RUNNERS_ID],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -535,6 +861,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -542,7 +869,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
 
     it "considers filtered locations for runners if set for the installation" do
       installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: project.id, created_at: Time.now - 8 * 24 * 60 * 60, allocator_preferences: {"location_filter" => [Location::GITHUB_RUNNERS_ID, Location::LEASEWEB_WDC02_ID]})
-      GithubRunner.create(vm_id: vm.id, repository_name: "ubicloud/test", label: "ubicloud", installation_id: installation.id)
+      GithubRunner.create(vm_id: vm.id, location_id: vm.location_id, repository_name: "ubicloud/test", label: "ubicloud", installation_id: installation.id)
       vm.location_id = Location::GITHUB_RUNNERS_ID
 
       expect(Scheduling::Allocator).to receive(:allocate).with(
@@ -556,6 +883,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [Location::GITHUB_RUNNERS_ID],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -566,7 +894,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         "location_filter" => [Location::GITHUB_RUNNERS_ID, Location::HETZNER_FSN1_ID, Location::HETZNER_HEL1_ID, Location::LEASEWEB_WDC02_ID],
         "location_preference" => [Location::LEASEWEB_WDC02_ID],
       })
-      GithubRunner.create(vm_id: vm.id, repository_name: "ubicloud/test", label: "ubicloud", installation_id: installation.id)
+      GithubRunner.create(vm_id: vm.id, location_id: vm.location_id, repository_name: "ubicloud/test", label: "ubicloud", installation_id: installation.id)
       vm.location_id = Location::GITHUB_RUNNERS_ID
 
       expect(Scheduling::Allocator).to receive(:allocate).with(
@@ -580,6 +908,55 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [Location::LEASEWEB_WDC02_ID],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
+        family_filter: ["standard"],
+      )
+      expect { nx.start }.to hop("create_unix_user")
+    end
+
+    it "excludes hosts for runners if set for the installation" do
+      excluded_host_id = VmHost.generate_uuid
+      installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: project.id, allocator_preferences: {"host_exclusion_filter" => [excluded_host_id]})
+      GithubRunner.create(vm_id: vm.id, location_id: vm.location_id, repository_name: "ubicloud/test", label: "ubicloud", installation_id: installation.id)
+      vm.location_id = Location::GITHUB_RUNNERS_ID
+
+      expect(Scheduling::Allocator).to receive(:allocate).with(
+        vm, storage_volumes,
+        allocation_state_filter: ["accepting"],
+        distinct_storage_devices: false,
+        host_filter: [],
+        host_exclusion_filter: [excluded_host_id],
+        data_center_exclusion_filter: [],
+        location_filter: [Location::GITHUB_RUNNERS_ID, Location::HETZNER_FSN1_ID, Location::HETZNER_HEL1_ID],
+        location_preference: [Location::GITHUB_RUNNERS_ID],
+        gpu_count: 0,
+        gpu_device: nil,
+        os_filter: nil,
+        family_filter: ["standard"],
+      )
+      expect { nx.start }.to hop("create_unix_user")
+    end
+
+    it "combines installation host exclusions with the caller-provided exclude_host_ids" do
+      excluded_host_id = VmHost.generate_uuid
+      called_host_id = VmHost.generate_uuid
+      installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: project.id, allocator_preferences: {"host_exclusion_filter" => [excluded_host_id]})
+      GithubRunner.create(vm_id: vm.id, location_id: vm.location_id, repository_name: "ubicloud/test", label: "ubicloud", installation_id: installation.id)
+      vm.location_id = Location::GITHUB_RUNNERS_ID
+      st.stack = [{"storage_volumes" => storage_volumes, "exclude_host_ids" => [called_host_id]}]
+
+      expect(Scheduling::Allocator).to receive(:allocate).with(
+        vm, storage_volumes,
+        allocation_state_filter: ["accepting"],
+        distinct_storage_devices: false,
+        host_filter: [],
+        host_exclusion_filter: [called_host_id, excluded_host_id],
+        data_center_exclusion_filter: [],
+        location_filter: [Location::GITHUB_RUNNERS_ID, Location::HETZNER_FSN1_ID, Location::HETZNER_HEL1_ID],
+        location_preference: [Location::GITHUB_RUNNERS_ID],
+        gpu_count: 0,
+        gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -588,7 +965,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     it "considers preferred families for runners if set for the installation" do
       vm.location_id = Location::GITHUB_RUNNERS_ID
       installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: project.id, allocator_preferences: {"family_filter" => ["standard", "premium"]})
-      GithubRunner.create(label: "ubicloud", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id)
+      GithubRunner.create(label: "ubicloud", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id, location_id: vm.location_id)
 
       expect(Scheduling::Allocator).to receive(:allocate).with(
         vm, storage_volumes,
@@ -601,6 +978,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [Location::GITHUB_RUNNERS_ID],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard", "premium"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -609,7 +987,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     it "allows premium family allocation if free runner upgrade runner is enabled" do
       vm.location_id = Location::GITHUB_RUNNERS_ID
       installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: project.id)
-      GithubRunner.create(label: "ubicloud", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id)
+      GithubRunner.create(label: "ubicloud", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id, location_id: vm.location_id)
       project.set_ff_free_runner_upgrade_until(Time.now + 5 * 24 * 60 * 60)
       expect(Scheduling::Allocator).to receive(:allocate).with(
         vm, storage_volumes,
@@ -622,6 +1000,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [Location::GITHUB_RUNNERS_ID],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["premium", "standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -631,7 +1010,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       vm.location_id = Location::GITHUB_RUNNERS_ID
       vm.family = "premium"
       installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: project.id, allocator_preferences: {"family_filter" => ["standard", "premium"]})
-      GithubRunner.create(label: "ubicloud-premium-30", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id)
+      GithubRunner.create(label: "ubicloud-premium-30", repository_name: "ubicloud/test", installation_id: installation.id, vm_id: vm.id, location_id: vm.location_id)
 
       expect(Scheduling::Allocator).to receive(:allocate).with(
         vm, storage_volumes,
@@ -644,6 +1023,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [Location::GITHUB_RUNNERS_ID],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["premium"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -652,7 +1032,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     it "do not upgrade to the premium runner if not allowed" do
       vm.location_id = Location::GITHUB_RUNNERS_ID
       installation = GithubInstallation.create(name: "ubicloud", type: "Organization", installation_id: 123, project_id: project.id, allocator_preferences: {"family_filter" => ["standard", "premium"]})
-      runner = Prog::Github::GithubRunnerNexus.assemble(installation, repository_name: "ubicloud/test", label: "ubicloud-standard-2").subject.update(vm_id: vm.id)
+      runner = Prog::Github::GithubRunnerNexus.assemble(installation, repository_name: "ubicloud/test", label: "ubicloud-standard-2").subject.update(vm_id: vm.id, location_id: vm.location_id)
       runner.incr_not_upgrade_premium
       expect(Scheduling::Allocator).to receive(:allocate).with(
         vm, storage_volumes,
@@ -665,6 +1045,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [Location::GITHUB_RUNNERS_ID],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -687,6 +1068,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: [],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -709,6 +1091,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -732,6 +1115,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [],
         gpu_count: 0,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -754,6 +1138,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         location_preference: [],
         gpu_count: 3,
         gpu_device: nil,
+        os_filter: nil,
         family_filter: ["standard"],
       )
       expect { nx.start }.to hop("create_unix_user")
@@ -767,10 +1152,33 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
   end
 
+  describe "#boots_from_customer_machine_image?" do
+    it "is true when the boot volume's machine image belongs to a customer project" do
+      metal = create_machine_image_version_metal
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 5, disk_index: 0, machine_image_version_id: metal.id)
+      expect(nx.boots_from_customer_machine_image?).to be(true)
+    end
+
+    it "is false when the boot volume's machine image belongs to a service project" do
+      service_project = Project.create(name: "base-mi")
+      allow(Config).to receive(:machine_images_service_project_id).and_return(service_project.id)
+      metal = create_machine_image_version_metal(project_id: service_project.id)
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 5, disk_index: 0, machine_image_version_id: metal.id)
+      expect(nx.boots_from_customer_machine_image?).to be(false)
+    end
+
+    it "is false when the boot volume has no machine image" do
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 5, disk_index: 0)
+      expect(nx.boots_from_customer_machine_image?).to be(false)
+    end
+  end
+
   describe "#wait_sshable" do
-    it "naps 6 seconds if it's the first time we execute wait_sshable" do
-      expect { nx.wait_sshable }.to nap(6)
-        .and change { vm.reload.update_firewall_rules_set? }.from(false).to(true)
+    it "naps 3 seconds if it's the first time we execute wait_sshable" do
+      schedule = st.schedule
+      expect { nx.wait_sshable }.to nap(3)
+        .and change { vm.update_firewall_rules_set?(cached: false) }.from(false).to(true)
+      expect(st.reload.schedule).to eq(schedule)
     end
 
     it "naps if not sshable" do
@@ -781,27 +1189,73 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
 
     it "hops to wait if sshable and billing record created" do
+      vm.update(allocated_at: Time.now - 100)
       vm.incr_update_firewall_rules
       adr = Address.create(cidr: "10.0.0.0/24", routed_to_host_id: vm_host.id)
       AssignedVmAddress.create(ip: "10.0.0.1", address_id: adr.id, dst_vm_id: vm.id)
       expect(Socket).to receive(:tcp).with("10.0.0.1", 22, connect_timeout: 1)
-      now = Time.now
-      expect(Time).to receive(:now).and_return(now).at_least(:once)
-      expect(vm).to receive(:update).with(display_state: "running", provisioned_at: now).and_return(true)
       expect(Clog).to receive(:emit).with("vm provisioned", instance_of(Array)).and_call_original
-      allow(vm).to receive(:allocated_at).and_return(now - 100)
       expect { nx.wait_sshable }.to hop("wait")
+      expect(vm.reload.display_state).to eq("running")
+      expect(vm.provisioned_at).to be_within(10).of(Time.now)
     end
 
     it "skips a check if ipv4 is not enabled" do
+      vm.update(allocated_at: Time.now - 100)
       vm.incr_update_firewall_rules
       expect(vm.ip4).to be_nil
-      now = Time.now
-      expect(Time).to receive(:now).and_return(now).at_least(:once)
-      expect(vm).to receive(:update).with(display_state: "running", provisioned_at: now).and_return(true)
       expect(Clog).to receive(:emit).with("vm provisioned", instance_of(Array)).and_call_original
-      allow(vm).to receive(:allocated_at).and_return(now - 100)
       expect { nx.wait_sshable }.to hop("wait")
+      expect(vm.reload.display_state).to eq("running")
+      expect(vm.provisioned_at).to be_within(10).of(Time.now)
+    end
+
+    it "schedules the waiting strand if the frame has one" do
+      vm.update(allocated_at: Time.now - 100)
+      vm.incr_update_firewall_rules
+      waiting_strand = Strand.create(prog: "Test", label: "start", schedule: Time.now + 10000)
+      refresh_frame(nx, new_values: {"waiting_strand_id" => waiting_strand.id})
+
+      expect { nx.wait_sshable }.to hop("wait")
+      expect(waiting_strand.reload.schedule).to be_within(10).of(Time.now)
+    end
+  end
+
+  describe "#wait_storage_catchup" do
+    before do
+      sd = StorageDevice.create(vm_host_id: vm_host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100)
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 20, disk_index: 0, use_bdev_ubi: false, storage_device_id: sd.id)
+      VmStorageVolume.create(vm_id: vm.id, boot: false, size_gib: 15, disk_index: 1, use_bdev_ubi: false, storage_device_id: sd.id)
+    end
+
+    it "hops to wait when no volume has no machine_image_version_id or remote_storage_server_id" do
+      expect { nx.wait_storage_catchup }.to hop("wait")
+    end
+
+    it "naps if a volume is not caught up" do
+      miv = create_machine_image_version_metal
+      vm.vm_storage_volumes_dataset.where(boot: true).update(machine_image_version_id: miv.id)
+      payload = {command: "status"}
+      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm.inhost_name}/0/rpc.sock -q 2 -w 2 | head -n 1", stdin: payload.to_json).and_return('{"status": {"stripes": {"fetched": 50, "source": 100}}}')
+      expect { nx.wait_storage_catchup }.to nap(30)
+    end
+
+    it "clears machine_image_version_id and remote_storage_server_id and hops to wait when volume is caught up" do
+      miv = create_machine_image_version_metal
+      sv = vm.vm_storage_volumes_dataset.first(boot: false)
+      sv.update(machine_image_version_id: miv.id)
+      rvm = create_vm(vm_host_id: vm.vm_host_id)
+      Strand.create_with_id(rvm.id, prog: "Vm::Metal::Nexus", label: "stopped_by_admin")
+      VhostBlockBackend.create(version: "0.5.1", allocation_weight: 100, vm_host_id: vm.vm_host_id)
+      rsv = VmStorageVolume.create(vm_id: rvm.id, boot: false, size_gib: 15, disk_index: 0, use_bdev_ubi: false, storage_device_id: sv.storage_device_id, key_encryption_key_1_id: StorageKeyEncryptionKey.create_random(auth_data: "abcdef1234567890").id)
+      rss = Prog::Storage::RemoteStorageServer::Nexus.assemble(rsv.id).subject
+      VmStorageVolume.create(vm_id: vm.id, boot: false, size_gib: 15, disk_index: 2, use_bdev_ubi: false, storage_device_id: sv.storage_device_id, remote_storage_server_id: rss.id)
+      payload = {command: "status"}
+      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm.inhost_name}/1/rpc.sock -q 2 -w 2 | head -n 1", stdin: payload.to_json).and_return('{"status": {"stripes": {"fetched": 100, "source": 100}}}')
+      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm.inhost_name}/2/rpc.sock -q 2 -w 2 | head -n 1", stdin: payload.to_json).and_return('{"status": {"stripes": {"fetched": 100, "source": 100}}}')
+      expect { nx.wait_storage_catchup }.to hop("wait")
+        .and change { rss.destroy_set?(cached: false) }.from(false).to(true)
+        .and change { vm.vm_storage_volumes_dataset.where(machine_image_version_id: nil).where(remote_storage_server_id: nil).count }.from(1).to(3)
     end
   end
 
@@ -870,7 +1324,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         amount: 1,
       )
 
-      vm.active_billing_records.each { expect(it).to receive(:finalize).and_call_original }
+      expect(vm.active_billing_records).to all(receive(:finalize).and_call_original)
       expect(vm.assigned_vm_address.active_billing_record).to receive(:finalize).and_call_original
       expect(nx).to receive(:log_vm_stats)
       nx.before_destroy
@@ -898,6 +1352,13 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect { nx.wait }.to nap(6 * 60 * 60)
     end
 
+    it "cleans the prep daemonizer state when requested" do
+      vm.incr_clean_prep
+      expect(sshable).to receive(:_cmd).with(/common\/bin\/daemonizer --clean prep_/, log: :on_error)
+      expect { nx.wait }.to nap(6 * 60 * 60)
+        .and change { vm.clean_prep_set?(cached: false) }.from(true).to(false)
+    end
+
     it "hops to start_after_host_reboot when needed" do
       vm.incr_start_after_host_reboot
       expect { nx.wait }.to hop("start_after_host_reboot")
@@ -910,6 +1371,32 @@ RSpec.describe Prog::Vm::Metal::Nexus do
 
     it "hops to update_firewall_rules when needed" do
       vm.incr_update_firewall_rules
+      expect { nx.wait }.to hop("update_firewall_rules")
+    end
+
+    it "hops to wait_storage_catchup when storage volume has machine_image_version_id" do
+      miv = create_machine_image_version_metal
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 20, disk_index: 0, use_bdev_ubi: false, machine_image_version_id: miv.id)
+      expect { nx.wait }.to hop("wait_storage_catchup")
+    end
+
+    it "hops to wait_storage_catchup when storage volume has remote_storage_server_id" do
+      target_host = create_vm_host
+      rss_source_vm = create_vm(vm_host_id: target_host.id, name: "rss-source-vm")
+      sd = StorageDevice.create(vm_host_id: target_host.id, name: "rss-sd", total_storage_gib: 10, available_storage_gib: 10)
+      Strand.create_with_id(rss_source_vm.id, prog: "Vm::Metal::Nexus", label: "stopped_by_admin")
+      VhostBlockBackend.create(version: "0.5.1", allocation_weight: 100, vm_host_id: target_host.id)
+      rss_source_volume = VmStorageVolume.create(vm_id: rss_source_vm.id, boot: true, size_gib: 5, disk_index: 0, storage_device_id: sd.id,
+        key_encryption_key_1_id: StorageKeyEncryptionKey.create_random(auth_data: "rss-src").id)
+      rss = Prog::Storage::RemoteStorageServer::Nexus.assemble(rss_source_volume.id).subject
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 20, disk_index: 0, use_bdev_ubi: false, remote_storage_server_id: rss.id)
+      expect { nx.wait }.to hop("wait_storage_catchup")
+    end
+
+    it "hops to update_firewall_rules before wait_storage_catchup" do
+      vm.incr_update_firewall_rules
+      miv = create_machine_image_version_metal
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 20, disk_index: 0, use_bdev_ubi: false, machine_image_version_id: miv.id)
       expect { nx.wait }.to hop("update_firewall_rules")
     end
 
@@ -934,15 +1421,42 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(nx).to receive(:available?).and_return(true)
       expect { nx.wait }.to nap(6 * 60 * 60)
     end
+
+    it "hops to rotate_storage_keys when a storage KEK reaches the rotation interval" do
+      create_stale_kek_volume
+      expect { nx.wait }.to hop("rotate_storage_keys")
+    end
+  end
+
+  describe "#rotate_storage_keys" do
+    it "starts a RotateKek for each stale volume and hops" do
+      vol1 = create_stale_kek_volume(disk_index: 0)
+      vol2 = create_stale_kek_volume(disk_index: 1)
+      expect { nx.rotate_storage_keys }.to hop("wait_rotate_storage_keys")
+      children = Strand.where(parent_id: st.id, prog: "Storage::RotateKek").select_map(:id)
+      expect(children).to contain_exactly(vol1.id, vol2.id)
+    end
+  end
+
+  describe "#wait_rotate_storage_keys" do
+    it "reaps a finished rotation and returns to wait" do
+      child = create_rotate_kek_strand(create_stale_kek_volume, finished: true)
+      expect { nx.wait_rotate_storage_keys }.to hop("wait")
+      expect(child).not_to exist
+    end
+
+    it "keeps waiting while a rotation is still running" do
+      create_rotate_kek_strand(create_stale_kek_volume)
+      expect { nx.wait_rotate_storage_keys }.to nap(10)
+    end
   end
 
   describe "#update_firewall_rules" do
     it "hops to wait_firewall_rules" do
       vm.incr_update_firewall_rules
-      expect(vm).to receive(:location).and_return(instance_double(Location, aws?: false, provider_dispatcher_group_name: "metal"))
       expect(nx).to receive(:push).with(Prog::Vnet::Metal::UpdateFirewallRules, {}, :update_firewall_rules)
       expect { nx.update_firewall_rules }
-        .to change { vm.reload.update_firewall_rules_set? }.from(true).to(false)
+        .to change { vm.update_firewall_rules_set?(cached: false) }.from(true).to(false)
     end
 
     it "hops to wait if firewall rules are applied" do
@@ -957,7 +1471,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(nx).to receive(:write_params_json)
       expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm reinstall-systemd-units #{vm.inhost_name}")
       expect { nx.update_spdk_dependency }.to hop("wait")
-        .and change { vm.reload.update_spdk_dependency_set? }.from(true).to(false)
+        .and change { vm.update_spdk_dependency_set?(cached: false) }.from(true).to(false)
     end
   end
 
@@ -966,7 +1480,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       vm.incr_restart
       expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm restart #{vm.inhost_name}")
       expect { nx.restart }.to hop("wait")
-        .and change { vm.reload.restart_set? }.from(true).to(false)
+        .and change { vm.restart_set?(cached: false) }.from(true).to(false)
     end
   end
 
@@ -975,7 +1489,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       vm.incr_start
       expect(sshable).to receive(:_cmd).with("sudo systemctl start #{vm.inhost_name}")
       expect { nx.start_after_stop }.to nap(5)
-        .and change { vm.reload.start_set? }.from(true).to(false)
+        .and change { vm.start_set?(cached: false) }.from(true).to(false)
     end
 
     it "hops to wait if vm is available" do
@@ -1001,7 +1515,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect { nx.stopped }.to hop("restart")
       frame = st.stack[0]
       expect(frame["deadline_target"]).to eq "wait"
-      expect(Time.parse(frame["deadline_at"])).to be_within(10).of(Time.now + 300)
+      expect(Time.new(frame["deadline_at"])).to be_within(10).of(Time.now + 300)
     end
 
     it "stops the vm and hops to stopped_by_admin with admin_stop semaphore" do
@@ -1010,24 +1524,24 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       vm.incr_stopping
       expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{vm.inhost_name}")
       expect { nx.stopped }.to hop("stopped_by_admin")
-        .and change { vm.reload.admin_stop_set? }.from(true).to(false)
-        .and change { vm.reload.stop_set? }.from(true).to(false)
-        .and change { vm.reload.stopping_set? }.from(true).to(false)
+        .and change { vm.admin_stop_set?(cached: false) }.from(true).to(false)
+        .and change { vm.stop_set?(cached: false) }.from(true).to(false)
+        .and change { vm.stopping_set?(cached: false) }.from(true).to(false)
     end
 
     it "decrements stop semaphore with stop and stopping semaphores" do
       vm.incr_stop
       vm.incr_stopping
       expect { nx.stopped }.to nap(0)
-        .and change { vm.reload.stop_set? }.from(true).to(false)
-        .and not_change { vm.reload.stopping_set? }
+        .and change { vm.stop_set?(cached: false) }.from(true).to(false)
+        .and not_change { vm.stopping_set?(cached: false) }
     end
 
     it "naps if not running with stop semaphore" do
       vm.incr_stop
       expect(sshable).to receive(:_cmd).with("systemctl is-active #{vm.inhost_name} #{vm.inhost_name}-dnsmasq").and_return("inactive\nactive\n")
       expect { nx.stopped }.to nap(0)
-        .and change { vm.reload.stop_set? }.from(true).to(false)
+        .and change { vm.stop_set?(cached: false) }.from(true).to(false)
     end
 
     it "does a soft stop if running with stop semaphore" do
@@ -1035,15 +1549,15 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(sshable).to receive(:_cmd).with("systemctl is-active #{vm.inhost_name} #{vm.inhost_name}-dnsmasq").and_return("active\nactive\n")
       expect(sshable).to receive(:_cmd).with("sudo host/bin/stop-vm #{vm.inhost_name}")
       expect { nx.stopped }.to nap(10)
-        .and change { vm.reload.stop_set? }.from(true).to(false)
-        .and change { vm.reload.stopping_set? }.from(false).to(true)
+        .and change { vm.stop_set?(cached: false) }.from(true).to(false)
+        .and change { vm.stopping_set?(cached: false) }.from(false).to(true)
     end
 
     it "decrements stopping semaphore when stopping semaphore if vm not running" do
       vm.incr_stopping
       expect(sshable).to receive(:_cmd).with("systemctl is-active #{vm.inhost_name} #{vm.inhost_name}-dnsmasq").and_return("inactive\nactive\n")
       expect { nx.stopped }.to nap(0)
-        .and change { vm.reload.stopping_set? }.from(true).to(false)
+        .and change { vm.stopping_set?(cached: false) }.from(true).to(false)
     end
 
     it "attempts nice shutdown with stopping semaphore and vm is running" do
@@ -1067,7 +1581,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect { nx.stopped }.to hop("start_after_stop")
       frame = st.stack[0]
       expect(frame["deadline_target"]).to eq "wait"
-      expect(Time.parse(frame["deadline_at"])).to be_within(10).of(Time.now + 300)
+      expect(Time.new(frame["deadline_at"])).to be_within(10).of(Time.now + 300)
     end
 
     it "does not stop if already stopped" do
@@ -1079,20 +1593,28 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(sshable).to receive(:_cmd).with("systemctl is-active #{vm.inhost_name} #{vm.inhost_name}-dnsmasq").and_return("active\nactive\n")
       expect { nx.stopped }.to hop("wait")
     end
+
+    it "hops to stopped_by_admin without decrementing prepare_to_move once stopped normally, even if user has requested start or restart" do
+      vm.incr_prepare_to_move
+      vm.incr_start
+      vm.incr_restart
+      expect { nx.stopped }.to hop("stopped_by_admin")
+        .and not_change { vm.prepare_to_move_set?(cached: false) }
+    end
   end
 
   describe "#unavailable" do
     it "hops to start_after_host_reboot when needed" do
       vm.incr_start_after_host_reboot
       expect { nx.unavailable }.to hop("start_after_host_reboot")
-        .and change { vm.reload.checkup_set? }.from(false).to(true)
+        .and change { vm.checkup_set?(cached: false) }.from(false).to(true)
     end
 
     it "restarts the VM when needed" do
       vm.incr_restart
       expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm restart #{vm.inhost_name}")
       expect { nx.unavailable }.to nap(0)
-        .and change { vm.reload.restart_set? }.from(true).to(false)
+        .and change { vm.restart_set?(cached: false) }.from(true).to(false)
     end
 
     it "hops to start_after_stop when needed" do
@@ -1100,7 +1622,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect { nx.unavailable }.to hop("start_after_stop")
       frame = st.stack[0]
       expect(frame["deadline_target"]).to eq "wait"
-      expect(Time.parse(frame["deadline_at"])).to be_within(10).of(Time.now + 300)
+      expect(Time.new(frame["deadline_at"])).to be_within(10).of(Time.now + 300)
     end
 
     it "hops to stopped when needed" do
@@ -1124,6 +1646,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(sshable).to receive(:_cmd).with("systemctl is-active #{vm.inhost_name} #{vm.inhost_name}-dnsmasq").and_return("active\ninactive\n")
       expect { nx.unavailable }.to nap(30)
         .and change { Page.get(:summary) }.from(nil).to("#{vm.ubid} unavailable but main process running")
+      expect(Page.from_tag_parts("VmExit", vm.ubid).resource_id).to eq(vm.id)
       frame = st.stack[0]
       expect(frame["reason_determined"]).to be true
     end
@@ -1133,6 +1656,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(sshable).to receive(:_cmd).with("systemctl show -p Result -p InvocationID --value #{vm.inhost_name}").and_return("oom-kill\nfoo\n")
       expect { nx.unavailable }.to nap(30)
         .and change { Page.get(:summary) }.from(nil).to("#{vm.ubid} stopped unexpectedly (oom-kill)")
+      expect(Page.from_tag_parts("VmExit", vm.ubid).resource_id).to eq(vm.id)
       frame = st.stack[0]
       expect(frame["reason_determined"]).to be true
     end
@@ -1187,10 +1711,10 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
 
     it "resolves page and hops to wait if vm is available" do
-      page = Prog::PageNexus.assemble("#{vm.ubid} stopped unexpectedly", ["VmExit", vm.ubid], vm.ubid).subject
+      page = Prog::PageNexus.assemble("#{vm.ubid} stopped unexpectedly", ["VmExit", vm.ubid], vm.ubid, resource_id: vm.id).subject
       expect(sshable).to receive(:_cmd).with("systemctl is-active #{vm.inhost_name} #{vm.inhost_name}-dnsmasq").and_return("active\nactive\n")
       expect { nx.unavailable }.to hop("wait")
-        .and change { page.reload.resolve_set? }.from(false).to(true)
+        .and change { page.resolve_set?(cached: false) }.from(false).to(true)
     end
   end
 
@@ -1209,35 +1733,35 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
 
     it "absorbs an already deleted errors as a success" do
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10).and_raise(
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error).and_raise(
         Sshable::SshError.new("stop", "", "Failed to stop #{nx.vm_name} Unit .* not loaded.", 1, nil),
       )
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq").and_raise(
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq", log: :on_error).and_raise(
         Sshable::SshError.new("stop", "", "Failed to stop #{nx.vm_name} Unit .* not loaded.", 1, nil),
       )
-      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}")
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}", log: :on_error)
 
       expect { nx.destroy }.to hop("destroy_slice")
     end
 
     it "raises unexpected vm stop errors" do
       ex = Sshable::SshError.new("stop", "", "unknown error", 1, nil)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10).and_raise(ex)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error).and_raise(ex)
 
       expect { nx.destroy }.to raise_error ex
     end
 
     it "raises unexpected dnsmasq stop errors" do
       ex = Sshable::SshError.new("stop", "", "unknown error", 1, nil)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq").and_raise(ex)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq", log: :on_error).and_raise(ex)
       expect { nx.destroy }.to raise_error ex
     end
 
     it "hops when all commands are succeeded" do
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq")
-      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}")
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq", log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}", log: :on_error)
 
       expect { nx.destroy }.to hop("destroy_slice")
       expect(vm.display_state).to eq("deleting")
@@ -1250,9 +1774,9 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       dev = StorageDevice.create(name: "DEFAULT", total_storage_gib: 1000, available_storage_gib: 500)
       VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 20, disk_index: 0, use_bdev_ubi: false, storage_device_id: dev.id)
 
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq")
-      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}")
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq", log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}", log: :on_error)
 
       expect { nx.destroy }.to hop("destroy_slice")
         .and change { dev.reload.available_storage_gib }.from(500).to(520)
@@ -1260,17 +1784,17 @@ RSpec.describe Prog::Vm::Metal::Nexus do
 
     it "hops to remove_vm_from_load_balancer if vm is part of a load balancer" do
       expect(vm).to receive(:load_balancer).and_return(instance_double(LoadBalancer)).at_least(:once)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq")
-      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete_keep_net #{nx.vm_name}")
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq", log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete_keep_net #{nx.vm_name}", log: :on_error)
 
       expect { nx.destroy }.to hop("remove_vm_from_load_balancer")
     end
 
     it "detaches from pci devices" do
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq")
-      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}")
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq", log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}", log: :on_error)
 
       pci = PciDevice.create(vm_id: vm.id, vm_host_id: vm_host.id, slot: "01:00.0", device_class: "dc", vendor: "vd", device: "dv", numa_node: 0, iommu_group: 3)
       expect(pci.vm).to eq(vm)
@@ -1279,9 +1803,10 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
 
     it "detaches from gpu partition" do
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq")
-      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}")
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete_gpu_partition #{nx.vm_name}")
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq", log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}", log: :on_error)
 
       pci = PciDevice.create(vm_host_id: vm_host.id, slot: "01:00.0", device_class: "dc", vendor: "vd", device: "dv", numa_node: 0, iommu_group: 3)
       gp = GpuPartition.create(vm_id: vm.id, vm_host_id: vm_host.id, partition_id: 1, gpu_count: 1)
@@ -1292,9 +1817,9 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
 
     it "updates slice" do
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq")
-      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}")
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq", log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}", log: :on_error)
 
       slice = VmHostSlice.create(vm_host_id: vm_host.id, name: "standard", family: "standard", cores: 1, total_cpu_percent: 200, used_cpu_percent: 200, total_memory_gib: 8, used_memory_gib: 8)
       vm.update(vm_host_slice_id: slice.id)
@@ -1304,9 +1829,9 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
 
     it "fails if VM cores is 0" do
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10)
-      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq")
-      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}")
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}", timeout: 10, log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{nx.vm_name}-dnsmasq", log: :on_error)
+      expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm delete #{nx.vm_name}", log: :on_error)
 
       vm.cores = 0
 
@@ -1318,6 +1843,19 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(nx).to receive(:host).and_return(nil).at_least(:once)
 
       expect { nx.destroy }.to hop("destroy_slice")
+    end
+
+    it "waits for an in-flight KEK rotation before tearing the VM down" do
+      create_rotate_kek_strand(create_stale_kek_volume)
+      expect { nx.destroy }.to nap(10)
+    end
+
+    it "reaps a finished KEK rotation and continues destroying" do
+      vm.update(vm_host_id: nil)
+      expect(nx).to receive(:host).and_return(nil).at_least(:once)
+      child = create_rotate_kek_strand(create_stale_kek_volume, finished: true)
+      expect { nx.destroy }.to hop("destroy_slice")
+      expect(child).not_to exist
     end
   end
 
@@ -1360,6 +1898,14 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         .and change(nic, :vm_id).from(vm.id).to(nil)
       expect(vm.exists?).to be(false)
     end
+
+    it "does not raise a foreign key violation on destroy because run_command.vm_id cascades" do
+      RunCommand.create(vm_id: vm.id, command: "fetch_serial_log")
+
+      expect { nx.destroy_slice }.to exit({"msg" => "vm deleted"})
+      expect(vm.exists?).to be(false)
+      expect(RunCommand.where(vm_id: vm.id).empty?).to be(true)
+    end
   end
 
   describe "#remove_vm_from_load_balancer" do
@@ -1400,10 +1946,42 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         /sudo host\/bin\/setup-vm recreate-unpersisted #{nx.vm_name}/,
         {stdin: /{"storage":{"vm.*_0":{"key":"key","init_vector":"iv","algorithm":"aes-256-gcm","auth_data":"somedata"}}}/},
       )
-      expect(vm).to receive(:update).with(display_state: "starting")
-      expect(vm).to receive(:update).with(display_state: "running")
-      expect(vm).to receive(:incr_update_firewall_rules)
       expect { nx.start_after_host_reboot }.to hop("wait")
+        .and change { vm.update_firewall_rules_set?(cached: false) }.from(false).to(true)
+      expect(vm.reload.display_state).to eq("running")
+    end
+
+    it "hops to restore_load_balancer if the vm is part of a load balancer" do
+      create_load_balancer
+      expect(sshable).to receive(:_cmd).with(/sudo host\/bin\/setup-vm recreate-unpersisted #{nx.vm_name}/, {stdin: '{"storage":{}}'})
+      expect { nx.start_after_host_reboot }.to hop("restore_load_balancer")
+    end
+
+    it "waits for an in-progress storage KEK rotation before recreating the vm" do
+      kek1 = StorageKeyEncryptionKey.create(algorithm: "aes-256-gcm", key: "key", init_vector: "iv", auth_data: "somedata")
+      kek2 = StorageKeyEncryptionKey.create(algorithm: "aes-256-gcm", key: "key2", init_vector: "iv2", auth_data: "somedata")
+      dev = StorageDevice.create(name: "nvme0", total_storage_gib: 1000, available_storage_gib: 500)
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 20, disk_index: 0, use_bdev_ubi: false, storage_device_id: dev.id, key_encryption_key_1_id: kek1.id, key_encryption_key_2_id: kek2.id)
+
+      expect(sshable).not_to receive(:_cmd)
+      expect { nx.start_after_host_reboot }.to nap(5)
+    end
+  end
+
+  describe "#restore_load_balancer" do
+    it "reinstalls the load balancer rules in the recreated network namespace" do
+      lb = create_load_balancer
+      expect { nx.restore_load_balancer }.to hop(:update_load_balancer, "Vnet::UpdateLoadBalancerNode") { it.strand_update_args[:stack].first["load_balancer_id"] == lb.id }
+    end
+
+    it "hops to wait after the rules are reinstalled" do
+      create_load_balancer
+      st.update(retval: {"msg" => "load balancer is updated"})
+      expect { nx.restore_load_balancer }.to hop("wait")
+    end
+
+    it "hops to wait if the vm is no longer part of a load balancer" do
+      expect { nx.restore_load_balancer }.to hop("wait")
     end
   end
 

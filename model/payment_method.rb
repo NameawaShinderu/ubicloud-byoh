@@ -13,15 +13,22 @@ class PaymentMethod < Sequel::Model
 
   def stripe_data
     if Config.stripe_secret_key
-      @stripe_data ||= StripeClient.payment_methods.retrieve(stripe_id)["card"].to_h.transform_keys!(&:to_s).slice(*%w[last4 brand exp_month exp_year country funding wallet checks])
+      @stripe_data ||= StripeClient.payment_methods.retrieve(stripe_id)["card"].to_h.transform_keys!(&:to_s).slice(*%w[last4 brand exp_month exp_year country funding wallet checks].freeze)
     end
   end
 
   def after_destroy
-    if Config.stripe_secret_key
-      StripeClient.payment_methods.detach(stripe_id)
-    end
+    detach_stripe(destroyed: true)
     super
+  end
+
+  DELETED_ORDER = 4313734
+
+  def detach_stripe(destroyed: false)
+    if Config.stripe_secret_key && order != DELETED_ORDER
+      StripeClient.payment_methods.detach(stripe_id)
+      update(order: DELETED_ORDER) unless destroyed
+    end
   end
 
   def path

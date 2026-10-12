@@ -11,7 +11,7 @@ RSpec.describe CloverAdmin do
   def page_data
     page.all(".page-table tbody tr").map do
       tds = it.all("td").map(&:text)
-      tds.delete_at(-3)
+      tds.delete_at(-4)
       tds
     end
   end
@@ -39,12 +39,12 @@ RSpec.describe CloverAdmin do
     fill_in "UBID, UUID, or prefix:term", with: account.ubid
     click_button "Show Object"
     expect(page.title).to eq "Ubicloud Admin - Account #{account.ubid}"
-    expect(object_data).to eq(email: "user@example.com", name: "", status_id: "2", suspended_at: "")
+    expect(object_data).to eq(email: "user@example.com", name: "", project_limit: "10", status_id: "2", suspended_at: "")
 
     project = account.projects.first
     click_link project.name
     expect(page.title).to eq "Ubicloud Admin - Project #{project.ubid}"
-    expect(object_data).to eq(billable: "true", billing_info_id: "", credit: "0.0", discount: "0", feature_flags: "{}", name: "Default", reputation: "new", visible: "true")
+    expect(object_data).to eq(billable: "true", billing_info_id: "", credit: "0.0", discount: "0", feature_flags: "{}", gcp_dedicated_subnet_vpcs: "false", name: "Default", reputation: "new", visible: "true")
 
     subject_tag = project.subject_tags.first
     click_link subject_tag.name
@@ -63,7 +63,7 @@ RSpec.describe CloverAdmin do
     fill_in "UBID, UUID, or prefix:term", with: account.id
     click_button "Show Object"
     expect(page.title).to eq "Ubicloud Admin - Account #{account.ubid}"
-    expect(object_data).to eq(email: "user@example.com", name: "", status_id: "2", suspended_at: "")
+    expect(object_data).to eq(email: "user@example.com", name: "", project_limit: "10", status_id: "2", suspended_at: "")
 
     fill_in "UBID, UUID, or prefix:term", with: "fed39539-ffe4-417d-9b8a-9a41ff7d4ad2"
     click_button "Show Object"
@@ -88,6 +88,15 @@ RSpec.describe CloverAdmin do
     expect(page.title).to eq "Ubicloud Admin - Account #{account.ubid}"
   end
 
+  it "searches case-insensitively" do
+    account = create_account
+    account.update(name: "UniqueTestName")
+
+    fill_in "UBID, UUID, or prefix:term", with: "ac:uniquetestname"
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - Account #{account.ubid}"
+  end
+
   it "searches by vm name with prefix and redirects for single result" do
     project = Project.create(name: "Default")
     vm = Prog::Vm::Nexus.assemble("dummy key", project.id, name: "unique-vm-search").subject
@@ -95,6 +104,28 @@ RSpec.describe CloverAdmin do
     fill_in "UBID, UUID, or prefix:term", with: "vm:unique-vm-search"
     click_button "Show Object"
     expect(page.title).to eq "Ubicloud Admin - Vm #{vm.ubid}"
+  end
+
+  it "searches by vm host sshable host with prefix and redirects for single result" do
+    vm_host = create_vm_host
+    vm_host.sshable.update(host: "unique-host-search.example.com")
+
+    fill_in "UBID, UUID, or prefix:term", with: "vh:unique-host-search"
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vm_host.ubid}"
+  end
+
+  it "searches by vm host provider server identifier with prefix and redirects for single result" do
+    vm_host = create_vm_host
+    HostProvider.create do
+      it.id = vm_host.id
+      it.server_identifier = "unique-server-id-123"
+      it.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+    end
+
+    fill_in "UBID, UUID, or prefix:term", with: "vh:unique-server-id-123"
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vm_host.ubid}"
   end
 
   it "searches by postgres resource name with prefix and redirects for single result" do
@@ -225,7 +256,7 @@ RSpec.describe CloverAdmin do
     vm = Prog::Vm::Nexus.assemble("dummy key", project.id, name: "my-vm").subject
     click_link "Vm"
     expect(page.title).to eq "Ubicloud Admin - Vm - Browse"
-    expect(page.all("#autoforme_content td").map(&:text)).to eq ["my-vm", "creating", "Default", "", "hetzner-fsn1", "x64", "ubuntu-jammy", "standard", "2", vm.created_at.to_s]
+    expect(page.all("#autoforme_content td").map(&:text)).to eq ["my-vm", "creating", "Default", "", "hetzner-fsn1", "x64", "ubuntu-noble", "standard", "2", "", vm.created_at.to_s]
 
     click_link vm.name
     expect(page.title).to eq "Ubicloud Admin - Vm #{vm.ubid}"
@@ -277,14 +308,20 @@ RSpec.describe CloverAdmin do
     expect(page.title).to eq "Ubicloud Admin - Location #{Location::HETZNER_FSN1_UBID}"
 
     vmh = Prog::Vm::HostNexus.assemble("1.1.0.0", location_id: Location::HETZNER_FSN1_ID, family: "standard").subject
+    HostProvider.create do
+      it.id = vmh.id
+      it.server_identifier = "123"
+      it.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+    end
     click_link "Ubicloud Admin"
     click_link "VmHost"
     click_link "Search"
 
     select "standard", from: "Family"
+    fill_in "Provider", with: "hetz"
     fill_in "Sshable", with: "1.0"
     click_button "Search"
-    expect(page.all("#autoforme_content td").map(&:text)).to eq [vmh.ubid, "1.1.0.0", "unprepared", "", "hetzner-fsn1", "", "standard", "", "0"]
+    expect(page.all("#autoforme_content td").map(&:text)).to eq [vmh.ubid, "1.1.0.0", "unprepared", "", "hetzner-fsn1", "", "hetzner", "standard", "", "0"]
 
     vm = Prog::Vm::Nexus.assemble("k y", project.id, unix_user: "ubi", name: "vm1", location_id: Location::HETZNER_FSN1_ID, boot_image: "github-ubuntu-2204", size: "standard-2", arch: "x64").subject
     click_link "Ubicloud Admin"
@@ -295,7 +332,7 @@ RSpec.describe CloverAdmin do
     fill_in "Project", with: project.ubid
     fill_in "Created at", with: vm.created_at.strftime("%Y-%m")
     click_button "Search"
-    expect(page.all("#autoforme_content td").map(&:text)).to eq ["vm1", "creating", "Test", "", "hetzner-fsn1", "x64", "github-ubuntu-2204", "standard", "2", vm.created_at.to_s]
+    expect(page.all("#autoforme_content td").map(&:text)).to eq ["vm1", "creating", "Test", "", "hetzner-fsn1", "x64", "github-ubuntu-2204", "standard", "2", "", vm.created_at.to_s]
 
     GithubInstallation.create(name: "ins1", installation_id: 1, type: "Organization", allocator_preferences: {family_filter: nil})
     ins2 = GithubInstallation.create(name: "ins2", installation_id: 2, type: "Organization", allocator_preferences: {"family_filter" => ["standard", "premium"]})
@@ -415,7 +452,7 @@ RSpec.describe CloverAdmin do
 
     within(".association", text: "vms") { click_link "(table)" }
     expect(page.title).to eq "Ubicloud Admin - Vm - Search"
-    expect(page.all("#autoforme_content td").map(&:text)).to eq ["assoc-table-vm", "creating", "assoc-table-test", "", "hetzner-fsn1", "x64", "ubuntu-jammy", "standard", "2", vm.created_at.to_s]
+    expect(page.all("#autoforme_content td").map(&:text)).to eq ["assoc-table-vm", "creating", "assoc-table-test", "", "hetzner-fsn1", "x64", "ubuntu-noble", "standard", "2", "", vm.created_at.to_s]
 
     expect(Config).to receive(:postgres_service_project_id).and_return(project.id).at_least(:once)
     pg = Prog::Postgres::PostgresResourceNexus.assemble(
@@ -430,7 +467,7 @@ RSpec.describe CloverAdmin do
     within(".association", text: "postgres_resources") { click_link "(table)" }
     expect(page.title).to eq "Ubicloud Admin - PostgresResource - Search"
     expect(page.all("#autoforme_content td").map(&:text)).to eq [
-      "assoc-table-pg", "assoc-table-test", "hetzner-fsn1", "standard", "standard-2", "64", "none", "17", "", pg.created_at.to_s,
+      "assoc-table-pg", "assoc-table-test", "hetzner-fsn1", "standard", "standard-2", "64", "none", "18", "", pg.created_at.to_s,
     ]
 
     server = pg.servers.first
@@ -438,7 +475,7 @@ RSpec.describe CloverAdmin do
     within(".association", text: "servers") { click_link "(table)" }
     expect(page.title).to eq "Ubicloud Admin - PostgresServer - Search"
     expect(page.all("#autoforme_content td").map(&:text)).to eq [
-      server.ubid, server.vm.ubid, "assoc-table-pg", "push", "ready", "17", "true", server.created_at.to_s,
+      server.ubid, server.vm.ubid, "assoc-table-pg", "push", "ready", "18", "true", server.created_at.to_s,
     ]
 
     vm_host = create_vm_host
@@ -449,6 +486,48 @@ RSpec.describe CloverAdmin do
     expect(page.all("#autoforme_content td").map(&:text)).to eq [
       "ubuntu-jammy", "20220202", vm_host.ubid, "14", "", boot_image.created_at.to_s,
     ]
+
+    vm.update(vm_host_id: vm_host.id)
+    visit "/model/VmHost/#{vm_host.ubid}"
+    within(".association", text: "vms") { click_link "(table)" }
+    expect(page.title).to eq "Ubicloud Admin - Vm - Search"
+    expect(page.all("#autoforme_content td").map(&:text)).to eq [
+      "assoc-table-vm", "creating", "assoc-table-test", vm_host.ubid, "hetzner-fsn1", "x64", "ubuntu-noble", "standard", "2", "", vm.created_at.to_s,
+    ]
+
+    strand = vm.strand
+    child_strand = Strand.create(prog: "Test", label: "start", parent_id: strand.id)
+    visit "/model/Strand/#{strand.ubid}"
+    within(".association", text: "children") { click_link "(table)" }
+    expect(page.title).to eq "Ubicloud Admin - Strand - Search"
+    expect(page.all("#autoforme_content td").map(&:text)).to eq [
+      child_strand.ubid, "Test", "start", child_strand.schedule.to_s, "0",
+    ]
+  end
+
+  it "shows association count in heading" do
+    project = Project.create(name: "assoc-count-test")
+    SshPublicKey.create(name: "key-0", public_key: "k v", project_id: project.id)
+
+    visit "/model/Project/#{project.ubid}"
+    within(".association", text: "ssh_public_keys") do
+      expect(find("h3").text).to eq "ssh_public_keys"
+      expect(page.all("ul li").length).to eq 1
+    end
+
+    SshPublicKey.create(name: "key-1", public_key: "k v", project_id: project.id)
+    page.refresh
+    within(".association", text: "ssh_public_keys") do
+      expect(find("h3").text).to eq "ssh_public_keys (2)"
+      expect(page.all("ul li").length).to eq 2
+    end
+
+    Array.new(100) { |i| SshPublicKey.create(name: "key-#{i + 2}", public_key: "k v", project_id: project.id) }
+    page.refresh
+    within(".association", text: "ssh_public_keys") do
+      expect(find("h3").text).to eq "ssh_public_keys (100+)"
+      expect(page.all("ul li").length).to eq 101
+    end
   end
 
   it "handles basic pagination when browsing by class" do
@@ -465,6 +544,21 @@ RSpec.describe CloverAdmin do
     key = SshPublicKey.last
     click_link key.name
     expect(page.title).to eq "Ubicloud Admin - SshPublicKey #{key.ubid}"
+  end
+
+  it "paginates past the first page when browsing a table ordered by a non-unique column" do
+    Array.new(28 - Strand.count) { Strand.create(prog: "Test", label: "test") }
+    expected_second_page = Strand.count - 25
+
+    page.refresh
+    click_link "Strand"
+    first_page = page.all("#autoforme_table a").map { it["href"] }
+    expect(first_page.length).to eq 25
+
+    click_link "Next"
+    second_page = page.all("#autoforme_table a").map { it["href"] }
+    expect(second_page.length).to eq expected_second_page
+    expect(second_page & first_page).to be_empty
   end
 
   it "ignores bogus ubids when paginating" do
@@ -538,6 +632,26 @@ RSpec.describe CloverAdmin do
     expect(page.title).to eq "Ubicloud Admin - BillingInfo #{billing_info.ubid}"
   end
 
+  it "supports validating VAT for BillingInfo" do
+    expect(Config).to receive(:stripe_secret_key).and_return("secret_key").at_least(:once)
+    customers_service = instance_double(Stripe::CustomerService)
+    allow(StripeClient).to receive(:customers).and_return(customers_service)
+    stripe_customer = {"name" => "ACME Inc.", "metadata" => {"tax_id" => "NL123456789B01"}, "address" => {"line1" => "Main Street 1", "country" => "NL"}}
+    allow(customers_service).to receive(:retrieve).with("cus_vat123").and_return(stripe_customer)
+    billing_info = BillingInfo.create(stripe_id: "cus_vat123")
+    path = "/model/BillingInfo/#{billing_info.ubid}/validate-vat"
+
+    visit "/model/BillingInfo/#{billing_info.ubid}"
+    click_link "Validate VAT"
+    expect(page).to have_current_path path, ignore_query: true
+    expect { click_button "Validate VAT" }.to change { Strand.where(prog: "ValidateVat").count }.from(0).to(1)
+    expect(page).to have_flash_notice("ValidateVat prog created")
+    expect(page.title).to eq "Ubicloud Admin - BillingInfo #{billing_info.ubid}"
+    strand = Strand.first(prog: "ValidateVat")
+    expect(strand.label).to eq "start"
+    expect(strand.stack.first["subject_id"]).to eq billing_info.id
+  end
+
   it "shows stripe data for payment method as extra" do
     expect(Config).to receive(:stripe_secret_key).and_return("secret_key").at_least(:once)
     payment_methods_service = instance_double(Stripe::PaymentMethodService)
@@ -582,7 +696,7 @@ RSpec.describe CloverAdmin do
     click_link "PostgresResource"
     expect(page.title).to eq "Ubicloud Admin - PostgresResource - Browse"
     expect(page.all("#autoforme_content td").map(&:text)).to eq [
-      "test-pg", "PgTest", "hetzner-fsn1", "standard", "standard-2", "64", "none", "17", "", pg.created_at.to_s,
+      "test-pg", "PgTest", "hetzner-fsn1", "standard", "standard-2", "64", "none", "18", "", pg.created_at.to_s,
     ]
 
     click_link pg.name
@@ -596,7 +710,7 @@ RSpec.describe CloverAdmin do
     fill_in "Created at", with: pg.created_at.strftime("%Y-%m")
     click_button "Search"
     expect(page.all("#autoforme_content td").map(&:text)).to eq [
-      "test-pg", "PgTest", "hetzner-fsn1", "standard", "standard-2", "64", "none", "17", "", pg.created_at.to_s,
+      "test-pg", "PgTest", "hetzner-fsn1", "standard", "standard-2", "64", "none", "18", "", pg.created_at.to_s,
     ]
 
     child_pg = Prog::Postgres::PostgresResourceNexus.assemble(
@@ -612,7 +726,7 @@ RSpec.describe CloverAdmin do
     fill_in "Parent", with: pg.ubid
     click_button "Search"
     expect(page.all("#autoforme_content td").map(&:text)).to eq [
-      "test-child-pg", "PgTest", "hetzner-fsn1", "standard", "standard-2", "64", "none", "17", "test-pg", child_pg.created_at.to_s,
+      "test-child-pg", "PgTest", "hetzner-fsn1", "standard", "standard-2", "64", "none", "18", "test-pg", child_pg.created_at.to_s,
     ]
   end
 
@@ -631,7 +745,7 @@ RSpec.describe CloverAdmin do
     click_link "PostgresServer"
     expect(page.title).to eq "Ubicloud Admin - PostgresServer - Browse"
     expect(page.all("#autoforme_content td").map(&:text)).to eq [
-      server.ubid, server.vm.ubid, "test-pg", "push", "ready", "17", "true", server.created_at.to_s,
+      server.ubid, server.vm.ubid, "test-pg", "push", "ready", "18", "true", server.created_at.to_s,
     ]
 
     click_link server.ubid, match: :first
@@ -645,7 +759,7 @@ RSpec.describe CloverAdmin do
     select "push", from: "Timeline access"
     click_button "Search"
     expect(page.all("#autoforme_content td").map(&:text)).to eq [
-      server.ubid, server.vm.ubid, "test-pg", "push", "ready", "17", "true", server.created_at.to_s,
+      server.ubid, server.vm.ubid, "test-pg", "push", "ready", "18", "true", server.created_at.to_s,
     ]
 
     click_link "test-pg"
@@ -657,7 +771,7 @@ RSpec.describe CloverAdmin do
     expect(Config).to receive(:postgres_service_project_id).and_return(project.id).at_least(:once)
 
     resource_id = PostgresResource.generate_uuid
-    server = PostgresServer.create(resource_id:, timeline: create_postgres_timeline(location_id: Location::HETZNER_FSN1_ID), version: PostgresResource::DEFAULT_VERSION)
+    server = PostgresServer.create(resource_id:, timeline: create_postgres_timeline(location_id: Location::HETZNER_FSN1_ID), version: PostgresResource.default_version)
 
     visit "/model/PostgresServer/#{server.ubid}"
     expect(page.title).to eq "Ubicloud Admin - PostgresServer #{server.ubid}"
@@ -702,12 +816,18 @@ RSpec.describe CloverAdmin do
       ["VmVCpu", "32", "16"],
       ["GithubRunnerVCpu", "400", "0"],
       ["GithubRunnerVCpuArm", "100", "0"],
+      ["GithubRunnerVCpuAws", "500", "0"],
+      ["GithubRunnerVCpuArmAws", "500", "0"],
       ["PostgresVCpu", "128", "0"],
       ["KubernetesVCpu", "32", "0"],
+      ["MachineImageVersion", "16", "0"],
     ]
   end
 
   it "shows current usage for project as extra" do
+    now = Time.now.utc.round
+    expect(Time).to receive(:now).and_return([now, Time.utc(now.year, now.month) + 3600].max).at_least(:once)
+
     project = Project.create(name: "test")
     vm = create_vm(project_id: project.id)
     BillingRecord.create(
@@ -715,7 +835,7 @@ RSpec.describe CloverAdmin do
       resource_id: vm.id,
       resource_name: vm.name,
       span: Sequel::Postgres::PGRange.new(Time.now - 3600, nil),
-      billing_rate_id: BillingRate.from_resource_properties("VmVCpu", vm.family, vm.location.name)["id"],
+      billing_rate_id: BillingRate.from_resource_properties("VmVCpu", vm.family, vm.location.name, false, BILLING_RATE_ACTIVE_AT)["id"],
       amount: vm.vcpus,
     )
 
@@ -723,7 +843,77 @@ RSpec.describe CloverAdmin do
     expect(page.title).to eq "Ubicloud Admin - Project #{project.ubid}"
     find("summary", text: /Current Usage \(subtotal: \$[\d.]+, cost: \$[\d.]+\)/).click
     expect(page.all(".project-usage-table tbody tr").count).to eq 1
-    expect(page.all(".project-usage-table tbody tr").first.all("td").map(&:text)).to eq ["test-vm", "VmVCpu", "standard", "61 minutes", "$0.037"]
+    expect(page.all(".project-usage-table tbody tr").first.all("td").map(&:text)).to eq ["test-vm", "VmVCpu", "standard", "60 minutes", "$0.046"]
+  end
+
+  it "shows hosted resources and utilized VM hosts for a Project as extra" do
+    project = Project.create(name: "some-customer")
+    other_project = Project.create(name: "some-other-customer")
+    service_project = Project.create(name: "internal-service")
+    vm_host = create_vm_host
+    other_vm_host = create_vm_host(location_id: Location::HETZNER_HEL1_ID, allocation_state: "draining")
+
+    # A VM owned by another project on the same host must never appear here.
+    create_vm(vm_host_id: vm_host.id, project_id: other_project.id, name: "other-project-vm")
+
+    reload = -> {
+      visit "/model/Project/#{project.ubid}"
+      page.all("summary").each(&:click)
+    }
+    hosts_rows = -> { page.all(".project-vm-hosts-table tbody tr").map { it.all("td").map(&:text) } }
+    resource_rows = -> { page.all(".project-resources-table tbody tr").map { it.all("td").map(&:text).first(4) }.sort_by { it[2] } }
+
+    # Before any resource is hosted for this project: no resource/host tables.
+    reload.call
+    expect(page).to have_no_css(".project-resources-table")
+    expect(page).to have_no_css(".project-vm-hosts-table")
+
+    # Plain customer VM, owned directly by the project.
+    create_vm(vm_host_id: vm_host.id, project_id: project.id, name: "customer-vm")
+    reload.call
+    expect(page.all(".project-resources-table thead th").map(&:text)).to eq(["Type", "Resource", "VM", "VM Host", "vCPUs", "Created At"])
+    expect(page.all(".project-vm-hosts-table thead th").map(&:text)).to eq(["VM Host", "Location", "State", "VMs", "PostgreSQL", "Kubernetes", "GitHub Runners", "Total"])
+    expect(resource_rows.call).to eq([["VM", "", "customer-vm", vm_host.ubid]])
+    expect(hosts_rows.call).to eq([[vm_host.ubid, "hetzner-fsn1", "accepting", "1", "0", "0", "0", "1"]])
+
+    pg = create_postgres_resource(project:, location_id: vm_host.location_id)
+    pg_vm = create_postgres_server(resource: pg).vm
+    pg_vm.update(vm_host_id: vm_host.id, project_id: service_project.id)
+    reload.call
+    expect(resource_rows.call).to eq([
+      ["VM", "", "customer-vm", vm_host.ubid],
+      ["PostgreSQL", pg.name, pg_vm.name, vm_host.ubid],
+    ].sort_by { it[2] })
+    expect(hosts_rows.call).to eq([[vm_host.ubid, "hetzner-fsn1", "accepting", "1", "1", "0", "0", "2"]])
+
+    k8s_ps = PrivateSubnet.create(name: "k8s-ps", project_id: project.id, location_id: vm_host.location_id, net4: "10.1.0.0/26", net6: "fdfb::/64")
+    cluster = KubernetesCluster.create(project_id: project.id, name: "k8s-cluster", private_subnet_id: k8s_ps.id, location_id: vm_host.location_id, cp_node_count: 1, version: Option.selectable_kubernetes_versions.first, target_node_size: "standard-2")
+    KubernetesNode.create(kubernetes_cluster_id: cluster.id, vm_id: create_vm(vm_host_id: vm_host.id, project_id: service_project.id, name: "k8s-vm").id)
+    reload.call
+    expect(resource_rows.call).to eq([
+      ["VM", "", "customer-vm", vm_host.ubid],
+      ["PostgreSQL", pg.name, pg_vm.name, vm_host.ubid],
+      ["Kubernetes", "k8s-cluster", "k8s-vm", vm_host.ubid],
+    ].sort_by { it[2] })
+    expect(hosts_rows.call).to eq([[vm_host.ubid, "hetzner-fsn1", "accepting", "1", "1", "1", "0", "3"]])
+
+    # The GitHub runner runs on the other host, so a second host row appears.
+    installation = GithubInstallation.create(installation_id: 99, name: "gh-org", type: "Organization", project_id: project.id)
+    gh_vm = create_vm(vm_host_id: other_vm_host.id, project_id: service_project.id, name: "gh-runner-vm")
+    GithubRunner.create(vm_id: gh_vm.id, location_id: gh_vm.location_id, repository_name: "repo", label: "ubicloud", installation_id: installation.id)
+    reload.call
+    expect(resource_rows.call).to eq([
+      ["VM", "", "customer-vm", vm_host.ubid],
+      ["PostgreSQL", pg.name, pg_vm.name, vm_host.ubid],
+      ["Kubernetes", "k8s-cluster", "k8s-vm", vm_host.ubid],
+      ["GitHub Runner", "gh-org", "gh-runner-vm", other_vm_host.ubid],
+    ].sort_by { it[2] })
+    expect(hosts_rows.call).to eq([
+      [vm_host.ubid, "hetzner-fsn1", "accepting", "1", "1", "1", "0", "3"],
+      [other_vm_host.ubid, "hetzner-hel1", "draining", "0", "0", "0", "1", "1"],
+    ].sort_by(&:first))
+
+    expect(page).to have_no_content("other-project-vm")
   end
 
   it "converts ubids to link" do
@@ -744,6 +934,15 @@ RSpec.describe CloverAdmin do
     expect(page.title).to eq "Ubicloud Admin - VmHost #{vm_host.ubid}"
     expect(page).to have_content "SSH Command: ssh root@1.2.3.4"
 
+    project = Project.create(name: "Default")
+    vm = Prog::Vm::Nexus.assemble_with_sshable(project.id, sshable_unix_user: "ubi", name: "sshable-vm").subject
+    vm.sshable.update(host: "5.6.7.8")
+    visit "/"
+    fill_in "UBID, UUID, or prefix:term", with: vm.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - Vm #{vm.ubid}"
+    expect(page).to have_content "SSH Command: ssh ubi@5.6.7.8"
+
     visit "/"
     fill_in "UBID, UUID, or prefix:term", with: vm_pool.ubid
     click_button "Show Object"
@@ -753,20 +952,21 @@ RSpec.describe CloverAdmin do
   it "shows active pages on index page, grouped by related host" do
     expect(page).to have_no_content "Active Pages"
 
-    page1 = Page.create(summary: "some problem", tag: "a")
+    page1 = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil).subject
     page.refresh
-    expect(page).to have_content "Active Pages"
+    expect(page).to have_content "1 Active Pages"
     expect(page_data).to eq [
-      ["", page1.ubid, "some problem", "{}"],
+      ["", "some problem", "[]", "{}"],
     ]
-    click_link page1.ubid
+    click_link page1.summary
     expect(page.title).to eq "Ubicloud Admin - Page #{page1.ubid}"
 
-    page2 = Page.create(summary: "another problem", tag: "b", details: {"related_resources" => [vm_pool.ubid]})
+    Prog::PageNexus.assemble("another problem", %w[b].freeze, vm_pool.ubid, resource_id: nil).subject
     visit "/"
+    expect(page).to have_content "2 Active Pages"
     expect(page_data).to eq [
-      ["", page1.ubid, "some problem", "{}"],
-      [page2.ubid, "another problem", "{\"related_resources\" => [\"#{vm_pool.ubid}\"]}"],
+      ["", "some problem", "[]", "{}"],
+      ["another problem", "[\"#{vm_pool.ubid}\"]", "{}"],
     ]
     click_link vm_pool.ubid
     expect(page.title).to eq "Ubicloud Admin - VmPool #{vm_pool.ubid}"
@@ -775,12 +975,13 @@ RSpec.describe CloverAdmin do
     pj = Project.create(name: "test")
     vm = Prog::Vm::Nexus.assemble("a a", pj.id).subject
     vm.update(vm_host_id: vmh.id)
-    page3 = Page.create(summary: "third problem", tag: "c", details: {"related_resources" => [vm.ubid]})
+    Prog::PageNexus.assemble("third problem", %w[c].freeze, vm.ubid, resource_id: nil).subject
     visit "/"
+    expect(page).to have_content "3 Active Pages"
     expect(page_data).to eq [
-      [vmh.ubid, page3.ubid, "third problem", "{\"related_resources\" => [\"#{vm.ubid}\"]}"],
-      ["", page1.ubid, "some problem", "{}"],
-      [page2.ubid, "another problem", "{\"related_resources\" => [\"#{vm_pool.ubid}\"]}"],
+      [vmh.ubid, "third problem", "[\"#{vm.ubid}\"]", "{}"],
+      ["", "some problem", "[]", "{}"],
+      ["another problem", "[\"#{vm_pool.ubid}\"]", "{}"],
     ]
 
     click_link vmh.ubid
@@ -789,6 +990,128 @@ RSpec.describe CloverAdmin do
     visit "/"
     click_link vm.ubid
     expect(page.title).to eq "Ubicloud Admin - Vm #{vm.ubid}"
+  end
+
+  it "omits the backtrace from the details of active pages on index page" do
+    page1 = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil, extra_data: {"exception_class" => "RuntimeError", "backtrace" => ["clover.rb:1"]}).subject
+    visit "/"
+    expect(page_data).to eq [
+      ["", "some problem", "[]", "{\"exception_class\" => \"RuntimeError\"}"],
+    ]
+    expect(page).to have_no_content "clover.rb:1"
+
+    click_link page1.summary
+    expect(page).to have_content "clover.rb:1"
+  end
+
+  it "hides snoozed pages on index page and shows a note about them" do
+    page1 = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil).subject
+    page2 = Prog::PageNexus.assemble("another problem", %w[b].freeze, nil, resource_id: nil).subject
+    visit "/"
+    expect(page).to have_content "2 Active Pages"
+    expect(page).to have_no_content "snoozed page"
+
+    PageSnooze.create(page_id: page1.id, snooze_until: Time.now + 3600, snoozed_by: "admin", note: "waiting")
+    visit "/"
+    expect(page).to have_content "1 Active Pages"
+    expect(page).to have_no_content "some problem"
+    expect(page).to have_content "See 1 more snoozed page"
+
+    PageSnooze.create(page_id: page2.id, snooze_until: Time.now + 3600, snoozed_by: "admin", note: "waiting")
+    visit "/"
+    expect(page).to have_no_content "Active Pages"
+    expect(page).to have_content "See 2 more snoozed pages"
+
+    PageSnooze.where(page_id: page1.id).update(snooze_until: Time.now - 60)
+    visit "/"
+    expect(page).to have_content "1 Active Pages"
+    expect(page).to have_content "some problem"
+    expect(page).to have_content "See 1 more snoozed page"
+  end
+
+  it "lists snoozed pages, reporting the snooze that keeps each hidden" do
+    page1 = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil).subject
+    page2 = Prog::PageNexus.assemble("another problem", %w[b].freeze, nil, resource_id: nil).subject
+    visit "/snoozed-pages"
+    expect(page.title).to eq "Ubicloud Admin - Snoozed Pages"
+    expect(page).to have_content "No data available for Snoozed Pages table"
+
+    long_snooze = PageSnooze.create(page_id: page1.id, snooze_until: Time.now + 7200, snoozed_by: "admin", note: "waiting on Hadi")
+    PageSnooze.create(page_id: page1.id, snooze_until: Time.now + 1800, snoozed_by: "someone", note: "shorter, later snooze")
+    short_snooze = PageSnooze.create(page_id: page2.id, snooze_until: Time.now + 900, snoozed_by: "admin", note: "replication lag")
+
+    visit "/"
+    click_link "See 2 more snoozed pages"
+    expect(page.title).to eq "Ubicloud Admin - Snoozed Pages"
+    expect(page.all(".snoozed-page-table tbody tr").map { it.all("td").map(&:text) }).to eq [
+      ["another problem", page2.created_at.strftime("%F %T"), short_snooze.snooze_until.strftime("%F %T"), "admin", "replication lag", ""],
+      ["some problem", page1.created_at.strftime("%F %T"), long_snooze.snooze_until.strftime("%F %T"), "admin", "waiting on Hadi", ""],
+    ]
+
+    click_link "some problem"
+    expect(page.title).to eq "Ubicloud Admin - Page #{page1.ubid}"
+  end
+
+  it "unsnoozes a page, ending every snooze still hiding it" do
+    page1 = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil).subject
+    # The created_at default is the transaction timestamp. All rows in one
+    # spec get the same value. Set created_at to put these two rows in order.
+    PageSnooze.create(page_id: page1.id, created_at: Time.now - 3600, snooze_until: Time.now + 7200, snoozed_by: "admin", note: "waiting on Hadi")
+    PageSnooze.create(page_id: page1.id, snooze_until: Time.now + 1800, snoozed_by: "someone", note: "overlapping snooze")
+
+    visit "/snoozed-pages"
+    within(".snoozed-page-table") { click_button "Unsnooze" }
+    expect(page).to have_flash_notice("Page unsnoozed")
+    # The action returns to the Page. The Page keeps the snooze rows.
+    expect(page.title).to eq "Ubicloud Admin - Page #{page1.ubid}"
+    notes = page.all(".page-snooze-table td:last-child").map(&:text)
+    expect(notes).to eq ["overlapping snooze", "waiting on Hadi"]
+
+    visit "/snoozed-pages"
+    expect(page).to have_content "No data available for Snoozed Pages table"
+
+    visit "/"
+    expect(page).to have_content "1 Active Pages"
+    expect(page).to have_content "some problem"
+    expect(page).to have_no_content "snoozed page"
+  end
+
+  it "unsnoozes a page from its own detail page" do
+    page1 = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil).subject
+    PageSnooze.create(page_id: page1.id, snooze_until: Time.now + 7200, snoozed_by: "admin", note: "waiting")
+
+    visit "/model/Page/#{page1.ubid}"
+    within("#action-list") { click_button "Unsnooze" }
+    expect(page).to have_flash_notice("Page unsnoozed")
+
+    visit "/"
+    expect(page).to have_content "some problem"
+    expect(page).to have_no_content "snoozed page"
+  end
+
+  it "counts snoozed info pages separately from the other snoozed pages" do
+    info_page = Prog::PageNexus.assemble("info problem", %w[c].freeze, nil, resource_id: nil, severity: "info").subject
+    other_info_page = Prog::PageNexus.assemble("another notice", %w[d].freeze, nil, resource_id: nil, severity: "info").subject
+    error_page = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil).subject
+    visit "/"
+    expect(page).to have_css("h2", text: "Info Pages")
+    expect(page).to have_content "info problem"
+    expect(page).to have_no_content "snoozed"
+
+    PageSnooze.create(page_id: info_page.id, snooze_until: Time.now + 3600, snoozed_by: "admin", note: "low priority")
+    PageSnooze.create(page_id: error_page.id, snooze_until: Time.now + 3600, snoozed_by: "admin", note: "waiting")
+    visit "/"
+    expect(page).to have_no_content "info problem"
+    expect(page.find_by_id("snoozed-pages-note").text).to eq "See 1 more snoozed page"
+    expect(page.find_by_id("snoozed-info-pages-note").text).to eq "See 1 more snoozed info page"
+    expect(page).to have_content "another notice"
+
+    # The section stays when all info pages are snoozed. Only the note shows.
+    PageSnooze.create(page_id: other_info_page.id, snooze_until: Time.now + 3600, snoozed_by: "admin", note: "low priority")
+    visit "/"
+    expect(page).to have_css("h2", text: "Info Pages")
+    expect(page).to have_no_css(".info-page-table")
+    expect(page.find_by_id("snoozed-info-pages-note").text).to eq "See 2 more snoozed info pages"
   end
 
   it "handles request for invalid ubid" do
@@ -804,8 +1127,8 @@ RSpec.describe CloverAdmin do
 
   it "handles request for invalid model or missing object" do
     %w[/model/Foo/ts1cyaqvp5ha6j5jt8ypbyagw9
-      /model/ArchivedRecord/ts1cyaqvp5ha6j5jt8ypbyagw9
-      /model/SubjectTag/ts1cyaqvp5ha6j5jt8ypbyagw9].each do |path|
+      /model/DeletedRecord/ts1cyaqvp5ha6j5jt8ypbyagw9
+      /model/SubjectTag/ts1cyaqvp5ha6j5jt8ypbyagw9].freeze.each do |path|
       expect { visit path }.to raise_error(RuntimeError, "admin route not handled: #{path}")
     end
   end
@@ -815,11 +1138,22 @@ RSpec.describe CloverAdmin do
   end
 
   it "shows 404 page if DONT_RAISE_ADMIN_ERRORS environment variable is set" do
-    ENV["DONT_RAISE_ADMIN_ERRORS"] = "1"
-    visit "/invalid-page"
-    expect(page.title).to eq "Ubicloud Admin - File Not Found"
-  ensure
-    ENV.delete("DONT_RAISE_ADMIN_ERRORS")
+    dont_raise_admin_errors do
+      visit "/invalid-page"
+      expect(page.title).to eq "Ubicloud Admin - File Not Found"
+    end
+  end
+
+  it "links to archived-record-by-id on 404 when path contains ubid" do
+    dont_raise_admin_errors do
+      vm = create_vm(name: "life-after-death")
+      visit "/model/Vm/#{vm.ubid}"
+      expect(page).to have_content("life-after-death")
+      vm.destroy
+      visit "/model/Vm/#{vm.ubid}"
+      click_link "searching archived records"
+      expect(page).to have_content("life-after-death")
+    end
   end
 
   it "raises errors by default in tests" do
@@ -827,12 +1161,11 @@ RSpec.describe CloverAdmin do
   end
 
   it "shows error page for errors if DONT_RAISE_ADMIN_ERRORS environment variable is set" do
-    ENV["DONT_RAISE_ADMIN_ERRORS"] = "1"
-    expect(Clog).to receive(:emit).with("admin route exception", instance_of(Hash)).and_call_original
-    visit "/error"
-    expect(page.title).to eq "Ubicloud Admin - Internal Server Error"
-  ensure
-    ENV.delete("DONT_RAISE_ADMIN_ERRORS")
+    dont_raise_admin_errors do
+      expect(Clog).to receive(:emit).with("admin route exception", instance_of(Hash)).and_call_original
+      visit "/error"
+      expect(page.title).to eq "Ubicloud Admin - Internal Server Error"
+    end
   end
 
   it "handles incorrect/missing CSRF tokens" do
@@ -1016,6 +1349,48 @@ RSpec.describe CloverAdmin do
     expect(boot_image.reload.activated_at).to be_nil
   end
 
+  it "supports adding DNS records to zones and deleteing DNS records" do
+    project = Project.create(name: "dns-test")
+    dns_zone = DnsZone.create(name: "test.example.com", project_id: project.id)
+    Strand.create_with_id(dns_zone.id, prog: "DnsZone::DnsZoneNexus", label: "start")
+
+    visit "/model/DnsZone/#{dns_zone.ubid}"
+    expect(page.title).to eq "Ubicloud Admin - DnsZone #{dns_zone.ubid}"
+
+    click_link "Add DNS Record"
+    fill_in "name (without zone)", with: "t"
+    fill_in "type", with: "A"
+    fill_in "data", with: "1.2.3.4"
+    fill_in "ttl", with: "90"
+    click_button "Add DNS Record"
+    expect(page.title).to eq "Ubicloud Admin - DnsZone #{dns_zone.ubid}"
+    expect(page).to have_flash_notice("Added DNS Record")
+    expect(dns_zone.reload.refresh_dns_servers_set?).to be true
+    expect(dns_zone.records.length).to eq 1
+    record = dns_zone.records.first
+    expect(record.name).to eq "t.test.example.com."
+    expect(record.type).to eq "A"
+    expect(record.data).to eq "1.2.3.4"
+    expect(record.ttl).to eq 90
+    expect(record.tombstoned).to be false
+
+    Semaphore.where(name: "refresh_dns_servers").delete
+    visit "/model/DnsRecord/#{record.ubid}"
+    expect(page.title).to eq "Ubicloud Admin - DnsRecord #{record.ubid}"
+    click_link "Delete DNS Record"
+    click_button "Delete DNS Record"
+    expect(page.title).to eq "Ubicloud Admin - DnsRecord #{record.ubid}"
+    expect(page).to have_flash_notice("Deleted DNS Record")
+    expect(dns_zone.reload.refresh_dns_servers_set?).to be true
+    expect(dns_zone.records.length).to eq 2
+    record = dns_zone.records.find { it.id != record.id }
+    expect(record.name).to eq "t.test.example.com."
+    expect(record.type).to eq "A"
+    expect(record.data).to eq "1.2.3.4"
+    expect(record.ttl).to eq 90
+    expect(record.tombstoned).to be true
+  end
+
   it "supports restarting Vms" do
     vm = Prog::Vm::Nexus.assemble("dummy-public key", Project.create(name: "Default").id, name: "dummy-vm-1").subject
     fill_in "UBID, UUID, or prefix:term", with: vm.ubid
@@ -1044,6 +1419,73 @@ RSpec.describe CloverAdmin do
     expect(vm.semaphores_dataset.select_order_map(:name)).to eq ["admin_stop", "stop"]
   end
 
+  it "supports preparing metal Vms to move" do
+    vm = Prog::Vm::Nexus.assemble("dummy-public key", Project.create(name: "Default").id, name: "dummy-vm-1").subject
+    fill_in "UBID, UUID, or prefix:term", with: vm.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - Vm #{vm.ubid}"
+
+    expect(vm.semaphores_dataset.select_map(:name)).to eq []
+    click_link "Prepare to Move"
+    click_button "Prepare to Move"
+    expect(page).to have_flash_notice("Prepare to move scheduled for Vm")
+    expect(page.title).to eq "Ubicloud Admin - Vm #{vm.ubid}"
+    expect(vm.semaphores_dataset.select_order_map(:name)).to eq ["prepare_to_move", "stop"]
+  end
+
+  it "does not support preparing non-metal Vms to move" do
+    dont_raise_admin_errors do
+      location = Location.create(name: "l1", display_name: "l1", ui_name: "l1", visible: true, provider: "aws")
+      vm = create_vm(location_id: location.id)
+      visit "/model/Vm/#{vm.ubid}/prepare_to_move"
+      click_button "Prepare to Move"
+      expect(page).to have_content "InvalidRequest: Prepare to move is only supported for metal Vms"
+      expect(vm.semaphores_dataset.select_map(:name)).to eq []
+    end
+  end
+
+  it "supports moving a Vm ready to move to a host in the same location" do
+    vm = create_archive_ready_vm(name: "test-name", public_key: "a a")
+    vm.incr_prepare_to_move
+    vm.strand.update(label: "stopped_by_admin")
+    vm.vm_host.update(total_cpus: 24)
+    private_subnet = PrivateSubnet.create(name: "ps", location_id: Location::HETZNER_FSN1_ID, net6: "fd10:9b0b:6b4b:8fbb::/64",
+      net4: "1.1.1.0/26", state: "waiting", project_id: vm.project_id)
+    Nic.create(private_subnet_id: private_subnet.id, private_ipv6: "fd10:9b0b:6b4b:8fbb:abc::", private_ipv4: "10.0.0.1",
+      mac: "00:00:00:00:00:00", encryption_key: "0x736f6d655f656e6372797074696f6e5f6b6579", name: "old-vm-nic",
+      vm_id: vm.id, state: "active")
+    create_vm_host(location_id: Location::HETZNER_HEL1_ID)
+    VhostBlockBackend.create(version: "0.5.1", allocation_weight: 100, vm_host_id: vm.vm_host_id)
+
+    fill_in "UBID, UUID, or prefix:term", with: vm.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - Vm #{vm.ubid}"
+
+    click_link "Move to Host"
+    expect(page.all("select[name=vm_host_id] option").map(&:text)).to eq ["", vm.vm_host.ubid]
+    select vm.vm_host.ubid
+    click_button "Move to Host"
+    expect(page).to have_flash_notice("Vm move scheduled")
+    expect(page.title).to eq "Ubicloud Admin - Vm #{vm.ubid}"
+
+    expect(vm.reload.name).to start_with("moving-with-")
+    new_vm = Vm.first(name: "test-name")
+    expect(new_vm.id).not_to eq vm.id
+    expect(new_vm.strand.stack.first["force_host_id"]).to eq vm.vm_host_id
+  end
+
+  it "does not support moving a Vm that is not ready to move" do
+    dont_raise_admin_errors do
+      vm = create_archive_ready_vm(name: "test-name", public_key: "a a")
+
+      visit "/model/Vm/#{vm.ubid}/move"
+      select vm.vm_host.ubid
+      click_button "Move to Host"
+      expect(page).to have_flash_error("Vm is not ready to move")
+      expect(page.title).to eq "Ubicloud Admin - Vm #{vm.ubid}"
+    end
+  end
+
   it "supports restarting PostgresResource" do
     project_id = Project.create(name: "Default").id
     expect(Config).to receive(:postgres_service_project_id).and_return(project_id).at_least(:once)
@@ -1058,12 +1500,12 @@ RSpec.describe CloverAdmin do
     click_button "Show Object"
     expect(page.title).to eq "Ubicloud Admin - PostgresResource #{pg.ubid}"
 
-    expect(Semaphore.where(strand_id: pg.servers_dataset.select_map(:id)).select_map(:name)).to eq []
+    expect(Semaphore.where(strand_id: pg.servers_dataset.select_map(:id)).select_order_map(:name)).to eq ["initial_provisioning"]
     click_link "Restart"
     click_button "Restart"
     expect(page).to have_flash_notice("Restart scheduled for PostgresResource")
     expect(page.title).to eq "Ubicloud Admin - PostgresResource #{pg.ubid}"
-    expect(Semaphore.where(strand_id: pg.servers_dataset.select_map(:id)).select_map(:name)).to eq ["restart"]
+    expect(Semaphore.where(strand_id: pg.servers_dataset.select_map(:id)).select_order_map(:name)).to eq ["initial_provisioning", "restart"]
   end
 
   it "supports moving VmHost to draining/accepting state" do
@@ -1078,12 +1520,29 @@ RSpec.describe CloverAdmin do
     expect(page).to have_flash_notice("Host allocation state changed to draining")
     expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
     expect(vmh.reload.allocation_state).to eq "draining"
+    expect(find_by_id("action-list").all("a").map(&:text)).to eq ["Move to Accepting", "Reboot", "Move to Location", "Force Create VM", "Download Boot Image"]
 
     click_link "Move to Accepting"
     click_button "Move to Accepting"
     expect(page).to have_flash_notice("Host allocation state changed to accepting")
     expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
     expect(vmh.reload.allocation_state).to eq "accepting"
+    expect(find_by_id("action-list").all("a").map(&:text)).to eq ["Move to Draining", "Reboot", "Move to Location", "Force Create VM", "Download Boot Image"]
+  end
+
+  it "does not allow moving a VmHost to the allocation state it already has" do
+    vmh = Prog::Vm::HostNexus.assemble("127.0.0.2").subject
+    vmh.update(allocation_state: "draining")
+    visit "/model/VmHost/#{vmh.ubid}/accept"
+    vmh.update(allocation_state: "accepting")
+
+    dont_raise_admin_errors do
+      click_button "Move to Accepting"
+      expect(page.title).to eq "Ubicloud Admin - File Not Found"
+
+      visit "/model/VmHost/#{vmh.ubid}/accept"
+      expect(page.title).to eq "Ubicloud Admin - File Not Found"
+    end
   end
 
   it "supports rebooting VmHosts" do
@@ -1102,6 +1561,11 @@ RSpec.describe CloverAdmin do
 
   it "supports hardware reseting VmHosts" do
     vmh = Prog::Vm::HostNexus.assemble("127.0.0.2").subject
+    HostProvider.create do
+      it.id = vmh.id
+      it.server_identifier = "123"
+      it.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+    end
     fill_in "UBID, UUID, or prefix:term", with: vmh.ubid
     click_button "Show Object"
     expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
@@ -1112,6 +1576,87 @@ RSpec.describe CloverAdmin do
     expect(page).to have_flash_notice("Hardware reset scheduled for VmHost")
     expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
     expect(vmh.semaphores_dataset.select_map(:name)).to eq ["hardware_reset"]
+  end
+
+  it "does not offer provider-backed actions for VmHosts without a provider" do
+    vmh = Prog::Vm::HostNexus.assemble("127.0.0.2").subject
+    fill_in "UBID, UUID, or prefix:term", with: vmh.ubid
+    click_button "Show Object"
+    expect(find_by_id("action-list").all("a").map(&:text)).not_to include("Hardware Reset", "Power On", "Power Status")
+
+    dont_raise_admin_errors do
+      %w[reset power_on power_status].each do |key|
+        visit "/model/VmHost/#{vmh.ubid}/#{key}"
+        expect(page.title).to eq "Ubicloud Admin - File Not Found"
+      end
+    end
+  end
+
+  it "supports powering on VmHosts" do
+    vmh = Prog::Vm::HostNexus.assemble("127.0.0.2").subject
+    HostProvider.create do
+      it.id = vmh.id
+      it.server_identifier = "123"
+      it.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+    end
+    allow(Config).to receive_messages(
+      hetzner_connection_string: "https://robot-ws.your-server.de",
+      hetzner_user: "user1",
+      hetzner_password: "pass",
+    )
+    stub_request(:get, "https://robot-ws.your-server.de/reset/123").to_return(status: 200, body: JSON.generate(reset: {operating_status: "shut off"}))
+    stub_request(:post, "https://robot-ws.your-server.de/reset/123").with(body: "type=power").to_return(status: 200, body: "")
+
+    fill_in "UBID, UUID, or prefix:term", with: vmh.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
+
+    click_link "Power On"
+    click_button "Power On"
+    expect(page).to have_flash_notice("Power on requested for VmHost")
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
+  end
+
+  it "supports showing power status of VmHosts" do
+    vmh = Prog::Vm::HostNexus.assemble("127.0.0.2").subject
+    HostProvider.create do
+      it.id = vmh.id
+      it.server_identifier = "123"
+      it.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+    end
+    allow(Config).to receive_messages(
+      hetzner_connection_string: "https://robot-ws.your-server.de",
+      hetzner_user: "user1",
+      hetzner_password: "pass",
+    )
+    stub_request(:get, "https://robot-ws.your-server.de/reset/123").to_return(status: 200, body: JSON.generate(reset: {operating_status: "shut off"}))
+
+    fill_in "UBID, UUID, or prefix:term", with: vmh.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
+
+    click_link "Power Status"
+    expect(page).to have_content("Power status: shut off")
+  end
+
+  it "supports provisioning spare GitHubRunners for all runners on a VmHost" do
+    vmh = create_vm_host
+    ins = GithubInstallation.create(installation_id: 123, name: "test-installation", type: "User")
+    create_vm(vm_host_id: vmh.id, name: "customer-vm")
+    2.times do |i|
+      runner_vm = create_vm(vm_host_id: vmh.id, name: "runner-vm-#{i}")
+      GithubRunner.create(repository_name: "test-repo-#{i}", label: "ubicloud", installation_id: ins.id, vm_id: runner_vm.id, location_id: runner_vm.location_id)
+    end
+
+    fill_in "UBID, UUID, or prefix:term", with: vmh.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
+
+    click_button "Provision Spare Runners"
+    expect(page).to have_flash_notice("Spare runners provisioned for GitHub runners on this host")
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
+    expect(GithubRunner.where(vm_id: nil).select_order_map([:repository_name, :label]))
+      .to eq [["test-repo-0", "ubicloud"], ["test-repo-1", "ubicloud"]]
   end
 
   it "supports moving VmHost to a non-github location and downloading boot images" do
@@ -1129,7 +1674,7 @@ RSpec.describe CloverAdmin do
 
     download_strands = Strand.where(prog: "DownloadBootImage").all
     downloaded_names = download_strands.map { it.stack.first["image_name"] }.sort
-    expect(downloaded_names).to eq %w[almalinux-9 debian-12 github-ubuntu-2204 github-ubuntu-2404 postgres-ubuntu-2204 ubuntu-jammy ubuntu-noble]
+    expect(downloaded_names).to eq %w[almalinux-9 debian-12 github-ubuntu-2204 github-ubuntu-2404 postgres-ubuntu-2204 postgres-ubuntu-2604 ubuntu-jammy ubuntu-noble].freeze
   end
 
   it "supports moving VmHost to github-runners location and downloading github images" do
@@ -1147,7 +1692,182 @@ RSpec.describe CloverAdmin do
 
     download_strands = Strand.where(prog: "DownloadBootImage").all
     downloaded_names = download_strands.map { it.stack.first["image_name"] }.sort
-    expect(downloaded_names).to eq %w[github-ubuntu-2204 github-ubuntu-2404]
+    expect(downloaded_names).to eq %w[github-ubuntu-2204 github-ubuntu-2404].freeze
+  end
+
+  it "shows information on presigned certs" do
+    click_link "Presigned Certs Info"
+    expect(page.title).to eq "Ubicloud Admin - Presigned Certs"
+
+    expect(page.all("table.presigned-certs tbody td").map(&:text)).to eq [
+      "presigned_postgres_cert", "0", "", "",
+      "presigned_load_balancer_cert", "0", "", "",
+    ]
+
+    t1 = Time.local(2026, 8, 13, 12)
+    DB[:presigned_postgres_cert].insert(
+      postgres_resource_id: PostgresResource.generate_uuid,
+      cert_id: Cert.create(hostname: "test.example.com").id,
+      created_at: t1,
+    )
+
+    page.refresh
+    expect(page.all("table.presigned-certs tbody td").map(&:text)).to eq [
+      "presigned_postgres_cert", "1", t1.strftime("%F %T"), t1.strftime("%F %T"),
+      "presigned_load_balancer_cert", "0", "", "",
+    ]
+
+    t2 = Time.local(2026, 8, 14, 12)
+    DB[:presigned_postgres_cert].insert(
+      postgres_resource_id: PostgresResource.generate_uuid,
+      cert_id: Cert.create(hostname: "test.example.com").id,
+      created_at: t2,
+    )
+
+    page.refresh
+    expect(page.all("table.presigned-certs tbody td").map(&:text)).to eq [
+      "presigned_postgres_cert", "2", t1.strftime("%F %T"), t2.strftime("%F %T"),
+      "presigned_load_balancer_cert", "0", "", "",
+    ]
+  end
+
+  it "supports force creating a VM on a VmHost" do
+    vmh = create_vm_host
+    BootImage.create(vm_host_id: vmh.id, name: "ubuntu-jammy", version: "1", size_gib: 14, activated_at: Time.now)
+    project = Project.create(name: "force-vm-project")
+
+    fill_in "UBID, UUID, or prefix:term", with: vmh.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
+
+    click_link "Force Create VM"
+    fill_in "project_id", with: project.ubid
+    fill_in "public_key", with: "ssh-ed25519 key"
+    fill_in "name", with: "forced-vm"
+    select "standard-2", from: "size"
+    select "ubuntu-jammy", from: "boot_image"
+    click_button "Force Create VM"
+    expect(page).to have_flash_notice("VM creation scheduled")
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
+
+    vm = Vm[name: "forced-vm"]
+    expect(vm).not_to be_nil
+    expect(vm.project_id).to eq project.id
+    expect(vm.boot_image).to eq "ubuntu-jammy"
+    expect(vm.location_id).to eq vmh.location_id
+    expect(vm.arch).to eq vmh.arch
+    expect(vm.ip4_enabled).to be true
+    expect(Strand[vm.id].stack.first["force_host_id"]).to eq vmh.id
+    expect(vm.vm_storage_volumes.map(&:size_gib)).to eq [40]
+  end
+
+  it "supports force creating a VM with a custom storage size on a VmHost" do
+    vmh = create_vm_host
+    BootImage.create(vm_host_id: vmh.id, name: "github-ubuntu-2404", version: "1", size_gib: 75, activated_at: Time.now)
+    project = Project.create(name: "force-vm-project")
+
+    visit "/model/VmHost/#{vmh.ubid}/force_create_vm"
+    fill_in "project_id", with: project.ubid
+    fill_in "public_key", with: "ssh-ed25519 key"
+    fill_in "name", with: "forced-vm"
+    select "standard-2", from: "size"
+    select "github-ubuntu-2404", from: "boot_image"
+    fill_in "storage_size_gib", with: "75"
+    click_button "Force Create VM"
+    expect(page).to have_flash_notice("VM creation scheduled")
+
+    vm = Vm[name: "forced-vm"]
+    expect(vm.vm_storage_volumes.map(&:size_gib)).to eq [75]
+  end
+
+  it "offers burstable sizes for force-create VM only when host accepts slices" do
+    no_slices = create_vm_host(accepts_slices: false)
+    BootImage.create(vm_host_id: no_slices.id, name: "ubuntu-jammy", version: "1", size_gib: 14, activated_at: Time.now)
+    visit "/model/VmHost/#{no_slices.ubid}/force_create_vm"
+    expect(page.all("select[name=size] option").map(&:text)).not_to include("burstable-1")
+
+    with_slices = create_vm_host(accepts_slices: true)
+    BootImage.create(vm_host_id: with_slices.id, name: "ubuntu-jammy", version: "1", size_gib: 14, activated_at: Time.now)
+    visit "/model/VmHost/#{with_slices.ubid}/force_create_vm"
+    expect(page.all("select[name=size] option").map(&:text)).to include("burstable-1")
+  end
+
+  it "deduplicates boot image options across versions in force-create VM form" do
+    vmh = create_vm_host
+    BootImage.create(vm_host_id: vmh.id, name: "ubuntu-jammy", version: "1", size_gib: 14, activated_at: Time.now)
+    BootImage.create(vm_host_id: vmh.id, name: "ubuntu-jammy", version: "2", size_gib: 14, activated_at: Time.now)
+    BootImage.create(vm_host_id: vmh.id, name: "debian-12", version: "1", size_gib: 14, activated_at: Time.now)
+    visit "/model/VmHost/#{vmh.ubid}/force_create_vm"
+    expect(page.all("select[name=boot_image] option").map(&:text)).to eq %w[debian-12 ubuntu-jammy].freeze
+  end
+
+  it "rejects force-create VM when project UBID is invalid" do
+    vmh = create_vm_host
+    BootImage.create(vm_host_id: vmh.id, name: "ubuntu-jammy", version: "1", size_gib: 14, activated_at: Time.now)
+
+    fill_in "UBID, UUID, or prefix:term", with: vmh.ubid
+    click_button "Show Object"
+
+    click_link "Force Create VM"
+    fill_in "project_id", with: "not-a-ubid"
+    fill_in "public_key", with: "ssh-ed25519 key"
+    select "standard-2", from: "size"
+    select "ubuntu-jammy", from: "boot_image"
+    click_button "Force Create VM"
+    expect(page).to have_flash_error("Invalid parameter submitted: project_id")
+    expect(Vm.count).to eq 0
+  end
+
+  it "supports downloading a boot image on a VmHost" do
+    vmh = create_vm_host
+
+    fill_in "UBID, UUID, or prefix:term", with: vmh.ubid
+    click_button "Show Object"
+
+    click_link "Download Boot Image"
+    select "ubuntu-jammy", from: "image_name"
+    fill_in "version", with: "20240701"
+    click_button "Download Boot Image"
+    expect(page).to have_flash_notice("Boot image download scheduled")
+    expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
+
+    st = Strand.first(prog: "DownloadBootImage")
+    expect(st.stack.first.values_at("subject_id", "image_name", "version")).to eq [vmh.id, "ubuntu-jammy", "20240701"]
+  end
+
+  it "downloads the default boot image version when no version is given" do
+    vmh = create_vm_host
+
+    visit "/model/VmHost/#{vmh.ubid}/download_boot_image"
+    select "ubuntu-jammy", from: "image_name"
+    click_button "Download Boot Image"
+    expect(page).to have_flash_notice("Boot image download scheduled")
+
+    st = Strand.first(prog: "DownloadBootImage")
+    expect(st.stack.first["version"]).to be_nil
+  end
+
+  it "only offers boot images available for the architecture of the VmHost" do
+    vmh = create_vm_host(arch: "arm64")
+
+    visit "/model/VmHost/#{vmh.ubid}/download_boot_image"
+    image_names = page.all("select[name=image_name] option").map(&:text)
+    expect(image_names).to include("ubuntu-jammy")
+    expect(image_names).not_to include("kubernetes-v1_35")
+  end
+
+  it "rejects boot image download for an unknown version" do
+    vmh = create_vm_host
+
+    dont_raise_admin_errors do
+      visit "/model/VmHost/#{vmh.ubid}/download_boot_image"
+      select "ubuntu-jammy", from: "image_name"
+      fill_in "version", with: "20200101"
+      click_button "Download Boot Image"
+      expect(page).to have_content "InvalidRequest: invalid version for boot image"
+    end
+
+    expect(Strand.first(prog: "DownloadBootImage")).to be_nil
   end
 
   it "supports provisioning spare GitHubRunner" do
@@ -1207,6 +1927,19 @@ RSpec.describe CloverAdmin do
     expect(page.driver.response.headers["Location"]).to eq "http://github.com/test-org"
   end
 
+  it "supports force stopping all runners for GithubInstallation" do
+    ins = GithubInstallation.create(installation_id: 123, name: "test-org", type: "Organization")
+    runner = GithubRunner.create(installation_id: ins.id, repository_name: "test-org/test-repo", label: "ubicloud")
+    Strand.create(prog: "Github::GithubRunnerNexus", label: "start") { it.id = runner.id }
+
+    visit "/model/GithubInstallation/#{ins.ubid}"
+    click_link "Force Stop All Runners"
+    click_button "Force Stop All Runners"
+    expect(page.title).to eq "Ubicloud Admin - GithubInstallation #{ins.ubid}"
+    expect(page).to have_flash_notice "Force stop scheduled for all runners of GitHub installation"
+    expect(runner.reload.semaphores.map(&:name).sort).to eq ["destroy", "skip_deregistration"]
+  end
+
   it "links to GitHub page for GithubRepository" do
     ins = GithubInstallation.create(installation_id: 123, name: "test-org", type: "Organization")
     repo = GithubRepository.create(name: "test-org/test-repo", installation_id: ins.id)
@@ -1229,20 +1962,20 @@ RSpec.describe CloverAdmin do
     click_link "Show Job Log"
     expect(page.title).to eq "Ubicloud Admin - GithubRepository #{repo.ubid}"
 
+    fill_in "job_ids", with: " "
+    click_button "Show Job Log"
+    expect(page).to have_flash_error("Invalid parameter submitted: job_ids")
+
     client = double
     expect(Github).to receive(:installation_client).and_return(client)
-    expect(client).to receive(:workflow_run_job_logs).with("test-org/test-repo", 12345).and_return("https://example.com/logs/12345.zip")
+    expect(client).to receive(:workflow_run_job_logs).with("test-org/test-repo", 12345).and_return("https://example.com/logs/12345")
 
-    fill_in "job_id", with: "bad"
+    fill_in "job_ids", with: "12345"
     click_button "Show Job Log"
-    expect(page).to have_flash_error("Invalid parameter submitted: job_id")
-
-    fill_in "job_id", with: "12345"
-    click_button "Show Job Log"
-    expect(page).to have_link("Download Job Log", href: "https://example.com/logs/12345.zip")
+    expect(page).to have_link("Job 12345: Show Log", href: "https://example.com/logs/12345")
   end
 
-  it "shows job not found for GithubRepository when job id is invalid" do
+  it "supports showing job logs for multiple job ids for GithubRepository" do
     ins = GithubInstallation.create(installation_id: 123, name: "test-org", type: "Organization")
     repo = GithubRepository.create(name: "test-org/test-repo", installation_id: ins.id)
 
@@ -1251,11 +1984,30 @@ RSpec.describe CloverAdmin do
 
     client = double
     expect(Github).to receive(:installation_client).and_return(client)
+    expect(client).to receive(:workflow_run_job_logs).with("test-org/test-repo", 12345).and_return("https://example.com/logs/12345")
     expect(client).to receive(:workflow_run_job_logs).with("test-org/test-repo", 99999).and_raise(Octokit::NotFound)
 
-    fill_in "job_id", with: "99999"
+    fill_in "job_ids", with: "12345, , 99999, bad,"
     click_button "Show Job Log"
-    expect(page).to have_content("Job not found")
+    expect(page).to have_link("Job 12345: Show Log", href: "https://example.com/logs/12345")
+    expect(page).to have_content("Job 99999: Octokit::NotFound: Octokit::NotFound")
+    expect(page).to have_content("Job bad: invalid job ID")
+  end
+
+  it "shows GitHub error for GithubRepository when job id is deprecated" do
+    ins = GithubInstallation.create(installation_id: 123, name: "test-org", type: "Organization")
+    repo = GithubRepository.create(name: "test-org/test-repo", installation_id: ins.id)
+
+    visit "/model/GithubRepository/#{repo.ubid}"
+    click_link "Show Job Log"
+
+    client = double
+    expect(Github).to receive(:installation_client).and_return(client)
+    expect(client).to receive(:workflow_run_job_logs).with("test-org/test-repo", 99999).and_raise(Octokit::Deprecated)
+
+    fill_in "job_ids", with: "99999"
+    click_button "Show Job Log"
+    expect(page).to have_content("Job 99999: Octokit::Deprecated: Octokit::Deprecated")
   end
 
   it "supports suspending and unsuspending Accounts" do
@@ -1278,8 +2030,24 @@ RSpec.describe CloverAdmin do
     expect(account.reload.suspended_at).to be_nil
   end
 
+  it "supports setting the project limit of Accounts" do
+    account = create_account(with_project: false)
+    fill_in "UBID, UUID, or prefix:term", with: account.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - Account #{account.ubid}"
+    expect(object_data[:project_limit]).to eq "10"
+
+    click_link "Set Project Limit"
+    fill_in "project_limit", with: "25"
+    click_button "Set Project Limit"
+    expect(page).to have_flash_notice("Set project limit")
+    expect(page.title).to eq "Ubicloud Admin - Account #{account.ubid}"
+    expect(account.reload.project_limit).to eq 25
+    expect(object_data[:project_limit]).to eq "25"
+  end
+
   it "supports resolving Pages" do
-    p = Prog::PageNexus.assemble("XYZ has an expired deadline!", ["Deadline"], "XYZ").subject
+    p = Prog::PageNexus.assemble("XYZ has an expired deadline!", ["Deadline"], Vm.generate_ubid.to_s, resource_id: nil).subject
 
     fill_in "UBID, UUID, or prefix:term", with: p.ubid
     click_button "Show Object"
@@ -1293,19 +2061,146 @@ RSpec.describe CloverAdmin do
     expect(p.semaphores_dataset.select_map(:name)).to eq ["resolve"]
   end
 
+  it "supports retriggering Pages" do
+    p = Prog::PageNexus.assemble("XYZ has an expired deadline!", ["Deadline"], Vm.generate_ubid.to_s, resource_id: nil).subject
+
+    fill_in "UBID, UUID, or prefix:term", with: p.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - Page #{p.ubid}"
+
+    expect(p.semaphores_dataset.select_map(:name)).to eq []
+    click_link "Retrigger"
+    click_button "Retrigger"
+    expect(page).to have_flash_notice("Retrigger scheduled for Page")
+    expect(page.title).to eq "Ubicloud Admin - Page #{p.ubid}"
+    expect(p.semaphores_dataset.select_map(:name)).to eq ["retrigger"]
+  end
+
+  it "supports snoozing Pages and lists snoozes on the Page detail page" do
+    p = Prog::PageNexus.assemble("XYZ has an expired deadline!", ["Deadline"], Vm.generate_ubid.to_s, resource_id: nil).subject
+
+    fill_in "UBID, UUID, or prefix:term", with: p.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - Page #{p.ubid}"
+    expect(page).to have_no_css ".page-snooze-table"
+
+    click_link "Snooze"
+    fill_in "minutes", with: 90
+    fill_in "note", with: "waiting for replication to catch up"
+    click_button "Snooze"
+    expect(page).to have_flash_notice("Page snoozed")
+    expect(page.title).to eq "Ubicloud Admin - Page #{p.ubid}"
+
+    snooze = PageSnooze.first
+    expect(snooze.page_id).to eq p.id
+    expect(snooze.snoozed_by).to eq "admin"
+    expect(snooze.note).to eq "waiting for replication to catch up"
+    expect(snooze.snooze_until).to be_within(60).of(Time.now + 90 * 60)
+
+    visit "/model/Page/#{p.ubid}"
+    expect(page.all(".page-snooze-table td").map(&:text)).to eq [
+      "admin",
+      snooze.created_at.strftime("%F %T"),
+      snooze.snooze_until.strftime("%F %T"),
+      "waiting for replication to catch up",
+    ]
+
+    # Both snoozes get the same transaction timestamp. Change created_at to
+    # put them in order.
+    snooze.update(created_at: Time.now - 3600)
+    visit "/model/Page/#{p.ubid}/snooze"
+    fill_in "minutes", with: 30
+    fill_in "note", with: "second snooze"
+    click_button "Snooze"
+
+    visit "/model/Page/#{p.ubid}"
+    notes = page.all(".page-snooze-table td:last-child").map(&:text)
+    expect(notes).to eq ["second snooze", "waiting for replication to catch up"]
+  end
+
+  it "limits a Page snooze to 2 days" do
+    p = Prog::PageNexus.assemble("XYZ has an expired deadline!", ["Deadline"], Vm.generate_ubid.to_s, resource_id: nil).subject
+
+    visit "/model/Page/#{p.ubid}/snooze"
+    fill_in "minutes", with: 2881
+    fill_in "note", with: "too long"
+    click_button "Snooze"
+    expect(page).to have_flash_notice("Page snoozed")
+    expect(PageSnooze.first.snooze_until).to be_within(60).of(Time.now + 2880 * 60)
+  end
+
+  it "does not offer the snooze action for a resolved Page" do
+    p = Prog::PageNexus.assemble("XYZ has an expired deadline!", ["Deadline"], Vm.generate_ubid.to_s, resource_id: nil).subject
+
+    visit "/model/Page/#{p.ubid}"
+    expect(page).to have_link "Snooze"
+
+    p.resolve(notify: false)
+    visit "/model/Page/#{p.ubid}"
+    expect(page).to have_no_link "Snooze"
+    expect { visit "/model/Page/#{p.ubid}/snooze" }.to raise_error(RuntimeError, "admin route not handled: /model/Page/#{p.ubid}/snooze")
+    expect(PageSnooze.count).to eq 0
+  end
+
   it "supports adding credit to Projects" do
-    p = Project.create(name: "Default", credit: 2)
+    p = Project.create(name: "Default")
 
     fill_in "UBID, UUID, or prefix:term", with: p.ubid
     click_button "Show Object"
     expect(page.title).to eq "Ubicloud Admin - Project #{p.ubid}"
 
     click_link "Add credit"
+    expect(page.find_field("credit")["step"]).to eq "0.01"
+    fill_in "name", with: "Good behavior"
     fill_in "credit", with: "50.0"
-    expect { click_button "Add credit" }.to change { p.reload.credit }.from(2).to(52)
+    click_button "Add credit"
 
     expect(page).to have_flash_notice("Added credit")
     expect(page.title).to eq "Ubicloud Admin - Project #{p.ubid}"
+    rc = ResourceCredit.all
+    expect(rc.length).to eq 1
+    rc = rc.first
+    expect(rc.project_id).to eq p.id
+    expect(rc.amount).to eq 50
+    expect(rc.name).to eq "Good behavior"
+    t = Time.now.utc
+    expect(rc.active_from).to eq Time.utc(t.year, t.month)
+  end
+
+  it "supports updating name of ResourceCredit" do
+    p = Project.create(name: "Default")
+    rc = ResourceCredit.create(project_id: p.id, name: "Old name", amount: 10, active_from: Time.utc(2026, 1))
+
+    fill_in "UBID, UUID, or prefix:term", with: rc.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - ResourceCredit #{rc.ubid}"
+
+    click_link "Update Name"
+    expect(page).to have_field("name", with: "Old name")
+    fill_in "name", with: "New name"
+    click_button "Update Name"
+
+    expect(page).to have_flash_notice("Updated name")
+    expect(page.title).to eq "Ubicloud Admin - ResourceCredit #{rc.ubid}"
+    expect(rc.reload.name).to eq "New name"
+  end
+
+  it "supports updating name of ResourceDiscount" do
+    p = Project.create(name: "Default")
+    rd = ResourceDiscount.create(project_id: p.id, name: "Old name", discount_percent: 10, active_from: Time.utc(2026, 1))
+
+    fill_in "UBID, UUID, or prefix:term", with: rd.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - ResourceDiscount #{rd.ubid}"
+
+    click_link "Update Name"
+    expect(page).to have_field("name", with: "Old name")
+    fill_in "name", with: "New name"
+    click_button "Update Name"
+
+    expect(page).to have_flash_notice("Updated name")
+    expect(page.title).to eq "Ubicloud Admin - ResourceDiscount #{rd.ubid}"
+    expect(rd.reload.name).to eq "New name"
   end
 
   it "supports setting feature flags of Project" do
@@ -1334,14 +2229,52 @@ RSpec.describe CloverAdmin do
       expect(page.title).to eq "Ubicloud Admin - Project #{p.ubid}"
     end
 
-    ENV["DONT_RAISE_ADMIN_ERRORS"] = "1"
-    visit path
-    select "free_runner_upgrade_until", from: "name"
-    fill_in "value", with: "invalid_json"
-    click_button "Set Feature Flag"
-    expect(page).to have_content "InvalidRequest: invalid JSON for feature flag value"
-  ensure
-    ENV.delete("DONT_RAISE_ADMIN_ERRORS")
+    dont_raise_admin_errors do
+      visit path
+      select "free_runner_upgrade_until", from: "name"
+      fill_in "value", with: "invalid_json"
+      click_button "Set Feature Flag"
+      expect(page).to have_content "InvalidRequest: invalid JSON for feature flag value"
+    end
+  end
+
+  it "allows adding and removing allowed domains for OidcProviders" do
+    op = OidcProvider.create(
+      display_name: "TestOIDC",
+      client_id: "client_id_test",
+      client_secret: "client_secret_test",
+      url: "http://www.example.com",
+      authorization_endpoint: "/fake_oidc/authorize",
+      token_endpoint: "/fake_oidc/token",
+      userinfo_endpoint: "/fake_oidc/userinfo",
+      jwks_uri: "http://www.example.com/fake_oidc/jwks",
+    )
+
+    fill_in "UBID, UUID, or prefix:term", with: op.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - OidcProvider #{op.ubid}"
+    expect(page.all("#allowed-domains li").map(&:text)).to eq []
+
+    click_link "Add Allowed Domain"
+
+    fill_in "domain", with: "foo.com"
+    click_button "Add Allowed Domain"
+    expect(page).to have_flash_notice("Added allowed domain")
+    expect(op.allowed_domains).to eq ["foo.com"]
+    expect(page.all("#allowed-domains li").map(&:text)).to eq ["foo.com"]
+
+    click_link "Remove Allowed Domain"
+
+    select "foo.com"
+    click_button "Remove Allowed Domain"
+    expect(op.allowed_domains).to eq []
+    expect(page).to have_flash_notice("Removed allowed domain")
+    expect(page.all("#allowed-domains li").map(&:text)).to eq []
+
+    expect(page.all("#locked-domains li").map(&:text)).to eq []
+    LockedDomain.create(domain: "foo.com", oidc_provider_id: op.id)
+    page.refresh
+    expect(page.all("#locked-domains li").map(&:text)).to eq ["foo.com"]
   end
 
   it "supports setting quota of Project" do
@@ -1388,6 +2321,175 @@ RSpec.describe CloverAdmin do
       expect(page).to have_flash_notice("Set quota")
       expect(p.effective_quota_value("VmVCpu")).to eq(32)
     end
+  end
+
+  it "supports updating billing info of Project" do
+    p = Project.create(name: "Default")
+
+    fill_in "UBID, UUID, or prefix:term", with: p.ubid
+    click_button "Show Object"
+    expect(page.title).to eq "Ubicloud Admin - Project #{p.ubid}"
+
+    # Action is hidden when Stripe is not enabled
+    path = "/model/Project/#{p.ubid}/update_billing_info"
+    expect(page).to have_no_link("Update Billing Info")
+    expect { visit path }.to raise_error(RuntimeError, "admin route not handled: #{path}")
+
+    expect(Config).to receive(:stripe_secret_key).and_return("secret_key").at_least(:once)
+    customers_service = instance_double(Stripe::CustomerService)
+    expect(StripeClient).to receive(:customers).and_return(customers_service).at_least(:once)
+
+    # Creates billing info when the project has none
+    visit "/model/Project/#{p.ubid}"
+    click_link "Update Billing Info"
+    expect(page).to have_current_path path, ignore_query: true
+    expect(page.find_field("Billing Name").value).to be_nil
+    fill_in "Billing Name", with: "ACME Inc."
+    fill_in "Billing Email", with: "acme@example.com"
+    select "Netherlands", from: "Country"
+    fill_in "City", with: "Amsterdam"
+    fill_in "Postal Code", with: "1234 AB"
+    fill_in "Address", with: "Main Street 1"
+    fill_in "Tax ID", with: "NL-123456789B01"
+    fill_in "Company Name", with: "ACME"
+
+    expect(customers_service).to receive(:create).with({
+      name: "ACME Inc.",
+      email: "acme@example.com",
+      address: {country: "NL", state: nil, city: "Amsterdam", postal_code: "1234 AB", line1: "Main Street 1", line2: nil},
+      metadata: {tax_id: "NL123456789B01", company_name: "ACME", note: ""},
+    }).and_return({"id" => "cus_123"})
+    expect { click_button "Update Billing Info" }.to change { Strand.where(prog: "ValidateVat").count }.from(0).to(1)
+    expect(page).to have_flash_notice("Billing info updated")
+    expect(page.title).to eq "Ubicloud Admin - Project #{p.ubid}"
+    billing_info = p.reload.billing_info
+    expect(billing_info.stripe_id).to eq "cus_123"
+    expect(Strand.first(prog: "ValidateVat").stack.first["subject_id"]).to eq billing_info.id
+
+    # Prefills form and updates existing billing info without resetting
+    # VAT validity when the tax id is unchanged
+    billing_info.update(valid_vat: true)
+    expect(customers_service).to receive(:retrieve).with("cus_123").at_least(:once).and_return(
+      "name" => "ACME Inc.",
+      "email" => "acme@example.com",
+      "address" => {"line1" => "Main Street 1", "country" => "NL", "city" => "Amsterdam", "postal_code" => "1234 AB"},
+      "metadata" => {"tax_id" => "NL123456789B01", "company_name" => "ACME", "note" => ""},
+    )
+    visit path
+    expect(page).to have_field("Billing Name", with: "ACME Inc.")
+    expect(page).to have_select("Country", selected: "Netherlands")
+    expect(page).to have_field("Tax ID", with: "NL123456789B01")
+
+    fill_in "Billing Name", with: "New Name"
+    expect(customers_service).to receive(:update).with("cus_123", {
+      name: "New Name",
+      email: "acme@example.com",
+      address: {country: "NL", state: nil, city: "Amsterdam", postal_code: "1234 AB", line1: "Main Street 1", line2: nil},
+      metadata: {tax_id: "NL123456789B01", company_name: "ACME", note: ""},
+    })
+    expect { click_button "Update Billing Info" }.not_to change { Strand.where(prog: "ValidateVat").count }
+    expect(page).to have_flash_notice("Billing info updated")
+    expect(billing_info.reload.valid_vat).to be true
+
+    # Resets VAT validity when the tax id changes, without scheduling
+    # validation for a blank tax id
+    visit path
+    fill_in "Tax ID", with: ""
+    expect(customers_service).to receive(:update).with("cus_123", {
+      name: "ACME Inc.",
+      email: "acme@example.com",
+      address: {country: "NL", state: nil, city: "Amsterdam", postal_code: "1234 AB", line1: "Main Street 1", line2: nil},
+      metadata: {tax_id: "", company_name: "ACME", note: ""},
+    })
+    expect { click_button "Update Billing Info" }.not_to change { Strand.where(prog: "ValidateVat").count }
+    expect(page).to have_flash_notice("Billing info updated")
+    expect(billing_info.reload.valid_vat).to be_nil
+
+    visit path
+    fill_in "Billing Email", with: "invalid"
+    expect(customers_service).to receive(:update).and_raise(Stripe::InvalidRequestError.new("Invalid email address: invalid", "email"))
+    expect { click_button "Update Billing Info" }.to raise_error(CloverError, "Invalid email address: invalid")
+  end
+
+  it "supports charging the card of a Project" do
+    billing_info = BillingInfo.create(stripe_id: "cus_123")
+    p = Project.create(name: "Default", billing_info_id: billing_info.id)
+    path = "/model/Project/#{p.ubid}/charge_card"
+    PaymentMethod.create(billing_info_id: billing_info.id, stripe_id: "pm_old", created_at: Time.now - 60)
+    PaymentMethod.create(billing_info_id: billing_info.id, stripe_id: "pm_new")
+
+    # Action is unavailable when Stripe is not enabled
+    expect { visit path }.to raise_error(RuntimeError, "admin route not handled: #{path}")
+
+    expect(Config).to receive(:stripe_secret_key).and_return("secret_key").at_least(:once)
+    customers_service = instance_double(Stripe::CustomerService)
+    expect(StripeClient).to receive(:customers).and_return(customers_service).at_least(:once)
+    expect(customers_service).to receive(:retrieve).with("cus_123").and_return({"name" => "ACME Inc.", "address" => {"country" => "US"}}).at_least(:once)
+    payment_intents_service = instance_double(Stripe::PaymentIntentService)
+    expect(StripeClient).to receive(:payment_intents).and_return(payment_intents_service).at_least(:once)
+
+    # Action is unavailable when the project has no payment method
+    no_card_path = "/model/Project/#{Project.create(name: "NoCard").ubid}/charge_card"
+    expect { visit no_card_path }.to raise_error(RuntimeError, "admin route not handled: #{no_card_path}")
+
+    BillingRecord.create(
+      project_id: p.id,
+      resource_id: GithubRunner.generate_uuid,
+      resource_name: "runner",
+      span: Sequel::Postgres::PGRange.new(Time.now, Time.now + 1),
+      billing_rate_id: BillingRate.from_resource_properties("GitHubRunnerMinutes", "standard-2", "global")["id"],
+      amount: 11992,
+    )
+    intent_params = {currency: "usd", confirm: true, off_session: true, customer: "cus_123", payment_method: "pm_new"}
+
+    # Rejects an amount below the minimum charge
+    visit path
+    fill_in "amount", with: "0.49"
+    expect { click_button "Charge Card" }.to raise_error(CloverError, "Amount must be at least 0.5")
+
+    # Shows a flash error when the charge does not succeed
+    visit path
+    fill_in "amount", with: "20"
+    expect(payment_intents_service).to receive(:create).with({amount: 2000, **intent_params}).and_raise(Stripe::CardError.new("Your card was declined.", {}))
+    click_button "Charge Card"
+    expect(page).to have_flash_error("Charge failed: Your card was declined.")
+    expect(page.title).to eq "Ubicloud Admin - Project #{p.ubid}"
+
+    visit path
+    fill_in "amount", with: "30"
+    expect(payment_intents_service).to receive(:create).with({amount: 3000, **intent_params}).and_return(Stripe::PaymentIntent.construct_from(id: "pi_123", status: "processing"))
+    click_button "Charge Card"
+    expect(page).to have_flash_error("Payment intent pi_123 has status processing")
+    expect(page.title).to eq "Ubicloud Admin - Project #{p.ubid}"
+    expect(ResourceCredit.all).to eq []
+    expect(p.reload.reputation).to eq "new"
+
+    # Prefills the amount with the current usage
+    visit "/model/Project/#{p.ubid}"
+    click_link "Charge Card"
+    expect(page).to have_field("amount", with: "12.49")
+    expect(payment_intents_service).to receive(:create).with({amount: 1249, **intent_params}).and_return(Stripe::PaymentIntent.construct_from(id: "pi_456", status: "succeeded"))
+    expect(Clog).to receive(:emit).with("Project card charged", {project_card_charged: {ubid: p.ubid, amount: 12.49, intent_id: "pi_456", admin: "admin"}}).and_call_original
+    click_button "Charge Card"
+    expect(page).to have_flash_notice("Charged card and added prepaid credit")
+    expect(page.title).to eq "Ubicloud Admin - Project #{p.ubid}"
+    credit = ResourceCredit.first
+    expect(credit.project_id).to eq p.id
+    expect(credit.name).to eq "Prepaid Credit"
+    expect(credit.amount).to eq 12.49
+    t = Time.now.utc
+    expect(credit.active_from).to eq Time.utc(t.year, t.month)
+    expect(p.reload.reputation).to eq "verified"
+
+    # Charges a custom amount
+    click_link "Charge Card"
+    expect(page).to have_field("amount", with: "0.0")
+    fill_in "amount", with: "19.99"
+    expect(payment_intents_service).to receive(:create).with({amount: 1999, **intent_params}).and_return(Stripe::PaymentIntent.construct_from(id: "pi_789", status: "succeeded"))
+    expect(Clog).to receive(:emit).with("Project card charged", {project_card_charged: {ubid: p.ubid, amount: 19.99, intent_id: "pi_789", admin: "admin"}}).and_call_original
+    click_button "Charge Card"
+    expect(page).to have_flash_notice("Charged card and added prepaid credit")
+    expect(ResourceCredit.select_order_map(:amount)).to eq [12.49, 19.99]
   end
 
   it "lists multiple info pages with proper links and content in table format" do
@@ -1448,6 +2550,703 @@ RSpec.describe CloverAdmin do
     expect(created_at_cell).to have_content(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/)
   end
 
+  describe "rollouts" do
+    before do
+      project = Project.create(name: "Rollout-Project")
+      allow(Config).to receive(:rollouts_project_id).and_return(project.id).at_least(:once)
+      click_link "Manage Rollouts"
+    end
+
+    it "shows strand status" do
+      expect(page.title).to eq "Ubicloud Admin - Manage Rollouts"
+      expect(page).to have_content("No data available for Active Rollouts")
+
+      rollouts_path = page.current_path
+      strand = Prog::RolloutRhizome.assemble
+      page.refresh
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutRhizome", "start", "0", strand.ubid, "", "{}", "", "", ""]
+      click_link strand.ubid
+      expect(page.title).to eq "Ubicloud Admin - Strand #{strand.ubid}"
+
+      strand.run
+      visit rollouts_path
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutRhizome", "wait_initial_rhizome_install", "0", strand.ubid, "", "{}", "", "", ""]
+    end
+
+    it "allows creation of rhizome rollout strands" do
+      click_button "Start Rhizome Rollout"
+
+      st = Strand.first(prog: "RolloutRhizome")
+      expect(page).to have_flash_notice("Started rollout strand: #{st.ubid}")
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutRhizome", "start", "0", st.ubid, "admin", "{}", "", "", ""]
+      expect(st.stack[0]["auto_exit"]).to be true
+    end
+
+    it "allows creation of rhizome rollout strands with auto exit disabled" do
+      uncheck "rhizome_auto_exit"
+      click_button "Start Rhizome Rollout"
+
+      st = Strand.first(prog: "RolloutRhizome")
+      expect(page).to have_flash_notice("Started rollout strand: #{st.ubid}")
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutRhizome", "start", "0", st.ubid, "admin", "{}", "", "", ""]
+      expect(st.stack[0]["auto_exit"]).to be false
+      expect(st.stack[0]["started_by"]).to eq "admin"
+    end
+
+    it "shows error for an invalid class/semaphore selection" do
+      # The select only offers valid options, so submit a tampered request directly.
+      csrf = find("#start-semaphore-rollout input[name=_csrf]", visible: false).value
+      page.driver.submit :post, "/rollouts/start/RolloutSemaphore", _csrf: csrf, class_semaphore: "Page bad", increment: "increment", gap: "60"
+
+      expect(page).to have_flash_error("invalid semaphore for class")
+      expect(Strand.first(prog: "RolloutSemaphore")).to be_nil
+    end
+
+    it "allows creation of semaphore increment rollout strands" do
+      page_st = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil)
+
+      select "Page - resolve", from: "Class - Semaphore"
+      fill_in "Gap (seconds)", with: "90"
+      click_button "Start Semaphore Rollout"
+
+      st = Strand.first(prog: "RolloutSemaphore")
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutSemaphore", "start", "0", st.ubid, "admin", "{}", "", "", "increment resolve"]
+      expect(page).to have_flash_notice("Started rollout strand: #{st.ubid}")
+
+      expect(st.stack[0]["semaphore"]).to eq "resolve"
+      expect(st.stack[0]["remaining"]).to eq [page_st.id]
+      expect(st.stack[0]["gap"]).to eq 90
+      expect(st.stack[0]["increment"]).to be true
+      expect(st.stack[0]["wait_label"]).to be true
+      expect(st.stack[0]["auto_exit"]).to be true
+      expect(st.stack[0]["started_by"]).to eq "admin"
+
+      st.run
+      page.refresh
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutSemaphore", "wait_current", "0", st.ubid, "admin", "{}", "", "", "increment resolve"]
+
+      Semaphore.where(strand_id: page_st.id, name: "resolve").delete
+      st.run
+      page.refresh
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutSemaphore", "start", "0", st.ubid, "admin", "{\"remaining\" => 0, \"completed\" => 1}", "", "", "increment resolve"]
+    end
+
+    it "allows creation of semaphore increment rollout strands with locations and wait labels and auto exit disabled" do
+      fsn1_vm = create_vm
+      hel1_vm = create_vm(location_id: Location::HETZNER_HEL1_ID)
+
+      Strand.create_with_id(fsn1_vm.id, prog: "Vm::Metal::Nexus", label: "start")
+      Strand.create_with_id(hel1_vm.id, prog: "Vm::Metal::Nexus", label: "start")
+
+      select "Vm - update_firewall_rules", from: "Class - Semaphore"
+      select "hetzner-fsn1"
+      fill_in "Wait Label", with: "wait"
+      uncheck "semaphore_auto_exit"
+      click_button "Start Semaphore Rollout"
+
+      st = Strand.first(prog: "RolloutSemaphore")
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutSemaphore", "start", "0", st.ubid, "admin", "{}", "", "", "increment update_firewall_rules"]
+      expect(page).to have_flash_notice("Started rollout strand: #{st.ubid}")
+
+      expect(st.stack[0]["semaphore"]).to eq "update_firewall_rules"
+      expect(st.stack[0]["remaining"]).to eq [fsn1_vm.id]
+      expect(st.stack[0]["gap"]).to eq 60
+      expect(st.stack[0]["increment"]).to be true
+      expect(st.stack[0]["wait_label"]).to eq "wait"
+      expect(st.stack[0]["auto_exit"]).to be false
+    end
+
+    it "allows creation of semaphore increment without wait rollout strands" do
+      page_st = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil)
+
+      select "Page - resolve", from: "Class - Semaphore"
+      choose "Increment Without Waiting"
+      click_button "Start Semaphore Rollout"
+
+      st = Strand.first(prog: "RolloutSemaphore")
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutSemaphore", "start", "0", st.ubid, "admin", "{}", "", "", "increment resolve"]
+      expect(page).to have_flash_notice("Started rollout strand: #{st.ubid}")
+
+      expect(st.stack[0]["semaphore"]).to eq "resolve"
+      expect(st.stack[0]["remaining"]).to eq [page_st.id]
+      expect(st.stack[0]["gap"]).to eq 60
+      expect(st.stack[0]["increment"]).to be true
+      expect(st.stack[0]["wait_label"]).to be false
+      expect(st.stack[0]["auto_exit"]).to be true
+
+      st.run
+      page.refresh
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutSemaphore", "start", "0", st.ubid, "admin", "{\"remaining\" => 0, \"completed\" => 1}", "", "", "increment resolve"]
+    end
+
+    it "allows creation of semaphore decrement rollout strands" do
+      page_st = Prog::PageNexus.assemble("some problem", %w[a].freeze, nil, resource_id: nil)
+
+      select "Page - resolve", from: "Class - Semaphore"
+      fill_in "Gap (seconds)", with: "90"
+      choose "Decrement"
+      click_button "Start Semaphore Rollout"
+
+      st = Strand.first(prog: "RolloutSemaphore")
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutSemaphore", "start", "0", st.ubid, "admin", "{}", "", "", "decrement resolve"]
+      expect(page).to have_flash_notice("Started rollout strand: #{st.ubid}")
+
+      expect(st.stack[0]["semaphore"]).to eq "resolve"
+      expect(st.stack[0]["remaining"]).to eq [page_st.id]
+      expect(st.stack[0]["gap"]).to eq 90
+      expect(st.stack[0]["increment"]).to be false
+      expect(st.stack[0]["auto_exit"]).to be true
+
+      st.run
+      page.refresh
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutSemaphore", "start", "0", st.ubid, "admin", "{\"remaining\" => 0, \"completed\" => 1}", "", "", "decrement resolve"]
+    end
+
+    it "allows pausing and unpausing strands" do
+      rollouts_path = page.current_path
+      click_button "Start Rhizome Rollout"
+
+      click_button "Pause"
+      st = Strand.first(prog: "RolloutRhizome")
+      expect(page).to have_flash_notice("Strand #{st.ubid} paused")
+      expect(st.semaphores.map(&:name)).to eq ["pause"]
+
+      st.this.update(schedule: "2100-01-01")
+      click_button "Unpause"
+      expect(page).to have_flash_notice("Strand #{st.ubid} unpaused")
+      expect(st.semaphores(reload: true)).to eq []
+      expect(st.this.get(:schedule)).to be_within(10).of(Time.now)
+
+      visit rollouts_path
+      st.destroy
+      click_button "Pause"
+      expect(page).to have_flash_error("Strand not found, it was probably already deleted")
+    end
+
+    it "allows destroying strands" do
+      click_button "Start Rhizome Rollout"
+
+      click_button "Destroy"
+      st = Strand.first(prog: "RolloutRhizome")
+      expect(page).to have_flash_notice("Strand #{st.ubid} destroyed")
+      expect(st.semaphores.map(&:name)).to eq ["destroy"]
+    end
+
+    it "allows marking RolloutRhizome strands as having working GitHub Runners" do
+      click_button "Start Rhizome Rollout"
+
+      st = Strand.first(prog: "RolloutRhizome")
+      st.stack[0]["monitor_github_runners_until"] = Time.now.to_i
+      st.modified!(:stack)
+      st.save_changes
+      page.refresh
+
+      click_button "Github Runners Work"
+      expect(page).to have_flash_notice("Strand #{st.ubid} updated")
+      expect(st.semaphores.map(&:name)).to eq ["github_runners_work"]
+    end
+
+    def create_minio_vm_host(**args)
+      vm_host = create_vm_host(**args)
+      cluster = MinioCluster.create(
+        location_id: Location::HETZNER_FSN1_ID,
+        name: "minio-cluster-name",
+        admin_user: "minio-admin",
+        admin_password: "dummy-password",
+        root_cert_1: "dummy-root-cert-1",
+        root_cert_2: "dummy-root-cert-2",
+        project_id: Project.create(name: "minio-project").id,
+      )
+      pool = MinioPool.create(
+        cluster_id: cluster.id,
+        start_index: 0,
+        server_count: 1,
+        drive_count: 1,
+        storage_size_gib: 100,
+        vm_size: "standard-2",
+      )
+      MinioServer.create(
+        minio_pool_id: pool.id,
+        vm_id: create_vm(vm_host_id: vm_host.id).id,
+        index: 0,
+      )
+      vm_host
+    end
+
+    it "allows creation of boot image rollout strands" do
+      vm_host = create_vm_host
+      create_minio_vm_host
+      version = Prog::DownloadBootImage::BOOT_IMAGE_SHA256.dig("ubuntu-noble", "x64").keys.max
+
+      select "ubuntu-noble", from: "Image Name"
+      fill_in "Version", with: version
+      click_button "Start Boot Image Rollout"
+
+      st = Strand.first(prog: "RolloutBootImage")
+      expect(page).to have_flash_notice("Started rollout strand: #{st.ubid}")
+
+      frame = st.stack[0]
+      expect(frame["image_name"]).to eq "ubuntu-noble"
+      expect(frame["version"]).to eq version
+      expect(frame["arch"]).to eq "x64"
+      expect(frame["concurrency"]).to eq 10
+      expect(frame["pause_stages"]).to be false
+      expect(frame["todo"]).to eq [vm_host.id]
+      expect(frame["started_by"]).to eq "admin"
+    end
+
+    it "allows creation of boot image rollout strands with custom options" do
+      vm_host1 = create_vm_host(arch: "arm64", created_at: Time.utc(2024, 1, 1))
+      vm_host2 = create_vm_host(arch: "arm64", created_at: Time.utc(2024, 1, 2))
+      minio_host = create_minio_vm_host(arch: "arm64", created_at: Time.utc(2024, 1, 3))
+      version = Prog::DownloadBootImage::BOOT_IMAGE_SHA256.dig("ubuntu-noble", "arm64").keys.max
+
+      select "ubuntu-noble", from: "Image Name"
+      fill_in "Version", with: version
+      select "arm64", from: "Arch"
+      fill_in "Concurrency", with: "3"
+      uncheck "Exclude Minio Hosts"
+      check "Pause Between Stages"
+      fill_in "Exclude VM Host IDs (comma separated)", with: " #{vm_host1.ubid}, #{vm_host2.id},, "
+      click_button "Start Boot Image Rollout"
+
+      st = Strand.first(prog: "RolloutBootImage")
+      expect(page).to have_flash_notice("Started rollout strand: #{st.ubid}")
+
+      frame = st.stack[0]
+      expect(frame["arch"]).to eq "arm64"
+      expect(frame["concurrency"]).to eq 3
+      expect(frame["pause_stages"]).to be true
+      expect(frame["todo"]).to eq [minio_host.id]
+    end
+
+    it "shows error when starting boot image rollout with invalid version" do
+      select "ubuntu-noble", from: "Image Name"
+      fill_in "Version", with: "20990101"
+      click_button "Start Boot Image Rollout"
+
+      expect(page).to have_flash_error("invalid version for boot image")
+      expect(Strand.first(prog: "RolloutBootImage")).to be_nil
+    end
+
+    it "shows error when starting boot image rollout with invalid excluded vm host id" do
+      version = Prog::DownloadBootImage::BOOT_IMAGE_SHA256.dig("ubuntu-noble", "x64").keys.max
+
+      select "ubuntu-noble", from: "Image Name"
+      fill_in "Version", with: version
+      fill_in "Exclude VM Host IDs (comma separated)", with: "not-an-id"
+      click_button "Start Boot Image Rollout"
+
+      expect(page).to have_flash_error("invalid vm host id: not-an-id")
+      expect(Strand.first(prog: "RolloutBootImage")).to be_nil
+    end
+
+    it "allows rolling back boot image rollout strands and shows their status" do
+      vm_host = create_vm_host
+      version = Prog::DownloadBootImage::BOOT_IMAGE_SHA256.dig("ubuntu-noble", "x64").keys.max
+      st = Prog::RolloutBootImage.assemble(image_name: "ubuntu-noble", version:, concurrency: 10)
+      page.refresh
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutBootImage", "wait", "0", st.ubid, "", "{\"image\" => \"ubuntu-noble #{version} x64\"}", "", "", ""]
+
+      frame = st.stack[0]
+      frame["todo"] = []
+      frame["in_progress"] = []
+      frame["stages"] = [[vm_host.id]]
+      frame["completed"] = [vm_host.id]
+      st.modified!(:stack)
+      st.save_changes
+      page.refresh
+      expect(page.all(".rollouts-table td").map(&:text)).to eq ["RolloutBootImage", "wait", "0", st.ubid, "", "{\"remaining\" => 1, \"completed\" => 1, \"image\" => \"ubuntu-noble #{version} x64\"}", "", "", ""]
+
+      click_button "Rollback"
+      expect(page).to have_flash_notice("Strand #{st.ubid} updated")
+      expect(st.semaphores.map(&:name)).to eq ["rollback"]
+    end
+  end
+
+  describe "kubernetes node image" do
+    before do
+      kubernetes_project = Project.create(name: "Kubernetes-Service")
+      image_project = Project.create(name: "Machine-Images-Service")
+      allow(Config).to receive_messages(kubernetes_service_project_id: kubernetes_project.id, machine_images_service_project_id: image_project.id)
+      MachineImageStore.create(project_id: image_project.id, location_id: Option.kubernetes_locations.first.id, provider: "r2", region: "auto", endpoint: "https://r2.cloudflare.com/", bucket: "test-bucket", access_key: "ak", secret_key: "sk")
+      click_link "Build Kubernetes Node Image"
+    end
+
+    it "starts a build and lists it" do
+      kubernetes_version = Option.kubernetes_versions.first
+      location = Option.kubernetes_locations.first
+
+      expect(page.title).to eq "Ubicloud Admin - Build Kubernetes Node Image"
+      expect(page).to have_content("No data available for Active Node Image Builds")
+
+      select kubernetes_version, from: "Kubernetes Version"
+      select location.display_name, from: "Location"
+      fill_in "Image Version", with: "20260730.1.0"
+      click_button "Start Node Image Build"
+
+      st = Strand.first(prog: "Kubernetes::BuildNodeImage")
+      expect(page).to have_flash_notice("Started kubernetes node image build strand: #{st.ubid}")
+      expect(st.stack.first.values_at("kubernetes_version", "location_id", "image_version"))
+        .to eq [kubernetes_version, location.id, "20260730.1.0"]
+      expect(page.all(".kubernetes-node-image-table td").map(&:text))
+        .to eq ["wait_vm", "0", st.ubid, kubernetes_version, location.display_name, "20260730.1.0", ""]
+    end
+
+    it "destroys a build" do
+      st = Prog::Kubernetes::BuildNodeImage.assemble(kubernetes_version: Option.kubernetes_versions.first, location_id: Option.kubernetes_locations.first.id, image_version: "20260730.1.0")
+      page.refresh
+
+      click_button "Destroy"
+
+      expect(page).to have_flash_notice("Destroying node image build strand: #{st.ubid}")
+      expect(st.semaphores.map(&:name)).to eq ["destroy"]
+    end
+
+    it "shows error when destroying a build that is already gone" do
+      st = Prog::Kubernetes::BuildNodeImage.assemble(kubernetes_version: Option.kubernetes_versions.first, location_id: Option.kubernetes_locations.first.id, image_version: "20260730.1.0")
+      page.refresh
+      st.destroy
+
+      click_button "Destroy"
+
+      expect(page).to have_flash_error("Strand not found, it was probably already deleted")
+    end
+
+    it "shows error for an unsupported kubernetes version" do
+      # The select only offers valid options, so submit a tampered request directly.
+      csrf = find("#start-kubernetes-node-image input[name=_csrf]", visible: false).value
+      page.driver.submit :post, "/kubernetes-node-image", _csrf: csrf,
+        kubernetes_version: "v0.1", location_id: Option.kubernetes_locations.first.ubid, image_version: "20260730.1.0"
+
+      expect(page).to have_flash_error("invalid kubernetes version")
+      expect(Strand.first(prog: "Kubernetes::BuildNodeImage")).to be_nil
+    end
+
+    it "shows error for a location without kubernetes" do
+      csrf = find("#start-kubernetes-node-image input[name=_csrf]", visible: false).value
+      page.driver.submit :post, "/kubernetes-node-image", _csrf: csrf,
+        kubernetes_version: Option.kubernetes_versions.first, location_id: Location[Location::HETZNER_HEL1_ID].ubid, image_version: "20260730.1.0"
+
+      expect(page).to have_flash_error("invalid location for kubernetes")
+      expect(Strand.first(prog: "Kubernetes::BuildNodeImage")).to be_nil
+    end
+
+    it "shows error for an invalid image version" do
+      select Option.kubernetes_versions.first, from: "Kubernetes Version"
+      select Option.kubernetes_locations.first.display_name, from: "Location"
+      fill_in "Image Version", with: "not a version"
+      click_button "Start Node Image Build"
+
+      expect(page).to have_flash_error("invalid image version")
+      expect(Strand.first(prog: "Kubernetes::BuildNodeImage")).to be_nil
+    end
+  end
+
+  describe "remove boot images" do
+    before do
+      click_link "Remove Boot Images"
+    end
+
+    it "lists boot image groups and removes only unused images" do
+      expect(page.title).to eq "Ubicloud Admin - Remove Boot Images"
+      expect(page).to have_content("No data available for Boot Images")
+
+      remove_path = page.current_path
+      vmh1 = create_vm_host
+      vmh2 = create_vm_host
+      used = BootImage.create(name: "ubuntu-noble", version: "20240101", vm_host_id: vmh1.id, size_gib: 14, activated_at: Time.now)
+      unused = BootImage.create(name: "ubuntu-noble", version: "20240101", vm_host_id: vmh2.id, size_gib: 14, activated_at: Time.now)
+      vm = create_vm(vm_host_id: vmh1.id)
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 5, disk_index: 0, boot_image_id: used.id)
+
+      visit remove_path
+      expect(page.all(".boot-images-table td").map(&:text)).to eq ["ubuntu-noble", "20240101", "2", "1", "Remove"]
+
+      click_link "Remove"
+      expect(page).to have_content("schedule removal of 1 of 2 image(s)")
+
+      click_button "Confirm Remove"
+      expect(page).to have_flash_notice("Scheduled removal of 1 boot image(s) for ubuntu-noble 20240101")
+      expect(Strand.where(prog: "RemoveBootImage").map { it.stack.first["subject_id"] }).to eq [unused.id]
+    end
+
+    it "shows a message and no button when there are no removable images" do
+      vmh = create_vm_host
+      image = BootImage.create(name: "ubuntu-noble", version: "20240101", vm_host_id: vmh.id, size_gib: 14, activated_at: Time.now)
+      vm = create_vm(vm_host_id: vmh.id)
+      VmStorageVolume.create(vm_id: vm.id, boot: true, size_gib: 5, disk_index: 0, boot_image_id: image.id)
+
+      page.refresh
+      click_link "Remove"
+      expect(page).to have_content("There are no images to remove.")
+      expect(page).to have_no_button("Confirm Remove")
+    end
+  end
+
+  describe "local E2E" do
+    before do
+      project = Project.create(name: "Postgres-Service-Project")
+      allow(Config).to receive(:postgres_service_project_id).and_return(project.id).at_least(:once)
+      allow(Config).to receive(:local_e2e_postgres_test_project_id).and_return(nil).at_least(:once)
+      click_link "Manage Local E2E"
+    end
+
+    it "shows strand status" do
+      expect(page.title).to eq "Ubicloud Admin - Manage Local E2E"
+      expect(page).to have_content("No data available for Active Local E2E Strands")
+
+      local_e2e_path = page.current_path
+      strand = Prog::Test::PostgresResource.assemble(provider: "metal")
+      page.refresh
+      expect(page.all(".local-e2e-table td").map(&:text)).to eq ["Test::PostgresResource", "start", "0", strand.ubid, '{"provider" => "metal"}', "", ""]
+      click_link strand.ubid
+      expect(page.title).to eq "Ubicloud Admin - Strand #{strand.ubid}"
+
+      strand.run
+      pg_ubid = UBID.to_ubid(strand.stack[0]["postgres_resource_id"])
+      visit local_e2e_path
+      expect(page.all(".local-e2e-table td").map(&:text)).to eq ["Test::PostgresResource", "wait_postgres_resource", "0", strand.ubid, "{\"provider\" => \"metal\", \"postgres_resource\" => \"#{pg_ubid}\"}", "", ""]
+      click_link pg_ubid
+      expect(page.title).to eq "Ubicloud Admin - PostgresResource #{pg_ubid}"
+    end
+
+    it "allows creation of strands" do
+      local_e2e_path = page.current_path
+      expect { click_button "Start Local E2E Strand" }.to raise_error(RuntimeError)
+
+      visit local_e2e_path
+      select "metal"
+      expect { click_button "Start Local E2E Strand" }.to raise_error(Roda::RodaPlugins::TypecastParams::Error)
+
+      visit local_e2e_path
+      check "PostgresResource"
+      expect { click_button "Start Local E2E Strand" }.to raise_error(RuntimeError)
+
+      visit local_e2e_path
+      check "PostgresResource"
+      select "metal"
+      click_button "Start Local E2E Strand"
+
+      st = Strand.first(prog: "Test::PostgresResource")
+      expect(st.stack[0]["local_e2e"]).to be true
+      expect(page).to have_flash_notice("Started local E2E strand(s): #{st.ubid}")
+      expect(page.all(".local-e2e-table td").map(&:text)).to eq ["Test::PostgresResource", "start", "0", st.ubid, '{"provider" => "metal"}', "", ""]
+    end
+
+    it "allows creation of multiple strands" do
+      check "PostgresResource"
+      check "HaPostgresResource"
+      select "metal"
+      click_button "Start Local E2E Strand"
+
+      ha_pg_st = Strand.first(prog: "Test::HaPostgresResource")
+      pg_st = Strand.first(prog: "Test::PostgresResource")
+      expect(page).to have_flash_notice("Started local E2E strand(s): #{pg_st.ubid} #{ha_pg_st.ubid}")
+      expect(page.all(".local-e2e-table td").map(&:text)).to eq [
+        "Test::HaPostgresResource", "start", "0", ha_pg_st.ubid, '{"provider" => "metal"}', "", "",
+        "Test::PostgresResource", "start", "0", pg_st.ubid, '{"provider" => "metal"}', "", "",
+      ]
+    end
+
+    it "allows creation of loop strands" do
+      check "PostgresResource"
+      check "HaPostgresResource"
+      select "metal"
+      check "Loop?"
+      click_button "Start Local E2E Strand"
+
+      st = Strand.first(prog: "Test::LocalE2eLoop")
+      expect(page).to have_flash_notice("Started local E2E strand(s): #{st.ubid}")
+      expect(page.all(".local-e2e-table td").map(&:text)).to eq ["Test::LocalE2eLoop", "start", "0", st.ubid, "{\"progs\" => [\"PostgresResource\", \"HaPostgresResource\"], \"prog_args\" => {\"provider\" => \"metal\"}, \"starts\" => 0, \"successes\" => 0, \"failures\" => 0}", "", ""]
+
+      st.run
+      page.refresh
+      child_ubid = st.children[0].ubid
+      expect(page.all(".local-e2e-table td").map(&:text)).to eq [
+        "Test::LocalE2eLoop", "wait", "0", st.ubid, "{\"progs\" => [\"HaPostgresResource\", \"PostgresResource\"], \"prog_args\" => {\"provider\" => \"metal\"}, \"starts\" => 1, \"successes\" => 0, \"failures\" => 0, \"current_strand\" => \"#{child_ubid}\"}", "", "",
+        "Test::PostgresResource", "start", "0", child_ubid, "{\"provider\" => \"metal\"}", "", "",
+      ]
+    end
+
+    it "allows pausing and unpausing strands" do
+      local_e2e_path = page.current_path
+      check "PostgresResource"
+      select "metal"
+      click_button "Start Local E2E Strand"
+
+      click_button "Pause"
+      st = Strand.first(prog: "Test::PostgresResource")
+      expect(page).to have_flash_notice("Strand #{st.ubid} paused")
+      expect(st.semaphores.map(&:name)).to eq ["pause"]
+
+      st.this.update(schedule: "2100-01-01")
+      click_button "Unpause"
+      expect(page).to have_flash_notice("Strand #{st.ubid} unpaused")
+      expect(st.semaphores(reload: true)).to eq []
+      expect(st.this.get(:schedule)).to be_within(10).of(Time.now)
+
+      st.this.update(prog: "Test::Base")
+      expect { click_button "Pause" }.to raise_error(RuntimeError)
+
+      visit local_e2e_path
+      st.destroy
+      click_button "Pause"
+      expect(page).to have_flash_error("Strand not found, it was probably already deleted")
+    end
+
+    it "allows destroying strands" do
+      check "PostgresResource"
+      select "metal"
+      click_button "Start Local E2E Strand"
+
+      click_button "Destroy"
+      st = Strand.first(prog: "Test::PostgresResource")
+      expect(page).to have_flash_notice("Strand #{st.ubid} destroyed")
+      expect(st.semaphores.map(&:name)).to eq ["destroy"]
+    end
+
+    it "allows destroying loop strand" do
+      check "PostgresResource"
+      select "metal"
+      check "Loop?"
+      click_button "Start Local E2E Strand"
+
+      click_button "Destroy"
+      st = Strand.first(prog: "Test::LocalE2eLoop")
+      expect(page).to have_flash_notice("Strand #{st.ubid} destroyed")
+      expect(st.semaphores.map(&:name)).to eq ["destroy"]
+    end
+  end
+
+  describe "setup-vm-host" do
+    before do
+      click_link "Setup VM Hosts"
+    end
+
+    def stub_hetzner_api(*hosts)
+      stub_request(:get, "https://robot-ws.your-server.de/ip").to_return(status: 200, body: JSON.dump(hosts.map { |host, _| {"ip" => {"ip" => host, "server_ip" => host}} }))
+      stub_request(:get, "https://robot-ws.your-server.de/subnet").to_return(status: 200, body: JSON.dump([]))
+      stub_request(:get, "https://robot-ws.your-server.de/failover").to_return(status: 200, body: JSON.dump([]))
+      hosts.each do |_, server_identifier|
+        stub_request(:get, "https://robot-ws.your-server.de/server/#{server_identifier}").to_return(status: 200, body: JSON.generate(server: {dc: "fsn1-dc14", product: "AX102"}))
+        stub_request(:post, "https://robot-ws.your-server.de/server/#{server_identifier}").to_return(status: 200, body: "{}")
+      end
+    end
+
+    it "shows unprepared hosts" do
+      expect(page.title).to eq "Ubicloud Admin - Setup VM Hosts"
+      expect(page).to have_content("No data available for Unprepared VM Hosts")
+
+      location_options = find_by_id("location_id").all("option").map(&:text)
+      expect(location_options).to include("hetzner-fsn1", "leaseweb-wdc02")
+      expect(location_options).not_to include("us-east-1")
+      expect(find_by_id("provider_name").all("option").map(&:text)).to eq ["", "hetzner", "leaseweb", "leaseweb-eu"]
+
+      create_vm_host
+      st = Prog::Vm::HostNexus.assemble("127.0.0.1")
+      vmh = VmHost[st.id]
+      vmh.update(total_cores: 48, total_hugepages_1g: 316)
+      StorageDevice.create(name: "nvme0", total_storage_gib: 100, available_storage_gib: 50, vm_host_id: vmh.id)
+
+      page.refresh
+      expect(page.all(".unprepared-vm-hosts-table td").map(&:text)).to eq [
+        vmh.ubid, "127.0.0.1", "", "", "start", "127.0.0.1/32", "100", "316", "48",
+      ]
+      click_link vmh.ubid
+      expect(page.title).to eq "Ubicloud Admin - VmHost #{vmh.ubid}"
+    end
+
+    it "allows setting up a vm host" do
+      stub_hetzner_api(["1.2.3.4", "12345"])
+
+      fill_in "Hosts", with: "12345,1.2.3.4"
+      select "hetzner-fsn1", from: "Location"
+      select "hetzner", from: "Provider"
+      check "ubuntu-jammy"
+      check "github-ubuntu-2404"
+      check "Install OS"
+      click_button "Setup VM Hosts"
+
+      st = Strand.first(prog: "Vm::HostNexus")
+      vmh = VmHost[st.id]
+      expect(page).to have_flash_notice("VM host setup started: #{st.ubid} (hetzner 12345)")
+      expect(vmh.sshable.host).to eq "1.2.3.4"
+      expect(vmh.location_id).to eq Location::HETZNER_FSN1_ID
+      expect(vmh.family).to eq "standard"
+      expect(vmh.provider_name).to eq "hetzner"
+      expect(vmh.provider.server_identifier).to eq "12345"
+      expect(vmh.data_center).to eq "fsn1-dc14"
+      expect(vmh.inventory.server_model).to eq "AX102"
+
+      frame = st.stack.first
+      expect(frame["vhost_block_backend_version"]).to eq Config.vhost_block_backend_version
+      expect(frame["default_boot_images"]).to contain_exactly("ubuntu-jammy", "github-ubuntu-2404")
+      expect(frame["install_os"]).to be true
+
+      expect(page.all(".unprepared-vm-hosts-table td").map(&:text)).to eq [
+        vmh.ubid, "1.2.3.4", "hetzner", "12345", "start", "1.2.3.4/32", "", "0", "",
+      ]
+    end
+
+    it "allows setting up a vm host without boot images or OS install" do
+      stub_hetzner_api(["1.2.3.5", "54321"])
+
+      fill_in "Hosts", with: "54321,1.2.3.5"
+      select "hetzner-fsn1", from: "Location"
+      select "premium", from: "Family"
+      select "hetzner", from: "Provider"
+      fill_in "Vhost Block Backend Version", with: "v0.2.2"
+      click_button "Setup VM Hosts"
+
+      st = Strand.first(prog: "Vm::HostNexus")
+      expect(page).to have_flash_notice("VM host setup started: #{st.ubid} (hetzner 54321)")
+      expect(VmHost[st.id].family).to eq "premium"
+
+      frame = st.stack.first
+      expect(frame["vhost_block_backend_version"]).to eq "v0.2.2"
+      expect(frame["default_boot_images"]).to eq []
+      expect(frame["install_os"]).to be false
+    end
+
+    it "allows setting up multiple vm hosts" do
+      stub_hetzner_api(["1.2.3.4", "12345"], ["1.2.3.5", "54321"])
+
+      fill_in "Hosts", with: "12345,1.2.3.4\n\n 54321 , 1.2.3.5 \n"
+      select "hetzner-fsn1", from: "Location"
+      select "hetzner", from: "Provider"
+      click_button "Setup VM Hosts"
+
+      vmh1 = VmHost.first(sshable: Sshable.where(host: "1.2.3.4"))
+      vmh2 = VmHost.first(sshable: Sshable.where(host: "1.2.3.5"))
+      expect(page).to have_flash_notice("VM host setup started: #{vmh1.ubid} (hetzner 12345), #{vmh2.ubid} (hetzner 54321)")
+      expect(vmh1.provider.server_identifier).to eq "12345"
+      expect(vmh2.provider.server_identifier).to eq "54321"
+    end
+
+    it "raises error for an address that is not IPv4" do
+      %w[not-an-ip 2a01::1].each do |host|
+        visit "/setup-vm-host"
+        fill_in "Hosts", with: "12345,#{host}"
+        select "hetzner-fsn1", from: "Location"
+        select "hetzner", from: "Provider"
+        expect { click_button "Setup VM Hosts" }.to raise_error(CloverError, "invalid IPv4 address: #{host}")
+      end
+      expect(VmHost.count).to eq 0
+    end
+
+    it "raises error for a malformed host line" do
+      ["1.2.3.4", ",1.2.3.4", "12345,1.2.3.4,extra"].each do |line|
+        visit "/setup-vm-host"
+        fill_in "Hosts", with: "12345,1.2.3.5\n#{line}"
+        select "hetzner-fsn1", from: "Location"
+        select "hetzner", from: "Provider"
+        expect { click_button "Setup VM Hosts" }.to raise_error(CloverError, "invalid host line: #{line}")
+      end
+      expect(VmHost.count).to eq 0
+    end
+  end
+
   it "shows admin list" do
     click_link "View Admin List"
     expect(page.title).to eq "Ubicloud Admin - Admin List"
@@ -1458,32 +3257,45 @@ RSpec.describe CloverAdmin do
   end
 
   it "shows GitHub runner x64 VM usage" do
-    installation = GithubInstallation.create(installation_id: 123, name: "test-installation", type: "User")
+    project = Project.create(name: "test-project")
+    project.add_quota(quota_id: ProjectQuota.default_quotas["GithubRunnerVCpu"]["id"], value: 400)
+    project.set_ff_spill_to_alien_runners(true)
+    installation = GithubInstallation.create(installation_id: 123, name: "test-installation", type: "User", project_id: project.id)
     installation_id = installation.id
     repository_name = "test-repo"
     GithubRunner.create(installation_id:, repository_name:, label: "ubicloud", allocated_at: Time.now)
     GithubRunner.create(installation_id:, repository_name:, label: "ubicloud-arm")
-    GithubRunner.create(installation_id:, repository_name:, label: "ubicloud-standard-2", allocated_at: Time.now, vm_id: create_vm(vcpus: 2, allocated_at: Time.now).id)
-    GithubRunner.create(installation_id:, repository_name:, label: "ubicloud-standard-4", allocated_at: Time.now, vm_id: create_vm(vcpus: 4, family: "premium").id)
-    GithubRunner.create(installation_id:, repository_name:, label: "ubicloud-standard-8", allocated_at: Time.now, vm_id: create_vm(vcpus: 8, family: "m7a").id)
-    GithubRunner.create(installation_id:, repository_name:, label: "ubicloud-standard-30")
+    vm2 = create_vm(vcpus: 2, allocated_at: Time.now)
+    GithubRunner.create(installation_id:, repository_name:, label: "ubicloud-standard-2", allocated_at: Time.now, vm_id: vm2.id, location_id: vm2.location_id)
+    vm4 = create_vm(vcpus: 4, family: "premium")
+    GithubRunner.create(installation_id:, repository_name:, label: "ubicloud-standard-4", allocated_at: Time.now, vm_id: vm4.id, location_id: vm4.location_id)
+    vm8 = create_vm(vcpus: 8, family: "m7a")
+    GithubRunner.create(installation_id:, repository_name:, label: "ubicloud-standard-8", allocated_at: Time.now, vm_id: vm8.id, location_id: vm8.location_id)
+    vm30 = create_vm(vcpus: 32, family: "m7a", allocated_at: Time.now)
+    GithubRunner.create(installation_id:, repository_name:, label: "ubicloud-standard-30", allocated_at: Time.now, vm_id: vm30.id, location_id: vm30.location_id)
+    create_vm_host(location_id: Location::GITHUB_RUNNERS_ID, family: "standard", used_cores: 12, total_cores: 48)
+    create_vm_host(location_id: Location::HETZNER_FSN1_ID, family: "premium", used_cores: 12, total_cores: 24)
+    create_vm(boot_image: Config.github_ubuntu_2204_x64_aws_ami_version, vcpus: 4)
+    create_vm(boot_image: Config.github_ubuntu_2404_x64_aws_ami_version, vcpus: 8)
+    create_vm(arch: "arm64", boot_image: Config.github_ubuntu_2404_arm64_aws_ami_version, vcpus: 16)
 
     click_link "GitHub Runner VM Usage"
     expect(page.title).to eq "Ubicloud Admin - GitHub Runner x64 VM Usage"
     expect(page).to have_link "Show arm64"
+    expect(page).to have_css("p", exact_text: "standard: vcpu 25.0%, hugepage 4.27%, spilled vcpus 12, spilled runners 2 - premium: vcpu 50.0%, hugepage 4.27%")
     expect(page.all("#content td").map(&:text)).to eq [
-      "TOTAL", "",
+      "TOTAL", "", "400", "500",
       "2", "1", "1", "0", "1", "0",
-      "16 / 46", "2 / 14",
+      "46 / 46", "34 / 46",
       "1", "0", "0", "0", "0", "0",
       "0", "1", "0", "0", "0",
-      "0", "0", "1", "0",
-      "test-installation", "true",
+      "0", "0", "1", "0", "1",
+      "test-installation", "true", "400", "500",
       "2", "1", "1", "0", "1", "0",
-      "16 / 46", "2 / 14",
+      "46 / 46", "34 / 46",
       "1", "0", "0", "0", "0", "0",
       "0", "1", "0", "0", "0",
-      "0", "0", "1", "0",
+      "0", "0", "1", "0", "1",
     ]
 
     click_link "test-installation"
@@ -1494,27 +3306,31 @@ RSpec.describe CloverAdmin do
     click_link "GitHub Runner VM Usage"
     expect(page.all("#content td").map(&:text)).to eq []
 
-    installation = GithubInstallation.create(installation_id: 123, name: "test-installation", type: "User")
+    project = Project.create(name: "test-project")
+    installation = GithubInstallation.create(installation_id: 123, name: "test-installation", type: "User", project_id: project.id)
     GithubRunner.create(installation_id: installation.id, repository_name: "test-repo", label: "ubicloud-arm")
     GithubRunner.create(installation_id: installation.id, repository_name: "test-repo", label: "ubicloud")
+    create_vm_host(arch: "arm64", location_id: Location::GITHUB_RUNNERS_ID, family: "standard", used_cores: 6, total_cores: 24)
+    create_vm(arch: "arm64", boot_image: Config.github_ubuntu_2204_arm64_aws_ami_version, vcpus: 8)
 
     click_link "Show arm64"
 
     expect(page.title).to eq "Ubicloud Admin - GitHub Runner arm64 VM Usage"
     expect(page).to have_link "Show x64"
+    expect(page).to have_css("p", exact_text: "standard: vcpu 25.0%, hugepage 4.27%, spilled vcpus 8, spilled runners 1")
     expect(page.all("#content td").map(&:text)).to eq [
-      "TOTAL", "",
+      "TOTAL", "", "100", "0",
       "1", "0", "0", "0", "0", "0",
       "0 / 2", "0 / 0",
       "0", "0", "0", "0", "0", "0",
       "0", "0", "0", "0", "0",
-      "0", "0", "0", "0",
-      "test-installation", "true",
+      "0", "0", "0", "0", "0",
+      "test-installation", "true", "100", "",
       "1", "0", "0", "0", "0", "0",
       "0 / 2", "0 / 0",
       "0", "0", "0", "0", "0", "0",
       "0", "0", "0", "0", "0",
-      "0", "0", "0", "0",
+      "0", "0", "0", "0", "0",
     ]
   end
 
@@ -1547,6 +3363,18 @@ RSpec.describe CloverAdmin do
     visit "/"
     expect(page).to have_content(now.to_s)
     expect(page).to have_no_content(/commit:/)
+  end
+
+  it "shows staging environment in footer" do
+    expect(Config).to receive(:staging).and_return(true).at_least(:once)
+    visit "/"
+    expect(page.find("footer")).to have_content("clover-staging")
+  end
+
+  it "shows production environment in footer" do
+    expect(Config).to receive(:production?).and_return(true).at_least(:once)
+    visit "/"
+    expect(page.find("footer span.env-production").text).to eq "clover-test"
   end
 
   it "finds both active and archived VMs by IPv4" do
@@ -1582,6 +3410,27 @@ RSpec.describe CloverAdmin do
     expect(page.find_field("days").value).to eq "5"
   end
 
+  describe "theme" do
+    it "switches theme via the footer forms" do
+      current = -> { page.find("#theme-switcher form.current input")[:value] }
+      visit "/"
+      expect(page.find("html")[:class]).to eq "theme-system"
+      expect(current.call).to eq "System"
+
+      within("#theme-switcher") { click_button "Dark" }
+      expect(page.find("html")[:class]).to eq "theme-dark"
+      expect(current.call).to eq "Dark"
+
+      within("#theme-switcher") { click_button "Light" }
+      expect(page.find("html")[:class]).to eq "theme-light"
+      expect(current.call).to eq "Light"
+
+      within("#theme-switcher") { click_button "System" }
+      expect(page.find("html")[:class]).to eq "theme-system"
+      expect(current.call).to eq "System"
+    end
+  end
+
   describe "archived-record-by-id" do
     it "finds archived records" do
       (vm = create_vm(name: "archived-vm")).destroy
@@ -1594,6 +3443,7 @@ RSpec.describe CloverAdmin do
       end
       expect(page).to have_content("archived-vm")
       expect(page).to have_content(vm.id)
+      expect(page).to have_link(vm.ubid, href: "/model/Vm/#{vm.ubid}")
 
       within("#archived_record_form") do
         fill_in "id", with: vm.id
@@ -1601,6 +3451,7 @@ RSpec.describe CloverAdmin do
       end
       expect(page).to have_content("archived-vm")
       expect(page).to have_content(vm.id)
+      expect(page).to have_link(vm.ubid, href: "/model/Vm/#{vm.ubid}")
     end
 
     it "uses model_name from select when provided" do
@@ -2055,10 +3906,19 @@ RSpec.describe CloverAdmin do
       click_button "Search"
       expect(audit_log_content).to be_empty
     end
+
+    it "does not show pagination link for invalid end date" do
+      insert_account_audit_log(account_id: user.id)
+
+      visit "/authentication-audit-log?end=2026-03-aa"
+      expect(audit_log_content).to be_empty
+      expect(page).to have_no_link("Older Results")
+      expect(page).to have_no_link("Next Page")
+    end
   end
 
   describe "admin authentication audit log" do
-    def insert_account_audit_log(account_id: DB[:admin_account].get(:id), message: "login", metadata: {"ip" => "127.0.0.1"}, at: Sequel::CURRENT_TIMESTAMP)
+    def insert_account_audit_log(account_id: DB[:admin_account].where(login: "admin").get(:id), message: "login", metadata: {"ip" => "127.0.0.1"}, at: Sequel::CURRENT_TIMESTAMP)
       DB[:admin_account_authentication_audit_log].returning(:id).insert(
         account_id:,
         message:,
@@ -2146,5 +4006,523 @@ RSpec.describe CloverAdmin do
       click_button "Search"
       expect(audit_log_content).to be_empty
     end
+  end
+
+  describe "cogs" do
+    def create_cogs_host(server_model: nil, monthly_price: nil, currency: nil, **args)
+      host = create_vm_host(**args)
+      if server_model || monthly_price
+        VmHostInventory.create(server_model:, monthly_price:, currency:) { it.id = host.id }
+      end
+      host
+    end
+
+    def create_minio_server(vm_host)
+      cluster = MinioCluster.create(
+        location_id: Location::HETZNER_FSN1_ID,
+        name: "minio-cluster-name",
+        admin_user: "minio-admin",
+        admin_password: "dummy-password",
+        root_cert_1: "dummy-root-cert-1",
+        root_cert_2: "dummy-root-cert-2",
+        project_id: Project.create(name: "minio-project").id,
+      )
+      pool = MinioPool.create(cluster_id: cluster.id, start_index: 0, server_count: 1, drive_count: 1, storage_size_gib: 100, vm_size: "standard-2")
+      MinioServer.create(minio_pool_id: pool.id, vm_id: create_vm(vm_host_id: vm_host.id).id, index: 0)
+    end
+
+    it "shows inventory and runner tables with the default conversion rate" do
+      create_cogs_host(total_cpus: 16, total_hugepages_1g: 52, server_model: "AX102", monthly_price: 100, currency: "EUR")
+      hel1_host = create_cogs_host(location_id: Location::HETZNER_HEL1_ID, total_cpus: 96, total_hugepages_1g: 368, server_model: "AX162-R", monthly_price: 400, currency: "EUR")
+      # Draining hosts still cost money, so they stay included.
+      create_cogs_host(location_id: Location::LEASEWEB_WDC02_ID, allocation_state: "draining", total_cpus: 128, total_hugepages_1g: 500, server_model: "HPE RL300", monthly_price: 5000, currency: "USD")
+      create_cogs_host(location_id: Location::GITHUB_RUNNERS_ID, family: "premium", total_cpus: 16, total_hugepages_1g: 52, server_model: "AX102-U", monthly_price: 50, currency: "EUR")
+      create_cogs_host(location_id: Location::GITHUB_RUNNERS_ID, arch: "arm64", total_cpus: 80, total_hugepages_1g: 320, server_model: "RX220", monthly_price: 220, currency: "EUR")
+      # A host with an empty inventory row and no learned cpus contributes
+      # zero cost and zero sellable vCPUs.
+      empty_inventory_host = create_cogs_host
+      VmHostInventory.create { it.id = empty_inventory_host.id }
+      # Excluded: a host without an inventory row, a host running a Minio
+      # server, a host outside the listed locations, and an unprepared host.
+      create_cogs_host(total_cpus: 16, total_hugepages_1g: 52)
+      create_minio_server(create_cogs_host(total_cpus: 16, total_hugepages_1g: 52, server_model: "AX102", monthly_price: 999, currency: "EUR"))
+      create_cogs_host(location_id: Location[name: "hetzner-ai"].id, total_cpus: 16, total_hugepages_1g: 52, server_model: "AX102", monthly_price: 999, currency: "EUR")
+      create_cogs_host(allocation_state: "unprepared", total_cpus: 16, total_hugepages_1g: 52, server_model: "AX102", monthly_price: 999, currency: "EUR")
+
+      create_vm(vm_host_id: hel1_host.id, vcpus: 4)
+      create_vm(vm_host_id: hel1_host.id, family: "burstable", vcpus: 1)
+      runner_vm = create_vm(vm_host_id: hel1_host.id, vcpus: 8)
+      GithubRunner.create(label: "ubicloud", repository_name: "my-repo", vm_id: runner_vm.id, location_id: runner_vm.location_id)
+
+      click_link "VM Host COGS"
+      expect(page.title).to eq "Ubicloud Admin - VM Host COGS"
+      expect(find_by_id("rate").value).to eq "1.14"
+
+      expect(page.all(".cogs-by-location-table td").map(&:text)).to eq [
+        "hetzner-fsn1", "standard", "2", "$114.00", "13", "$17.54",
+        "hetzner-hel1", "standard", "1", "$456.00", "92", "$9.91",
+        "leaseweb-wdc02", "standard", "1", "$5,000.00", "125", "$80.00",
+        "github-runners", "premium", "1", "$57.00", "13", "$8.77",
+      ]
+      expect(page.all(".cogs-by-location-table td .cost").map(&:text)).to eq [
+        "$114.00", "$17.54", "$456.00", "$9.91", "$5,000.00", "$80.00", "$57.00", "$8.77",
+      ]
+
+      expect(page.all(".cogs-by-type-table td").map(&:text)).to eq [
+        "AX102", "2", "$171.00", "26", "$13.15",
+        "AX162", "1", "$456.00", "92", "$9.91",
+        "HPE RL300", "1", "$5,000.00", "125", "$80.00",
+        "unknown", "1", "$0.00", "0", "-",
+      ]
+
+      expect(page.all(".cogs-runners-by-type-table td").map(&:text)).to eq [
+        "AX102", "x64", "premium", "1", "13", "$8.77", "$13.30",
+        "AX102", "x64", "standard", "1", "13", "$17.54", "$26.60",
+        "AX162", "x64", "standard", "1", "87", "$9.91", "$101.20",
+        "RX220", "arm64", "standard", "1", "79", "$6.35", "$58.52",
+        "unknown", "x64", "standard", "1", "0", "-", "-",
+      ]
+
+      expect(page.all(".cogs-runners-by-family-table td").map(&:text)).to eq [
+        "premium", "x64", "1", "13", "$8.77", "$13.30",
+        "standard", "arm64", "1", "79", "$6.35", "$58.52",
+        "standard", "x64", "3", "100", "$10.86", "$127.30",
+      ]
+    end
+
+    it "recalculates with a submitted conversion rate" do
+      create_cogs_host(total_cpus: 16, total_hugepages_1g: 52, server_model: "AX102", monthly_price: 100, currency: "EUR")
+
+      click_link "VM Host COGS"
+      fill_in "EUR/USD Rate", with: "2"
+      click_button "Recalculate"
+      expect(find_by_id("rate").value).to eq "2.0"
+      expect(page.all(".cogs-by-location-table td").map(&:text)).to eq [
+        "hetzner-fsn1", "standard", "1", "$200.00", "13", "$30.77",
+      ]
+    end
+
+    it "raises for an invalid conversion rate" do
+      expect { visit "/cogs?rate=abc" }.to raise_error(CloverError, "invalid conversion rate")
+      expect { visit "/cogs?rate=0" }.to raise_error(CloverError, "invalid conversion rate")
+    end
+  end
+
+  it "shows VM Host Usage filtered by location" do
+    vm_host = create_vm_host(data_center: "FSN1-DC1", total_cores: 48, used_cores: 4, total_hugepages_1g: 375, used_hugepages_1g: 32)
+    HostProvider.create do
+      it.id = vm_host.id
+      it.server_identifier = "123"
+      it.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+    end
+    StorageDevice.create(name: "nvme0", total_storage_gib: 1000, available_storage_gib: 600, vm_host_id: vm_host.id)
+    StorageDevice.create(name: "nvme1", total_storage_gib: 500, available_storage_gib: 100, vm_host_id: vm_host.id)
+    BootImage.create(name: "ubuntu-jammy", version: "1", vm_host_id: vm_host.id, size_gib: 14)
+    BootImage.create(name: "ubuntu-jammy", version: "2", vm_host_id: vm_host.id, size_gib: 14)
+    BootImage.create(name: "ubuntu-noble", version: "1", vm_host_id: vm_host.id, size_gib: 14)
+    create_vm(vm_host_id: vm_host.id)
+    create_vm(vm_host_id: vm_host.id)
+
+    # A host in another location that must be excluded by the location filter.
+    create_vm_host(location_id: Location::GITHUB_RUNNERS_ID)
+
+    click_link "VM Host Usage"
+    expect(page.title).to eq "Ubicloud Admin - VM Host Usage"
+
+    # No results are shown until a search is performed.
+    expect(page).to have_no_css(".vm-host-usage-table")
+
+    click_button "Search"
+    headers = page.all(".vm-host-usage-table thead th").map(&:text)
+    expect(headers).to include("location", "provider")
+    expect(page.all(".vm-host-usage-table tbody tr").size).to eq 2
+    expect(page.find(".vm-host-usage-table caption").text).to eq "VM Hosts (2)"
+
+    select "hetzner-fsn1", from: "Location"
+    click_button "Search"
+    row = page.all(".vm-host-usage-table tbody tr").map { it.all("td").map(&:text) }
+    expect(row.size).to eq 1
+    expect(page.find(".vm-host-usage-table caption").text).to eq "VM Hosts (1)"
+    expect(row.first).to include(vm_host.ubid, "accepting", "FSN1-DC1", "hetzner", "standard", "2", "4 / 48", "32 / 375", "800 / 1500", "0 / 0", "2")
+  end
+
+  it "filters VM Host Usage by arch, total_cores, state and provider, composing filters" do
+    x64_48 = create_vm_host(arch: "x64", total_cores: 48, allocation_state: "accepting")
+    x64_96 = create_vm_host(arch: "x64", total_cores: 96, allocation_state: "draining")
+    arm_48 = create_vm_host(arch: "arm64", total_cores: 48, allocation_state: "accepting")
+    HostProvider.create do
+      it.id = x64_96.id
+      it.server_identifier = "123"
+      it.provider_name = HostProvider::LEASEWEB_PROVIDER_NAME
+    end
+    ubids = lambda { page.all(".vm-host-usage-table tbody tr").map { it.all("td").map(&:text).first } }
+
+    click_link "VM Host Usage"
+    select "arm64", from: "Arch"
+    click_button "Search"
+    expect(ubids.call).to eq([arm_48.ubid])
+
+    visit "/vm-host-usage"
+    select "96", from: "Cores"
+    click_button "Search"
+    expect(ubids.call).to eq([x64_96.ubid])
+
+    visit "/vm-host-usage"
+    select "draining", from: "State"
+    click_button "Search"
+    expect(ubids.call).to eq([x64_96.ubid])
+
+    visit "/vm-host-usage"
+    select "leaseweb", from: "Provider"
+    click_button "Search"
+    expect(ubids.call).to eq([x64_96.ubid])
+
+    visit "/vm-host-usage"
+    click_button "Search"
+    expect(ubids.call).to eq([x64_48.ubid, arm_48.ubid, x64_96.ubid].sort)
+
+    # Composed arch + cores + state filter.
+    select "x64", from: "Arch"
+    select "48", from: "Cores"
+    select "accepting", from: "State"
+    click_button "Search"
+    expect(ubids.call).to eq([x64_48.ubid])
+  end
+
+  it "shows Customer Usage with resources, vcpu usage, and spend, ordered by vcpus" do
+    big = Project.create(name: "big-customer")
+    small = Project.create(name: "small-customer")
+    service_project = Project.create(name: "internal-service")
+    Project.create(name: "empty-customer") # no resources or invoices; never appears
+
+    ac1 = create_account("a@ibi.com", with_project: false)
+    ac2 = create_account("b@ibi.com", with_project: false)
+    ac3 = create_account("c@ibi.com", with_project: false)
+    DB[:access_tag].insert(project_id: big.id, hyper_tag_id: ac1.id)
+    DB[:access_tag].insert(project_id: big.id, hyper_tag_id: ac2.id)
+    DB[:access_tag].insert(project_id: big.id, hyper_tag_id: ac3.id)
+    ac2.update(created_at: Time.now - 100)
+
+    big_label = "big-customer (b@ibi.com)"
+
+    reload = -> { visit "/customer-usage" }
+    rows = -> { page.all(".customer-usage-table tbody tr").map { it.all("td").map(&:text) } }
+
+    # Before any project has resources or invoices, there are no customers.
+    click_link "Customer Usage"
+    expect(page.title).to eq "Ubicloud Admin - Customer Usage"
+    expect(page).to have_no_css(".customer-usage-table")
+    expect(page).to have_content("No data available")
+
+    create_vm(project_id: big.id, vcpus: 8)
+    reload.call
+    expect(page.all(".customer-usage-table thead th").map(&:text)).to eq(["Project", "Reputation", "VMs", "PostgreSQL", "Kubernetes", "Runners", "Total vCPUs", "Total Spend"])
+    expect(rows.call).to eq([[big_label, "new", "1", "0", "0", "0", "8", "$0.00"]])
+
+    pg = create_postgres_resource(project: big, location_id: Location::HETZNER_FSN1_ID)
+    create_postgres_server(resource: pg).vm.update(project_id: service_project.id)
+    reload.call
+    expect(rows.call).to eq([[big_label, "new", "1", "1", "0", "0", "10", "$0.00"]])
+
+    k8s_ps = PrivateSubnet.create(name: "k8s-ps", project_id: big.id, location_id: Location::HETZNER_FSN1_ID, net4: "10.1.0.0/26", net6: "fdfb::/64")
+    kc = KubernetesCluster.create(project_id: big.id, name: "k8s-cluster", private_subnet_id: k8s_ps.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 1, version: Option.selectable_kubernetes_versions.first, target_node_size: "standard-2")
+    KubernetesNode.create(kubernetes_cluster_id: kc.id, vm_id: create_vm(project_id: service_project.id, vcpus: 4, name: "k8s-node-vm").id)
+    reload.call
+    expect(rows.call).to eq([[big_label, "new", "1", "1", "1", "0", "14", "$0.00"]])
+
+    installation = GithubInstallation.create(installation_id: 99, name: "gh-org", type: "Organization", project_id: big.id)
+    gh_vm = create_vm(project_id: service_project.id, vcpus: 2, name: "gh-runner-vm")
+    GithubRunner.create(vm_id: gh_vm.id, location_id: gh_vm.location_id, repository_name: "repo", label: "ubicloud", installation_id: installation.id)
+    reload.call
+    expect(rows.call).to eq([[big_label, "new", "1", "1", "1", "1", "16", "$0.00"]])
+
+    Invoice.create(project_id: big.id, invoice_number: "2601-big-01", content: {cost: 10.0}, begin_time: "2025-01-01", end_time: "2025-02-01")
+    Invoice.create(project_id: big.id, invoice_number: "2602-big-02", content: {cost: 5.5}, begin_time: "2025-02-01", end_time: "2025-03-01")
+    reload.call
+    expect(rows.call).to eq([[big_label, "new", "1", "1", "1", "1", "16", "$15.50"]])
+
+    create_vm(project_id: small.id, vcpus: 2)
+    Invoice.create(project_id: small.id, invoice_number: "2601-small-01", content: {cost: 1.0}, begin_time: "2025-01-01", end_time: "2025-02-01")
+    reload.call
+    expect(rows.call).to eq([
+      [big_label, "new", "1", "1", "1", "1", "16", "$15.50"],
+      ["small-customer", "new", "1", "0", "0", "0", "2", "$1.00"],
+    ])
+
+    DB[:access_tag].insert(project_id: small.id, hyper_tag_id: create_account("x@small.com", with_project: false).id)
+    reload.call
+    expect(rows.call).to eq([
+      [big_label, "new", "1", "1", "1", "1", "16", "$15.50"],
+      ["small-customer (x@small.com)", "new", "1", "0", "0", "0", "2", "$1.00"],
+    ])
+
+    minio_service = Project.create(name: "minio-service")
+    minio_host = create_vm_host(location_id: Location::HETZNER_FSN1_ID)
+    minio_cluster = MinioCluster.create(name: "minio-cluster", project_id: minio_service.id, location_id: minio_host.location_id, admin_user: "admin", admin_password: "dummy-password")
+    minio_pool = MinioPool.create(cluster_id: minio_cluster.id, server_count: 1, drive_count: 1, storage_size_gib: 100, vm_size: "standard-2", start_index: 0)
+    MinioServer.create(minio_pool_id: minio_pool.id, vm_id: create_vm(vm_host_id: minio_host.id, project_id: minio_service.id, name: "minio-vm").id, index: 0)
+
+    reload.call
+    expect(rows.call).to eq([
+      [big_label, "new", "1", "1", "1", "1", "16", "$15.50"],
+      ["small-customer (x@small.com)", "new", "1", "0", "0", "0", "2", "$1.00"],
+      ["minio-service", "new", "1", "0", "0", "0", "2", "$0.00"],
+    ])
+
+    expect(page).to have_no_content("empty-customer")
+    expect(page).to have_no_content("internal-service")
+  end
+
+  it "shows accounts grouped by IP address, ordered by last account creation" do
+    fraud1 = create_account("fraud1@ibi.com", with_project: false)
+    fraud2 = create_account("fraud2@ibi.com", with_project: false)
+    fraud3 = create_account("fraud3@ibi.com", with_project: false)
+    other = create_account("other@ibi.com", with_project: false)
+    alone = create_account("alone@ibi.com", with_project: false)
+
+    fraud1.update(created_at: Time.now - 300, suspended_at: Time.now)
+    fraud2.update(created_at: Time.now - 200)
+    fraud3.update(created_at: Time.now - 100, suspended_at: Time.now)
+    other.update(created_at: Time.now - 400)
+
+    add_ip = ->(account, ip, message = "login", at: Sequel::CURRENT_TIMESTAMP) do
+      DB[:account_authentication_audit_log].insert(account_id: account.id, message:, metadata: Sequel.pg_jsonb({"ip" => ip}), at:)
+    end
+
+    [fraud1, fraud2, fraud3].each { add_ip.call(it, "1.2.3.4", "create_account") }
+    add_ip.call(fraud1, "1.2.3.4") # duplicate IP for same account is counted once
+    add_ip.call(fraud1, "5.6.7.8")
+    add_ip.call(other, "5.6.7.8")
+    add_ip.call(alone, "9.9.9.9") # single account IPs are not shown
+    add_ip.call(other, "1.2.3.4", "login", at: Time.now - 40 * 24 * 60 * 60) # older than the default 30 day window
+    DB[:account_authentication_audit_log].insert(account_id: alone.id, message: "login", metadata: Sequel.pg_jsonb({}))
+
+    rows = -> { page.all(".accounts-by-ip-table tbody tr").map { it.all("td").map(&:text) } }
+    time = ->(account) { account.reload.created_at.strftime("%F %T") }
+
+    click_link "Accounts by IP Address"
+    expect(page.title).to eq "Ubicloud Admin - Accounts by IP Address"
+    expect(page.all(".accounts-by-ip-table thead th").map(&:text)).to eq(
+      ["IP", "Accounts", "Suspended Accounts", "First Account Created At", "Last Account Created At"],
+    )
+    expect(rows.call).to eq([
+      ["1.2.3.4", "3", "2", time.call(fraud1), time.call(fraud3)],
+      ["5.6.7.8", "2", "1", time.call(other), time.call(fraud1)],
+    ])
+
+    click_link "1.2.3.4"
+    expect(page).to have_current_path("/accounts-by-ip/1.2.3.4?days=30")
+    expect(page.title).to eq "Ubicloud Admin - Accounts for 1.2.3.4"
+    expect(page.all(".accounts-for-ip-table thead th").map(&:text)).to eq(
+      ["Account", "Name", "Email", "Created At", "Suspended At"],
+    )
+    expect(page.all(".accounts-for-ip-table tbody tr").map { it.all("td").map(&:text) }).to eq([
+      [fraud3.ubid, "", fraud3.email, time.call(fraud3), fraud3.suspended_at.strftime("%F %T")],
+      [fraud2.ubid, "", fraud2.email, time.call(fraud2), ""],
+      [fraud1.ubid, "", fraud1.email, time.call(fraud1), fraud1.suspended_at.strftime("%F %T")],
+    ])
+
+    # The older log line of the other account is only in the wider day window.
+    click_link "Back to Accounts by IP Address"
+    fill_in "Days", with: "60"
+    click_button "Show Accounts"
+    click_link "1.2.3.4"
+    expect(page.all(".accounts-for-ip-table tbody td:nth-child(3)").map(&:text)).to include(other.email)
+
+    click_link "Authentication Audit Logs for this IP"
+    expect(page.title).to eq "Ubicloud Admin - Authentication Audit Log"
+    expect(page.all("#audit-log-search-results tbody td:nth-child(3)").map(&:text).uniq.sort).to eq([fraud1, fraud2, fraud3, other].map(&:ubid).sort)
+
+    visit "/accounts-by-ip"
+    fill_in "Days", with: "60"
+    click_button "Show Accounts"
+    expect(rows.call).to eq([
+      ["1.2.3.4", "4", "2", time.call(other), time.call(fraud3)],
+      ["5.6.7.8", "2", "1", time.call(other), time.call(fraud1)],
+    ])
+
+    visit "/accounts-by-ip"
+    fill_in "Minimum Accounts", with: "3"
+    click_button "Show Accounts"
+    expect(rows.call).to eq([["1.2.3.4", "3", "2", time.call(fraud1), time.call(fraud3)]])
+
+    DB[:account_authentication_audit_log].delete
+    visit "/accounts-by-ip"
+    expect(page).to have_no_css(".accounts-by-ip-table")
+    expect(page).to have_content("No data available")
+  end
+
+  it "shows approximate table row counts" do
+    click_link "Approximate Table Row Counts"
+    expect(page.title).to eq "Ubicloud Admin - Approximate Table Row Counts"
+    expect(page.all(".object-table thead th").map(&:text)).to eq(["Table", "Approximate Row Count"])
+
+    rows = page.all(".object-table tbody tr").map { it.all("td").map(&:text) }
+    expect(rows.map(&:first)).to eq DB.loose_counts("public").keys.map(&:to_s)
+    expect(rows.map(&:last)).to all(match(/\A(-1|\d+)\z/))
+  end
+
+  it "shows customer resources hosted on a VM host, resolving managed services to the customer" do
+    vm_host = create_vm_host
+    other_vm_host = create_vm_host
+    customer = Project.create(name: "some-customer")
+    service_project = Project.create(name: "internal-service")
+    minio_service = Project.create(name: "minio-service")
+
+    ac1 = create_account("a@someuser.com", with_project: false)
+    ac2 = create_account("b@someuser.com", with_project: false)
+    ac2.update(created_at: ac1.created_at + 100)
+
+    DB[:access_tag].insert(project_id: customer.id, hyper_tag_id: ac1.id)
+    DB[:access_tag].insert(project_id: customer.id, hyper_tag_id: ac2.id)
+    customer_label = "some-customer (a@someuser.com)"
+
+    # A VM on another host must never appear in this host's tables.
+    create_vm(vm_host_id: other_vm_host.id, project_id: customer.id, name: "vm-in-another-host")
+
+    reload = -> {
+      visit "/model/VmHost/#{vm_host.ubid}"
+      page.all("summary").each(&:click)
+    }
+    summary_rows = -> { page.all(".vm-host-customers-summary-table tbody tr").map { it.all("td").map(&:text) }.sort_by(&:first) }
+    # Assert the identifying columns (customer, type, resource, vm), ordered by vm name.
+    resource_rows = -> { page.all(".vm-host-resources-table tbody tr").map { it.all("td").map(&:text).first(4) }.sort_by(&:last) }
+
+    # Before any VM is hosted: only the empty-state message, no tables.
+    reload.call
+    expect(page).to have_content("No customer resources are hosted on this host.")
+    expect(page).to have_no_css(".vm-host-customers-summary-table")
+    expect(page).to have_no_css(".vm-host-resources-table")
+
+    # Plain customer VM, owned directly by the customer project.
+    create_vm(vm_host_id: vm_host.id, project_id: customer.id, name: "customer-vm")
+    reload.call
+    expect(page.all(".vm-host-customers-summary-table thead th").map(&:text)).to eq(["Customer", "VMs", "PostgreSQL", "Kubernetes", "GitHub Runners", "Total"])
+    expect(page.all(".vm-host-resources-table thead th").map(&:text)).to eq(["Customer", "Type", "Resource", "VM", "vCPUs", "Created At"])
+    expect(summary_rows.call).to eq([[customer_label, "1", "0", "0", "0", "1"]])
+    expect(resource_rows.call).to eq([[customer_label, "VM", "", "customer-vm"]])
+
+    # PostgreSQL: the VM is owned by the service project but attributed to the
+    # customer through the postgres resource.
+    pg = create_postgres_resource(project: customer, location_id: vm_host.location_id)
+    pg_vm = create_postgres_server(resource: pg).vm
+    pg_vm.update(vm_host_id: vm_host.id, project_id: service_project.id)
+    reload.call
+    expect(summary_rows.call).to eq([[customer_label, "1", "1", "0", "0", "2"]])
+    expect(resource_rows.call).to eq([
+      [customer_label, "VM", "", "customer-vm"],
+      [customer_label, "PostgreSQL", pg.name, pg_vm.name],
+    ].sort_by(&:last))
+
+    # Kubernetes: attributed to the customer through the cluster.
+    k8s_ps = PrivateSubnet.create(name: "k8s-ps", project_id: customer.id, location_id: vm_host.location_id, net4: "10.1.0.0/26", net6: "fdfb::/64")
+    cluster = KubernetesCluster.create(project_id: customer.id, name: "k8s-cluster", private_subnet_id: k8s_ps.id, location_id: vm_host.location_id, cp_node_count: 1, version: Option.selectable_kubernetes_versions.first, target_node_size: "standard-2")
+    KubernetesNode.create(kubernetes_cluster_id: cluster.id, vm_id: create_vm(vm_host_id: vm_host.id, project_id: service_project.id, name: "k8s-node-vm").id)
+    reload.call
+    expect(summary_rows.call).to eq([[customer_label, "1", "1", "1", "0", "3"]])
+    expect(resource_rows.call).to eq([
+      [customer_label, "VM", "", "customer-vm"],
+      [customer_label, "PostgreSQL", pg.name, pg_vm.name],
+      [customer_label, "Kubernetes", "k8s-cluster", "k8s-node-vm"],
+    ].sort_by(&:last))
+
+    # GitHub runner: attributed to the customer through the installation.
+    installation = GithubInstallation.create(installation_id: 99, name: "gh-org", type: "Organization", project_id: customer.id)
+    gh_vm = create_vm(vm_host_id: vm_host.id, project_id: service_project.id, name: "gh-runner-vm")
+    GithubRunner.create(vm_id: gh_vm.id, location_id: gh_vm.location_id, repository_name: "repo", label: "ubicloud", installation_id: installation.id)
+    reload.call
+    expect(summary_rows.call).to eq([[customer_label, "1", "1", "1", "1", "4"]])
+    expect(resource_rows.call).to eq([
+      [customer_label, "VM", "", "customer-vm"],
+      [customer_label, "PostgreSQL", pg.name, pg_vm.name],
+      [customer_label, "Kubernetes", "k8s-cluster", "k8s-node-vm"],
+      [customer_label, "GitHub Runner", "gh-org", "gh-runner-vm"],
+    ].sort_by(&:last))
+
+    # Minio server: the VM is owned by the internal Minio service project and is
+    # not mapped to a customer, so it appears under the service project with no
+    # email.
+    minio_cluster = MinioCluster.create(name: "minio-cluster", project_id: minio_service.id, location_id: vm_host.location_id, admin_user: "admin", admin_password: "dummy-password")
+    minio_pool = MinioPool.create(cluster_id: minio_cluster.id, server_count: 1, drive_count: 1, storage_size_gib: 100, vm_size: "standard-2", start_index: 0)
+    MinioServer.create(minio_pool_id: minio_pool.id, vm_id: create_vm(vm_host_id: vm_host.id, project_id: minio_service.id, name: "minio-vm").id, index: 0)
+    reload.call
+    expect(summary_rows.call).to eq([
+      ["minio-service", "1", "0", "0", "0", "1"],
+      [customer_label, "1", "1", "1", "1", "4"],
+    ])
+    expect(resource_rows.call).to eq([
+      [customer_label, "VM", "", "customer-vm"],
+      ["minio-service", "VM", "", "minio-vm"],
+      [customer_label, "PostgreSQL", pg.name, pg_vm.name],
+      [customer_label, "Kubernetes", "k8s-cluster", "k8s-node-vm"],
+      [customer_label, "GitHub Runner", "gh-org", "gh-runner-vm"],
+    ].sort_by(&:last))
+
+    expect(page).to have_no_content("internal-service")
+    expect(page).to have_no_content("vm-in-another-host")
+  end
+
+  it "shows inventory and host provider details on VmHost page" do
+    vm_host = create_vm_host
+
+    visit "/model/VmHost/#{vm_host.ubid}"
+    expect(page).to have_css("summary", text: "Inventory")
+    expect(page).to have_no_css(".vm-host-inventory-table")
+    page.all("summary").each(&:click)
+    expect(page).to have_content("No data available for Inventory table")
+
+    inventory = VmHostInventory.create do
+      it.id = vm_host.id
+      it.server_model = "AX102"
+      it.cpu = "AMD Ryzen 9 7950X3D"
+      it.memory = "128GB"
+      it.storage = "2x 1.92TB NVMe SSD"
+      it.uplink = "1Gbps"
+      it.monthly_price = 109.9
+      it.currency = "EUR"
+    end
+    page.refresh
+    page.all("summary").each(&:click)
+    expect(page.all(".vm-host-inventory-table thead th").map(&:text)).to eq(["Column", "Value"])
+    expect(page.all(".vm-host-inventory-table tbody tr").map { it.all("td").map(&:text) }.to_h).to eq({
+      "updated_at" => inventory.updated_at.strftime("%F %T"),
+      "server_model" => "AX102",
+      "cpu" => "AMD Ryzen 9 7950X3D",
+      "memory" => "128GB",
+      "storage" => "2x 1.92TB NVMe SSD",
+      "uplink" => "1Gbps",
+      "gpu" => "",
+      "monthly_price" => "109.90",
+      "currency" => "EUR",
+    })
+
+    # With a provider, the table is titled after it.
+    HostProvider.create do
+      it.id = vm_host.id
+      it.server_identifier = "123"
+      it.provider_name = HostProvider::HETZNER_PROVIDER_NAME
+    end
+    page.refresh
+    expect(page).to have_css("summary", text: "Provider hetzner #123")
+    expect(page).to have_no_css("summary", text: "Inventory")
+  end
+
+  it "renders the customer summary when customers have equal resource totals" do
+    vm_host = create_vm_host
+    c1 = Project.create(name: "customer-b")
+    c2 = Project.create(name: "customer-c")
+    c3 = Project.create(name: "customer-a")
+    create_vm(vm_host_id: vm_host.id, project_id: c1.id, name: "vm-one")
+    create_vm(vm_host_id: vm_host.id, project_id: c2.id, name: "vm-two")
+    create_vm(vm_host_id: vm_host.id, project_id: c3.id, name: "vm-three")
+
+    visit "/model/VmHost/#{vm_host.ubid}"
+    page.all("summary").each(&:click)
+    summary = page.all(".vm-host-customers-summary-table tbody tr").map { it.all("td").map(&:text) }.sort_by(&:first)
+    expect(summary).to eq([
+      ["customer-a", "1", "0", "0", "0", "1"],
+      ["customer-b", "1", "0", "0", "0", "1"],
+      ["customer-c", "1", "0", "0", "0", "1"],
+    ])
   end
 end

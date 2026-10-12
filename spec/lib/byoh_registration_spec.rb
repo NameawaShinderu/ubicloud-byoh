@@ -35,6 +35,16 @@ RSpec.describe ByohRegistration do
       }.to raise_error(described_class::ValidationError, /not a valid CIDR/)
     end
 
+    it "rejects an IPv4 block that contains main_ip" do
+      expect {
+        described_class.new(**base_args.merge(routed_networks: ["203.0.113.40/29"])).validate!
+      }.to raise_error(described_class::ValidationError, /contains main_ip 203.0.113.42/)
+    end
+
+    it "accepts main_ip declared as its own /32" do
+      expect { described_class.new(**base_args.merge(routed_networks: ["203.0.113.42/32", "10.99.0.0/29"])).validate! }.not_to raise_error
+    end
+
     it "rejects a non-/64 IPv6 routed_network" do
       expect {
         described_class.new(**base_args.merge(routed_networks: ["fd00::/48"])).validate!

@@ -1,0 +1,8 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative "../lib/parseable_setup"
+require_relative "../../common/lib/node_exporter_setup"
+
+ParseableSetup.new(ARGV).run
+NodeExporterSetup.new.run

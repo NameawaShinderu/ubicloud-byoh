@@ -331,9 +331,14 @@ RSpec.describe Prog::Ai::InferenceEndpointReplicaNexus do
   describe "#unavailable" do
     it "creates a page if replica is unavailable" do
       LoadBalancerVmPort.dataset.update(state: "down")
-      expect(Prog::PageNexus).to receive(:assemble)
+      expect(Page.count).to eq(0)
       expect(inference_endpoint).to receive(:maintenance_set?).and_return(false)
       expect { nx.unavailable }.to nap(30)
+
+      page = Page.from_tag_parts("InferenceEndpointReplicaUnavailable", replica.ubid)
+      expect(page).not_to be_nil
+      expect(page.severity).to eq("warning")
+      expect(page.resource_id).to eq(replica.id)
     end
 
     it "does not create a page if replica is in maintenance mode" do
@@ -449,6 +454,22 @@ RSpec.describe Prog::Ai::InferenceEndpointReplicaNexus do
         JSON.parse("[{\"ubid\":\"#{replica.ubid}\",\"request_count\":1,\"prompt_token_count\":10,\"completion_token_count\":20},{\"ubid\":\"anotherubid\",\"request_count\":0,\"prompt_token_count\":0,\"completion_token_count\":0}]"),
         "output", "completion_token_count",
       )
+
+      nx.ping_gateway
+    end
+
+    it "keeps a project eligible via an active ResourceCredit despite an exhausted free quota and no payment method" do
+      allow(FreeQuota).to receive(:get_exhausted_projects).and_return(projects.map(&:id))
+      ResourceCredit.create(project_id: projects.first.id, name: "Test credit", amount: 5, active_from: Time.utc(Time.now.year, Time.now.month))
+      expect(inference_endpoint).to receive(:is_public).and_return(true).twice
+      expect(inference_endpoint).to receive(:ubid).and_return("ieubid")
+
+      expect(sshable).to receive(:_cmd) do |command, options|
+        json_sent = JSON.parse(options[:stdin])
+        expect(json_sent["projects"].map { it["ubid"] }).to eq([projects.first.ubid])
+      end.and_return("{\"inference_endpoint\":\"1eqhk4b9gfq27gc5agxkq84bhr\",\"replica\":\"1rvtmbhd8cne6jpz3xxat7rsnr\",\"projects\":[]}")
+      expect(nx).to receive(:update_billing_records).with([], "input", "prompt_token_count")
+      expect(nx).to receive(:update_billing_records).with([], "output", "completion_token_count")
 
       nx.ping_gateway
     end

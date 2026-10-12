@@ -6,6 +6,8 @@ class Prog::BootstrapRhizome < Prog::Base
   subject_is :sshable
   semaphore :destroy
 
+  frame_reader :target_folder, :no_bundler_install
+
   def user
     @user ||= frame.fetch("user", "root")
   end
@@ -36,7 +38,7 @@ LogLevel VERBOSE
 
 # Terminate sessions with clients that cannot return packets rapidly.
 ClientAliveInterval 2
-ClientAliveCountMax 4
+ClientAliveCountMax 20
 
 # Increase the maximum number of concurrent unauthenticated connections.
 MaxStartups 50:1:150
@@ -55,7 +57,7 @@ LOGIND
     pop "rhizome user bootstrapped and source installed" if retval&.dig("msg") == "installed rhizome"
 
     key_data = sshable.keys.map(&:private_key)
-    no_bundler_install = (strand.stack.first["no_bundler_install"] == true).to_s
+    no_bundler_install = (self.no_bundler_install == true).to_s
     Util.rootish_ssh(sshable.host, user, key_data, <<SH, LOGIND_CONFIG:, SSHD_CONFIG:, public_keys: sshable.keys.map(&:public_key).join("\n"), no_bundler_install:)
 set -ueo pipefail
 if [ :no_bundler_install = false ]; then
@@ -84,6 +86,6 @@ echo :public_keys | sudo tee /home/rhizome/.ssh/authorized_keys > /dev/null
 sync
 SH
 
-    push Prog::InstallRhizome, {"target_folder" => frame["target_folder"]}
+    push Prog::InstallRhizome, {"target_folder" => target_folder}
   end
 end

@@ -2,30 +2,49 @@
 
 class PostgresResource < Sequel::Model
   module Metal
+    def self.available_families_and_sizes(_location, _project)
+      Set.new(
+        Option::POSTGRES_SIZE_OPTIONS.filter_map { |name, opt| [opt.family, name] if opt.family == "standard" || opt.family == "hobby" },
+      )
+    end
+
+    def self.storage_sizes(_location, family, vcpu_count)
+      min_storage = (vcpu_count >= 30) ? 1024 : vcpu_count * 32
+      min_storage /= 2 if family == "hobby"
+      [min_storage, min_storage * 2, min_storage * 4]
+    end
+
     private
+
+    def metal_boot_image(pg_version, arch, family)
+      "postgres-#{family}"
+    end
 
     def metal_upgrade_candidate_server
       servers
         .reject(&:is_representative)
-        .select { |server| server.vm.vm_storage_volumes.filter { it.boot }.any? { it.boot_image.version >= UPGRADE_IMAGE_MIN_VERSIONS[target_version] } }
+        .select { |server| server.vm.vm_storage_volumes.filter { it.boot }.any? { it.boot_image.version >= UPGRADE_IMAGE_MIN_VERSIONS.dig(server.image_family, target_version) } }
         .max_by(&:created_at)
+    end
+
+    def metal_lockout_mechanisms
+      ["pg_stop", "hba", "host_routing"].freeze
     end
 
     def metal_new_server_exclusion_filters
       # If the server is in leaseweb, we don't have multiple DCs, that's
       # why we return an empty list of data centers.
-      return ServerExclusionFilters.new(exclude_host_ids: [], exclude_data_centers: [], exclude_availability_zones: [], availability_zone: nil) if Config.allow_unspread_servers
-      return ServerExclusionFilters.new(exclude_host_ids: Array(representative_server.vm.vm_host_id), exclude_data_centers: [], exclude_availability_zones: [], availability_zone: nil) if location.provider == HostProvider::LEASEWEB_PROVIDER_NAME
+      return ServerExclusionFilters.new(exclude_host_ids: [], exclude_data_centers: [], exclude_availability_zones: [], availability_zone: nil, availability_zone_required: false) if Config.allow_unspread_servers
+      return ServerExclusionFilters.new(exclude_host_ids: Array(representative_server.vm.vm_host_id), exclude_data_centers: [], exclude_availability_zones: [], availability_zone: nil, availability_zone_required: false) if location.provider == HostProvider::LEASEWEB_PROVIDER_NAME
 
+      active_vm_ids = servers.reject { |s| s.needs_recycling? || s.destroy_set? }.map(&:vm_id)
       exclude_data_centers = VmHost
-        .where(data_center: VmHost
-          .join(:vm, vm_host_id: :id)
-          .where(Sequel[:vm][:id] => servers_dataset.select(:vm_id))
-          .select(:data_center)
-          .distinct)
+        .join(:vm, vm_host_id: :id)
+        .where(Sequel[:vm][:id] => active_vm_ids)
+        .distinct
         .select_map(:data_center)
 
-      ServerExclusionFilters.new(exclude_host_ids: [], exclude_data_centers:, exclude_availability_zones: [], availability_zone: nil)
+      ServerExclusionFilters.new(exclude_host_ids: [], exclude_data_centers:, exclude_availability_zones: [], availability_zone: nil, availability_zone_required: false)
     end
   end
 end

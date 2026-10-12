@@ -3,8 +3,8 @@
 class Prog::Vnet::NicNexus < Prog::Base
   subject_is :nic
 
-  def self.assemble(private_subnet_id, name: nil, ipv6_addr: nil, ipv4_addr: nil, exclude_availability_zones: [], availability_zone: nil)
-    unless (subnet = PrivateSubnet[private_subnet_id])
+  def self.assemble(private_subnet_id, name: nil, ipv6_addr: nil, ipv4_addr: nil, exclude_availability_zones: [], availability_zone: nil, availability_zone_required: false, is_management: false, use_eip: true, create_network_interface: true)
+    unless (subnet = PrivateSubnet.for_update.with_pk(private_subnet_id))
       fail "Given subnet doesn't exist with the id #{private_subnet_id}"
     end
 
@@ -16,16 +16,18 @@ class Prog::Vnet::NicNexus < Prog::Base
 
     DB.transaction do
       prog, ipv4_addr, mac, state, aws_subnet_id = if subnet.location.aws?
-        aws_subnet = select_aws_subnet(subnet, availability_zone, exclude_availability_zones)
-        ipv4 = ipv4_addr || allocate_ipv4_from_aws_subnet(subnet, aws_subnet)
-        ["Vnet::Aws::NicNexus", ipv4.to_s, nil, "active", aws_subnet&.id]
+        aws_subnet = select_aws_subnet(subnet, availability_zone, exclude_availability_zones, availability_zone_required:)
+        ipv4 = ipv4_addr || (allocate_ipv4_from_aws_subnet(subnet, aws_subnet) if create_network_interface)
+        ["Vnet::Aws::NicNexus", ipv4&.to_s, nil, "active", aws_subnet&.id]
+      elsif subnet.location.gcp?
+        ["Vnet::Gcp::NicNexus", (ipv4_addr || subnet.random_private_ipv4).to_s, nil, "active", nil]
       else
         ["Vnet::Metal::NicNexus", (ipv4_addr || subnet.random_private_ipv4).to_s, gen_mac, "initializing", nil]
       end
 
-      Nic.create_with_id(id, private_ipv6: ipv6_addr, private_ipv4: ipv4_addr, mac:, name:, private_subnet_id:, state:)
+      Nic.create_with_id(id, private_ipv6: ipv6_addr, private_ipv4: ipv4_addr, mac:, name:, private_subnet_id:, state:, is_management:)
       label = (subnet.location_id == Location::GITHUB_RUNNERS_ID) ? "wait" : "start"
-      Strand.create_with_id(id, prog:, label:, stack: [{"exclude_availability_zones" => exclude_availability_zones, "availability_zone" => availability_zone, "ipv4_addr" => ipv4_addr, "aws_subnet_id" => aws_subnet_id}])
+      Strand.create_with_id(id, prog:, label:, stack: [{"exclude_availability_zones" => exclude_availability_zones, "availability_zone" => availability_zone, "ipv4_addr" => ipv4_addr, "aws_subnet_id" => aws_subnet_id, "use_eip" => use_eip, "create_network_interface?" => create_network_interface}])
     end
   end
 
@@ -40,7 +42,7 @@ class Prog::Vnet::NicNexus < Prog::Base
     }.join(":").downcase
   end
 
-  def self.select_aws_subnet(subnet, availability_zone, exclude_availability_zones)
+  def self.select_aws_subnet(subnet, availability_zone, exclude_availability_zones, availability_zone_required: false)
     ps_aws_resource = subnet.private_subnet_aws_resource
     return unless ps_aws_resource
 
@@ -62,6 +64,10 @@ class Prog::Vnet::NicNexus < Prog::Base
       end
     end
 
+    if availability_zone_required
+      fail "No subnet in required availability zone #{availability_zone} of #{subnet.ubid}"
+    end
+
     # Fallback to any available subnet
     base_ds = AwsSubnet.where(private_subnet_aws_resource_id: ps_aws_resource.id)
     ds = excluded_az_ids.empty? ? base_ds : base_ds.exclude(location_aws_az_id: excluded_az_ids)
@@ -78,12 +84,12 @@ class Prog::Vnet::NicNexus < Prog::Base
       total_hosts = 2**(32 - subnet_cidr.netmask.prefix_len) - 5
       random_offset = SecureRandom.random_number(total_hosts) + 4
 
-      addr = subnet_cidr.nth(random_offset)
+      ipv4 = "#{subnet_cidr.nth(random_offset)}/32"
 
       # Check no existing NIC uses this IP
-      next if subnet.nics.any? { |n| n.private_ipv4.network.to_s == addr.to_s }
+      next unless subnet.nics_dataset.where(private_ipv4: ipv4).empty?
 
-      "#{addr}/32"
+      ipv4
     end
   end
 end

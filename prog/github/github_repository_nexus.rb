@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/util"
-
 class Prog::Github::GithubRepositoryNexus < Prog::Base
   subject_is :github_repository
 
@@ -36,8 +34,9 @@ class Prog::Github::GithubRepositoryNexus < Prog::Base
     end
     deadline = clock_time + 80
     client = github_repository.installation.client(auto_paginate: true)
-    queued_runs = client.repository_workflow_runs(github_repository.name, {status: "queued"})[:workflow_runs]
-    Clog.emit("polled queued runs", {polled_queued_runs: {repository_name: github_repository.name, count: queued_runs.count}})
+    created_after = (Time.now - 7 * 24 * 60 * 60).utc.strftime("%Y-%m-%d")
+    queued_runs = client.repository_workflow_runs(github_repository.name, {status: "queued", created: ">=#{created_after}"})[:workflow_runs]
+    Clog.emit("polled queued runs", {polled_queued_runs: {repository_name: github_repository.name, count: queued_runs.count, oldest_run_at: queued_runs.map { it[:created_at] }.min}})
 
     # We check the rate limit after the first API call to avoid unnecessary API
     # calls to fetch only the rate limit. Every response includes the rate limit
@@ -144,7 +143,7 @@ class Prog::Github::GithubRepositoryNexus < Prog::Base
       check_queued_jobs if Config.enable_github_workflow_poller
     rescue Octokit::NotFound
       Clog.emit("not found repository", {not_found_repository: {repository_name: github_repository.name}})
-      if github_repository.runners.count == 0
+      if github_repository.runners_dataset.empty?
         github_repository.incr_destroy
         nap 0
       end
@@ -158,10 +157,10 @@ class Prog::Github::GithubRepositoryNexus < Prog::Base
   label def destroy
     decr_destroy
 
-    register_deadline(nil, 5 * 60)
+    register_deadline(nil, 400)
     unless github_repository.runners.empty?
       Clog.emit("Cannot destroy repository with active runners", {not_destroyed_repository: {repository_name: github_repository.name}})
-      nap 5 * 60
+      nap 2 * 60
     end
 
     github_repository.cache_entries_dataset.destroy

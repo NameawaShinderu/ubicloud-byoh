@@ -18,6 +18,13 @@ class Clover < Roda
     "deleting" => "bg-red-100 text-red-800",
   ).freeze
 
+  MACHINE_IMAGE_VERSION_STATE_LABEL_COLOR = Hash.new("bg-slate-100 text-slate-800").merge!(
+    "ready" => "bg-green-100 text-green-800",
+    "creating" => "bg-yellow-100 text-yellow-800",
+    "destroying" => "bg-red-100 text-red-800",
+    "failed" => "bg-red-100 text-red-800",
+  ).freeze
+
   VM_STATE_LABEL_COLOR = Hash.new("bg-slate-100 text-slate-800").merge!(
     "running" => "bg-green-100 text-green-800",
     "creating" => "bg-yellow-100 text-yellow-800",
@@ -107,21 +114,21 @@ class Clover < Roda
 
   def omniauth_providers
     @omniauth_providers ||= [
-      # :nocov:
+      # simplecov:disable
       Config.omniauth_google_id ? [:google, "Google"] : nil,
       Config.omniauth_github_id ? [:github, "GitHub"] : nil,
-      # :nocov:
+      # simplecov:enable
     ].compact
   end
 
   def sort_aces!(aces)
     @aces.sort! do |a, b|
-      # :nocov:
+      # simplecov:disable
       # Admin tag at the top (one of these branches will be hit, but
       # cannot force which)
       next -1 unless a.last
       next 1 unless b.last
-      # :nocov:
+      # simplecov:enable
 
       # Label sorting by subject, action, object for remaining ACEs
       a_tags = a[1]
@@ -216,7 +223,7 @@ class Clover < Roda
   def self.humanize_size(bytes)
     return nil if bytes.nil? || bytes.zero?
 
-    units = %w[B KB MB GB]
+    units = %w[B KB MB GB].freeze
     exp = (Math.log(bytes) / Math.log(1024)).to_i
     exp = [exp, units.size - 1].min
 

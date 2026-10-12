@@ -26,7 +26,7 @@ RSpec.describe Prog::Github::DeleteCacheEntries do
       expect(st.prog).to eq "Github::DeleteCacheEntries"
       expect(st.label).to eq "delete_entries"
       expect(st.stack[0]["subject_id"]).to eq repository.id
-      expect(Time.parse(st.stack[0]["initiated_at"])).to be_within(10).of(Time.now)
+      expect(Time.new(st.stack[0]["initiated_at"])).to be_within(10).of(Time.now)
     end
 
     it "accepts an initiated_at Time" do
@@ -35,7 +35,7 @@ RSpec.describe Prog::Github::DeleteCacheEntries do
       expect(st.prog).to eq "Github::DeleteCacheEntries"
       expect(st.label).to eq "delete_entries"
       expect(st.stack[0]["subject_id"]).to eq repository.id
-      expect(Time.parse(st.stack[0]["initiated_at"])).to eq initiated_at
+      expect(Time.new(st.stack[0]["initiated_at"])).to eq initiated_at
     end
   end
 
@@ -59,12 +59,29 @@ RSpec.describe Prog::Github::DeleteCacheEntries do
   end
 
   describe "#next_entry" do
-    it "returns next entry" do
+    it "returns next entry when using a time-based deletion" do
       entries = self.entries
       expect(dce.next_entry).to eq entries[0]
       entries[0].this.update(created_at: Time.now + 10)
       expect(dce.next_entry).to eq entries[1]
       entries[1].this.update(created_at: Time.now + 10)
+      expect(dce.next_entry).to be_nil
+    end
+
+    it "returns next entry when deleting specific ids" do
+      cache_entry_ids = entries.map(&:id)
+      dce = described_class.new(described_class.assemble(repository.id, cache_entry_ids:))
+      returned_cache_entry_ids = []
+      returned_cache_entry_ids << dce.next_entry.id
+      expect(dce.strand.stack[0]["cache_entry_ids"].size).to eq 1
+      returned_cache_entry_ids << dce.next_entry.id
+      expect(cache_entry_ids.sort).to eq returned_cache_entry_ids.sort
+      expect(dce.strand.stack[0]["cache_entry_ids"]).to eq []
+      expect(dce.next_entry).to be_nil
+    end
+
+    it "returns nil if no github repository" do
+      repository.destroy
       expect(dce.next_entry).to be_nil
     end
   end

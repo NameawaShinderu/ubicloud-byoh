@@ -1,17 +1,18 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/net_ssh"
-
 class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
   subject_is :kubernetes_cluster
 
+  frame_reader :nodepool_id, :machine_image_version_id
+  frame_accessor :node_id, :no_bundler_install
+
   def node
-    @node ||= KubernetesNode[frame["node_id"]]
+    @node ||= KubernetesNode[node_id]
   end
 
   def kubernetes_nodepool
     return @kubernetes_nodepool if defined?(@kubernetes_nodepool)
-    @kubernetes_nodepool = KubernetesNodepool[frame["nodepool_id"]]
+    @kubernetes_nodepool = KubernetesNodepool[nodepool_id]
   end
 
   def vm
@@ -37,11 +38,20 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
 
   def before_run
     if kubernetes_cluster.strand.label == "destroy" && strand.label != "destroy"
-      pop "provisioning canceled"
+      hop_destroy
     end
   end
 
   label def start
+    register_deadline(nil, 20 * 60)
+    hop_create_node
+  end
+
+  label def create_node
+    if kubernetes_nodepool && kubernetes_nodepool.kubernetes_cluster_id != kubernetes_cluster.id
+      fail "nodepool #{kubernetes_nodepool.ubid} does not belong to cluster #{kubernetes_cluster.ubid}"
+    end
+
     name, vm_size, storage_size_gib = if kubernetes_nodepool
       ["#{kubernetes_nodepool.ubid}-#{SecureRandom.alphanumeric(5).downcase}",
         kubernetes_nodepool.target_node_size,
@@ -52,9 +62,11 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
         kubernetes_cluster.target_node_storage_size_gib]
     end
 
-    storage_volumes = [{encrypted: true, size_gib: storage_size_gib}] if storage_size_gib
+    if storage_size_gib || machine_image_version_id
+      storage_volumes = [{encrypted: true, size_gib: storage_size_gib, machine_image_version_id:}.compact]
+    end
 
-    boot_image = "kubernetes-#{kubernetes_cluster.version.tr(".", "_")}"
+    boot_image = "kubernetes-#{(kubernetes_nodepool || kubernetes_cluster).version.tr(".", "_")}"
 
     node = Prog::Kubernetes::KubernetesNodeNexus.assemble(
       Config.kubernetes_service_project_id,
@@ -64,14 +76,14 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
       size: vm_size,
       storage_volumes:,
       boot_image:,
-      private_subnet_id: kubernetes_cluster.private_subnet_id,
       enable_ip4: true,
       kubernetes_cluster_id: kubernetes_cluster.id,
       kubernetes_nodepool_id: kubernetes_nodepool&.id,
     ).subject
     vm = node.vm
 
-    update_stack({"node_id" => node.id})
+    self.node_id = node.id
+    self.no_bundler_install = true if vm.vm_storage_volumes_dataset.first(boot: true).machine_image_version_id
 
     unless kubernetes_nodepool
       kubernetes_cluster.api_server_lb.add_vm(vm)
@@ -90,7 +102,7 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
       table ip nat {
         chain postrouting {
           type nat hook postrouting priority 100;
-          ip saddr #{vm.nics.first.private_ipv4} oifname "ens3" masquerade
+          ip saddr #{vm.user_nic.private_ipv4} oifname "ens3" masquerade
         }
       }
 
@@ -115,7 +127,12 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
     vm.sshable.cmd("sudo systemctl enable --now nftables")
     vm.sshable.cmd "sudo systemctl enable --now kubelet"
 
-    bud Prog::BootstrapRhizome, {"target_folder" => "kubernetes", "subject_id" => vm.id, "user" => "ubi"}
+    if kubernetes_nodepool.nil? && Config.operator_ssh_public_keys
+      all_keys_str = "#{vm.sshable.keys.first.public_key}\n#{Config.operator_ssh_public_keys}\n"
+      vm.sshable.write_file("/home/ubi/.ssh/authorized_keys", all_keys_str, user: :current)
+    end
+
+    bud Prog::BootstrapRhizome, {"target_folder" => "kubernetes", "subject_id" => vm.id, "user" => "ubi", "no_bundler_install" => no_bundler_install}.compact
 
     hop_wait_bootstrap_rhizome
   end
@@ -133,9 +150,11 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
   end
 
   label def init_cluster
-    case vm.sshable.d_check("init_kubernetes_cluster")
+    state = vm.sshable.d_check("init_kubernetes_cluster")
+    case state
     when "Succeeded"
-      hop_install_cni
+      Page.from_tag_parts("KubernetesNodeInitClusterFailed", node.ubid)&.incr_resolve
+      hop_wait_api_server_lb
     when "NotStarted"
       params = {
         node_name: vm.name,
@@ -153,17 +172,32 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
     when "InProgress"
       nap 10
     when "Failed"
-      Clog.emit("INIT CLUSTER FAILED")
-      nap 65536
-      # TODO: register deadline
+      Clog.emit("init kubernetes cluster failed", {logs: vm.sshable.d_logs("init_kubernetes_cluster")})
+      Prog::PageNexus.assemble(
+        "init kubernetes cluster failed on node #{node.ubid}",
+        ["KubernetesNodeInitClusterFailed", node.ubid],
+        node.ubid,
+        resource_id: node.id,
+      )
+      nap 30
+    else
+      Clog.emit("got unknown state from daemonizer2 check: #{state}")
+      nap 30
     end
+  end
 
-    nap 65536
+  label def wait_api_server_lb
+    kubernetes_cluster.client.kubectl("get --raw=/healthz")
+    hop_install_cni
+  rescue RuntimeError
+    nap 5
   end
 
   label def join_control_plane
-    case vm.sshable.d_check("join_control_plane")
+    state = vm.sshable.d_check("join_control_plane")
+    case state
     when "Succeeded"
+      Page.from_tag_parts("KubernetesNodeJoinControlPlaneFailed", node.ubid)&.incr_resolve
       hop_install_cni
     when "NotStarted"
       cp_sshable = kubernetes_cluster.sshable
@@ -182,17 +216,25 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
     when "InProgress"
       nap 10
     when "Failed"
-      # TODO: Create a page
-      Clog.emit("JOIN CP NODE TO CLUSTER FAILED")
-      nap 65536
+      Clog.emit("join cp node to cluster failed", {logs: vm.sshable.d_logs("join_control_plane")})
+      Prog::PageNexus.assemble(
+        "join cp node to cluster failed on node #{node.ubid}",
+        ["KubernetesNodeJoinControlPlaneFailed", node.ubid],
+        node.ubid,
+        resource_id: node.id,
+      )
+      nap 30
+    else
+      Clog.emit("got unknown state from daemonizer2 check: #{state}")
+      nap 30
     end
-
-    nap 65536
   end
 
   label def join_worker
-    case vm.sshable.d_check("join_worker")
+    state = vm.sshable.d_check("join_worker")
+    case state
     when "Succeeded"
+      Page.from_tag_parts("KubernetesNodeJoinWorkerFailed", node.ubid)&.incr_resolve
       hop_install_cni
     when "NotStarted"
       cp_sshable = kubernetes_cluster.sshable
@@ -204,18 +246,25 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
         discovery_token_ca_cert_hash: cp_sshable.cmd("sudo kubeadm token create --print-join-command", log: false)[/discovery-token-ca-cert-hash (\S+)/, 1],
         node_ipv4: vm.private_ipv4,
         node_ipv6: vm.ip6,
+        node_labels: {"ubicloud.com/nodepool" => kubernetes_nodepool.ubid},
       }
       vm.sshable.d_run("join_worker", "kubernetes/bin/join-node", stdin: JSON.generate(params), log: false)
       nap 15
     when "InProgress"
       nap 10
     when "Failed"
-      # TODO: Create a page
-      Clog.emit("JOIN WORKER NODE TO CLUSTER FAILED")
-      nap 65536
+      Clog.emit("join worker node to cluster failed", {logs: vm.sshable.d_logs("join_worker")})
+      Prog::PageNexus.assemble(
+        "join worker node to cluster failed on node #{node.ubid}",
+        ["KubernetesNodeJoinWorkerFailed", node.ubid],
+        node.ubid,
+        resource_id: node.id,
+      )
+      nap 30
+    else
+      Clog.emit("got unknown state from daemonizer2 check: #{state}")
+      nap 30
     end
-
-    nap 65536
   end
 
   label def install_cni
@@ -223,15 +272,23 @@ class Prog::Kubernetes::ProvisionKubernetesNode < Prog::Base
 {
   "cniVersion": "1.0.0",
   "name": "ubicni-network",
-  "type": "ubicni",
-  "ranges":{
-      "subnet_ipv6": "#{NetAddr::IPv6Net.new(vm.ephemeral_net6.network, NetAddr::Mask128.new(80))}",
-      "subnet_ula_ipv6": "#{vm.nics.first.private_ipv6}",
-      "subnet_ipv4": "#{vm.nics.first.private_ipv4}"
-  }
+  "plugins": [
+    {
+      "type": "ubicni",
+      "ranges":{
+          "subnet_ipv6": "#{NetAddr::IPv6Net.new(vm.ephemeral_net6.network, NetAddr::Mask128.new(vm.ephemeral_net6.netmask.prefix_len + 1))}",
+          "subnet_ula_ipv6": "#{vm.user_nic.private_ipv6}",
+          "subnet_ipv4": "#{vm.user_nic.private_ipv4}"
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": {"portMappings": true}
+    }
+  ]
 }
 CONFIG
-    vm.sshable.cmd("sudo tee /etc/cni/net.d/ubicni-config.json", stdin: cni_config)
+    vm.sshable.cmd("sudo tee /etc/cni/net.d/ubicni-config.conflist", stdin: cni_config)
     hop_approve_new_csr
   end
 
@@ -244,6 +301,19 @@ CONFIG
     end
     kubernetes_cluster.incr_sync_internal_dns_config
     kubernetes_cluster.incr_sync_worker_mesh
+    kubernetes_cluster.incr_update_billing_records
+    node.incr_configure_metrics
     pop({node_id: node.id})
+  end
+
+  label def destroy
+    if node_id
+      node_ubid = UBID.to_ubid(node_id)
+      %w[KubernetesNodeInitClusterFailed KubernetesNodeJoinControlPlaneFailed KubernetesNodeJoinWorkerFailed].each do
+        Page.from_tag_parts(it, node_ubid)&.incr_resolve
+      end
+    end
+
+    pop "provisioning canceled"
   end
 end

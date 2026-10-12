@@ -102,10 +102,18 @@ module AdminModelSpecHelper
       DiscountCode.create(code: "TEST123", credit_amount: 10, expires_at: Time.now + 86400)
     end
 
-    def create_dns_record
+    def create_resource_discount
       project = Project.create(name: "test-project")
-      zone = DnsZone.create(project_id: project.id, name: "test.com")
-      DnsRecord.create(dns_zone_id: zone.id, name: "www", type: "A", ttl: 300, data: "1.2.3.4")
+      ResourceDiscount.create(project_id: project.id, discount_percent: 10, active_from: Time.utc(Time.now.year, Time.now.month))
+    end
+
+    def create_resource_credit
+      project = Project.create(name: "test-project")
+      ResourceCredit.create(project_id: project.id, name: "test-credit", amount: 10, active_from: Time.utc(Time.now.year, Time.now.month))
+    end
+
+    def create_dns_record
+      DnsRecord.create(dns_zone_id: create_dns_zone.id, name: "www.test.com.", type: "A", ttl: 300, data: "1.2.3.4")
     end
 
     def create_dns_server
@@ -126,6 +134,13 @@ module AdminModelSpecHelper
       project = Project.create(name: "test-project")
       firewall = Firewall.create(name: "test-firewall", project_id: project.id, location_id: Location::HETZNER_FSN1_ID)
       FirewallRule.create(firewall_id: firewall.id, cidr: "0.0.0.0/0", port_range: Sequel.pg_range(80..80))
+    end
+
+    def create_gcp_vpc
+      project = Project.create(name: "test-project")
+      location = Location.create(name: "gcp-us-central1", provider: "gcp", project_id: project.id,
+        display_name: "GCP US Central 1", ui_name: "GCP US Central 1", visible: true)
+      GcpVpc.create(project_id: project.id, location_id: location.id, name: "ubicloud-test")
     end
 
     def create_github_cache_entry
@@ -161,6 +176,10 @@ module AdminModelSpecHelper
     def create_gpu_partition
       host = Prog::Vm::HostNexus.assemble("1.2.3.4", family: "gpu-standard").subject
       GpuPartition.create(vm_host_id: host.id, partition_id: 0, gpu_count: 1)
+    end
+
+    def create_hypervisor
+      Hypervisor.first
     end
 
     def create_inference_endpoint
@@ -266,7 +285,7 @@ module AdminModelSpecHelper
         private_subnet_id: ps.id,
         location_id: Location::HETZNER_FSN1_ID,
         cp_node_count: 3,
-        version: Option.kubernetes_versions.first,
+        version: Option.selectable_kubernetes_versions.first,
         target_node_size: "standard-2",
       )
     end
@@ -289,7 +308,7 @@ module AdminModelSpecHelper
 
     def create_kubernetes_nodepool
       cluster = create_kubernetes_cluster
-      KubernetesNodepool.create(kubernetes_cluster_id: cluster.id, name: "test-pool", target_node_size: "standard-2", node_count: 1)
+      KubernetesNodepool.create(kubernetes_cluster_id: cluster.id, name: "test-pool", target_node_size: "standard-2", node_count: 1, version: cluster.version)
     end
 
     def create_load_balancer
@@ -315,6 +334,7 @@ module AdminModelSpecHelper
       MachineImageVersionMetal.create_with_id(v,
         store_id: store.id,
         store_prefix: "test-prefix",
+        status: "creating",
         archive_kek_id: kek.id)
       v
     end
@@ -364,9 +384,19 @@ module AdminModelSpecHelper
       LocationAz.create(location_id: location.id, az: "us-east-1a", zone_id: "use1-az1")
     end
 
+    def create_provider_ip_range
+      location = Location.create(name: "us-west-2", display_name: "AWS US West 2", ui_name: "AWS US West", visible: true, provider: "aws", project_id: nil)
+      ProviderIpRange.create(location_id: location.id, bucket_id: "intra_region", ip_version: 4, cidrs: Sequel.pg_array(["3.5.140.0/22"], :cidr))
+    end
+
     def create_location_credential_aws
       location = Location.create(name: "test-loc-cred", display_name: "Test Location", ui_name: "Test", visible: true, provider: "aws")
       LocationCredentialAws.create(access_key: "test-key", secret_key: "test-secret") { it.id = location.id }
+    end
+
+    def create_location_credential_gcp
+      location = Location.create(name: "test-loc-cred-gcp", display_name: "Test GCP Location", ui_name: "Test GCP", visible: true, provider: "gcp")
+      LocationCredentialGcp.create(project_id: "test-project", service_account_email: "test@test.iam.gserviceaccount.com", credentials_json: "{}") { it.id = location.id }
     end
 
     def create_minio_cluster
@@ -405,6 +435,11 @@ module AdminModelSpecHelper
       NicAwsResource.create_with_id(nic, network_interface_id: "eni-12345")
     end
 
+    def create_nic_gcp_resource
+      nic = create_nic
+      NicGcpResource.create_with_id(nic, vpc_name: "ubicloud-test-net", subnet_name: "ubicloud-test-sub")
+    end
+
     def create_object_tag
       project = Project.create(name: "test-project")
       ObjectTag.create(project_id: project.id, name: "test-object-tag")
@@ -425,6 +460,10 @@ module AdminModelSpecHelper
 
     def create_page
       Page.create(summary: "Test page", tag: "test-tag", details: {})
+    end
+
+    def create_page_snooze
+      PageSnooze.create(page_id: create_page.id, snooze_until: Time.now + 3600, snoozed_by: "admin", note: "test note")
     end
 
     def create_payment_method
@@ -460,6 +499,12 @@ module AdminModelSpecHelper
       PostgresMetricDestination.create_with_id(pg, url: "https://metrics.example.com", username: "test", password: "test-pass", postgres_resource_id: pg.id)
     end
 
+    def create_postgres_log_destination
+      project = Project.create(name: "test-project")
+      pg = create_postgres_resource(project:, location_id: Location::HETZNER_FSN1_ID)
+      PostgresLogDestination.create(postgres_resource_id: pg.id, name: "test-dest", type: "syslog", url: "tcp://logs.example.com:6514")
+    end
+
     def create_postgres_init_script
       project = Project.create(name: "test-project")
       pg = create_postgres_resource(project:, location_id: Location::HETZNER_FSN1_ID)
@@ -486,9 +531,19 @@ module AdminModelSpecHelper
       ProjectDiscountCode.create(project_id: project.id, discount_code_id: code.id)
     end
 
+    def create_remote_storage_server
+      volume = create_vm_storage_volume
+      host = create_vm_host
+      RemoteStorageServer.create(source_vm_storage_volume_id: volume.id, vm_host_id: host.id, psk: "supersecretpsk", psk_identity: "ubiblk-rss", port: 5500)
+    end
+
     def create_rhizome_installation
       sshable = create_sshable
       RhizomeInstallation.create_with_id(sshable, folder: "test-folder", commit: "abc123", digest: "def456")
+    end
+
+    def create_run_command
+      RunCommand.create(vm_id: create_vm.id, command: "fetch_serial_log")
     end
 
     def create_semaphore
@@ -540,6 +595,29 @@ module AdminModelSpecHelper
       VhostBlockBackend.create(vm_host_id: host.id, version_code: 401, allocation_weight: 100)
     end
 
+    def create_parseable_resource
+      project = Project.create(name: "test-project")
+      ps = PrivateSubnet.create(name: "test-ps", project_id: project.id, location_id: Location::HETZNER_FSN1_ID, net4: "10.0.0.0/26", net6: "fdfa::/64")
+      ParseableResource.create(
+        project_id: project.id,
+        location_id: Location::HETZNER_FSN1_ID,
+        private_subnet_id: ps.id,
+        name: "test-parseable",
+        admin_user: "admin",
+        admin_password: "test-password",
+        blob_storage_access_key: "access-key-1234",
+        blob_storage_secret_key: "secret-key-5678",
+        target_vm_size: "standard-2",
+        target_storage_size_gib: 100,
+      )
+    end
+
+    def create_parseable_server
+      pr = create_parseable_resource
+      vm = Prog::Vm::Nexus.assemble_with_sshable(pr.project_id, name: "vm-parseable", private_subnet_id: pr.private_subnet_id).subject
+      ParseableServer.create(parseable_resource_id: pr.id, vm_id: vm.id)
+    end
+
     def create_victoria_metrics_resource
       project = Project.create(name: "test-project")
       ps = PrivateSubnet.create(name: "test-ps", project_id: project.id, location_id: Location::HETZNER_FSN1_ID, net4: "10.0.0.0/26", net6: "fdfa::/64")
@@ -564,6 +642,23 @@ module AdminModelSpecHelper
     def create_vm
       project = Project.create(name: "test-project")
       Prog::Vm::Nexus.assemble("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGWmPgJE test@example.com", project.id, name: "test-vm").subject
+    end
+
+    def create_vm_gcp_resource
+      project = Project.create(name: "test-project")
+      location = Location.create(name: "gcp-us-central1", provider: "gcp", project_id: project.id,
+        display_name: "GCP US Central 1", ui_name: "GCP US Central 1", visible: true)
+      az = LocationAz.create(location_id: location.id, az: "a")
+      vm = Vm.create(
+        unix_user: "ubi", public_key: "ssh-ed25519 key",
+        name: "vmgcpres-vm",
+        family: "c4a-standard", cores: 0, vcpus: 8,
+        memory_gib: 32, arch: "arm64",
+        location_id: location.id, project_id: project.id,
+        boot_image: "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64",
+        display_state: "creating", ip4_enabled: false, created_at: Time.now,
+      )
+      VmGcpResource.create_with_id(vm, location_az_id: az.id)
     end
 
     def create_vm_host
@@ -602,6 +697,18 @@ module AdminModelSpecHelper
     def create_vm_storage_volume
       vm = create_vm
       VmStorageVolume.create(vm_id: vm.id, boot: false, size_gib: 10, disk_index: 1)
+    end
+
+    def create_network_volume
+      NetworkVolume.create(location_id: Location::HETZNER_FSN1_ID, size_gib: 64)
+    end
+
+    def create_aws_volume
+      AwsVolume.create_with_id(create_network_volume, volume_type: "gp3", provisioned_iops: 3000)
+    end
+
+    def create_gcp_volume
+      GcpVolume.create_with_id(create_network_volume, volume_type: "hyperdisk-balanced", provisioned_iops: 3000)
     end
   end
 end

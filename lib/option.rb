@@ -7,7 +7,7 @@ module Option
   AI_MODELS = ai_models.select { it["enabled"] }.freeze
 
   def self.locations(only_visible: true, feature_flags: {})
-    Location.where(project_id: nil).all.select { |pl| !only_visible || (pl.visible || feature_flags["visible_locations"]&.include?(pl.name)) }
+    Location.where(project_id: nil).order(:display_name).all.select { |pl| !only_visible || (pl.visible || feature_flags["visible_locations"]&.include?(pl.name)) }
   end
 
   def self.kubernetes_locations
@@ -15,7 +15,33 @@ module Option
   end
 
   def self.kubernetes_versions
-    ["v1.34", "v1.33"].freeze
+    ["v1.37", "v1.36", "v1.35", "v1.34", "v1.33"].freeze
+  end
+
+  def self.selectable_kubernetes_versions
+    kubernetes_versions.first(2)
+  end
+
+  MACHINE_IMAGE_SEARCH_LOCATIONS = {
+    Location::HETZNER_FSN1_ID => [Location::HETZNER_FSN1_ID, Location::HETZNER_HEL1_ID],
+    Location::HETZNER_HEL1_ID => [Location::HETZNER_HEL1_ID, Location::HETZNER_FSN1_ID],
+  }.each_value(&:freeze).freeze
+
+  def self.machine_image_search_locations(location_id)
+    MACHINE_IMAGE_SEARCH_LOCATIONS.fetch(location_id, [location_id])
+  end
+
+  def self.kubernetes_minor_version(version)
+    version[/^v\d+\.(\d+)$/, 1].to_i
+  end
+
+  def self.kubernetes_upgrade_candidate(version)
+    {
+      "v1.33" => "v1.34",
+      "v1.34" => "v1.35",
+      "v1.35" => "v1.36",
+      "v1.36" => "v1.37",
+    }.freeze[version]
   end
 
   def self.families
@@ -36,37 +62,152 @@ module Option
     "#{family}.#{suffix}"
   end
 
+  # Neither half of the machine type name is derivable from our family name,
+  # so both come from the family config.
+  def self.gcp_instance_type_name(family, vcpu_count, lssd: true)
+    config = GCP_FAMILY_VM_CONFIG.fetch(family)
+    "#{config[:gce_prefix]}-#{vcpu_count}#{"-#{config[:gce_suffix]}" if lssd}"
+  end
+
+  # Whole GiB, since vm.memory_gib is an integer column: c4 ratios are
+  # fractional (3.75 and 7.75), and a few shapes do not follow their family's
+  # ratio at all and are listed in memory_gib_overrides.
+  def self.gcp_memory_gib(family, vcpu_count)
+    config = GCP_FAMILY_VM_CONFIG.fetch(family)
+    config.dig(:memory_gib_overrides, vcpu_count) || (vcpu_count * config[:mem_ratio]).floor
+  end
+
   def self.vring_workers(vcpus)
     [1, vcpus / 2].max
   end
 
-  AWS_FAMILY_OPTIONS = ["c6gd", "m6a", "m6id", "m6gd", "m7a", "m7i", "m7g", "m8g", "m8gd", "i8g", "i8ge", "i7i", "i7ie", "r8gd", "r6gd", "r6id"].freeze
+  generic_local_storage_vcpus = [2, 4, 8, 16, 32, 48, 64]
+  rgd_families_local_storage_vcpus = [1, *generic_local_storage_vcpus]
+  ebs_families_vcpus = [2, 4, 8, 16, 32, 64]
+  i_families_local_storage_vcpus = [2, 4, 8, 16, 32, 48, 64, 96, 192]
+  ie_families_local_storage_vcpus = [2, 4, 8, 12, 24, 48, 72, 96, 192]
+
+  AWS_FAMILY_VM_CONFIG = {
+    # Compute optimized: vcpu * 2 memory
+    "c6gd" => {vcpus: generic_local_storage_vcpus, mem_ratio: 2, arch: "arm64"},
+    "c7gd" => {vcpus: generic_local_storage_vcpus, mem_ratio: 2, arch: "arm64"},
+    "c8gd" => {vcpus: generic_local_storage_vcpus, mem_ratio: 2, arch: "arm64"},
+    "c6id" => {vcpus: generic_local_storage_vcpus, mem_ratio: 2, arch: "x64"},
+    "c8id" => {vcpus: generic_local_storage_vcpus, mem_ratio: 2, arch: "x64"},
+    # General purpose: vcpu * 4 memory
+    "m6a" => {vcpus: ebs_families_vcpus, mem_ratio: 4, arch: "x64"},
+    "m7a" => {vcpus: ebs_families_vcpus, mem_ratio: 4, arch: "x64"},
+    "m7i" => {vcpus: ebs_families_vcpus, mem_ratio: 4, arch: "x64"},
+    "m8a" => {vcpus: ebs_families_vcpus, mem_ratio: 4, arch: "x64"},
+    "m8i" => {vcpus: ebs_families_vcpus, mem_ratio: 4, arch: "x64"},
+    "m7g" => {vcpus: ebs_families_vcpus, mem_ratio: 4, arch: "arm64"},
+    "m8g" => {vcpus: ebs_families_vcpus, mem_ratio: 4, arch: "arm64"},
+    "m9g" => {vcpus: ebs_families_vcpus, mem_ratio: 4, arch: "arm64"},
+    "m6gd" => {vcpus: generic_local_storage_vcpus, mem_ratio: 4, arch: "arm64"},
+    "m7gd" => {vcpus: generic_local_storage_vcpus, mem_ratio: 4, arch: "arm64"},
+    "m8gd" => {vcpus: generic_local_storage_vcpus, mem_ratio: 4, arch: "arm64"},
+    "m6id" => {vcpus: generic_local_storage_vcpus, mem_ratio: 4, arch: "x64"},
+    "m8id" => {vcpus: generic_local_storage_vcpus, mem_ratio: 4, arch: "x64"},
+    # Storage optimized: vcpu * 8 memory
+    "i8g" => {vcpus: i_families_local_storage_vcpus, mem_ratio: 8, arch: "arm64"},
+    "i7i" => {vcpus: i_families_local_storage_vcpus, mem_ratio: 8, arch: "x64"},
+    "i8ge" => {vcpus: ie_families_local_storage_vcpus, mem_ratio: 8, arch: "arm64"},
+    "i7ie" => {vcpus: ie_families_local_storage_vcpus, mem_ratio: 8, arch: "x64"},
+    # Memory optimized: vcpu * 8 memory
+    "r6gd" => {vcpus: rgd_families_local_storage_vcpus, mem_ratio: 8, arch: "arm64"},
+    "r7gd" => {vcpus: rgd_families_local_storage_vcpus, mem_ratio: 8, arch: "arm64"},
+    "r8gd" => {vcpus: rgd_families_local_storage_vcpus, mem_ratio: 8, arch: "arm64"},
+    "r6id" => {vcpus: generic_local_storage_vcpus, mem_ratio: 8, arch: "x64"},
+    "r8id" => {vcpus: generic_local_storage_vcpus, mem_ratio: 8, arch: "x64"},
+  }.freeze
+
+  AWS_FAMILY_OPTIONS = AWS_FAMILY_VM_CONFIG.keys.freeze
+
+  c4a_shapes = {4 => 1, 8 => 2, 16 => 4, 32 => 6, 48 => 10, 64 => 14, 72 => 16}
+  c4_shapes = {4 => 1, 8 => 1, 16 => 2, 24 => 4, 32 => 5, 48 => 8, 96 => 16, 144 => 24, 192 => 32, 288 => 48}
+  c4d_shapes = {8 => 1, 16 => 1, 32 => 2, 48 => 4, 64 => 6, 96 => 8, 192 => 16, 384 => 32}
+  c3d_shapes = {8 => 1, 16 => 1, 30 => 2, 60 => 4, 90 => 8, 180 => 16, 360 => 32}
+
+  # shapes maps a vcpu count to the number of bundled local SSDs, not to a
+  # storage size: the size is that count times ssd_gib.
+  GCP_FAMILY_VM_CONFIG = {
+    "c4a-standard" => {gce_prefix: "c4a-standard", gce_suffix: "lssd", arch: "arm64", mem_ratio: 4, ssd_gib: 375, shapes: c4a_shapes},
+    "c4a-highmem" => {gce_prefix: "c4a-highmem", gce_suffix: "lssd", arch: "arm64", mem_ratio: 8, ssd_gib: 375, shapes: c4a_shapes},
+    "c4-standard" => {gce_prefix: "c4-standard", gce_suffix: "lssd", arch: "x64", mem_ratio: 3.75, ssd_gib: 375, shapes: c4_shapes},
+    "c4-highmem" => {gce_prefix: "c4-highmem", gce_suffix: "lssd", arch: "x64", mem_ratio: 7.75, ssd_gib: 375, shapes: c4_shapes},
+    "c4d-standard" => {gce_prefix: "c4d-standard", gce_suffix: "lssd", arch: "x64", mem_ratio: 3.875, ssd_gib: 375, shapes: c4d_shapes},
+    "c4d-highmem" => {gce_prefix: "c4d-highmem", gce_suffix: "lssd", arch: "x64", mem_ratio: 7.875, ssd_gib: 375, shapes: c4d_shapes},
+    # c3 has no highmem variant.
+    "c3-standard" => {gce_prefix: "c3-standard", gce_suffix: "lssd", arch: "x64", mem_ratio: 4, ssd_gib: 375,
+                      shapes: {4 => 1, 8 => 2, 22 => 4, 44 => 8, 88 => 16, 176 => 32}},
+    "c3d-standard" => {gce_prefix: "c3d-standard", gce_suffix: "lssd", arch: "x64", mem_ratio: 4, ssd_gib: 375, shapes: c3d_shapes},
+    "c3d-highmem" => {gce_prefix: "c3d-highmem", gce_suffix: "lssd", arch: "x64", mem_ratio: 8, ssd_gib: 375, shapes: c3d_shapes},
+    # z3 is highmem only; the suffix selects local SSD per vcpu, not memory.
+    "z3-standardlssd" => {gce_prefix: "z3-highmem", gce_suffix: "standardlssd", arch: "x64", mem_ratio: 8, ssd_gib: 3000,
+                          shapes: {14 => 1, 22 => 2, 44 => 3, 88 => 6, 176 => 12},
+                          # z3-highmem-176-standardlssd ships 1406 GiB, not the 1408 the 8x ratio gives.
+                          memory_gib_overrides: {176 => 1406}},
+    "z3-highlssd" => {gce_prefix: "z3-highmem", gce_suffix: "highlssd", arch: "x64", mem_ratio: 8, ssd_gib: 3000,
+                      shapes: {8 => 1, 16 => 2, 22 => 3, 32 => 4, 44 => 6, 88 => 12}},
+  }.freeze
+
+  # GCE can live migrate a VM with at most this much attached local SSD.
+  # A larger VM must terminate and restart on host maintenance instead.
+  # z3 rejects creation outright when the maintenance policy is wrong.
+  # Only the largest z3 shapes exceed this, so a single limit covers every family.
+  GCP_LIVE_MIGRATION_MAX_LOCAL_SSD_GIB = 18000
+
+  def self.gcp_on_host_maintenance(family, vcpu_count)
+    total_gib = GCP_STORAGE_SIZE_OPTIONS.fetch(family).fetch(vcpu_count).max
+    (total_gib > GCP_LIVE_MIGRATION_MAX_LOCAL_SSD_GIB) ? "TERMINATE" : "MIGRATE"
+  end
+
+  GCP_FAMILY_OPTIONS = GCP_FAMILY_VM_CONFIG.keys.freeze
+
   non_storage_optimized_vm_storage_size_options = {1 => [59], 2 => [118], 4 => [237], 8 => [474], 16 => [950], 32 => [1900], 48 => [2850], 64 => [3800], 96 => [5700], 128 => [7600], 192 => [11400]}
   AWS_STORAGE_SIZE_OPTIONS = {
     "c6gd" => non_storage_optimized_vm_storage_size_options,
+    "c6id" => non_storage_optimized_vm_storage_size_options,
+    "c7gd" => non_storage_optimized_vm_storage_size_options,
+    "c8gd" => non_storage_optimized_vm_storage_size_options,
+    "c8id" => non_storage_optimized_vm_storage_size_options,
     "m6a" => non_storage_optimized_vm_storage_size_options,
     "m6id" => non_storage_optimized_vm_storage_size_options,
     "m6gd" => non_storage_optimized_vm_storage_size_options,
     "m7a" => non_storage_optimized_vm_storage_size_options,
     "m7i" => non_storage_optimized_vm_storage_size_options,
+    "m8a" => non_storage_optimized_vm_storage_size_options,
     "m7g" => non_storage_optimized_vm_storage_size_options,
+    "m7gd" => non_storage_optimized_vm_storage_size_options,
     "m8g" => non_storage_optimized_vm_storage_size_options,
     "m8gd" => non_storage_optimized_vm_storage_size_options,
-    "i8g" => {2 => [468], 4 => [937], 8 => [1875], 16 => [3750], 32 => [7500], 64 => [15000], 96 => [22500]},
-    "i8ge" => {2 => [1250], 4 => [2500], 8 => [5000], 12 => [7500], 24 => [15000], 48 => [30000], 72 => [45000], 96 => [60000]},
-    "i7i" => {2 => [468], 4 => [937], 8 => [1875], 16 => [3750], 32 => [7500], 48 => [11250], 64 => [15000], 96 => [22500]},
-    "i7ie" => {2 => [1250], 4 => [2500], 8 => [5000], 12 => [7500], 24 => [15000], 48 => [30000], 72 => [45000], 96 => [60000]},
-    "r8gd" => non_storage_optimized_vm_storage_size_options,
+    "m8i" => non_storage_optimized_vm_storage_size_options,
+    "m8id" => non_storage_optimized_vm_storage_size_options,
+    "m9g" => non_storage_optimized_vm_storage_size_options,
+    "i8g" => {2 => [468], 4 => [937], 8 => [1875], 16 => [3750], 32 => [7500], 48 => [11250], 64 => [15000], 96 => [22500], 192 => [45000]},
+    "i8ge" => {2 => [1250], 4 => [2500], 8 => [5000], 12 => [7500], 24 => [15000], 48 => [30000], 72 => [45000], 96 => [60000], 192 => [120000]},
+    "i7i" => {2 => [468], 4 => [937], 8 => [1875], 16 => [3750], 32 => [7500], 48 => [11250], 64 => [15000], 96 => [22500], 192 => [45000]},
+    "i7ie" => {2 => [1250], 4 => [2500], 8 => [5000], 12 => [7500], 24 => [15000], 48 => [30000], 72 => [45000], 96 => [60000], 192 => [120000]},
     "r6gd" => non_storage_optimized_vm_storage_size_options,
     "r6id" => non_storage_optimized_vm_storage_size_options,
+    "r7gd" => non_storage_optimized_vm_storage_size_options,
+    "r8gd" => non_storage_optimized_vm_storage_size_options,
+    "r8id" => non_storage_optimized_vm_storage_size_options,
+  }.freeze
+
+  GCP_STORAGE_SIZE_OPTIONS = GCP_FAMILY_VM_CONFIG.transform_values { |config|
+    config[:shapes].transform_values { |disk_count| [disk_count * config[:ssd_gib]] }.freeze
   }.freeze
 
   BootImage = Struct.new(:name, :display_name)
   BootImages = [
     ["gpu-ubuntu-noble", "Ubuntu 24.04 for GPU VMs"],
+    ["ubuntu-resolute", "Ubuntu Resolute 26.04 LTS"],
     ["ubuntu-noble", "Ubuntu Noble 24.04 LTS"],
     ["ubuntu-jammy", "Ubuntu Jammy 22.04 LTS"],
+    ["debian-13", "Debian 13"],
     ["debian-12", "Debian 12"],
+    ["almalinux-10", "AlmaLinux 10"],
     ["almalinux-9", "AlmaLinux 9"],
   ].map { |args| BootImage.new(*args) }.freeze
 
@@ -78,7 +219,6 @@ module Option
 
   VmFamilies = [
     ["standard", "Dedicated CPU", true, false],
-    ["standard-gpu", "Dedicated GPU", false, false],
     ["premium", "Dedicated Premium CPU", false, false],
     ["burstable", "Shared CPU", true, true],
   ].map { |args| VmFamily.new(*args) }
@@ -95,8 +235,6 @@ module Option
   }.concat([2, 4, 8, 16, 30, 60].map {
     storage_size_options = [it * 20, it * 40]
     VmSize.new("standard-#{it}", "standard", it, it * 100, 0, (it * 3.2).to_i, storage_size_options, NO_IO_LIMITS, vring_workers(it), false, "arm64")
-  }).concat([6].map {
-    VmSize.new("standard-gpu-#{it}", "standard-gpu", it, it * 100, 0, (it * 5.34).to_i, [it * 30], NO_IO_LIMITS, vring_workers(it), false, "x64")
   }).concat([2, 4, 8, 16, 30].map {
     storage_size_options = [it * 20, it * 40]
     VmSize.new("premium-#{it}", "premium", it, it * 100, 0, it * 4, storage_size_options, NO_IO_LIMITS, vring_workers(it), false, "x64")
@@ -108,47 +246,58 @@ module Option
     storage_size_options = [it * 10, it * 20]
     io_limits = IoLimits.new(it * 50, it * 50)
     VmSize.new("burstable-#{it}", "burstable", it, it * 50, it * 50, (it * 1.6).to_i, storage_size_options, io_limits, 1, false, "arm64")
-  }).concat(AWS_FAMILY_OPTIONS.reject { |f| ["i8g", "i8ge", "i7i", "i7ie", "r8gd", "r6gd", "r6id"].include?(f) }.product([2, 4, 8, 16, 32, 64]).map { |family, vcpu|
-    memory_coefficient = (family == "c6gd") ? 2 : 4
-    arch = ["m6a", "m6id", "m7a", "m7i"].include?(family) ? "x64" : "arm64"
-    VmSize.new(aws_instance_type_name(family, vcpu), family, vcpu, vcpu * 100, 0, vcpu * memory_coefficient, AWS_STORAGE_SIZE_OPTIONS[family][vcpu], NO_IO_LIMITS, nil, false, arch)
-  }).concat(["i8g", "i7i"].product([2, 4, 8, 16, 32, 64, 96]).map { |family, vcpu|
-    arch = (family == "i8g") ? "arm64" : "x64"
-    VmSize.new(aws_instance_type_name(family, vcpu), family, vcpu, vcpu * 100, 0, vcpu * 8, AWS_STORAGE_SIZE_OPTIONS[family][vcpu], NO_IO_LIMITS, nil, false, arch)
-  }).concat(["i8ge", "i7ie"].product([2, 4, 8, 12, 24, 48, 72, 96]).map { |family, vcpu|
-    arch = (family == "i8ge") ? "arm64" : "x64"
-    VmSize.new(aws_instance_type_name(family, vcpu), family, vcpu, vcpu * 100, 0, vcpu * 8, AWS_STORAGE_SIZE_OPTIONS[family][vcpu], NO_IO_LIMITS, nil, false, arch)
-  }).concat(["r8gd"].product([1, 2, 4, 8, 16, 32, 48, 64, 96, 192]).map { |family, vcpu|
-    VmSize.new(aws_instance_type_name(family, vcpu), family, vcpu, vcpu * 100, 0, vcpu * 8, AWS_STORAGE_SIZE_OPTIONS[family][vcpu], NO_IO_LIMITS, nil, false, "arm64")
-  }).concat(["r6gd"].product([1, 2, 4, 8, 16, 32, 48, 64]).map { |family, vcpu|
-    VmSize.new(aws_instance_type_name(family, vcpu), family, vcpu, vcpu * 100, 0, vcpu * 8, AWS_STORAGE_SIZE_OPTIONS[family][vcpu], NO_IO_LIMITS, nil, false, "arm64")
-  }).concat(["r6id"].product([2, 4, 8, 16, 32, 48, 64, 96, 128]).map { |family, vcpu|
-    VmSize.new(aws_instance_type_name(family, vcpu), family, vcpu, vcpu * 100, 0, vcpu * 8, AWS_STORAGE_SIZE_OPTIONS[family][vcpu], NO_IO_LIMITS, nil, false, "x64")
+  }).concat(AWS_FAMILY_VM_CONFIG.flat_map { |family, cfg|
+    cfg[:vcpus].map { |vcpu|
+      VmSize.new(aws_instance_type_name(family, vcpu), family, vcpu, vcpu * 100, 0,
+        vcpu * cfg[:mem_ratio], AWS_STORAGE_SIZE_OPTIONS[family][vcpu], NO_IO_LIMITS, nil, false, cfg[:arch])
+    }
+  }).concat(GCP_FAMILY_VM_CONFIG.flat_map { |family, config|
+    config[:shapes].keys.map { |vcpu|
+      VmSize.new("#{family}-#{vcpu}", family, vcpu, vcpu * 100, 0,
+        gcp_memory_gib(family, vcpu), GCP_STORAGE_SIZE_OPTIONS[family][vcpu], NO_IO_LIMITS, nil, false, config[:arch])
+    }
   }).freeze
 
   # Postgres Global Options
-  PostgresFlavorOption = Data.define(:name, :brand, :title, :description)
+  PostgresFlavorOption = Data.define(:name, :title)
   POSTGRES_FLAVOR_OPTIONS = [
-    [PostgresResource::Flavor::STANDARD, "ubicloud", "PostgreSQL Database", "Get started by creating a new PostgreSQL database which is managed by Ubicloud team. It's a good choice for general purpose databases."],
-    [PostgresResource::Flavor::PARADEDB, "paradedb", "ParadeDB PostgreSQL Database", "ParadeDB is an Elasticsearch alternative built on Postgres. ParadeDB instances are managed by the ParadeDB team and are optimal for search and analytics workloads."],
-    [PostgresResource::Flavor::LANTERN, "lantern", "Lantern PostgreSQL Database", "Lantern is a PostgreSQL-based vector database designed specifically for building AI applications. Lantern instances are managed by the Lantern team and are optimal for AI workloads."],
+    [PostgresResource::Flavor::STANDARD, "PostgreSQL Database"],
   ].to_h { |args| [args[0], PostgresFlavorOption.new(*args)] }.freeze
 
-  PostgresFamilyOption = Data.define(:name, :description)
+  PostgresFamilyOption = Data.define(:name, :description, :category)
   POSTGRES_FAMILY_OPTIONS = [
-    ["standard", "Dedicated CPU"],
-    ["hobby", "Shared CPU"],
-    ["m8gd", "General Purpose, Graviton3"],
-    ["i8g", "Storage Optimized, Graviton4"],
-    ["i8ge", "Storage Optimized, Graviton4"],
-    ["i7i", "Storage Optimized, Intel Xeon"],
-    ["i7ie", "Storage Optimized, Intel Xeon"],
-    ["r8gd", "Memory Optimized, Graviton4"],
-    ["r6gd", "Memory Optimized, Graviton2"],
-    ["r6id", "Memory Optimized, Intel Xeon"],
-    ["c6gd", "Compute Optimized, Graviton2"],
-    ["m6id", "General Purpose, Intel Xeon"],
-    ["m6gd", "General Purpose, Graviton2"],
+    ["standard", "Dedicated CPU", "dedicated"],
+    ["hobby", "Shared CPU", "shared"],
+    ["m6gd", "General Purpose, Graviton2", "general-purpose"],
+    ["m6id", "General Purpose, Intel Xeon", "general-purpose"],
+    ["m7gd", "General Purpose, Graviton3", "general-purpose"],
+    ["m8gd", "General Purpose, Graviton4", "general-purpose"],
+    ["m8id", "General Purpose, Intel Xeon", "general-purpose"],
+    ["c6gd", "Compute Optimized, Graviton2", "compute-optimized"],
+    ["c6id", "Compute Optimized, Intel Xeon", "compute-optimized"],
+    ["c7gd", "Compute Optimized, Graviton3", "compute-optimized"],
+    ["c8gd", "Compute Optimized, Graviton4", "compute-optimized"],
+    ["c8id", "Compute Optimized, Intel Xeon", "compute-optimized"],
+    ["i7i", "Storage Optimized, Intel Xeon", "storage-optimized"],
+    ["i7ie", "Storage Optimized, Intel Xeon", "storage-optimized"],
+    ["i8g", "Storage Optimized, Graviton4", "storage-optimized"],
+    ["i8ge", "Storage Optimized, Graviton4", "storage-optimized"],
+    ["r6gd", "Memory Optimized, Graviton2", "memory-optimized"],
+    ["r6id", "Memory Optimized, Intel Xeon", "memory-optimized"],
+    ["r7gd", "Memory Optimized, Graviton3", "memory-optimized"],
+    ["r8gd", "Memory Optimized, Graviton4", "memory-optimized"],
+    ["r8id", "Memory Optimized, Intel Xeon", "memory-optimized"],
+    ["c4a-standard", "General Purpose, Google Axion", "general-purpose"],
+    ["c4a-highmem", "Memory Optimized, Google Axion", "memory-optimized"],
+    ["c4-standard", "General Purpose, Intel Xeon", "general-purpose"],
+    ["c4-highmem", "Memory Optimized, Intel Xeon", "memory-optimized"],
+    ["c4d-standard", "General Purpose, AMD EPYC", "general-purpose"],
+    ["c4d-highmem", "Memory Optimized, AMD EPYC", "memory-optimized"],
+    ["c3-standard", "General Purpose, Intel Xeon", "general-purpose"],
+    ["c3d-standard", "General Purpose, AMD EPYC", "general-purpose"],
+    ["c3d-highmem", "Memory Optimized, AMD EPYC", "memory-optimized"],
+    ["z3-standardlssd", "Storage Optimized, Intel Xeon", "storage-optimized"],
+    ["z3-highlssd", "Storage Optimized, Intel Xeon, double storage per vCPU", "storage-optimized"],
   ].to_h { |args| [args[0], PostgresFamilyOption.new(*args)] }.freeze
 
   PostgresSizeOption = Data.define(:name, :family, :vcpu_count, :memory_gib)
@@ -166,32 +315,80 @@ module Option
     ["c6gd", 8, 16],
     ["c6gd", 16, 32],
     ["c6gd", 32, 64],
+    ["c6gd", 48, 96],
     ["c6gd", 64, 128],
+    ["c6id", 2, 4],
+    ["c6id", 4, 8],
+    ["c6id", 8, 16],
+    ["c6id", 16, 32],
+    ["c6id", 32, 64],
+    ["c6id", 48, 96],
+    ["c6id", 64, 128],
+    ["c7gd", 2, 4],
+    ["c7gd", 4, 8],
+    ["c7gd", 8, 16],
+    ["c7gd", 16, 32],
+    ["c7gd", 32, 64],
+    ["c7gd", 48, 96],
+    ["c7gd", 64, 128],
+    ["c8gd", 2, 4],
+    ["c8gd", 4, 8],
+    ["c8gd", 8, 16],
+    ["c8gd", 16, 32],
+    ["c8gd", 32, 64],
+    ["c8gd", 48, 96],
+    ["c8gd", 64, 128],
+    ["c8id", 2, 4],
+    ["c8id", 4, 8],
+    ["c8id", 8, 16],
+    ["c8id", 16, 32],
+    ["c8id", 32, 64],
+    ["c8id", 48, 96],
+    ["c8id", 64, 128],
     ["m6id", 2, 8],
     ["m6id", 4, 16],
     ["m6id", 8, 32],
     ["m6id", 16, 64],
     ["m6id", 32, 128],
+    ["m6id", 48, 192],
     ["m6id", 64, 256],
     ["m6gd", 2, 8],
     ["m6gd", 4, 16],
     ["m6gd", 8, 32],
     ["m6gd", 16, 64],
     ["m6gd", 32, 128],
+    ["m6gd", 48, 192],
     ["m6gd", 64, 256],
+    ["m7gd", 2, 8],
+    ["m7gd", 4, 16],
+    ["m7gd", 8, 32],
+    ["m7gd", 16, 64],
+    ["m7gd", 32, 128],
+    ["m7gd", 48, 192],
+    ["m7gd", 64, 256],
     ["m8gd", 2, 8],
     ["m8gd", 4, 16],
     ["m8gd", 8, 32],
     ["m8gd", 16, 64],
     ["m8gd", 32, 128],
+    ["m8gd", 48, 192],
     ["m8gd", 64, 256],
+    ["m8id", 2, 8],
+    ["m8id", 4, 16],
+    ["m8id", 8, 32],
+    ["m8id", 16, 64],
+    ["m8id", 32, 128],
+    ["m8id", 48, 192],
+    ["m8id", 64, 256],
     ["i8g", 2, 16],
     ["i8g", 4, 32],
     ["i8g", 8, 64],
     ["i8g", 16, 128],
     ["i8g", 32, 256],
+    ["i8g", 48, 384],
     ["i8g", 64, 512],
     ["i8g", 96, 768],
+    ["i8g", 192, 1536],
     ["i8ge", 2, 16],
     ["i8ge", 4, 32],
     ["i8ge", 8, 64],
@@ -200,6 +397,7 @@ module Option
     ["i8ge", 48, 384],
     ["i8ge", 72, 576],
     ["i8ge", 96, 768],
+    ["i8ge", 192, 1536],
     ["i7i", 2, 16],
     ["i7i", 4, 32],
     ["i7i", 8, 64],
@@ -208,6 +406,7 @@ module Option
     ["i7i", 48, 384],
     ["i7i", 64, 512],
     ["i7i", 96, 768],
+    ["i7i", 192, 1536],
     ["i7ie", 2, 16],
     ["i7ie", 4, 32],
     ["i7ie", 8, 64],
@@ -216,16 +415,7 @@ module Option
     ["i7ie", 48, 384],
     ["i7ie", 72, 576],
     ["i7ie", 96, 768],
-    ["r8gd", 1, 8],
-    ["r8gd", 2, 16],
-    ["r8gd", 4, 32],
-    ["r8gd", 8, 64],
-    ["r8gd", 16, 128],
-    ["r8gd", 32, 256],
-    ["r8gd", 48, 384],
-    ["r8gd", 64, 512],
-    ["r8gd", 96, 768],
-    ["r8gd", 192, 1536],
+    ["i7ie", 192, 1536],
     ["r6gd", 1, 8],
     ["r6gd", 2, 16],
     ["r6gd", 4, 32],
@@ -241,9 +431,32 @@ module Option
     ["r6id", 32, 256],
     ["r6id", 48, 384],
     ["r6id", 64, 512],
-    ["r6id", 96, 768],
-    ["r6id", 128, 1024],
-  ].to_h do |args|
+    ["r7gd", 1, 8],
+    ["r7gd", 2, 16],
+    ["r7gd", 4, 32],
+    ["r7gd", 8, 64],
+    ["r7gd", 16, 128],
+    ["r7gd", 32, 256],
+    ["r7gd", 48, 384],
+    ["r7gd", 64, 512],
+    ["r8gd", 1, 8],
+    ["r8gd", 2, 16],
+    ["r8gd", 4, 32],
+    ["r8gd", 8, 64],
+    ["r8gd", 16, 128],
+    ["r8gd", 32, 256],
+    ["r8gd", 48, 384],
+    ["r8gd", 64, 512],
+    ["r8id", 2, 16],
+    ["r8id", 4, 32],
+    ["r8id", 8, 64],
+    ["r8id", 16, 128],
+    ["r8id", 32, 256],
+    ["r8id", 48, 384],
+    ["r8id", 64, 512],
+  ].concat(GCP_FAMILY_VM_CONFIG.flat_map { |family, config|
+    config[:shapes].keys.map { |vcpu| [family, vcpu, gcp_memory_gib(family, vcpu)] }
+  }).to_h do |args|
     name = if AWS_FAMILY_OPTIONS.include?(args[0])
       aws_instance_type_name(args[0], args[1])
     else
@@ -258,13 +471,32 @@ module Option
     ["burstable-2", POSTGRES_SIZE_OPTIONS["hobby-2"]],
   ].to_h).freeze
 
+  POSTGRES_FAMILY_FALLBACK_CHAINS = [
+    ["c6gd", "c7gd", "c8gd"],
+    ["c6id", "c8id"],
+    ["m6id", "m8id"],
+    ["m6gd", "m7gd", "m8gd"],
+    ["r6gd", "r7gd", "r8gd"],
+    ["r6id", "r8id"],
+  ].freeze
+
+  def self.postgres_fallback_candidates(family)
+    chain = POSTGRES_FAMILY_FALLBACK_CHAINS.find { it.include?(family) }
+    chain ? chain - [family] : []
+  end
+
+  def self.postgres_family_rank(family)
+    chain = POSTGRES_FAMILY_FALLBACK_CHAINS.find { it.include?(family) }
+    chain ? chain.index(family) : -1
+  end
+
   POSTGRES_STORAGE_SIZE_OPTIONS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096].freeze
 
   POSTGRES_VERSION_OPTIONS = {
     PostgresResource::Flavor::STANDARD => ["18", "17", "16"],
-    PostgresResource::Flavor::PARADEDB => ["17", "16"],
-    PostgresResource::Flavor::LANTERN => ["17", "16"],
   }
+
+  POSTGRES_IMAGE_FAMILIES = %w[ubuntu-2204 ubuntu-2604].freeze
 
   PostgresHaOption = Data.define(:name, :standby_count, :description)
   POSTGRES_HA_OPTIONS = [
@@ -272,6 +504,10 @@ module Option
     [PostgresResource::HaType::ASYNC, 1, "1 Standby"],
     [PostgresResource::HaType::SYNC, 2, "2 Standbys"],
   ].to_h { |args| [args[0], PostgresHaOption.new(*args)] }.freeze
+
+  POSTGRES_LOG_STREAM_OPTIONS = %w[postgres pgbouncer upgrade].freeze
+  POSTGRES_LOG_SERVER_ROLE_OPTIONS = %w[primary standby].freeze
+  POSTGRES_LOG_LEVEL_OPTIONS = %w[DEBUG INFO WARN ERROR FATAL].freeze
 
   AWS_LOCATIONS = ["us-west-2", "us-east-1", "us-east-2", "ap-southeast-2", "eu-west-1", "eu-central-1"].freeze
 

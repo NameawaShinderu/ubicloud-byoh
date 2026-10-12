@@ -142,46 +142,11 @@ RSpec.describe Clover, "postgres" do
         expect(response_body["pg_config"]).to eq({"wal_level" => "logical"})
       end
 
-      it "sends mail to partners" do
-        project.set_ff_postgres_paradedb(true)
-        expect(Config).to receive(:postgres_paradedb_notification_email).and_return("dummy@mail.com")
-        expect(Util).to receive(:send_email)
-
-        post "/project/#{project.ubid}/location/eu-central-h1/postgres/test-postgres-no-ha", {
-          size: "standard-2",
-          storage_size: 64,
-          flavor: "paradedb",
-        }.to_json
-
-        expect(last_response.status).to eq(200)
-      end
-
       it "fails if invalid flavor is used" do
-        project.set_ff_postgres_lantern(false)
         post "/project/#{project.ubid}/location/eu-central-h1/postgres/test-postgres-invalid", {
           size: "standard-2",
           storage_size: 64,
           flavor: "invalid",
-        }.to_json
-        expect(last_response.status).to eq(400)
-      end
-
-      it "fails if lantern feature flag is not enabled" do
-        project.set_ff_postgres_lantern(false)
-        post "/project/#{project.ubid}/location/eu-central-h1/postgres/test-postgres-lantern", {
-          size: "standard-2",
-          storage_size: 64,
-          flavor: "lantern",
-        }.to_json
-        expect(last_response.status).to eq(400)
-      end
-
-      it "fails if paradedb feature flag is not enabled" do
-        project.set_ff_postgres_paradedb(false)
-        post "/project/#{project.ubid}/location/eu-central-h1/postgres/test-postgres-paradedb", {
-          size: "standard-2",
-          storage_size: 64,
-          flavor: "paradedb",
         }.to_json
         expect(last_response.status).to eq(400)
       end
@@ -193,7 +158,7 @@ RSpec.describe Clover, "postgres" do
           ha_type: "sync",
         }.to_json
 
-        expect(last_response).to have_api_error(400, "Validation failed for following fields: location", {"location" => "Invalid location. Available options: eu-central-h1, us-east-a2, us-east-1, us-west-2"})
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: location", {"location" => "Invalid location. Available options: eu-central-h1, us-east-1, us-east-a2, us-west-2"})
       end
 
       it "location not exist" do
@@ -255,8 +220,6 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "can update database properties" do
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
-
         patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
           size: "standard-8",
           storage_size: 256,
@@ -269,8 +232,77 @@ RSpec.describe Clover, "postgres" do
         expect(last_response.status).to eq(200)
       end
 
+      it "logs scale and high availability changes" do
+        expect(Clog).to receive(:emit).with("Postgres database scale requested", {postgres_scale: {
+          resource_ubid: pg.ubid,
+          project_ubid: project.ubid,
+          account_ubid: user.ubid,
+          location: pg.display_location,
+          current_vm_size: "standard-2",
+          target_vm_size: "standard-8",
+          current_storage_size_gib: 128,
+          target_storage_size_gib: 256,
+          current_vcpu_count: 2,
+          target_vcpu_count: 16,
+        }}).and_call_original
+        expect(Clog).to receive(:emit).with("Postgres database high availability change requested", {postgres_ha_change: {
+          resource_ubid: pg.ubid,
+          project_ubid: project.ubid,
+          account_ubid: user.ubid,
+          location: pg.display_location,
+          current_ha_type: "none",
+          target_ha_type: "async",
+          current_standby_count: 0,
+          target_standby_count: 1,
+          vcpu_count: 8,
+          storage_size_gib: 256,
+        }}).and_call_original
+
+        patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
+          size: "standard-8",
+          storage_size: 256,
+          ha_type: "async",
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+      end
+
+      it "logs vcpu and storage sizes when only high availability changes" do
+        allow(Clog).to receive(:emit).and_call_original
+        expect(Clog).not_to receive(:emit).with("Postgres database scale requested", anything)
+        expect(Clog).to receive(:emit).with("Postgres database high availability change requested", {postgres_ha_change: {
+          resource_ubid: pg.ubid,
+          project_ubid: project.ubid,
+          account_ubid: user.ubid,
+          location: pg.display_location,
+          current_ha_type: "none",
+          target_ha_type: "sync",
+          current_standby_count: 0,
+          target_standby_count: 2,
+          vcpu_count: 2,
+          storage_size_gib: 128,
+        }}).and_call_original
+
+        patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
+          ha_type: "sync",
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+      end
+
+      it "does not log scale or high availability changes if the configuration is unchanged" do
+        allow(Clog).to receive(:emit).and_call_original
+        expect(Clog).not_to receive(:emit).with("Postgres database scale requested", anything)
+        expect(Clog).not_to receive(:emit).with("Postgres database high availability change requested", anything)
+
+        patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
+          tags: [{key: "env", value: "prod"}],
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+      end
+
       it "clears storage auto-scale semaphores on update" do
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
         pg.incr_storage_auto_scale_action_performed_80
         pg.incr_storage_auto_scale_action_performed_85
         pg.incr_storage_auto_scale_action_performed_90
@@ -290,7 +322,6 @@ RSpec.describe Clover, "postgres" do
 
       it "preserves existing init_script when not provided in patch request" do
         PostgresInitScript.create_with_id(pg, init_script: "sudo whoami")
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
 
         patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
           size: "standard-2",
@@ -303,27 +334,24 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "can scale down storage if the requested size is enough for existing data" do
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
         expect(project).to receive(:postgres_resources_dataset).and_return(instance_double(PostgresResource.dataset.class, first: pg, association_join: instance_double(Sequel::Dataset, sum: 1))).at_least(:once)
         expect(described_class).to receive(:authorized_project).with(user, project.id).and_return(project)
-        tsdb_client = instance_double(VictoriaMetrics::Client)
-        expect(PostgresServer).to receive(:victoria_metrics_client).and_return(tsdb_client)
-        expect(tsdb_client).to receive(:query).and_return([{"value" => [Time.now.to_i, "5.0"]}])
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].insert(postgres_server_id: pg.representative_server.id, data_disk_usage_percent: 5, observed_at: Time.now)
 
         patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
           storage_size: 64,
         }.to_json
 
         expect(pg.reload.target_storage_size_gib).to eq(64)
+      ensure
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].where(postgres_server_id: pg.representative_server.id).delete
       end
 
       it "does not scale down storage if the requested size is too small for existing data" do
         expect(project).to receive(:postgres_resources_dataset).and_return(instance_double(Sequel::Dataset, first: pg))
         expect(described_class).to receive(:authorized_project).with(user, project.id).and_return(project)
         expect(pg.representative_server).to receive(:storage_size_gib).and_return(128).at_least(:once)
-        tsdb_client = instance_double(VictoriaMetrics::Client)
-        expect(PostgresServer).to receive(:victoria_metrics_client).and_return(tsdb_client)
-        expect(tsdb_client).to receive(:query).and_return([{"value" => [Time.now.to_i, "95.0"]}])
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].insert(postgres_server_id: pg.representative_server.id, data_disk_usage_percent: 95, observed_at: Time.now)
 
         patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
           storage_size: 64,
@@ -331,11 +359,11 @@ RSpec.describe Clover, "postgres" do
 
         expect(pg.reload.target_storage_size_gib).to eq(128)
         expect(last_response).to have_api_error(400, "Validation failed for following fields: storage_size", {"storage_size" => "Insufficient storage size is requested. It is only possible to reduce the storage size if the current usage is less than 80% of the requested size."})
+      ensure
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].where(postgres_server_id: pg.representative_server.id).delete
       end
 
       it "returns error message if current usage is unknown" do
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
-
         patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
           size: "standard-3",
         }.to_json
@@ -344,13 +372,10 @@ RSpec.describe Clover, "postgres" do
         expect(last_response).to have_api_error(400, "Validation failed for following fields: size")
       end
 
-      it "blocks scale down if metrics query fails" do
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
+      it "blocks scale down if the disk usage observation is stale" do
         expect(project).to receive(:postgres_resources_dataset).and_return(instance_double(PostgresResource.dataset.class, first: pg, association_join: instance_double(Sequel::Dataset, sum: 1))).at_least(:once)
         expect(described_class).to receive(:authorized_project).with(user, project.id).and_return(project)
-        tsdb_client = instance_double(VictoriaMetrics::Client)
-        expect(PostgresServer).to receive(:victoria_metrics_client).and_return(tsdb_client)
-        expect(tsdb_client).to receive(:query).and_raise(StandardError.new("error"))
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].insert(postgres_server_id: pg.representative_server.id, data_disk_usage_percent: 5, observed_at: Time.now - PostgresServer::DISK_USAGE_MAX_AGE_SECONDS - 60)
 
         patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
           storage_size: 64,
@@ -358,28 +383,13 @@ RSpec.describe Clover, "postgres" do
 
         expect(last_response.status).to eq(400)
         expect(JSON.parse(last_response.body)["error"]["message"]).to eq("Metrics unavailable right now to verify scale down safety")
+      ensure
+        POSTGRES_MONITOR_DB[:postgres_disk_usage_monitor].where(postgres_server_id: pg.representative_server.id).delete
       end
 
-      it "skips disk usage check if metrics client is unavailable" do
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
+      it "blocks scale down if there is no disk usage observation" do
         expect(project).to receive(:postgres_resources_dataset).and_return(instance_double(PostgresResource.dataset.class, first: pg, association_join: instance_double(Sequel::Dataset, sum: 1))).at_least(:once)
         expect(described_class).to receive(:authorized_project).with(user, project.id).and_return(project)
-        expect(PostgresServer).to receive(:victoria_metrics_client).and_return(nil)
-
-        patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
-          storage_size: 64,
-        }.to_json
-
-        expect(pg.reload.target_storage_size_gib).to eq(64)
-      end
-
-      it "blocks scale down if no disk usage data available" do
-        pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 128, disk_index: 0)
-        expect(project).to receive(:postgres_resources_dataset).and_return(instance_double(PostgresResource.dataset.class, first: pg, association_join: instance_double(Sequel::Dataset, sum: 1))).at_least(:once)
-        expect(described_class).to receive(:authorized_project).with(user, project.id).and_return(project)
-        tsdb_client = instance_double(VictoriaMetrics::Client)
-        expect(PostgresServer).to receive(:victoria_metrics_client).and_return(tsdb_client)
-        expect(tsdb_client).to receive(:query).and_return([])
 
         patch "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}", {
           storage_size: 64,
@@ -387,6 +397,7 @@ RSpec.describe Clover, "postgres" do
 
         expect(last_response.status).to eq(400)
         expect(JSON.parse(last_response.body)["error"]["message"]).to eq("Metrics unavailable right now to verify scale down safety")
+        expect(pg.reload.target_storage_size_gib).to eq(128)
       end
 
       it "fails to update read replica" do
@@ -400,7 +411,6 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "read-replica" do
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         expect(PostgresTimeline).to receive(:earliest_restore_time).and_return(true)
 
         post "/project/#{project.ubid}/location/eu-central-h1/postgres/#{pg.name}/read-replica", {
@@ -412,7 +422,6 @@ RSpec.describe Clover, "postgres" do
 
       it "read-replica inherits init_script from parent" do
         PostgresInitScript.create_with_id(pg, init_script: "sudo whoami")
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         expect(PostgresTimeline).to receive(:earliest_restore_time).and_return(true)
 
         post "/project/#{project.ubid}/location/eu-central-h1/postgres/#{pg.name}/read-replica", {
@@ -431,7 +440,6 @@ RSpec.describe Clover, "postgres" do
           user_config: {"max_connections" => "3000", "wal_level" => "replica"},
           pgbouncer_user_config: {"max_client_conn" => "150", "pool_mode" => "transaction"},
         )
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         expect(PostgresTimeline).to receive(:earliest_restore_time).and_return(true)
 
         post "/project/#{project.ubid}/location/eu-central-h1/postgres/#{pg.name}/read-replica", {
@@ -448,7 +456,6 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "read-replica with tags" do
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         expect(PostgresTimeline).to receive(:earliest_restore_time).and_return(true)
 
         tags = [{"key" => "env", "value" => "test"}, {"key" => "team", "value" => "backend"}]
@@ -464,7 +471,6 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "read-replica rejects invalid config values" do
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         expect(PostgresTimeline).to receive(:earliest_restore_time).and_return(true)
 
         post "/project/#{project.ubid}/location/eu-central-h1/postgres/#{pg.name}/read-replica", {
@@ -473,6 +479,19 @@ RSpec.describe Clover, "postgres" do
         }.to_json
 
         expect(last_response).to have_api_error(400, "Validation failed for following fields: pg_config.wal_level")
+      end
+
+      it "read-replica rejects restart-sensitive params set below the primary's value" do
+        pg.update(user_config: {"max_connections" => "500"})
+        expect(PostgresTimeline).to receive(:earliest_restore_time).and_return(true)
+
+        post "/project/#{project.ubid}/location/eu-central-h1/postgres/#{pg.name}/read-replica", {
+          name: "my-read-replica-with-low-config",
+          pg_config: {"max_connections" => "100"},
+        }.to_json
+
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: pg_config.max_connections")
+        expect(PostgresResource.first(name: "my-read-replica-with-low-config")).to be_nil
       end
 
       it "fails read-replica creation if the parent is not ready" do
@@ -492,6 +511,7 @@ RSpec.describe Clover, "postgres" do
         expect(project).to receive(:postgres_resources_dataset).and_return(instance_double(Sequel::Dataset, first: pg))
         expect(described_class).to receive(:authorized_project).with(user, project.id).and_return(project)
         pg.update(parent_id: pg.id)
+        create_minio_cluster_for_blob_storage
         post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/promote-read-replica"
 
         expect(last_response.status).to eq(200)
@@ -501,6 +521,7 @@ RSpec.describe Clover, "postgres" do
         expect(project).to receive(:postgres_resources_dataset).and_return(instance_double(Sequel::Dataset, first: pg))
         expect(described_class).to receive(:authorized_project).with(user, project.id).and_return(project)
         pg.update(parent_id: pg.id)
+        create_minio_cluster_for_blob_storage
         post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/promote"
 
         expect(last_response.status).to eq(200)
@@ -572,10 +593,177 @@ RSpec.describe Clover, "postgres" do
         expect(JSON.parse(last_response.body)["error"]["details"]["url"]).to eq("Invalid URL scheme. Only https URLs are supported.")
       end
 
+      def post_metric_destination(params)
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/metric-destination", params.to_json
+      end
+
+      def metric_destination_error
+        expect(last_response.status).to eq(400)
+        JSON.parse(last_response.body)["error"]["details"]
+      end
+
+      it "metric-destination with bearer token" do
+        post_metric_destination(url: "https://example.com", options: {authorization: {credentials: "my_token"}})
+
+        expect(last_response.status).to eq(200)
+        md = pg.metric_destinations.first
+        expect(md.username).to be_nil
+        expect(md.password).to be_nil
+        expect(md.options).to eq({"authorization" => {"credentials" => "my_token"}})
+      end
+
+      it "metric-destination with headers only" do
+        post_metric_destination(url: "https://example.com", options: {headers: {"X-Scope-OrgID" => "tenant1"}})
+
+        expect(last_response.status).to eq(200)
+        md = pg.metric_destinations.first
+        expect(md.username).to be_nil
+        expect(md.options).to eq({"headers" => {"X-Scope-OrgID" => "tenant1"}})
+      end
+
+      it "metric-destination with basic auth and headers" do
+        post_metric_destination(url: "https://example.com", username: "username", password: "password",
+          options: {headers: {"X-Scope-OrgID" => "tenant1"}})
+
+        expect(last_response.status).to eq(200)
+        md = pg.metric_destinations.first
+        expect(md.username).to eq("username")
+        expect(md.options).to eq({"headers" => {"X-Scope-OrgID" => "tenant1"}})
+      end
+
+      it "metric-destination without any credentials" do
+        post_metric_destination(url: "https://example.com")
+
+        expect(metric_destination_error["options"]).to eq("no credentials given, set username and password, options.authorization, or options.headers")
+      end
+
+      it "metric-destination with empty headers and no other credentials" do
+        post_metric_destination(url: "https://example.com", options: {headers: {}})
+
+        expect(metric_destination_error["options"]).to eq("no credentials given, set username and password, options.authorization, or options.headers")
+      end
+
+      it "metric-destination with username but no password" do
+        post_metric_destination(url: "https://example.com", username: "username")
+
+        expect(metric_destination_error["username"]).to eq("must be set together with password")
+      end
+
+      it "metric-destination combining basic auth with authorization" do
+        post_metric_destination(url: "https://example.com", username: "username", password: "password",
+          options: {authorization: {credentials: "my_token"}})
+
+        expect(metric_destination_error["options"]).to eq("options.authorization cannot be combined with username and password")
+      end
+
+      it "metric-destination with unsupported options key" do
+        post_metric_destination(url: "https://example.com", options: {oauth2: {client_id: "id"}})
+
+        expect(metric_destination_error["options"]).to eq("options may only contain 'authorization' and 'headers'")
+      end
+
+      it "metric-destination with malformed authorization" do
+        post_metric_destination(url: "https://example.com", options: {authorization: {type: "Bearer"}})
+
+        expect(metric_destination_error["options"]).to eq("options.authorization must be an object with a non-empty string 'credentials' and an optional string 'type'")
+      end
+
+      it "metric-destination with null authorization" do
+        post_metric_destination(url: "https://example.com", options: {authorization: nil})
+
+        expect(metric_destination_error["options"]).to eq("options.authorization must be an object with a non-empty string 'credentials' and an optional string 'type'")
+      end
+
+      it "metric-destination with empty credentials" do
+        post_metric_destination(url: "https://example.com", options: {authorization: {credentials: ""}})
+
+        expect(metric_destination_error["options"]).to eq("options.authorization must be an object with a non-empty string 'credentials' and an optional string 'type'")
+      end
+
+      it "metric-destination with blank authorization type" do
+        post_metric_destination(url: "https://example.com", options: {authorization: {type: " ", credentials: "my_token"}})
+
+        expect(metric_destination_error["options"]).to eq("options.authorization.type must be a non-empty string")
+      end
+
+      it "metric-destination with basic authorization type" do
+        post_metric_destination(url: "https://example.com", options: {authorization: {type: "Basic", credentials: "my_token"}})
+
+        expect(metric_destination_error["options"]).to eq("options.authorization.type cannot be basic, set username and password instead")
+      end
+
+      it "metric-destination with null headers" do
+        post_metric_destination(url: "https://example.com", username: "username", password: "password", options: {headers: nil})
+
+        expect(metric_destination_error["options"]).to eq("options.headers must be a flat object with string values")
+      end
+
+      it "metric-destination setting a prometheus remote_write version header" do
+        post_metric_destination(url: "https://example.com", options: {headers: {"X-Prometheus-Remote-Write-Version" => "0.1.0"}})
+
+        expect(metric_destination_error["options"]).to eq("options.headers cannot set X-Prometheus-Remote-Write-Version")
+      end
+
+      it "metric-destination with non-string header values" do
+        post_metric_destination(url: "https://example.com", options: {headers: {"X-Scope-OrgID" => 1}})
+
+        expect(metric_destination_error["options"]).to eq("options.headers must be a flat object with string values")
+      end
+
+      it "metric-destination setting a header prometheus reserves" do
+        post_metric_destination(url: "https://example.com", options: {headers: {"Authorization" => "Bearer my_token"}})
+
+        expect(metric_destination_error["options"]).to eq("options.headers cannot set Authorization")
+      end
+
+      it "log-destination (syslog)" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/log-destination", {
+          name: "graylog",
+          type: "syslog",
+          url: "tcp://logs.example.com:6514",
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        expect(JSON.parse(last_response.body)).to include("type" => "syslog", "url" => "tcp://logs.example.com:6514")
+      end
+
+      it "log-destination (otlp)" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/log-destination", {
+          name: "nr",
+          type: "otlp",
+          url: "https://otlp.nr-data.net",
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        expect(JSON.parse(last_response.body)).to include("type" => "otlp", "url" => "https://otlp.nr-data.net")
+      end
+
+      it "log-destination invalid syslog port" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/log-destination", {
+          name: "graylog",
+          type: "syslog",
+          url: "tcp://logs.example.com:99999",
+        }.to_json
+
+        expect(last_response.status).to eq(400)
+        expect(JSON.parse(last_response.body)["error"]["details"]["url"]).to eq("port must be between 1 and 65535")
+      end
+
+      it "log-destination invalid otlp url scheme" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/log-destination", {
+          name: "graylog",
+          type: "otlp",
+          url: "http://insecure.example.com",
+        }.to_json
+
+        expect(last_response.status).to eq(400)
+        expect(JSON.parse(last_response.body)["error"]["details"]["url"]).to eq("Invalid URL scheme. Only https URLs are supported.")
+      end
+
       it "restore" do
         backup = Struct.new(:key, :last_modified)
         restore_target = Time.now.utc
-        expect(MinioCluster).to receive(:first).and_return(instance_double(MinioCluster, url: "dummy-url", root_certs: "dummy-certs")).at_least(:once)
+        create_minio_cluster_for_blob_storage
         expect(Minio::Client).to receive(:new).and_return(instance_double(Minio::Client, list_objects: [backup.new("basebackups_005/backup_stop_sentinel.json", restore_target - 10 * 60)])).at_least(:once)
 
         post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/restore", {
@@ -590,7 +778,7 @@ RSpec.describe Clover, "postgres" do
         PostgresInitScript.create_with_id(pg, init_script: "sudo whoami")
         backup = Struct.new(:key, :last_modified)
         restore_target = Time.now.utc
-        expect(MinioCluster).to receive(:first).and_return(instance_double(MinioCluster, url: "dummy-url", root_certs: "dummy-certs")).at_least(:once)
+        create_minio_cluster_for_blob_storage
         expect(Minio::Client).to receive(:new).and_return(instance_double(Minio::Client, list_objects: [backup.new("basebackups_005/backup_stop_sentinel.json", restore_target - 10 * 60)])).at_least(:once)
 
         post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/restore", {
@@ -612,7 +800,7 @@ RSpec.describe Clover, "postgres" do
         )
         backup = Struct.new(:key, :last_modified)
         restore_target = Time.now.utc
-        expect(MinioCluster).to receive(:first).and_return(instance_double(MinioCluster, url: "dummy-url", root_certs: "dummy-certs")).at_least(:once)
+        create_minio_cluster_for_blob_storage
         expect(Minio::Client).to receive(:new).and_return(instance_double(Minio::Client, list_objects: [backup.new("basebackups_005/backup_stop_sentinel.json", restore_target - 10 * 60)])).at_least(:once)
 
         post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/restore", {
@@ -654,6 +842,45 @@ RSpec.describe Clover, "postgres" do
         }.to_json
 
         expect(last_response.status).to eq(200)
+      end
+
+      it "reset password also updates read replica records" do
+        replica = Prog::Postgres::PostgresResourceNexus.assemble(
+          project_id: project.id,
+          location_id: pg.location_id,
+          name: "my-replica",
+          target_vm_size: pg.target_vm_size,
+          target_storage_size_gib: pg.target_storage_size_gib,
+          parent_id: pg.id,
+        ).subject
+
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/reset-superuser-password", {
+          password: "DummyPassword123",
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        expect(pg.reload.superuser_password).to eq("DummyPassword123")
+        expect(replica.reload.superuser_password).to eq("DummyPassword123")
+      end
+
+      it "reset password does not touch promoted children" do
+        promoted = Prog::Postgres::PostgresResourceNexus.assemble(
+          project_id: project.id,
+          location_id: pg.location_id,
+          name: "my-promoted",
+          target_vm_size: pg.target_vm_size,
+          target_storage_size_gib: pg.target_storage_size_gib,
+          parent_id: pg.id,
+        ).subject
+        promoted.update(restore_target: Time.now)
+        original_password = promoted.superuser_password
+
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/reset-superuser-password", {
+          password: "DummyPassword123",
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        expect(promoted.reload.superuser_password).to eq(original_password)
       end
 
       it "reset password invalid restore" do
@@ -715,6 +942,55 @@ RSpec.describe Clover, "postgres" do
 
         expect(last_response.status).to eq(400)
         expect(pg.reload.maintenance_window_start_at).to be_nil
+      end
+
+      it "can set maintenance window days" do
+        project.set_ff_postgres_enable_maintenance_window_days(true)
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/set-maintenance-window", {
+          maintenance_window_start_at: 9,
+          maintenance_window_days: ["mon", "wed"],
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        body = JSON.parse(last_response.body)
+        expect(body["maintenance_window_days"]).to eq(["mon", "wed"])
+        pg.reload
+        expect(pg.maintenance_window_days_bitmask).to eq((1 << 0) | (1 << 2))
+
+        # Full-replace semantics: omitting the new fields resets them.
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/set-maintenance-window", {
+          maintenance_window_start_at: 9,
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        pg.reload
+        expect(pg.maintenance_window_days_bitmask).to eq(0)
+
+        # Days without a start hour are meaningless, so the window being unset clears them.
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/set-maintenance-window", {
+          maintenance_window_days: ["mon"],
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        pg.reload
+        expect(pg.maintenance_window_start_at).to be_nil
+        expect(pg.maintenance_window_days_bitmask).to eq(0)
+
+        # Invalid day names are rejected by the OpenAPI enum at the request boundary.
+        expect {
+          post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/set-maintenance-window", {
+            maintenance_window_days: ["funday"],
+          }.to_json
+        }.to raise_error(Committee::InvalidRequest, /isn't part of the enum/)
+      end
+
+      it "returns an error when maintenance window days are set without the feature enabled" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/set-maintenance-window", {
+          maintenance_window_days: ["mon"],
+        }.to_json
+
+        expect(last_response.status).to eq(400)
+        expect(JSON.parse(last_response.body)["error"]["message"]).to eq("Maintenance window days are not enabled for this project.")
       end
 
       it "invalid payment" do
@@ -781,8 +1057,8 @@ RSpec.describe Clover, "postgres" do
 
       it "fails when end timestamp is before start timestamp" do
         query_params = {
-          start: (DateTime.now.new_offset(0) - 1).rfc3339,
-          end: (DateTime.now.new_offset(0) - 2).rfc3339,
+          start: (Time.now.utc - 60 * 60 * 24).xmlschema,
+          end: (Time.now.utc - 60 * 60 * 24 * 2).xmlschema,
         }
 
         query_str = URI.encode_www_form(query_params)
@@ -793,8 +1069,8 @@ RSpec.describe Clover, "postgres" do
 
       it "fails when time range is too large" do
         query_params = {
-          start: (DateTime.now.new_offset(0) - 32).rfc3339,
-          end: DateTime.now.new_offset(0).rfc3339,
+          start: (Time.now.utc - 60 * 60 * 24 * 32).xmlschema,
+          end: Time.now.utc.xmlschema,
         }
         query_str = URI.encode_www_form(query_params)
 
@@ -805,8 +1081,8 @@ RSpec.describe Clover, "postgres" do
 
       it "fails when start timestamp is too old" do
         query_params = {
-          start: (DateTime.now.new_offset(0) - 32).rfc3339,
-          end: (DateTime.now.new_offset(0) - 31).rfc3339,
+          start: (Time.now.utc - 60 * 60 * 24 * 32).xmlschema,
+          end: (Time.now.utc - 60 * 60 * 24 * 31).xmlschema,
         }
         query_str = URI.encode_www_form(query_params)
 
@@ -872,6 +1148,8 @@ RSpec.describe Clover, "postgres" do
 
         expect(last_response.status).to eq(200)
         expect(JSON.parse(last_response.body)["name"]).to eq(pg.name)
+        expect(JSON.parse(last_response.body)["connection_string"]).to eq(pg.connection_string)
+        expect(JSON.parse(last_response.body)["private_connection_string"]).to eq(pg.private_connection_string)
       end
 
       it "success ubid" do
@@ -989,7 +1267,7 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "rejects reserved names" do
-        %w[postgres ubi_replication].each do
+        %w[postgres ubi_replication].freeze.each do
           post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/cert/create-client-keypair", {
             common_name: "postgres",
             duration: 3600,
@@ -1043,6 +1321,22 @@ RSpec.describe Clover, "postgres" do
         post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/cert/remove-auth-user", {
           name: "test",
         }.to_json
+        expect(pg.reload.cert_auth_users).to eq([])
+      end
+
+      it "rejects names that would inject pg_hba.conf rules" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/cert/add-auth-user", {
+          name: "u\nhost all all 0.0.0.0/0 trust",
+        }.to_json
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: name", {"name" => "Name must only contain alphanumeric characters, underscores, and hyphens. It must not exceed 64 characters."})
+        expect(pg.reload.cert_auth_users).to eq([])
+      end
+
+      it "rejects postgres, ubi_replication, and all names" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/cert/add-auth-user", {
+          name: "all",
+        }.to_json
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: name", {"name" => "Name must not be postgres, ubi_replication, or all."})
         expect(pg.reload.cert_auth_users).to eq([])
       end
     end
@@ -1104,6 +1398,25 @@ RSpec.describe Clover, "postgres" do
 
         expect(last_response.status).to eq(204)
       end
+
+      it "log-destination" do
+        ld = PostgresLogDestination.create(
+          postgres_resource_id: pg.id,
+          name: "graylog",
+          type: "syslog",
+          url: "tcp://logs.example.com:6514",
+        )
+        delete "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/log-destination/#{ld.ubid}"
+
+        expect(last_response.status).to eq(204)
+        expect(PostgresLogDestination[ld.id]).to be_nil
+      end
+
+      it "log-destination not exist" do
+        delete "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/log-destination/1d000000000000000000000000"
+
+        expect(last_response.status).to eq(204)
+      end
     end
 
     describe "config" do
@@ -1117,6 +1430,17 @@ RSpec.describe Clover, "postgres" do
         expect(response_body["pg_config"]).to eq({"max_connections" => "100"})
         expect(response_body["pgbouncer_config"]).to eq({"max_client_conn" => "100"})
         expect(response_body["default_pg_config"]).to include("shared_buffers", "work_mem", "max_connections", "effective_cache_size")
+      end
+
+      it "serializes numeric config values without failing response validation" do
+        pg.update(user_config: {"max_connections" => 100}, pgbouncer_user_config: {"max_client_conn" => 100})
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/config"
+
+        expect(last_response.status).to eq(200)
+        response_body = JSON.parse(last_response.body)
+        expect(response_body["pg_config"]).to eq({"max_connections" => 100})
+        expect(response_body["pgbouncer_config"]).to eq({"max_client_conn" => 100})
       end
 
       it "full update" do
@@ -1135,6 +1459,39 @@ RSpec.describe Clover, "postgres" do
 
         expect(pg.reload.user_config).to eq({"archive_mode" => "on"})
         expect(pg.reload.pgbouncer_user_config).to eq({"admin_users" => "postgres"})
+      end
+
+      it "rejects ubicloud.shared_memory_percent above what the server's memory allows" do
+        # standard-2 has 8 GiB, so the ceiling is 50 rather than the schema's 75.
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/config", {
+          pg_config: {"ubicloud.shared_memory_percent" => "75"},
+          pgbouncer_config: {},
+        }.to_json
+
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: pg_config.ubicloud.shared_memory_percent")
+        expect(JSON.parse(last_response.body).dig("error", "details", "pg_config.ubicloud.shared_memory_percent")).to eq("must be at most 50 on a server with 8 GiB of memory")
+        expect(pg.reload.user_config).to eq({})
+      end
+
+      it "accepts ubicloud.shared_memory_percent at the ceiling for the server's memory" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/config", {
+          pg_config: {"ubicloud.shared_memory_percent" => "50"},
+          pgbouncer_config: {},
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        expect(pg.reload.user_config).to eq({"ubicloud.shared_memory_percent" => "50"})
+      end
+
+      it "reports the schema range error rather than the memory ceiling when both would apply" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/config", {
+          pg_config: {"ubicloud.shared_memory_percent" => "90"},
+          pgbouncer_config: {},
+        }.to_json
+
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: pg_config.ubicloud.shared_memory_percent")
+        expect(JSON.parse(last_response.body).dig("error", "details", "pg_config.ubicloud.shared_memory_percent")).to eq(["must be between 25 and 75"])
+        expect(pg.reload.user_config).to eq({})
       end
 
       it "full update without restart-requiring changes does not include restart message" do
@@ -1178,11 +1535,55 @@ RSpec.describe Clover, "postgres" do
         expect(pg.reload.user_config).to eq({"max_connections" => "120", "archive_mode" => "on"})
         expect(pg.reload.pgbouncer_user_config).to eq({"max_client_conn" => "100", "admin_users" => "postgres"})
       end
+
+      it "rejects increasing a restart-sensitive param beyond a read replica's value" do
+        pg.update(user_config: {"max_connections" => "100"})
+        replica = Prog::Postgres::PostgresResourceNexus.assemble(
+          project_id: project.id,
+          location_id: pg.location_id,
+          name: "my-replica-for-config-test",
+          target_vm_size: pg.target_vm_size,
+          target_storage_size_gib: pg.target_storage_size_gib,
+          target_version: pg.version,
+          parent_id: pg.id,
+          user_config: {"max_connections" => "100"},
+        ).subject
+
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/config", {
+          pg_config: {"max_connections" => "200"},
+          pgbouncer_config: {},
+        }.to_json
+
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: pg_config.max_connections")
+        expect(pg.reload.user_config).to eq({"max_connections" => "100"})
+        expect(replica.reload.user_config).to eq({"max_connections" => "100"})
+      end
+
+      it "rejects decreasing a read replica's restart-sensitive param below the primary's value" do
+        pg.update(user_config: {"max_connections" => "200"})
+        replica = Prog::Postgres::PostgresResourceNexus.assemble(
+          project_id: project.id,
+          location_id: pg.location_id,
+          name: "my-replica-for-config-test-2",
+          target_vm_size: pg.target_vm_size,
+          target_storage_size_gib: pg.target_storage_size_gib,
+          target_version: pg.version,
+          parent_id: pg.id,
+          user_config: {"max_connections" => "200"},
+        ).subject
+
+        post "/project/#{project.ubid}/location/#{replica.display_location}/postgres/#{replica.name}/config", {
+          pg_config: {"max_connections" => "100"},
+          pgbouncer_config: {},
+        }.to_json
+
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: pg_config.max_connections")
+        expect(replica.reload.user_config).to eq({"max_connections" => "200"})
+      end
     end
 
     describe "upgrade" do
       before do
-        VmStorageVolume.create(vm_id: pg.representative_server.vm.id, size_gib: pg.target_storage_size_gib, boot: false, disk_index: 0)
         allow(pg.representative_server).to receive(:version).and_return("16")
       end
 
@@ -1196,6 +1597,22 @@ RSpec.describe Clover, "postgres" do
         expect(response["current_version"]).to eq(pg.version)
         expect(response["target_version"]).to eq(pg.reload.target_version)
         expect(pg.reload.target_version.to_i).to eq(old_pg_version + 1)
+      end
+
+      it "logs the upgrade request" do
+        expect(Clog).to receive(:emit).with("Postgres database upgrade requested", {postgres_upgrade: {
+          resource_ubid: pg.ubid,
+          project_ubid: project.ubid,
+          account_ubid: user.ubid,
+          location: pg.display_location,
+          current_version: "16",
+          target_version: "17",
+          read_replica_count: 0,
+        }}).and_call_original
+
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/upgrade"
+
+        expect(last_response.status).to eq(200)
       end
 
       it "failed post" do
@@ -1242,7 +1659,172 @@ RSpec.describe Clover, "postgres" do
         expect(server).to have_key("role")
         expect(server).to have_key("state")
         expect(server).to have_key("synchronization_status")
-        expect(server).to have_key("vm")
+      end
+
+      it "returns servers during failover" do
+        pg.representative_server.strand.update(label: "taking_over")
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/servers"
+
+        expect(last_response.status).to eq(200)
+        expect(JSON.parse(last_response.body)["items"].first["state"]).to eq("failing_over")
+      end
+    end
+
+    describe "logs" do
+      let(:parseable_client) { instance_double(Parseable::Client) }
+
+      before do
+        allow(ParseableResource).to receive(:client_for_project).and_return(parseable_client)
+      end
+
+      def expected_logs_sql(pg_ubid, limit: 51, extra_where: nil)
+        cols = '"log_id", "time_unix_nano", "stream", "severity_text", "body", "instance", "server_role", "remote_host_port", "dbname", "pid", "user"'
+        condition = extra_where ? "(\"log_id\" IS NOT NULL) AND #{extra_where}" : '"log_id" IS NOT NULL'
+        "SELECT #{cols} FROM \"#{pg_ubid}\" WHERE (#{condition}) ORDER BY \"log_id\" DESC LIMIT #{limit}"
+      end
+
+      it "returns logs successfully without filters" do
+        rows = [{"log_id" => "0196a9f7-0000-7000-8000-000000000001", "time_unix_nano" => "2026-01-01T00:00:00", "stream" => "postgres", "severity_text" => "INFO", "body" => "started", "instance" => pg.representative_server.ubid, "server_role" => "primary"}]
+        expect(parseable_client).to receive(:query).with(expected_logs_sql(pg.ubid), start_time: anything, end_time: anything).and_return(rows)
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs"
+
+        expect(last_response.status).to eq(200)
+        response_body = JSON.parse(last_response.body)
+        expect(response_body["logs"].length).to eq(1)
+        log = response_body["logs"].first
+        expect(log["timestamp"]).to eq("2026-01-01T00:00:00Z")
+        expect(log["stream_name"]).to eq("postgres")
+        expect(log["severity_level"]).to eq("INFO")
+        expect(log["message"]).to eq("started")
+        expect(log["server_role"]).to eq("primary")
+      end
+
+      it "returns logs successfully with filters" do
+        rows = [{"time_unix_nano" => "2026-01-01T00:00:00", "stream" => "postgres", "severity_text" => "INFO", "body" => "started", "instance" => pg.representative_server.ubid, "server_role" => "primary"}]
+        expect(parseable_client).to receive(:query).with(
+          expected_logs_sql(pg.ubid, extra_where: "(\"stream\" = 'postgres') AND (\"server_role\" = 'primary') AND (\"severity_text\" = 'INFO') AND (\"message\" LIKE '%SELECT\\_\\%%')"),
+          start_time: anything, end_time: anything,
+        ).and_return(rows)
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs?stream_name=postgres&server_role=primary&query_pattern=SELECT_%25&severity_level=INFO"
+
+        expect(last_response.status).to eq(200)
+        response_body = JSON.parse(last_response.body)
+        expect(response_body["logs"].length).to eq(1)
+        log = response_body["logs"].first
+        expect(log["timestamp"]).to eq("2026-01-01T00:00:00Z")
+        expect(log["stream_name"]).to eq("postgres")
+        expect(log["severity_level"]).to eq("INFO")
+        expect(log["message"]).to eq("started")
+        expect(log["server_role"]).to eq("primary")
+      end
+
+      it "includes context when context fields are present" do
+        rows = [{"log_id" => "0196a9f7-0000-7000-8000-000000000001", "time_unix_nano" => "2026-01-01T00:00:00", "stream" => "postgres", "severity_text" => "INFO", "body" => "connection received", "instance" => pg.representative_server.ubid, "server_role" => "primary", "remote_host_port" => "10.0.0.1:5432", "dbname" => "mydb", "pid" => "1234", "user" => "alice"}]
+        expect(parseable_client).to receive(:query).with(expected_logs_sql(pg.ubid), start_time: anything, end_time: anything).and_return(rows)
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs"
+
+        expect(last_response.status).to eq(200)
+        log = JSON.parse(last_response.body)["logs"].first
+        expect(log["context"]).to eq("remote_host_port" => "10.0.0.1:5432", "dbname" => "mydb", "pid" => "1234", "user" => "alice")
+      end
+
+      it "returns logs with an unclassified severity level" do
+        rows = [{"log_id" => "0196a9f7-0000-7000-8000-000000000001", "time_unix_nano" => "2026-01-01T00:00:00", "stream" => "postgres", "severity_text" => "UNSPECIFIED", "body" => "started", "instance" => pg.representative_server.ubid, "server_role" => "primary"}]
+        expect(parseable_client).to receive(:query).with(expected_logs_sql(pg.ubid), start_time: anything, end_time: anything).and_return(rows)
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs"
+
+        expect(last_response.status).to eq(200)
+        log = JSON.parse(last_response.body)["logs"].first
+        expect(log["severity_level"]).to eq("UNSPECIFIED")
+      end
+
+      it "omits context when no context fields are present" do
+        rows = [{"log_id" => "0196a9f7-0000-7000-8000-000000000001", "time_unix_nano" => "2026-01-01T00:00:00", "stream" => "pgbouncer", "severity_text" => "INFO", "body" => "listening on 0.0.0.0:5432", "instance" => pg.representative_server.ubid, "server_role" => "primary"}]
+        expect(parseable_client).to receive(:query).with(expected_logs_sql(pg.ubid), start_time: anything, end_time: anything).and_return(rows)
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs"
+
+        expect(last_response.status).to eq(200)
+        log = JSON.parse(last_response.body)["logs"].first
+        expect(log).not_to have_key("context")
+      end
+
+      it "returns pagination_key when more results exist" do
+        rows = Array.new(51) { |i| {"log_id" => "0196a9f7-0000-7000-8000-#{i.to_s.rjust(12, "0")}", "time_unix_nano" => "2026-01-01T00:00:00", "stream" => "postgres", "severity_text" => "INFO", "body" => "msg", "instance" => "pv05vz1sfkz20qn6ghvv9ermmz", "server_role" => "primary"} }
+        expect(parseable_client).to receive(:query).with(expected_logs_sql(pg.ubid), start_time: anything, end_time: anything).and_return(rows)
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs"
+
+        expect(last_response.status).to eq(200)
+        response_body = JSON.parse(last_response.body)
+        expect(response_body["logs"].length).to eq(50)
+        expect(response_body["pagination_key"]).to eq("0196a9f7-0000-7000-8000-000000000049")
+      end
+
+      it "uses pagination_key as a log_id cursor" do
+        cursor = "0196a9f7-0000-7000-8000-000000000049"
+        expect(parseable_client).to receive(:query).with(expected_logs_sql(pg.ubid, extra_where: "(\"log_id\" < '#{cursor}')"), start_time: anything, end_time: anything).and_return([])
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs?pagination_key=#{cursor}"
+
+        expect(last_response.status).to eq(200)
+      end
+
+      it "returns 400 when no parseable client is available" do
+        expect(ParseableResource).to receive(:client_for_project).and_return(nil)
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs"
+
+        expect(last_response).to have_api_error(400, "Log aggregation is not enabled for this instance")
+      end
+
+      it "returns 503 when parseable query fails" do
+        expect(parseable_client).to receive(:query).with(expected_logs_sql(pg.ubid), start_time: anything, end_time: anything).and_raise(Parseable::Client::Error.new("connection refused"))
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs"
+
+        expect(last_response).to have_api_error(503, "Log service is temporarily unavailable. Please try again in a few moments.")
+      end
+
+      it "rejects end time before start time" do
+        query_params = {start: (Time.now.utc - 86400).iso8601, end: (Time.now.utc - 2 * 86400).iso8601}
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs?#{URI.encode_www_form(query_params)}"
+
+        expect(last_response).to have_api_error(400, "End time must be after start time")
+      end
+
+      it "rejects start time older than 7 days" do
+        query_params = {start: (Time.now.utc - 8 * 86400).iso8601, end: (Time.now.utc - 7 * 86400).iso8601}
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs?#{URI.encode_www_form(query_params)}"
+
+        expect(last_response).to have_api_error(400, "Cannot query logs older than 7 days")
+      end
+
+      it "rejects time range greater than 24 hours" do
+        query_params = {start: (Time.now.utc - 25 * 3600).iso8601, end: Time.now.utc.iso8601}
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs?#{URI.encode_www_form(query_params)}"
+        expect(last_response).to have_api_error(400, "Maximum time range for log queries is 24 hours")
+      end
+
+      it "rejects limit greater than 500" do
+        expect(parseable_client).not_to receive(:query)
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs?max_log_lines=501"
+
+        expect(last_response).to have_api_error(400, "Maximum limit is 500")
+      end
+
+      it "rejects long pattern" do
+        expect(parseable_client).not_to receive(:query)
+
+        long_pattern = "foo" * 100
+
+        get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/logs?query_pattern=#{long_pattern}"
+        expect(last_response).to have_api_error(400, "query_pattern must be less than 200 chars")
       end
     end
 
@@ -1250,7 +1832,7 @@ RSpec.describe Clover, "postgres" do
       it "returns backups successfully" do
         backup = Struct.new(:key, :last_modified)
         backup_time = Time.now.utc
-        expect(MinioCluster).to receive(:first).and_return(instance_double(MinioCluster, url: "dummy-url", root_certs: "dummy-certs")).at_least(:once)
+        create_minio_cluster_for_blob_storage
         expect(Minio::Client).to receive(:new).and_return(instance_double(Minio::Client, list_objects: [
           backup.new("basebackups_005/backup1_backup_stop_sentinel.json", backup_time - 2 * 24 * 60 * 60),
           backup.new("basebackups_005/backup2_backup_stop_sentinel.json", backup_time - 1 * 24 * 60 * 60),
@@ -1267,7 +1849,7 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "returns empty list when no backups exist" do
-        expect(MinioCluster).to receive(:first).and_return(instance_double(MinioCluster, url: "dummy-url", root_certs: "dummy-certs")).at_least(:once)
+        create_minio_cluster_for_blob_storage
         expect(Minio::Client).to receive(:new).and_return(instance_double(Minio::Client, list_objects: [])).at_least(:once)
 
         get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.ubid}/backup"
@@ -1279,14 +1861,113 @@ RSpec.describe Clover, "postgres" do
       end
 
       it "returns empty list when blob storage is not configured" do
-        expect(MinioCluster).to receive(:first).and_return(nil).at_least(:once)
-
         get "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/backup"
 
         expect(last_response.status).to eq(200)
         response_body = JSON.parse(last_response.body)
         expect(response_body["count"]).to eq(0)
         expect(response_body["items"]).to eq([])
+      end
+    end
+
+    describe "backup-credentials" do
+      def create_provider_location(provider)
+        Location.create(name: "loc-#{provider}", display_name: "#{provider}-loc", ui_name: "#{provider} loc", visible: true, provider:)
+      end
+
+      it "returns 400 for read replicas" do
+        replica = Prog::Postgres::PostgresResourceNexus.assemble(
+          project_id: project.id,
+          location_id: pg.location_id,
+          name: "my-replica-for-backup-credentials-test",
+          target_vm_size: pg.target_vm_size,
+          target_storage_size_gib: pg.target_storage_size_gib,
+          target_version: pg.version,
+          parent_id: pg.id,
+        ).subject
+
+        post "/project/#{project.ubid}/location/#{replica.display_location}/postgres/#{replica.name}/backup-credentials"
+
+        expect(last_response).to have_api_error(400, "Backup downloads are not supported for read replicas. Request credentials on the primary database.")
+      end
+
+      it "returns 400 for non-aws databases when the minio flag is not set" do
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/backup-credentials"
+
+        expect(last_response).to have_api_error(400, "Backup downloads are not available for this PostgreSQL database.")
+      end
+
+      it "returns 400 for gcp-hosted databases" do
+        pg.timeline.update(location_id: create_provider_location("gcp").id)
+        project.set_ff_postgres_backup_download_minio(true)
+
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/backup-credentials"
+
+        expect(last_response).to have_api_error(400, "Backup downloads are not supported for GCP-hosted PostgreSQL databases.")
+      end
+
+      it "returns 400 for aws databases using instance-profile credentials" do
+        pg.timeline.update(location_id: create_provider_location("aws").id)
+        expect(Config).to receive(:aws_postgres_iam_access).and_return(true)
+
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/backup-credentials"
+
+        expect(last_response).to have_api_error(400, "Backup downloads are not available for this PostgreSQL database.")
+      end
+
+      it "creates temporary credentials without a CA certificate for aws-hosted databases" do
+        aws_location = create_provider_location("aws")
+        LocationCredentialAws.create_with_id(aws_location, access_key: "ak", secret_key: "sk")
+        pg.timeline.update(location_id: aws_location.id)
+        expiration = Time.now.utc + 36 * 60 * 60
+        sts_client = Aws::STS::Client.new(stub_responses: true)
+        expect(Aws::STS::Client).to receive(:new).and_return(sts_client)
+        sts_client.stub_responses(:get_federation_token, credentials: {access_key_id: "AKID", secret_access_key: "SECRET", session_token: "TOKEN", expiration:})
+
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/backup-credentials"
+
+        expect(last_response.status).to eq(200)
+        response_body = JSON.parse(last_response.body)
+        expect(response_body["access_key_id"]).to eq("AKID")
+        expect(response_body).not_to have_key("ca_certificate")
+      end
+
+      it "returns 400 when the writer policy lacks federation permission (pre-existing timelines)" do
+        aws_location = create_provider_location("aws")
+        pg.timeline.update(location_id: aws_location.id)
+        sts_client = Aws::STS::Client.new(stub_responses: true)
+        expect(Aws::STS::Client).to receive(:new).and_return(sts_client)
+        sts_client.stub_responses(:get_federation_token, "AccessDenied")
+
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/backup-credentials"
+
+        expect(last_response).to have_api_error(400, "Backup downloads are not yet available for this database. Please contact support if this persists.")
+      end
+
+      it "creates temporary credentials for metal-provider databases once the minio flag is set" do
+        project.set_ff_postgres_backup_download_minio(true)
+        create_minio_cluster_for_blob_storage
+        # create_minio_cluster_for_blob_storage seeds the DNS zone under the postgres
+        # service project; point MinioCluster#dns_zone's lookup at it so the endpoint resolves.
+        allow(Config).to receive(:minio_service_project_id).and_return(Config.postgres_service_project_id)
+        expiration = Time.now.utc + 36 * 60 * 60
+        minio_client = instance_double(Minio::Client)
+        expect(Minio::Client).to receive(:new).and_return(minio_client)
+        expect(minio_client).to receive(:assume_role)
+          .with(policy: pg.timeline.download_blob_storage_policy, duration_seconds: PostgresTimeline::DOWNLOAD_CREDENTIALS_DURATION_SECONDS)
+          .and_return({access_key_id: "AKID", secret_access_key: "SECRET", session_token: "TOKEN", expiration:})
+
+        post "/project/#{project.ubid}/location/#{pg.display_location}/postgres/#{pg.name}/backup-credentials"
+
+        expect(last_response.status).to eq(200)
+        response_body = JSON.parse(last_response.body)
+        expect(response_body["bucket"]).to eq(pg.timeline.ubid)
+        expect(response_body["endpoint"]).to eq("https://walg-minio.minio.test:9000")
+        expect(response_body["region"]).to eq("us-east-1")
+        expect(response_body["access_key_id"]).to eq("AKID")
+        expect(response_body["secret_access_key"]).to eq("SECRET")
+        expect(response_body["session_token"]).to eq("TOKEN")
+        expect(response_body["expiration"]).to eq(expiration.iso8601)
       end
     end
   end

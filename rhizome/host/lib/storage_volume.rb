@@ -8,6 +8,7 @@ require "openssl"
 require "base64"
 require "yaml"
 require_relative "boot_image"
+require_relative "device_resolver"
 require_relative "vm_path"
 require_relative "spdk_path"
 require_relative "spdk_rpc"
@@ -15,14 +16,12 @@ require_relative "spdk_setup"
 require_relative "storage_key_encryption"
 require_relative "kek_pipe"
 require_relative "storage_path"
-require_relative "toml"
+require "perfect_toml"
 require_relative "vhost_block_backend"
 
 class StorageVolume
-  class NoPersistentDeviceId < RuntimeError; end
-
   include KekPipe
-  include Toml
+  include DeviceResolver
 
   attr_reader :image_path, :read_only
   def initialize(vm_name, params)
@@ -45,8 +44,9 @@ class StorageVolume
     @copy_on_read = params.fetch("copy_on_read", false)
     @track_written = params.fetch("track_written", false)
     @stripe_sector_count_shift = Integer(params.fetch("stripe_sector_count_shift", 11))
-    @cpus = params["cpus"]
+    @allowed_cpus = params["allowed_cpus"]
     @archive_source = params["archive_source"]
+    @remote_source = params["remote_source"]
   end
 
   def vp
@@ -79,7 +79,7 @@ class StorageVolume
     encryption_key = generate_data_encryption_key
 
     if @vhost_backend_version
-      create_empty_disk_file
+      create_empty_disk_file(disk_size_mib: vhost_backend_disk_size_mib)
       prep_vhost_backend(encryption_key, key_wrapping_secrets)
       return
     end
@@ -104,7 +104,7 @@ class StorageVolume
   end
 
   def has_source?
-    !!(@image_path || @archive_source)
+    !!(@image_path || @archive_source || @remote_source)
   end
 
   def requires_metadata?
@@ -180,7 +180,8 @@ class StorageVolume
       "--kek #{sp.kek_pipe}"
     end
 
-    if @archive_source
+    if @archive_source || @remote_source
+      # An archive (S3) or remote stripe source needs outbound network access.
       restrict_address_families = "AF_UNIX AF_INET AF_INET6"
       private_network = "no"
     else
@@ -191,6 +192,8 @@ class StorageVolume
 
     # systemd-analyze security result:
     # Overall exposure level for #{vhost_user_block_service}: 0.5 SAFE
+    allowed_cpus_line = @allowed_cpus ? "AllowedCPUs=#{@allowed_cpus.join(" ")}\n" : ""
+
     service_file_path = "/etc/systemd/system/#{vhost_user_block_service}"
     File.write(service_file_path, <<~SERVICE)
         [Unit]
@@ -199,7 +202,7 @@ class StorageVolume
 
         [Service]
         Slice=#{@slice}
-        Environment=RUST_LOG=info
+        #{allowed_cpus_line}Environment=RUST_LOG=info
         Environment=RUST_BACKTRACE=1
         ExecStart=#{vhost_backend.bin_path} --config #{sp.vhost_backend_config} #{kek_arg}
         Restart=no
@@ -270,33 +273,8 @@ class StorageVolume
   # fallback there.
   def io_limit_device(path)
     persistent_device_id(path)
-  rescue NoPersistentDeviceId
+  rescue DeviceResolver::NoPersistentDeviceId
     path
-  end
-
-  def persistent_device_id(path)
-    path_stat = File.stat(path)
-
-    Dir["/dev/disk/by-id/*"].each do |id|
-      dev_path = File.realpath(id)
-      dev_stat = File.stat(dev_path)
-      next unless dev_stat.rdev_major == path_stat.dev_major && dev_stat.rdev_minor == path_stat.dev_minor
-
-      # Choose stable symlink types by subsystem:
-      #  - SSDs: Use identifiers starting with 'wwn' (World Wide Name), globally unique.
-      #  - NVMe: Use identifiers starting with 'nvme-eui', also globally unique.
-      #  - MD devices: Use uuid identifiers.
-      #  - LVM/device-mapper: Use LVM uuid identifiers.
-      dev = File.basename(dev_path)
-      return id if (dev.start_with?("nvme") && id.include?("nvme-eui.")) ||
-        (dev.start_with?("sd") && id.include?("wwn-")) ||
-        (dev.start_with?("md") && id.include?("md-uuid-")) ||
-        (dev.start_with?("dm") && id.include?("dm-uuid-"))
-    rescue SystemCallError
-      next
-    end
-
-    raise NoPersistentDeviceId, "No persistent device ID found for storage path: #{path}"
   end
 
   def wrap_key_b64(storage_key_encryption, key)
@@ -330,32 +308,26 @@ class StorageVolume
     key2_wrapped_b64 = wrap_key_b64(key_encryption, encryption_key[:key2])
     config["encryption_key"] = [key1_wrapped_b64, key2_wrapped_b64]
 
-    if @cpus
-      config["cpus"] = @cpus
-      config["num_queues"] = @cpus.count
-    end
-
     config
   end
 
   def v2_main_toml
-    sections = []
-    sections << v2_include_section
-    sections << v2_device_section
-    sections << v2_tuning_section
-    sections << v2_encryption_section
-    sections.join("\n")
+    PerfectTOML.generate({
+      "include" => v2_includes,
+      "device" => v2_device_table,
+      "tuning" => v2_tuning_table,
+      "encryption" => v2_encryption_table,
+    })
   end
 
-  def v2_include_section
+  def v2_includes
     includes = []
     includes << File.basename(sp.vhost_backend_stripe_source_config) if has_source?
     includes << File.basename(sp.vhost_backend_secrets_config)
-    items = includes.map { |f| toml_str(f) }.join(", ")
-    "include = [#{items}]\n"
+    includes
   end
 
-  def v2_device_section
+  def v2_device_table
     hash = {
       "data_path" => disk_file,
       "vhost_socket" => vhost_sock,
@@ -364,27 +336,22 @@ class StorageVolume
       "track_written" => @track_written,
     }
     hash["metadata_path"] = sp.vhost_backend_metadata if requires_metadata?
-    toml_section("device", hash)
+    hash
   end
 
-  def v2_tuning_section
-    hash = {
-      "num_queues" => @cpus ? @cpus.count : @num_queues,
+  def v2_tuning_table
+    {
+      "num_queues" => @num_queues,
       "queue_size" => @queue_size,
       "seg_size_max" => 64 * 1024,
       "seg_count_max" => 4,
       "poll_timeout_us" => 1000,
       "write_through" => write_through_device?,
-      "cpus" => @cpus,
     }
-    toml_section("tuning", hash.compact)
   end
 
-  def v2_encryption_section
-    hash = {
-      "xts_key.ref" => "xts-key",
-    }
-    toml_section("encryption", hash)
+  def v2_encryption_table
+    {"xts_key" => {"ref" => "xts-key"}}
   end
 
   def v2_secrets_toml(encryption_key, key_wrapping_secrets)
@@ -395,37 +362,26 @@ class StorageVolume
       StorageKeyEncryption.aes256gcm_encrypt(kek_bytes, xts_key_name, xts_plaintext),
     )
 
-    sections = []
-    sections << toml_section("secrets.#{xts_key_name}", {
-      "source.inline" => wrapped_xts_b64,
-      "encoding" => "base64",
-      "encrypted_by.ref" => "kek",
-    })
-
-    sections << toml_section("secrets.kek", {
-      "source.file" => sp.kek_pipe,
-      "encoding" => "base64",
-    })
+    secrets = {
+      xts_key_name => wrapped_kek_secret(wrapped_xts_b64),
+      "kek" => {"source" => {"file" => sp.kek_pipe}, "encoding" => "base64"},
+    }
 
     if @archive_source
-      sections << toml_section("secrets.archive-access-key", {
-        "source.inline" => @archive_source["encrypted_access_key_id"],
-        "encoding" => "base64",
-        "encrypted_by.ref" => "kek",
-      })
-      sections << toml_section("secrets.archive-secret-key", {
-        "source.inline" => @archive_source["encrypted_secret_access_key"],
-        "encoding" => "base64",
-        "encrypted_by.ref" => "kek",
-      })
-      sections << toml_section("secrets.archive-kek", {
-        "source.inline" => @archive_source["encrypted_archive_kek"],
-        "encoding" => "base64",
-        "encrypted_by.ref" => "kek",
-      })
+      secrets["archive-access-key"] = wrapped_kek_secret(@archive_source["encrypted_access_key_id"])
+      secrets["archive-secret-key"] = wrapped_kek_secret(@archive_source["encrypted_secret_access_key"])
+      secrets["archive-kek"] = wrapped_kek_secret(@archive_source["encrypted_archive_kek"])
     end
 
-    sections.join("\n")
+    if @remote_source
+      secrets["remote-psk"] = wrapped_kek_secret(@remote_source["encrypted_psk"])
+    end
+
+    PerfectTOML.generate({"secrets" => secrets})
+  end
+
+  def wrapped_kek_secret(inline)
+    {"source" => {"inline" => inline}, "encoding" => "base64", "encrypted_by" => {"ref" => "kek"}}
   end
 
   def v2_stripe_source_toml
@@ -437,9 +393,17 @@ class StorageVolume
         "prefix" => @archive_source["prefix"],
         "region" => @archive_source["region"],
         "endpoint" => @archive_source["endpoint"],
-        "access_key_id.ref" => "archive-access-key",
-        "secret_access_key.ref" => "archive-secret-key",
-        "archive_kek.ref" => "archive-kek",
+        "autofetch" => @archive_source.fetch("autofetch", false),
+        "access_key_id" => {"ref" => "archive-access-key"},
+        "secret_access_key" => {"ref" => "archive-secret-key"},
+        "archive_kek" => {"ref" => "archive-kek"},
+      }
+    elsif @remote_source
+      {
+        "type" => "remote",
+        "address" => @remote_source["address"],
+        "autofetch" => @remote_source.fetch("autofetch", false),
+        "psk" => {"identity" => @remote_source["psk_identity"], "secret" => {"ref" => "remote-psk"}},
       }
     else
       {
@@ -448,7 +412,7 @@ class StorageVolume
         "copy_on_read" => @copy_on_read,
       }
     end
-    toml_section("stripe_source", hash)
+    PerfectTOML.generate({"stripe_source" => hash})
   end
 
   def vhost_backend_kek(key_wrapping_secrets)
@@ -518,6 +482,21 @@ class StorageVolume
     end
   end
 
+  def dump_metadata(key_wrapping_secrets)
+    fail "vhost block backend version #{@vhost_backend_version} does not support dump-metadata" unless @vhost_backend_version && vhost_backend.config_v2?
+
+    run_with_kek_pipe(
+      [
+        "sudo", "-u", @vm_name,
+        vhost_backend.dump_metadata_path,
+        "--config", sp.vhost_backend_config,
+      ],
+      kek_pipe: sp.kek_pipe,
+      kek_content: vhost_backend_kek(key_wrapping_secrets),
+      owner: @vm_name,
+    )
+  end
+
   def stop_service_if_loaded(name)
     r "systemctl", "stop", name
   rescue CommandFail => e
@@ -574,8 +553,123 @@ class StorageVolume
   end
 
   def read_data_encryption_key(key_wrapping_secrets)
-    sek = StorageKeyEncryption.new(key_wrapping_secrets)
-    sek.read_encrypted_dek(data_encryption_key_path)
+    read_encrypted_dek(data_encryption_key_path, key_wrapping_secrets)
+  end
+
+  def read_encrypted_dek(path, kek)
+    StorageKeyEncryption.new(kek).read_encrypted_dek(path)
+  end
+
+  def back_up_key(old_kek)
+    write_config_file(key_file_backup(old_kek), File.read(config_key_file))
+  end
+
+  def rewrite_secrets(old_kek, new_kek)
+    live = config_key_file
+    old_secrets_backup = key_file_backup(old_kek)
+    new = "#{live}.new"
+
+    remove_stale_spdk_key
+    write_rotated_secrets(new, old_secrets_backup, old_kek, new_kek)
+    verify_rotated_secrets(old_secrets_backup, old_kek, new, new_kek)
+    File.rename(new, live)
+    sync_parent_dir(live)
+  end
+
+  def remove_stale_spdk_key
+    # A spdk -> ubiblk migration leaves the old spdk DEK file behind.
+    return unless @vhost_backend_version && File.exist?(sp.data_encryption_key)
+
+    rm_if_exists(sp.data_encryption_key)
+    sync_parent_dir(sp.data_encryption_key)
+  end
+
+  def retire_key_backup(old_kek)
+    path = key_file_backup(old_kek)
+    rm_if_exists(path)
+    sync_parent_dir(path)
+  end
+
+  def key_file_backup(kek)
+    "#{config_key_file}.#{OpenSSL::Digest::SHA256.hexdigest(kek["key"])}"
+  end
+
+  def config_key_file
+    if !@vhost_backend_version
+      data_encryption_key_path
+    elsif use_config_v2?
+      sp.vhost_backend_secrets_config
+    else
+      sp.vhost_backend_config
+    end
+  end
+
+  def read_config_dek(path, kek)
+    if !@vhost_backend_version
+      read_encrypted_dek(path, kek)
+    else
+      ke = StorageKeyEncryption.new(kek)
+      key1, key2 = YAML.safe_load_file(path).fetch("encryption_key").map { |b64|
+        blob = Base64.decode64(b64)
+        ke.unwrap_key([blob[0...-16], blob[-16..]]).unpack1("H*")
+      }
+      {cipher: "AES_XTS", key: key1, key2: key2}
+    end
+  end
+
+  def write_rotated_secrets(new, source, old_kek, new_kek)
+    write_config_file(new, rotated_secrets(source, old_kek, new_kek))
+  end
+
+  def rotated_secrets(source, old_kek, new_kek)
+    if !@vhost_backend_version
+      StorageKeyEncryption.new(new_kek).encrypted_dek_json(read_config_dek(source, old_kek))
+    elsif use_config_v2?
+      rewrap_config_v2_secrets(source, old_kek, new_kek)
+    else
+      dek = read_config_dek(source, old_kek)
+      ke = StorageKeyEncryption.new(new_kek)
+      config = YAML.safe_load_file(source)
+      config["encryption_key"] = [wrap_key_b64(ke, dek[:key]), wrap_key_b64(ke, dek[:key2])]
+      config.to_yaml
+    end
+  end
+
+  def unwrap_encrypted_inline_secret(name, secret, kek_key)
+    fail "config-v2 secret #{name} is not wrapped by the kek" unless secret.dig("encrypted_by", "ref") == "kek"
+    fail "config-v2 secret #{name} is not base64 encoded" unless secret["encoding"] == "base64"
+    inline = secret.dig("source", "inline")
+    fail "config-v2 secret #{name} has no inline value" unless inline
+    StorageKeyEncryption.aes256gcm_decrypt(kek_key, name, Base64.strict_decode64(inline))
+  end
+
+  def rewrap_config_v2_secrets(source, old_kek, new_kek)
+    old_key = Base64.decode64(old_kek["key"])
+    new_key = Base64.decode64(new_kek["key"])
+    config = PerfectTOML.load_file(source)
+    config.fetch("secrets").each do |name, secret|
+      next if name == "kek"
+
+      plaintext = unwrap_encrypted_inline_secret(name, secret, old_key)
+      secret["source"]["inline"] = Base64.strict_encode64(StorageKeyEncryption.aes256gcm_encrypt(new_key, name, plaintext))
+    end
+    PerfectTOML.generate(config)
+  end
+
+  def config_v2_secret_plaintexts(path, kek)
+    key = Base64.decode64(kek["key"])
+    PerfectTOML.load_file(path).fetch("secrets").filter_map { |name, secret|
+      [name, unwrap_encrypted_inline_secret(name, secret, key)] unless name == "kek"
+    }.to_h
+  end
+
+  def verify_rotated_secrets(source, old_kek, new, new_kek)
+    changed = if use_config_v2?
+      config_v2_secret_plaintexts(source, old_kek) != config_v2_secret_plaintexts(new, new_kek)
+    else
+      read_config_dek(source, old_kek) != read_config_dek(new, new_kek)
+    end
+    fail "secrets changed after rotation" if changed
   end
 
   def verify_imaged_disk_size
@@ -639,20 +733,34 @@ class StorageVolume
     # so it doesn't error out in concurrent VM creations.
     rpc_socket = "/var/tmp/spdk_dd.sock.#{@vm_name}"
 
-    count_param = count.nil? ? "" : "--count #{count}"
+    cmd = [SpdkPath.bin(@spdk_version, "spdk_dd"), "--config", "/dev/stdin",
+      "--disable-cpumask-locks",
+      "--rpc-socket", rpc_socket,
+      "--if", input_file,
+      "--ob", "crypt0",
+      "--bs=#{block_size}"]
+    cmd.push("--count", count.to_s) unless count.nil?
 
-    r("#{SpdkPath.bin(@spdk_version, "spdk_dd")} --config /dev/stdin " \
-    "--disable-cpumask-locks " \
-    "--rpc-socket #{rpc_socket.shellescape} " \
-    "--if #{input_file.shellescape} " \
-    "--ob crypt0 " \
-    "--bs=#{block_size} #{count_param}", stdin: spdk_config_json)
+    r(*cmd, stdin: spdk_config_json)
   end
 
   def create_ubi_writespace(encryption_key)
     create_empty_disk_file(disk_size_mib: @disk_size_gib * 1024 + 16)
     # just clear the metadata section, i.e. first 8MB
     encrypted_image_copy(encryption_key, "/dev/zero", block_size: 2097152, count: 4)
+  end
+
+  # Size (MiB) of a vhost-backend disk.raw: the requested size_gib, or the source
+  # volume's actual disk.raw size when moving (remote_source["disk_size_bytes"]),
+  # whichever is larger.
+  def vhost_backend_disk_size_mib
+    nominal_mib = @disk_size_gib * 1024
+    source_bytes = @remote_source && @remote_source["disk_size_bytes"]
+    return nominal_mib unless source_bytes
+
+    mib = 1024 * 1024
+    source_mib = (source_bytes + mib - 1) / mib # round up to whole MiB
+    [nominal_mib, source_mib].max
   end
 
   def create_empty_disk_file(disk_size_mib: @disk_size_gib * 1024)
@@ -669,7 +777,7 @@ class StorageVolume
     FileUtils.chmod "u=rw,g=r,o=", disk_file
 
     # allow spdk to access the image
-    r "setfacl -m u:spdk:rw #{disk_file.shellescape}"
+    r "setfacl", "-m", "u:spdk:rw", disk_file
   end
 
   def setup_spdk_bdev(encryption_key)
@@ -711,7 +819,7 @@ class StorageVolume
     FileUtils.chmod "u=rw,g=r,o=", spdk_vhost_sock
 
     # allow vm user to access the vhost socket
-    r "setfacl -m u:#{@vm_name}:rw #{spdk_vhost_sock.shellescape}"
+    r "setfacl", "-m", "u:#{@vm_name}:rw", spdk_vhost_sock
 
     # create a symlink to the socket in the per vm storage dir
     rm_if_exists(vhost_sock)
@@ -731,10 +839,6 @@ class StorageVolume
 
   def vhost_user_block_service
     @vhost_user_block_service ||= "#{@vm_name}-#{@disk_index}-storage.service" if @vhost_backend_version
-  end
-
-  def q_vhost_user_block_service
-    @q_vhost_user_block_service ||= vhost_user_block_service.shellescape if vhost_user_block_service
   end
 
   def sp

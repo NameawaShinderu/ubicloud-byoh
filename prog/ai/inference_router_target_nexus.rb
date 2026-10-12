@@ -1,10 +1,7 @@
 # frozen_string_literal: true
 
-require "digest"
 require "json"
 require "forwardable"
-
-require_relative "../../lib/util"
 
 class Prog::Ai::InferenceRouterTargetNexus < Prog::Base
   subject_is :inference_router_target

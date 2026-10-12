@@ -8,7 +8,7 @@ RSpec.describe Clover, "github" do
     GithubInstallation.create(installation_id: 123, name: "test-user", type: "User", project_id: prj.id)
   end
 
-  let(:runner) { GithubRunner.create(installation_id: installation.id, label: "ubicloud", repository_name: "my-repo", runner_id: 123, vm_id: "46683a25-acb1-4371-afe9-d39f303e44b4") }
+  let(:runner) { GithubRunner.create(installation_id: installation.id, label: "ubicloud", repository_name: "my-repo", runner_id: 123, vm_id: "46683a25-acb1-4371-afe9-d39f303e44b4", location_id: Location::HETZNER_FSN1_ID) }
 
   before do
     allow(Config).to receive(:github_app_webhook_secret).and_return("secret")
@@ -22,6 +22,21 @@ RSpec.describe Clover, "github" do
 
   it "fails if signature digest tampered" do
     page.driver.post("/webhook/github", {}, {"HTTP_X_HUB_SIGNATURE_256" => "sha256=1234567890"})
+    expect(page.status_code).to eq(401)
+  end
+
+  it "fails if signature does not use sha256" do
+    page.driver.post("/webhook/github", {}, {"HTTP_X_HUB_SIGNATURE_256" => "md5=#{OpenSSL::HMAC.hexdigest("md5", "secret", "")}"})
+    expect(page.status_code).to eq(401)
+  end
+
+  it "fails if signature algorithm is not supported by OpenSSL" do
+    page.driver.post("/webhook/github", {}, {"HTTP_X_HUB_SIGNATURE_256" => "unsupported_hashing_method=abc123digest"})
+    expect(page.status_code).to eq(401)
+  end
+
+  it "fails if signature has no algorithm prefix" do
+    page.driver.post("/webhook/github", {}, {"HTTP_X_HUB_SIGNATURE_256" => "sha256"})
     expect(page.status_code).to eq(401)
   end
 
@@ -67,7 +82,16 @@ RSpec.describe Clover, "github" do
 
   context "when workflow_job event" do
     it "fails if installation not exists" do
+      expect(Clog).to receive(:emit).with("Unregistered installation", instance_of(Hash)).and_call_original
       send_webhook("workflow_job", workflow_job_payload(action: "queued", installation_id: 789))
+
+      expect(page.status_code).to eq(200)
+      expect(page.body).to eq({error: {message: "Unregistered installation"}}.to_json)
+    end
+
+    it "fails if installation is missing from the payload" do
+      expect(Clog).to receive(:emit).with("Unregistered installation", instance_of(Hash)).and_call_original
+      send_webhook("workflow_job", workflow_job_payload(action: "queued").except(:installation))
 
       expect(page.status_code).to eq(200)
       expect(page.body).to eq({error: {message: "Unregistered installation"}}.to_json)
@@ -105,6 +129,8 @@ RSpec.describe Clover, "github" do
     end
 
     it "uses custom label if label is an existing custom label" do
+      billing_info_id = BillingInfo.create(stripe_id: "0").id
+      installation.project.update(billing_info_id:)
       GithubCustomLabel.create(installation_id: installation.id, name: "custom-label-1", alias_for: "ubicloud-standard-4")
       send_webhook("workflow_job", workflow_job_payload(action: "queued", workflow_job: workflow_job_object(label: "custom-label-1")))
 
@@ -115,12 +141,24 @@ RSpec.describe Clover, "github" do
     end
 
     it "creates runner when receive queued action" do
+      billing_info_id = BillingInfo.create(stripe_id: "0").id
+      installation.project.update(billing_info_id:)
       send_webhook("workflow_job", workflow_job_payload(action: "queued"))
 
       expect(page.status_code).to eq(200)
       created_runner = GithubRunner.first(installation_id: installation.id, repository_name: "my-repo", label: "ubicloud", actual_label: "ubicloud")
       expect(created_runner).not_to be_nil
       expect(page.body).to eq({message: "GithubRunner[#{created_runner.ubid}] created"}.to_json)
+    end
+
+    it "does not create runner if there is no billing info" do
+      expect(Clog).to receive(:emit).with("Github runner queue request without billing info", {github_runner_billing_info_missing: {installation_id: installation.id}}).and_call_original
+      send_webhook("workflow_job", workflow_job_payload(action: "queued"))
+
+      expect(page.status_code).to eq(200)
+      created_runner = GithubRunner.first(installation_id: installation.id, repository_name: "my-repo", label: "ubicloud", actual_label: "ubicloud")
+      expect(created_runner).to be_nil
+      expect(page.body).to eq({error: {message: "Must setup payment method before using Ubicloud runners"}}.to_json)
     end
 
     it "fails if not queued and runner_id is empty" do

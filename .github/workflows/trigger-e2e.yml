@@ -12,10 +12,10 @@ on:
 jobs:
     pr_comment:
       if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/run-e2e')
-      runs-on: ubicloud
+      runs-on: ubuntu-slim
       steps:
         - name: Trigger E2E tests
-          uses: actions/github-script@v8
+          uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
           with:
             script: |
               // Check if the comment is from a contributor

@@ -6,7 +6,7 @@ module Ubicloud
 
     set_fragment "postgres"
 
-    set_columns :id, :name, :state, :location, :vm_size, :storage_size_gib, :version, :target_version, :ha_type, :flavor, :ca_certificates, :connection_string, :primary, :firewall_rules, :metric_destinations, :tags, :maintenance_window_start_at, :read_replica, :parent, :read_replicas
+    set_columns :id, :name, :state, :location, :vm_size, :storage_size_gib, :version, :target_version, :ha_type, :flavor, :ca_certificates, :connection_string, :private_connection_string, :primary, :firewall_rules, :metric_destinations, :log_destinations, :tags, :maintenance_window_start_at, :read_replica, :parent, :read_replicas
 
     def self._convert_tags_in_params_from_hash_to_array(params)
       if params[:tags]
@@ -61,14 +61,52 @@ module Ubicloud
       rule
     end
 
-    # Add a metric destination for this database with the given username, password,
-    # and URL. Returns a hash for the metric destination.
-    def add_metric_destination(username:, password:, url:)
-      md = adapter.post(_path("/metric-destination"), username:, password:, url:)
+    # Add a metric destination for this database with the given URL. Authenticate with
+    # basic auth by passing username and password, and/or with options:
+    # {"authorization" => {"credentials" => token}} and {"headers" => {...}}.
+    # Returns a hash for the metric destination.
+    def add_metric_destination(url:, username: nil, password: nil, options: nil)
+      md = adapter.post(_path("/metric-destination"), url:, username:, password:, options:)
 
       self[:metric_destinations]&.<<(md)
 
       md
+    end
+
+    # Add a metric destination for this database authenticating with a bearer token.
+    # Pass headers for providers that also require custom headers (e.g. X-Scope-OrgID
+    # for Mimir). Returns a hash for the metric destination.
+    def add_bearer_metric_destination(url:, token:, headers: {})
+      options = {"authorization" => {"type" => "Bearer", "credentials" => token}}
+      options["headers"] = headers unless headers.empty?
+      add_metric_destination(url:, options:)
+    end
+
+    # Add an OTLP HTTP log destination for this database.
+    # Pass an https:// url and optionally options: {"headers" => {...}} for
+    # providers that require header-based authentication (e.g. Grafana, New Relic, Datadog).
+    # Returns a hash for the log destination.
+    def add_otlp_log_destination(name:, url:, headers: {})
+      add_log_destination(name:, type: "otlp", url:, options: {"headers" => headers})
+    end
+
+    # Add a syslog (RFC 5424 over TLS) log destination for this database.
+    # Pass a tcp://host:port url and optionally options: {"structured_data" => {...}} for
+    # providers that require SD-based authentication (e.g. Mezmo, Papertrail).
+    # Returns a hash for the log destination.
+    def add_syslog_log_destination(name:, host:, port: 6514, structured_data: {})
+      url = "tcp://#{host}:#{port}"
+      add_log_destination(name:, type: "syslog", url:, options: {"structured_data" => structured_data})
+    end
+
+    # Delete the log destination with the given id.  Returns nil.
+    def delete_log_destination(ld_id)
+      check_no_slash(ld_id, "invalid log destination id format")
+      adapter.delete(_path("/log-destination/#{ld_id}"))
+
+      self[:log_destinations]&.delete_if { it[:id] == ld_id }
+
+      nil
     end
 
     # Delete the metric destination with the given id.  Returns nil.
@@ -126,12 +164,16 @@ module Ubicloud
       merge_into_values(adapter.post(_path("/promote-read-replica")))
     end
 
-    # Set the start hour (0-23) for the maintenance window, or nil
-    # to unset the maintenance window.
-    def set_maintenance_window(start_hour)
+    # Set the maintenance window. start_hour is the start hour (0-23), or nil to
+    # unset the window. days is an optional array of 3-letter lowercase day
+    # names (e.g. ["mon", "wed"]).
+    def set_maintenance_window(start_hour, days: nil)
       params = {}
       if start_hour
         params[:maintenance_window_start_at] = start_hour
+      end
+      if days
+        params[:maintenance_window_days] = days
       end
       merge_into_values(adapter.post(_path("/set-maintenance-window"), params))
     end
@@ -166,8 +208,32 @@ module Ubicloud
       adapter.get(_path("/upgrade"))
     end
 
+    # Represents one page of log results. Call next_page to retrieve the next page.
+    class LogPage < Array
+      attr_writer :postgres
+      attr_accessor :next_page_args
+
+      def next_page
+        @postgres.logs(**@next_page_args) if @postgres && @next_page_args
+      end
+    end
+
+    # Return a LogPage of log entries for this database. Accepts optional keyword
+    # arguments: start, end (RFC3339 strings), stream_name, server_role, severity_level, query_pattern,
+    # max_log_lines (1-500, default 50), and pagination_key for subsequent pages.
+    def logs(start: nil, end: nil, stream_name: nil, server_role: nil, severity_level: nil, query_pattern: nil, max_log_lines: nil, pagination_key: nil)
+      _logs(start:, end:, stream_name:, server_role:, severity_level:, query_pattern:, max_log_lines:, pagination_key:)
+    end
+
     def backups
       adapter.get(_path("/backup"))[:items]
+    end
+
+    # Create temporary, read-only credentials for downloading backups directly from
+    # object storage. Returns a hash with bucket, endpoint, region, access_key_id,
+    # secret_access_key, session_token, and expiration.
+    def create_backup_credentials
+      adapter.post(_path("/backup-credentials"))
     end
 
     # Return an array of server hashes for this database.
@@ -189,6 +255,29 @@ module Ubicloud
     # Remove a user from cert_auth_users. Returns a hash with :items key listing remaining cert auth users.
     def remove_cert_auth_user(name)
       adapter.post(_path("/cert/remove-auth-user"), name:)
+    end
+
+    private
+
+    def _logs(**opts)
+      result = adapter.get(_path("/logs"), opts)
+      page = LogPage.new.replace(result[:logs] || [].freeze)
+      if result[:pagination_key]
+        opts[:pagination_key] = result[:pagination_key]
+        page.postgres = self
+        page.next_page_args = opts
+      end
+      page
+    end
+
+    def add_log_destination(name:, type:, url:, options: nil)
+      params = {name:, type:, url:, options:}
+      params.compact!
+      ld = adapter.post(_path("/log-destination"), **params)
+
+      self[:log_destinations]&.<<(ld)
+
+      ld
     end
   end
 end

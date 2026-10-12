@@ -84,6 +84,53 @@ RSpec.describe Clover, "vm" do
         expect(Vm.first.ip4_enabled).to be false
       end
 
+      it "rejects the web-only machine_image field" do
+        expect {
+          post "/project/#{project.ubid}/location/#{TEST_LOCATION}/vm/test-vm", {
+            public_key: "ssh key",
+            unix_user: "ubi",
+            size: "standard-2",
+            machine_image: "my-image@latest",
+          }.to_json
+        }.to raise_error(Committee::InvalidRequest, /schema does not define properties: machine_image/)
+      end
+
+      it "rejects boot_image referencing an MI the user cannot view" do
+        create_machine_image_version_metal(project_id: project.id, location_id: Location::HETZNER_FSN1_ID, name: "my-image", version: "v1", set_latest_version: true)
+
+        other_user = create_account("other_user@example.com")
+        other_user.add_project(project)
+        other_pat = ApiKey.create_personal_access_token(other_user, project:)
+        header "Authorization", "Bearer pat-#{other_pat.ubid}-#{other_pat.key}"
+        [other_user.id, other_pat.id].each do |sid|
+          AccessControlEntry.create(project_id: project.id, subject_id: sid, action_id: ActionType::NAME_MAP["Vm:create"])
+          AccessControlEntry.create(project_id: project.id, subject_id: sid, action_id: ActionType::NAME_MAP["PrivateSubnet:view"])
+        end
+
+        post "/project/#{project.ubid}/location/#{TEST_LOCATION}/vm/test-vm", {
+          public_key: "ssh key",
+          unix_user: "ubi",
+          size: "standard-2",
+          boot_image: "my-image@latest",
+        }.to_json
+
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: boot_image", {"boot_image" => "Selected machine image is not available"})
+        expect(Vm.count).to eq(0)
+      end
+
+      it "rejects the web MI sentinel as an invalid boot image name" do
+        post "/project/#{project.ubid}/location/#{TEST_LOCATION}/vm/test-vm", {
+          public_key: "ssh key",
+          unix_user: "ubi",
+          size: "standard-2",
+          boot_image: "__machine_image",
+        }.to_json
+
+        expect(last_response.status).to eq(400)
+        expect(JSON.parse(last_response.body).dig("error", "details", "boot_image")).to include("not a valid boot image name")
+        expect(Vm.count).to eq(0)
+      end
+
       it "success with private subnet" do
         ps_id = Prog::Vnet::SubnetNexus.assemble(project.id, name: "dummy-ps-1", location_id: Location[display_name: TEST_LOCATION].id).ubid
 
@@ -166,7 +213,7 @@ RSpec.describe Clover, "vm" do
           enable_ip4: true,
         }.to_json
 
-        expect(last_response).to have_api_error(400, "Validation failed for following fields: boot_image", {"boot_image" => "\"invalid-boot-image\" is not a valid boot image name. Available boot image names are: [\"gpu-ubuntu-noble\", \"ubuntu-noble\", \"ubuntu-jammy\", \"debian-12\", \"almalinux-9\"]"})
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: boot_image", {"boot_image" => "\"invalid-boot-image\" is not a valid boot image name. Available boot image names are: [\"gpu-ubuntu-noble\", \"ubuntu-resolute\", \"ubuntu-noble\", \"ubuntu-jammy\", \"debian-13\", \"debian-12\", \"almalinux-10\", \"almalinux-9\"], or you can use machine-image-name@version, machine-image-name@latest"})
       end
 
       it "invalid vm size" do
@@ -327,6 +374,37 @@ RSpec.describe Clover, "vm" do
       end
     end
 
+    describe "set-maintenance-window" do
+      it "can set maintenance window" do
+        post "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/set-maintenance-window", {
+          maintenance_window_start_at: "9",
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        expect(JSON.parse(last_response.body)["maintenance_window_start_at"]).to eq 9
+        expect(vm.reload.maintenance_window_start_at).to eq(9)
+
+        post "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/set-maintenance-window", {
+          maintenance_window_start_at: nil,
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        expect(JSON.parse(last_response.body)["maintenance_window_start_at"]).to be_nil
+        expect(vm.reload.maintenance_window_start_at).to be_nil
+
+        post "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/set-maintenance-window", {
+          maintenance_window_start_at: 25,
+        }.to_json
+
+        expect(last_response.status).to eq(400)
+        expect(vm.reload.maintenance_window_start_at).to be_nil
+
+        expect do
+          post "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/set-maintenance-window"
+        end.to raise_error(Committee::InvalidRequest)
+      end
+    end
+
     describe "delete" do
       it "success" do
         delete "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}"
@@ -365,6 +443,94 @@ RSpec.describe Clover, "vm" do
         expect(last_response.status).to eq(404)
         expect(JSON.parse(last_response.body)).to eq("error" => {"code" => 404, "details" => {"location" => "Given location is not a valid location. Available locations: eu-central-h1, eu-north-h1, us-east-a2"}, "message" => "Validation failed for following path components: location", "type" => "InvalidLocation"})
         expect(SemSnap.new(vm.id).set?("destroy")).to be false
+      end
+
+      it "refuses to delete a VM that is being captured as a machine image version" do
+        metal = create_machine_image_version_metal
+        metal.update(pinned_source_vm_id: vm.id)
+
+        delete "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}"
+
+        expect(last_response).to have_api_error(400, "Cannot delete VM while it is being captured as a machine image version")
+        expect(SemSnap.new(vm.id).set?("destroy")).to be false
+      end
+    end
+
+    describe "serial-log" do
+      before { vm.update(vm_host_id: create_vm_host.id) }
+
+      def rc
+        RunCommand.where(vm_id: vm.id, command: "fetch_serial_log").first
+      end
+
+      it "returns a 400, not a 500, when the vm has no assigned host" do
+        vm.update(vm_host_id: nil)
+
+        get "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/serial-log"
+
+        expect(last_response).to have_api_error(400, "VM has no assigned host")
+      end
+
+      it "starts a fetch if none has been requested yet" do
+        expect {
+          get "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/serial-log"
+        }.to change { RunCommand.where(vm_id: vm.id, command: "fetch_serial_log").count }.from(0).to(1)
+
+        expect(last_response.status).to eq(202)
+        expect(JSON.parse(last_response.body)["status"]).to eq("created")
+      end
+
+      it "does not request another fetch while one is already in flight" do
+        get "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/serial-log"
+
+        expect {
+          get "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/serial-log"
+        }.not_to change { rc.id }
+
+        expect(last_response.status).to eq(202)
+      end
+
+      it "returns 200 with the output once succeeded" do
+        RunCommand.create(vm_id: vm.id, command: "fetch_serial_log", status: "succeeded", output: "log", run_at: Time.now)
+
+        get "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/serial-log"
+
+        expect(last_response.status).to eq(200)
+        body = JSON.parse(last_response.body)
+        expect(body["status"]).to eq("succeeded")
+        expect(body["output"]).to eq("log")
+        expect(body).not_to have_key("id")
+      end
+
+      it "ignores an explicit refresh request within the cooldown" do
+        RunCommand.create(vm_id: vm.id, command: "fetch_serial_log", status: "succeeded", output: "log", run_at: Time.now)
+
+        expect {
+          get "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/serial-log?refresh=true"
+        }.not_to change { rc.id }
+      end
+
+      it "starts a new fetch when refresh is requested and the cooldown has passed" do
+        existing = RunCommand.create(vm_id: vm.id, command: "fetch_serial_log", status: "succeeded", output: "log", run_at: Time.now - 61)
+
+        expect {
+          get "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/serial-log?refresh=true"
+        }.to change { rc.status }.from("succeeded").to("created")
+
+        expect(last_response.status).to eq(202)
+        expect(rc.id).to eq(existing.id)
+        expect(rc.output).to be_nil
+      end
+
+      it "starts a new fetch automatically once the previous result is stale, without an explicit refresh" do
+        existing = RunCommand.create(vm_id: vm.id, command: "fetch_serial_log", status: "succeeded", output: "log", run_at: Time.now - 3601)
+
+        expect {
+          get "/project/#{project.ubid}/location/#{vm.display_location}/vm/#{vm.name}/serial-log"
+        }.to change { rc.status }.from("succeeded").to("created")
+
+        expect(last_response.status).to eq(202)
+        expect(rc.id).to eq(existing.id)
       end
     end
   end

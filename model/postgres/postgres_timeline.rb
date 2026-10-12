@@ -11,56 +11,68 @@ class PostgresTimeline < Sequel::Model
 
   plugin ResourceMethods, encrypted_columns: :secret_key
   plugin ProviderDispatcher, __FILE__
-  plugin SemaphoreMethods, :destroy
+  plugin SemaphoreMethods, :destroy, :take_backup_for_converge, :refresh_blob_storage_policy
 
   BACKUP_BUCKET_EXPIRATION_DAYS = 8
+  DOWNLOAD_CREDENTIALS_DURATION_SECONDS = 60 * 60 * 36
 
   def bucket_name
     ubid
   end
 
-  def generate_walg_config(version)
-    walg_credentials = if access_key
-      <<-WALG_CONF
-AWS_ACCESS_KEY_ID=#{access_key}
-AWS_SECRET_ACCESS_KEY=#{secret_key}
-      WALG_CONF
-    end
-    <<-WALG_CONF
-WALG_S3_PREFIX=s3://#{ubid}
-AWS_ENDPOINT=#{blob_storage_endpoint}
-#{walg_credentials}
-AWS_REGION=#{walg_config_region}
-AWS_S3_FORCE_PATH_STYLE=true
-PGHOST=/var/run/postgresql
-PGDATA=/dat/#{version}/data
-    WALG_CONF
+  def walg_config_env_contents(server)
+    return "" unless walg_optimized_config_enabled?
+    return "" unless (params = walg_config_params(server))
+
+    direct_io = walg_direct_io_enabled?
+    direct_io_drive_count = server.storage_device_paths.count if direct_io
+    WalgConfig.config_env_contents(**params, direct_io:, direct_io_drive_count:)
+  end
+
+  def walg_optimized_config_enabled?
+    !leader.nil? && !leader.resource.project.get_ff_postgres_walg_optimized_config_disabled
+  end
+
+  def walg_direct_io_enabled?
+    !leader.resource.project.get_ff_postgres_walg_direct_io_disabled
   end
 
   def need_backup?
     return false if blob_storage.nil?
     return false if leader.nil?
+    return true if take_backup_for_converge_set?
+    return false if latest_backup_started_at && latest_backup_started_at > Time.now - 60 * 60 * backup_period_hours
 
-    status = leader.vm.sshable.cmd("common/bin/daemonizer --check take_postgres_backup")
-    return true if ["Failed", "NotStarted"].include?(status)
-    return true if status == "Succeeded" && (latest_backup_started_at.nil? || latest_backup_started_at < Time.now - 60 * 60 * backup_period_hours)
+    leader.vm.sshable.d_check("take_postgres_backup") != "InProgress"
+  end
 
-    false
+  # wal-g segment names are `<timeline 8hex><log 8hex><seg 8hex>`; .history
+  # & other objects don't match
+  WAL_SEGMENT_RE = /\A[0-9A-F]{24}\z/
+
+  # To allow overriding in specs
+  def self.any_archived_wal?(timeline)
+    timeline.any_archived_wal?
+  end
+
+  # Whether any WAL segment has been archived. Gates unarchive E2E until
+  # post-backup writes land in the archive, not the live tail segment.
+  def any_archived_wal?
+    return false if blob_storage.nil?
+    list_objects("wal_005/").any? { WAL_SEGMENT_RE.match?(it.key.delete_prefix("wal_005/").split(".").first) }
   end
 
   def backups
-    return [] if blob_storage.nil?
+    return @backups if @backups
+    return @backups = [] if blob_storage.nil?
 
-    begin
-      list_objects("basebackups_005/", delimiter: "/")
-        .select { it.key.end_with?("backup_stop_sentinel.json") }
-    rescue => ex
-      recoverable_errors = ["The AWS Access Key Id you provided does not exist in our records.", "The specified bucket does not exist", "AccessDenied", "No route to host", "Connection refused"]
-      Clog.emit("Backup fetch exception", Util.exception_to_hash(ex))
-      return [] if recoverable_errors.any? { ex.message.include?(it) }
+    @backups = list_objects("basebackups_005/", delimiter: "/").select { it.key.end_with?("backup_stop_sentinel.json") }
+  rescue => ex
+    recoverable_errors = ["Access Key Id you provided does not exist in our records.", "The specified bucket does not exist", "AccessDenied", "No route to host", "Connection refused"]
+    Clog.emit("Backup fetch exception", Util.exception_to_hash(ex))
+    raise unless recoverable_errors.any? { ex.message.include?(it) }
 
-      raise
-    end
+    @backups = []
   end
 
   def latest_backup_label_before_target(target:)
@@ -114,6 +126,17 @@ PGDATA=/dat/#{version}/data
   def blob_storage_policy
     {Version: "2012-10-17", Statement: [{Effect: "Allow", Action: ["s3:*"], Resource: ["arn:aws:s3:::#{ubid}*"]}]}
   end
+
+  # Least-privilege, read-only policy handed to customers for downloading their own
+  # backups. Passed as an inline STS session policy when minting temporary credentials
+  # (see #create_download_credentials) rather than attached to a persistent IAM/canned
+  # policy object, since no standing credential is created for this feature.
+  def download_blob_storage_policy
+    {Version: "2012-10-17", Statement: [
+      {Effect: "Allow", Action: ["s3:ListBucket", "s3:GetBucketLocation"], Resource: ["arn:aws:s3:::#{ubid}"]},
+      {Effect: "Allow", Action: ["s3:GetObject", "s3:GetObjectVersion"], Resource: ["arn:aws:s3:::#{ubid}/basebackups_005/*", "arn:aws:s3:::#{ubid}/wal_005/*"]},
+    ]}
+  end
 end
 
 # Table: postgres_timeline
@@ -127,6 +150,7 @@ end
 #  location_id               | uuid                     |
 #  cached_earliest_backup_at | timestamp with time zone |
 #  backup_period_hours       | smallint                 | NOT NULL DEFAULT 24
+#  latest_backup_size_in_gib | bigint                   |
 # Indexes:
 #  postgres_timeline_pkey | PRIMARY KEY btree (id)
 # Foreign key constraints:

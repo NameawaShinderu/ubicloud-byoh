@@ -11,7 +11,6 @@ RSpec.describe Prog::InstallRhizome do
 
   describe "#start" do
     it "writes tar" do
-      expect(ir).to receive(:update_stack).with({"rhizome_digest" => instance_of(String)}).and_call_original
       expect(ir.sshable).to receive(:_cmd) do |*args, **kwargs|
         expect(args).to eq ["tar xf -"]
 
@@ -22,6 +21,7 @@ RSpec.describe Prog::InstallRhizome do
         expect(kwargs[:stdin][257..261]).to eq "ustar"
       end
       expect { ir.start }.to hop("install_gems")
+        .and change { ir.strand.stack[0]["rhizome_digest"] }.from(nil).to(instance_of(String))
     end
 
     it "handles non-ascii content in tar" do
@@ -31,19 +31,18 @@ RSpec.describe Prog::InstallRhizome do
       end
       expect { ir.start }.to hop("install_gems")
     end
-
-    it "writes tar including specs" do
-      sshable2 = Sshable.create
-      ir_spec = described_class.new(Strand.create_with_id(sshable2, prog: "InstallRhizome", label: "start", stack: [{"target_folder" => "host", "install_specs" => true}]))
-      expect(ir_spec.sshable).to receive(:_cmd)
-      expect { ir_spec.start }.to hop("install_gems")
-    end
   end
 
   describe "#install_gems" do
-    it "runs some commands and exits" do
+    it "runs some commands and hops" do
       expect(ir.sshable).to receive(:_cmd).with("bundle config set --local path vendor/bundle && bundle install")
-      expect { ir.install_gems }.to hop
+      expect { ir.install_gems }.to hop("validate")
+    end
+
+    it "hops without running commands if target folder is not host" do
+      refresh_frame(ir, new_values: {"target_folder" => "postgres"})
+      expect(ir.sshable).not_to receive(:_cmd)
+      expect { ir.install_gems }.to hop("validate")
     end
   end
 

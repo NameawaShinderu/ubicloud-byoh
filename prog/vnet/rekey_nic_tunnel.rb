@@ -50,7 +50,7 @@ class Prog::Vnet::RekeyNicTunnel < Prog::Base
     end.flatten
 
     vm_name = nic.src_ipsec_tunnels.first.vm_name(nic)
-    state_data = nic.vm.vm_host.sshable.cmd("sudo ip -n :vm_name xfrm state", vm_name:)
+    state_data = nic.vm.vm_host.sshable.cmd("sudo ip -n :vm_name xfrm state", vm_name:, log: :on_error)
 
     # Extract SPIs along with src and dst from state data
     states = state_data.scan(/^src (\S+) dst (\S+).*?proto esp spi (0x[0-9a-f]+)/m)
@@ -108,6 +108,8 @@ class Prog::Vnet::RekeyNicTunnel < Prog::Base
       key = @tunnel.src_nic.encryption_key
       begin
         cmd = "sudo -- xargs -I {} -- ip -n :namespace xfrm state add src :src dst :dst proto esp spi :spi reqid :reqid mode tunnel aead 'rfc4106(gcm(aes))' {} 128"
+
+        cmd = NetSsh.combine(cmd, "flag esn replay-window 4096") if @args["esn"]
 
         cmd = NetSsh.combine(cmd, "sel src 0.0.0.0/0 dst 0.0.0.0/0") if is_ipv4
 

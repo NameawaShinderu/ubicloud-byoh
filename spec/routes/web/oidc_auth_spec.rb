@@ -3,17 +3,20 @@
 require_relative "spec_helper"
 require "jwt"
 require "cgi/escape"
+require "openssl"
 
 # Rack middleware acting as a fake OIDC authorization server.
 # Intercepts GET /fake_oidc/authorize, captures the nonce for later use,
 # and redirects to the callback URL with configurable response modes.
 class FakeOidcApp
-  attr_accessor :last_nonce, :callback_mode
+  attr_accessor :last_nonce, :callback_mode, :last_code_challenge, :last_code_challenge_method
 
   def initialize(main_app)
     @main_app = main_app
     @last_nonce = nil
     @callback_mode = :success
+    @last_code_challenge = nil
+    @last_code_challenge_method = nil
   end
 
   def call(env)
@@ -26,6 +29,8 @@ class FakeOidcApp
 
   def authorize(req)
     @last_nonce = req.params["nonce"]
+    @last_code_challenge = req.params["code_challenge"]
+    @last_code_challenge_method = req.params["code_challenge_method"]
     state = CGI.escape(req.params["state"].to_s)
     redirect_uri = req.params["redirect_uri"]
     sep = redirect_uri.include?("?") ? "&" : "?"
@@ -55,7 +60,7 @@ RSpec.describe Clover, "OIDC auth" do
   let(:fake_oidc) { FakeOidcApp::APP }
 
   let(:oidc_provider) do
-    OidcProvider.create(
+    op = OidcProvider.create(
       display_name: "TestOIDC",
       client_id: "client_id_test",
       client_secret: "client_secret_test",
@@ -65,6 +70,8 @@ RSpec.describe Clover, "OIDC auth" do
       userinfo_endpoint: "/fake_oidc/userinfo",
       jwks_uri: "http://www.example.com/fake_oidc/jwks",
     )
+    op.add_allowed_domain("Example.com")
+    op
   end
 
   let(:token_url) { "http://www.example.com/fake_oidc/token" }
@@ -76,6 +83,8 @@ RSpec.describe Clover, "OIDC auth" do
     Capybara.app = fake_oidc
     fake_oidc.last_nonce = nil
     fake_oidc.callback_mode = :success
+    fake_oidc.last_code_challenge = nil
+    fake_oidc.last_code_challenge_method = nil
     allow(Config).to receive(:base_url).and_return("http://www.example.com")
   end
 
@@ -119,6 +128,24 @@ RSpec.describe Clover, "OIDC auth" do
     click_button "Login"
   end
 
+  it "fails login if domain is not allowed domain for OidcProvider" do
+    oidc_provider.remove_allowed_domain("example.com")
+    stub_token_endpoint
+    stub_userinfo_endpoint
+    initiate_oidc_login
+
+    expect(page.title).to eq("Ubicloud - Login")
+    expect(page).to have_flash_error("Login via TestOIDC is not allowed for the example.com domain.")
+    account = Account.first
+    expect(account.email).to eq("user@example.com")
+    # Creation of identity still allowed, just not login
+    expect(AccountIdentity.select_map([:account_id, :provider])).to eq([[account.id, oidc_provider.ubid]])
+
+    visit "/"
+    expect(page.title).to eq("Ubicloud - Login")
+    expect(page).to have_current_path "/login", ignore_query: true
+  end
+
   it "performs full OIDC login creating account (string aud, no email_verified, no groups)" do
     stub_token_endpoint
     stub_userinfo_endpoint
@@ -129,6 +156,36 @@ RSpec.describe Clover, "OIDC auth" do
     account = Account.first
     expect(account.email).to eq("user@example.com")
     expect(AccountIdentity.select_map([:account_id, :provider])).to eq([[account.id, oidc_provider.ubid]])
+  end
+
+  it "doesn't send a PKCE code_challenge when the provider doesn't advertise support" do
+    stub_token_endpoint
+    stub_userinfo_endpoint
+    initiate_oidc_login
+
+    expect(page.title).to eq("Ubicloud - Default Dashboard")
+    expect(fake_oidc.last_code_challenge).to be_nil
+  end
+
+  it "sends a PKCE code_challenge and a matching verifier when the provider supports it" do
+    oidc_provider.update(pkce_supported: true)
+    stub_token_endpoint
+    stub_userinfo_endpoint
+
+    sent_verifier = nil
+    initiate_oidc_login
+
+    expect(page.title).to eq("Ubicloud - Default Dashboard")
+    expect(fake_oidc.last_code_challenge).not_to be_nil
+    expect(fake_oidc.last_code_challenge_method).to eq "S256"
+    expect(
+      a_request(:post, token_url).with { |req|
+        sent_verifier = Rack::Utils.parse_nested_query(req.body)["code_verifier"]
+        true
+      },
+    ).to have_been_made
+    expect(sent_verifier).not_to be_nil
+    expect(Base64.urlsafe_encode64(OpenSSL::Digest::SHA256.digest(sent_verifier), padding: false)).to eq(fake_oidc.last_code_challenge)
   end
 
   it "handles array aud in id_token (aud.is_a?(String) false branch)" do
@@ -152,11 +209,19 @@ RSpec.describe Clover, "OIDC auth" do
     expect(page).to have_flash_error("There was an error logging in with the external provider")
   end
 
-  describe "with group_prefix configured" do
-    before { oidc_provider.update(group_prefix: "org-") }
+  it "ignores groups when group_prefix is set but groups_claim isn't" do
+    oidc_provider.update(group_prefix: "org-")
+    stub_token_endpoint(id_token: {groups: %w[eng].freeze})
+    initiate_oidc_login
+    expect(page.title).to eq("Ubicloud - Default Dashboard")
+    expect(a_request(:get, userinfo_url)).not_to have_been_made
+  end
+
+  describe "with group_prefix and groups_claim configured" do
+    before { oidc_provider.update(group_prefix: "org-", groups_claim: "groups") }
 
     it "extracts groups from id_token without calling userinfo endpoint" do
-      stub_token_endpoint(id_token: {groups: %w[eng ops]})
+      stub_token_endpoint(id_token: {groups: %w[eng ops].freeze})
       initiate_oidc_login
       expect(page.title).to eq("Ubicloud - Default Dashboard")
       visit "/oidc-groups"
@@ -165,7 +230,7 @@ RSpec.describe Clover, "OIDC auth" do
 
     it "issues userinfo call when groups not in id_token" do
       stub_token_endpoint  # generates id_token with sub+email but no groups
-      stub_userinfo_endpoint(body: {"sub" => "oidc_sub_123", "email" => "user@example.com", "groups" => %w[foo bar]})
+      stub_userinfo_endpoint(body: {"sub" => "oidc_sub_123", "email" => "user@example.com", "groups" => %w[foo bar].freeze})
       initiate_oidc_login
       expect(page.title).to eq("Ubicloud - Default Dashboard")
       visit "/oidc-groups"
@@ -174,11 +239,49 @@ RSpec.describe Clover, "OIDC auth" do
 
     it "handles userinfo call not including information that was in id token" do
       stub_token_endpoint(id_token: {email_verified: true})
-      stub_userinfo_endpoint(body: {"groups" => %w[foo bar]})
+      stub_userinfo_endpoint(body: {"groups" => %w[foo bar].freeze})
       initiate_oidc_login
       expect(page.title).to eq("Ubicloud - Default Dashboard")
       visit "/oidc-groups"
       expect(page.body).to eq "org-foo,org-bar"
+    end
+
+    it "accepts a single group sent as a string rather than an array" do
+      stub_token_endpoint(id_token: {groups: "eng"})
+      initiate_oidc_login
+      expect(page.title).to eq("Ubicloud - Default Dashboard")
+      visit "/oidc-groups"
+      expect(page.body).to eq "org-eng"
+    end
+
+    it "keeps groups from an id_token without email after fetching userinfo" do
+      stub_token_endpoint(id_token: {email: nil, groups: %w[eng].freeze})
+      stub_userinfo_endpoint
+      initiate_oidc_login
+      expect(page.title).to eq("Ubicloud - Default Dashboard")
+      visit "/oidc-groups"
+      expect(page.body).to eq "org-eng"
+    end
+
+    describe "with a custom groups_claim" do
+      before { oidc_provider.update(groups_claim: "myapp:groups") }
+
+      it "extracts groups from the configured id_token claim" do
+        stub_token_endpoint(id_token: {"myapp:groups": %w[eng].freeze, groups: %w[other].freeze})
+        initiate_oidc_login
+        expect(page.title).to eq("Ubicloud - Default Dashboard")
+        visit "/oidc-groups"
+        expect(page.body).to eq "org-eng"
+      end
+
+      it "extracts groups from the configured userinfo claim" do
+        stub_token_endpoint
+        stub_userinfo_endpoint(body: {"sub" => "oidc_sub_123", "email" => "user@example.com", "myapp:groups" => %w[foo].freeze})
+        initiate_oidc_login
+        expect(page.title).to eq("Ubicloud - Default Dashboard")
+        visit "/oidc-groups"
+        expect(page.body).to eq "org-foo"
+      end
     end
   end
 

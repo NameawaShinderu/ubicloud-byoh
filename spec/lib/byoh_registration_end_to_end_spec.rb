@@ -11,8 +11,8 @@ require_relative "../model/spec_helper"
 #     dispatcher pattern (no mocks of setup_ssh_keys itself).
 #
 #   • vm_host.hardware_reset integration — exercises the full chain from
-#     model/vm_host.rb → Hosting::Apis.hardware_reset_server → HostProvider#api
-#     → Hosting::GenericApis#reset → Hosting::RedfishClient#power_reset → wire.
+#     model/vm_host.rb → HostProvider#api (Hosting::ProviderApis.for)
+#     → Hosting::GenericApis#hardware_reset → Hosting::RedfishClient#power_reset → wire.
 #     Excon stubs stand in for a real BMC but the code path is 100% production.
 RSpec.describe ByohRegistration, "end_to_end" do
   let(:base_reg) {
@@ -75,7 +75,7 @@ RSpec.describe ByohRegistration, "end_to_end" do
     }
     let(:vm_host) { VmHost[strand.id] }
 
-    it "drives the full model → Hosting::Apis → GenericApis → RedfishClient chain on a live DB record" do
+    it "drives the full model → ProviderApis → GenericApis → RedfishClient chain on a live DB record" do
       # Stub the Redfish wire as if a real BMC were answering.
       Excon.stub({path: "/redfish/v1/Systems/1", method: :get},
         {status: 200, body: {
@@ -96,7 +96,7 @@ RSpec.describe ByohRegistration, "end_to_end" do
       )
 
       # This is the exact call production makes from prog/vm/host_nexus.rb
-      # hardware_reset label → vm_host.hardware_reset → Hosting::Apis.hardware_reset_server.
+      # hardware_reset label → vm_host.hardware_reset → provider.api.hardware_reset.
       expect { vm_host.hardware_reset }.not_to raise_error
       expect(captured_body).to eq("ResetType" => "ForceRestart")
     end

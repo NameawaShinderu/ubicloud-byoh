@@ -1,19 +1,30 @@
 id: kcnzrctjjg4j4g6eqvdsvzthwp
 name: test-kc
 location: eu-central-h1
-display-state: creating
+display-state: running
 cp-node-count: 1
 node-size: standard-2
-version: v1.34
+version: v1.36
 nodepool 1:
   id: kn4gs7gjswkt4j06xy8w80s1ys
   name: test-kc-np
-  node-count: 1
+  node-count: 2
   node-size: standard-2
+  version: v1.35
   vm 1:
     ip6: bbab:de77:9a94:fa69::2
     ip4-enabled: true
     ip4: 130.0.0.3
+  vm 2:
+    ip6: abab:de77:9a94:fa69::2
+    ip4-enabled: true
+    ip4: 131.0.0.4
+nodepool 2:
+  id: kn1a9yb27r3p7qgx4rpmprccws
+  name: test-kc-np2
+  node-count: 1
+  node-size: standard-2
+  version: v1.36
 cp-vms 1:
   ip6: ccab:de77:9a94:fa69::2
   ip4-enabled: true

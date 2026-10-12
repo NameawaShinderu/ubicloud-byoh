@@ -6,11 +6,11 @@ RSpec.describe VmStats do
   let(:vm_stats) { described_class.new("vmh6b1sz") }
 
   before do
-    allow(vm_stats).to receive(:r).with("getconf", "CLK_TCK").and_return("100\n")
+    allow(vm_stats).to receive(:_run_command).with("getconf", "CLK_TCK").and_return("100\n")
   end
 
   def stub_unit_property(unit, property, value)
-    allow(vm_stats).to receive(:r)
+    allow(vm_stats).to receive(:_run_command)
       .with("systemctl", "show", unit, "--property", property)
       .and_return("#{property}=#{value}\n")
   end
@@ -23,7 +23,7 @@ RSpec.describe VmStats do
       stub_unit_property("vmh6b1sz-0-storage", "MemoryPeak", "51892224")
       stub_unit_property("vmh6b1sz-0-storage", "MemorySwapPeak", "123879")
       stub_unit_property("vmh6b1sz-0-storage", "ActiveEnterTimestampMonotonic", "31534196")
-      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC).and_return(1616.0)
+      expect(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC).and_return(1616.0).at_least(:once)
       expect(File).to receive(:read).with("/proc/3373/stat").and_return("3373 (cloud-hyperviso) S 1 3373 3373 0 -1 4194560 1163 0 0 0 95143 16431 0 0 20 0 13 0 3364 8618754048 960 18446744073709551615 135770696667136 135770699811150 140729095742720 0 0 0 134234114 69632 1073759298 0 0 0 17 7 0 0 0 89566 0 135770700348320 135770700898816 93826017284096 140729095744653 140729095745099 140729095745099 140729095745483 0")
       expect(File).to receive(:read).with("/proc/3350/stat").and_return("3350 (vhost-backend) S 1 3350 3350 0 -1 4194560 15183 45 31 0 16602 733 0 0 20 0 7 0 3351 17248038912 10371 18446744073709551615 140535920156672 140535933113610 140725366025408 0 0 0 0 4096 1088 0 0 0 17 7 0 0 0 0 0 140535936046520 140535939797664 93825003057152 140725366033855 140725366033953 140725366033953 140725366034378 0")
       expect(File).to receive(:foreach).with("/proc/3350/io")
@@ -58,6 +58,13 @@ RSpec.describe VmStats do
         },
       ))
 
+      expect(vm_stats).to receive(:query_ubiblk_rpc).with("/var/storage/vmh6b1sz/0/rpc.sock", {command: "stats"}).and_return(
+        {"stats" => {"queues" => [
+          {"bytes_read" => 8_192_000, "bytes_written" => 3_276_800, "read_ops" => 1500, "write_ops" => 500, "flush_ops" => 10},
+          {"bytes_read" => 3_072_000, "bytes_written" => 819_200, "read_ops" => 500, "write_ops" => 100, "flush_ops" => 5},
+        ]}},
+      )
+
       expect(vm_stats.collect).to eq(
         {
           "vm" => {
@@ -88,9 +95,24 @@ RSpec.describe VmStats do
               "read_bytes" => 1185382400,
               "write_bytes" => 5457008640,
             },
+            "ubiblk_stats" => {
+              "bytes_read" => 11_264_000,
+              "bytes_written" => 4_096_000,
+              "read_ops" => 2000,
+              "write_ops" => 600,
+              "flush_ops" => 15,
+            },
           },
         },
       )
+    end
+  end
+
+  describe "#unit_active_age_ms" do
+    it "returns nil when ActiveEnterTimestampMonotonic is zero" do
+      stub_unit_property("my-unit", "ActiveEnterTimestampMonotonic", "0")
+      expect(Process).not_to receive(:clock_gettime)
+      expect(vm_stats.send(:unit_active_age_ms, "my-unit")).to be_nil
     end
   end
 
@@ -101,7 +123,7 @@ RSpec.describe VmStats do
     end
 
     it "raises an error if the property is not found" do
-      expect(vm_stats).to receive(:r).with("systemctl", "show", "my-unit", "--property", "MainPID").and_return("\n")
+      expect(vm_stats).to receive(:_run_command).with("systemctl", "show", "my-unit", "--property", "MainPID").and_return("\n")
       expect { vm_stats.unit_property("my-unit", "MainPID") }.to raise_error(RuntimeError, "unexpected output from systemctl show: \"\"")
     end
   end
@@ -122,7 +144,7 @@ RSpec.describe VmStats do
 
   describe "#clk_tick" do
     it "returns the number of clock ticks per second" do
-      expect(vm_stats).to receive(:r).with("getconf", "CLK_TCK").and_return("234\n")
+      expect(vm_stats).to receive(:_run_command).with("getconf", "CLK_TCK").and_return("234\n")
       expect(vm_stats.clk_tick).to eq(234)
     end
   end
@@ -142,6 +164,57 @@ RSpec.describe VmStats do
         {"disk_index" => 0, "vhost_block_backend_version" => "v0.1", "queue_size" => 64, "num_queues" => 4, "size_gib" => 20},
         {"disk_index" => 2, "vhost_block_backend_version" => "v0.1", "queue_size" => 128, "num_queues" => 2, "size_gib" => 40},
       ])
+    end
+  end
+
+  describe "#ubiblk_stats" do
+    it "returns an empty hash for backends before v0.4.0" do
+      disk = {"disk_index" => 0, "vhost_block_backend_version" => "v0.2.2"}
+      expect(vm_stats).not_to receive(:query_ubiblk_rpc)
+      expect(vm_stats.ubiblk_stats(disk)).to eq({})
+    end
+
+    it "sums stats across queues" do
+      disk = {"disk_index" => 0, "storage_device" => "nvme1", "vhost_block_backend_version" => "v0.4.2"}
+      expect(vm_stats).to receive(:query_ubiblk_rpc).with("/var/storage/devices/nvme1/vmh6b1sz/0/rpc.sock", {command: "stats"}).and_return(
+        {"stats" => {"queues" => [
+          {"bytes_read" => 8_192_000, "bytes_written" => 3_276_800, "read_ops" => 1500, "write_ops" => 500, "flush_ops" => 10},
+          {"bytes_read" => 3_072_000, "bytes_written" => 819_200, "read_ops" => 500, "write_ops" => 100, "flush_ops" => 5},
+        ]}},
+      )
+      expect(vm_stats.ubiblk_stats(disk)).to eq(
+        {"ubiblk_stats" => {"bytes_read" => 11_264_000, "bytes_written" => 4_096_000, "read_ops" => 2000, "write_ops" => 600, "flush_ops" => 15}},
+      )
+    end
+
+    it "falls back to the DEFAULT storage device when none is set" do
+      disk = {"disk_index" => 2, "vhost_block_backend_version" => "v0.4.2"}
+      expect(vm_stats).to receive(:query_ubiblk_rpc).with("/var/storage/vmh6b1sz/2/rpc.sock", {command: "stats"}).and_return(
+        {"stats" => {"queues" => [{"bytes_read" => 6_144_000, "bytes_written" => 2_048_000, "read_ops" => 1000, "write_ops" => 500, "flush_ops" => 3}]}},
+      )
+      expect(vm_stats.ubiblk_stats(disk)).to eq(
+        {"ubiblk_stats" => {"bytes_read" => 6_144_000, "bytes_written" => 2_048_000, "read_ops" => 1000, "write_ops" => 500, "flush_ops" => 3}},
+      )
+    end
+
+    it "records an error instead of failing when the backend RPC fails" do
+      disk = {"disk_index" => 0, "storage_device" => "nvme1", "vhost_block_backend_version" => "v0.4.2"}
+      expect(vm_stats).to receive(:query_ubiblk_rpc).and_raise(Errno::ECONNREFUSED)
+      expect(vm_stats.ubiblk_stats(disk)).to match({"ubiblk_stats_error" => a_string_starting_with("Errno::ECONNREFUSED")})
+    end
+  end
+
+  describe "#query_ubiblk_rpc" do
+    it "writes a line-delimited JSON request and parses the response line" do
+      client, server = UNIXSocket.pair
+      server.puts('{"stats":{"queues":[]}}')
+      expect(UNIXSocket).to receive(:open).with("/var/storage/vmh6b1sz/0/rpc.sock") { |_path, &blk| blk.call(client) }
+
+      expect(vm_stats.query_ubiblk_rpc("/var/storage/vmh6b1sz/0/rpc.sock", {command: "stats"})).to eq({"stats" => {"queues" => []}})
+      expect(server.readline).to eq("{\"command\":\"stats\"}\n")
+    ensure
+      client.close
+      server.close
     end
   end
 end

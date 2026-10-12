@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/util"
-
 class Prog::Github::DestroyGithubInstallation < Prog::Base
   subject_is :github_installation
 
@@ -42,6 +40,13 @@ class Prog::Github::DestroyGithubInstallation < Prog::Base
   label def wait_resource_destroy
     nap 10 unless github_installation.runners_dataset.empty?
     nap 10 unless github_installation.repositories_dataset.empty?
+
+    github_installation.destroy_private_subnets
+    hop_wait_private_subnets_destroy
+  end
+
+  label def wait_private_subnets_destroy
+    nap 10 unless github_installation.private_subnets_dataset.empty?
 
     github_installation.destroy
     Clog.emit("GithubInstallation is deleted.", github_installation)

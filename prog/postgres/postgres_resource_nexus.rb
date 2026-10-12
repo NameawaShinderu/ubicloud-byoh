@@ -7,14 +7,20 @@ require_relative "../../lib/util"
 class Prog::Postgres::PostgresResourceNexus < Prog::Base
   subject_is :postgres_resource
 
+  frame_reader :initial_cert_id
+  frame_accessor :refresh_cert_id, :current_cert_id
+
   extend Forwardable
 
-  def_delegators :postgres_resource, :servers, :representative_server
+  def_delegators :postgres_resource, :representative_server
 
   def self.assemble(project_id:, location_id:, name:, target_vm_size:, target_storage_size_gib:,
-    target_version: PostgresResource::DEFAULT_VERSION, flavor: PostgresResource::Flavor::STANDARD,
+    target_version: nil, flavor: PostgresResource::Flavor::STANDARD,
     ha_type: PostgresResource::HaType::NONE, parent_id: nil, tags: [], restore_target: nil, with_firewall_rules: true,
-    user_config: {}, pgbouncer_user_config: {}, private_subnet_name: nil, init_script: nil)
+    user_config: {}, pgbouncer_user_config: {}, private_subnet_name: nil, init_script: nil,
+    hostname_version: Config.postgres_hostname_version_default, restore_from_timeline_id: nil,
+    target_image_family: Config.postgres_default_image_family,
+    preferred_availability_zone_id: nil, required_availability_zone_id: nil)
 
     unless (project = Project[project_id])
       fail "No existing project"
@@ -24,36 +30,108 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
       fail "No existing location"
     end
 
+    if restore_from_timeline_id && parent_id
+      fail "Cannot specify both parent_id and restore_from_timeline_id"
+    end
+
+    if (preferred_availability_zone_id || required_availability_zone_id) && !location.aws?
+      fail "Availability zone requests are only supported for AWS locations"
+    end
+
+    target_version ||= PostgresResource.default_version if parent_id.nil?
+
+    if restore_from_timeline_id
+      unless (timeline = PostgresTimeline[restore_from_timeline_id])
+        fail "No existing timeline"
+      end
+
+      restore_target &&= validate_restore_target(restore_target, timeline)
+
+      # Invariant: target_image_family must be the family that produced this
+      # backup, because its index bytes assume that OS. The only caller that
+      # sets restore_from_timeline_id (unarchive) passes the archived
+      # representative's family.
+      superuser_password = SecureRandom.urlsafe_base64(15)
+      timeline_id = timeline.id
+      timeline_access = "fetch"
+    elsif parent_id.nil?
+      superuser_password = SecureRandom.urlsafe_base64(15)
+      timeline_id = Prog::Postgres::PostgresTimelineNexus.assemble(location_id: location.id).id
+      timeline_access = "push"
+    else
+      unless (parent = PostgresResource[parent_id])
+        fail "No existing parent"
+      end
+
+      restore_target &&= validate_restore_target(restore_target, parent.timeline)
+    end
+
     DB.transaction do
-      superuser_password, timeline_id, timeline_access, target_version = if parent_id.nil?
-        [SecureRandom.urlsafe_base64(15), Prog::Postgres::PostgresTimelineNexus.assemble(location_id: location.id).id, "push", target_version]
-      else
-        unless (parent = PostgresResource[parent_id])
-          fail "No existing parent"
-        end
+      if parent
+        # Serializes the password copy against a concurrent reset
+        parent.lock!
 
         if target_version && target_version != parent.version
           fail Validation::ValidationFailed.new({version: "Version must be the same as the parent"})
         end
 
-        if restore_target
-          restore_target = Validation.validate_date(restore_target, "restore_target")
-          earliest_restore_time = parent.timeline.earliest_restore_time
-          latest_restore_time = parent.timeline.latest_restore_time
-
-          unless earliest_restore_time && earliest_restore_time <= restore_target &&
-              latest_restore_time && restore_target <= latest_restore_time
-            fail Validation::ValidationFailed.new({restore_target: "Restore target must be between #{earliest_restore_time} and #{latest_restore_time}"})
-          end
-        end
-        [parent.superuser_password, parent.timeline.id, "fetch", parent.version]
+        superuser_password = parent.superuser_password
+        timeline_id = parent.timeline.id
+        timeline_access = "fetch"
+        target_version = parent.version
+        target_image_family = parent.representative_server.image_family
       end
 
-      postgres_resource = PostgresResource.create(
-        project_id:, location_id: location.id, name:,
-        target_vm_size:, target_storage_size_gib:,
-        superuser_password:, ha_type:, target_version:, flavor:, parent_id:, tags:, restore_target:, hostname_version: "v2", user_config:, pgbouncer_user_config:,
-      )
+      # Copy of conditions from PostgresResource#uses_publicly_signed_certificates?
+      use_publicly_signed_certificates = hostname_version == "v3" &&
+        Config.acme_email &&
+        location.dns_suffix.to_s.empty? &&
+        !project.get_ff_postgres_hostname_override &&
+        DnsZone[project_id: Config.postgres_service_project_id, name: Config.postgres_service_hostname_v3]
+
+      if use_publicly_signed_certificates
+        strand_frame = {"use_publicly_signed_certificates" => true}
+        strand_args = {stack: [strand_frame]}
+
+        postgres_resource_id, cert_id = DB[:presigned_postgres_cert]
+          .where(postgres_resource_id: DB[:presigned_postgres_cert]
+            .order(:created_at)
+            .limit(1)
+            .for_update
+            .skip_locked
+            .select(:postgres_resource_id))
+          .returning(:postgres_resource_id, :cert_id)
+          .delete
+          .first&.values_at(:postgres_resource_id, :cert_id)
+
+        Prog::Vnet::MaintainPresignedPostgresCerts.schedule_strand if postgres_resource_id
+
+        if cert_id
+          cert = Cert.with_pk!(cert_id)
+          server_cert = cert.cert
+          server_cert_key = OpenSSL::PKey::EC.new(cert.csr_key).to_pem
+          strand_frame["current_cert_id"] = cert_id
+        else
+          need_initial_cert_id = true
+        end
+      end
+      postgres_resource_id ||= PostgresResource.generate_uuid
+
+      postgres_resource = PostgresResource.create_with_id(postgres_resource_id,
+        project_id:, location_id: location.id, name:, target_vm_size:,
+        target_storage_size_gib:, server_cert:, server_cert_key:, superuser_password:,
+        ha_type:, target_version:, flavor:, parent_id:, tags:, restore_target:,
+        hostname_version:, user_config:, pgbouncer_user_config:, target_image_family:,
+        preferred_availability_zone_id:, required_availability_zone_id:)
+
+      if need_initial_cert_id
+        strand_frame["current_cert_id"] = strand_frame["initial_cert_id"] = Prog::Vnet::CertNexus.assemble(
+          postgres_resource.cert_hostname,
+          postgres_resource.dns_zone.id,
+          private_hostname: postgres_resource.cert_private_hostname,
+          waiting_strand_id: postgres_resource_id,
+        ).id
+      end
 
       PostgresInitScript.create_with_id(postgres_resource, init_script:) if init_script && !init_script.empty?
 
@@ -66,14 +144,7 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
 
       # Internal firewall, will be directly attached to postgres server VMs
       internal_firewall = Firewall.create(name: "#{postgres_resource.ubid}-internal-firewall", location_id: location.id, description: "Postgres default firewall", project_id: Config.postgres_service_project_id)
-      internal_firewall.replace_firewall_rules(
-        Config.control_plane_outbound_cidrs.map { {cidr: it, port_range: Sequel.pg_range(22..22)} } + [
-          {cidr: private_subnet.net4.to_s, port_range: Sequel.pg_range(5432..5432)},
-          {cidr: private_subnet.net4.to_s, port_range: Sequel.pg_range(6432..6432)},
-          {cidr: private_subnet.net6.to_s, port_range: Sequel.pg_range(5432..5432)},
-          {cidr: private_subnet.net6.to_s, port_range: Sequel.pg_range(6432..6432)},
-        ],
-      )
+      internal_firewall.replace_firewall_rules(postgres_resource.internal_firewall_rules)
 
       if with_firewall_rules
         firewall.replace_firewall_rules([
@@ -84,13 +155,91 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
         ])
       end
 
-      Prog::Postgres::PostgresServerNexus.assemble(resource_id: postgres_resource.id, timeline_id:, timeline_access:, is_representative: true)
+      Prog::Postgres::PostgresServerNexus.assemble(resource_id: postgres_resource.id, timeline_id:, timeline_access:, is_representative: true,
+        availability_zone: postgres_resource.requested_availability_zone_suffix, availability_zone_required: postgres_resource.availability_zone_required?)
 
-      strand = Strand.create_with_id(postgres_resource, prog: "Postgres::PostgresResourceNexus", label: "start")
+      strand = Strand.create_with_id(postgres_resource, prog: "Postgres::PostgresResourceNexus", label: "start", **strand_args)
 
       if project.get_ff_postgres_aws_use_different_azs_for_standbys && location.aws?
         postgres_resource.incr_use_different_az
       end
+
+      strand
+    end
+  end
+
+  def self.validate_restore_target(restore_target, timeline)
+    restore_target = Validation.validate_date(restore_target, "restore_target")
+    earliest = timeline.earliest_restore_time
+    latest = timeline.latest_restore_time
+    unless earliest && earliest <= restore_target && latest && restore_target <= latest
+      fail Validation::ValidationFailed.new({restore_target: "Restore target must be between #{earliest} and #{latest}"})
+    end
+    restore_target
+  end
+
+  def self.unarchive(postgres_resource_id)
+    if postgres_resource_id.is_a?(String) && postgres_resource_id.bytesize == 26
+      postgres_resource_id = UBID.to_uuid(postgres_resource_id) || fail("Invalid UBID: #{postgres_resource_id}")
+    end
+
+    days = PostgresTimeline::BACKUP_BUCKET_EXPIRATION_DAYS
+    archived_postgres_resource = DeletedRecord.find_by_id(postgres_resource_id, model_name: "PostgresResource", days:)
+    fail "No archived PostgresResource for id #{postgres_resource_id}" unless archived_postgres_resource
+
+    last_n_days = Sequel::CURRENT_TIMESTAMP - Sequel.cast("#{days} days", :interval)
+    model_values = Sequel.pg_jsonb_op(:model_values)
+    representative_server = {
+      Sequel[:model_name] => "PostgresServer",
+      model_values.get_text("resource_id") => postgres_resource_id,
+      model_values.get_text("is_representative") => "true",
+    }
+    archived_representative_server = DB[:deleted_record].where(representative_server).where { deleted_at > last_n_days }.first
+    fail "No archived representative PostgresServer for id #{postgres_resource_id}" unless archived_representative_server
+
+    timeline_id = archived_representative_server[:model_values]["timeline_id"]
+    timeline = PostgresTimeline[timeline_id]
+    fail "Original timeline #{timeline_id} no longer exists" unless timeline
+    fail "Original timeline #{timeline_id} has no restorable backup" unless PostgresTimeline.earliest_restore_time(timeline)
+
+    v = archived_postgres_resource[:model_values]
+    DB.transaction do
+      strand = assemble(
+        project_id: v["project_id"],
+        location_id: v["location_id"],
+        name: v["name"],
+        target_vm_size: v["target_vm_size"],
+        target_storage_size_gib: v["target_storage_size_gib"],
+        target_version: v["target_version"],
+        flavor: v["flavor"],
+        ha_type: v["ha_type"],
+        tags: v["tags"] || [],
+        user_config: v["user_config"] || {},
+        pgbouncer_user_config: v["pgbouncer_user_config"] || {},
+        hostname_version: v["hostname_version"],
+        restore_from_timeline_id: timeline_id,
+        target_image_family: archived_representative_server[:model_values]["image_family"] || "ubuntu-2204",
+      )
+
+      postgres_resource = strand.subject
+      # assemble omits these customer-config columns; restore from archive.
+      # Encrypted columns & metric/log destination secrets aren't archived,
+      # and firewall rules are deliberately left at assemble's defaults.
+      postgres_resource.update(
+        maintenance_window_start_at: v["maintenance_window_start_at"],
+        cert_auth_users: v["cert_auth_users"] || [],
+        trusted_ca_certs: v["trusted_ca_certs"],
+      )
+
+      representative_server = postgres_resource.representative_server
+      # Marks the unarchive flow so configure_hash skips recovery_target_time
+      # & initialize_database_from_backup uses LATEST. Recovery terminates
+      # when WAL is exhausted then promotes; no live primary to follow.
+      representative_server.incr_unarchive
+      # WAL replay restores role with old password, but assemble generated a
+      # fresh one. initial_provisioning clears before configure revisits after
+      # promotion, so push new password via semaphore which wait consumes
+      representative_server.incr_update_superuser_password
 
       strand
     end
@@ -113,7 +262,13 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
   end
 
   label def start
-    nap 5 unless representative_server.vm.strand.label == "wait"
+    Prog::Postgres::SetupLogAggregation.assemble(postgres_resource.id)
+
+    hop_wait_representative_server
+  end
+
+  label def wait_representative_server
+    nap 60 unless representative_server.vm.provisioned_at
 
     postgres_resource.incr_initial_provisioning
     if postgres_resource.parent
@@ -140,12 +295,11 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
         dns_zone.insert_record(record_name:, type: "CNAME", ttl: 10, data: vm.aws_instance.ipv4_dns_name + ".")
       else
         dns_zone.insert_record(record_name:, type: "A", ttl: 10, data: vm.ip4_string)
-        if postgres_resource.created_at >= PostgresResource::AAAA_CUTOFF ||
-            !dns_zone.records_dataset.where(type: "AAAA", name: record_name + ".").empty?
+        unless dns_zone.records_dataset.where(type: "AAAA", name: record_name + ".").empty?
           dns_zone.insert_record(record_name:, type: "AAAA", ttl: 10, data: vm.ip6_string)
         end
 
-        record_name = "private.#{record_name}"
+        record_name = postgres_resource.private_hostname
         dns_zone.delete_record(record_name:)
         dns_zone.insert_record(record_name:, type: "A", ttl: 10, data: vm.private_ipv4_string)
         dns_zone.insert_record(record_name:, type: "AAAA", ttl: 10, data: vm.private_ipv6_string)
@@ -164,16 +318,25 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
     # without excessive branching, we create the very first root certificate
     # with only 5 year validity. So it would look like it is created 5 years
     # ago.
-    postgres_resource.root_cert_1, postgres_resource.root_cert_key_1 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Root Certificate Authority", duration: 60 * 60 * 24 * 365 * 5)
-    postgres_resource.root_cert_2, postgres_resource.root_cert_key_2 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Root Certificate Authority", duration: 60 * 60 * 24 * 365 * 10)
-    postgres_resource.server_cert, postgres_resource.server_cert_key = create_certificate
 
-    postgres_resource.client_root_cert_1, postgres_resource.client_root_cert_key_1 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Client Certificate Authority", duration: 60 * 60 * 24 * 365 * 5)
-    postgres_resource.client_root_cert_2, postgres_resource.client_root_cert_key_2 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Client Certificate Authority", duration: 60 * 60 * 24 * 365 * 10)
-    postgres_resource.client_cert, postgres_resource.client_cert_key = create_client_certificate
+    if use_publicly_signed_certificates?
+      # Do not generate root certs if we are using publicly signed certificates.
+      # We started a CertNexus strand in assemble, nap until the cert is ready.
+      wait_for_public_cert("initial_cert_id") if initial_cert_id
+    elsif !postgres_resource.root_cert_1
+      # Do not regenerate certificates already present, in case we napped due to a reap.
+      postgres_resource.root_cert_1, postgres_resource.root_cert_key_1 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Root Certificate Authority", duration: 60 * 60 * 24 * 365 * 5)
+      postgres_resource.root_cert_2, postgres_resource.root_cert_key_2 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Root Certificate Authority", duration: 60 * 60 * 24 * 365 * 10)
+      postgres_resource.server_cert, postgres_resource.server_cert_key = create_certificate
+    end
+
+    unless postgres_resource.client_root_cert_1
+      postgres_resource.client_root_cert_1, postgres_resource.client_root_cert_key_1 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Client Certificate Authority", duration: 60 * 60 * 24 * 365 * 5)
+      postgres_resource.client_root_cert_2, postgres_resource.client_root_cert_key_2 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Client Certificate Authority", duration: 60 * 60 * 24 * 365 * 10)
+      postgres_resource.client_cert, postgres_resource.client_cert_key = create_client_certificate
+    end
 
     postgres_resource.save_changes
-
     reap(:wait_servers, nap: 5)
   end
 
@@ -185,40 +348,61 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
     # 10 year - (9 year + 6 months) - (1 month padding) = 5 months. So we will
     # rotate the root_cert_1 with root_cert_2 if the remaining time is less
     # than 5 months.
-    if OpenSSL::X509::Certificate.new(postgres_resource.root_cert_1).not_after < Time.now + 60 * 60 * 24 * 30 * 5
+
+    if !use_publicly_signed_certificates? && OpenSSL::X509::Certificate.new(postgres_resource.root_cert_1).not_after < Time.now + 60 * 60 * 24 * 30 * 5
       postgres_resource.root_cert_1, postgres_resource.root_cert_key_1 = postgres_resource.root_cert_2, postgres_resource.root_cert_key_2
       postgres_resource.root_cert_2, postgres_resource.root_cert_key_2 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Root Certificate Authority", duration: 60 * 60 * 24 * 365 * 10)
-      servers.each(&:incr_refresh_certificates)
+      PostgresServer.incr_refresh_certificates(server_ids_dataset)
     end
 
     if OpenSSL::X509::Certificate.new(postgres_resource.client_root_cert_1).not_after < Time.now + 60 * 60 * 24 * 30 * 5
       postgres_resource.client_root_cert_1, postgres_resource.client_root_cert_key_1 = postgres_resource.client_root_cert_2, postgres_resource.client_root_cert_key_2
       postgres_resource.client_root_cert_2, postgres_resource.client_root_cert_key_2 = Util.create_root_certificate(common_name: "#{postgres_resource.ubid} Client Certificate Authority", duration: 60 * 60 * 24 * 365 * 10)
-      servers.each(&:incr_refresh_certificates)
+      PostgresServer.incr_refresh_certificates(server_ids_dataset)
     end
 
     refresh = false
-    if OpenSSL::X509::Certificate.new(postgres_resource.server_cert).not_after < Time.now + 60 * 60 * 24 * 30
+    if OpenSSL::X509::Certificate.new(postgres_resource.send(use_publicly_signed_certificates? ? :client_cert : :server_cert)).not_after < Time.now + 60 * 60 * 24 * 30
       refresh = true
     end
     when_refresh_certificates_set? do
       refresh = true
     end
     if refresh
-      postgres_resource.server_cert, postgres_resource.server_cert_key = create_certificate
+      unless use_publicly_signed_certificates?
+        postgres_resource.server_cert, postgres_resource.server_cert_key = create_certificate
+      end
       postgres_resource.client_cert, postgres_resource.client_cert_key = create_client_certificate
-      servers.each(&:incr_refresh_certificates)
+      PostgresServer.incr_refresh_certificates(server_ids_dataset)
     end
 
     postgres_resource.certificate_last_checked_at = Time.now
     postgres_resource.save_changes
-    decr_refresh_certificates
 
+    if use_publicly_signed_certificates? && OpenSSL::X509::Certificate.new(postgres_resource.server_cert).not_after < Time.now + 60 * 60 * 24 * 13
+      self.current_cert_id = self.refresh_cert_id = Prog::Vnet::CertNexus.assemble(
+        postgres_resource.cert_hostname,
+        postgres_resource.dns_zone.id,
+        private_hostname: postgres_resource.cert_private_hostname,
+        waiting_strand_id: postgres_resource.id,
+      ).id
+      hop_wait_refresh_public_cert
+    end
+
+    decr_refresh_certificates
+    hop_wait
+  end
+
+  label def wait_refresh_public_cert
+    wait_for_public_cert("refresh_cert_id")
+    postgres_resource.save_changes
+    PostgresServer.incr_refresh_certificates(server_ids_dataset)
+    decr_refresh_certificates
     hop_wait
   end
 
   label def wait_servers
-    nap 5 if servers.any? { it.strand.label != "wait" }
+    nap 5 unless Strand.where(id: server_ids_dataset).exclude(label: "wait").empty?
     hop_update_billing_records
   end
 
@@ -230,26 +414,26 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
       current_vm_size = Option::POSTGRES_SIZE_OPTIONS[postgres_resource.vm_size]
       vm_family = current_vm_size.family
       vcpu_count = current_vm_size.vcpu_count
-      storage_size_gib = representative_server.storage_size_gib
+      storage_size_gib = representative_server.billed_storage_size_gib
       location = postgres_resource.location
 
       new_billing_records = postgres_resource.target_server_count.times.flat_map do |index|
-        resource_type = index.zero? ? "" : "Standby"
+        resource_type, slot_prefix, slot_suffix = index.zero? ? ["", "primary", ""] : ["Standby", "standby", "-#{index - 1}"]
         [
-          {billing_rate_id: BillingRate.from_resource_properties("Postgres#{resource_type}VCpu", "#{flavor}-#{vm_family}", location.name, location.byoc)["id"], amount: vcpu_count},
-          {billing_rate_id: BillingRate.from_resource_properties("Postgres#{resource_type}Storage", flavor, location.name, location.byoc)["id"], amount: storage_size_gib},
+          {billing_rate_id: BillingRate.from_resource_properties("Postgres#{resource_type}VCpu", "#{flavor}-#{vm_family}", location.name, location.byoc)["id"], amount: vcpu_count, slot: "#{slot_prefix}-vcpu#{slot_suffix}"},
+          {billing_rate_id: BillingRate.from_resource_properties("Postgres#{resource_type}Storage", flavor, location.name, location.byoc)["id"], amount: storage_size_gib, slot: "#{slot_prefix}-storage#{slot_suffix}"},
         ]
       end
 
       existing_billing_records = postgres_resource.active_billing_records.map do |br|
-        {billing_rate_id: br.billing_rate_id, amount: br.amount}
+        {billing_rate_id: br.billing_rate_id, amount: br.amount, slot: br.resource_tags["slot"]}
       end
 
       if new_billing_records.sort_by { it.values } != existing_billing_records.sort_by { it.values }
         postgres_resource.active_billing_records.each(&:finalize)
 
         new_billing_records.each do |br|
-          create_billing_record(billing_rate_id: br[:billing_rate_id], amount: br[:amount])
+          create_billing_record(billing_rate_id: br[:billing_rate_id], amount: br[:amount], slot: br[:slot])
         end
       end
     end
@@ -258,13 +442,14 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
     hop_wait
   end
 
-  def create_billing_record(billing_rate_id:, amount:)
+  def create_billing_record(billing_rate_id:, amount:, slot:)
     BillingRecord.create(
       project_id: postgres_resource.project_id,
       resource_id: postgres_resource.id,
       resource_name: postgres_resource.name,
       billing_rate_id:,
       amount:,
+      resource_tags: {"slot" => slot},
     )
   end
 
@@ -289,18 +474,15 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
     end
 
     refresh = false
-    if postgres_resource.certificate_last_checked_at < Time.now - 60 * 60 * 24 * 30 # ~1 month
+    if postgres_resource.certificate_last_checked_at < Time.now - 60 * 60 * 24 * (use_publicly_signed_certificates? ? 7 : 30)
       refresh = true
     end
     when_refresh_certificates_set? do
       refresh = true
     end
     if refresh
+      register_deadline("wait", 10 * 60)
       hop_refresh_certificates
-    end
-
-    when_update_firewall_rules_set? do
-      decr_update_firewall_rules
     end
 
     nap 30
@@ -311,7 +493,7 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
 
     decr_destroy
 
-    Semaphore.incr(strand.children_dataset.select(:id), "destroy")
+    PostgresResource.incr_destroy(strand.children_dataset.select(:id))
     hop_wait_children_destroyed
   end
 
@@ -319,14 +501,20 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
     reap(nap: 5) do
       postgres_resource.private_subnet.incr_destroy_if_only_used_internally(
         ubid: postgres_resource.ubid,
-        vm_ids: servers.map(&:vm_id),
+        vm_ids: postgres_resource.servers_dataset.select(:vm_id),
       )
 
       postgres_resource.internal_firewall.destroy
 
-      servers.each(&:incr_destroy)
+      if postgres_resource.parseable_password
+        Prog::Postgres::TeardownLogAggregation.assemble(postgres_resource.ubid)
+      end
 
+      PostgresServer.incr_destroy(server_ids_dataset)
+      Cert.incr_destroy(current_cert_id) if current_cert_id
       postgres_resource.dns_zone&.delete_record(record_name: postgres_resource.hostname)
+      # Resolve every page about the resource so none orphans after it is gone.
+      Page.incr_resolve(Page.active.for_resource(postgres_resource.id).select(:id))
       postgres_resource.destroy
 
       pop "postgres resource is deleted"
@@ -338,7 +526,7 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
 
     Util.create_certificate(
       subject: "/C=US/O=Ubicloud/CN=#{postgres_resource.identity}",
-      extensions: ["subjectAltName=DNS:#{postgres_resource.identity},DNS:#{postgres_resource.hostname},DNS:private.#{postgres_resource.hostname}", "keyUsage=digitalSignature,keyEncipherment", "subjectKeyIdentifier=hash", "extendedKeyUsage=serverAuth"],
+      extensions: ["subjectAltName=DNS:#{postgres_resource.identity},DNS:#{postgres_resource.cert_hostname},DNS:#{postgres_resource.cert_private_hostname}", "keyUsage=digitalSignature,keyEncipherment", "subjectKeyIdentifier=hash", "extendedKeyUsage=serverAuth"],
       duration: 60 * 60 * 24 * 30 * 6, # ~6 months
       issuer_cert: root_cert,
       issuer_key: root_cert_key,
@@ -355,5 +543,23 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
       issuer_cert:,
       issuer_key:,
     ).map(&:to_pem)
+  end
+
+  def server_ids_dataset
+    postgres_resource.servers_dataset.select(:id)
+  end
+
+  def use_publicly_signed_certificates?
+    frame["use_publicly_signed_certificates"]
+  end
+
+  def wait_for_public_cert(frame_key)
+    cert_id = send(frame_key)
+    cert = Cert.with_pk!(cert_id)
+    nap(10 * 60) unless cert.cert
+
+    postgres_resource.server_cert = cert.cert
+    postgres_resource.server_cert_key = OpenSSL::PKey::EC.new(cert.csr_key).to_pem
+    delete_from_stack(frame_key)
   end
 end

@@ -3,6 +3,8 @@
 require "json"
 
 class Prog::Test::VmHostSlices < Prog::Test::Base
+  frame_reader :slice_ids
+
   label def start
     hop_verify_separation
   end
@@ -37,6 +39,6 @@ class Prog::Test::VmHostSlices < Prog::Test::Base
   end
 
   def slices
-    @slices ||= frame["slices"].map { VmHostSlice[it] }
+    @slices ||= slice_ids.map { VmHostSlice[it] }
   end
 end

@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 class Serializers::KubernetesNodepool < Serializers::Base
+  VMS_EAGER = [:strand, :semaphores, :assigned_vm_address, :vm_storage_volumes, :location].freeze
+
   def self.serialize_internal(kn, options = {})
     base = {
       id: kn.ubid,
@@ -8,9 +10,10 @@ class Serializers::KubernetesNodepool < Serializers::Base
       name: kn.name,
       node_count: kn.node_count,
       node_size: kn.target_node_size,
+      version: kn.version,
     }
     if options[:detailed]
-      base[:vms] = Serializers::Vm.serialize(kn.vms_dataset.all)
+      base[:vms] = Serializers::Vm.serialize(kn.vms(eager: VMS_EAGER))
     end
     base
   end

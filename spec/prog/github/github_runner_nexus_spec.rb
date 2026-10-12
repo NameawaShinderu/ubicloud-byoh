@@ -15,7 +15,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     installation_id = GithubInstallation.create(installation_id: 123, project_id: customer_project.id, name: "ubicloud", type: "Organization", created_at: now - 8 * 24 * 60 * 60).id
     vm_id = create_vm(location_id: Location::GITHUB_RUNNERS_ID, project_id: runner_project.id, boot_image: "github-ubuntu-2204").id
     Sshable.create_with_id(vm_id)
-    runner = GithubRunner.create(installation_id:, vm_id:, repository_name: "test-repo", label: "ubicloud-standard-4", actual_label: "ubicloud-standard-4", created_at: now, allocated_at: now + 10, ready_at: now + 20, runner_id: 123, workflow_job: {"id" => 123})
+    runner = GithubRunner.create(installation_id:, vm_id:, location_id: Location::GITHUB_RUNNERS_ID, repository_name: "test-repo", label: "ubicloud-standard-4", actual_label: "ubicloud-standard-4", created_at: now, allocated_at: now + 10, ready_at: now + 20, runner_id: 123, workflow_job: {"id" => 123})
     Strand.create_with_id(runner, prog: "Github::GithubRunnerNexus", label: "start")
     runner
   end
@@ -66,6 +66,30 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(vm.project_id).to eq(Config.github_runner_service_project_id)
     end
 
+    it "uses ch_version 53.0 if randomly selected" do
+      expect(Config).to receive(:github_actions_ch_53_percent).and_return(100)
+      vm = nx.pick_vm
+      expect(vm.strand.stack[0]["ch_version"]).to eq "53.0"
+    end
+
+    it "does not specify ch_version if not randomly selected" do
+      expect(Config).to receive(:github_actions_ch_53_percent).and_return(0)
+      vm = nx.pick_vm
+      expect(vm.strand.stack[0]["ch_version"]).to be_nil
+    end
+
+    it "does not specify ch_version for alien vms even if randomly selected" do
+      expect(Config).not_to receive(:github_actions_ch_53_percent)
+      runner.incr_spill_over
+      location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+      LocationCredentialAws.create(access_key: "test-access-key", secret_key: "test-secret-key") { it.id = location.id }
+      LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az1")
+      expect(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
+      picked_vm = nx.pick_vm
+      expect(picked_vm.location.aws?).to be(true)
+      expect(picked_vm.strand.stack[0]["ch_version"]).to be_nil
+    end
+
     it "provisions a new vm if pool is valid but there is no vm" do
       VmPool.create(size: 2, vm_size: "standard-4", boot_image: "github-ubuntu-2204", location_id: Location::GITHUB_RUNNERS_ID, storage_size_gib: 150, arch: "x64")
       vm = nx.pick_vm
@@ -110,6 +134,19 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       picked_vm = nx.pick_vm
       expect(vm.id).not_to eq(picked_vm.id)
       expect(picked_vm.pool_id).to be_nil
+      expect(picked_vm.vm_storage_volumes.first.track_written).to be(false)
+      expect(picked_vm.strand.stack.first["waiting_strand_id"]).to eq(runner.id)
+      expect(picked_vm.strand.stack.first["allocated_waiting_strand_id"]).to eq(runner.id)
+    end
+
+    it "skips pool if the installation has location preferences even when the pool has a vm" do
+      installation.update(allocator_preferences: {"family_filter" => ["premium", "standard"], "location_filter" => [Location::LEASEWEB_WDC02_ID], "location_preference" => [Location::LEASEWEB_WDC02_ID]})
+      pool = VmPool.create(size: 2, vm_size: "premium-4", boot_image: "github-ubuntu-2404", location_id: Location::GITHUB_RUNNERS_ID, storage_size_gib: 150, arch: "x64")
+      vm = create_vm(pool_id: pool.id, display_state: "running", family: "premium")
+      expect(Prog::Vm::Nexus).to receive(:assemble_with_sshable).and_call_original
+      picked_vm = nx.pick_vm
+      expect(vm.id).not_to eq(picked_vm.id)
+      expect(picked_vm.pool_id).to be_nil
     end
 
     it "uses alien vms by given ratio" do
@@ -120,14 +157,15 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az1")
       expect(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
       picked_vm = nx.pick_vm
-      expect(picked_vm.family).to eq("m7a")
+      expect(picked_vm.family).to eq("m8a")
       expect(picked_vm.location.aws?).to be(true)
       expect(picked_vm.boot_image).to eq(Config.github_ubuntu_2404_x64_aws_ami_version)
-      expect(picked_vm.strand.stack.first["alternative_families"]).to eq(["m7i", "m6a"])
+      expect(picked_vm.strand.stack.first["alternative_families"]).to eq(["m8i", "m7a", "m7i", "m6a"])
+      expect(picked_vm.user_nic.strand.stack.first["use_eip"]).to be(false)
     end
 
     it "does not use alien vms for large vcpu runners" do
-      runner.update(label: "ubicloud-standard-30")
+      runner.update(label: "ubicloud-standard-60")
       project.set_ff_aws_alien_runners_ratio(1.0)
       picked_vm = nx.pick_vm
       expect(picked_vm.family).to eq("standard")
@@ -141,9 +179,22 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az1")
       expect(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
       picked_vm = nx.pick_vm
-      expect(picked_vm.family).to eq("m7a")
+      expect(picked_vm.family).to eq("m8a")
       expect(picked_vm.location.aws?).to be(true)
       expect(picked_vm.boot_image).to eq(Config.github_ubuntu_2404_x64_aws_ami_version)
+    end
+
+    it "uses a 32 vCPU alien vm for 30 vCPU runners if spilled over" do
+      runner.update(label: "ubicloud-standard-30")
+      runner.incr_spill_over
+      location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+      LocationCredentialAws.create(access_key: "test-access-key", secret_key: "test-secret-key") { it.id = location.id }
+      LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az1")
+      expect(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
+      picked_vm = nx.pick_vm
+      expect(picked_vm.family).to eq("m8a")
+      expect(picked_vm.vcpus).to eq(32)
+      expect(picked_vm.location.aws?).to be(true)
     end
 
     it "uses alien arm64 vms if spilled over" do
@@ -154,9 +205,111 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az1")
       expect(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
       picked_vm = nx.pick_vm
-      expect(picked_vm.family).to eq("m8g")
+      expect(picked_vm.family).to eq("m9g")
       expect(picked_vm.location.aws?).to be(true)
       expect(picked_vm.boot_image).to eq(Config.github_ubuntu_2404_arm64_aws_ami_version)
+    end
+
+    it "creates a private subnet for each alien vm unless the project shares a VPC between them" do
+      runner.incr_spill_over
+      location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+      LocationCredentialAws.create(access_key: "test-access-key", secret_key: "test-secret-key") { it.id = location.id }
+      LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az1")
+      expect(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
+
+      ps = nx.pick_vm.private_subnets.first
+      expect(installation.private_subnets_dataset.all).to eq []
+      expect(ps.net4.netmask.prefix_len).to eq(28)
+    end
+
+    it "creates a private subnet for the alien vms of the installation" do
+      project.set_ff_aws_alien_runners_shared_vpc(true)
+      runner.incr_spill_over
+      location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+      LocationCredentialAws.create(access_key: "test-access-key", secret_key: "test-secret-key") { it.id = location.id }
+      LocationAz.create(location_id: location.id, az: "a", zone_id: "euc1-az2")
+      LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az3")
+      expect(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
+      # Ubid and IPv6 generation also call random_number, so only the VPC range draw is stubbed.
+      allow(SecureRandom).to receive(:random_number).and_call_original
+      expect(SecureRandom).to receive(:random_number).with(1..255).and_return(42)
+      expect(installation).to receive(:lock!).with(:no_key_update).and_call_original
+
+      picked_vm = nx.pick_vm
+      ps = picked_vm.private_subnets.first
+      expect(installation.private_subnets.map(&:id)).to eq([ps.id])
+      expect(ps).to have_attributes(location_id: location.id, project_id: vm.project_id)
+      expect(ps.net4.to_s).to eq("10.42.0.0/17")
+      expect(ps.private_subnet_aws_resource.aws_subnets_dataset.order(:ipv4_cidr).map { it.ipv4_cidr.to_s }).to eq(["10.42.0.0/20", "10.42.16.0/20"])
+    end
+
+    it "places alien vms in the private subnet of the installation in the location" do
+      project.set_ff_aws_alien_runners_shared_vpc(true)
+      runner.incr_spill_over
+      location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+      LocationCredentialAws.create(access_key: "test-access-key", secret_key: "test-secret-key") { it.id = location.id }
+      LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az1")
+      expect(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
+      other_installation = GithubInstallation.create(installation_id: 456, project_id: project.id, name: "other", type: "Organization")
+      other_installation.add_private_subnet(Prog::Vnet::SubnetNexus.assemble(vm.project_id, location_id: location.id).subject)
+      installation.add_private_subnet(Prog::Vnet::SubnetNexus.assemble(vm.project_id).subject)
+      ps = Prog::Vnet::SubnetNexus.assemble(vm.project_id, location_id: location.id).subject
+      installation.add_private_subnet(ps)
+      expect(installation).not_to receive(:lock!)
+
+      picked_vm = nil
+      expect { picked_vm = nx.pick_vm }.not_to change(PrivateSubnet, :count)
+      expect(picked_vm.private_subnets.map(&:id)).to eq([ps.id])
+    end
+
+    it "places alien vms in the private subnet another runner of the installation created while waiting for the lock" do
+      project.set_ff_aws_alien_runners_shared_vpc(true)
+      runner.incr_spill_over
+      location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+      LocationCredentialAws.create(access_key: "test-access-key", secret_key: "test-secret-key") { it.id = location.id }
+      LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az1")
+      expect(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
+      ps = Prog::Vnet::SubnetNexus.assemble(vm.project_id, location_id: location.id).subject
+      expect(installation).to receive(:lock!).with(:no_key_update).and_wrap_original do |original, *args|
+        installation.add_private_subnet(ps)
+        original.call(*args)
+      end
+
+      picked_vm = nil
+      expect { picked_vm = nx.pick_vm }.not_to change(PrivateSubnet, :count)
+      expect(picked_vm.private_subnets.map(&:id)).to eq([ps.id])
+    end
+
+    describe "while the private subnet of the installation is being destroyed" do
+      let(:installation_ps) do
+        location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+        LocationCredentialAws.create(access_key: "test-access-key", secret_key: "test-secret-key") { it.id = location.id }
+        LocationAz.create(location_id: location.id, az: "b", zone_id: "euc1-az1")
+        Prog::Vnet::SubnetNexus.assemble(vm.project_id, location_id: location.id).subject
+      end
+
+      before do
+        project.set_ff_aws_alien_runners_shared_vpc(true)
+        runner.incr_spill_over
+        installation.add_private_subnet(installation_ps)
+        expect(Config).to receive(:github_runner_aws_location_id).and_return(installation_ps.location_id)
+      end
+
+      it "places alien vms in a dedicated private subnet when destroy is set" do
+        installation_ps.incr_destroy
+
+        ps = nx.pick_vm.private_subnets.first
+        expect(ps.net4.netmask.prefix_len).to eq(28)
+        expect(installation.private_subnets_dataset.select_map(Sequel[:private_subnet][:id])).to eq([installation_ps.id])
+      end
+
+      it "places alien vms in a dedicated private subnet when destroying is set" do
+        installation_ps.incr_destroying
+
+        ps = nx.pick_vm.private_subnets.first
+        expect(ps.net4.netmask.prefix_len).to eq(28)
+        expect(installation.private_subnets_dataset.select_map(Sequel[:private_subnet][:id])).to eq([installation_ps.id])
+      end
     end
   end
 
@@ -178,7 +331,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(BillingRecord).to receive(:create).and_call_original
       nx.update_billing_record
 
-      br = BillingRecord[resource_id: project.id]
+      br = BillingRecord[resource_id: installation.id]
       expect(br.amount).to eq(5)
       expect(br.duration(now, now)).to eq(1)
     end
@@ -188,7 +341,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(BillingRecord).to receive(:create).and_call_original
       nx.update_billing_record
 
-      br = BillingRecord[resource_id: project.id]
+      br = BillingRecord[resource_id: installation.id]
       expect(br.amount).to eq(5)
       expect(br.duration(now, now)).to eq(1)
       expect(br.billing_rate["resource_family"]).to eq("standard-2-arm")
@@ -202,7 +355,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(BillingRecord).to receive(:create).and_call_original
       nx.update_billing_record
 
-      br = BillingRecord[resource_id: project.id]
+      br = BillingRecord[resource_id: installation.id]
       expect(br.amount).to eq(5)
       expect(br.duration(now, now)).to eq(1)
       expect(br.billing_rate["resource_family"]).to eq("premium-2")
@@ -212,12 +365,11 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     it "uses the original billing rate for runners who were upgraded for free based on runner creation time" do
       vm.update(family: "premium")
       runner.update(label: "ubicloud-standard-2", ready_at: now - 5 * 60, created_at: now - 100)
-
-      expect(installation).to receive(:free_runner_upgrade_expires_at).and_return(now - 50)
+      project.set_ff_free_runner_upgrade_until(now - 50).reload
       expect(BillingRecord).to receive(:create).and_call_original
       nx.update_billing_record
 
-      br = BillingRecord[resource_id: project.id]
+      br = BillingRecord[resource_id: installation.id]
       expect(br.amount).to eq(5)
       expect(br.duration(now, now)).to eq(1)
       expect(br.billing_rate["resource_family"]).to eq("standard-2")
@@ -232,11 +384,26 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(BillingRecord).to receive(:create).and_call_original
       nx.update_billing_record
 
-      br = BillingRecord[resource_id: project.id]
+      br = BillingRecord[resource_id: installation.id]
       expect(br.amount).to eq(5)
       expect(br.duration(now, now)).to eq(1)
       expect(br.billing_rate["resource_family"]).to eq("standard-2")
       expect(runner.billed_vm_size).to eq("standard-2")
+    end
+
+    it "bills 30 vCPUs for alien runners running on 32 vCPU instances" do
+      runner.update(label: "ubicloud-standard-30", ready_at: now - 5 * 60)
+      location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+      vm.update(location_id: location.id, family: "m7a", vcpus: 32)
+      expect(vm.location.aws?).to be(true)
+      expect(BillingRecord).to receive(:create).and_call_original
+      nx.update_billing_record
+
+      br = BillingRecord[resource_id: installation.id]
+      expect(br.amount).to eq(5)
+      expect(br.duration(now, now)).to eq(1)
+      expect(br.billing_rate["resource_family"]).to eq("standard-30")
+      expect(runner.billed_vm_size).to eq("standard-30")
     end
 
     it "updates the amount of existing billing record" do
@@ -247,7 +414,22 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       nx.update_billing_record
 
       expect { nx.update_billing_record }
-        .to change { BillingRecord[resource_id: project.id].amount }.from(5).to(10)
+        .to change { BillingRecord[resource_id: installation.id].amount }.from(5).to(10)
+    end
+
+    it "aggregates billing records by repository when the feature flag is enabled" do
+      project.set_ff_github_billing_by_repository(true)
+      repository = GithubRepository.create(name: "ubicloud/test-repo", installation_id: installation.id)
+      runner.update(repository_id: repository.id, ready_at: now - 5 * 60)
+
+      expect { nx.update_billing_record }
+        .to change { BillingRecord.where(resource_id: repository.id).count }.from(0).to(1)
+
+      expect { nx.update_billing_record }
+        .to change { BillingRecord[resource_id: repository.id].amount }.from(5).to(10)
+
+      expect(BillingRecord.where(resource_id: installation.id).count).to eq(0)
+      expect(BillingRecord[resource_id: repository.id].resource_name).to eq("Daily Usage 2026-02-05 (test-repo)")
     end
 
     it "create a new record for a new day" do
@@ -264,9 +446,9 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(BillingRecord).to receive(:create).and_call_original
       # Create tomorrow record
       expect { nx.update_billing_record }
-        .to change { BillingRecord.where(resource_id: project.id).count }.from(1).to(2)
+        .to change { BillingRecord.where(resource_id: installation.id).count }.from(1).to(2)
 
-      expect(BillingRecord.where(resource_id: project.id).map(&:amount)).to eq([5, 5])
+      expect(BillingRecord.where(resource_id: installation.id).map(&:amount)).to eq([5, 5])
     end
 
     it "tries 3 times and creates single billing record" do
@@ -276,7 +458,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
 
       expect {
         3.times { nx.update_billing_record }
-      }.to change { BillingRecord.where(resource_id: project.id).count }.from(0).to(1)
+      }.to change { BillingRecord.where(resource_id: installation.id).count }.from(0).to(1)
     end
 
     it "tries 4 times and fails" do
@@ -341,6 +523,12 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       end
     end
 
+    it "hops to allocate_vm when the spill over semaphore is set manually" do
+      runner.incr_spill_over
+      expect(project).not_to receive(:quota_available?)
+      expect { nx.wait_concurrency_limit }.to hop("allocate_vm")
+    end
+
     it "hops to allocate_vm when customer concurrency limit frees up" do
       expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(true)
       expect { nx.wait_concurrency_limit }.to hop("allocate_vm")
@@ -377,6 +565,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
 
       it "waits if utilization is high, spill over enabled, and waited enough but spill vcpus limit exceeded" do
         expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(false)
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpuAws", 0).and_return(true)
         project.set_ff_spill_to_alien_runners(true)
         runner.update(created_at: now - 40)
         expect(Config).to receive(:github_runner_aws_spill_vcpu_capacity).and_return(10)
@@ -386,8 +575,31 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
         expect(runner.spill_over_set?).to be(false)
       end
 
+      it "waits if utilization is high, spill over enabled, and waited enough but spill runner limit exceeded" do
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(false)
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpuAws", 0).and_return(true)
+        project.set_ff_spill_to_alien_runners(true)
+        runner.update(created_at: now - 40)
+        expect(Config).to receive(:github_runner_aws_spill_runner_capacity).and_return(1)
+        create_vm(vcpus: 2, boot_image: Config.github_ubuntu_2204_x64_aws_ami_version)
+
+        expect { nx.wait_concurrency_limit }.to nap
+        expect(runner.spill_over_set?).to be(false)
+      end
+
+      it "waits if utilization is high, spill over enabled, and waited enough but customer's own alien quota is exceeded" do
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(false)
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpuAws", 0).and_return(false)
+        project.set_ff_spill_to_alien_runners(true)
+        runner.update(created_at: now - 40)
+
+        expect { nx.wait_concurrency_limit }.to nap
+        expect(runner.spill_over_set?).to be(false)
+      end
+
       it "allocates if utilization is high but spill over enabled and waited enough" do
         expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(false)
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpuAws", 0).and_return(true)
         project.set_ff_spill_to_alien_runners(true)
         runner.update(created_at: now - 40)
 
@@ -395,9 +607,41 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
         expect(runner.spill_over_set?).to be(true)
       end
 
+      it "spills over 30 vCPU runners" do
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(false)
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpuAws", 0).and_return(true)
+        project.set_ff_spill_to_alien_runners(true)
+        runner.update(label: "ubicloud-standard-30", created_at: now - 40)
+
+        expect { nx.wait_concurrency_limit }.to hop("allocate_vm")
+        expect(runner.spill_over_set?).to be(true)
+      end
+
+      it "does not spill over 60 vCPU runners" do
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(false)
+        project.set_ff_spill_to_alien_runners(true)
+        runner.update(label: "ubicloud-standard-60", created_at: now - 40)
+
+        expect { nx.wait_concurrency_limit }.to nap
+        expect(runner.spill_over_set?).to be(false)
+      end
+
       it "allocates if standard utilization is low" do
         expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(false)
         VmHost[arch: "x64", family: "standard"].update(used_cores: 8)
+        expect { nx.wait_concurrency_limit }.to hop("allocate_vm")
+      end
+
+      it "waits if hugepage utilization is high although core utilization is low" do
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(false)
+        VmHost.where(arch: "x64", family: "standard").update(used_cores: 8, used_hugepages_1g: 350)
+        expect { nx.wait_concurrency_limit }.to nap
+      end
+
+      it "ignores hosts that don't report their cores or hugepages yet" do
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpu", 0).and_return(false)
+        VmHost.where(arch: "x64", family: "standard").update(used_cores: 8)
+        create_vm_host(location_id: Location::GITHUB_RUNNERS_ID, arch: "x64", family: "standard", total_cores: 0, used_cores: 0, total_hugepages_1g: 0, used_hugepages_1g: 0)
         expect { nx.wait_concurrency_limit }.to hop("allocate_vm")
       end
 
@@ -437,6 +681,16 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
         runner.update(label: "ubicloud-standard-4-arm")
         VmHost[arch: "arm64"].update(used_cores: 8)
         expect { nx.wait_concurrency_limit }.to hop("allocate_vm")
+      end
+
+      it "checks the arm alien quota when spilling over an arm64 runner" do
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpuArm", 0).and_return(false)
+        expect(project).to receive(:quota_available?).with("GithubRunnerVCpuArmAws", 0).and_return(true)
+        runner.update(label: "ubicloud-standard-16-arm", created_at: now - 40)
+        project.set_ff_spill_to_alien_runners(true)
+
+        expect { nx.wait_concurrency_limit }.to hop("allocate_vm")
+        expect(runner.spill_over_set?).to be(true)
       end
     end
 
@@ -516,25 +770,226 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(Clog).to receive(:emit).with("runner_allocated", instance_of(Hash)).and_call_original
       expect { nx.allocate_vm }.to hop("wait_vm")
       expect(runner.vm_id).to eq(picked_vm.id)
+      expect(runner.location_id).to eq(picked_vm.location_id)
       expect(runner.allocated_at).to eq(now)
       expect(picked_vm.name).to eq(runner.ubid)
     end
   end
 
   describe "#wait_vm" do
-    it "naps 10 seconds if vm is not allocated yet" do
-      vm.update(allocated_at: nil)
+    before { project.set_ff_early_jit_registration(true) }
+
+    context "when a large runner waits for metal capacity" do
+      before do
+        project.set_ff_early_jit_registration(false)
+        project.set_ff_spill_to_alien_runners(true)
+        runner.update(label: "ubicloud-standard-16")
+        vm.update(allocated_at: nil, provisioned_at: nil, created_at: now - 61)
+        Strand.create_with_id(vm, prog: "Vm::Metal::Nexus", label: "start")
+        vm.incr_waiting_for_capacity
+      end
+
+      it "destroys the metal vm and spills over to aws" do
+        ps = PrivateSubnet.create(name: "runner-subnet", location_id: Location::GITHUB_RUNNERS_ID, net4: "10.0.0.0/28", net6: "fd10::/64", project_id: vm.project_id)
+        fw = Firewall.create(name: "runner-fw", location_id: Location::GITHUB_RUNNERS_ID, project_id: vm.project_id)
+        fw.associate_with_private_subnet(ps, apply_firewalls: false)
+        Nic.create(private_subnet_id: ps.id, vm_id: vm.id, name: "runner-nic", mac: "00:00:00:00:00:01", private_ipv4: "10.0.0.2/32", private_ipv6: "fd10::2/128", state: "active")
+        Strand.create_with_id(ps, prog: "Vnet::SubnetNexus", label: "wait")
+
+        expect { nx.wait_vm }.to hop("allocate_vm")
+        expect(runner.reload.vm_id).to be_nil
+        expect(runner.location_id).to be_nil
+        expect(runner.allocated_at).to be_nil
+        expect(runner.spill_over_set?).to be(true)
+        expect(vm.reload.destroy_set?).to be(true)
+        expect(ps.destroy_set?).to be(true)
+        expect(fw).not_to exist
+      end
+
+      it "spills over 30 vCPU runners" do
+        runner.update(label: "ubicloud-standard-30")
+
+        expect { nx.wait_vm }.to hop("allocate_vm")
+        expect(runner.reload.spill_over_set?).to be(true)
+      end
+
+      it "does not spill over smaller runners" do
+        runner.update(label: "ubicloud-standard-8")
+        expect { nx.wait_vm }.to nap(10)
+        expect(runner.spill_over_set?).to be(false)
+      end
+
+      it "does not spill over runners that are not on metal" do
+        vm.update(location_id: Location::HETZNER_FSN1_ID)
+        expect { nx.wait_vm }.to nap(10)
+        expect(runner.spill_over_set?).to be(false)
+      end
+
+      it "does not spill over if the vm is allocated" do
+        vm.update(allocated_at: now)
+        expect { nx.wait_vm }.to nap(10)
+        expect(runner.spill_over_set?).to be(false)
+      end
+
+      it "does not spill over if the metal allocator has not run out of capacity" do
+        vm.semaphores_dataset.destroy
+        expect { nx.wait_vm }.to nap(10)
+        expect(runner.spill_over_set?).to be(false)
+      end
+
+      it "does not spill over if the vm has not waited enough" do
+        vm.update(created_at: now - 59)
+        expect { nx.wait_vm }.to nap(10)
+        expect(runner.spill_over_set?).to be(false)
+      end
+
+      it "does not spill over if the feature flag is disabled" do
+        project.set_ff_spill_to_alien_runners(false)
+        expect { nx.wait_vm }.to nap(10)
+        expect(runner.spill_over_set?).to be(false)
+      end
+
+      it "does not spill over if the customer's alien quota is exceeded" do
+        project.update(reputation: "limited")
+        location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+        allow(Config).to receive(:github_runner_aws_location_id).and_return(location.id)
+        aws_vm = create_vm(location_id: location.id)
+        aws_runner = GithubRunner.create(installation_id: installation.id, vm_id: aws_vm.id, location_id: location.id, repository_name: "test-repo", label: "ubicloud-standard-2")
+        Strand.create_with_id(aws_runner, prog: "Github::GithubRunnerNexus", label: "wait")
+
+        expect { nx.wait_vm }.to nap(10)
+        expect(runner.spill_over_set?).to be(false)
+      end
+
+      it "does not spill over if the spill vcpus limit is exceeded" do
+        expect(Config).to receive(:github_runner_aws_spill_vcpu_capacity).and_return(10)
+        create_vm(vcpus: 16, boot_image: Config.github_ubuntu_2204_x64_aws_ami_version)
+        expect { nx.wait_vm }.to nap(10)
+        expect(runner.spill_over_set?).to be(false)
+      end
+
+      it "does not spill over if the spill runner limit is exceeded" do
+        expect(Config).to receive(:github_runner_aws_spill_runner_capacity).and_return(1)
+        create_vm(vcpus: 2, boot_image: Config.github_ubuntu_2204_x64_aws_ami_version)
+        expect { nx.wait_vm }.to nap(10)
+        expect(runner.spill_over_set?).to be(false)
+      end
+    end
+
+    it "does not generate the jit config if the feature flag is not enabled" do
+      project.set_ff_early_jit_registration(false)
+      vm.update(allocated_at: now)
+      expect(client).not_to receive(:post)
       expect { nx.wait_vm }.to nap(10)
     end
 
-    it "naps a second if vm is allocated but not provisioned yet" do
+    it "naps until the vm prog schedules it if the vm is not allocated yet" do
+      vm.update(allocated_at: nil, provisioned_at: nil)
+      expect(client).not_to receive(:post)
+      expect { nx.wait_vm }.to nap(10)
+    end
+
+    it "generates the jit config and naps if the vm is allocated but not provisioned yet" do
       vm.update(allocated_at: now)
-      expect { nx.wait_vm }.to nap(1)
+      expect(client).to receive(:post).with(/.*generate-jitconfig/, hash_including(name: runner.ubid.to_s, labels: [runner.actual_label])).and_return({runner: {id: 123456}, encoded_jit_config: "AABBCC$"})
+      expect { nx.wait_vm }.to nap(10)
+      expect(runner.runner_id).to eq(123456)
+      expect(runner.encoded_jit_config).to eq("AABBCC$")
+    end
+
+    it "does not generate the jit config again if it is already generated" do
+      vm.update(allocated_at: now)
+      runner.update(encoded_jit_config: "AABBCC$")
+      expect(client).not_to receive(:post)
+      expect { nx.wait_vm }.to nap(10)
+    end
+
+    it "generates the jit config and hops if it was not generated before the vm became ready" do
+      vm.update(allocated_at: now, provisioned_at: now)
+      expect(client).to receive(:post).with(/.*generate-jitconfig/, hash_including(name: runner.ubid.to_s, labels: [runner.actual_label])).and_return({runner: {id: 123456}, encoded_jit_config: "AABBCC$"})
+      expect { nx.wait_vm }.to hop("setup_environment")
+      expect(runner.encoded_jit_config).to eq("AABBCC$")
     end
 
     it "hops if vm is ready" do
       vm.update(allocated_at: now, provisioned_at: now)
+      runner.update(encoded_jit_config: "AABBCC$")
       expect { nx.wait_vm }.to hop("setup_environment")
+    end
+
+    context "when a metal vm is not sshable yet" do
+      before do
+        runner.update(encoded_jit_config: "AABBCC$")
+        vm.update(vm_host_id: create_vm_host.id, allocated_at: now - 6 * 60, provisioned_at: nil)
+      end
+
+      it "replaces the runner when the host serial log shows the kernel boot race" do
+        expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo grep -qsE EXT4-fs\\ error.\\*ext4_mb_generate_buddy.\\*block\\ bitmap\\ and\\ bg\\ descriptor\\ inconsistent /vm/#{vm.inhost_name}/serial.log && echo match || true").and_return("match\n")
+        expect { nx.wait_vm }.to nap(0)
+        expect(nx.boot_race_checked).to be true
+        expect(runner.spare_runner_provisioned_set?(cached: false)).to be true
+        expect(runner.destroy_set?(cached: false)).to be true
+      end
+
+      it "checks the host serial log only once and keeps waiting when it is not the boot race" do
+        expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo grep -qsE EXT4-fs\\ error.\\*ext4_mb_generate_buddy.\\*block\\ bitmap\\ and\\ bg\\ descriptor\\ inconsistent /vm/#{vm.inhost_name}/serial.log && echo match || true").once.and_return("")
+        expect { nx.wait_vm }.to nap(10)
+        expect(nx.boot_race_checked).to be true
+        expect(runner.destroy_set?(cached: false)).to be false
+        expect { nx.wait_vm }.to nap(10)
+      end
+
+      it "does not check the host before the vm has been unsshable for 5 minutes" do
+        vm.update(allocated_at: now - 4 * 60)
+        expect(vm.vm_host.sshable).not_to receive(:_cmd)
+        expect { nx.wait_vm }.to nap(10)
+        expect(nx.boot_race_checked).to be_nil
+      end
+
+      it "does not check the host for a vm that is not on a metal host" do
+        vm.update(vm_host_id: nil)
+        expect { nx.wait_vm }.to nap(10)
+        expect(nx.boot_race_checked).to be_nil
+      end
+    end
+
+    it "deregisters the runner and naps if the generate request fails due to 'already exists with the same name' error" do
+      vm.update(allocated_at: now)
+      expect(client).to receive(:post)
+        .with(/.*generate-jitconfig/, hash_including(name: runner.ubid.to_s, labels: [runner.actual_label]))
+        .and_raise(Octokit::Conflict.new({body: "409 - Already exists - A runner with the name *** already exists."}))
+      expect(client).to receive(:paginate)
+        .and_yield({runners: [{name: runner.ubid.to_s, id: 123}]}, instance_double(Sawyer::Response, data: {runners: []}))
+        .and_return({runners: [{name: runner.ubid.to_s, id: 123}]})
+      expect(client).to receive(:delete).with("/repos/#{runner.repository_name}/actions/runners/123")
+      expect(Clog).to receive(:emit).with("Deregistering runner because it already exists", instance_of(Array)).and_call_original
+      expect { nx.wait_vm }.to nap(5)
+    end
+
+    it "fails if the generate request fails due to 'already exists with the same name' error but couldn't find the runner" do
+      vm.update(allocated_at: now)
+      expect(client).to receive(:post)
+        .with(/.*generate-jitconfig/, hash_including(name: runner.ubid.to_s, labels: [runner.actual_label]))
+        .and_raise(Octokit::Conflict.new({body: "409 - Already exists - A runner with the name *** already exists."}))
+      expect(client).to receive(:paginate).and_return({runners: []})
+      expect(client).not_to receive(:delete)
+      expect { nx.wait_vm }.to raise_error RuntimeError, "BUG: Failed with runner already exists error but couldn't find it"
+    end
+
+    it "fails if the generate request fails due to 'Octokit::Conflict' but it's not already exists error" do
+      vm.update(allocated_at: now)
+      expect(client).to receive(:post)
+        .with(/.*generate-jitconfig/, hash_including(name: runner.ubid.to_s, labels: [runner.actual_label]))
+        .and_raise(Octokit::Conflict.new({body: "409 - Another issue"}))
+      expect { nx.wait_vm }.to raise_error Octokit::Conflict
+    end
+
+    it "handles common GitHub API errors during generation" do
+      vm.update(allocated_at: now)
+      expect(client).to receive(:post).and_raise(Octokit::Error.new({body: "Repository level self-hosted runners are disabled"}))
+      expect { nx.wait_vm }.to nap(0)
+        .and change { Page.active.count }.by(1)
+      expect(runner.destroy_set?).to be(true)
     end
   end
 
@@ -557,33 +1012,35 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
   describe "#setup_environment" do
     before do
       vm.update(vm_host_id: create_vm_host(data_center: "FSN1-DC8").id)
+      allow(Config).to receive(:clover_runtime_token_secret).and_return("1")
     end
 
     it "hops to register_runner" do
-      expect(vm).to receive(:runtime_token).and_return("my_token")
       installation.update(use_docker_mirror: false, cache_enabled: false)
-      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND)
+      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND, log: :on_error)
         set -ueo pipefail
-        echo "image version: $ImageVersion"
-        sudo usermod -a -G sudo,adm runneradmin
         jq '. += ['\\{\\"group\\":\\"Ubicloud\\ Managed\\ Runner\\",\\"detail\\":\\"Name:\\ #{runner.ubid}\\\\nLabel:\\ ubicloud-standard-4\\\\nVM\\ Family:\\ standard\\\\nArch:\\ x64\\\\nImage:\\ github-ubuntu-2204\\\\nVM\\ Host:\\ #{vm.vm_host.ubid}\\\\nVM\\ Pool:\\ \\\\nLocation:\\ hetzner-fsn1\\\\nDatacenter:\\ FSN1-DC8\\\\nProject:\\ #{project.ubid}\\\\nConsole\\ URL:\\ http://localhost:9292/project/#{project.ubid}/github\\"\\}']' /imagegeneration/imagedata.json | sudo -u runner tee /home/runner/actions-runner/.setup_info > /dev/null
-        echo "UBICLOUD_RUNTIME_TOKEN="my_token"
+        echo "UBICLOUD_RUNTIME_TOKEN="#{vm.runtime_token}"
         UBICLOUD_CACHE_URL="http://localhost:9292"/runtime/github/" | sudo tee -a /etc/environment > /dev/null
       COMMAND
 
       expect { nx.setup_environment }.to hop("register_runner")
     end
 
+    it "hops to start_runner when the jit config is already generated" do
+      runner.update(encoded_jit_config: "AABBCC$")
+      installation.update(use_docker_mirror: false, cache_enabled: false)
+      expect(vm.sshable).to receive(:_cmd)
+      expect { nx.setup_environment }.to hop("start_runner")
+    end
+
     it "hops to register_runner with after enabling transparent cache" do
-      expect(vm).to receive(:runtime_token).and_return("my_token")
       installation.update(use_docker_mirror: false, cache_enabled: true)
-      expect(vm).to receive(:nics).and_return([instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.1/32"))]).at_least(:once)
-      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND)
+      expect(vm).to receive(:nics).and_return([instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.1/32"), is_management: false)]).at_least(:once)
+      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND, log: :on_error)
         set -ueo pipefail
-        echo "image version: $ImageVersion"
-        sudo usermod -a -G sudo,adm runneradmin
         jq '. += ['\\{\\"group\\":\\"Ubicloud\\ Managed\\ Runner\\",\\"detail\\":\\"Name:\\ #{runner.ubid}\\\\nLabel:\\ ubicloud-standard-4\\\\nVM\\ Family:\\ standard\\\\nArch:\\ x64\\\\nImage:\\ github-ubuntu-2204\\\\nVM\\ Host:\\ #{vm.vm_host.ubid}\\\\nVM\\ Pool:\\ \\\\nLocation:\\ hetzner-fsn1\\\\nDatacenter:\\ FSN1-DC8\\\\nProject:\\ #{project.ubid}\\\\nConsole\\ URL:\\ http://localhost:9292/project/#{project.ubid}/github\\"\\}']' /imagegeneration/imagedata.json | sudo -u runner tee /home/runner/actions-runner/.setup_info > /dev/null
-        echo "UBICLOUD_RUNTIME_TOKEN="my_token"
+        echo "UBICLOUD_RUNTIME_TOKEN="#{vm.runtime_token}"
         UBICLOUD_CACHE_URL="http://localhost:9292"/runtime/github/" | sudo tee -a /etc/environment > /dev/null
         echo "CUSTOM_ACTIONS_CACHE_URL=http://"10.0.0.1":51123/random_token/" | sudo tee -a /etc/environment > /dev/null
       COMMAND
@@ -591,16 +1048,30 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect { nx.setup_environment }.to hop("register_runner")
     end
 
+    it "resolves the transparent cache domain to the vm on aws" do
+      installation.update(use_docker_mirror: false, cache_enabled: false)
+      location = Location.create(name: "eu-central-1", provider: "aws", project_id: vm.project_id, display_name: "aws-eu-central-1", ui_name: "AWS Frankfurt", visible: true)
+      ps = PrivateSubnet.create(name: "runner-subnet", location_id: location.id, net4: "10.0.0.0/26", net6: "fd10:9b0b:6b4b:8fbb::/64", state: "waiting", project_id: vm.project_id)
+      Nic.create(private_subnet_id: ps.id, private_ipv4: "10.0.0.5/32", private_ipv6: "fd10:9b0b:6b4b:8fbb::/79", name: "runner-nic", state: "active", vm_id: vm.id)
+      vm.update(location_id: location.id, vm_host_id: nil)
+      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND, log: :on_error)
+        set -ueo pipefail
+        jq '. += ['\\{\\"group\\":\\"Ubicloud\\ Managed\\ Runner\\",\\"detail\\":\\"Name:\\ #{runner.ubid}\\\\nLabel:\\ ubicloud-standard-4\\\\nVM\\ Family:\\ standard\\\\nArch:\\ x64\\\\nImage:\\ github-ubuntu-2204\\\\nVM\\ Host:\\ \\\\nVM\\ Pool:\\ \\\\nLocation:\\ \\\\nDatacenter:\\ \\\\nProject:\\ #{project.ubid}\\\\nConsole\\ URL:\\ http://localhost:9292/project/#{project.ubid}/github\\"\\}']' /imagegeneration/imagedata.json | sudo -u runner tee /home/runner/actions-runner/.setup_info > /dev/null
+        echo "UBICLOUD_RUNTIME_TOKEN="#{vm.runtime_token}"
+        UBICLOUD_CACHE_URL="http://localhost:9292"/runtime/github/" | sudo tee -a /etc/environment > /dev/null
+        echo 10.0.0.5" ubicloudhostplaceholder.blob.core.windows.net" | sudo tee -a /etc/hosts > /dev/null
+      COMMAND
+
+      expect { nx.setup_environment }.to hop("register_runner")
+    end
+
     it "hops to register_runner with cache proxy replacement" do
-      expect(vm).to receive(:runtime_token).and_return("my_token")
       installation.update(use_docker_mirror: false, cache_enabled: false)
       project.set_ff_cache_proxy_download_url({"x64" => "https://example.com/cache-proxy-x64.tar.gz", "arm64" => "https://example.com/cache-proxy-arm64.tar.gz"})
-      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND)
+      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND, log: :on_error)
         set -ueo pipefail
-        echo "image version: $ImageVersion"
-        sudo usermod -a -G sudo,adm runneradmin
         jq '. += ['\\{\\"group\\":\\"Ubicloud\\ Managed\\ Runner\\",\\"detail\\":\\"Name:\\ #{runner.ubid}\\\\nLabel:\\ ubicloud-standard-4\\\\nVM\\ Family:\\ standard\\\\nArch:\\ x64\\\\nImage:\\ github-ubuntu-2204\\\\nVM\\ Host:\\ #{vm.vm_host.ubid}\\\\nVM\\ Pool:\\ \\\\nLocation:\\ hetzner-fsn1\\\\nDatacenter:\\ FSN1-DC8\\\\nProject:\\ #{project.ubid}\\\\nConsole\\ URL:\\ http://localhost:9292/project/#{project.ubid}/github\\"\\}']' /imagegeneration/imagedata.json | sudo -u runner tee /home/runner/actions-runner/.setup_info > /dev/null
-        echo "UBICLOUD_RUNTIME_TOKEN="my_token"
+        echo "UBICLOUD_RUNTIME_TOKEN="#{vm.runtime_token}"
         UBICLOUD_CACHE_URL="http://localhost:9292"/runtime/github/" | sudo tee -a /etc/environment > /dev/null
         sudo systemctl stop cache-proxy.service
         curl -fsSL -o /tmp/cache-proxy.tar.gz https://example.com/cache-proxy-x64.tar.gz
@@ -612,35 +1083,73 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     end
 
     it "does not replace cache proxy if arch url is not set" do
-      expect(vm).to receive(:runtime_token).and_return("my_token")
       installation.update(use_docker_mirror: false, cache_enabled: false)
       project.set_ff_cache_proxy_download_url({"arm64" => "https://example.com/cache-proxy-arm64.tar.gz"})
-      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND)
+      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND, log: :on_error)
         set -ueo pipefail
-        echo "image version: $ImageVersion"
-        sudo usermod -a -G sudo,adm runneradmin
         jq '. += ['\\{\\"group\\":\\"Ubicloud\\ Managed\\ Runner\\",\\"detail\\":\\"Name:\\ #{runner.ubid}\\\\nLabel:\\ ubicloud-standard-4\\\\nVM\\ Family:\\ standard\\\\nArch:\\ x64\\\\nImage:\\ github-ubuntu-2204\\\\nVM\\ Host:\\ #{vm.vm_host.ubid}\\\\nVM\\ Pool:\\ \\\\nLocation:\\ hetzner-fsn1\\\\nDatacenter:\\ FSN1-DC8\\\\nProject:\\ #{project.ubid}\\\\nConsole\\ URL:\\ http://localhost:9292/project/#{project.ubid}/github\\"\\}']' /imagegeneration/imagedata.json | sudo -u runner tee /home/runner/actions-runner/.setup_info > /dev/null
-        echo "UBICLOUD_RUNTIME_TOKEN="my_token"
+        echo "UBICLOUD_RUNTIME_TOKEN="#{vm.runtime_token}"
         UBICLOUD_CACHE_URL="http://localhost:9292"/runtime/github/" | sudo tee -a /etc/environment > /dev/null
       COMMAND
 
       expect { nx.setup_environment }.to hop("register_runner")
     end
 
-    it "naps if ssh authentication failed" do
-      expect(vm).to receive(:runtime_token).and_return("my_token")
-      expect(vm).to receive(:nics).and_return([instance_double(Nic, private_ipv4: NetAddr::IPv4Net.parse("10.0.0.1/32"))]).at_least(:once)
-      expect(vm.sshable).to receive(:_cmd).and_raise(Net::SSH::AuthenticationFailed.new("Authentication failed for user runneradmin@1.2.3.4"))
-      expect(Clog).to receive(:emit).with("ssh authentication failed", instance_of(Hash)).and_call_original
+    it "hops to register_runner without a vm host" do
+      installation.update(use_docker_mirror: false, cache_enabled: false)
+      vm.update(vm_host_id: nil)
+      expect(vm.sshable).to receive(:_cmd).with("bash", stdin: <<~COMMAND, log: :on_error)
+        set -ueo pipefail
+        jq '. += ['\\{\\"group\\":\\"Ubicloud\\ Managed\\ Runner\\",\\"detail\\":\\"Name:\\ #{runner.ubid}\\\\nLabel:\\ ubicloud-standard-4\\\\nVM\\ Family:\\ standard\\\\nArch:\\ x64\\\\nImage:\\ github-ubuntu-2204\\\\nVM\\ Host:\\ \\\\nVM\\ Pool:\\ \\\\nLocation:\\ \\\\nDatacenter:\\ \\\\nProject:\\ #{project.ubid}\\\\nConsole\\ URL:\\ http://localhost:9292/project/#{project.ubid}/github\\"\\}']' /imagegeneration/imagedata.json | sudo -u runner tee /home/runner/actions-runner/.setup_info > /dev/null
+        echo "UBICLOUD_RUNTIME_TOKEN="#{vm.runtime_token}"
+        UBICLOUD_CACHE_URL="http://localhost:9292"/runtime/github/" | sudo tee -a /etc/environment > /dev/null
+      COMMAND
 
-      expect { nx.setup_environment }.to nap(1)
+      expect { nx.setup_environment }.to hop("register_runner")
+    end
+
+    it "provisions a spare runner and destroys the runner on a known kernel boot race" do
+      installation.update(use_docker_mirror: false, cache_enabled: false)
+      expect(vm.sshable).to receive(:_cmd).with("bash", any_args).and_raise(Errno::EHOSTUNREACH)
+      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo grep -qsE EXT4-fs\\ error.\\*ext4_mb_generate_buddy.\\*block\\ bitmap\\ and\\ bg\\ descriptor\\ inconsistent /vm/#{vm.inhost_name}/serial.log && echo match || true").and_return("match\n")
+      expect { nx.setup_environment }.to nap(0)
+      expect(runner.spare_runner_provisioned_set?(cached: false)).to be true
+      expect(runner.destroy_set?(cached: false)).to be true
+      expect(GithubRunner.exclude(id: runner.id).where(installation_id: installation.id, label: runner.label).count).to eq 1
+    end
+
+    it "reraises a connection error that is not a known kernel boot race" do
+      installation.update(use_docker_mirror: false, cache_enabled: false)
+      expect(vm.sshable).to receive(:_cmd).with("bash", any_args).and_raise(Errno::ECONNREFUSED)
+      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo grep -qsE EXT4-fs\\ error.\\*ext4_mb_generate_buddy.\\*block\\ bitmap\\ and\\ bg\\ descriptor\\ inconsistent /vm/#{vm.inhost_name}/serial.log && echo match || true").and_return("")
+      expect { nx.setup_environment }.to raise_error(Errno::ECONNREFUSED)
+      expect(runner.destroy_set?(cached: false)).to be false
+    end
+  end
+
+  describe "#known_kernel_boot_race?" do
+    before { vm.update(vm_host_id: create_vm_host.id) }
+
+    it "is false when the vm has no host" do
+      vm.update(vm_host_id: nil)
+      expect(nx.known_kernel_boot_race?).to be false
+    end
+
+    it "is true when the serial log shows the race" do
+      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo grep -qsE EXT4-fs\\ error.\\*ext4_mb_generate_buddy.\\*block\\ bitmap\\ and\\ bg\\ descriptor\\ inconsistent /vm/#{vm.inhost_name}/serial.log && echo match || true").and_return("match\n")
+      expect(nx.known_kernel_boot_race?).to be true
+    end
+
+    it "is false when the serial log does not show the race" do
+      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo grep -qsE EXT4-fs\\ error.\\*ext4_mb_generate_buddy.\\*block\\ bitmap\\ and\\ bg\\ descriptor\\ inconsistent /vm/#{vm.inhost_name}/serial.log && echo match || true").and_return("")
+      expect(nx.known_kernel_boot_race?).to be false
     end
   end
 
   describe "#register_runner" do
     it "registers runner hops" do
       expect(client).to receive(:post).with(/.*generate-jitconfig/, hash_including(name: runner.ubid.to_s, labels: [runner.label])).and_return({runner: {id: 123}, encoded_jit_config: "AABBCC$"})
-      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, stdin: "AABBCC$")
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, stdin: "AABBCC$", log: :on_error)
         sudo -u runner tee /home/runner/actions-runner/.jit_token > /dev/null
         sudo systemctl start runner-script.service
       COMMAND
@@ -656,7 +1165,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(client).to receive(:paginate)
         .and_yield({runners: [{name: runner.ubid.to_s, id: 123}]}, instance_double(Sawyer::Response, data: {runners: []}))
         .and_return({runners: [{name: runner.ubid.to_s, id: 123}]})
-      expect(vm.sshable).to receive(:_cmd).with("systemctl show -p SubState --value runner-script").and_return("dead")
+      expect(vm.sshable).to receive(:_cmd).with(described_class::RUNNER_SCRIPT_SUBSTATE_COMMAND).and_return("dead")
       expect(client).to receive(:delete).with("/repos/#{runner.repository_name}/actions/runners/123")
       expect(Clog).to receive(:emit).with("Deregistering runner because it already exists", instance_of(Array)).and_call_original
       expect { nx.register_runner }.to nap(5)
@@ -669,7 +1178,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(client).to receive(:paginate)
         .and_yield({runners: [{name: runner.ubid.to_s, id: 123}]}, instance_double(Sawyer::Response, data: {runners: []}))
         .and_return({runners: [{name: runner.ubid.to_s, id: 123}]})
-      expect(vm.sshable).to receive(:_cmd).with("systemctl show -p SubState --value runner-script").and_return("running")
+      expect(vm.sshable).to receive(:_cmd).with(described_class::RUNNER_SCRIPT_SUBSTATE_COMMAND).and_return("running")
       expect { nx.register_runner }.to hop("wait")
       expect(runner.runner_id).to eq(123)
       expect(runner.ready_at).to eq(now)
@@ -693,7 +1202,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
 
     it "fails without a log if the ssh error doesn't match" do
       expect(client).to receive(:post).with(/.*generate-jitconfig/, hash_including(name: runner.ubid.to_s, labels: [runner.label])).and_return({runner: {id: 123}, encoded_jit_config: "AABBCC$"})
-      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, stdin: "AABBCC$").and_raise Sshable::SshError.new("command", "", "unknown command", 123, nil)
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, stdin: "AABBCC$", log: :on_error).and_raise Sshable::SshError.new("command", "", "unknown command", 123, nil)
         sudo -u runner tee /home/runner/actions-runner/.jit_token > /dev/null
         sudo systemctl start runner-script.service
       COMMAND
@@ -704,8 +1213,77 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     it "handles common GitHub API errors during registration" do
       expect(client).to receive(:post).and_raise(Octokit::Error.new({body: "Repository level self-hosted runners are disabled"}))
       expect { nx.register_runner }.to nap(0)
-        .and change { Page.count }.by(1)
+        .and change { Page.active.count }.by(1)
       expect(runner.destroy_set?).to be(true)
+    end
+  end
+
+  describe "#start_runner" do
+    before { vm.update(allocated_at: now) }
+
+    it "starts the runner script with the stored jit config and hops" do
+      runner.update(encoded_jit_config: "AABBCC$")
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, stdin: "AABBCC$", log: :on_error)
+        sudo -u runner tee /home/runner/actions-runner/.jit_token > /dev/null
+        sudo systemctl start runner-script.service
+      COMMAND
+      expect { nx.start_runner }.to hop("wait")
+      expect(runner.ready_at).to eq(now)
+      expect(runner.encoded_jit_config).to be_nil
+    end
+
+    it "hops to register_runner if there is no jit config" do
+      expect(vm.sshable).not_to receive(:_cmd)
+      expect { nx.start_runner }.to hop("register_runner")
+    end
+
+    it "does not regenerate the jit config if the vm was allocated recently after a long capacity wait" do
+      runner.update(encoded_jit_config: "AABBCC$", allocated_at: now - 2 * 60 * 60)
+      expect(client).not_to receive(:delete)
+      expect(client).not_to receive(:post)
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, stdin: "AABBCC$", log: :on_error)
+        sudo -u runner tee /home/runner/actions-runner/.jit_token > /dev/null
+        sudo systemctl start runner-script.service
+      COMMAND
+      expect { nx.start_runner }.to hop("wait")
+    end
+
+    it "regenerates the jit config if it may have expired" do
+      runner.update(encoded_jit_config: "OLD$", allocated_at: now - 20 * 60)
+      vm.update(allocated_at: now - 20 * 60)
+      expect(client).to receive(:delete).with("/repos/#{runner.repository_name}/actions/runners/123")
+      expect(client).to receive(:post).with(/.*generate-jitconfig/, hash_including(name: runner.ubid.to_s, labels: [runner.actual_label])).and_return({runner: {id: 456}, encoded_jit_config: "NEW$"})
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, stdin: "NEW$", log: :on_error)
+        sudo -u runner tee /home/runner/actions-runner/.jit_token > /dev/null
+        sudo systemctl start runner-script.service
+      COMMAND
+      expect { nx.start_runner }.to hop("wait")
+      expect(runner.runner_id).to eq(456)
+      expect(runner.ready_at).to eq(now)
+      expect(runner.encoded_jit_config).to be_nil
+    end
+
+    it "tolerates an already removed runner while regenerating the jit config" do
+      runner.update(encoded_jit_config: "OLD$", allocated_at: now - 20 * 60)
+      vm.update(allocated_at: now - 20 * 60)
+      expect(client).to receive(:delete).with("/repos/#{runner.repository_name}/actions/runners/123").and_raise(Octokit::NotFound)
+      expect(client).to receive(:post).with(/.*generate-jitconfig/, hash_including(name: runner.ubid.to_s, labels: [runner.actual_label])).and_return({runner: {id: 456}, encoded_jit_config: "NEW$"})
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, stdin: "NEW$", log: :on_error)
+        sudo -u runner tee /home/runner/actions-runner/.jit_token > /dev/null
+        sudo systemctl start runner-script.service
+      COMMAND
+      expect { nx.start_runner }.to hop("wait")
+      expect(runner.runner_id).to eq(456)
+    end
+
+    it "fails without a log if the ssh error doesn't match" do
+      runner.update(encoded_jit_config: "AABBCC$")
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, stdin: "AABBCC$", log: :on_error).and_raise Sshable::SshError.new("command", "", "unknown command", 123, nil)
+        sudo -u runner tee /home/runner/actions-runner/.jit_token > /dev/null
+        sudo systemctl start runner-script.service
+      COMMAND
+      expect(Clog).not_to receive(:emit).with("Failed to start runner script").and_call_original
+      expect { nx.start_runner }.to raise_error Sshable::SshError
     end
   end
 
@@ -713,13 +1291,14 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     it "naps until rate limit resets and creates a page when rate limited" do
       expect(client).to receive(:rate_limit).and_return(instance_double(Octokit::RateLimit, remaining: 0, limit: 5000, resets_at: now + 300))
       refresh_frame(nx, new_values: {"deadline_target" => "wait", "deadline_at" => (now - 5 * 60).to_s})
-      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests } }.to nap(300)
+      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests.new({body: "API rate limit exceeded"}) } }.to nap(300)
         .and change { Page.count }.by(1)
-      expect(Time.parse(nx.frame["deadline_at"])).to eq(now + 10 * 60)
+      expect(Time.new(nx.frame["deadline_at"])).to eq(now + 10 * 60)
       expect(Page.first).to have_attributes(
         summary: "GitHub API rate limit exceeded for installation #{installation.ubid}",
         tag: Page.generate_tag(["GithubRateLimitExceeded", installation.ubid]),
         severity: "warning",
+        resource_id: installation.id,
       )
     end
 
@@ -727,47 +1306,136 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(client).to receive(:rate_limit).and_return(instance_double(Octokit::RateLimit, remaining: 0, limit: 5000, resets_at: now + 5))
       nx.incr_destroying
       refresh_frame(nx, new_values: {"deadline_target" => nil, "deadline_at" => (now - 5 * 60).to_s})
-      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests } }.to nap(30)
-      expect(Time.parse(nx.frame["deadline_at"])).to eq(now + 15 * 60)
+      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests.new({body: "API rate limit exceeded"}) } }.to nap(30)
+      expect(Time.new(nx.frame["deadline_at"])).to eq(now + 15 * 60)
     end
 
     it "destroys the runner if the rate limit reset is more than 10 minutes away while provisioning" do
       expect(client).to receive(:rate_limit).and_return(instance_double(Octokit::RateLimit, remaining: 0, limit: 5000, resets_at: now + 11 * 60))
-      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests } }.to nap
-        .and change { Page.count }.by(1)
+      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests.new({body: "API rate limit exceeded"}) } }.to nap
+        .and change { Page.active.count }.by(1)
       expect(runner.destroy_set?).to be(true)
     end
 
     it "skips the deregistration if the rate limit reset is more than 15 minutes away while destroying" do
       expect(client).to receive(:rate_limit).and_return(instance_double(Octokit::RateLimit, remaining: 0, limit: 5000, resets_at: now + 16 * 60))
       nx.incr_destroying
-      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests } }.to nap
+      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests.new({body: "API rate limit exceeded"}) } }.to nap
         .and change { Page.count }.by(1)
       expect(runner.skip_deregistration_set?).to be(true)
     end
 
-    it "destroys the runner if self-hosted runners are disabled" do
+    it "skips the deregistration if the installation is suspended while destroying" do
+      nx.incr_destroying
+      expect { nx.rescue_common_github_api_errors { raise Octokit::InstallationSuspended.new({body: "This installation has been suspended"}) } }.to nap(0)
+      expect(runner.skip_deregistration_set?).to be(true)
+      expect(runner.destroy_set?).to be(false)
+    end
+
+    it "destroys the runner without deregistration if the installation is suspended while provisioning" do
+      expect { nx.rescue_common_github_api_errors { raise Octokit::InstallationSuspended.new({body: "This installation has been suspended"}) } }.to nap(0)
+      expect(runner.skip_deregistration_set?).to be(true)
+      expect(runner.destroy_set?).to be(true)
+    end
+
+    def add_github_user(email)
+      Account.create(email:).tap do |account|
+        account.add_project(project)
+        AccessControlEntry.create(project_id: project.id, subject_id: account.id, action_id: ActionType::NAME_MAP["Project:github"])
+      end
+    end
+
+    it "destroys the runner and emails project users if self-hosted runners are disabled" do
+      add_github_user("github-user@example.com")
+      add_github_user("another-github-user@example.com")
+      Account.create(email: "billing-only@example.com").tap do |account|
+        account.add_project(project)
+        AccessControlEntry.create(project_id: project.id, subject_id: account.id, action_id: ActionType::NAME_MAP["Project:billing"])
+      end
+
       expect { nx.rescue_common_github_api_errors { raise Octokit::Error.new({body: "Repository level self-hosted runners are disabled"}) } }.to nap(0)
-        .and change { Page.count }.by(1)
+        .and change { Page.count }.from(0).to(1)
+        .and change { Mail::TestMailer.deliveries.length }.from(0).to(1)
       expect(runner.destroy_set?).to be(true)
+      mail = Mail::TestMailer.deliveries.last
+      expect(mail.to).to contain_exactly("github-user@example.com", "another-github-user@example.com")
+      expect(mail.subject).to eq("Action Required: Couldn't provision Ubicloud runners for the \"test-repo\" repository")
+      expect(mail.html_part.body).to include("Repository level self-hosted runners are disabled on this repository.")
+      expect(Page.first).to have_attributes(tag: Page.generate_tag(["GithubSelfHostRunnersDisabled", installation.ubid]), resource_id: installation.id)
     end
 
-    it "destroys the runner if IP allowlist is enabled" do
+    it "destroys the runner and emails project users if GitHub Actions are disabled" do
+      add_github_user("github-user@example.com")
+      expect { nx.rescue_common_github_api_errors { raise Octokit::Error.new({body: "GitHub Actions is disabled on this repository"}) } }.to nap(0)
+        .and change { Page.count }.from(0).to(1)
+        .and change { Mail::TestMailer.deliveries.length }.from(0).to(1)
+      expect(runner.destroy_set?).to be(true)
+      expect(Mail::TestMailer.deliveries.last.html_part.body).to include("GitHub Actions is disabled on this repository.")
+      expect(Page.first).to have_attributes(tag: Page.generate_tag(["GithubActionsDisabled", installation.ubid]), resource_id: installation.id)
+    end
+
+    it "destroys the runner and emails project users if IP allowlist is enabled" do
+      add_github_user("github-user@example.com")
       expect { nx.rescue_common_github_api_errors { raise Octokit::Error.new({body: "your IP address is not permitted to access this resource"}) } }.to nap(0)
-        .and change { Page.count }.by(1)
+        .and change { Page.count }.from(0).to(1)
+        .and change { Mail::TestMailer.deliveries.length }.from(0).to(1)
       expect(runner.destroy_set?).to be(true)
+      expect(Mail::TestMailer.deliveries.last.html_part.body).to include("your organization has an IP allow list enabled")
+      expect(Page.first).to have_attributes(tag: Page.generate_tag(["GithubIPAllowlistEnabled", installation.ubid]), resource_id: installation.id)
     end
 
-    it "destroys the runner if resource not accessible by integration" do
+    it "destroys the runner and emails project users if resource not accessible by integration" do
+      add_github_user("github-user@example.com")
       repo = GithubRepository.create(name: "test-repo", installation_id: runner.installation_id)
       runner.update(repository_id: repo.id)
       expect { nx.rescue_common_github_api_errors { raise Octokit::Error.new({body: "Resource not accessible by integration"}) } }.to nap(0)
-        .and change { Page.count }.by(1)
+        .and change { Page.count }.from(0).to(1)
+        .and change { Mail::TestMailer.deliveries.length }.from(0).to(1)
+      expect(runner.destroy_set?).to be(true)
+      expect(Mail::TestMailer.deliveries.last.html_part.body).to include("Resource not accessible by integration.")
+      expect(Page.first).to have_attributes(tag: Page.generate_tag(["GithubResourceNotAccessible", installation.ubid, repo.ubid]), resource_id: repo.id)
+    end
+
+    it "does not send a duplicate email when an active page already exists" do
+      add_github_user("github-user@example.com")
+      expect { nx.rescue_common_github_api_errors { raise Octokit::Error.new({body: "Repository level self-hosted runners are disabled"}) } }.to nap(0)
+        .and change { Page.count }.from(0).to(1)
+        .and change { Mail::TestMailer.deliveries.length }.from(0).to(1)
+
+      expect { nx.rescue_common_github_api_errors { raise Octokit::Error.new({body: "Repository level self-hosted runners are disabled"}) } }.to nap(0)
+        .and not_change { Page.count }
+        .and not_change { Mail::TestMailer.deliveries.length }
+    end
+
+    it "creates the page but sends no email when no project user has the github permission" do
+      expect { nx.rescue_common_github_api_errors { raise Octokit::Error.new({body: "Repository level self-hosted runners are disabled"}) } }.to nap(0)
+        .and change { Page.count }.from(0).to(1)
+        .and not_change { Mail::TestMailer.deliveries.length }
+      expect(runner.destroy_set?).to be(true)
+    end
+
+    it "destroys the runner without a page or email if the runner group is full" do
+      expect(client).not_to receive(:get)
+      expect { nx.rescue_common_github_api_errors { raise Octokit::UnprocessableEntity.new({body: "Runner group 1 has reached max limit of 10000 runners."}) } }.to nap(0)
+        .and not_change { Page.count }
+        .and not_change { Mail::TestMailer.deliveries.length }
+      expect(runner.destroy_set?).to be(true)
+    end
+
+    it "destroys the runner if TooManyRequests is raised with a self-hosted runners disabled message" do
+      expect(client).not_to receive(:rate_limit)
+      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests.new({body: "Repository level self-hosted runners are disabled"}) } }.to nap(0)
+        .and change { Page.count }.from(0).to(1)
       expect(runner.destroy_set?).to be(true)
     end
 
     it "re-raises unexpected Octokit errors" do
       expect { nx.rescue_common_github_api_errors { raise Octokit::Error.new({body: "Unexpected error"}) } }.to raise_error Octokit::Error
+    end
+
+    it "re-raises TooManyRequests without a rate limit message" do
+      expect(client).not_to receive(:rate_limit)
+      expect { nx.rescue_common_github_api_errors { raise Octokit::TooManyRequests.new({body: "Something else"}) } }.to raise_error Octokit::TooManyRequests
     end
   end
 
@@ -775,7 +1443,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     it "does not destroy runner if it does not pick a job in five minutes, and busy" do
       runner.update(ready_at: now - 6 * 60, workflow_job: nil)
       expect(client).to receive(:get).and_return({busy: true})
-      expect(vm.sshable).to receive(:_cmd).with("systemctl show -p SubState --value runner-script").and_return("running")
+      expect(vm.sshable).to receive(:_cmd).with(described_class::RUNNER_SCRIPT_SUBSTATE_COMMAND).and_return("running")
       expect(nx).not_to receive(:register_deadline).with(nil, 7200)
 
       expect { nx.wait }.to nap(60)
@@ -785,7 +1453,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     it "destroys runner if it does not pick a job in five minutes and not busy" do
       runner.update(ready_at: now - 6 * 60, workflow_job: nil)
       expect(client).to receive(:get).and_return({busy: false})
-      expect(vm.sshable).to receive(:_cmd).with("systemctl show -p SubState --value runner-script").and_return("running")
+      expect(vm.sshable).to receive(:_cmd).with(described_class::RUNNER_SCRIPT_SUBSTATE_COMMAND).and_return("running")
       expect(nx).to receive(:register_deadline).twice
       expect(Clog).to receive(:emit).with("The runner did not pick a job", instance_of(GithubRunner)).and_call_original
 
@@ -796,7 +1464,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     it "destroys runner if it does not pick a job in five minutes and already deleted" do
       runner.update(ready_at: now - 6 * 60, workflow_job: nil)
       expect(client).to receive(:get).and_raise(Octokit::NotFound)
-      expect(vm.sshable).to receive(:_cmd).with("systemctl show -p SubState --value runner-script").and_return("running")
+      expect(vm.sshable).to receive(:_cmd).with(described_class::RUNNER_SCRIPT_SUBSTATE_COMMAND).and_return("running")
       expect(nx).to receive(:register_deadline).twice
       expect(Clog).to receive(:emit).with("The runner did not pick a job", instance_of(GithubRunner)).and_call_original
 
@@ -806,21 +1474,21 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
 
     it "does not destroy runner if it doesn not pick a job but two minutes not pass yet" do
       runner.update(ready_at: now - 60, workflow_job: nil)
-      expect(vm.sshable).to receive(:_cmd).with("systemctl show -p SubState --value runner-script").and_return("running")
+      expect(vm.sshable).to receive(:_cmd).with(described_class::RUNNER_SCRIPT_SUBSTATE_COMMAND).and_return("running")
 
       expect { nx.wait }.to nap(60)
       expect(runner.destroy_set?).to be(false)
     end
 
     it "destroys the runner if the runner-script is succeeded" do
-      expect(vm.sshable).to receive(:_cmd).with("systemctl show -p SubState --value runner-script").and_return("exited")
+      expect(vm.sshable).to receive(:_cmd).with(described_class::RUNNER_SCRIPT_SUBSTATE_COMMAND).and_return("exited")
 
       expect { nx.wait }.to nap(15)
       expect(runner.destroy_set?).to be(true)
     end
 
     it "provisions a spare runner and destroys the current one if the runner-script is failed" do
-      expect(vm.sshable).to receive(:_cmd).with("systemctl show -p SubState --value runner-script").and_return("failed")
+      expect(vm.sshable).to receive(:_cmd).with(described_class::RUNNER_SCRIPT_SUBSTATE_COMMAND).and_return("failed")
       expect(runner).to receive(:provision_spare_runner)
 
       expect { nx.wait }.to nap(0)
@@ -828,7 +1496,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     end
 
     it "naps if the runner-script is running" do
-      expect(vm.sshable).to receive(:_cmd).with("systemctl show -p SubState --value runner-script").and_return("running")
+      expect(vm.sshable).to receive(:_cmd).with(described_class::RUNNER_SCRIPT_SUBSTATE_COMMAND).and_return("running")
 
       expect { nx.wait }.to nap(60)
     end
@@ -894,7 +1562,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
 
     it "Logs journalctl, docker limits, and cache proxy log if workflow_job is not successful" do
       runner.update(workflow_job: {"conclusion" => "failure"})
-      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo ln /vm/#{vm.inhost_name}/serial.log /var/log/ubicloud/serials/#{runner.ubid}\\_serial.log")
+      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo ln /vm/#{vm.inhost_name}/serial.log /var/log/ubicloud/serials/#{runner.ubid}\\_serial.log", log: :on_error)
       expect(vm.sshable).to receive(:_cmd).with("journalctl -u runner-script -t 'run-withenv.sh' -t 'systemd' --no-pager | grep -Fv Started")
       expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, log: false)
         TOKEN=$(curl -m 10 -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
@@ -908,7 +1576,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
 
     it "Logs journalctl, docker limits, and cache proxy log if workflow_job is nil" do
       runner.update(workflow_job: nil)
-      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo ln /vm/#{vm.inhost_name}/serial.log /var/log/ubicloud/serials/#{runner.ubid}\\_serial.log")
+      expect(vm.vm_host.sshable).to receive(:_cmd).with("sudo ln /vm/#{vm.inhost_name}/serial.log /var/log/ubicloud/serials/#{runner.ubid}\\_serial.log", log: :on_error)
       expect(vm.sshable).to receive(:_cmd).with("journalctl -u runner-script -t 'run-withenv.sh' -t 'systemd' --no-pager | grep -Fv Started")
       expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, log: false)
         TOKEN=$(curl -m 10 -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
@@ -923,7 +1591,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
 
     it "Logs docker limits and cache proxy log if workflow_job is successful" do
       runner.update(workflow_job: {"conclusion" => "success"})
-      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, log: false).and_return("ratelimit-limit: 100;w=21600\nratelimit-remaining: 98;w=21600\ndocker-ratelimit-source: 192.168.1.1\n")
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, log: false).and_return("docker-ratelimit-source: 192.168.1.1\nx-ratelimit-limit: 100;w=21600\nratelimit-limit: 100;w=21600\nx-ratelimit-remaining: 98;w=21600\nratelimit-remaining: 98;w=21600\n")
         TOKEN=$(curl -m 10 -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
         curl -m 10 -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
       COMMAND
@@ -978,7 +1646,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
 
     it "Logs docker limits and empty cache proxy log if workflow_job is successful" do
       runner.update(workflow_job: {"conclusion" => "success"})
-      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, log: false).and_return("ratelimit-limit: 100;w=21600\nratelimit-remaining: 98;w=21600\ndocker-ratelimit-source: 192.168.1.1\n")
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, log: false).and_return("docker-ratelimit-source: 192.168.1.1\nx-ratelimit-limit: 100;w=21600\nratelimit-limit: 100;w=21600\nx-ratelimit-remaining: 98;w=21600\nratelimit-remaining: 98;w=21600\n")
         TOKEN=$(curl -m 10 -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
         curl -m 10 -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
       COMMAND
@@ -990,11 +1658,23 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
 
     it "Logs docker limits and nil cache proxy log if workflow_job is successful" do
       runner.update(workflow_job: {"conclusion" => "success"})
-      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, log: false).and_return("ratelimit-limit: 100;w=21600\nratelimit-remaining: 98;w=21600\ndocker-ratelimit-source: 192.168.1.1\n")
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, log: false).and_return("docker-ratelimit-source: 192.168.1.1\nx-ratelimit-limit: 100;w=21600\nratelimit-limit: 100;w=21600\nx-ratelimit-remaining: 98;w=21600\nratelimit-remaining: 98;w=21600\n")
         TOKEN=$(curl -m 10 -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
         curl -m 10 -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
       COMMAND
       expect(Clog).to receive(:emit).with("Remaining DockerHub rate limits", {dockerhub_rate_limits: {limit: 100, limit_window: 21600, remaining: 98, remaining_window: 21600, source: "192.168.1.1"}})
+      expect(vm.sshable).to receive(:_cmd).with("sudo cat /var/log/cacheproxy.log", log: false).and_return(nil)
+
+      nx.collect_final_telemetry
+    end
+
+    it "Logs docker limits whatever the header order is, and without the source header" do
+      runner.update(workflow_job: {"conclusion" => "success"})
+      expect(vm.sshable).to receive(:_cmd).with(<<~COMMAND, log: false).and_return("ratelimit-remaining: 98;w=21600\nratelimit-limit: 100;w=21600\n")
+        TOKEN=$(curl -m 10 -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:ratelimitpreview/test:pull" | jq -r .token)
+        curl -m 10 -s --head -H "Authorization: Bearer $TOKEN" https://registry-1.docker.io/v2/ratelimitpreview/test/manifests/latest | grep ratelimit
+      COMMAND
+      expect(Clog).to receive(:emit).with("Remaining DockerHub rate limits", {dockerhub_rate_limits: {limit: 100, limit_window: 21600, remaining: 98, remaining_window: 21600, source: nil}})
       expect(vm.sshable).to receive(:_cmd).with("sudo cat /var/log/cacheproxy.log", log: false).and_return(nil)
 
       nx.collect_final_telemetry
@@ -1038,14 +1718,28 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
       expect(client).to receive(:get).and_raise(Octokit::NotFound)
       expect(client).not_to receive(:delete)
       expect(nx).to receive(:collect_final_telemetry)
-      fw = instance_double(Firewall)
-      ps = instance_double(PrivateSubnet, firewalls: [fw])
-      expect(fw).to receive(:destroy)
-      expect(ps).to receive(:incr_destroy)
-      expect(vm).to receive(:private_subnets).and_return([ps])
+      ps = Prog::Vnet::SubnetNexus.assemble(vm.project_id, allow_only_ssh: true).subject
+      firewall = ps.firewalls.first
+      Nic.create(private_subnet_id: ps.id, private_ipv4: "10.0.0.5/32", private_ipv6: "fd10:9b0b:6b4b:8fbb::/79", name: "runner-nic", state: "active", vm_id: vm.id)
       expect(vm).to receive(:incr_destroy)
 
       expect { nx.destroy }.to hop("wait_vm_destroy")
+      expect(ps.destroy_set?).to be(true)
+      expect(firewall).not_to exist
+    end
+
+    it "keeps the private subnet the installation shares between its runners" do
+      runner.incr_skip_deregistration
+      Strand.create_with_id(vm, prog: "Vm::Nexus", label: "wait")
+      ps = Prog::Vnet::SubnetNexus.assemble(vm.project_id, allow_only_ssh: true).subject
+      installation.add_private_subnet(ps)
+      firewall = ps.firewalls.first
+      Nic.create(private_subnet_id: ps.id, private_ipv4: "10.0.0.5/32", private_ipv6: "fd10:9b0b:6b4b:8fbb::/79", name: "runner-nic", state: "active", vm_id: vm.id)
+
+      expect { nx.destroy }.to hop("wait_vm_destroy")
+      expect(ps.destroy_set?).to be(false)
+      expect(firewall).to exist
+      expect(vm.destroy_set?(cached: false)).to be(true)
     end
 
     it "skip deregistration and destroy vm immediately" do
@@ -1083,7 +1777,7 @@ RSpec.describe Prog::Github::GithubRunnerNexus do
     end
 
     it "does not destroy vm if it's already destroyed" do
-      runner.update(vm_id: nil)
+      runner.update(vm_id: nil, location_id: nil)
       expect(nx).to receive(:vm).and_return(nil).at_least(:once)
       expect(nx).to receive(:decr_destroy)
       expect(client).to receive(:get).and_raise(Octokit::NotFound)

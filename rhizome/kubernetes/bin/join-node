@@ -17,6 +17,8 @@ begin
   node_ipv6 = params.fetch("node_ipv6")
   if is_control_plane
     certificate_key = params.fetch("certificate_key")
+  else
+    node_labels = params.fetch("node_labels")
   end
 rescue KeyError => e
   puts "Needed #{e.key} in parameters"
@@ -51,23 +53,16 @@ if is_control_plane
       "advertiseAddress" => node_ipv4,
       "bindPort" => 6443,
     },
-    "apiServer" => {
-      "extraArgs" => [
-        {
-          "name" => "bind-address",
-          "value" => "::",
-        },
-        {
-          "name" => "advertise-address",
-          "value" => node_ipv4,
-        },
-      ],
-    },
+  }
+else
+  config["nodeRegistration"]["kubeletExtraArgs"] << {
+    "name" => "node-labels",
+    "value" => node_labels.map { |k, v| "#{k}=#{v}" }.join(","),
   }
 end
 
 config_path = "/tmp/join-config.yaml"
 safe_write_to_file(config_path, config.to_yaml)
-r("kubeadm join --config #{config_path}")
+r("kubeadm", "join", "--config", config_path)
 
 r("sudo /home/ubi/kubernetes/bin/setup-cni")

@@ -5,6 +5,8 @@ require "uri"
 
 class Prog::Test::FirewallRules < Prog::Test::Base
   subject_is :firewall
+  frame_reader :subnet_id_outside
+  frame_accessor :vm_to_be_connected_id, :firewalls
 
   label def start
     vms = [vm1, vm2, vm_outside]
@@ -34,19 +36,17 @@ ExecStart=nc -l 8080 -6
     vm1.sshable.cmd("sudo systemctl daemon-reload")
     vm1.sshable.cmd("sudo systemctl enable listening_ipv4.service")
     vm1.sshable.cmd("sudo systemctl enable listening_ipv6.service")
-    update_stack({"vm_to_be_connected_id" => vm1.id})
+    self.vm_to_be_connected_id = vm1.id
 
     hop_perform_tests_none
   end
 
   label def perform_tests_none
-    update_firewall_rules(config: :perform_tests_none) unless frame["firewalls"] == "none"
+    update_firewall_rules(config: :perform_tests_none) unless firewalls == "none"
 
-    update_stack({"firewalls" => "none"})
+    self.firewalls = "none"
 
-    if firewall.private_subnets.first.update_firewall_rules_set? || firewall.private_subnets.first.vms.any? { |vm| vm.update_firewall_rules_set? }
-      nap 5
-    end
+    nap 5 unless firewall_rules_applied?(firewall.private_subnets.first)
 
     vm1.sshable.cmd("true")
     vm2.sshable.cmd("true")
@@ -59,12 +59,10 @@ ExecStart=nc -l 8080 -6
   end
 
   label def perform_tests_public_ipv4
-    update_firewall_rules(config: :perform_tests_public_ipv4) unless frame["firewalls"] == "public_ipv4"
+    update_firewall_rules(config: :perform_tests_public_ipv4) unless firewalls == "public_ipv4"
 
-    update_stack({"firewalls" => "public_ipv4"})
-    if firewall.private_subnets.first.update_firewall_rules_set? || firewall.private_subnets.first.vms.any? { |vm| vm.update_firewall_rules_set? }
-      nap 5
-    end
+    self.firewalls = "public_ipv4"
+    nap 5 unless firewall_rules_applied?(firewall.private_subnets.first)
 
     test_connection(vm1.ip4_string, vm2, should_fail: false, ipv4: true, hop_method_symbol: nil)
     test_connection(vm1.ip4_string, vm_outside, should_fail: true, ipv4: true, hop_method_symbol: :hop_perform_tests_public_ipv6)
@@ -73,12 +71,10 @@ ExecStart=nc -l 8080 -6
   end
 
   label def perform_tests_public_ipv6
-    update_firewall_rules(config: :perform_tests_public_ipv6) unless frame["firewalls"] == "public_ipv6"
+    update_firewall_rules(config: :perform_tests_public_ipv6) unless firewalls == "public_ipv6"
 
-    update_stack({"firewalls" => "public_ipv6"})
-    if firewall.private_subnets.first.update_firewall_rules_set? || firewall.private_subnets.first.vms.any? { |vm| vm.update_firewall_rules_set? }
-      nap 5
-    end
+    self.firewalls = "public_ipv6"
+    nap 5 unless firewall_rules_applied?(firewall.private_subnets.first)
 
     vm1.sshable.cmd("sudo systemctl stop listening_ipv4.service")
     vm1.sshable.cmd("sudo systemctl start listening_ipv6.service")
@@ -88,27 +84,23 @@ ExecStart=nc -l 8080 -6
   end
 
   label def perform_tests_private_ipv4
-    update_firewall_rules(config: :perform_tests_private_ipv4) unless frame["firewalls"] == "private_ipv4"
+    update_firewall_rules(config: :perform_tests_private_ipv4) unless firewalls == "private_ipv4"
 
-    update_stack({"firewalls" => "private_ipv4"})
-    if firewall.private_subnets.first.update_firewall_rules_set? || firewall.private_subnets.first.vms.any? { |vm| vm.update_firewall_rules_set? }
-      nap 5
-    end
+    self.firewalls = "private_ipv4"
+    nap 5 unless firewall_rules_applied?(firewall.private_subnets.first)
 
     vm1.sshable.cmd("sudo systemctl stop listening_ipv6.service")
     vm1.sshable.cmd("sudo systemctl start listening_ipv4.service")
-    test_connection(vm1.nics.first.private_ipv4.nth(0), vm2, should_fail: false, ipv4: true, hop_method_symbol: nil)
+    test_connection(vm1.user_nic.private_ipv4.nth(0), vm2, should_fail: false, ipv4: true, hop_method_symbol: nil)
     test_connection(vm1.ip4_string, vm_outside, should_fail: true, ipv4: true, hop_method_symbol: :hop_perform_tests_private_ipv6)
-    fail_test "#{vm_outside.inhost_name} should not be able to connect to #{vm1.nics.first.private_ipv4.nth(0)} on port 8080"
+    fail_test "#{vm_outside.inhost_name} should not be able to connect to #{vm1.user_nic.private_ipv4.nth(0)} on port 8080"
   end
 
   label def perform_tests_private_ipv6
-    update_firewall_rules(config: :perform_tests_private_ipv6) unless frame["firewalls"] == "private_ipv6"
+    update_firewall_rules(config: :perform_tests_private_ipv6) unless firewalls == "private_ipv6"
 
-    update_stack({"firewalls" => "private_ipv6"})
-    if firewall.private_subnets.first.update_firewall_rules_set? || firewall.private_subnets.first.vms.any? { |vm| vm.update_firewall_rules_set? }
-      nap 5
-    end
+    self.firewalls = "private_ipv6"
+    nap 5 unless firewall_rules_applied?(firewall.private_subnets.first)
 
     vm1.sshable.cmd("sudo systemctl stop listening_ipv4.service")
     vm1.sshable.cmd("sudo systemctl start listening_ipv6.service")
@@ -139,7 +131,7 @@ ExecStart=nc -l 8080 -6
     when :perform_tests_public_ipv6
       {cidr: vm2.ip6_string, port_range: Sequel.pg_range(8080..8080)}
     when :perform_tests_private_ipv4
-      {cidr: vm2.nics.first.private_ipv4.to_s, port_range: Sequel.pg_range(8080..8080)}
+      {cidr: vm2.user_nic.private_ipv4.to_s, port_range: Sequel.pg_range(8080..8080)}
     when :perform_tests_private_ipv6
       {cidr: vm2.private_ipv6.to_s, port_range: Sequel.pg_range(8080..8080)}
     else
@@ -150,7 +142,7 @@ ExecStart=nc -l 8080 -6
   end
 
   def vm1
-    connected_id = frame["vm_to_be_connected_id"]
+    connected_id = vm_to_be_connected_id
     @vm1 ||= if connected_id
       firewall.private_subnets.first.vms.find { |vm| vm.id == connected_id }
     else
@@ -163,7 +155,7 @@ ExecStart=nc -l 8080 -6
   end
 
   def vm_outside
-    @vm_outside ||= PrivateSubnet.find { |ps| ps.id != vm1.private_subnets.first.id }.vms.first
+    @vm_outside ||= PrivateSubnet[subnet_id_outside].vms.first
   end
 
   def test_connection(to_connect_ip, connecting, should_fail: false, ipv4: true, hop_method_symbol: nil)

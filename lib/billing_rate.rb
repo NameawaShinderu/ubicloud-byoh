@@ -3,15 +3,15 @@
 require "yaml"
 
 class BillingRate
-  # :nocov:
+  # simplecov:disable
   def self.freeze
     rates
     super
   end
-  # :nocov:
+  # simplecov:enable
 
   def self.rates
-    @rates ||= YAML.load_file("config/billing_rates.yml", permitted_classes: [Time])
+    @rates ||= Dir["config/billing_rates/*.yml"].flat_map { YAML.load_file(it, permitted_classes: [Time]) }
   end
 
   def self.from_resource_properties(resource_type, resource_family, location, byoc = false, active_at = Time.now)
@@ -78,6 +78,8 @@ class BillingRate
       "#{resource_family}-#{amount.to_i} backed Kubernetes Worker Node"
     when "KubernetesWorkerStorage"
       "#{amount.to_i} GiB Storage for Kubernetes Worker Node"
+    when "MachineImageStorage"
+      "#{"%.2f" % amount} GiB Storage for Machine Image"
     else
       fail "BUG: Unknown resource type for line item description"
     end

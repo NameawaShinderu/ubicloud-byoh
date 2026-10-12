@@ -11,27 +11,37 @@ class PostgresResource < Sequel::Model
   one_to_one :representative_server, class: :PostgresServer, key: :resource_id, conditions: {is_representative: true}, read_only: true
   one_through_one :timeline, class: :PostgresTimeline, join_table: :postgres_server, left_key: :resource_id, read_only: true
   one_to_many :metric_destinations, class: :PostgresMetricDestination, remover: nil, clearer: nil
+  one_to_many :log_destinations, class: :PostgresLogDestination, remover: nil, clearer: nil
   many_to_one :private_subnet, read_only: true
   many_to_one :location, read_only: true
   one_to_many :read_replicas, class: :PostgresResource, key: :parent_id, conditions: {restore_target: nil}, read_only: true
   one_to_one :init_script, class: :PostgresInitScript, key: :id, read_only: true
 
-  plugin :association_dependencies, metric_destinations: :destroy, init_script: :destroy
+  plugin :association_dependencies, metric_destinations: :destroy, log_destinations: :destroy, init_script: :destroy
   dataset_module Pagination
 
   plugin ResourceMethods, redacted_columns: [:root_cert_1, :root_cert_2, :server_cert, :trusted_ca_certs, :client_root_cert_1, :client_root_cert_2, :client_cert],
-    encrypted_columns: [:superuser_password, :root_cert_key_1, :root_cert_key_2, :server_cert_key, :client_root_cert_key_1, :client_root_cert_key_2, :client_cert_key]
+    encrypted_columns: [:superuser_password, :root_cert_key_1, :root_cert_key_2, :server_cert_key, :client_root_cert_key_1, :client_root_cert_key_2, :client_cert_key, :parseable_password]
   plugin ProviderDispatcher, __FILE__
-  plugin SemaphoreMethods, :initial_provisioning, :update_firewall_rules, :refresh_dns_record, :update_billing_records,
-    :destroy, :refresh_certificates, :use_different_az, :use_old_walg_command, :check_disk_usage,
+  plugin SemaphoreMethods, :initial_provisioning, :refresh_dns_record, :update_billing_records,
+    :destroy, :refresh_certificates, :use_different_az, :check_disk_usage,
     :storage_auto_scale_action_performed_80, :storage_auto_scale_action_performed_85, :storage_auto_scale_action_performed_90,
-    :storage_auto_scale_canceled, :storage_auto_scale_not_cancellable, :skip_strict_memory_overcommit
+    :storage_auto_scale_canceled, :storage_auto_scale_not_cancellable, :skip_strict_memory_overcommit,
+    :bypass_maintenance_window
   include ObjectTag::Cleanup
 
-  ServerExclusionFilters = Struct.new(:exclude_host_ids, :exclude_data_centers, :exclude_availability_zones, :availability_zone)
+  ServerExclusionFilters = Struct.new(:exclude_host_ids, :exclude_data_centers, :exclude_availability_zones, :availability_zone, :availability_zone_required)
 
   def display_location
     location.display_name
+  end
+
+  # AWS management SSH uses IPv6 (so the mgmt NIC gets no IPv4 EIP) only when
+  # the flag is on and the subnet has a dedicated mgmt security group with the
+  # control plane SSH ingress rules.
+  def aws_ssh_ipv6?
+    return false unless location.aws? && project.get_ff_postgres_aws_ssh_ipv6
+    private_subnet.dedicated_mgmt_security_group?
   end
 
   def path
@@ -50,6 +60,8 @@ class PostgresResource < Sequel::Model
     representative_server.version
   end
 
+  RUNNING_STRAND_LABELS = %w[wait refresh_certificates wait_refresh_public_cert refresh_dns_record].freeze
+
   def display_state
     return "deleting" if destroying_set? || destroy_set? || strand.nil?
 
@@ -58,24 +70,32 @@ class PostgresResource < Sequel::Model
     return "restoring_backup" if server_strand_label == "initialize_database_from_backup"
     return "replaying_wal" if ["wait_catch_up", "wait_synchronization"].include?(server_strand_label)
     return "finalizing_restore" if server_strand_label == "wait_recovery_completion"
-    return "restarting" if server_strand_label == "restart"
-    return "running" if ["wait", "refresh_certificates", "refresh_dns_record"].include?(strand.label) && !initial_provisioning_set?
+    return "restarting" if server_strand_label == "wait" && representative_server.restart_set?
+    return "running" if RUNNING_STRAND_LABELS.include?(strand.label) && !initial_provisioning_set?
 
     "creating"
   end
 
+  # Update prog assemble method when updating this
+  def uses_publicly_signed_certificates?
+    !!(hostname_version == "v3" &&
+      Config.acme_email &&
+      location.dns_suffix.to_s.empty? &&
+      !project.get_ff_postgres_hostname_override &&
+      dns_zone)
+  end
+
   def hostname_suffix
-    project&.get_ff_postgres_hostname_override || [location.dns_suffix, Config.postgres_service_hostname].compact.join(".")
+    domain = (hostname_version == "v3") ? Config.postgres_service_hostname_v3 : Config.postgres_service_hostname
+    project&.get_ff_postgres_hostname_override || [location.dns_suffix, domain].compact.join(".")
   end
 
   def dns_zone
     @dns_zone ||= DnsZone[project_id: Config.postgres_service_project_id, name: hostname_suffix]
   end
 
-  AAAA_CUTOFF = Time.utc(2026, 1, 13, 20)
   def can_add_aaaa_record?
     !location.aws? &&
-      created_at < AAAA_CUTOFF &&
       dns_zone &&
       representative_server.vm.ip6_string &&
       dns_zone
@@ -94,39 +114,102 @@ class PostgresResource < Sequel::Model
     end
   end
 
+  def private_hostname
+    if dns_zone
+      if hostname_version == "v3"
+        "#{name}.#{ubid}.private.#{hostname_suffix}"
+      else
+        "private.#{hostname}"
+      end
+    else
+      representative_server.vm.private_ipv4_string
+    end
+  end
+
+  def cert_hostname
+    if dns_zone && hostname_version == "v3"
+      "*.#{ubid}.#{hostname_suffix}"
+    else
+      hostname
+    end
+  end
+
+  def cert_private_hostname
+    if dns_zone && hostname_version == "v3"
+      "*.#{ubid}.private.#{hostname_suffix}"
+    else
+      private_hostname
+    end
+  end
+
   def identity
     "#{ubid}.#{hostname_suffix}"
   end
 
-  def connection_string
+  def libpq_ssl_params(channel_binding: true, publicly_signed: uses_publicly_signed_certificates?)
+    ssl_params = {"sslmode" => "require"}
+    ssl_params["channel_binding"] = "require" if channel_binding
+    if publicly_signed
+      ssl_params["sslmode"] = "verify-full"
+      ssl_params["sslrootcert"] = "system"
+    end
+    ssl_params
+  end
+
+  private def base_connection_string(hostname)
     URI::Generic.build2(
       scheme: "postgres",
       userinfo: "postgres:#{URI.encode_uri_component(superuser_password)}",
       host: hostname,
       port: 5432,
       path: "/postgres",
-      query: "channel_binding=require",
+      query: libpq_ssl_params.map { it.join("=") }.join("&"),
     ).to_s
+  end
+
+  def connection_string
+    base_connection_string(hostname)
+  end
+
+  def private_connection_string
+    base_connection_string(private_hostname)
   end
 
   def replication_connection_string(application_name:)
     query_parameters = {
-      sslrootcert: "/etc/ssl/certs/server-ca.crt",
+      sslrootcert: (root_cert_1 && root_cert_2) ? "/etc/ssl/certs/server-ca.crt" : "system",
       sslcert: "/etc/ssl/certs/client.crt",
       sslkey: "/etc/ssl/certs/client.key",
       sslmode: dns_zone ? "verify-full" : "require",
       dbname: "postgres",
       application_name:,
-    }.map { |k, v| "#{k}=#{v}" }.join("&")
+      tcp_user_timeout: 30000,
+    }
+    query_parameters = query_parameters.map { |k, v| "#{k}=#{v}" }.join("&")
 
-    URI::Generic.build2(scheme: "postgres", userinfo: "ubi_replication", host: dns_zone ? identity : representative_server.vm.ip4_string, query: query_parameters).to_s
+    URI::Generic.build2(scheme: "postgres", userinfo: "ubi_replication", host: private_hostname, query: query_parameters).to_s
+  end
+
+  def requested_availability_zone_id
+    required_availability_zone_id || preferred_availability_zone_id
+  end
+
+  def availability_zone_required?
+    !required_availability_zone_id.nil?
+  end
+
+  def requested_availability_zone_suffix
+    return unless (zone_id = requested_availability_zone_id)
+
+    suffix = location.location_azs_dataset.where(zone_id:).get(:az)
+    fail "#{location.name} has no availability zone #{zone_id}" if suffix.nil? && availability_zone_required?
+    suffix
   end
 
   def provision_new_standby
-    timeline_id = read_replica? ? parent.timeline.id : timeline.id
     Prog::Postgres::PostgresServerNexus.assemble(
       resource_id: id,
-      timeline_id:,
+      timeline_id: effective_timeline.id,
       timeline_access: "fetch",
       **new_server_exclusion_filters.to_h,
     )
@@ -143,6 +226,8 @@ class PostgresResource < Sequel::Model
   def has_enough_fresh_servers?
     if version.to_i < target_version.to_i
       !upgrade_candidate_server.nil?
+    elsif family_migration_in_progress?
+      !family_migration_candidate.nil?
     else
       servers.count { !it.needs_recycling? } >= target_server_count
     end
@@ -151,9 +236,25 @@ class PostgresResource < Sequel::Model
   def has_enough_ready_servers?
     if version.to_i < target_version.to_i
       upgrade_candidate_server&.strand&.label == "wait"
+    elsif family_migration_in_progress?
+      family_migration_candidate&.strand&.label == "wait"
     else
       servers.count { !it.needs_recycling? && it.strand.label == "wait" } >= target_server_count
     end
+  end
+
+  def family_migration_in_progress?
+    return false if read_replica?
+    representative_server.image_family != target_image_family
+  end
+
+  def family_migration_candidate
+    servers.reject(&:is_representative).select { it.image_family == target_image_family }.max_by(&:created_at)
+  end
+
+  # Whether the primary must run synchronous replication (ANY-1 quorum commit).
+  def needs_sync_replication?
+    ha_type == HaType::SYNC
   end
 
   def needs_convergence?
@@ -161,8 +262,91 @@ class PostgresResource < Sequel::Model
     servers.any? { it.needs_recycling? } || servers.count != target_server_count || needs_upgrade
   end
 
+  def effective_timeline
+    read_replica? ? parent.timeline : timeline
+  end
+
+  def data_volume_size_gib
+    target_storage_size_gib
+  end
+
+  DECIMAL_GB_PER_BINARY_GIB = (1024**3) / 1_000_000_000.0
+
+  # On AWS, target_storage_size_gib is instance-store capacity in decimal GB.
+  # Convert to binary GiB before comparing against df-measured sizes. GCP and
+  # metal are already binary GiB.
+  def target_storage_capacity_gib
+    if location.aws?
+      target_storage_size_gib / DECIMAL_GB_PER_BINARY_GIB
+    else
+      target_storage_size_gib.to_f
+    end
+  end
+
+  def latest_backup_too_large_for_target?
+    limit = target_storage_capacity_gib
+    current = representative_server&.storage_size_gib
+    limit *= STORAGE_SCALE_DOWN_MAX_USAGE_RATIO if current && data_volume_size_gib < current
+    effective_timeline.latest_backup_size_in_gib > limit
+  end
+
+  # A scale down is only allowed if the current disk usage stays below this
+  # fraction of the requested storage size.
+  STORAGE_SCALE_DOWN_MAX_USAGE_RATIO = 0.8
+
+  # Current disk usage of the representative server in GiB, or nil if there
+  # are no recent metrics. A scale down is refused while this is nil, because
+  # there is no way to tell whether the data fits.
+  def observed_disk_usage_gib
+    return unless (percent = representative_server.observed_disk_usage_percent)
+    percent * representative_server.storage_size_gib / 100.0
+  end
+
+  # Whether usage_gib fits in target_storage_size_gib with the headroom a
+  # scale down requires. Callers pass usage_gib in, so that checking many
+  # sizes queries the metrics only once.
+  def storage_size_fits_usage?(target_storage_size_gib, usage_gib)
+    target_storage_size_gib * STORAGE_SCALE_DOWN_MAX_USAGE_RATIO >= usage_gib
+  end
+
   def in_maintenance_window?
-    maintenance_window_start_at.nil? || (Time.now.utc.hour - maintenance_window_start_at) % 24 < MAINTENANCE_DURATION_IN_HOURS
+    return true if maintenance_window_start_at.nil?
+    now = Time.now.utc
+    offset = (now.hour - maintenance_window_start_at) % 24
+    return false unless offset < MAINTENANCE_DURATION_IN_HOURS
+    return true if maintenance_window_days_bitmask.zero?
+
+    # Check the day the window opened at, in case window crosses the midnight
+    bit = ((now - offset * 3600).wday + 6) % 7
+    maintenance_window_days_bitmask[bit] == 1
+  end
+
+  def pending_platform_maintenance?
+    !Semaphore.where(strand_id: servers_dataset.select(:id), name: "recycle").empty?
+  end
+
+  # Returns array of any DNS record lookup failures
+  def check_all_dns_records
+    return [].freeze unless dns_zone && (vm = representative_server&.vm)
+
+    record_name = hostname
+    nameservers = dns_zone.dns_servers(eager: :vms).flat_map { it.vms.map(&:ip4_string) }
+
+    DnsChecker.open(nameservers) do |dns|
+      if location.aws?
+        dns.check(:CNAME, record_name, vm.aws_instance.ipv4_dns_name + ".")
+      else
+        dns.check(:A, record_name, vm.ip4_string)
+
+        unless dns_zone.records_dataset.where(type: "AAAA", name: record_name + ".").empty?
+          dns.check(:AAAA, record_name, vm.ip6_string)
+        end
+
+        record_name = private_hostname
+        dns.check(:A, record_name, vm.private_ipv4_string)
+        dns.check(:AAAA, record_name, vm.private_ipv6_string)
+      end
+    end
   end
 
   # This may return nil if the customer has destroyed the firewall or
@@ -176,6 +360,29 @@ class PostgresResource < Sequel::Model
   end
 
   PG_FIREWALL_RULE_PORT_RANGES = [Sequel.pg_range(5432..5432), Sequel.pg_range(6432..6432)].freeze
+
+  def internal_firewall_rules
+    pg_cidrs = [private_subnet.net4.to_s, private_subnet.net6.to_s] + Config.postgres_internal_firewall_cidrs
+    rules = pg_cidrs.flat_map { |cidr| PG_FIREWALL_RULE_PORT_RANGES.map { |port_range| {cidr:, port_range:} } }
+    rules += Config.control_plane_outbound_cidrs.map { {cidr: it, port_range: Sequel.pg_range(22..22)} } if mgmt_ssh_via_user_security_group?
+    rules
+  end
+
+  # Keep port 22 in the internal firewall, which the user security group is
+  # reconciled to, only while some server still depends on the user group
+  # for control plane SSH. New AWS resources use the mgmt group from the
+  # start; existing ones switch once the mgmt group is split off and every
+  # VM has a management NIC.
+  def mgmt_ssh_via_user_security_group?
+    return true unless location.aws?
+    return false if servers.empty?
+
+    ps_aws = private_subnet.private_subnet_aws_resource
+    return true if ps_aws.nil? || ps_aws.mgmt_security_group_id.nil? || ps_aws.mgmt_security_group_id == ps_aws.user_security_group_id
+
+    servers.any? { it.vm.management_nic.nil? }
+  end
+
   def pg_firewall_rules(firewall: customer_firewall)
     return [] unless firewall
 
@@ -221,22 +428,61 @@ class PostgresResource < Sequel::Model
   def validate
     super
     validates_includes(0..23, :maintenance_window_start_at, allow_nil: true, message: "must be between 0 and 23")
+    validates_includes(0..127, :maintenance_window_days_bitmask, allow_nil: true, message: "must be between 0 and 127")
+  end
+
+  # An empty list means the window applies every day (the bitmask is 0).
+  def maintenance_window_day_names
+    DAYS_OF_WEEK.each_with_index.filter_map { |d, i| d if maintenance_window_days_bitmask[i] == 1 }
+  end
+
+  # [day, checked] pairs for the maintenance window days.
+  def maintenance_window_day_options_state
+    DAYS_OF_WEEK.each_with_index.map { |day, i| [day, maintenance_window_days_bitmask[i] == 1] }
+  end
+
+  # Human readable window, such as "Mon, Thu, 22:00 - 00:00 (UTC)", or nil if
+  # no maintenance window is set.
+  def maintenance_window_label
+    return unless (start_at = maintenance_window_start_at)
+    hours = self.class.maintenance_hour_options[start_at][1]
+    days = maintenance_window_day_names
+    days.empty? ? hours : "#{days.map(&:capitalize).join(", ")}, #{hours}"
   end
 
   def read_replica?
     parent_id && restore_target.nil?
   end
 
+  # nil when backup downloads are available; otherwise a user-facing message explaining
+  # why, which the route raises and the view branches on, so the two never drift.
+  def backup_download_unavailable_message
+    return "Backup downloads are not supported for read replicas. Request credentials on the primary database." if read_replica?
+    return "Backup downloads are not supported for GCP-hosted PostgreSQL databases." if timeline.location.gcp?
+
+    unavailable = "Backup downloads are not available for this PostgreSQL database."
+    return unavailable unless timeline.location.aws? || project.get_ff_postgres_backup_download_minio
+    # In instance-profile mode the bucket policy is attached to the Postgres VM role
+    # rather than a static writer user, so there is no credential for GetFederationToken
+    # to federate a download session from.
+    return unavailable if timeline.location.aws? && Config.aws_postgres_iam_access
+
+    nil
+  end
+
   def ongoing_failover?
     servers.any? { it.taking_over? }
   end
 
-  def incr_restart
-    Semaphore.incr(servers_dataset.select(:id), "restart")
+  def server_incr(*semaphores)
+    server_ids = servers.map(&:id)
+    semaphores.map do
+      Semaphore.incr(server_ids, it)
+    end
   end
 
   def upgrade_stage
-    strand.children_dataset.where(prog: "Postgres::ConvergePostgresResource").first&.label
+    strand.children_dataset.first(prog: "Postgres::ConvergePostgresResource")&.label
   end
 
   def upgrade_status
@@ -257,9 +503,33 @@ class PostgresResource < Sequel::Model
     !needs_convergence? && !PostgresTimeline.earliest_restore_time(timeline).nil?
   end
 
+  def update_target_sizes_with_replicas(target_vm_size:, target_storage_size_gib:, **extra)
+    target_vm_size_changing = self.target_vm_size != target_vm_size
+    update(target_vm_size:, target_storage_size_gib:, **extra)
+    read_replicas_dataset.update(target_vm_size:, target_storage_size_gib:)
+    return unless target_vm_size_changing
+    clamp_shared_memory_percent(target_vm_size)
+    servers.each(&:decr_ignore_instance_size_mismatch)
+    read_replicas.each do |rr|
+      rr.clamp_shared_memory_percent(target_vm_size)
+      rr.servers.each(&:decr_ignore_instance_size_mismatch)
+    end
+  end
+
+  # Adjust shared memory percent for small VM sizes.
+  def clamp_shared_memory_percent(target_vm_size)
+    requested = user_config["ubicloud.shared_memory_percent"]
+    return unless requested
+
+    max = Validation.postgres_max_shared_memory_percent(Option::POSTGRES_SIZE_OPTIONS[target_vm_size].memory_gib)
+    return if Integer(requested) <= max
+
+    update(user_config: user_config.merge("ubicloud.shared_memory_percent" => max.to_s))
+  end
+
   def handle_storage_auto_scale
     begin
-      disk_usage_percent = representative_server.vm.sshable.cmd("df --output=pcent /dat | tail -n 1").strip.delete("%").to_i
+      disk_usage_percent = representative_server.disk_usage_percent
     rescue
       Clog.emit("Failed to check disk usage for #{ubid}, skipping storage auto-scale check", representative_server)
       return
@@ -282,20 +552,20 @@ class PostgresResource < Sequel::Model
     return if disk_usage_percent < 90 && storage_auto_scale_action_performed_85_set?
     return if storage_auto_scale_action_performed_90_set?
 
-    # target_storage_size_gib being bigger than representative server's storage
+    # data_volume_size_gib being bigger than representative server's storage
     # size means storage auto-scale is in progress, so we should not trigger
     # another auto-scale or send warning emails.
-    return if representative_server.storage_size_gib < target_storage_size_gib
+    return if representative_server.storage_size_gib < data_volume_size_gib
 
     next_option = next_storage_auto_scale_option
 
     extra_email_content = if storage_auto_scale_canceled_set?
       :canceled_previously
     elsif next_option.nil?
-      Prog::PageNexus.assemble("#{ubid} high disk usage #{disk_usage_percent}%. No further auto-scaling possible.", ["PGStorageAutoScaleMaxSize", id], ubid, severity: "warning")
+      Prog::PageNexus.assemble("#{ubid} high disk usage #{disk_usage_percent}%. No further auto-scaling possible.", ["PGStorageAutoScaleMaxSize", id], ubid, resource_id: id, severity: "warning")
       :at_max_size
     elsif !project.quota_available?("PostgresVCpu", vcpu_delta(next_option))
-      Prog::PageNexus.assemble("#{ubid} high disk usage #{disk_usage_percent}%. Quota insufficient for auto-scale.", ["PGStorageAutoScaleQuotaInsufficient", id], ubid, severity: "warning")
+      Prog::PageNexus.assemble("#{ubid} high disk usage #{disk_usage_percent}%. Quota insufficient for auto-scale.", ["PGStorageAutoScaleQuotaInsufficient", id], ubid, resource_id: id, severity: "warning")
       :quota_insufficient
     end
 
@@ -311,8 +581,7 @@ class PostgresResource < Sequel::Model
         target_storage_size_gib = next_option["storage_size"]
 
         unless storage_auto_scale_canceled_set?
-          update(target_vm_size:, target_storage_size_gib:)
-          read_replicas_dataset.update(target_vm_size:, target_storage_size_gib:)
+          update_target_sizes_with_replicas(target_vm_size:, target_storage_size_gib:)
         end
       end
 
@@ -350,7 +619,7 @@ class PostgresResource < Sequel::Model
   def can_cancel_storage_auto_scale?
     return false if storage_auto_scale_canceled_set? || storage_auto_scale_not_cancellable_set? || !storage_auto_scale_action_performed_90_set?
 
-    converge_strand = strand.children_dataset.where(prog: "Postgres::ConvergePostgresResource").first
+    converge_strand = strand.children_dataset.first(prog: "Postgres::ConvergePostgresResource")
     return false unless converge_strand
 
     ["start", "provision_servers", "wait_servers_to_be_ready", "wait_for_maintenance_window"].include?(converge_strand.label)
@@ -366,12 +635,11 @@ class PostgresResource < Sequel::Model
       return false unless can_cancel_storage_auto_scale?
 
       current_storage_size_gib = representative_server.storage_size_gib
-      update(target_vm_size: vm_size, target_storage_size_gib: current_storage_size_gib)
-      read_replicas_dataset.update(target_vm_size: vm_size, target_storage_size_gib: current_storage_size_gib)
+      update_target_sizes_with_replicas(target_vm_size: vm_size, target_storage_size_gib: current_storage_size_gib)
 
       incr_storage_auto_scale_canceled
 
-      Prog::PageNexus.assemble("#{ubid} storage auto-scale canceled by user", ["PGStorageAutoScaleCanceled", id], ubid, severity: "warning")
+      Prog::PageNexus.assemble("#{ubid} storage auto-scale canceled by user", ["PGStorageAutoScaleCanceled", id], ubid, resource_id: id, severity: "warning")
 
       send_storage_auto_scale_canceled_notification
 
@@ -478,6 +746,32 @@ class PostgresResource < Sequel::Model
     )
   end
 
+  def send_failover_notification(mode:)
+    planned = mode == "planned"
+
+    body = [
+      "A standby server has been promoted to primary for your PostgreSQL database '#{name}' (#{ubid}).",
+    ]
+
+    body << if planned
+      "The promotion happened as part of maintenance or a configuration change."
+    else
+      "The primary server became unavailable, so a standby took over."
+    end
+
+    body << "Connections were briefly interrupted while the standby took over."
+
+    Util.send_email(
+      accounts_with_access,
+      planned ? "PostgreSQL Planned Maintenance: #{name}" : "PostgreSQL Failover: #{name}",
+      bcc: Config.postgres_notification_email,
+      greeting: "Hello,",
+      body:,
+      button_title: "View Database",
+      button_link: "#{Config.base_url}#{project.path}#{path}",
+    )
+  end
+
   # Returns emails for accounts with access
   def accounts_with_access
     Authorization.allowed_accounts_dataset(project.id, "Postgres:view", self).distinct.select_map(:email)
@@ -488,35 +782,28 @@ class PostgresResource < Sequel::Model
 
     options.add_option(name: "name")
 
-    options.add_option(name: "flavor", values: flavor || postgres_flavors(project).keys)
+    options.add_option(name: "flavor", values: flavor || Option::POSTGRES_FLAVOR_OPTIONS.keys)
 
-    options.add_option(name: "location", values: location || postgres_locations(project), parent: "flavor") do |flavor, location|
-      flavor == PostgresResource.default_flavor || location.provider != "aws"
-    end
+    available_families_and_sizes_by_location = {}
+    options.add_option(name: "location", values: location || postgres_locations(project), parent: "flavor")
 
     options.add_option(name: "family", values: Option::POSTGRES_FAMILY_OPTIONS.keys, parent: "location") do |flavor, location, family|
-      if location.aws?
-        ["m8gd", "i8g"].include?(family) || (Option::AWS_FAMILY_OPTIONS.include?(family) && project.send(:"get_ff_enable_#{family}"))
-      else
-        family == "standard" || family == "hobby"
-      end
+      (available_families_and_sizes_by_location[location.name] ||= available_families_and_sizes(location, project)).any? { |f, _| f == family }
     end
 
     options.add_option(name: "size", values: Option::POSTGRES_SIZE_OPTIONS.keys, parent: "family") do |flavor, location, family, size|
-      Option::POSTGRES_SIZE_OPTIONS[size].family == family
+      next false unless Option::POSTGRES_SIZE_OPTIONS[size].family == family
+      available_families_and_sizes_by_location[location.name].include?([family, size])
     end
 
-    storage_size_options = Option::POSTGRES_STORAGE_SIZE_OPTIONS + Option::AWS_STORAGE_SIZE_OPTIONS.values.flat_map { |h| h.values.flatten }.uniq
+    storage_size_options = Option::POSTGRES_STORAGE_SIZE_OPTIONS +
+      Option::AWS_STORAGE_SIZE_OPTIONS.merge(Option::GCP_STORAGE_SIZE_OPTIONS)
+        .values
+        .flat_map { |h| h.values.flatten }
+    storage_size_options.uniq!
     options.add_option(name: "storage_size", values: storage_size_options, parent: "size") do |flavor, location, family, size, storage_size|
       vcpu_count = Option::POSTGRES_SIZE_OPTIONS[size].vcpu_count
-
-      if location.aws?
-        Option::AWS_STORAGE_SIZE_OPTIONS[family][vcpu_count].include?(storage_size)
-      else
-        min_storage = (vcpu_count >= 30) ? 1024 : vcpu_count * 32
-        min_storage /= 2 if family == "hobby"
-        [min_storage, min_storage * 2, min_storage * 4].include?(storage_size)
-      end
+      storage_sizes(location, family, vcpu_count).include?(storage_size)
     end
 
     options.add_option(name: "version", values: Option::POSTGRES_VERSION_OPTIONS.values.flatten.uniq, parent: "flavor") do |flavor, version|
@@ -525,6 +812,8 @@ class PostgresResource < Sequel::Model
 
     options.add_option(name: "ha_type", values: Option::POSTGRES_HA_OPTIONS.keys, parent: "storage_size")
 
+    options.add_option(name: "restrict_by_default", values: %w[false true])
+
     if project.get_ff_postgres_init_script
       options.add_option(name: "init_script")
     end
@@ -532,12 +821,20 @@ class PostgresResource < Sequel::Model
     options.serialize
   end
 
-  def self.postgres_flavors(project)
-    Option::POSTGRES_FLAVOR_OPTIONS.reject { |k,| (k == Flavor::LANTERN && !project.get_ff_postgres_lantern) || (k == Flavor::PARADEDB && !project.get_ff_postgres_paradedb) }
+  def setup_log_aggregation
+    # Setup only needs to happen if there's a Parseable resource present in the
+    # PG service project.
+    return unless (client = ParseableResource.client_for_project(Config.postgres_service_project_id))
+
+    client.create_stream(stream_name: ubid)
+    client.set_retention(stream_name: ubid, duration_days: ParseableResource::LOG_RETENTION_DAYS)
+    client.create_role(role_name: ubid, privileges: [{privilege: "ingestor", resource: {stream: ubid}}])
+    password = client.create_user(user_id: ubid, roles: [ubid])
+    update(parseable_password: password)
   end
 
   def self.postgres_locations(project)
-    Location.postgres_locations + project.locations
+    Location.postgres_locations(project.get_ff_visible_postgres_locations) + project.locations
   end
 
   module HaType
@@ -552,23 +849,15 @@ class PostgresResource < Sequel::Model
 
   module Flavor
     STANDARD = "standard"
-    PARADEDB = "paradedb"
-    LANTERN = "lantern"
   end
 
   def self.default_flavor
     Flavor::STANDARD
   end
 
-  def self.partner_notification_flavors
-    [PostgresResource::Flavor::PARADEDB, PostgresResource::Flavor::LANTERN]
-  end
-
-  def requires_partner_notification_email?
-    self.class.partner_notification_flavors.include?(flavor)
-  end
-
-  DEFAULT_VERSION = "17"
+  # Bumped on its own schedule: a version is offered in POSTGRES_VERSION_OPTIONS
+  # for a while before new databases are created with it by default.
+  DEFAULT_VERSION = "18"
   LATEST_VERSION = "18"
 
   def self.default_version
@@ -576,6 +865,8 @@ class PostgresResource < Sequel::Model
   end
 
   MAINTENANCE_DURATION_IN_HOURS = 2
+  DAYS_OF_WEEK = %w[mon tue wed thu fri sat sun].freeze
+  DAYS_OF_WEEK_BIT = DAYS_OF_WEEK.each_with_index.to_h { |d, i| [d, 1 << i] }.freeze
 
   def self.maintenance_hour_options
     Array.new(24) do
@@ -583,57 +874,93 @@ class PostgresResource < Sequel::Model
     end
   end
 
+  def self.maintenance_window_days_mask(names)
+    return 0 if names.nil? || names.empty?
+
+    # Days of week are stored as a bitmask and presented to the user
+    # as list of short strings stored in DAYS_OF_WEEK
+    names.reduce(0) do |mask, name|
+      mask | DAYS_OF_WEEK_BIT.fetch(name.to_s.downcase) do
+        fail Validation::ValidationFailed.new({maintenance_window_days: "\"#{name}\" is not a valid day. Valid days: #{DAYS_OF_WEEK.join(", ")}"})
+      end
+    end
+  end
+
+  # Minimum boot-image version a server must run to be a major-version upgrade
+  # candidate, keyed by image family then target PG version. Version strings are
+  # only comparable within a family, so 2604 servers are checked against the
+  # 2604 floor (its first published build) rather than the 2204 dates. Keep a
+  # subtree for every family in Option::POSTGRES_IMAGE_FAMILIES; a missing
+  # family makes metal_upgrade_candidate_server's lookup nil.
   UPGRADE_IMAGE_MIN_VERSIONS = {
-    "17" => "20240801",
-    "18" => "20251021",
+    "ubuntu-2204" => {
+      "17" => "20240801",
+      "18" => "20251021",
+    },
+    "ubuntu-2604" => {
+      "17" => "20260824.1.0",
+      "18" => "20260824.1.0",
+    },
   }
 end
 
 # Table: postgres_resource
 # Columns:
-#  id                          | uuid                     | PRIMARY KEY
-#  created_at                  | timestamp with time zone | NOT NULL DEFAULT now()
-#  project_id                  | uuid                     | NOT NULL
-#  name                        | text                     | NOT NULL
-#  target_vm_size              | text                     | NOT NULL
-#  target_storage_size_gib     | bigint                   | NOT NULL
-#  superuser_password          | text                     | NOT NULL
-#  root_cert_1                 | text                     |
-#  root_cert_key_1             | text                     |
-#  server_cert                 | text                     |
-#  server_cert_key             | text                     |
-#  root_cert_2                 | text                     |
-#  root_cert_key_2             | text                     |
-#  certificate_last_checked_at | timestamp with time zone | NOT NULL DEFAULT now()
-#  parent_id                   | uuid                     |
-#  restore_target              | timestamp with time zone |
-#  ha_type                     | ha_type                  | NOT NULL DEFAULT 'none'::ha_type
-#  hostname_version            | hostname_version         | NOT NULL DEFAULT 'v1'::hostname_version
-#  private_subnet_id           | uuid                     |
-#  flavor                      | postgres_flavor          | NOT NULL DEFAULT 'standard'::postgres_flavor
-#  location_id                 | uuid                     | NOT NULL
-#  maintenance_window_start_at | integer                  |
-#  user_config                 | jsonb                    | NOT NULL DEFAULT '{}'::jsonb
-#  pgbouncer_user_config       | jsonb                    | NOT NULL DEFAULT '{}'::jsonb
-#  tags                        | jsonb                    | NOT NULL DEFAULT '[]'::jsonb
-#  target_version              | text                     | NOT NULL
-#  trusted_ca_certs            | text                     |
-#  cert_auth_users             | jsonb                    | NOT NULL DEFAULT '[]'::jsonb
-#  client_root_cert_1          | text                     |
-#  client_root_cert_key_1      | text                     |
-#  client_root_cert_2          | text                     |
-#  client_root_cert_key_2      | text                     |
-#  client_cert                 | text                     |
-#  client_cert_key             | text                     |
+#  id                              | uuid                     | PRIMARY KEY
+#  created_at                      | timestamp with time zone | NOT NULL DEFAULT now()
+#  project_id                      | uuid                     | NOT NULL
+#  name                            | text                     | NOT NULL
+#  target_vm_size                  | text                     | NOT NULL
+#  target_storage_size_gib         | bigint                   | NOT NULL
+#  superuser_password              | text                     | NOT NULL
+#  root_cert_1                     | text                     |
+#  root_cert_key_1                 | text                     |
+#  server_cert                     | text                     |
+#  server_cert_key                 | text                     |
+#  root_cert_2                     | text                     |
+#  root_cert_key_2                 | text                     |
+#  certificate_last_checked_at     | timestamp with time zone | NOT NULL DEFAULT now()
+#  parent_id                       | uuid                     |
+#  restore_target                  | timestamp with time zone |
+#  ha_type                         | ha_type                  | NOT NULL DEFAULT 'none'::ha_type
+#  hostname_version                | text                     | NOT NULL DEFAULT 'v3'::text
+#  private_subnet_id               | uuid                     |
+#  flavor                          | postgres_flavor          | NOT NULL DEFAULT 'standard'::postgres_flavor
+#  location_id                     | uuid                     | NOT NULL
+#  maintenance_window_start_at     | integer                  |
+#  user_config                     | jsonb                    | NOT NULL DEFAULT '{}'::jsonb
+#  pgbouncer_user_config           | jsonb                    | NOT NULL DEFAULT '{}'::jsonb
+#  tags                            | jsonb                    | NOT NULL DEFAULT '[]'::jsonb
+#  target_version                  | text                     | NOT NULL
+#  trusted_ca_certs                | text                     |
+#  cert_auth_users                 | jsonb                    | NOT NULL DEFAULT '[]'::jsonb
+#  client_root_cert_1              | text                     |
+#  client_root_cert_key_1          | text                     |
+#  client_root_cert_2              | text                     |
+#  client_root_cert_key_2          | text                     |
+#  client_cert                     | text                     |
+#  client_cert_key                 | text                     |
+#  parseable_password              | text                     |
+#  maintenance_window_days_bitmask | smallint                 | NOT NULL DEFAULT 0
+#  preferred_availability_zone_id  | text                     |
+#  required_availability_zone_id   | text                     |
+#  target_image_family             | text                     | NOT NULL DEFAULT 'ubuntu-2204'::text
+#  target_storage_configuration    | jsonb                    |
 # Indexes:
 #  postgres_server_pkey                               | PRIMARY KEY btree (id)
 #  postgres_resource_project_id_location_id_name_uidx | UNIQUE btree (project_id, location_id, name)
 # Check constraints:
-#  target_version_check               | (target_version = ANY (ARRAY['16'::text, '17'::text, '18'::text]))
-#  valid_maintenance_windows_start_at | (maintenance_window_start_at >= 0 AND maintenance_window_start_at <= 23)
+#  at_most_one_availability_zone_request  | (preferred_availability_zone_id IS NULL OR required_availability_zone_id IS NULL)
+#  hostname_version_check                 | (hostname_version = ANY (ARRAY['v1'::text, 'v2'::text, 'v3'::text]))
+#  target_image_family_check              | (target_image_family = ANY (ARRAY['ubuntu-2204'::text, 'ubuntu-2604'::text]))
+#  target_storage_configuration_is_object | (target_storage_configuration IS NULL OR jsonb_typeof(target_storage_configuration) = 'object'::text)
+#  target_version_check                   | (target_version = ANY (ARRAY['16'::text, '17'::text, '18'::text]))
+#  valid_maintenance_window_days_bitmask  | (maintenance_window_days_bitmask >= 0 AND maintenance_window_days_bitmask <= 127)
+#  valid_maintenance_windows_start_at     | (maintenance_window_start_at >= 0 AND maintenance_window_start_at <= 23)
 # Foreign key constraints:
 #  postgres_resource_location_id_fkey       | (location_id) REFERENCES location(id)
 #  postgres_resource_private_subnet_id_fkey | (private_subnet_id) REFERENCES private_subnet(id)
 # Referenced By:
 #  postgres_init_script        | postgres_init_script_id_fkey                          | (id) REFERENCES postgres_resource(id)
+#  postgres_log_destination    | postgres_log_destination_postgres_resource_id_fkey    | (postgres_resource_id) REFERENCES postgres_resource(id)
 #  postgres_metric_destination | postgres_metric_destination_postgres_resource_id_fkey | (postgres_resource_id) REFERENCES postgres_resource(id)

@@ -3,6 +3,10 @@
 require_relative "spec_helper"
 
 RSpec.describe VmStorageVolume do
+  let(:vm_host) { create_vm_host }
+  let(:vm) { create_vm(vm_host_id: vm_host.id) }
+  let(:default_storage_device) { StorageDevice.create(vm_host_id: vm_host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100) }
+
   it "can render a device_path" do
     vm = Vm.new(location: Location[Location::HETZNER_FSN1_ID]).tap { it.id = "eb3dbcb3-2c90-8b74-8fb4-d62a244d7ae5" }
     expect(described_class.new(disk_index: 7, vm:).device_path).to eq("/dev/disk/by-id/virtio-vmxcyvsc_7")
@@ -12,6 +16,12 @@ RSpec.describe VmStorageVolume do
     prj = Project.create(name: "test-project")
     vm = Vm.new(location: Location.create(name: "us-west-2", provider: "aws", project_id: prj.id, display_name: "aws-us-west-2", ui_name: "AWS US East 1", visible: true)).tap { it.id = "eb3dbcb3-2c90-8b74-8fb4-d62a244d7ae5" }
     expect(described_class.new(disk_index: 2, vm:).device_path).to eq("/dev/nvme2n1")
+  end
+
+  it "#provider_dispatcher_group_name delegates through vm location" do
+    vm = Vm.new_with_id(location: Location[Location::HETZNER_FSN1_ID])
+    v = described_class.new(disk_index: 0, vm:)
+    expect(v.provider_dispatcher_group_name).to eq("metal")
   end
 
   it "returns correct spdk version if exists associated installation" do
@@ -66,6 +76,143 @@ RSpec.describe VmStorageVolume do
       v = described_class.new(disk_index: 7)
       allow(v).to receive(:vhost_block_backend).and_return(VhostBlockBackend.new)
       expect(v.queue_size).to eq(64)
+    end
+  end
+
+  describe "#path" do
+    it "returns the correct path for the volume in the default storage device" do
+      vol = described_class.create(vm_id: vm.id, disk_index: 3, storage_device_id: default_storage_device.id, boot: false, size_gib: 10)
+      expect(vol.path).to eq("/var/storage/#{vm.inhost_name}/3")
+    end
+
+    it "returns the correct path for the volume in a non-default storage device" do
+      storage_device = StorageDevice.create(vm_host_id: vm.vm_host_id, name: "disk1", total_storage_gib: 100, available_storage_gib: 100)
+      vol = described_class.create(vm_id: vm.id, disk_index: 2, storage_device_id: storage_device.id, boot: false, size_gib: 10)
+      expect(vol.path).to eq("/var/storage/devices/disk1/#{vm.inhost_name}/2")
+    end
+  end
+
+  describe "#rpc" do
+    it "sends a json payload to the rpc socket and parses the response" do
+      vol = described_class.create(vm_id: vm.id, disk_index: 1, storage_device_id: default_storage_device.id, boot: false, size_gib: 10)
+      payload = {"command" => "version"}
+      allow(vol.vm.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm.inhost_name}/1/rpc.sock -q 2 -w 2 | head -n 1", stdin: payload.to_json).and_return('{"version":"v0.4.1"}')
+      expect(vol.rpc(**payload)).to eq({"version" => "v0.4.1"})
+    end
+  end
+
+  describe "#caught_up?" do
+    let(:vol) { described_class.create(vm_id: vm.id, disk_index: 1, storage_device_id: default_storage_device.id, boot: false, size_gib: 10) }
+
+    it "is true when stripes fetched equals source" do
+      payload = {"command" => "status"}
+      allow(vol.vm.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm.inhost_name}/1/rpc.sock -q 2 -w 2 | head -n 1", stdin: payload.to_json).and_return('{"status": {"stripes": {"fetched": 100, "source": 100}}}')
+      expect(vol.caught_up?).to be true
+    end
+
+    it "is false when stripes fetched differs from source" do
+      payload = {"command" => "status"}
+      allow(vol.vm.vm_host.sshable).to receive(:_cmd).with("sudo nc -U /var/storage/#{vm.inhost_name}/1/rpc.sock -q 2 -w 2 | head -n 1", stdin: payload.to_json).and_return('{"status": {"stripes": {"fetched": 50, "source": 100}}}')
+      expect(vol.caught_up?).to be false
+    end
+  end
+
+  describe "#dump_metadata" do
+    let(:vbb) { VhostBlockBackend.create(version_code: 400, allocation_weight: 100, vm_host_id: vm_host.id) }
+    let(:kek) { StorageKeyEncryptionKey.create_random(auth_data: "aad") }
+    let(:volume) do
+      described_class.create(
+        vm:,
+        disk_index: 1,
+        storage_device: default_storage_device,
+        vhost_block_backend_id: vbb.id,
+        key_encryption_key_1: kek,
+        boot: false,
+        size_gib: 10,
+        vring_workers: 1,
+      )
+    end
+
+    it "runs storage-dump-metadata command and returns stdout" do
+      expect(volume.vm.vm_host.sshable).to receive(:_cmd).with(
+        "sudo host/bin/storage-dump-metadata #{vm.inhost_name} DEFAULT 1 v0.4.0",
+        stdin: kek.secret_key_material_hash.to_json,
+      ).and_return("metadata")
+
+      expect(volume.dump_metadata).to eq("metadata")
+    end
+
+    it "fails when vhost block backend does not support dump_metadata" do
+      vbb.update(version_code: 301)
+
+      expect { volume.dump_metadata }.to raise_error(RuntimeError, "dump_metadata only supported for vm storage volumes with vhost block backend version v0.4.0+")
+    end
+
+    it "fails when volume is not encrypted" do
+      volume.update(key_encryption_key_1: nil)
+
+      expect { volume.dump_metadata }.to raise_error(RuntimeError, "dump_metadata requires an encrypted vm storage volume")
+    end
+
+    it "fails when volume does not have a vhost block backend" do
+      volume.update(vhost_block_backend_id: nil, vring_workers: nil)
+
+      expect { volume.dump_metadata }.to raise_error(RuntimeError, "dump_metadata only supported for vm storage volumes with vhost block backend version v0.4.0+")
+    end
+  end
+
+  describe "#restart_daemon" do
+    let(:vbb) { VhostBlockBackend.create(version_code: 400, allocation_weight: 100, vm_host_id: vm_host.id) }
+    let(:vm) {
+      project = Project.create(name: "test-project")
+      vm_host = create_vm_host
+      storage_device = StorageDevice.create(vm_host_id: vm_host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100)
+      vm = Prog::Vm::Nexus.assemble("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7", project.id).subject
+      vm.vm_storage_volumes.first.update(vhost_block_backend_id: vbb.id, vring_workers: 2, storage_device_id: storage_device.id)
+      vm.update(vm_host_id: vm_host.id)
+      vm.strand.update(label: "stopped")
+      vm
+    }
+    let(:volume) { vm.vm_storage_volumes.first }
+
+    it "runs storage-restart-daemon command with the kek as stdin" do
+      expect(volume.vm.vm_host.sshable).to receive(:_cmd).with(
+        "sudo host/bin/storage-restart-daemon #{vm.inhost_name} DEFAULT 0 v0.4.0",
+        stdin: volume.key_encryption_key_1.secret_key_material_hash.to_json,
+      ).and_return("")
+
+      volume.restart_daemon
+    end
+
+    it "accepts a VM stopped by admin" do
+      vm.strand.update(label: "stopped_by_admin")
+      expect(volume.vm.vm_host.sshable).to receive(:_cmd).with(
+        "sudo host/bin/storage-restart-daemon #{vm.inhost_name} DEFAULT 0 v0.4.0",
+        stdin: volume.key_encryption_key_1.secret_key_material_hash.to_json,
+      ).and_return("")
+
+      volume.restart_daemon
+    end
+
+    it "fails when VM is not stopped" do
+      vm.strand.update(label: "wait")
+      expect { volume.restart_daemon }.to raise_error(RuntimeError, "VM must be stopped before restarting the vhost backend daemon")
+    end
+
+    it "fails when volume is not encrypted" do
+      volume.update(key_encryption_key_1: nil)
+      expect { volume.restart_daemon }.to raise_error(RuntimeError, "restart_daemon requires an encrypted vm storage volume")
+    end
+
+    it "fails when a storage key rotation is in progress" do
+      kek2 = StorageKeyEncryptionKey.create(algorithm: "aes-256-gcm", key: "key2", init_vector: "iv2", auth_data: "somedata")
+      volume.update(key_encryption_key_2_id: kek2.id)
+      expect { volume.restart_daemon }.to raise_error(RuntimeError, "cannot restart the vhost backend daemon while a storage key rotation is in progress")
+    end
+
+    it "fails when volume does not have a vhost block backend" do
+      volume.update(vhost_block_backend_id: nil, vring_workers: nil)
+      expect { volume.restart_daemon }.to raise_error(RuntimeError, "restart_daemon only supported for vm storage volumes with vhost block backend")
     end
   end
 end

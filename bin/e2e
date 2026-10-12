@@ -13,41 +13,91 @@ def main(options)
 end
 
 def test_metal(options, test_cases)
-  default_boot_images = test_cases.values_at(*options[:test_cases]).flat_map { it["images"] }.uniq
+  run_kubernetes_tests = options[:test_cases].any? { it.start_with?("kubernetes") }
+  if run_kubernetes_tests && !Config.machine_images_service_project_id
+    fail "kubernetes test cases build their node images as machine images, set MACHINE_IMAGES_SERVICE_PROJECT_ID"
+  end
+
+  base_machine_image_names = if Config.machine_images_service_project_id
+    %w[ubuntu-noble ubuntu-resolute].freeze
+  else
+    []
+  end
+
+  # The large (~75 GiB each) GitHub runner images dominate the host bootstrap
+  # download wave and gate the entire suite from starting. Skip them here and
+  # let Prog::Test::GithubRunner download them itself, so they fetch in parallel
+  # with the other test cases instead of on the bootstrap critical path.
+  default_boot_images = test_cases.values_at(*options[:test_cases]).flat_map { it["images"] }.uniq.reject { it.start_with?("github") }
+
+  # base_machine_image_names will be fetched as UMIs
+  default_boot_images -= base_machine_image_names
+
   hetzner_server_st = Prog::Test::HetznerServer.assemble(vm_host_id: options[:vm_host_id], default_boot_images:)
   wait_until(hetzner_server_st, "wait")
 
-  if options[:test_cases].include?("postgres_ha") || options[:test_cases].include?("postgres_upgrade")
+  if Config.machine_images_service_project_id
+    vm_host_id = Strand[hetzner_server_st.id].stack.first["vm_host_id"]
+    vm_host = VmHost[vm_host_id]
+    base_machine_images_st = Prog::Test::BaseMachineImages.assemble(location_id: vm_host.location_id, arch: vm_host.arch, base_image_names: base_machine_image_names)
+    wait_until(base_machine_images_st, "wait")
+  end
+
+  if options[:test_cases].include?("postgres_ha") || options[:test_cases].include?("postgres_upgrade") || options[:test_cases].include?("postgres_unarchive")
     Project[Config.postgres_service_project_id] ||
       Project.create_with_id(Config.postgres_service_project_id, name: "Postgres-Service-Project")
     minio_cluster_st = Prog::Test::MinioCluster.assemble(Config.postgres_service_project_id)
     wait_until(minio_cluster_st, "wait")
   end
 
+  if run_kubernetes_tests
+    Project[Config.kubernetes_service_project_id] ||
+      Project.create_with_id(Config.kubernetes_service_project_id, name: "Ubicloud-Kubernetes-Resources")
+    Project[Config.load_balancer_service_project_id] ||
+      Project.create_with_id(Config.load_balancer_service_project_id, name: "Load-Balancer-Service-Project")
+    k8s_dns_zone_st = Prog::Test::DnsZone.assemble(Config.kubernetes_service_hostname, Config.kubernetes_service_project_id)
+    lb_dns_zone_st = Prog::Test::DnsZone.assemble(Config.load_balancer_service_hostname, Config.load_balancer_service_project_id)
+
+    kubernetes_versions = [Option.selectable_kubernetes_versions[1]]
+    kubernetes_versions << Option.selectable_kubernetes_versions[0] if options[:test_cases].include?("kubernetes_upgrade")
+    kubernetes_node_images_st = Prog::Test::KubernetesNodeImages.assemble(location_id: vm_host.location_id, kubernetes_versions:)
+  end
+
   tests_to_wait = []
   if options[:test_cases].include?("vm") && (test_case = test_cases["vm"])
-    # Testing slices is not parallel with other tests as it requires a specific host state
-
     # This tests encrypted VMs with slices, which will create both standard and
     # burstable VMs. The test will also test host reboot.
-    encrypted_vms_st = Prog::Test::VmGroup.assemble(boot_images: test_case["images"], test_reboot: true, test_slices: true)
+    encrypted_vms_st = Prog::Test::VmGroup.assemble(boot_images: test_case["images"], base_machine_image_names:, test_reboot: true)
     log(encrypted_vms_st, "storage_encrypted: true")
-    # Not running in parallel but waiting, since host is rebooted during test.
-    # Rebooting makes the next test to test reboot practically as well depending
-    # on when the host is rebooted and can cause flaky issues for github runner tests.
-    wait_until(encrypted_vms_st)
+    # The reboot would kill the node image builders, so let it happen only once
+    # the images are captured.
+    wait_until(kubernetes_node_images_st, "wait") if run_kubernetes_tests
+    Semaphore.incr(encrypted_vms_st.id, "allow_reboot")
+    # Block only until the in-test host reboot completes; rebooting the shared
+    # host while other tests run would disrupt their VMs. Once the host is back
+    # and VmGroup starts re-verifying its VMs, the rest runs in parallel.
+    wait_until(encrypted_vms_st, "verify_vms_after_reboot")
+    tests_to_wait << encrypted_vms_st
+  end
 
-    # YYY: Remove this when all hosts use slices
-    Semaphore.incr(hetzner_server_st.id, "disallow_slices")
-    wait_until(hetzner_server_st, "wait")
+  if Config.machine_images_service_project_id && options[:test_cases].include?("machine_image_vm_capture")
+    tests_to_wait << Prog::Test::VmSourcedMachineImages.assemble(location_id: vm_host.location_id, arch: vm_host.arch)
+  end
+
+  if options[:test_cases].include?("move_vm")
+    tests_to_wait << Prog::Test::MoveVm.assemble(vm_host)
   end
 
   if (gh_test_cases = test_cases.values_at(*options[:test_cases].select { it.include?("github_runner") })).any?
-    tests_to_wait << Prog::Test::GithubRunner.assemble(gh_test_cases)
+    vm_host_id = Strand[hetzner_server_st.id].stack.first["vm_host_id"]
+    tests_to_wait << Prog::Test::GithubRunner.assemble(gh_test_cases, vm_host_id:)
   end
 
   if options[:test_cases].include?("postgres_standard")
     tests_to_wait << Prog::Test::PostgresResource.assemble
+  end
+  if options[:test_cases].include?("postgres_ubuntu_2604")
+    tests_to_wait << Prog::Test::PostgresImageFamily.assemble
   end
   if options[:test_cases].include?("postgres_ha")
     tests_to_wait << Prog::Test::HaPostgresResource.assemble
@@ -55,9 +105,30 @@ def test_metal(options, test_cases)
   if options[:test_cases].include?("postgres_upgrade")
     tests_to_wait << Prog::Test::UpgradePostgresResource.assemble
   end
+  if options[:test_cases].include?("postgres_upgrade16")
+    tests_to_wait << Prog::Test::UpgradePostgresResource.assemble(start_version: "16")
+  end
+  if options[:test_cases].include?("postgres_unarchive")
+    tests_to_wait << Prog::Test::UnarchivePostgresResource.assemble
+  end
 
-  if options[:test_cases].include?("kubernetes")
-    tests_to_wait << Prog::Test::Kubernetes.assemble
+  # Skip postgres_firewall on metal: the assertion at
+  # Prog::Test::PostgresFirewall#test_block_all_rules has the VM nc its
+  # own external IP, but the host's nftables fw_table accepts every
+  # private-source packet (`ip saddr @private_ipv4_cidrs ... accept`)
+  # before customer firewall rules are evaluated, so a block-all rule
+  # set never blocks VM-to-self traffic on metal. The aws and gcp
+  # invocations of this test (in their own provider blocks below)
+  # exercise the assertion against deny-by-default cloud firewalls
+  # where it has teeth.
+
+  if run_kubernetes_tests
+    wait_until(k8s_dns_zone_st, "wait")
+    wait_until(lb_dns_zone_st, "wait")
+    wait_until(kubernetes_node_images_st, "wait")
+    tests_to_wait << Prog::Test::Kubernetes.assemble if options[:test_cases].include?("kubernetes")
+    tests_to_wait << Prog::Test::KubernetesUpgrade.assemble if options[:test_cases].include?("kubernetes_upgrade")
+    tests_to_wait << Prog::Test::KubernetesFirewall.assemble if options[:test_cases].include?("kubernetes_firewall")
   end
 
   # Although wait_until will be blocked while checking the first one
@@ -65,10 +136,23 @@ def test_metal(options, test_cases)
   # No need to make it parallel.
   tests_to_wait.each { |st| wait_until(st) }
 
+  Semaphore.incr(base_machine_images_st.id, "destroy_base_machine_images") if base_machine_images_st
+
   if minio_cluster_st
     Semaphore.incr(minio_cluster_st.id, "destroy_and_verify")
     wait_until(minio_cluster_st)
   end
+
+  if run_kubernetes_tests
+    Semaphore.incr(k8s_dns_zone_st.id, "destroy_and_verify")
+    Semaphore.incr(lb_dns_zone_st.id, "destroy_and_verify")
+    Semaphore.incr(kubernetes_node_images_st.id, "destroy_kubernetes_node_images")
+    wait_until(k8s_dns_zone_st)
+    wait_until(lb_dns_zone_st)
+    wait_until(kubernetes_node_images_st)
+  end
+
+  wait_until(base_machine_images_st) if base_machine_images_st
 
   Semaphore.incr(hetzner_server_st.id, "verify_cleanup_and_destroy")
   wait_until(hetzner_server_st)
@@ -83,11 +167,52 @@ def test_aws(options, test_cases)
   if options[:test_cases].include?("postgres_standard")
     tests_to_wait << Prog::Test::PostgresResource.assemble(provider: "aws")
   end
+  if options[:test_cases].include?("postgres_ubuntu_2604")
+    tests_to_wait << Prog::Test::PostgresImageFamily.assemble(provider: "aws")
+  end
   if options[:test_cases].include?("postgres_ha")
     tests_to_wait << Prog::Test::HaPostgresResource.assemble(provider: "aws")
   end
   if options[:test_cases].include?("postgres_upgrade")
     tests_to_wait << Prog::Test::UpgradePostgresResource.assemble(provider: "aws")
+  end
+  if options[:test_cases].include?("postgres_upgrade16")
+    tests_to_wait << Prog::Test::UpgradePostgresResource.assemble(provider: "aws", start_version: "16")
+  end
+  if options[:test_cases].include?("postgres_unarchive")
+    tests_to_wait << Prog::Test::UnarchivePostgresResource.assemble(provider: "aws")
+  end
+
+  if options[:test_cases].include?("postgres_firewall")
+    tests_to_wait << Prog::Test::PostgresFirewall.assemble(provider: "aws")
+  end
+
+  tests_to_wait.each { |st| wait_until(st) }
+end
+
+def test_gcp(options, test_cases)
+  Project[Config.postgres_service_project_id] ||
+    Project.create_with_id(Config.postgres_service_project_id, name: "Postgres-Service-Project")
+
+  tests_to_wait = []
+  if options[:test_cases].include?("postgres_standard")
+    tests_to_wait << Prog::Test::PostgresResource.assemble(provider: "gcp", gcp_location_name: "gcp-us-east4")
+  end
+  if options[:test_cases].include?("postgres_ubuntu_2604")
+    tests_to_wait << Prog::Test::PostgresImageFamily.assemble(provider: "gcp", gcp_location_name: "gcp-us-east4")
+  end
+  if options[:test_cases].include?("postgres_ha")
+    tests_to_wait << Prog::Test::HaPostgresResource.assemble(provider: "gcp")
+  end
+  if options[:test_cases].include?("postgres_upgrade")
+    tests_to_wait << Prog::Test::UpgradePostgresResource.assemble(provider: "gcp")
+  end
+  if options[:test_cases].include?("postgres_unarchive")
+    tests_to_wait << Prog::Test::UnarchivePostgresResource.assemble(provider: "gcp")
+  end
+
+  if options[:test_cases].include?("postgres_firewall")
+    tests_to_wait << Prog::Test::PostgresFirewall.assemble(provider: "gcp")
   end
 
   tests_to_wait.each { |st| wait_until(st) }
@@ -123,7 +248,7 @@ end
 options = {test_cases: ["vm"]}
 OptionParser.new do |opts|
   opts.on("--vm-host-id VM_HOST_ID", "Use existing vm host") { |v| options[:vm_host_id] = (v.length == 26) ? UBID.to_uuid(v) : v }
-  opts.on("--provider PROVIDER", String, "Provider to run tests on (metal, aws)") { |v| options[:provider] = v }
+  opts.on("--provider PROVIDER", String, "Provider to run tests on (metal, aws, gcp)") { |v| options[:provider] = v }
   opts.on("--test-cases TEST_CASES", Array, "List of test cases to run separated by comma") { |v| options[:test_cases] = v }
 end.parse!
 

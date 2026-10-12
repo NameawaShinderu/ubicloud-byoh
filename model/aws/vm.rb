@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "base64"
+
 class Vm < Sequel::Model
   module Aws
     private
@@ -8,8 +10,23 @@ class Vm < Sequel::Model
       ephemeral_net6&.nth(0)
     end
 
+    def aws_fetch_serial_log
+      response = location.location_credential_aws.client.get_console_output(instance_id: aws_instance.instance_id)
+      response.output ? Base64.decode64(response.output) : ""
+    end
+
     def aws_update_firewall_rules_prog
       Prog::Vnet::Aws::UpdateFirewallRules
+    end
+
+    def aws_validate_firewall_cap(firewall)
+      # AWS has no firewall count cap
+      nil
+    end
+
+    def aws_validate_subnet_firewall_cap(subnet)
+      # AWS has no firewall count cap
+      nil
     end
   end
 end

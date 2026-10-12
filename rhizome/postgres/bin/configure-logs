@@ -1,0 +1,101 @@
+#!/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require_relative "../../common/lib/util"
+require_relative "../lib/otel_log_config"
+require_relative "../lib/guard_duty_agent_setup"
+
+config = JSON.parse($stdin.read)
+instance = config["instance"]
+server_role = config["server_role"]
+version = config["version"]
+resource_id = config["resource_id"]
+resource_name = config["resource_name"]
+log_destinations = config["log_destinations"] || []
+cloudwatch_auth_region = config["cloudwatch_auth_region"]
+guardduty_region = config["guardduty_region"]
+
+log_dir = "/dat/#{version}/data/pg_log"
+
+r "mkdir", "-p", "/etc/otelcol-contrib", "/var/lib/otelcol-contrib/state", "/tmp/otelcol"
+otelcol_user = "otelcol-contrib"
+
+r "chown", "-R", otelcol_user, "/var/lib/otelcol-contrib/state", "/etc/otelcol-contrib", "/tmp/otelcol"
+r "usermod", "-aG", "systemd-journal", otelcol_user
+
+# Ensure the log directory exists (may not yet on initial provisioning)
+unless File.directory?(log_dir)
+  r "mkdir", "-p", log_dir
+  r "chown", "postgres:postgres", log_dir
+end
+
+# Grant traverse on /dat and each intermediate directory down to the log dir
+r "setfacl", "-m", "u:#{otelcol_user}:x", "/dat", "/dat/#{version}", "/dat/#{version}/data"
+
+# Grant recursive read (+rX) and set the default ACL (+r) for new files in one call
+r "setfacl", "-R", "-m", "u:#{otelcol_user}:rX,d:u:#{otelcol_user}:r", log_dir
+
+# The imds_protection table permits IMDS for root only, and the boot service
+# reloads it from /etc/nftables.conf, so the awscloudwatchlogs exporter needs
+# its user accepted in that file to hold the instance role across reboots.
+# The declare-delete pair replaces only this table; other tables, such as
+# pg_metering with its billing counters, survive the reload.
+if cloudwatch_auth_region
+  safe_write_to_file("/etc/nftables.conf", <<~CONF)
+    #!/usr/sbin/nft -f
+
+    table inet imds_protection;
+    delete table inet imds_protection;
+    table inet imds_protection {
+        chain output {
+            type filter hook output priority 0; policy accept;
+
+            # Allow root and the collector to access IMDS
+            meta skuid 0 ip daddr 169.254.169.254 accept
+            meta skuid 0 ip6 daddr fd00:ec2::254 accept
+            meta skuid "#{otelcol_user}" ip daddr 169.254.169.254 accept
+            meta skuid "#{otelcol_user}" ip6 daddr fd00:ec2::254 accept
+
+            # Block all other users from accessing IMDS
+            ip daddr 169.254.169.254 drop
+            ip6 daddr fd00:ec2::254 drop
+        }
+    }
+  CONF
+  r "nft", "-f", "/etc/nftables.conf"
+end
+
+# Write per-destination TLS CA bundles for any destination that supplies one.
+log_destinations.each_with_index do |dest, i|
+  ca_bundle = (dest["options"] || {})["ca_bundle"]
+  next unless ca_bundle
+  ca_path = OtelLogConfig.dest_ca_file_path(i)
+  safe_write_to_file(ca_path, ca_bundle)
+  r "chown", otelcol_user, ca_path
+end
+
+log_config = OtelLogConfig.new(
+  instance: instance,
+  server_role: server_role,
+  log_dir: log_dir,
+  resource_id: resource_id,
+  resource_name: resource_name,
+  log_destinations: log_destinations,
+  cloudwatch_auth_region: cloudwatch_auth_region,
+)
+
+safe_write_to_file("/etc/otelcol-contrib/config.yaml", log_config.to_config)
+
+r "systemctl", "enable", "--now", "otelcol-contrib"
+r "systemctl", "restart", "otelcol-contrib"
+
+# The collector ships /{instance}/postgresql now; stop the agent only after
+# the collector restart, so a failure between the two leaves both shippers
+# on rather than neither. The agent-free image drops the unit entirely, and
+# absence must not fail provisioning there.
+if cloudwatch_auth_region && r("systemctl cat amazon-cloudwatch-agent.service > /dev/null 2>&1 && echo YES || echo NO").strip == "YES"
+  r "systemctl", "disable", "--now", "amazon-cloudwatch-agent"
+end
+
+GuardDutyAgentSetup.new(guardduty_region).run if guardduty_region

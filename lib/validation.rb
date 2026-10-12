@@ -66,14 +66,29 @@ module Validation
   # - Same with regular name pattern, but shorter (40 chars)
   ALLOWED_KUBERNETES_NAME_PATTERN = %r{\A[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?\z}
 
+  # Machine image version labels (e.g. v1.0, 20260423120000)
+  # - Max length 64
+  # - ASCII letters, numbers, dot, hyphen, underscore
+  # - Must start with a letter or number
+  ALLOWED_MACHINE_IMAGE_VERSION_LABEL_PATTERN = %r{\A[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}\z}
+
   def self.validate_name(name)
     msg = "Name must only contain lowercase letters, numbers, and hyphens and have max length 63."
-    fail ValidationFailed.new({name: msg}) unless name&.match(ALLOWED_NAME_PATTERN)
+    fail ValidationFailed.new({name: msg}) unless name&.match?(ALLOWED_NAME_PATTERN)
+  end
+
+  def self.validate_postgres_cert_auth_user_name(name)
+    unless name&.match?(/\A[a-zA-Z0-9_-]{1,64}\z/)
+      fail ValidationFailed.new({name: "Name must only contain alphanumeric characters, underscores, and hyphens. It must not exceed 64 characters."})
+    end
+    if ["postgres", "ubi_replication", "all"].include?(name)
+      fail ValidationFailed.new({name: "Name must not be postgres, ubi_replication, or all."})
+    end
   end
 
   def self.validate_minio_username(username)
     msg = "Minio user must only contain lowercase letters, numbers, hyphens and underscore and cannot start with a number or hyphen. It also have max length of 32, min length of 3."
-    fail ValidationFailed.new({username: msg}) unless username&.match(ALLOWED_MINIO_USERNAME_PATTERN)
+    fail ValidationFailed.new({username: msg}) unless username&.match?(ALLOWED_MINIO_USERNAME_PATTERN)
   end
 
   def self.validate_minio_setup(storage_size_gib:, pool_count:, server_count:, drive_count:)
@@ -124,8 +139,8 @@ module Validation
   end
 
   def self.validate_boot_image(image_name)
-    unless Option::BootImages.find { it.name == image_name }
-      fail ValidationFailed.new({boot_image: "\"#{image_name}\" is not a valid boot image name. Available boot image names are: #{Option::BootImages.map(&:name)}"})
+    unless Option::BootImages.find { it.name == image_name } || image_name.include?("@")
+      fail ValidationFailed.new({boot_image: "\"#{image_name}\" is not a valid boot image name. Available boot image names are: #{Option::BootImages.map(&:name)}, or you can use machine-image-name@version, machine-image-name@latest"})
     end
   end
 
@@ -139,7 +154,7 @@ module Validation
 
   def self.validate_os_user_name(os_user_name)
     msg = "OS user name must only contain lowercase letters, numbers, hyphens and underscore and cannot start with a number or hyphen. It also have max length of 32."
-    fail ValidationFailed.new({user: msg}) unless os_user_name&.match(ALLOWED_OS_USER_NAME_PATTERN)
+    fail ValidationFailed.new({user: msg}) unless os_user_name&.match?(ALLOWED_OS_USER_NAME_PATTERN)
   end
 
   def self.validate_storage_volumes(storage_volumes, boot_disk_index)
@@ -147,6 +162,7 @@ module Validation
       :encrypted, :size_gib, :boot, :read_only, :image,
       :max_read_mbytes_per_sec, :max_write_mbytes_per_sec,
       :vring_workers, :track_written, :machine_image_version_id,
+      :remote_storage_server_id,
     ]
     fail ValidationFailed.new({storage_volumes: "At least one storage volume is required."}) if storage_volumes.empty?
     if boot_disk_index < 0 || boot_disk_index >= storage_volumes.length
@@ -206,6 +222,15 @@ module Validation
     fail ValidationFailed.new({cidr: "Invalid CIDR"})
   end
 
+  ALLOWED_PROTOCOLS = %w[tcp udp].freeze
+
+  def self.validate_protocol(protocol)
+    return "tcp" if protocol.nil?
+    protocol = protocol.downcase
+    fail ValidationFailed.new({protocol: "Invalid protocol, must be tcp or udp"}) unless ALLOWED_PROTOCOLS.include?(protocol)
+    protocol
+  end
+
   def self.validate_port_range(port_range)
     return [0, 65535] if port_range.nil?
 
@@ -250,17 +275,91 @@ module Validation
   end
 
   def self.validate_short_text(text, field_name)
-    fail ValidationFailed.new({field_name: "The #{field_name} must have max length 63 and only contain alphanumeric characters, hyphen, underscore, space, parantheses, exclamation, question mark and star."}) unless text.match(ALLOWED_SHORT_TEXT_PATTERN)
+    fail ValidationFailed.new({field_name: "The #{field_name} must have max length 63 and only contain alphanumeric characters, hyphen, underscore, space, parantheses, exclamation, question mark and star."}) unless text.match?(ALLOWED_SHORT_TEXT_PATTERN)
   end
 
   def self.validate_account_name(name)
-    fail ValidationFailed.new({name: "Name must only contain letters, numbers, spaces, and hyphens and have max length 63."}) unless name&.match(ALLOWED_ACCOUNT_NAME)
+    fail ValidationFailed.new({name: "Name must only contain letters, numbers, spaces, and hyphens and have max length 63."}) unless name&.match?(ALLOWED_ACCOUNT_NAME)
   end
 
   def self.validate_url(url)
     uri = URI.parse(url)
     fail ValidationFailed.new({url: "Invalid URL scheme. Only https URLs are supported."}) if uri.scheme != "https"
     fail ValidationFailed.new({url: "Invalid URL"}) if uri.host.nil? || uri.host.empty?
+  rescue URI::InvalidURIError
+    fail ValidationFailed.new({url: "Invalid URL"})
+  end
+
+  def self.validate_log_destination_options(type, options)
+    return unless options
+
+    allowed_key = (type == "otlp") ? "headers" : "structured_data"
+    extra = options.keys - [allowed_key]
+    fail ValidationFailed.new({options: "options may only contain '#{allowed_key}' for #{type}"}) if extra.any?
+
+    if type == "otlp"
+      headers = options["headers"]
+      if headers
+        fail ValidationFailed.new({options: "options.headers must be a flat object with string values"}) unless
+          headers.is_a?(Hash) && headers.values.all?(String)
+      end
+    else
+      sd = options["structured_data"]
+      if sd
+        fail ValidationFailed.new({options: "options.structured_data must be an object mapping SD-IDs to key/value objects"}) unless
+          sd.is_a?(Hash) && sd.values.all? { it.is_a?(Hash) && it.values.all?(String) }
+      end
+    end
+  end
+
+  # Headers a remote_write client may not set, from reservedHeaders and
+  # validateHeaders in prometheus/config/config.go.
+  PROMETHEUS_RESERVED_HEADERS = %w[accept-encoding authorization connection
+    content-encoding content-length content-type host keep-alive
+    proxy-authenticate proxy-authorization user-agent www-authenticate
+    x-amz-content-sha256 x-amz-date x-amz-security-token
+    x-prometheus-remote-read-version x-prometheus-remote-write-version].freeze
+
+  def self.validate_metric_destination_auth(username, password, options)
+    fail ValidationFailed.new({username: "must be set together with password"}) if username.nil? != password.nil?
+
+    if options
+      extra = options.keys - %w[authorization headers]
+      fail ValidationFailed.new({options: "options may only contain 'authorization' and 'headers'"}) if extra.any?
+
+      if options.key?("authorization")
+        authorization = options["authorization"]
+        fail ValidationFailed.new({options: "options.authorization must be an object with a non-empty string 'credentials' and an optional string 'type'"}) unless
+          authorization.is_a?(Hash) && (authorization.keys - %w[type credentials]).empty? &&
+            authorization["credentials"].is_a?(String) && !authorization["credentials"].empty?
+
+        # Prometheus trims the type and defaults it to Bearer when empty.
+        type = authorization.fetch("type", "Bearer")
+        fail ValidationFailed.new({options: "options.authorization.type must be a non-empty string"}) unless type.is_a?(String) && !type.strip.empty?
+        fail ValidationFailed.new({options: "options.authorization.type cannot be basic, set username and password instead"}) if type.strip.casecmp?("basic")
+        fail ValidationFailed.new({options: "options.authorization cannot be combined with username and password"}) if username
+      end
+
+      if options.key?("headers")
+        headers = options["headers"]
+        fail ValidationFailed.new({options: "options.headers must be a flat object with string values"}) unless
+          headers.is_a?(Hash) && headers.values.all?(String)
+        reserved = headers.keys.select { PROMETHEUS_RESERVED_HEADERS.include?(it.downcase) }
+        fail ValidationFailed.new({options: "options.headers cannot set #{reserved.join(", ")}"}) if reserved.any?
+      end
+    end
+
+    unless username || options&.key?("authorization") || options&.dig("headers")&.any?
+      fail ValidationFailed.new({options: "no credentials given, set username and password, options.authorization, or options.headers"})
+    end
+  end
+
+  def self.validate_syslog_url(url)
+    uri = URI.parse(url)
+    fail ValidationFailed.new({url: "Invalid URL scheme. Only tcp URLs are supported for syslog."}) if uri.scheme != "tcp"
+    fail ValidationFailed.new({url: "Invalid URL"}) if uri.host.nil? || uri.host.empty?
+    fail ValidationFailed.new({url: "Invalid URL"}) if uri.port.nil?
+    fail ValidationFailed.new({url: "port must be between 1 and 65535"}) unless (1..65535).cover?(uri.port)
   rescue URI::InvalidURIError
     fail ValidationFailed.new({url: "Invalid URL"})
   end
@@ -295,7 +394,7 @@ module Validation
   end
 
   def self.validate_kubernetes_name(name)
-    fail ValidationFailed.new({name: "Kubernetes cluster name must only contain lowercase letters, numbers, and hyphens and have max length 40."}) unless name&.match(ALLOWED_KUBERNETES_NAME_PATTERN)
+    fail ValidationFailed.new({name: "Kubernetes cluster name must only contain lowercase letters, numbers, and hyphens and have max length 40."}) unless name&.match?(ALLOWED_KUBERNETES_NAME_PATTERN)
   end
 
   def self.validate_kubernetes_cp_node_count(count)
@@ -308,12 +407,17 @@ module Validation
   end
 
   def self.validate_kubernetes_version(version)
-    fail ValidationFailed.new({version: "Kubernetes version \"#{version}\" is not supported. Available versions: #{Option.kubernetes_versions.join(", ")}"}) unless Option.kubernetes_versions.include?(version)
+    fail ValidationFailed.new({version: "Kubernetes version \"#{version}\" is not supported. Available versions: #{Option.selectable_kubernetes_versions.join(", ")}"}) unless Option.selectable_kubernetes_versions.include?(version)
+  end
+
+  def self.validate_kubernetes_location(location_id)
+    return if Option.kubernetes_locations.any? { it.id == location_id }
+    fail ValidationFailed.new({location: "Kubernetes clusters are not supported in this location. Available locations: #{Option.kubernetes_locations.map(&:display_name).join(", ")}"})
   end
 
   def self.validate_victoria_metrics_username(username)
     msg = "VictoriaMetrics user must only contain lowercase letters, numbers, hyphens and underscore and cannot start with a number or hyphen. It also has a max length of 32 and a min length of 3."
-    fail ValidationFailed.new({username: msg}) unless username&.match(ALLOWED_VICTORIA_METRICS_USERNAME_PATTERN)
+    fail ValidationFailed.new({username: msg}) unless username&.match?(ALLOWED_VICTORIA_METRICS_USERNAME_PATTERN)
   end
 
   def self.validate_victoria_metrics_storage_size(storage_size)
@@ -354,11 +458,44 @@ module Validation
   def self.validate_postgres_upgrade(postgres_resource)
     fail ValidationFailed.new({needs_convergence: "Database cluster is waiting for convergence, please wait for it to complete"}) if postgres_resource.needs_convergence?
     fail ValidationFailed.new({read_replica: "Read replicas cannot be upgraded"}) if postgres_resource.read_replica?
-    fail ValidationFailed.new({flavor: "Lantern Postgres instances cannot be upgraded"}) if postgres_resource.flavor == PostgresResource::Flavor::LANTERN
     fail ValidationFailed.new({version: "Database is already at the latest version"}) unless postgres_resource.can_upgrade?
   end
 
   def self.validate_postgres_version(version, flavor)
     fail ValidationFailed.new({version: "Version #{version} is not supported for #{flavor} flavor"}) unless Option::POSTGRES_VERSION_OPTIONS[flavor].include?(version)
+  end
+
+  # Hugepages come out of VM memory, so the ceiling is lower on small servers,
+  # where 75% would not leave enough behind for backends and the rest of the
+  # system.
+  def self.postgres_max_shared_memory_percent(memory_gib)
+    (memory_gib <= 16) ? 50 : 75
+  end
+
+  def self.validate_postgres_restart_sensitive_params(version, user_config, parent: nil, children: [])
+    params = PostgresServer.restart_sensitive_params
+    target_values = lambda do |cfg_version, cfg|
+      validator = PostgresConfigValidator.new(cfg_version)
+      params.to_h { |k| [k, Integer(cfg[k] || validator.default(k))] }
+    end
+
+    target = target_values.call(version, user_config)
+    errors = {}
+
+    if parent
+      parent_target = target_values.call(parent.version, parent.user_config)
+      params.each do |k|
+        errors[k] = "must be >= #{parent_target[k]} to match the primary's current value" if target[k] < parent_target[k]
+      end
+    end
+
+    children.each do |child|
+      child_target = target_values.call(child.version, child.user_config)
+      params.each do |k|
+        errors[k] ||= "must be <= #{child_target[k]} to match read replica '#{child.name}''s current value" if target[k] > child_target[k]
+      end
+    end
+
+    fail ValidationFailed.new(errors.transform_keys { |key| "pg_config.#{key}" }) if errors.any?
   end
 end

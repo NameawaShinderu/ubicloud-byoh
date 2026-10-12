@@ -16,11 +16,11 @@ RSpec.describe Clover, "cli pg show" do
   end
 
   it "shows information for PostgreSQL database" do
-    expect(Config).to receive(:postgres_service_hostname).and_return("pg.example.com").at_least(:once)
+    expect(Config).to receive(:postgres_service_hostname_v3).and_return("pg.example.com").at_least(:once)
     DnsZone.create(project_id: @project.id, name: "pg.example.com")
     @pg.add_metric_destination(username: "md-user", password: "1", url: "https://md.example.com")
+    @pg.add_log_destination(name: "ld-name", type: "syslog", url: "tcp://logs.example.com:6514")
     @pg.update(root_cert_1: "a", root_cert_2: "b")
-    @pg.representative_server.vm.add_vm_storage_volume(boot: false, size_gib: 64, disk_index: 0)
     rules = @pg.pg_firewall_rules
     rules[0].update(description: "my fwr desc")
 
@@ -33,11 +33,12 @@ RSpec.describe Clover, "cli pg show" do
       target-vm-size: standard-2
       storage-size-gib: 64
       target-storage-size-gib: 64
-      version: 17
-      target-version: 17
+      version: 18
+      target-version: 18
       ha-type: none
       flavor: standard
-      connection-string: postgres://postgres:#{@pg.superuser_password}@test-pg.#{@pg.ubid}.pg.example.com:5432/postgres?channel_binding=require
+      connection-string: postgres://postgres:#{@pg.superuser_password}@test-pg.#{@pg.ubid}.pg.example.com:5432/postgres?sslmode=require&channel_binding=require
+      private-connection-string: postgres://postgres:#{@pg.superuser_password}@test-pg.#{@pg.ubid}.private.pg.example.com:5432/postgres?sslmode=require&channel_binding=require
       primary: true
       earliest-restore-time: 
       maintenance-window-start-at: 
@@ -50,7 +51,9 @@ RSpec.describe Clover, "cli pg show" do
         3: #{rules[2].ubid}  ::/0  5432  
         4: #{rules[3].ubid}  ::/0  6432  
       metric-destinations:
-        1: #{@pg.metric_destinations[0].ubid}  md-user  https://md.example.com
+        1: #{@pg.metric_destinations[0].ubid}  basic_auth  md-user  https://md.example.com
+      log-destinations:
+        1: #{@pg.log_destinations[0].ubid}  ld-name  syslog  tcp://logs.example.com:6514
       read-replicas:
       ca-certificates:
       a
@@ -67,11 +70,12 @@ RSpec.describe Clover, "cli pg show" do
       target-vm-size: standard-2
       storage-size-gib: 64
       target-storage-size-gib: 64
-      version: 17
-      target-version: 17
+      version: 18
+      target-version: 18
       ha-type: none
       flavor: standard
-      connection-string: postgres://postgres:#{@pg.superuser_password}@test-pg.#{@pg.ubid}.pg.example.com:5432/postgres?channel_binding=require
+      connection-string: postgres://postgres:#{@pg.superuser_password}@test-pg.#{@pg.ubid}.pg.example.com:5432/postgres?sslmode=require&channel_binding=require
+      private-connection-string: postgres://postgres:#{@pg.superuser_password}@test-pg.#{@pg.ubid}.private.pg.example.com:5432/postgres?sslmode=require&channel_binding=require
       primary: true
       earliest-restore-time: 
       maintenance-window-start-at: 
@@ -84,12 +88,23 @@ RSpec.describe Clover, "cli pg show" do
         3: #{rules[2].ubid}  ::/0  5432  
         4: #{rules[3].ubid}  ::/0  6432  
       metric-destinations:
-        1: #{@pg.metric_destinations[0].ubid}  md-user  https://md.example.com
+        1: #{@pg.metric_destinations[0].ubid}  basic_auth  md-user  https://md.example.com
+      log-destinations:
+        1: #{@pg.log_destinations[0].ubid}  ld-name  syslog  tcp://logs.example.com:6514
       read-replicas:
         eu-central-h1/test-pg
       ca-certificates:
       a
       b
+    END
+  end
+
+  it "omits the username for metric destinations that do not use basic auth" do
+    @pg.add_metric_destination(url: "https://token.example.com", options: {"authorization" => {"credentials" => "my_token"}})
+
+    expect(cli(%W[pg #{@ref} show -f metric-destinations])).to eq <<~END
+      metric-destinations:
+        1: #{@pg.metric_destinations[0].ubid}  authorization  https://token.example.com
     END
   end
 

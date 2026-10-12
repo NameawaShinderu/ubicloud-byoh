@@ -1,9 +1,23 @@
 # frozen_string_literal: true
 
 require_relative "../../common/lib/util"
+require "fileutils"
 require "logger"
 
 class PostgresSetup
+  # Per-service GOMEMLIMIT targets, sum kept under system-go_services.slice MemoryHigh=2G
+  GO_SERVICES = {
+    "prometheus" => "1024MiB",
+    "wal-g" => "448MiB",
+    "postgres_exporter" => "384MiB",
+    "node_exporter" => "128MiB",
+  }.freeze
+
+  # postgres_exporter keeps one connection and runs its custom queries without a
+  # context, so a query that never returns blocks every later scrape. The quotes
+  # are load-bearing: systemd splits an unquoted Environment= value on the space.
+  POSTGRES_EXPORTER_ENVIRONMENT = %(Environment="PGOPTIONS=-c statement_timeout=5000"\n)
+
   def initialize(version)
     @version = version
   end
@@ -11,14 +25,17 @@ class PostgresSetup
   def install_packages
     # Check if the packages exist in the cache, if so, install them.
     if File.exist?("/var/cache/postgresql-packages/#{@version}")
-      r "sudo install-postgresql-packages #{@version}"
+      r "sudo", "install-postgresql-packages", @version.to_s
     end
   end
 
-  def configure_memory_overcommit(strict: false)
+  def configure_memory_overcommit(strict: false, hugepage_percent: 25)
     if strict
       total_mem_kb = File.read("/proc/meminfo").match(/MemTotal:\s+(\d+)/)[1].to_i
-      overcommit_kbytes = (total_mem_kb * 0.8 + 2 * 1048576).round
+      # hugepage_percent of memory is reserved for hugepages, which do not count
+      # towards the commit limit, so only the remainder is available for overcommit.
+      non_hugepage_mem_kb = total_mem_kb * (100 - hugepage_percent) / 100.0
+      overcommit_kbytes = (non_hugepage_mem_kb * 0.8 + 2 * 1048576).round
       safe_write_to_file("/etc/sysctl.d/99-overcommit.conf", "vm.overcommit_memory=2\nvm.overcommit_kbytes=#{overcommit_kbytes}\n")
     else
       r "sudo rm -f /etc/sysctl.d/99-overcommit.conf"
@@ -27,17 +44,169 @@ class PostgresSetup
     r "sudo sysctl --system"
   end
 
+  def configure_tcp_keepalive
+    safe_write_to_file("/etc/sysctl.d/99-tcp-keepalive.conf", <<~SYSCTL)
+      net.ipv4.tcp_keepalive_time=30
+      net.ipv4.tcp_keepalive_probes=3
+      net.ipv4.tcp_keepalive_intvl=10
+    SYSCTL
+    r "sudo sysctl --system"
+  end
+
+  JOURNALD_CONF_PATH = "/etc/systemd/journald.conf.d/50-persistent.conf"
+
+  JOURNAL_MAX_USE = "1G"
+
+  JOURNALD_CONF = <<~JOURNALD
+    [Journal]
+    Storage=persistent
+    SystemMaxUse=#{JOURNAL_MAX_USE}
+    SystemMaxFileSize=64M
+    MaxRetentionSec=1month
+    SplitMode=none
+    Compress=yes
+    ForwardToSyslog=no
+  JOURNALD
+
+  # Every file the stock rsyslog config writes, with its rotated and compressed
+  # generations. Once rsyslog is gone nothing writes, rotates or reads them.
+  RSYSLOG_LOGS_GLOB = "/var/log/{syslog,auth.log,kern.log,daemon.log,user.log,lpr.log,cron.log,debug,messages,mail.log,mail.info,mail.warn,mail.err}*"
+
+  # rsyslog duplicates the journal into /var/log with no size ceiling, so the
+  # root filesystem fills. The current image drops it for a capped persistent
+  # journal at build time; servers built before that image need the same end
+  # state applied in place, including reclaiming what rsyslog already wrote.
+  def configure_journald
+    unless File.exist?(JOURNALD_CONF_PATH) && File.read(JOURNALD_CONF_PATH) == JOURNALD_CONF
+      r "mkdir", "-p", File.dirname(JOURNALD_CONF_PATH)
+      safe_write_to_file(JOURNALD_CONF_PATH, JOURNALD_CONF)
+      r "systemctl", "restart", "systemd-journald"
+      r "journalctl", "--rotate"
+      r "journalctl", "--vacuum-size=#{JOURNAL_MAX_USE}"
+    end
+
+    return unless File.exist?("/usr/sbin/rsyslogd")
+
+    # postrm takes /etc/logrotate.d/rsyslog with it, so the stale weekly config
+    # does not outlive the daemon.
+    r "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "purge", "-y", "rsyslog"
+
+    FileUtils.rm_f(Dir.glob(RSYSLOG_LOGS_GLOB))
+  end
+
+  PERIODIC_UNITS = %w[postgres-metrics.service io-throttle@.service disk-full-check@.service].freeze
+
+  PERIODIC_UNIT_DROPIN = <<~DROPIN
+    [Service]
+    SyslogLevel=notice
+    LogLevelMax=notice
+  DROPIN
+
+  def quiet_periodic_units
+    changed = false
+    PERIODIC_UNITS.each do |unit|
+      path = "/etc/systemd/system/#{unit}.d/50-quiet-journal.conf"
+      next if File.exist?(path) && File.read(path) == PERIODIC_UNIT_DROPIN
+      r "mkdir", "-p", File.dirname(path)
+      safe_write_to_file(path, PERIODIC_UNIT_DROPIN)
+      changed = true
+    end
+    r "systemctl", "daemon-reload" if changed
+  end
+
+  def configure_service_slice
+    safe_write_to_file("/etc/systemd/system/system-go_services.slice", <<~SLICE)
+      [Slice]
+      MemoryHigh=2G
+      MemoryMax=2560M
+    SLICE
+    rewritten = GO_SERVICES.filter_map do |svc, gomemlimit|
+      r "mkdir", "-p", "/etc/systemd/system/#{svc}.service.d"
+      path = "/etc/systemd/system/#{svc}.service.d/override.conf"
+      override = <<~OVERRIDE
+        [Service]
+        Slice=system-go_services.slice
+        Environment=GOMEMLIMIT=#{gomemlimit}
+      OVERRIDE
+      override += POSTGRES_EXPORTER_ENVIRONMENT if svc == "postgres_exporter"
+      changed = !File.file?(path) || File.read(path) != override
+      safe_write_to_file(path, override)
+      svc if changed
+    end
+    r "systemctl daemon-reload"
+    # Apply cap so without restarting. Slice=, GOMEMLIMIT and Environment= are all
+    # load-time directives, so restart a service only when it is not in the slice
+    # yet, or when its drop-in just changed.
+    r "systemctl set-property system-go_services.slice MemoryHigh=2G MemoryMax=2560M"
+    GO_SERVICES.each_key do |svc|
+      current_slice = r("systemctl", "show", "#{svc}.service", "-p", "Slice", "--value").strip
+      next if current_slice == "system-go_services.slice" && !rewritten.include?(svc)
+      r "systemctl", "try-restart", "#{svc}.service"
+    end
+  end
+
   def setup_data_directory
     r "chown postgres /dat"
 
     # Below commands are required for idempotency
-    r "rm -rf /dat/#{@version}"
-    r "rm -rf /etc/postgresql/#{@version}"
+    r "rm", "-rf", "/dat/#{@version}"
+    r "rm", "-rf", "/etc/postgresql/#{@version}"
 
-    r "echo \"data_directory = '/dat/#{@version}/data'\" | sudo tee /etc/postgresql-common/createcluster.d/data-dir.conf"
+    r "echo :line | sudo tee /etc/postgresql-common/createcluster.d/data-dir.conf", line: "data_directory = '/dat/#{@version}/data'"
+
+    # Install to path postgres can access
+    r "install", "-m", "0755", File.expand_path("../bin/disk-full-check", __dir__), "/usr/local/sbin/disk-full-check"
+
+    # Stage pg_log_throttle conf outside conf.d/ so PG does not load it
+    # until disk-full-check symlinks it in at the restart threshold.
+    r "install", "-d", "-m", "0755", "/etc/postgresql-common/pg-logs-throttle"
+    r "install", "-m", "0644", File.expand_path("../lib/pg-logs-throttle/991-pg-logs-throttle.conf", __dir__), "/etc/postgresql-common/pg-logs-throttle/991-pg-logs-throttle.conf"
+
+    safe_write_to_file("/etc/systemd/system/disk-full-check@.service", <<~DISKFULL)
+      [Unit]
+      Wants=disk-full-check@%i.timer
+      Description=Mitigate disk full scenarios
+
+      [Service]
+      Type=oneshot
+      User=postgres
+      ExecStart=/usr/local/sbin/disk-full-check %i
+
+      [Install]
+      WantedBy=multi-user.target
+    DISKFULL
+
+    safe_write_to_file("/etc/systemd/system/disk-full-check@.timer", <<~DISKFULL)
+      [Unit]
+      Description=Schedule disk full check
+
+      [Timer]
+      OnBootSec=30s
+      OnUnitActiveSec=20s
+      AccuracySec=1s
+      Unit=disk-full-check@%i.service
+
+      [Install]
+      WantedBy=timers.target
+    DISKFULL
+
+    r "sudo systemctl daemon-reload"
+    r "sudo", "systemctl", "enable", "--now", "disk-full-check@#{@version}.timer"
+  end
+
+  # Runs between wal-g backup-fetch and pg_createcluster.
+  # Does nothing by default.
+  def after_backup_fetch
   end
 
   def create_cluster
-    r "pg_createcluster #{@version} main --port=5432 --locale=C.UTF8"
+    # Use builtin collation for PG 17+
+    if @version.to_i >= 17
+      r "pg_createcluster", @version.to_s, "main", "--port=5432", "--", "--locale-provider=builtin", "--builtin-locale=C.UTF-8"
+    else
+      r "pg_createcluster", @version.to_s, "main", "--port=5432", "--locale=C.UTF8"
+    end
   end
 end
+
+require_relative "override/postgres_setup"

@@ -7,11 +7,14 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
   DEFAULT_HEALTH_CHECK_ENDPOINT = "/up"
 
   subject_is :load_balancer
+  frame_accessor :cert
 
   def self.assemble_with_multiple_ports(private_subnet_id, ports:, name: nil, algorithm: "round_robin",
     health_check_endpoint: DEFAULT_HEALTH_CHECK_ENDPOINT, health_check_interval: 30, health_check_timeout: 15,
     health_check_up_threshold: 3, health_check_down_threshold: 2, health_check_protocol: "http",
-    custom_hostname_prefix: nil, custom_hostname_dns_zone_id: nil, stack: LoadBalancer::Stack::DUAL, cert_enabled: health_check_protocol == "https")
+    custom_hostname_prefix: nil, custom_hostname_dns_zone_id: nil, stack: LoadBalancer::Stack::DUAL,
+    cert_enabled: health_check_protocol == "https",
+    hostname_version: Config.load_balancer_hostname_version_default)
 
     unless (ps = PrivateSubnet[private_subnet_id])
       fail "Given subnet doesn't exist with the id #{private_subnet_id}"
@@ -27,7 +30,22 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
     ports = Validation.validate_load_balancer_ports(ports)
 
     DB.transaction do
-      lb = LoadBalancer.create(
+      if cert_enabled && hostname_version == 2
+        load_balancer_id, cert_id = DB[:presigned_load_balancer_cert]
+          .where(load_balancer_id: DB[:presigned_load_balancer_cert]
+            .order(:created_at)
+            .limit(1)
+            .for_update
+            .skip_locked
+            .select(:load_balancer_id))
+          .returning(:load_balancer_id, :cert_id)
+          .delete
+          .first&.values_at(:load_balancer_id, :cert_id)
+        Prog::Vnet::MaintainPresignedLoadBalancerCerts.schedule_strand if load_balancer_id
+      end
+      load_balancer_id ||= LoadBalancer.generate_uuid
+
+      lb = LoadBalancer.create_with_id(load_balancer_id,
         private_subnet_id:, name:, algorithm:,
         custom_hostname:, custom_hostname_dns_zone_id:,
         stack:, project_id: ps.project_id,
@@ -38,8 +56,9 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
         health_check_down_threshold:,
         health_check_protocol:,
         cert_enabled:,
-      )
+        hostname_version:)
       ports.each { |src_port, dst_port| LoadBalancerPort.create(load_balancer_id: lb.id, src_port:, dst_port:) }
+      DB[:certs_load_balancers].insert(load_balancer_id:, cert_id:) if cert_id
       Strand.create_with_id(lb, prog: "Vnet::LoadBalancerNexus", label: "wait")
     end
   end
@@ -47,10 +66,12 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
   def self.assemble(private_subnet_id, name: nil, algorithm: "round_robin",
     health_check_endpoint: DEFAULT_HEALTH_CHECK_ENDPOINT, health_check_interval: 30, health_check_timeout: 15,
     health_check_up_threshold: 3, health_check_down_threshold: 2, health_check_protocol: "http", src_port: nil, dst_port: nil,
-    custom_hostname_prefix: nil, custom_hostname_dns_zone_id: nil, stack: LoadBalancer::Stack::DUAL, cert_enabled: health_check_protocol == "https")
+    custom_hostname_prefix: nil, custom_hostname_dns_zone_id: nil, stack: LoadBalancer::Stack::DUAL,
+    cert_enabled: health_check_protocol == "https",
+    hostname_version: Config.load_balancer_hostname_version_default)
 
     assemble_with_multiple_ports(private_subnet_id, name:, algorithm:, health_check_endpoint:, health_check_interval:, health_check_timeout:,
-      health_check_up_threshold:, health_check_down_threshold:, health_check_protocol:, ports: [[src_port, dst_port]], custom_hostname_prefix:, custom_hostname_dns_zone_id:, stack:, cert_enabled:)
+      health_check_up_threshold:, health_check_down_threshold:, health_check_protocol:, ports: [[src_port, dst_port]], custom_hostname_prefix:, custom_hostname_dns_zone_id:, stack:, cert_enabled:, hostname_version:)
   end
 
   label def wait
@@ -75,16 +96,18 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
   end
 
   label def create_new_cert
-    cert = Prog::Vnet::CertNexus.assemble(load_balancer.hostname, load_balancer.dns_zone&.id, add_private: true).subject
+    cert = Prog::Vnet::CertNexus.assemble(load_balancer.cert_hostname, load_balancer.dns_zone&.id,
+      private_hostname: load_balancer.cert_private_hostname,
+      waiting_strand_id: strand.id).subject
     load_balancer.add_cert(cert)
-    update_stack("cert" => cert.id)
+    self.cert = cert.id
     hop_wait_cert_provisioning
   end
 
   label def wait_cert_provisioning
     # Wait until the cert we created in create_new_cert actually has a cert
-    if frame["cert"] ? Cert[frame["cert"]].cert.nil? : load_balancer.need_certificates?
-      nap 60
+    if cert ? Cert[cert].cert.nil? : load_balancer.need_certificates?
+      nap(10 * 60)
     elsif load_balancer.refresh_cert_set?
       load_balancer.vms.each do |vm|
         bud Prog::Vnet::CertServer, {"subject_id" => load_balancer.id, "vm_id" => vm.id}, :reshare_certificate
@@ -93,15 +116,15 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
       hop_wait_cert_broadcast
     end
 
-    update_stack("cert" => nil)
+    self.cert = nil
     hop_wait
   end
 
   label def wait_cert_broadcast
     reap(nap: 1) do
       decr_refresh_cert
-      update_stack("cert" => nil)
-      load_balancer.certs_dataset.exclude(id: load_balancer.active_cert.id).all do |cert|
+      self.cert = nil
+      load_balancer.certs_dataset.exclude(id: load_balancer.active_cert&.id).all do |cert|
         LoadBalancerCert[cert_id: cert.id].destroy
       end
       hop_wait
@@ -157,46 +180,52 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
 
     if (dns_zone = load_balancer.dns_zone)
       hostname = load_balancer.hostname
-      private_hostname = "private.#{hostname}"
+      private_hostname = load_balancer.private_hostname
 
       ip_info = []
       load_balancer.vms_to_dns.each do |vm|
         # Insert IPv4 record if stack is ipv4 or dual, and vm has IPv4
         if load_balancer.ipv4_enabled?
           if vm.ip4_string
-            ip_info << [vm.ip4_string, "A", hostname]
+            ip_info << [vm.ip4_string, "A", hostname, dns_zone]
           elsif vm.ip4_enabled
             # VM will have a public IPv4 address, but it is not assigned yet
             nap 5
           end
-          ip_info << [vm.private_ipv4_string, "A", private_hostname]
+          ip_info << [vm.private_ipv4_string, "A", private_hostname, private_dns_zone]
         end
 
         if load_balancer.ipv6_enabled?
           if vm.ip6_string
-            ip_info << [vm.ip6_string, "AAAA", hostname]
+            ip_info << [vm.ip6_string, "AAAA", hostname, dns_zone]
           else
             # VM public IPv6 address not assigned yet
             nap 5
           end
-          ip_info << [vm.private_ipv6_string, "AAAA", private_hostname]
+          ip_info << [vm.private_ipv6_string, "AAAA", private_hostname, private_dns_zone]
         end
       end
 
       dns_zone.delete_record(record_name: hostname)
-      dns_zone.delete_record(record_name: private_hostname)
-      ip_info.each do |data, type, record_name|
-        dns_zone.insert_record(
-          record_name:,
-          type:,
-          ttl: 10,
-          data:,
-        )
+      private_dns_zone.delete_record(record_name: private_hostname) if private_hostname
+      ip_info.each do |data, type, record_name, zone|
+        if record_name
+          zone.insert_record(
+            record_name:,
+            type:,
+            ttl: 10,
+            data:,
+          )
+        end
       end
     end
 
     load_balancer.private_subnet.incr_update_firewall_rules
     load_balancer.incr_update_load_balancer
     hop_wait
+  end
+
+  def private_dns_zone
+    @private_dns_zone ||= DnsZone[project_id: Config.load_balancer_service_project_id, name: load_balancer.domain]
   end
 end

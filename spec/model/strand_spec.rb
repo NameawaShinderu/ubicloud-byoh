@@ -9,6 +9,23 @@ RSpec.describe Strand do
       label: "start")
   }
 
+  describe "deleted records" do
+    it "does not keep a deleted record for a nexus strand, whose resource is kept in its own right" do
+      st = described_class.create(prog: "Vm::Nexus", label: "start")
+      expect { st.destroy }.not_to change { DeletedRecord.where(model_name: "Strand").count }
+    end
+
+    it "keeps one for an operational strand, the only trace that it ran" do
+      st = described_class.create(prog: "RolloutBootImage", label: "start")
+      expect { st.destroy }.to change { DeletedRecord.where(model_name: "Strand").count }.by(1)
+    end
+
+    it "does not keep one for a strand listed as adding nothing to its resource" do
+      st = described_class.create(prog: "LearnHypervisor", label: "start")
+      expect { st.destroy }.not_to change { DeletedRecord.where(model_name: "Strand").count }
+    end
+  end
+
   context "when leasing" do
     it "can take a lease only if one is not already taken" do
       st.save_changes
@@ -73,6 +90,14 @@ RSpec.describe Strand do
     }.to change(st, :label).from("hop_entry").to("hop_exit")
   end
 
+  it "records the label transition time with subsecond precision on hop" do
+    st.save_changes
+    st.label = "hop_entry"
+    expect(st).to receive(:load).and_return Prog::Test.new(st)
+    st.unsynchronized_run
+    expect(st.stack[0]["last_label_changed_at"]).to match(/\.\d{6} /)
+  end
+
   it "rejects prog names that are not in the right module" do
     expect {
       described_class.prog_verify(Object)
@@ -98,7 +123,8 @@ RSpec.describe Strand do
 
     st.take_lease_and_reload do
       # Simulate concurrent Signal between TAKE_LEASE_PS and nap handler.
-      # LEAST(schedule, NOW()) = NOW() since TAKE_LEASE_PS set schedule > NOW().
+      # The wake must fail the nap handler's compare-and-set; see
+      # Strand::SCHEDULE_NO_LATER_THAN_NOW.
       Semaphore.incr(st.id, "test")
 
       ret = st.unsynchronized_run
@@ -108,6 +134,66 @@ RSpec.describe Strand do
       # signal's value (~NOW), NOT set to 123 seconds in the future.
       expect(st.schedule).to be < Time.now + 60
     end
+  end
+
+  it "keeps the nap when the prog increments its own semaphore through the snap" do
+    st.update(label: "snap_signal_napper", schedule: Time.now - 100)
+
+    ret = st.unsynchronized_run
+    expect(ret).to be_a(Prog::Base::Nap)
+
+    expect(st.reload.schedule).to be > Time.now + 100
+    expect(Semaphore.where(strand_id: st.id, name: "test_semaphore")).not_to be_empty
+  end
+
+  it "stays runnable when a semaphore arrives mid-run on an overdue strand" do
+    st.update(label: "late_signal_napper", schedule: Time.now - 100)
+
+    ret = st.unsynchronized_run
+    expect(ret).to be_a(Prog::Base::Nap)
+
+    expect(st.reload.schedule).to be <= Time.now
+    expect(Semaphore.where(strand_id: st.id, name: "late_signal")).not_to be_empty
+  end
+
+  it "wakes up a strand scheduled in the future" do
+    st.update(schedule: Time.now + 10000, stack: [{"waiting_strand_id" => st.id}])
+
+    st.wakeup_waiting_strand
+
+    expect(st.reload.schedule).to be_within(10).of(Time.now)
+  end
+
+  it "supports an array of strands" do
+    st.update(schedule: Time.now + 10000, stack: [{"waiting_strand_id" => [st.id]}])
+
+    st.wakeup_waiting_strand
+
+    expect(st.reload.schedule).to be_within(10).of(Time.now)
+  end
+
+  it "keeps the schedule of an overdue strand on wakeup" do
+    schedule = Time.now - 100
+    st.update(schedule:, stack: [{"waiting_strand_id" => st.id}])
+
+    st.wakeup_waiting_strand
+
+    expect(st.reload.schedule).to be_within(1).of(schedule)
+  end
+
+  it "does nothing when there is no strand waiting" do
+    st.update(schedule: Time.now + 10000)
+
+    expect { st.wakeup_waiting_strand }.not_to change { st.reload.schedule }
+  end
+
+  it "wakes up and consumes the strand stored under the given key" do
+    st.update(schedule: Time.now + 10000, stack: [{"allocated_waiting_strand_id" => st.id, "waiting_strand_id" => st.id}])
+
+    st.wakeup_waiting_strand("allocated_waiting_strand_id")
+
+    expect(st.stack[0]).to eq({"waiting_strand_id" => st.id})
+    expect(st.reload.schedule).to be_within(10).of(Time.now)
   end
 
   it "logs end of strand if it took long" do

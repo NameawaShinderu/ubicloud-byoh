@@ -147,8 +147,9 @@ RSpec.describe Clover, "project" do
         expect(page).to have_no_content new_project.name
       end
 
-      it "can remove self from any project with multiple users" do
+      it "can remove self from any project with multiple admins" do
         project.add_account(user2)
+        project.subject_tags_dataset[name: "Admin"].add_member(user2.id)
 
         visit "/project"
         within("#project-#{project.ubid}") { click_button "Remove Access" }
@@ -156,8 +157,9 @@ RSpec.describe Clover, "project" do
         expect(page).to have_no_content "project-1"
       end
 
-      it "can remove self from any project with multiple users, even without authorization" do
+      it "can remove self from any project with multiple admins, even without authorization" do
         project.add_account(user2)
+        project.subject_tags_dataset[name: "Admin"].add_member(user2.id)
         AccessControlEntry.dataset.destroy
 
         visit "/project"
@@ -173,6 +175,29 @@ RSpec.describe Clover, "project" do
         expect(page).to have_flash_error("You can't remove the last user from 'project-1' project. Delete project instead.")
         within("#project-#{project.ubid}") { click_link project.name }
         expect(page.title).to eq "Ubicloud - project-1 Dashboard"
+      end
+
+      it "cannot remove self from project where you are the only admin" do
+        project.add_account(user2)
+        visit "/project"
+        within("#project-#{project.ubid}") { click_button "Remove Access" }
+        expect(page).to have_flash_error("You can't remove the last admin from 'project-1' project.")
+        within("#project-#{project.ubid}") { click_link project.name }
+        expect(page.title).to eq "Ubicloud - project-1 Dashboard"
+      end
+
+      it "removes invitations for project sent by user when removing user from project" do
+        project.add_account(user2)
+        project.subject_tags_dataset[name: "Admin"].add_member(user2.id)
+        invitation1 = project.add_invitation(email: "user3@example.com", inviter_id: user.id, expires_at: Time.now + 1000)
+        invitation2 = project.add_invitation(email: user2.email, inviter_id: user.id, expires_at: Time.now + 1000)
+
+        visit "/project"
+        within("#project-#{project.ubid}") { click_button "Remove Access" }
+        expect(page).to have_flash_notice("Removed your access to the project")
+        expect(page).to have_no_content "project-1"
+        expect(invitation1).not_to exist
+        expect(invitation2).not_to exist
       end
     end
 
@@ -248,7 +273,7 @@ RSpec.describe Clover, "project" do
         project = Project[name:]
         expect(project.accounts_dataset.count).to eq 1
         expect(project.access_control_entries.count).to eq 2
-        expect(project.subject_tags.map(&:name).sort).to eq %w[Admin Member]
+        expect(project.subject_tags.map(&:name).sort).to eq %w[Admin Member].freeze
         expect(user.projects).to include project
       end
 
@@ -269,6 +294,29 @@ RSpec.describe Clover, "project" do
         expect(page).to have_flash_error("Project limit exceeded. You can create up to 10 projects. Contact support@ubicloud.com if you need more.")
         expect(page.title).to eq("Ubicloud - Create Project")
         expect(user.projects_dataset.count).to eq 10
+      end
+
+      it "uses the project limit of the account" do
+        user.update(project_limit: 11)
+
+        (10 - user.projects_dataset.count).times do |i|
+          user.create_project_with_default_policy("project-#{i}")
+        end
+
+        visit "/project/create"
+        fill_in "Name", with: "new-project-10"
+        click_button "Create"
+
+        expect(page).to have_flash_notice("Project created")
+        expect(user.projects_dataset.count).to eq 11
+
+        visit "/project/create"
+        fill_in "Name", with: "new-project-11"
+        click_button "Create"
+
+        expect(page).to have_flash_error("Project limit exceeded. You can create up to 11 projects. Contact support@ubicloud.com if you need more.")
+        expect(page.title).to eq("Ubicloud - Create Project")
+        expect(user.projects_dataset.count).to eq 11
       end
     end
 
@@ -374,6 +422,9 @@ RSpec.describe Clover, "project" do
         find_by_id("desktop-menu").click_link "Settings"
 
         expect(page.title).to eq("Ubicloud - #{project.name}")
+        %w[VmVCpu PostgresVCpu KubernetesVCpu MachineImageVersion].freeze.each do |resource_type|
+          expect(page).to have_content(resource_type)
+        end
       end
 
       it "raises forbidden when does not have permissions" do
@@ -654,7 +705,7 @@ RSpec.describe Clover, "project" do
         project.remove_account(user2)
 
         DB.transaction(rollback: :always) do
-          DB[:account_password_hashes].where(id: user2.id).delete(force: true)
+          DB[:account_password_hashes].where(id: user2.id).delete
           user2.destroy
           within("#user-#{user2.ubid}") do
             click_button "Remove"
@@ -878,6 +929,14 @@ RSpec.describe Clover, "project" do
           click_button "Update"
         end
         expect(page).to have_flash_error("The project must have at least one admin.")
+
+        mst = SubjectTag.create(project_id: project.id, name: "Empty")
+        admin_tag.add_member(mst.id)
+        within "form#managed-policy" do
+          select "No access", from: "user_policies[#{user.ubid}]"
+          click_button "Update"
+        end
+        expect(page).to have_flash_error("The project must have at least one admin.")
       end
 
       it "can not have more than 50 pending invitations" do
@@ -938,6 +997,16 @@ RSpec.describe Clover, "project" do
 
         expect(page.title).to eq("Ubicloud - project-1 - Audit Log")
         expect(audit_log_content).to eq ["vm/create", user.ubid, ""]
+      end
+
+      it "audit log entries won't show links to objects not related to project" do
+        insert_audit_log(project_id: Project.create(name: "other").id)
+
+        visit project.path
+        click_link "View Audit Logs"
+
+        expect(page.title).to eq("Ubicloud - project-1 - Audit Log")
+        expect(audit_log_content).to eq []
       end
 
       it "can filter by action" do
@@ -1051,6 +1120,36 @@ RSpec.describe Clover, "project" do
 
         click_link "View"
         expect(page.title).to eq("Ubicloud - vm-test")
+
+        st = SubjectTag.create(name: "st-test", project_id: project.id)
+        insert_audit_log(object_ids: [st.id], ubid_type: "st")
+        visit "#{project.path}/audit-log"
+        fill_in "Object", with: st.ubid
+        click_button "Search"
+        expect(audit_log_content).to eq ["st/create", user.ubid, "st-test (View)"]
+        click_link "View"
+        expect(page.title).to eq("Ubicloud - project-1 - st-test")
+
+        expect(Config).to receive(:kubernetes_service_project_id).and_return(Project.create(name: "UbicloudKubernetesService").id).at_least(:once)
+        cluster = Prog::Kubernetes::KubernetesClusterNexus.assemble(
+          name: "myk8s",
+          project_id: project.id,
+          location_id: Location::HETZNER_FSN1_ID,
+        ).subject
+
+        nodepool = Prog::Kubernetes::KubernetesNodepoolNexus.assemble(
+          name: "kn-test",
+          node_count: 2,
+          kubernetes_cluster_id: cluster.id,
+        ).subject
+
+        insert_audit_log(ubid_type: "kn", object_ids: [nodepool.id])
+        visit "#{project.path}/audit-log"
+        fill_in "Object", with: nodepool.ubid
+        click_button "Search"
+        expect(audit_log_content).to eq ["kn/create", user.ubid, "kn-test (View)"]
+        click_link "View"
+        expect(page.title).to eq("Ubicloud - kn-test")
       end
 
       it "can filter by date, including correct pagination at same timestamp" do
@@ -1149,6 +1248,14 @@ RSpec.describe Clover, "project" do
         expect(DB[:access_tag].where(project_id: project.id).count).to eq(0)
         expect(AccessControlEntry.where(project_id: project.id).count).to eq(0)
         expect(SubjectTag.where(project_id: project.id).count).to eq(0)
+      end
+
+      it "can delete project when it has GithubInstallation" do
+        GithubInstallation.create(name: "unique-gh-install", installation_id: 999, type: "User", project_id: project.id)
+        visit project.path
+        click_button "Delete"
+        expect(page).to have_flash_notice("Project deleted")
+        expect(project.reload.visible).to be false
       end
 
       it "can not delete project when it has resources" do

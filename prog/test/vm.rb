@@ -4,6 +4,7 @@ require "json"
 
 class Prog::Test::Vm < Prog::Test::Base
   subject_is :vm, :sshable
+  frame_reader :first_boot
 
   label def start
     hop_verify_dd
@@ -28,13 +29,15 @@ class Prog::Test::Vm < Prog::Test::Base
     # On first boot, create files with random content and store their sha256 sums
     # On subsequent boots, verify that the files still exist and their content matches
     num_files = 5
-    first_boot = frame.fetch("first_boot", true)
     if first_boot
       sshable.cmd("mkdir ~/persistence_test")
       (1..num_files).each do |_|
         sha256 = sshable.cmd("head -c 1M /dev/urandom | tee /tmp/persistence-test | sha256sum | awk '{print $1}'").strip
         sshable.cmd("mv /tmp/persistence-test :file", file: File.join("/home/ubi/persistence_test", sha256))
       end
+      # Rotate each encrypted volume's KEK before the reboot, so the post-reboot
+      # pass only succeeds if the rotated volumes still open with the new KEK.
+      hop_rotate_storage_keys
     else
       files = sshable.cmd("ls ~/persistence_test").split
       fail_test "persistence test: unexpected number of files" if files.size != num_files
@@ -43,9 +46,20 @@ class Prog::Test::Vm < Prog::Test::Base
         sha256 = sshable.cmd("sha256sum :file | awk '{print $1}'", file: File.join("/home/ubi/persistence_test", file)).strip
         fail_test "persistence test: file content mismatch" unless sha256 == file
       end
+      hop_install_packages
     end
+  end
 
-    hop_install_packages
+  label def rotate_storage_keys
+    vm.vm_storage_volumes.each do |volume|
+      Prog::Storage::RotateKek.assemble(volume.id, parent_id: strand.id)
+    end
+    hop_wait_rotate_storage_keys
+  end
+
+  label def wait_rotate_storage_keys
+    # Resume the pre-reboot pass at ping_google when KEK rotations are done.
+    reap(:ping_google, nap: 10)
   end
 
   label def install_packages
@@ -83,25 +97,46 @@ class Prog::Test::Vm < Prog::Test::Base
       sshable.cmd("sync :test_file", test_file:)
     }
 
+    hop_verify_track_written
+  end
+
+  label def verify_track_written
+    vm.vm_storage_volumes.each do |vol|
+      written = vol.dump_metadata[/^written stripes:[ \t]*(.*)$/, 1]
+      fail_test "no written stripes reported for disk #{vol.disk_index}" if written.nil? || written.empty?
+    end
+
     hop_verify_vm_stats
   end
+
+  VM_STATS_KEYS = ["active_age_ms", "cpu_stats", "main_pid", "vcpus"].freeze
+  DISK_STATS_KEYS = ["active_age_ms", "cpu_stats", "io_stats", "main_pid",
+    "memory_peak_bytes", "memory_swap_peak_bytes", "num_queues", "queue_size",
+    "size_gib", "vhost_block_backend_version"].freeze
 
   label def verify_vm_stats
     result = vm.vm_host.sshable.cmd_json("sudo host/bin/vm-stats :vm_name", vm_name: vm.inhost_name)
     fail_test "missing top-level key 'vm' in vm-stats output" unless result.key?("vm")
     vm_stats = result["vm"]
-    fail_test "missing expected keys in vm stats" unless vm_stats.keys.sort == ["active_age_ms", "cpu_stats", "main_pid", "vcpus"]
+    fail_test "missing expected keys in vm stats" unless VM_STATS_KEYS.all? { vm_stats.key?(it) }
 
     vm.vm_storage_volumes.each { |vol|
       disk_key = "disk_#{vol.disk_index}"
       fail_test "missing expected key '#{disk_key}' in vm-stats output" unless result.key?(disk_key)
       disk_stats = result[disk_key]
-      fail_test "missing expected keys in #{disk_key} stats" unless disk_stats.keys.sort == [
-        "active_age_ms", "cpu_stats", "io_stats", "main_pid",
-        "memory_peak_bytes", "memory_swap_peak_bytes",
-        "num_queues", "queue_size", "size_gib", "vhost_block_backend_version",
-      ]
+      fail_test "missing expected keys in #{disk_key} stats" unless DISK_STATS_KEYS.all? { disk_stats.key?(it) }
+      if (error = disk_stats["ubiblk_stats_error"])
+        fail_test "ubiblk stats error in #{disk_key} stats: #{error}"
+      end
     }
+
+    hop_verify_storage_rpc
+  end
+
+  label def verify_storage_rpc
+    response = vm.vm_storage_volumes.first.rpc(command: "version")
+    expected_version = Config.vhost_block_backend_version.delete_prefix("v")
+    fail_test "Failed to get vhost-block-backend version for VM #{vm.ubid} using RPC" unless response["version"] == expected_version
 
     hop_stop_semaphore
   end
@@ -184,6 +219,8 @@ class Prog::Test::Vm < Prog::Test::Base
 
   label def ping_google
     sshable.cmd("ping -c 2 google.com")
+    # The pre-reboot pass skips the fio throughput check.
+    hop_ping_vms_in_subnet if first_boot
     hop_verify_io_rates
   end
 
@@ -229,7 +266,7 @@ class Prog::Test::Vm < Prog::Test::Base
       sshable.cmd("ping -c 2 :ip", ip: x.ip6)
 
       # ping private IPs
-      nic = x.nics.first
+      nic = x.user_nic
       private_ip6 = nic.private_ipv6.nth(2).to_s
       private_ip4 = nic.private_ipv4.network.to_s
       sshable.cmd("ping -c 2 :ip", ip: private_ip6)
@@ -246,7 +283,7 @@ class Prog::Test::Vm < Prog::Test::Base
       sshable.cmd("ping -c 2 :ip", ip: x.ip6)
 
       # ping private IPs shouldn't work
-      nic = x.nics.first
+      nic = x.user_nic
       private_ip6 = nic.private_ipv6.nth(2).to_s
       private_ip4 = nic.private_ipv4.network.to_s
 

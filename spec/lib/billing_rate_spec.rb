@@ -28,6 +28,11 @@ RSpec.describe BillingRate do
       expect(described_class.line_item_description("IPAddress", "IPv4", 1)).to eq("IPv4 Address")
     end
 
+    it "returns fractional GiB for MachineImageStorage" do
+      expect(described_class.line_item_description("MachineImageStorage", "standard", 0.488)).to eq("0.49 GiB Storage for Machine Image")
+      expect(described_class.line_item_description("MachineImageStorage", "standard", 2.7)).to eq("2.70 GiB Storage for Machine Image")
+    end
+
     it "raises exception for unknown type" do
       expect { described_class.line_item_description("NewType", "NewFamily", 1) }.to raise_error("BUG: Unknown resource type for line item description")
     end
@@ -58,7 +63,7 @@ RSpec.describe BillingRate do
   end
 
   it "can unambiguously find active rate" do
-    expect(described_class.rates.group_by { [it["resource_type"], it["resource_family"], it["location"], it["active_from"]] }).not_to be_any { |k, v| v.count != 1 }
+    expect(described_class.rates.group_by { [it["resource_type"], it["resource_family"], it["location"], it["byoc"], it["active_from"]] }).not_to be_any { |k, v| v.count != 1 }
   end
 
   it "can find rate for aws locations" do

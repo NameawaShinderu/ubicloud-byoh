@@ -13,11 +13,11 @@ runs:
     - name: Setup PostgreSQL
       shell: bash
       run: |
-        # Remove the default PostgreSQL cluster on the runner
-        sudo -u postgres pg_dropcluster 16 main --stop
+        # Stop the default PostgreSQL cluster on the runner if it exists
+        sudo -u postgres pg_dropcluster 16 main --stop || true
         # Install PostgreSQL
         sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
-        wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+        curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
         sudo apt-get update
         sudo apt-get install -y postgresql-17 postgresql-client-17
         # Allow runner user to access PostgreSQL
@@ -25,13 +25,13 @@ runs:
         runner_map runner clover
         runner_map runner clover_password' | sudo tee -a /etc/postgresql/17/main/pg_ident.conf > /dev/null
         sudo sed -i '1i local   all   all   peer map=runner_map' /etc/postgresql/17/main/pg_hba.conf
-        sudo systemctl start postgresql
+        sudo systemctl restart postgresql
         until pg_isready -q; do sleep 1; done
 
     - name: Set up Ruby
-      uses: ruby/setup-ruby@v1
+      uses: ruby/setup-ruby@bec3f19a76460dbe12f60def7d1a77585f07516c # v1.322.0
       with:
-        ruby-version: .tool-versions
+        ruby-version: mise.toml
         bundler-cache: true
 
     - name: Create .env.rb file
@@ -47,7 +47,7 @@ runs:
 
     - name: Set up Node.js
       if: ${{ inputs.setup-node == 'true' }}
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
       with:
         node-version-file: "package.json"
         cache: "npm"

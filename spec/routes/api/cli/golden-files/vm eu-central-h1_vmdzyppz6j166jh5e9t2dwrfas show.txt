@@ -4,13 +4,15 @@ state: running
 location: eu-central-h1
 size: standard-2
 unix-user: ubi
-storage-size-gib: 0
+storage-size-gib: 40
+boot-image: ubuntu-noble
 ip6: 
 ip4-enabled: true
 ip4: 128.0.0.1
 private-ipv4: 10.67.141.133
 private-ipv6: fda0:d79a:93e7:d4fd:1c2::2
 subnet: default-eu-central-h1
+maintenance-window-start-at: 
 firewall 1:
   id: fw4gj2v4h1fe3q28q0hnf7g8n1
   name: default-eu-central-h1-default
@@ -18,5 +20,7 @@ firewall 1:
   location: eu-central-h1
   path: /location/eu-central-h1/firewall/default-eu-central-h1-default
   rules:
-    1: fra7jvrz94be7qy8qrq8n1jrp1  0.0.0.0/0  0..65535  
-    2: fr7cv7h5bz324maazy93ykn8s4  ::/0  0..65535  
+    1: fra7jvrz94be7qy8qrq8n1jrp1  0.0.0.0/0  0..65535  tcp  
+    2: frek9rkejx123kdw7qk9pwp9r0  0.0.0.0/0  0..65535  udp  
+    3: fr7cv7h5bz324maazy93ykn8s4  ::/0  0..65535  tcp  
+    4: frgyxj9tzccy1kdwvx0hyzhnna  ::/0  0..65535  udp  

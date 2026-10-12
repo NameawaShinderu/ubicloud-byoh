@@ -4,27 +4,21 @@ require "aws-sdk-ec2"
 
 class Prog::Vnet::Aws::NicNexus < Prog::Base
   subject_is :nic
+  # create_network_interface? (not create_network_interface) so the frame
+  # reader does not collide with the create_network_interface label below.
+  frame_reader :aws_subnet_id, :use_eip, :create_network_interface?
 
   label def start
     register_deadline("wait", 5 * 60)
-    NicAwsResource.create_with_id(nic.id)
+    NicAwsResource.create_with_id(nic.id, use_eip: use_eip != false, create_network_interface: create_network_interface? != false)
     hop_create_subnet
   end
 
   label def create_subnet
     nap 2 unless private_subnet.strand.label == "wait"
 
-    register_deadline("attach_eip_network_interface", 3 * 60)
-
-    # Handle legacy VPCs with per-NIC subnets
-    if old_subnet?
-      subnet = client.describe_subnets({filters: [{name: "vpc-id", values: [vpc_id]}]}).subnets[0]
-      nic.nic_aws_resource.update(subnet_id: subnet.subnet_id, subnet_az: subnet.availability_zone.delete_prefix(private_subnet.location.name))
-      hop_create_network_interface
-    end
-
     # AwsSubnet was selected at assemble time and stored in frame
-    aws_subnet = nic.private_subnet.private_subnet_aws_resource.aws_subnets_dataset.first(id: frame["aws_subnet_id"])
+    aws_subnet = nic.private_subnet.private_subnet_aws_resource.aws_subnets_dataset.first(id: aws_subnet_id)
     fail "No available AWS subnet found" unless aws_subnet
 
     nic.nic_aws_resource.update(
@@ -33,34 +27,57 @@ class Prog::Vnet::Aws::NicNexus < Prog::Base
       aws_subnet_id: aws_subnet.id,
     )
 
+    # NICs we don't create ourselves have their network interface created by AWS at launch.
+    hop_wait unless nic.nic_aws_resource.create_network_interface
+
+    register_deadline("attach_eip_network_interface", 3 * 60)
     hop_create_network_interface
   end
 
   label def create_network_interface
     begin
+      ps_aws = private_subnet.private_subnet_aws_resource
+      sg_id = nic.is_management ? ps_aws.mgmt_security_group_id : ps_aws.user_security_group_id
       network_interface_response = client.create_network_interface({
         subnet_id: nic.nic_aws_resource.subnet_id,
         private_ip_address: nic.private_ipv4.network.to_s,
         ipv_6_prefix_count: 1,
-        groups: [
-          private_subnet.private_subnet_aws_resource.security_group_id,
-        ],
+        groups: [sg_id],
         tag_specifications: Util.aws_tag_specifications("network-interface", nic.name),
         client_token: nic.id,
       })
       network_interface_id = network_interface_response.network_interface.network_interface_id
     rescue Aws::EC2::Errors::InvalidIPAddressInUse
-      network_interfaces = client.describe_network_interfaces({
+      private_ip = nic.private_ipv4.network.to_s
+      network_interface = client.describe_network_interfaces({
         filters: [
           {name: "subnet-id", values: [nic.nic_aws_resource.subnet_id]},
-          {name: "addresses.private-ip-address", values: [nic.private_ipv4.network.to_s]},
-          {name: "status", values: ["available"]},
+          {name: "addresses.private-ip-address", values: [private_ip]},
+          {name: "tag:Name", values: [nic.name]},
         ],
-      }).network_interfaces
-      fail "No available network interface found for IP #{nic.private_ipv4.network}" if network_interfaces.empty?
-      network_interface_id = network_interfaces[0].network_interface_id
+      }).network_interfaces.first
+
+      unless network_interface
+        new_ip = Prog::Vnet::NicNexus.allocate_ipv4_from_aws_subnet(private_subnet, nic.nic_aws_resource.aws_subnet)
+        Clog.emit("NIC private IP is taken by another network interface, reallocating", {nic_ip_reallocated: {nic: nic.ubid, from: private_ip, to: new_ip}})
+        nic.update(private_ipv4: new_ip)
+        nap 0
+      end
+
+      nap 1 unless network_interface.status == "available"
+      network_interface_id = network_interface.network_interface_id
     end
     nic.nic_aws_resource.update(network_interface_id:)
+
+    # AWS by default rejects outgoing traffic if response is coming out of network interface
+    # that is different from the one that received the request. When multiple network interfaces
+    # are attached, we either need to disable source/dest check or add routing rules to ensure
+    # response goes out of the same network interface. Disabling source/dest check is simpler and
+    # safe because of our single-tenancy model.
+    client.modify_network_interface_attribute(
+      network_interface_id:,
+      source_dest_check: {value: false},
+    )
 
     hop_assign_ipv6_address
   end
@@ -75,7 +92,11 @@ class Prog::Vnet::Aws::NicNexus < Prog::Base
 
   label def wait_network_interface_created
     if get_network_interface.status == "available"
-      hop_allocate_eip
+      hop_allocate_eip if nic.nic_aws_resource.use_eip
+
+      # NICs without an EIP (e.g. mgmt reached over IPv6) skip EIP allocation.
+      unregister_deadline("attach_eip_network_interface")
+      hop_wait
     end
 
     nap 1
@@ -110,6 +131,9 @@ class Prog::Vnet::Aws::NicNexus < Prog::Base
     register_deadline(nil, 10 * 60)
     hop_destroy_entities unless nic.nic_aws_resource
 
+    # NICs we didn't create ourselves are deleted by AWS on instance termination.
+    hop_destroy_entities unless nic.nic_aws_resource.create_network_interface
+
     begin
       ignore_invalid_nic do
         client.delete_network_interface({network_interface_id: nic.nic_aws_resource.network_interface_id})
@@ -129,21 +153,6 @@ class Prog::Vnet::Aws::NicNexus < Prog::Base
       allocation_id = nic.nic_aws_resource&.eip_allocation_id
       client.release_address({allocation_id:}) if allocation_id
     end
-    hop_delete_subnet
-  end
-
-  label def delete_subnet
-    # Only delete legacy per-NIC subnets, not shared AZ subnets
-    if old_subnet? || !nic.nic_aws_resource.aws_subnet_id
-      ignore_invalid_nic do
-        client.delete_subnet({subnet_id: nic.nic_aws_resource.subnet_id})
-      rescue Aws::EC2::Errors::DependencyViolation => e
-        raise e if private_subnet.nics.count == 1
-
-        Clog.emit("dependency violation for aws nic", {ignored_aws_nic_failure: Util.exception_to_hash(e, backtrace: nil)})
-      end
-    end
-
     hop_destroy_entities
   end
 
@@ -161,19 +170,11 @@ class Prog::Vnet::Aws::NicNexus < Prog::Base
     @private_subnet ||= nic.private_subnet
   end
 
-  def vpc_id
-    @vpc_id ||= private_subnet.private_subnet_aws_resource.vpc_id
-  end
-
   def get_network_interface
-    client.describe_network_interfaces({filters: [{name: "network-interface-id", values: [nic.nic_aws_resource.network_interface_id]}, {name: "tag:Ubicloud", values: ["true"]}]}).network_interfaces[0]
+    client.describe_network_interfaces({filters: [{name: "network-interface-id", values: [nic.nic_aws_resource.network_interface_id]}, {name: "tag:Ubicloud", values: [Config.provider_resource_tag_value]}]}).network_interfaces[0]
   end
 
   private
-
-  def old_subnet?
-    private_subnet.net4.netmask.prefix_len == PrivateSubnet::DEFAULT_SUBNET_PREFIX_LEN
-  end
 
   def ignore_invalid_nic
     yield

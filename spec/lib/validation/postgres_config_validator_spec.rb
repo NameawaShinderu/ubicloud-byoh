@@ -20,10 +20,60 @@ RSpec.describe Validation::PostgresConfigValidator do
   end
 
   describe "#validate" do
+    context "with time units" do
+      it "accepts time units for each supported Postgres version without changing the config" do
+        %w[16 17 18].each do |version|
+          time_validator = described_class.new(version)
+          config = {
+            "client_connection_check_interval" => "5s",
+            "idle_in_transaction_session_timeout" => "15s",
+            "idle_session_timeout" => "2min",
+            "lock_timeout" => "250ms",
+            "post_auth_delay" => "1s",
+            "pre_auth_delay" => "1s",
+            "recovery_min_apply_delay" => "250ms",
+            "tcp_keepalives_idle" => "5s",
+            "tcp_keepalives_interval" => "5s",
+            "tcp_user_timeout" => "500ms",
+          }
+          config["transaction_timeout"] = "1h" unless version == "16"
+
+          expect(time_validator.validation_errors(config.freeze)).to be_empty
+        end
+      end
+
+      it "accepts the supported time units, bare milliseconds, and zero" do
+        [0, 15000, "0", "15000", "0s", "1000us", "1ms", "1s", "1min", "1h", "1d"].each do |value|
+          expect(validator.validation_errors("lock_timeout" => value)).to be_empty
+        end
+      end
+
+      it "rejects unsupported units and malformed durations" do
+        ["15m", "15MS", "-1s", "15s trailing", "15s\n"].each do |value|
+          expect(validator.validation_errors("lock_timeout" => value)).not_to be_empty
+        end
+      end
+    end
+
     context "with valid configurations" do
       it "returns no errors for valid max_connections" do
         config = {"max_connections" => "100"}
         expect { validator.validate(config) }.not_to raise_error
+      end
+
+      it "accepts ubicloud.shared_memory_percent within range and flags it as restart-requiring" do
+        expect { validator.validate({"ubicloud.shared_memory_percent" => "50"}) }.not_to raise_error
+        expect(validator.requires_restart?("ubicloud.shared_memory_percent")).to be true
+      end
+
+      it "rejects ubicloud.shared_memory_percent outside the 25-75 range" do
+        expect { validator.validate({"ubicloud.shared_memory_percent" => "90"}) }.to raise_error(Validation::ValidationFailed)
+        expect { validator.validate({"ubicloud.shared_memory_percent" => "10"}) }.to raise_error(Validation::ValidationFailed)
+      end
+
+      it "validates ubicloud.shared_memory_percent rather than passing it through as a custom option" do
+        expect { validator.validate({"ubicloud.other_setting" => "anything"}) }.not_to raise_error
+        expect { validator.validate({"ubicloud.shared_memory_percent" => "anything"}) }.to raise_error(Validation::ValidationFailed)
       end
 
       it "returns no errors for valid log_statement" do
@@ -36,33 +86,38 @@ RSpec.describe Validation::PostgresConfigValidator do
         expect { validator.validate(config) }.not_to raise_error
       end
 
-      it "returns no errors for properly quoted string with spaces" do
-        config = {"archive_command" => "'foo bar'"}
-        expect { validator.validate(config) }.not_to raise_error
-      end
-
       it "returns no errors for simple string without special characters" do
         config = {"application_name" => "my_app0001"}
         expect { validator.validate(config) }.not_to raise_error
       end
 
+      it "returns no errors for string with spaces" do
+        config = {"archive_command" => "foo bar"}
+        expect { validator.validate(config) }.not_to raise_error
+      end
+
       it "returns no errors for string with path characters" do
-        config = {"ssl_ca_file" => "'/etc/ssl/certs/ca.crt'"}
+        config = {"ssl_ca_file" => "/etc/ssl/certs/ca.crt"}
         expect { validator.validate(config) }.not_to raise_error
       end
 
-      it "returns no errors for properly quoted string with comma" do
-        config = {"shared_preload_libraries" => "'pg_cron,pg_stat_statements'"}
+      it "returns no errors for string with comma" do
+        config = {"shared_preload_libraries" => "pg_cron,pg_stat_statements"}
         expect { validator.validate(config) }.not_to raise_error
       end
 
-      it "returns no errors for properly quoted string with two escaped quotes" do
-        config = {"application_name" => "'my''app'"}
+      it "returns no errors for string with single quotes in the middle" do
+        config = {"application_name" => "my'app"}
         expect { validator.validate(config) }.not_to raise_error
       end
 
-      it "returns no errors for properly quoted string with escaped backslash" do
-        config = {"application_name" => "'my\\'app'"}
+      it "returns no errors for string with backslash" do
+        config = {"application_name" => "my\\app"}
+        expect { validator.validate(config) }.not_to raise_error
+      end
+
+      it "returns no errors for string with double quotes" do
+        config = {"unix_socket_directories" => '"/tmp/my socket dir", /tmp'}
         expect { validator.validate(config) }.not_to raise_error
       end
 
@@ -71,9 +126,48 @@ RSpec.describe Validation::PostgresConfigValidator do
         expect { validator.validate(config) }.not_to raise_error
       end
 
-      it "returns no errors for unknown customized option" do
+      it "returns no errors for valid customized option" do
         config = {"citus.shard_count" => "32"}
         expect { validator.validate(config) }.not_to raise_error
+      end
+
+      it "rejects customized option with invalid characters" do
+        config = {"citus.shard-count" => "32"}
+        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed)
+      end
+
+      it "rejects $ in each part for customized option, both at the start and in the middle" do
+        expect { validator.validate({"$citus.shard_count" => "32"}) }.to raise_error(Validation::ValidationFailed)
+        expect { validator.validate({"citus.$shard_count" => "32"}) }.to raise_error(Validation::ValidationFailed)
+        expect { validator.validate({"citus.shard$count" => "32"}) }.to raise_error(Validation::ValidationFailed)
+        expect { validator.validate({"c$itus.shard_count" => "32"}) }.to raise_error(Validation::ValidationFailed)
+      end
+
+      it "rejects digits as the first character in each part for customized option" do
+        expect { validator.validate({"1citus.shard_count" => "32"}) }.to raise_error(Validation::ValidationFailed)
+        expect { validator.validate({"citus.1shard_count" => "32"}) }.to raise_error(Validation::ValidationFailed)
+      end
+
+      it "rejects empty part for customized option" do
+        expect { validator.validate({".shard_count" => "32"}) }.to raise_error(Validation::ValidationFailed)
+        expect { validator.validate({"citus." => "32"}) }.to raise_error(Validation::ValidationFailed)
+      end
+
+      it "accepts digits as non-start characters in each part for customized option" do
+        config = {"c1tus.shard_c0unt" => "32"}
+        expect { validator.validate(config) }.not_to raise_error
+      end
+
+      it "rejects customized option with more than two parts" do
+        config = {"citus.shard.count.extra" => "32"}
+        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed)
+      end
+
+      it "rejects newline characters in value" do
+        config = {"ext.option" => "my\napp"}
+        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed) do |error|
+          expect(error.details["ext.option"]).to include("Value cannot contain newlines")
+        end
       end
 
       it "returns no errors for non-string value" do
@@ -132,24 +226,25 @@ RSpec.describe Validation::PostgresConfigValidator do
         expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed)
       end
 
-      it "returns error for unquoted string with spaces" do
-        config = {"archive_command" => "foo bar"}
-        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed)
+      it "returns error for string wrapped in single quotes" do
+        config = {"archive_command" => "'foo bar'"}
+        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed) do |error|
+          expect(error.details["archive_command"]).to include("must not be wrapped in single quotes - quoting is handled automatically")
+        end
       end
 
-      it "returns error for unquoted string with comma" do
-        config = {"shared_preload_libraries" => "pg_cron,pg_stat_statements"}
-        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed)
+      it "returns error for string with mismatched leading single quote" do
+        config = {"application_name" => "'my_app"}
+        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed) do |error|
+          expect(error.details["application_name"]).to include("has a mismatched single quote")
+        end
       end
 
-      it "returns error for quoted string with unescaped quotes" do
-        config = {"application_name" => "'my'app'"}
-        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed)
-      end
-
-      it "returns error for unquoted string with special characters" do
-        config = {"archive_command" => "/usr/bin/test && echo 'done'"}
-        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed)
+      it "returns error for string with mismatched trailing single quote" do
+        config = {"application_name" => "my_app'"}
+        expect { validator.validate(config) }.to raise_error(Validation::ValidationFailed) do |error|
+          expect(error.details["application_name"]).to include("has a mismatched single quote")
+        end
       end
     end
 
@@ -248,6 +343,30 @@ RSpec.describe Validation::PostgresConfigValidator do
     it "returns false for non-restart params" do
       expect(validator.requires_restart?("work_mem")).to be false
       expect(validator.requires_restart?("log_statement")).to be false
+    end
+
+    it "tracks a param whose restart requirement changes between versions" do
+      # PG 18 draws autovacuum workers from the autovacuum_worker_slots pool, so
+      # the worker count itself became reloadable.
+      expect(described_class.new("16").requires_restart?("autovacuum_max_workers")).to be true
+      expect(described_class.new("17").requires_restart?("autovacuum_max_workers")).to be true
+      expect(described_class.new("18").requires_restart?("autovacuum_max_workers")).to be false
+    end
+  end
+
+  describe "#valid_config?" do
+    it "is true for params the version knows" do
+      expect(validator.valid_config?("max_connections")).to be true
+    end
+
+    it "is false for params the version does not know" do
+      expect(described_class.new("16").valid_config?("autovacuum_vacuum_max_threshold")).to be false
+      expect(described_class.new("17").valid_config?("autovacuum_vacuum_max_threshold")).to be false
+      expect(described_class.new("18").valid_config?("autovacuum_vacuum_max_threshold")).to be true
+    end
+
+    it "is false for unknown params" do
+      expect(validator.valid_config?("not_a_real_guc")).to be false
     end
   end
 end

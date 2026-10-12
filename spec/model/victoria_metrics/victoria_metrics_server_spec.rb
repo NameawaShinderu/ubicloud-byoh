@@ -72,6 +72,7 @@ RSpec.describe VictoriaMetricsServer do
         endpoint: vms.endpoint,
         ssl_ca_data: vms.resource.root_certs,
         socket: File.join("unix://", socket_path, "health_monitor_socket"),
+        verify_host: nil,
         username: vms.resource.admin_user,
         password: vms.resource.admin_password,
       ).and_return(client)
@@ -137,7 +138,7 @@ RSpec.describe VictoriaMetricsServer do
       previous_pulse = {reading: "down", reading_rpt: 5, reading_chg: fixed_time - 60}
 
       vms.check_pulse(session:, previous_pulse:)
-      expect(vms.reload.checkup_set?).to be true
+      expect(vms.checkup_set?(cached: false)).to be true
     end
 
     it "does not increment checkup semaphore when already set" do
@@ -159,6 +160,7 @@ RSpec.describe VictoriaMetricsServer do
         endpoint: vms.endpoint,
         ssl_ca_data: vms.resource.root_certs,
         socket: nil,
+        verify_host: nil,
         username: vms.resource.admin_user,
         password: vms.resource.admin_password,
       )
@@ -172,6 +174,7 @@ RSpec.describe VictoriaMetricsServer do
         endpoint: vms.endpoint,
         ssl_ca_data: vms.resource.root_certs,
         socket:,
+        verify_host: nil,
         username: vms.resource.admin_user,
         password: vms.resource.admin_password,
       )

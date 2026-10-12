@@ -10,18 +10,24 @@ Commands:
     list                               List PostgreSQL databases
 
 Post Commands:
+    add-bearer-metric-destination      Add a PostgreSQL metric destination using bearer token authentication
     add-cert-auth-user                 Add user to list of users authenticating with client certificate authentication
     add-config-entries                 Add configuration entries to a PostgreSQL database
     add-firewall-rule                  Add a PostgreSQL firewall rule
     add-metric-destination             Add a PostgreSQL metric destination
+    add-otlp-log-destination           Add an OTLP HTTP log destination to a PostgreSQL database
     add-pgbouncer-config-entries       Add pgbouncer configuration entries to a PostgreSQL database
-    ca-certificates                    Print CA certificates for a PostgreSQL database
+    add-syslog-log-destination         Add a syslog (RFC 5424 over TLS) log destination to a PostgreSQL database
+    ca-certificates                    Print CA certificates for a PostgreSQL database (if available)
     create                             Create a PostgreSQL database
+    create-backup-credentials          Create temporary, read-only credentials for downloading PostgreSQL backups
     create-client-cert-keypair         Create client certificate keypair with given common name, expiring after a duration of seconds
     create-read-replica                Create a read replica for a PostgreSQL database
     delete-firewall-rule               Delete a PostgreSQL firewall rule
+    delete-log-destination             Delete a PostgreSQL log destination
     delete-metric-destination          Delete a PostgreSQL metric destination
     destroy                            Destroy a PostgreSQL database
+    get-logs                           Fetch logs for a PostgreSQL database in CSV format
     list-backups                       List backups for a PostgreSQL database
     list-servers                       List servers for a PostgreSQL database
     modify                             Modify a PostgreSQL database cluster

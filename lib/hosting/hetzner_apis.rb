@@ -1,26 +1,23 @@
 # frozen_string_literal: true
 
 require "excon"
-class Hosting::HetznerApis
-  def initialize(hetzner_host)
-    @host = hetzner_host
-  end
-
-  def reimage(server_id, hetzner_ssh_public_key: Config.hetzner_ssh_public_key, dist: "Ubuntu 24.04 LTS base")
-    unless hetzner_ssh_public_key
-      raise "hetzner_ssh_public_key is not set"
-    end
-
-    key_data = hetzner_ssh_public_key.split(" ")[1]
-    decoded_data = Base64.decode64(key_data)
-    fingerprint = OpenSSL::Digest::MD5.new(decoded_data).hexdigest
-    formatted_fingerprint = fingerprint.scan(/../).join(":")
+class Hosting::HetznerApis < Hosting::ProviderApis
+  def reimage(hetzner_ssh_public_key: Config.hetzner_ssh_public_key, dist: "Ubuntu 24.04 LTS base")
+    authorized_key = ssh_key_fingerprint(hetzner_ssh_public_key)
     connection = create_connection
     connection.post(path: "/boot/#{server_id}/linux",
-      body: URI.encode_www_form(dist:, lang: "en", authorized_key: formatted_fingerprint),
+      body: URI.encode_www_form(dist:, lang: "en", authorized_key:),
       expects: 200)
 
     connection.post(path: "/reset/#{server_id}", body: "type=hw", expects: 200)
+    nil
+  end
+
+  # Enables the rescue system for the next boot. A reboot is required afterwards.
+  def enable_rescue(hetzner_ssh_public_key: Config.hetzner_ssh_public_key)
+    create_connection.post(path: "/boot/#{server_id}/rescue",
+      body: URI.encode_www_form(os: "linux", authorized_key: ssh_key_fingerprint(hetzner_ssh_public_key)),
+      expects: 200)
     nil
   end
 
@@ -28,31 +25,32 @@ class Hosting::HetznerApis
   # without giving the Server operating system time to gracefully stop. This
   # may lead to data loss, it’s equivalent to pulling the power cord and
   # plugging it in again. Reset should only be used when reboot does not work.
-  def reset(server_id)
+  def hardware_reset
     create_connection.post(path: "/reset/#{server_id}", body: "type=hw", expects: 200)
     nil
   end
 
-  def add_key(name, key)
-    create_connection.post(path: "/key",
-      body: URI.encode_www_form(name:, data: key),
-      expects: 201)
+  # Hetzner has no dedicated power on API; pressing the power button toggles
+  # the current state, and the ACPI signal would ask a running operating
+  # system to shut down gracefully. Checking the operating status first and
+  # doing nothing when the server is already running narrows, but cannot
+  # eliminate, the window in which the press turns the server off instead.
+  def power_on
+    return if power_status == "running"
+
+    create_connection.post(path: "/reset/#{server_id}", body: "type=power", expects: 200)
     nil
   end
 
-  def delete_key(key)
-    key_data = key.split(" ")[1]
-    decoded_data = Base64.decode64(key_data)
-    fingerprint = OpenSSL::Digest::MD5.new(decoded_data).hexdigest
-
-    create_connection.delete(path: "/key/#{fingerprint}", expects: [200, 404])
-    nil
+  # Returns the operating status of the server, one of "running", "shut off"
+  # or "not supported".
+  def power_status
+    response = create_connection.get(path: "/reset/#{server_id}", expects: 200)
+    JSON.parse(response.body).dig("reset", "operating_status")
   end
 
   def get_main_ip4
-    response = create_connection.get(path: "/server/#{@host.server_identifier}",
-      expects: 200)
-
+    response = create_connection.get(path: "/server/#{server_id}", expects: 200)
     response_hash = JSON.parse(response.body)
     response_hash.dig("server", "server_ip")
   end
@@ -99,7 +97,13 @@ class Hosting::HetznerApis
     end
   end
 
-  IpInfo = Struct.new(:ip_address, :source_host_ip, :is_failover, keyword_init: true)
+  IpInfo = Data.define(:ip_address, :source_host_ip) do
+    # Hetzner routes every extra address to the host's main IP, so the host
+    # claims only the main IP itself and every extra stays VM-allocatable.
+    def host_only? = ip_address == "#{source_host_ip}/32"
+
+    def host_connectivity? = false
+  end
 
   # Finds IP addresses that match with the host's IP address. An important
   # detail about this function is that; Hetzner API returns the failover IPv6
@@ -109,7 +113,7 @@ class Hosting::HetznerApis
   # filtered out. If in future, this needs to be fixed, we'll have to find a way
   # to also add the IPv6 subnets.
   def find_matching_ips(result)
-    host_address = @host.vm_host.sshable.host
+    host_address = @provider.vm_host.sshable.host
     (
       # Aggregate single-ip addresses.
       result[:ips].filter_map do |ip|
@@ -118,7 +122,6 @@ class Hosting::HetznerApis
         IpInfo.new(
           ip_address: "#{ip["ip"]}/32",
           source_host_ip: ip["server_ip"],
-          is_failover: ip["failover_ip"],
         )
       end +
 
@@ -132,28 +135,43 @@ class Hosting::HetznerApis
         IpInfo.new(
           ip_address: "#{subnet["ip"]}/#{mask}",
           source_host_ip: subnet["server_ip"],
-          is_failover: subnet["failover_ip"],
         )
       end
     )
   end
 
-  def pull_dc(server_id)
+  def pull_data_center
     response = create_connection.get(path: "/server/#{server_id}", expects: 200)
     json_server = JSON.parse(response.body)
     json_server.dig("server", "dc")
   end
 
-  def set_server_name(server_id, name)
-    create_connection.post(path: "/server/#{server_id}",
-      body: URI.encode_www_form(server_name: name),
-      expects: 200)
+  # The Robot API reports only the product name for a server.
+  def pull_inventory
+    response = create_connection.get(path: "/server/#{server_id}", expects: 200)
+    {server_model: JSON.parse(response.body).dig("server", "product")}
+  end
+
+  def set_server_name(server_name)
+    create_connection.post(path: "/server/#{server_id}", body: URI.encode_www_form(server_name:), expects: 200)
   end
 
   def create_connection
-    Excon.new(@host.connection_string,
-      user: @host.user,
-      password: @host.password,
-      headers: {"Content-Type" => "application/x-www-form-urlencoded"})
+    Excon.new(Config.hetzner_connection_string, user: Config.hetzner_user, password: Config.hetzner_password, headers: {"Content-Type" => "application/x-www-form-urlencoded"})
+  end
+
+  private
+
+  def ssh_key_fingerprint(hetzner_ssh_public_key)
+    raise "hetzner_ssh_public_key is not set" unless hetzner_ssh_public_key
+
+    key_data = hetzner_ssh_public_key.split(" ")[1]
+    decoded_data = Base64.decode64(key_data)
+    fingerprint = OpenSSL::Digest::MD5.new(decoded_data).hexdigest
+    fingerprint.scan(/../).join(":")
+  end
+
+  def server_id
+    @provider.server_identifier
   end
 end

@@ -17,6 +17,18 @@ RSpec.describe GithubRepository do
     allow(Aws::S3::Client).to receive(:new).and_return(blob_storage_client)
   end
 
+  describe "#blob_storage_client" do
+    it "builds the S3 client with bounded timeouts and retries" do
+      expect(Aws::S3::Client).to receive(:new).with(hash_including(
+        http_open_timeout: 5,
+        http_read_timeout: 8,
+        retry_limit: 2,
+      )).and_return(blob_storage_client)
+
+      expect(github_repository.blob_storage_client).to eq(blob_storage_client)
+    end
+  end
+
   describe ".destroy_blob_storage" do
     let(:uploads) { instance_double(Aws::S3::Types::ListMultipartUploadsOutput, uploads: [instance_double(Aws::S3::Types::MultipartUpload, key: "test-key", upload_id: "test-upload-id")]) }
 
@@ -46,13 +58,13 @@ RSpec.describe GithubRepository do
       expect(github_repository.reload.access_key).to be_nil
     end
 
-    it "succeed if can not delete token" do
+    it "clears the credentials even if it can not delete the token" do
       expect(blob_storage_client).to receive(:list_multipart_uploads).and_return(uploads)
       expect(blob_storage_client).to receive(:abort_multipart_upload).with(bucket: github_repository.bucket_name, key: "test-key", upload_id: "test-upload-id")
       expect(blob_storage_client).to receive(:delete_bucket).with(bucket: github_repository.bucket_name)
       expect(cloudflare_client).to receive(:delete_token).with(github_repository.access_key).and_raise(Excon::Error::HTTPStatus.new("Expected(200) <=> Actual(520 Unknown)", nil, Excon::Response.new(body: "foo")))
       github_repository.destroy_blob_storage
-      expect(github_repository.reload.access_key).to eq("my-token-id")
+      expect(github_repository.reload.access_key).to be_nil
     end
   end
 
@@ -75,6 +87,14 @@ RSpec.describe GithubRepository do
       github_repository.setup_blob_storage
       expect(github_repository.reload.access_key).to eq("test-key")
       expect(github_repository.secret_key).to eq(Digest::SHA256.hexdigest("test-secret"))
+    end
+
+    it "prefixes the bucket and token names with e2e in e2e runs" do
+      allow(Config).to receive(:is_e2e).and_return(true)
+      expect(blob_storage_client).to receive(:create_bucket).with(hash_including(bucket: "e2e-#{github_repository.ubid}"))
+      expect(cloudflare_client).to receive(:create_token).with("e2e-#{github_repository.ubid}-token", instance_of(Array)).and_return(["test-key", "test-secret"])
+      github_repository.setup_blob_storage
+      expect(github_repository.reload.access_key).to eq("test-key")
     end
 
     it "succeeds if the bucket already exists and access key does not exist" do

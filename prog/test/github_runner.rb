@@ -10,20 +10,28 @@ class Prog::Test::GithubRunner < Prog::Test::Base
   WORKFLOW_NAME = "test.yml"
   BRANCH_NAME = "main"
 
-  def self.assemble(test_cases, provider: "metal")
+  frame_reader :provider, :customer_project_id, :labels, :boot_images, :vm_host_id
+  frame_accessor :vm_pool_id, :fail_message, :test_run_id
+
+  def self.assemble(test_cases, provider: "metal", vm_host_id: nil)
     service_project = Project.create_with_id(Config.github_runner_service_project_id, name: "Github-Runner-Service-Project")
     Project.create_with_id(Config.vm_pool_project_id, name: "Vm-Pool-Service-Project")
-    customer_project = Project.create(name: "Github-Runner-Customer-Project")
+    billing_info_id = BillingInfo.create(stripe_id: "0").id
+    customer_project = Project.create(name: "Github-Runner-Customer-Project", billing_info_id:)
 
     if provider == "aws"
       customer_project.set_ff_aws_alien_runners_ratio(1)
+      customer_project.set_ff_aws_alien_runners_shared_vpc(true)
       location = Location.create_with_id(Config.github_runner_aws_location_id, name: "eu-central-1", provider: "aws", project_id: service_project.id, display_name: "aws-e2e", ui_name: "aws-e2e", visible: true)
-      LocationCredentialAws.create_with_id(location.id, access_key: Config.e2e_aws_access_key, secret_key: Config.e2e_aws_secret_key)
+      Prog::Test::Base.ensure_aws_e2e_credential(location)
     end
 
     if (url = Config.e2e_cache_proxy_download_url) && !url.empty?
       customer_project.set_ff_cache_proxy_download_url({x64: url})
     end
+
+    # Cover both the early and the old runner registration routes.
+    customer_project.set_ff_early_jit_registration([true, false].sample)
 
     GithubInstallation.create(
       installation_id: Config.e2e_github_installation_id,
@@ -37,11 +45,15 @@ class Prog::Test::GithubRunner < Prog::Test::Base
     labels = []
     labels << "ubicloud-standard-2-ubuntu-2204" if test_cases.any? { it["name"].include?("2204") }
     labels << "ubicloud-standard-2-ubuntu-2404" if test_cases.any? { it["name"].include?("2404") }
+    labels << "ubicloud-standard-2-ubuntu-2604" if test_cases.any? { it["name"].include?("2604") }
 
     if provider == "aws"
       labels << "ubicloud-standard-2-arm-ubuntu-2204" if test_cases.any? { it["name"].include?("2204") }
       labels << "ubicloud-standard-2-arm-ubuntu-2404" if test_cases.any? { it["name"].include?("2404") }
+      labels << "ubicloud-standard-2-arm-ubuntu-2604" if test_cases.any? { it["name"].include?("2604") }
     end
+
+    boot_images = vm_host_id ? test_cases.flat_map { it["images"] || [] }.uniq : []
 
     Strand.create(
       prog: "Test::GithubRunner",
@@ -50,17 +62,26 @@ class Prog::Test::GithubRunner < Prog::Test::Base
         "provider" => provider,
         "customer_project_id" => customer_project.id,
         "labels" => labels,
+        "boot_images" => boot_images,
+        "vm_host_id" => vm_host_id,
       }],
     )
   end
 
   label def start
-    hop_trigger_test_run if frame["provider"] == "aws"
+    hop_trigger_test_run if provider == "aws"
+
+    boot_images.each { vm_host.download_boot_image(it) }
+    hop_wait_image_downloads
+  end
+
+  label def wait_image_downloads
+    nap 5 unless boot_images.count == vm_host.boot_images_dataset.where(name: boot_images).exclude(activated_at: nil).count
     hop_create_vm_pool
   end
 
   label def create_vm_pool
-    label_data = Github.runner_labels[frame["labels"].first]
+    label_data = Github.runner_labels[labels.first]
     pool = Prog::Vm::VmPool.assemble(
       size: 2,
       vm_size: label_data["vm_size"],
@@ -69,13 +90,13 @@ class Prog::Test::GithubRunner < Prog::Test::Base
       storage_size_gib: label_data["storage_size_gib"],
       arch: label_data["arch"],
     ).subject
-    update_stack({"vm_pool_id" => pool.id})
+    self.vm_pool_id = pool.id
 
     hop_wait_vm_pool_to_be_ready
   end
 
   label def wait_vm_pool_to_be_ready
-    pool = VmPool[frame["vm_pool_id"]]
+    pool = VmPool[vm_pool_id]
     nap 10 unless pool.size == pool.vms_dataset.exclude(provisioned_at: nil).count
 
     # No need to provision a new VM to the pool when the first one is picked.
@@ -86,23 +107,23 @@ class Prog::Test::GithubRunner < Prog::Test::Base
   end
 
   label def trigger_test_run
-    inputs = {triggered_by: ENV["GITHUB_RUN_ID"], provider: frame["provider"], runners: frame["labels"].to_json}
+    inputs = {triggered_by: ENV["GITHUB_RUN_ID"], provider:, runners: labels.to_json}
     response = client.post("repos/#{repository_name}/actions/workflows/#{WORKFLOW_NAME}/dispatches", {ref: BRANCH_NAME, inputs:, return_run_details: true})
     unless response
-      update_stack({"fail_message" => "Couldn't trigger workflow"})
+      self.fail_message = "Couldn't trigger workflow"
       hop_clean_resources
     end
 
     Clog.emit("Triggered GitHub workflow run", {github_workflow_run: {run_id: response[:workflow_run_id], html_url: response[:html_url]}})
-    update_stack({"test_run_id" => response[:workflow_run_id]})
+    self.test_run_id = response[:workflow_run_id]
     hop_check_test_run
   end
 
   label def check_test_run
-    run = client.workflow_run(repository_name, frame["test_run_id"])
+    run = client.workflow_run(repository_name, test_run_id)
     conclusion = run[:conclusion]
     if FAIL_CONCLUSIONS.include?(conclusion)
-      update_stack({"fail_message" => "Test run failed with conclusion: #{conclusion}"})
+      self.fail_message = "Test run failed with conclusion: #{conclusion}"
     elsif IN_PROGRESS_CONCLUSIONS.include?(conclusion) || conclusion.nil?
       nap 15
     end
@@ -112,9 +133,9 @@ class Prog::Test::GithubRunner < Prog::Test::Base
 
   label def clean_resources
     begin
-      client.cancel_workflow_run(repository_name, frame["test_run_id"]) if frame["test_run_id"]
+      client.cancel_workflow_run(repository_name, test_run_id) if test_run_id
     rescue Octokit::Error
-      Clog.emit("Workflow run #{frame["test_run_id"]} has already been finished")
+      Clog.emit("Workflow run #{test_run_id} has already been finished")
     end
 
     if GithubRunner.any?
@@ -122,9 +143,9 @@ class Prog::Test::GithubRunner < Prog::Test::Base
       nap 15
     end
 
-    if (pool = VmPool[frame["vm_pool_id"]])
+    if (pool = VmPool[vm_pool_id])
       unless pool.vms.count.zero?
-        update_stack({"fail_message" => "The runner did not picked from the pool"})
+        self.fail_message = "The runner did not picked from the pool"
       end
       pool.incr_destroy
     end
@@ -140,11 +161,24 @@ class Prog::Test::GithubRunner < Prog::Test::Base
       nap 15
     end
 
+    installation = GithubInstallation.first(project_id: customer_project_id)
+    installation.destroy_private_subnets
+    unless installation.private_subnets_dataset.empty?
+      Clog.emit("Waiting private subnets to be destroyed")
+      nap 15
+    end
+
     Project[Config.github_runner_service_project_id]&.destroy
     Project[Config.vm_pool_project_id]&.destroy
-    Project[frame["customer_project_id"]]&.destroy
+    if (project = Project[customer_project_id])
+      billing_info = project.billing_info
+      project.update(billing_info_id: nil)
+      # Skip after_delete as the stripe_id is not valid
+      billing_info.delete(force: true)
+      project.destroy
+    end
 
-    frame["fail_message"] ? fail_test(frame["fail_message"]) : hop_finish
+    fail_message ? fail_test(fail_message) : hop_finish
   end
 
   label def finish
@@ -155,8 +189,12 @@ class Prog::Test::GithubRunner < Prog::Test::Base
     nap 15
   end
 
+  def vm_host
+    @vm_host ||= VmHost[vm_host_id]
+  end
+
   def repository_name
-    "#{REPOSITORY_NAME_PREFIX}-#{frame["provider"]}"
+    "#{REPOSITORY_NAME_PREFIX}-#{provider}"
   end
 
   def client

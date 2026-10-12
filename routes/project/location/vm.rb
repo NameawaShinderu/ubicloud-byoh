@@ -34,10 +34,27 @@ class Clover
 
       r.delete true do
         authorize("Vm:delete", vm)
+        handle_validation_failure("vm/show") { @page = "settings" }
 
-        DB.transaction do
-          vm.incr_destroy
-          audit_log(vm, "destroy")
+        begin
+          DB.transaction do
+            # lock to serialize with concurrent MI version metal nexus assemble
+            vm.lock!
+            unless vm.pinning_machine_image_version_metal_dataset.empty?
+              raise CloverError.new(400, "InvalidRequest", "Cannot delete VM while it is being captured as a machine image version")
+            end
+
+            vm.incr_destroy
+            audit_log(vm, "destroy")
+          end
+        rescue Sequel::NoExistingObject
+          # The VM was destroyed concurrently (e.g. a retried DELETE racing the
+          # destroy strand) between the lookup above and vm.lock! here. The VM is
+          # already gone, so treat the delete as successful instead of paging.
+          #
+          # Covering this rescue would require fault injection to make the
+          # initial lookup succeed but the subsequent vm.lock! fail, so the body
+          # is deliberately left empty (no nil) to not count it towards coverage.
         end
 
         if web?
@@ -50,9 +67,16 @@ class Clover
 
       r.rename vm, perm: "Vm:edit", serializer: Serializers::Vm, template_prefix: "vm"
 
-      r.show_object(vm, actions: %w[overview networking settings], perm: "Vm:view", template: "vm/show")
+      r.show_object(vm, actions: %w[overview networking serial-log settings].freeze, perm: "Vm:view", template: "vm/show")
 
-      r.post %w[restart start stop] do |action|
+      r.get "serial-log", api? || r.accepts_json? do
+        authorize("Vm:view", vm)
+        rc = vm_serial_log(vm, refresh: typecast_params.bool("refresh"))
+        response.status = 202 if rc.status == "created"
+        Serializers::RunCommand.serialize(rc)
+      end
+
+      r.post %w[restart start stop].freeze do |action|
         authorize("Vm:edit", vm)
         handle_validation_failure("vm/show") { @page = "settings" }
 
@@ -64,9 +88,25 @@ class Clover
           raise CloverError.new(400, "InvalidRequest", "The #{action} action is not supported in the VM's current state")
         end
 
-        DB.transaction do
-          vm.public_send(:"incr_#{action}")
-          audit_log(vm, action)
+        begin
+          DB.transaction do
+            if action == "start"
+              vm.lock!
+              unless vm.pinning_machine_image_version_metal_dataset.empty?
+                raise CloverError.new(400, "InvalidRequest", "Cannot start VM while it is being captured as a machine image version")
+              end
+            end
+
+            vm.public_send(:"incr_#{action}")
+            audit_log(vm, action)
+          end
+        rescue Sequel::NoExistingObject
+          # VM concurrently destroyed, so return 404.
+          # Covering this needs fault injection (lookup succeeds, lock! fails),
+          # so it is excluded from coverage.
+          # simplecov:disable
+          raise CloverError.new(404, "ResourceNotFound", "Virtual machine not found")
+          # simplecov:enable
         end
 
         if api?
@@ -77,6 +117,23 @@ class Clover
             notice << ". Note that stopped VMs still accrue billing charges. To stop billing charges, delete the VM."
           end
           flash["notice"] = notice
+          r.redirect vm, "/settings"
+        end
+      end
+
+      r.post "set-maintenance-window" do
+        authorize("Vm:edit", vm)
+        vm.set(maintenance_window_start_at: typecast_params.int("maintenance_window_start_at"))
+
+        DB.transaction do
+          vm.save_changes
+          audit_log(vm, "set_maintenance_window")
+        end
+
+        if api?
+          Serializers::Vm.serialize(vm, {detailed: true})
+        else
+          flash["notice"] = "Maintenance window is #{"un" unless vm.maintenance_window_start_at}set"
           r.redirect vm, "/settings"
         end
       end

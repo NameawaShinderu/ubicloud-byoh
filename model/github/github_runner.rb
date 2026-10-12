@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require_relative "../../model"
-require_relative "../../lib/net_ssh"
 
 class GithubRunner < Sequel::Model
   one_to_one :strand, key: :id
@@ -10,19 +9,51 @@ class GithubRunner < Sequel::Model
   many_to_one :vm, read_only: true
   one_through_one :project, join_table: :github_installation, left_key: :id, left_primary_key: :installation_id, read_only: true
 
-  plugin ResourceMethods, redacted_columns: :workflow_job
-  plugin SemaphoreMethods, :destroy, :skip_deregistration, :not_upgrade_premium, :spill_over
+  plugin ResourceMethods, encrypted_columns: :encoded_jit_config, redacted_columns: :workflow_job
+  plugin SemaphoreMethods, :destroy, :skip_deregistration, :not_upgrade_premium, :spill_over, :spare_runner_provisioned
   include HealthMonitorMethods
 
   NOT_VM_ALLOCATED_RUNNER_LABELS = %w[start wait_concurrency_limit apply_custom_label_quota].freeze
 
+  AWS_AMI_VERSIONS = [
+    Config.github_ubuntu_2204_x64_aws_ami_version,
+    Config.github_ubuntu_2404_x64_aws_ami_version,
+    Config.github_ubuntu_2604_x64_aws_ami_version,
+    Config.github_ubuntu_2204_arm64_aws_ami_version,
+    Config.github_ubuntu_2404_arm64_aws_ami_version,
+    Config.github_ubuntu_2604_arm64_aws_ami_version,
+  ].freeze
+
   dataset_module do
     def total_active_runner_vcpus
-      left_join(:strand, id: :id)
+      left_join(:strand, id: Sequel[:github_runner][:id])
         .exclude(Sequel[:strand][:label] => NOT_VM_ALLOCATED_RUNNER_LABELS)
         .select_map(Sequel[:github_runner][:label])
         .sum { Github.runner_labels[it]["vcpus"] }
     end
+
+    def metal_active_runner_vcpus
+      ds = self
+      if (aws_location_id = Config.github_runner_aws_location_id)
+        ds = ds.exclude(location_id: aws_location_id)
+      end
+      ds.total_active_runner_vcpus
+    end
+
+    def aws_active_runner_vcpus
+      return 0 unless (aws_location_id = Config.github_runner_aws_location_id)
+      where(location_id: aws_location_id)
+        .total_active_runner_vcpus
+    end
+  end
+
+  def self.aws_vm_usage(arch: nil)
+    ds = Vm.where(boot_image: AWS_AMI_VERSIONS)
+    ds = ds.where(arch:) if arch
+    ds.get([
+      Sequel.function(:coalesce, Sequel.function(:sum, :vcpus), 0).as(:vcpus),
+      Sequel.function(:count).*.as(:runners),
+    ])
   end
 
   def label_data
@@ -52,6 +83,9 @@ class GithubRunner < Sequel::Model
       if (vhost_block_backend_version = vm.vm_storage_volumes.first&.vhost_block_backend&.version)
         values[:vhost_block_backend_version] = vhost_block_backend_version
       end
+      if (ch_version = vm.strand&.stack&.dig(0, "ch_version"))
+        values[:ch_version] = ch_version
+      end
       if vm.vm_host
         values[:vm_host_ubid] = vm.vm_host.ubid
         values[:data_center] = vm.vm_host.data_center
@@ -62,7 +96,9 @@ class GithubRunner < Sequel::Model
     Clog.emit(message, {message => values})
   end
 
-  def provision_spare_runner
+  def provision_spare_runner(force: false)
+    return if !force && spare_runner_provisioned_set?
+    incr_spare_runner_provisioned
     Prog::Github::GithubRunnerNexus.assemble(installation, repository_name:, label:).subject
   end
 
@@ -82,6 +118,10 @@ class GithubRunner < Sequel::Model
     aggregate_readings(previous_pulse:, reading:, data: {available_memory:})
   end
 
+  def page_on_sshable_failure?
+    false
+  end
+
   def custom_label
     GithubCustomLabel.first(name: actual_label, installation_id:)
   end
@@ -93,22 +133,28 @@ end
 
 # Table: github_runner
 # Columns:
-#  id              | uuid                     | PRIMARY KEY
-#  installation_id | uuid                     |
-#  repository_name | text                     | NOT NULL
-#  label           | text                     | NOT NULL
-#  vm_id           | uuid                     |
-#  runner_id       | bigint                   |
-#  created_at      | timestamp with time zone | NOT NULL DEFAULT CURRENT_TIMESTAMP
-#  ready_at        | timestamp with time zone |
-#  workflow_job    | jsonb                    |
-#  repository_id   | uuid                     |
-#  allocated_at    | timestamp with time zone |
-#  billed_vm_size  | text                     |
-#  actual_label    | text                     |
+#  id                 | uuid                     | PRIMARY KEY
+#  installation_id    | uuid                     |
+#  repository_name    | text                     | NOT NULL
+#  label              | text                     | NOT NULL
+#  vm_id              | uuid                     |
+#  runner_id          | bigint                   |
+#  created_at         | timestamp with time zone | NOT NULL DEFAULT CURRENT_TIMESTAMP
+#  ready_at           | timestamp with time zone |
+#  workflow_job       | jsonb                    |
+#  repository_id      | uuid                     |
+#  allocated_at       | timestamp with time zone |
+#  billed_vm_size     | text                     |
+#  actual_label       | text                     |
+#  location_id        | uuid                     |
+#  encoded_jit_config | text                     |
 # Indexes:
-#  github_runner_pkey      | PRIMARY KEY btree (id)
-#  github_runner_vm_id_key | UNIQUE btree (vm_id)
+#  github_runner_pkey                  | PRIMARY KEY btree (id)
+#  github_runner_vm_id_key             | UNIQUE btree (vm_id)
+#  github_runner_installation_id_index | btree (installation_id)
+# Check constraints:
+#  location_id_and_vm_id_set_together | (location_id IS NOT NULL AND vm_id IS NOT NULL OR location_id IS NULL AND vm_id IS NULL)
 # Foreign key constraints:
 #  github_runner_installation_id_fkey | (installation_id) REFERENCES github_installation(id)
+#  github_runner_location_id_fkey     | (location_id) REFERENCES location(id)
 #  github_runner_repository_id_fkey   | (repository_id) REFERENCES github_repository(id)

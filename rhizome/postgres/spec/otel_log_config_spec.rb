@@ -1,0 +1,613 @@
+# frozen_string_literal: true
+
+require "yaml"
+require_relative "../lib/otel_log_config"
+
+RSpec.describe OtelLogConfig do
+  let(:instance) { "pg1abc2def3" }
+  let(:server_role) { "primary" }
+  let(:log_dir) { "/dat/17/data/pg_log" }
+  let(:resource_name) { "my-pg-db" }
+  let(:resource_id) { "pg9x8y7z6w" }
+  let(:log_destinations) { [] }
+  let(:cloudwatch_auth_region) { nil }
+  let(:config) { described_class.new(instance: instance, server_role: server_role, log_dir: log_dir, resource_name: resource_name, resource_id: resource_id, log_destinations: log_destinations, cloudwatch_auth_region: cloudwatch_auth_region) }
+  let(:parsed) { YAML.safe_load(config.to_config, aliases: true) }
+
+  describe "#to_config" do
+    it "includes health_check and file_storage extensions" do
+      expect(parsed["extensions"]).to have_key("health_check")
+      expect(parsed["extensions"]).to have_key("file_storage/state")
+    end
+
+    it "binds the health_check extension to the loopback address" do
+      expect(parsed["extensions"]["health_check"]["endpoint"]).to eq("127.0.0.1:13133")
+    end
+
+    it "configures the pglog filelog receiver with the correct log dir" do
+      expect(parsed["receivers"]["filelog/pglog"]["include"]).to include("/dat/17/data/pg_log/postgresql-*.log")
+    end
+
+    it "tags pglog events with instance and server_role" do
+      pglog_ops = parsed["receivers"]["filelog/pglog"]["operators"]
+      expect(pglog_ops.select { |op| op["field"] == "attributes.instance" }.map { |op| op["value"] }).to all(eq("pg1abc2def3"))
+      expect(pglog_ops.select { |op| op["field"] == "attributes.server_role" }.map { |op| op["value"] }).to all(eq("primary"))
+    end
+
+    it "sets hostname to the instance ubid in the pglog receiver" do
+      pglog_ops = parsed["receivers"]["filelog/pglog"]["operators"]
+      expect(pglog_ops).to include(include("field" => "attributes.hostname", "value" => "pg1abc2def3"))
+    end
+
+    it "removes error_severity after severity parsing" do
+      pglog_ops = parsed["receivers"]["filelog/pglog"]["operators"]
+      expect(pglog_ops).to include(include("type" => "remove", "field" => "attributes.error_severity"))
+    end
+
+    it "retains only the expected fields in the pglog receiver" do
+      retain_op = parsed["receivers"]["filelog/pglog"]["operators"].find { |op| op["type"] == "retain" }
+      expect(retain_op["fields"]).to include(
+        "body", "attributes.message",
+        "attributes.stream", "attributes.instance", "attributes.server_role", "attributes.hostname",
+        "attributes.resource_name", "attributes.resource_id",
+        "attributes.pid", "attributes.dbname", "attributes.user",
+        "attributes.app_name", "attributes.remote_host", "attributes.remote_host_port",
+      )
+    end
+
+    it "defaults session attributes to empty strings in the pglog receiver when the regex did not capture them" do
+      pglog_ops = parsed["receivers"]["filelog/pglog"]["operators"]
+      %w[dbname user remote_host_port].freeze.each do |field|
+        op = pglog_ops.find { |o| o["type"] == "add" && o["field"] == "attributes.#{field}" }
+        expect(op).to include("value" => "", "if" => "attributes.#{field} == nil")
+      end
+    end
+
+    it "maps pglog severity levels without using non-standard info3" do
+      severity_op = parsed["receivers"]["filelog/pglog"]["operators"].find { |op| op["type"] == "regex_parser" }
+      mapping = severity_op["severity"]["mapping"]
+      expect(mapping).not_to have_key("info3")
+      expect(mapping["info"]).to include("NOTICE", "INFO", "LOG", "DETAIL", "HINT")
+      expect(mapping["warn"]).to eq("WARNING")
+      expect(mapping["fatal"]).to include("FATAL", "PANIC")
+    end
+
+    it "maps journald severity levels without using non-standard info3" do
+      severity_op = parsed["receivers"]["journald"]["operators"].find { |op| op["type"] == "severity_parser" }
+      mapping = severity_op["mapping"]
+      expect(mapping).not_to have_key("info3")
+      expect(Array(mapping["info"])).to include("5", "6")
+    end
+
+    it "falls back to copying body into attributes.message when the regex did not match" do
+      pglog_ops = parsed["receivers"]["filelog/pglog"]["operators"]
+      fallback_idx = pglog_ops.index { |op| op["type"] == "copy" && op["from"] == "body" && op["to"] == "attributes.message" }
+      promote_idx = pglog_ops.index { |op| op["type"] == "copy" && op["from"] == "attributes.message" && op["to"] == "body" }
+      expect(fallback_idx).not_to be_nil
+      expect(pglog_ops[fallback_idx]["if"]).to eq("attributes.message == nil")
+      expect(fallback_idx).to be < promote_idx
+    end
+
+    it "configures the journald receiver" do
+      expect(parsed["receivers"]).to have_key("journald")
+    end
+
+    it "filters journald at the receiver to postgres-related units" do
+      expect(parsed["receivers"]["journald"]["units"]).to contain_exactly(
+        "system-postgresql.slice",
+        "system-pgbouncer.slice",
+        "upgrade_postgres.service",
+      )
+    end
+
+    it "parses journald realtime timestamp into the log timestamp" do
+      time_parser = parsed["receivers"]["journald"]["operators"].find { |op| op["id"] == "parse_journal_timestamp" }
+      expect(time_parser).to include(
+        "type" => "time_parser",
+        "parse_from" => 'body["__REALTIME_TIMESTAMP"]',
+        "layout_type" => "epoch",
+        "layout" => "us",
+        "on_error" => "send_quiet",
+      )
+      filter_idx = parsed["receivers"]["journald"]["operators"].index { |op| op["id"] == "filter_units" }
+      time_parser_idx = parsed["receivers"]["journald"]["operators"].index(time_parser)
+      expect(time_parser_idx).to be < filter_idx
+    end
+
+    it "routes journal records to postgres-related streams" do
+      routes = parsed["receivers"]["journald"]["operators"].find { |op| op["id"] == "filter_units" }["routes"]
+      exprs = routes.map { |r| r["expr"] }
+      expect(exprs).to include(a_string_including('startsWith "postgresql@"'))
+      expect(exprs).to include(a_string_including('startsWith "pgbouncer@"'))
+      expect(exprs).to include(a_string_including('startsWith "upgrade_postgres"'))
+    end
+
+    it "marks journal streams correctly" do
+      op_ids = parsed["receivers"]["journald"]["operators"].filter_map { |op| op["id"] }
+      expect(op_ids).to include("mark_postgres_stream", "mark_pgbouncer_stream", "mark_upgrade_stream")
+    end
+
+    it "includes a batch processor" do
+      expect(parsed["processors"]).to have_key("batch")
+    end
+
+    it "configures the batch processor with a 2s timeout and 10k max batch size" do
+      expect(parsed["processors"]["batch"]).to include("timeout" => "2s", "send_batch_max_size" => 10240)
+    end
+
+    it "includes a memory_limiter processor" do
+      expect(parsed["processors"]["memory_limiter"]).to include("limit_mib", "spike_limit_mib")
+    end
+
+    it "lists health_check and file_storage in service extensions" do
+      expect(parsed["service"]["extensions"]).to contain_exactly("health_check", "file_storage/state")
+    end
+
+    context "with no destinations" do
+      let(:log_destinations) { [] }
+
+      it "produces a nop exporter" do
+        expect(parsed["exporters"]).to have_key("nop")
+      end
+
+      it "produces no transform processors" do
+        expect(parsed["processors"].keys).not_to include(a_string_starting_with("transform/"))
+      end
+
+      it "produces noop pipelines for pglog and journal" do
+        expect(parsed["service"]["pipelines"]).to have_key("logs/pglog/noop")
+        expect(parsed["service"]["pipelines"]).to have_key("logs/journal/noop")
+        expect(parsed["service"]["pipelines"]["logs/pglog/noop"]["exporters"]).to eq(["nop"])
+      end
+    end
+
+    context "with one syslog destination and no options" do
+      let(:log_destinations) do
+        [{"type" => "syslog", "url" => "tcp://logs.example.com:6514", "options" => nil}]
+      end
+
+      it "creates a syslog exporter with the correct host and port" do
+        exporter = parsed["exporters"]["syslog/dest0"]
+        expect(exporter["endpoint"]).to eq("logs.example.com")
+        expect(exporter["port"]).to eq(6514)
+      end
+
+      it "uses TCP with RFC 5424" do
+        exporter = parsed["exporters"]["syslog/dest0"]
+        expect(exporter["network"]).to eq("tcp")
+        expect(exporter["protocol"]).to eq("rfc5424")
+      end
+
+      it "enables TLS" do
+        expect(parsed["exporters"]["syslog/dest0"]["tls"]["insecure"]).to be false
+      end
+
+      it "creates pglog and journal pipelines for the destination" do
+        expect(parsed["service"]["pipelines"]).to have_key("logs/pglog/dest0")
+        expect(parsed["service"]["pipelines"]).to have_key("logs/journal/dest0")
+      end
+
+      it "creates a transform processor for the destination" do
+        expect(parsed["processors"]).to have_key("transform/dest0")
+      end
+
+      it "does not stamp syslog records with a UUIDv7 log_id" do
+        statements = parsed["processors"]["transform/dest0"]["log_statements"].flat_map { |s| s["statements"] }
+        expect(statements).not_to include(a_string_including("UUIDv7"))
+      end
+
+      it "includes proc_id, appname, priority and message formatting statements" do
+        statements = parsed["processors"]["transform/dest0"]["log_statements"].flat_map { |s| s["statements"] }
+        expect(statements).to include(a_string_including('log.attributes["proc_id"]'))
+        expect(statements).to include(a_string_including('log.attributes["appname"]') & a_string_including("my-pg-db-"))
+        expect(statements).to include(a_string_matching(/log\.attributes\["priority"\].*log\.severity_number/))
+        expect(statements).to include(a_string_including("log.severity_text"))
+      end
+
+      it "prepends pglog context fields to attributes[message] for pglog entries" do
+        statements = parsed["processors"]["transform/dest0"]["log_statements"].flat_map { |s| s["statements"] }
+        expect(statements).to include(
+          a_string_matching(/log\.attributes\["remote_host_port"\].*log\.attributes\["dbname"\].*log\.attributes\["user"\].*log\.attributes\["app_name"\].*log\.attributes\["remote_host"\]/) &
+          a_string_including('where log.attributes["dbname"] != nil'),
+        )
+      end
+
+      it "includes the transform processor in the pipeline" do
+        pglog = parsed["service"]["pipelines"]["logs/pglog/dest0"]
+        expect(pglog["processors"]).to eq(["memory_limiter", "transform/timestamp_fallback", "transform/dest0", "batch"])
+      end
+    end
+
+    context "with syslog structured_data in options" do
+      let(:log_destinations) do
+        [{
+          "type" => "syslog",
+          "url" => "tcp://logs.example.com:6514",
+          "options" => {"structured_data" => {"honeybadger@61642" => {"api_key" => "secret", "env" => "prod"}}},
+        }]
+      end
+
+      it "creates a transform processor for the destination" do
+        expect(parsed["processors"]).to have_key("transform/dest0")
+      end
+
+      it "emits structured_data set statements in the transform processor" do
+        statements = parsed["processors"]["transform/dest0"]["log_statements"].flat_map { |s| s["statements"] }
+        expect(statements).to include(a_string_including('log.attributes["structured_data"]["honeybadger@61642"]["api_key"], "secret"'))
+        expect(statements).to include(a_string_including('log.attributes["structured_data"]["honeybadger@61642"]["env"], "prod"'))
+      end
+
+      it "includes the transform processor in the pipeline" do
+        pglog = parsed["service"]["pipelines"]["logs/pglog/dest0"]
+        expect(pglog["processors"]).to eq(["memory_limiter", "transform/timestamp_fallback", "transform/dest0", "batch"])
+      end
+    end
+
+    context "with syslog structured_data value containing double quotes" do
+      let(:log_destinations) do
+        [{"type" => "syslog", "url" => "tcp://logs.example.com:6514", "options" => {"structured_data" => {"sd@1" => {"key" => 'val"ue'}}}}]
+      end
+
+      it "escapes double quotes in structured_data values" do
+        statements = parsed["processors"]["transform/dest0"]["log_statements"].flat_map { |s| s["statements"] }
+        expect(statements).to include(a_string_including('["key"], "val\\"ue"'))
+      end
+    end
+
+    context "with one otlp destination and no headers" do
+      let(:log_destinations) do
+        [{"type" => "otlp", "url" => "https://otlp.nr-data.net", "options" => nil}]
+      end
+
+      it "creates an otlphttp exporter with the correct endpoint" do
+        exporter = parsed["exporters"]["otlp_http/dest0"]
+        expect(exporter["endpoint"]).to eq("https://otlp.nr-data.net")
+      end
+
+      it "enables gzip compression on the exporter" do
+        exporter = parsed["exporters"]["otlp_http/dest0"]
+        expect(exporter["compression"]).to eq("gzip")
+      end
+
+      it "omits headers from the exporter when nil" do
+        exporter = parsed["exporters"]["otlp_http/dest0"]
+        expect(exporter).not_to have_key("headers")
+      end
+
+      it "omits encoding when not specified" do
+        expect(parsed["exporters"]["otlp_http/dest0"]).not_to have_key("encoding")
+      end
+
+      it "omits tls when no ca_bundle is provided" do
+        expect(parsed["exporters"]["otlp_http/dest0"]).not_to have_key("tls")
+      end
+
+      it "configures retry_on_failure for the otlp exporter" do
+        retry_cfg = parsed["exporters"]["otlp_http/dest0"]["retry_on_failure"]
+        expect(retry_cfg).to include("enabled" => true, "initial_interval" => "5s", "max_interval" => "30s")
+      end
+
+      it "configures a persistent sending_queue backed by file_storage for the otlp exporter" do
+        queue_cfg = parsed["exporters"]["otlp_http/dest0"]["sending_queue"]
+        expect(queue_cfg).to include("storage" => "file_storage/state", "queue_size" => 1000)
+      end
+
+      it "creates pglog and journal pipelines for the destination" do
+        expect(parsed["service"]["pipelines"]).to have_key("logs/pglog/dest0")
+        expect(parsed["service"]["pipelines"]).to have_key("logs/journal/dest0")
+      end
+
+      it "stamps every otlp record with a UUIDv7 log_id" do
+        statements = parsed["processors"]["transform/dest0"]["log_statements"].flat_map { |s| s["statements"] }
+        expect(statements).to eq(['set(log.attributes["log_id"], UUIDv7())'])
+      end
+
+      it "includes the transform processor in the pipeline" do
+        pglog = parsed["service"]["pipelines"]["logs/pglog/dest0"]
+        expect(pglog["processors"]).to eq(["memory_limiter", "transform/timestamp_fallback", "transform/dest0", "batch"])
+      end
+    end
+
+    context "with one otlp destination and headers" do
+      let(:log_destinations) do
+        [{"type" => "otlp", "url" => "https://otlp.nr-data.net", "options" => {"headers" => {"api-key" => "secret", "X-Custom" => "val"}}}]
+      end
+
+      it "includes the headers in the exporter config" do
+        exporter = parsed["exporters"]["otlp_http/dest0"]
+        expect(exporter["headers"]).to eq({"api-key" => "secret", "X-Custom" => "val"})
+      end
+    end
+
+    context "with an otlp destination that sets encoding and ca_bundle" do
+      let(:log_destinations) do
+        [{
+          "type" => "otlp",
+          "url" => "https://parseable.example.com",
+          "options" => {
+            "encoding" => "json",
+            "ca_bundle" => "-----BEGIN CERTIFICATE-----\n...",
+            "headers" => {"X-P-Stream" => "pg9x8y7z6w", "X-P-Log-Source" => "otel-logs", "Authorization" => "Basic abc"},
+          },
+        }]
+      end
+
+      it "sets encoding on the exporter" do
+        expect(parsed["exporters"]["otlp_http/dest0"]["encoding"]).to eq("json")
+      end
+
+      it "points tls.ca_file at the per-destination CA path" do
+        expect(parsed["exporters"]["otlp_http/dest0"]["tls"]["ca_file"]).to eq(described_class.dest_ca_file_path(0))
+      end
+
+      it "does not use insecure_skip_verify" do
+        expect(parsed["exporters"]["otlp_http/dest0"]["tls"]).not_to have_key("insecure_skip_verify")
+      end
+
+      it "passes through arbitrary headers (including Authorization)" do
+        expect(parsed["exporters"]["otlp_http/dest0"]["headers"]).to include("Authorization" => "Basic abc", "X-P-Stream" => "pg9x8y7z6w", "X-P-Log-Source" => "otel-logs")
+      end
+
+      it "still stamps records with UUIDv7" do
+        statements = parsed["processors"]["transform/dest0"]["log_statements"].flat_map { |s| s["statements"] }
+        expect(statements).to eq(['set(log.attributes["log_id"], UUIDv7())'])
+      end
+
+      it "does not create a basicauth extension" do
+        expect(parsed["extensions"].keys).not_to include(a_string_starting_with("basicauth"))
+      end
+    end
+
+    context "with multiple syslog destinations" do
+      let(:log_destinations) do
+        [
+          {"type" => "syslog", "url" => "tcp://logs1.example.com:6514", "options" => nil},
+          {"type" => "syslog", "url" => "tcp://logs2.example.com:6515", "options" => nil},
+        ]
+      end
+
+      it "creates a separate syslog exporter for each destination" do
+        expect(parsed["exporters"]).to have_key("syslog/dest0")
+        expect(parsed["exporters"]).to have_key("syslog/dest1")
+      end
+
+      it "uses the correct host and port for each destination" do
+        expect(parsed["exporters"]["syslog/dest0"]["endpoint"]).to eq("logs1.example.com")
+        expect(parsed["exporters"]["syslog/dest0"]["port"]).to eq(6514)
+        expect(parsed["exporters"]["syslog/dest1"]["endpoint"]).to eq("logs2.example.com")
+        expect(parsed["exporters"]["syslog/dest1"]["port"]).to eq(6515)
+      end
+
+      it "creates pglog and journal pipelines for each destination" do
+        pipelines = parsed["service"]["pipelines"]
+        expect(pipelines).to have_key("logs/pglog/dest0")
+        expect(pipelines).to have_key("logs/pglog/dest1")
+        expect(pipelines).to have_key("logs/journal/dest0")
+        expect(pipelines).to have_key("logs/journal/dest1")
+      end
+    end
+
+    context "with multiple otlp destinations" do
+      let(:log_destinations) do
+        [
+          {"type" => "otlp", "url" => "https://otlp.nr-data.net", "options" => {"headers" => {"api-key" => "key1"}}},
+          {"type" => "otlp", "url" => "https://otlp.intake.datadoghq.com", "options" => {"headers" => {"DD-API-KEY" => "key2"}}},
+        ]
+      end
+
+      it "creates a separate otlphttp exporter for each destination" do
+        expect(parsed["exporters"]).to have_key("otlp_http/dest0")
+        expect(parsed["exporters"]).to have_key("otlp_http/dest1")
+      end
+
+      it "creates a UUIDv7 transform for each otlp destination" do
+        ["transform/dest0", "transform/dest1"].each do |k|
+          statements = parsed["processors"][k]["log_statements"].flat_map { |s| s["statements"] }
+          expect(statements).to eq(['set(log.attributes["log_id"], UUIDv7())'])
+        end
+      end
+    end
+
+    context "with an unknown destination type" do
+      let(:log_destinations) do
+        [{"type" => "unknown", "url" => "tcp://logs.example.com:514"}]
+      end
+
+      it "creates a transform processor with nil statements" do
+        transform = parsed["processors"]["transform/dest0"]
+        expect(transform["log_statements"].first["statements"]).to be_nil
+      end
+    end
+
+    context "with mixed otlp and syslog destinations" do
+      let(:log_destinations) do
+        [
+          {"type" => "otlp", "url" => "https://otlp.nr-data.net", "options" => {"headers" => {"api-key" => "key1"}}},
+          {"type" => "syslog", "url" => "tcp://logs.example.com:6514", "options" => nil},
+        ]
+      end
+
+      it "creates an otlphttp exporter for the otlp destination" do
+        expect(parsed["exporters"]).to have_key("otlp_http/dest0")
+      end
+
+      it "creates a syslog exporter for the syslog destination" do
+        expect(parsed["exporters"]).to have_key("syslog/dest1")
+      end
+
+      it "uses the per-destination transform for both pipelines" do
+        pglog0 = parsed["service"]["pipelines"]["logs/pglog/dest0"]
+        expect(pglog0["processors"]).to eq(["memory_limiter", "transform/timestamp_fallback", "transform/dest0", "batch"])
+        expect(pglog0["exporters"]).to eq(["otlp_http/dest0"])
+
+        pglog1 = parsed["service"]["pipelines"]["logs/pglog/dest1"]
+        expect(pglog1["processors"]).to eq(["memory_limiter", "transform/timestamp_fallback", "transform/dest1", "batch"])
+        expect(pglog1["exporters"]).to eq(["syslog/dest1"])
+      end
+    end
+
+    context "with cloudwatch_auth_region unset" do
+      it "adds no auth receiver, exporter or pipeline" do
+        expect(parsed["receivers"]).not_to have_key("journald/auth")
+        expect(parsed["exporters"]).not_to have_key("awscloudwatchlogs/auth")
+        expect(parsed["service"]["pipelines"]).not_to have_key("logs/auth/cloudwatch")
+      end
+
+      it "adds no postgresql receiver, exporter or pipeline" do
+        expect(parsed["receivers"]).not_to have_key("filelog/pglog_raw")
+        expect(parsed["exporters"]).not_to have_key("awscloudwatchlogs/postgresql")
+        expect(parsed["service"]["pipelines"]).not_to have_key("logs/postgresql/cloudwatch")
+      end
+
+      # The collector consumes parsed YAML, so compare structure, not bytes.
+      # Regenerate the golden file only for a deliberate collector config change:
+      #   ruby -r./rhizome/postgres/lib/otel_log_config -e 'puts OtelLogConfig.new(
+      #     instance: "pg1abc2def3", server_role: "primary", log_dir: "/dat/17/data/pg_log",
+      #     resource_name: "my-pg-db", resource_id: "pg9x8y7z6w", log_destinations: []).to_config'
+      it "produces the same config as before auth shipping existed" do
+        golden = YAML.safe_load_file(File.expand_path("otel_log_config-golden.yaml", __dir__), aliases: true)
+        expect(YAML.safe_load(config.to_config, aliases: true)).to eq(golden)
+      end
+
+      it "defaults to unset when the control plane sends no key" do
+        older = described_class.new(instance: instance, server_role: server_role, log_dir: log_dir, resource_name: resource_name, resource_id: resource_id, log_destinations: log_destinations)
+        expect(older.to_config).to eq(config.to_config)
+      end
+    end
+
+    context "with cloudwatch_auth_region set" do
+      let(:cloudwatch_auth_region) { "us-west-2" }
+      let(:auth_receiver) { parsed["receivers"]["journald/auth"] }
+      let(:auth_operators) { auth_receiver["operators"] }
+
+      it "matches the auth and authpriv syslog facilities at every priority" do
+        expect(auth_receiver["matches"]).to eq([{"SYSLOG_FACILITY" => "4"}, {"SYSLOG_FACILITY" => "10"}])
+        expect(auth_receiver["priority"]).to eq("debug")
+        expect(auth_receiver["storage"]).to eq("file_storage/state")
+      end
+
+      it "parses the journal realtime timestamp before it rewrites the body" do
+        expect(auth_operators.first).to eq(
+          "id" => "parse_journal_timestamp",
+          "type" => "time_parser",
+          "parse_from" => 'body["__REALTIME_TIMESTAMP"]',
+          "layout_type" => "epoch",
+          "layout" => "us",
+          "on_error" => "send_quiet",
+        )
+      end
+
+      it "defaults the identifier and the message before it concatenates them" do
+        expect(auth_operators[1]).to eq("type" => "move", "from" => "body", "to" => "attributes.journald")
+        expect(auth_operators[2]).to eq("type" => "add", "field" => 'attributes.journald["SYSLOG_IDENTIFIER"]', "value" => "unknown", "if" => 'attributes.journald["SYSLOG_IDENTIFIER"] == nil')
+        expect(auth_operators[3]).to eq("type" => "add", "field" => 'attributes.journald["MESSAGE"]', "value" => "", "if" => 'attributes.journald["MESSAGE"] == nil')
+      end
+
+      it "rebuilds the syslog line in the body and omits the pid when the journal has none" do
+        expect(auth_operators[4]).to eq(
+          "type" => "add",
+          "field" => "attributes.auth_line",
+          "value" => 'EXPR(string(attributes.journald["SYSLOG_IDENTIFIER"]) + (attributes.journald["_PID"] == nil ? "" : "[" + string(attributes.journald["_PID"]) + "]") + ": " + string(attributes.journald["MESSAGE"]))',
+          "on_error" => "send_quiet",
+        )
+        expect(auth_operators[5]).to eq("type" => "move", "from" => "attributes.auth_line", "to" => "body")
+      end
+
+      it "drops the journal map last, so only the rebuilt body ships" do
+        expect(auth_operators.last).to eq("type" => "remove", "field" => "attributes.journald")
+      end
+
+      it "parses no severity and routes nothing, because the exporter ships text" do
+        types = auth_operators.map { |op| op["type"] }
+        expect(types).not_to include("severity_parser")
+        expect(types).not_to include("router")
+      end
+
+      it "exports raw records to the auth log group of the instance" do
+        expect(parsed["exporters"]["awscloudwatchlogs/auth"]).to eq(
+          "region" => "us-west-2",
+          "log_group_name" => "/pg1abc2def3/auth",
+          "log_stream_name" => "pg1abc2def3/auth",
+          "raw_log" => true,
+          "sending_queue" => {"storage" => "file_storage/state", "queue_size" => 1000},
+          "retry_on_failure" => {"enabled" => true, "initial_interval" => "5s", "max_interval" => "30s", "max_elapsed_time" => "300s"},
+        )
+      end
+
+      it "sets no log_retention, which the instance role may not write" do
+        expect(parsed["exporters"]["awscloudwatchlogs/auth"]).not_to have_key("log_retention")
+      end
+
+      it "creates the auth pipeline when there is no customer destination" do
+        expect(parsed["service"]["pipelines"]["logs/auth/cloudwatch"]).to eq(
+          "receivers" => ["journald/auth"],
+          "processors" => ["memory_limiter", "batch"],
+          "exporters" => ["awscloudwatchlogs/auth"],
+        )
+      end
+
+      it "tails the log files raw, parsing only the timestamp for event time" do
+        expect(parsed["receivers"]["filelog/pglog_raw"]).to eq(
+          "include" => ["/dat/17/data/pg_log/postgresql-*.log"],
+          "start_at" => "end",
+          "storage" => "file_storage/state",
+          "preserve_leading_whitespaces" => true,
+          "preserve_trailing_whitespaces" => true,
+          "operators" => [
+            {"type" => "regex_parser", "regex" => '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \w+)', "on_error" => "send_quiet"},
+            {"type" => "time_parser", "parse_from" => "attributes.timestamp", "layout" => "2006-01-02 15:04:05.000 MST", "layout_type" => "gotime", "if" => "attributes.timestamp != nil", "on_error" => "send_quiet"},
+            {"type" => "remove", "field" => "attributes.timestamp", "if" => "attributes.timestamp != nil"},
+          ],
+        )
+      end
+
+      it "exports raw records to the postgresql log group of the instance" do
+        expect(parsed["exporters"]["awscloudwatchlogs/postgresql"]).to eq(
+          parsed["exporters"]["awscloudwatchlogs/auth"].merge(
+            "log_group_name" => "/pg1abc2def3/postgresql",
+            "log_stream_name" => "pg1abc2def3/postgresql",
+          ),
+        )
+      end
+
+      it "creates the postgresql pipeline when there is no customer destination" do
+        expect(parsed["service"]["pipelines"]["logs/postgresql/cloudwatch"]).to eq(
+          "receivers" => ["filelog/pglog_raw"],
+          "processors" => ["memory_limiter", "batch"],
+          "exporters" => ["awscloudwatchlogs/postgresql"],
+        )
+      end
+
+      it "keeps the nop exporter that the noop pipelines name" do
+        expect(parsed["exporters"]).to have_key("nop")
+      end
+
+      context "with a customer destination" do
+        let(:log_destinations) do
+          [{"type" => "syslog", "url" => "tcp://logs.example.com:6514", "options" => nil}]
+        end
+
+        it "creates the auth pipeline alongside the destination pipelines" do
+          pipelines = parsed["service"]["pipelines"]
+          expect(pipelines).to have_key("logs/pglog/dest0")
+          expect(pipelines["logs/auth/cloudwatch"]["exporters"]).to eq(["awscloudwatchlogs/auth"])
+        end
+
+        it "keeps the cloudwatch receivers out of the customer pipelines" do
+          pipelines = parsed["service"]["pipelines"].except("logs/auth/cloudwatch", "logs/postgresql/cloudwatch")
+          receivers = pipelines.values.flat_map { |p| p["receivers"] }
+          expect(receivers).not_to include("journald/auth")
+          expect(receivers).not_to include("filelog/pglog_raw")
+        end
+
+        it "creates the postgresql pipeline alongside the destination pipelines" do
+          expect(parsed["service"]["pipelines"]["logs/postgresql/cloudwatch"]["exporters"]).to eq(["awscloudwatchlogs/postgresql"])
+        end
+
+        it "adds no nop exporter" do
+          expect(parsed["exporters"]).not_to have_key("nop")
+        end
+      end
+    end
+  end
+end

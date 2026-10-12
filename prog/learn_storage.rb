@@ -4,6 +4,7 @@ require_relative "../lib/system_parser"
 
 class Prog::LearnStorage < Prog::Base
   subject_is :sshable, :vm_host
+  frame_reader :format_storage
 
   def make_model_instances
     devices = SystemParser.extract_disk_info_from_df(sshable.cmd("df -B1 --output=source,target,size,avail"))
@@ -44,9 +45,12 @@ class Prog::LearnStorage < Prog::Base
   label def start
     # The upsert below resets available_storage_gib to what df reports, which
     # would drop the reservations of volumes already placed on the device.
+    # Check before formatting too, which would destroy those volumes.
     unless VmStorageVolume.where(storage_device_id: vm_host.storage_devices_dataset.select(:id)).empty?
       fail "Refusing to relearn storage of #{vm_host.ubid}: VM storage volumes already use its storage devices, and relearning would reset their available_storage_gib"
     end
+
+    sshable.cmd("sudo host/bin/format-storage-disks") if format_storage
 
     make_model_instances.each do |sd|
       sd.skip_auto_validations(:unique) do

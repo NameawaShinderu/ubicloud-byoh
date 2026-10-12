@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "../../common/lib/util"
+
 class PgBouncerSetup
   def initialize(version, max_connections, num_instances, user_config)
     @version = version
@@ -47,7 +49,6 @@ Description=Sockets for PgBouncer
 
 [Socket]
 ListenStream=6432
-ListenStream=%i
 ListenStream=/tmp/.s.PGSQL.%i
 
 ReusePort=true
@@ -69,7 +70,8 @@ PGBOUNCER_SOCKET
 
   def peer_config
     peers = (1..@num_instances.to_i).map do |i|
-      "#{i} = host=/tmp/.s.PGSQL.#{port_num(i)}"
+      # host is the socket directory, pgbouncer appends /.s.PGSQL.<port> itself.
+      "#{i} = host=/tmp port=#{port_num(i)}"
     end.join("\n")
 
     <<PGBOUNCER_PEER
@@ -134,7 +136,8 @@ PGBOUNCER_CONFIG
 
   def enable_and_start_service
     (1..@num_instances.to_i).each do |i|
-      r "systemctl reload #{service_template_name}#{port_num(i)} || systemctl enable --now #{service_template_name}#{port_num(i)}"
+      unit = "#{service_template_name}#{port_num(i)}"
+      r "systemctl reload :unit || systemctl enable --now :unit", unit: unit
     end
   end
 

@@ -11,8 +11,9 @@ end
 # Columns:
 #  vm_host_id       | uuid    |
 #  cpu_number       | integer |
-#  spdk             | boolean | NOT NULL
 #  vm_host_slice_id | uuid    |
+#  numa_node        | integer |
+#  io               | boolean | NOT NULL
 # Indexes:
 #  vm_host_cpu_pkey | PRIMARY KEY btree (vm_host_id, cpu_number)
 # Foreign key constraints:

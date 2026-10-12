@@ -18,7 +18,7 @@ RSpec.describe Clover, "github" do
     end
 
     it "vm has runner but no repository" do
-      GithubRunner.create(vm_id: vm.id, repository_name: "test", label: "ubicloud")
+      GithubRunner.create(vm_id: vm.id, location_id: vm.location_id, repository_name: "test", label: "ubicloud")
       get "/runtime/github"
 
       expect(last_response).to have_runtime_error(400, "invalid JWT format or claim in Authorization header")
@@ -26,7 +26,7 @@ RSpec.describe Clover, "github" do
 
     it "vm has runner and repository" do
       repository = GithubRepository.create(name: "test", access_key: "key")
-      GithubRunner.create(vm_id: vm.id, repository_name: "test", label: "ubicloud", repository_id: repository.id)
+      GithubRunner.create(vm_id: vm.id, location_id: vm.location_id, repository_name: "test", label: "ubicloud", repository_id: repository.id)
       get "/runtime/github"
 
       expect(last_response.status).to eq(404)
@@ -38,7 +38,7 @@ RSpec.describe Clover, "github" do
     login_runtime(vm)
     installation = GithubInstallation.create(installation_id: 123, name: "test-user", type: "User", project: Project.create(name: "test"))
     repository = GithubRepository.create(name: "test", access_key: nil, installation:)
-    GithubRunner.create(vm_id: vm.id, repository_name: "test", label: "ubicloud", repository_id: repository.id)
+    GithubRunner.create(vm_id: vm.id, location_id: vm.location_id, repository_name: "test", label: "ubicloud", repository_id: repository.id)
     blob_storage_client = instance_double(Aws::S3::Client)
     allow(Aws::S3::Client).to receive(:new).and_return(blob_storage_client)
     expect(blob_storage_client).to receive(:create_bucket)
@@ -57,7 +57,7 @@ RSpec.describe Clover, "github" do
     login_runtime(vm)
     installation = GithubInstallation.create(installation_id: 456, name: "test-user2", type: "User", project: Project.create(name: "test2"))
     repository = GithubRepository.create(name: "test2", access_key: nil, installation:)
-    GithubRunner.create(vm_id: vm.id, repository_name: "test2", label: "ubicloud", repository_id: repository.id)
+    GithubRunner.create(vm_id: vm.id, location_id: vm.location_id, repository_name: "test2", label: "ubicloud", repository_id: repository.id)
     blob_storage_client = instance_double(Aws::S3::Client)
     allow(Aws::S3::Client).to receive(:new).and_return(blob_storage_client)
     expect(blob_storage_client).to receive(:create_bucket)
@@ -73,7 +73,10 @@ RSpec.describe Clover, "github" do
   describe "cache endpoints" do
     let(:repository) { GithubRepository.create(name: "test", default_branch: "main", access_key: "123", installation:) }
     let(:installation) { GithubInstallation.create(installation_id: 123, name: "test-user", type: "User", project: Project.create(name: "test")) }
-    let(:runner) { GithubRunner.create(vm_id: create_vm.id, repository_name: "test", label: "ubicloud", repository_id: repository.id, workflow_job: {head_branch: "dev"}) }
+    let(:runner) {
+      vm = create_vm
+      GithubRunner.create(vm_id: vm.id, location_id: vm.location_id, repository_name: "test", label: "ubicloud", repository_id: repository.id, workflow_job: {head_branch: "dev"})
+    }
     let(:url_presigner) { instance_double(Aws::S3::Presigner, presigned_request: "aa") }
     let(:blob_storage_client) { instance_double(Aws::S3::Client) }
 
@@ -133,7 +136,7 @@ RSpec.describe Clover, "github" do
       end
 
       it "rollbacks inconsistent cache entry if a failure occurs in the middle" do
-        expect(blob_storage_client).to receive(:create_multipart_upload).and_raise(CloverError.new(500, "UnexceptedError", "Sorry, we couldn’t process your request because of an unexpected error."))
+        expect(blob_storage_client).to receive(:create_multipart_upload).and_raise(CloverError.new(500, "UnexpectedError", "Sorry, we couldn’t process your request because of an unexpected error."))
         post "/runtime/github/caches", {key: "k1", version: "v1", cacheSize: 75 * 1024 * 1024}
 
         expect(last_response).to have_runtime_error(500, "Sorry, we couldn’t process your request because of an unexpected error.")
@@ -282,6 +285,12 @@ RSpec.describe Clover, "github" do
         expect(last_response.status).to eq(204)
       end
 
+      it "fails if no keys given" do
+        get "/runtime/github/cache", {keys: ",", version: "v1"}
+
+        expect(last_response.status).to eq(204)
+      end
+
       it "fails if one of the parameters are missing" do
         [
           ["k1,k2", nil],
@@ -345,6 +354,15 @@ RSpec.describe Clover, "github" do
 
         expect(last_response.status).to eq(200)
         expect(JSON.parse(last_response.body).slice("cacheKey", "cacheVersion", "scope").values).to eq(["k1", "v1", "main"])
+      end
+
+      it "returns no cache when scope cannot be determined and check is enabled" do
+        runner.update(workflow_job: nil)
+        repository.update(default_branch: nil)
+        GithubCacheEntry.create(key: "k1", version: "v1", scope: "dev", repository_id: repository.id, created_by: runner.id, committed_at: Time.now)
+        get "/runtime/github/cache", {keys: "k1", version: "v1"}
+
+        expect(last_response.status).to eq(204)
       end
 
       it "returns the first matched cache with key for runner's branch" do

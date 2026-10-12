@@ -3,7 +3,9 @@
 require_relative "../../model/spec_helper"
 
 RSpec.describe Prog::Test::PostgresResource do
-  subject(:pgr_test) { described_class.new(described_class.assemble) }
+  subject(:pgr_test) { described_class.new(pgr_strand) }
+
+  let(:pgr_strand) { described_class.assemble }
 
   let(:test_project) { Project.create(name: "test-project") }
   let(:service_project) { Project.create(name: "service-project") }
@@ -33,9 +35,34 @@ RSpec.describe Prog::Test::PostgresResource do
 
   describe ".assemble" do
     it "creates a strand and service projects" do
-      st = described_class.assemble
+      st = nil
+      expect { st = described_class.assemble }.to change { Project.select_order_map(:name) }.from(["service-project"]).to(["Postgres-Test-Project", "service-project"])
       expect(st).to be_a Strand
       expect(st.label).to eq("start")
+    end
+
+    it "sets the cloudwatch feature flag on the test project" do
+      described_class.assemble
+      expect(Project[name: "Postgres-Test-Project"].get_ff_aws_cloudwatch_logs).to be true
+    end
+
+    it "uses existing project if Config.local_e2e_postgres_test_project_id" do
+      st = nil
+      project = Project.create(name: "foo")
+      expect(Config).to receive(:local_e2e_postgres_test_project_id).and_return(project.id).at_least(:once)
+      expect { st = described_class.assemble }.not_to change { Project.select_order_map(:name) }
+      expect(st).to be_a Strand
+    end
+  end
+
+  describe "#before_run" do
+    it "naps if pause is set" do
+      Semaphore.incr(pgr_strand.id, "pause")
+      expect { pgr_test.before_run }.to nap(60 * 60)
+    end
+
+    it "does nothing if pause is not set" do
+      expect(pgr_test.before_run).to be_nil
     end
   end
 
@@ -45,6 +72,7 @@ RSpec.describe Prog::Test::PostgresResource do
     end
 
     it "creates resource on aws and hops to wait_postgres_resource" do
+      expect(Config).to receive(:e2e_aws_assume_role).and_return(nil)
       expect(Config).to receive(:e2e_aws_access_key).and_return("access_key")
       expect(Config).to receive(:e2e_aws_secret_key).and_return("secret_key")
       aws_strand = described_class.assemble(provider: "aws")
@@ -53,6 +81,113 @@ RSpec.describe Prog::Test::PostgresResource do
       LocationAz.create(location_id: location.id, az: "a", zone_id: "usw2-az1")
       expect { aws_pgr_test.start }.to hop("wait_postgres_resource")
       expect(LocationCredentialAws[location.id].access_key).to eq("access_key")
+    end
+
+    it "creates resource on aws using assume_role and hops to wait_postgres_resource" do
+      expect(Config).to receive(:e2e_aws_assume_role).and_return("arn:aws:iam::123:role/e2e").at_least(:once)
+      expect(Config).to receive(:e2e_aws_access_key).and_return(nil)
+      expect(Config).to receive(:e2e_aws_secret_key).and_return(nil)
+      aws_strand = described_class.assemble(provider: "aws")
+      aws_pgr_test = described_class.new(aws_strand)
+      location = Location[provider: "aws", project_id: nil, name: "us-west-2"]
+      LocationAz.create(location_id: location.id, az: "a", zone_id: "usw2-az1")
+      expect { aws_pgr_test.start }.to hop("wait_postgres_resource")
+      expect(LocationCredentialAws[location.id].assume_role).to eq("arn:aws:iam::123:role/e2e")
+      expect(LocationCredentialAws[location.id].access_key).to be_nil
+    end
+
+    it "fails when both assume_role and access_key are configured" do
+      expect(Config).to receive(:e2e_aws_assume_role).and_return("arn:aws:iam::123:role/e2e")
+      expect(Config).to receive(:e2e_aws_access_key).and_return("access_key")
+      expect(Config).to receive(:e2e_aws_secret_key).and_return(nil)
+      aws_strand = described_class.assemble(provider: "aws")
+      aws_pgr_test = described_class.new(aws_strand)
+      location = Location[provider: "aws", project_id: nil, name: "us-west-2"]
+      LocationAz.create(location_id: location.id, az: "a", zone_id: "usw2-az1")
+      expect { aws_pgr_test.start }.to raise_error(/cannot be combined/)
+    end
+
+    it "skips aws credential creation when credential already exists" do
+      aws_strand = described_class.assemble(provider: "aws")
+      aws_pgr_test = described_class.new(aws_strand)
+      location = Location[provider: "aws", project_id: nil, name: "us-west-2"]
+      LocationAz.create(location_id: location.id, az: "a", zone_id: "usw2-az1")
+      LocationCredentialAws.create_with_id(location, access_key: "existing_key", secret_key: "existing_secret")
+      expect { aws_pgr_test.start }.to hop("wait_postgres_resource")
+      expect(LocationCredentialAws[location.id].access_key).to eq("existing_key")
+    end
+
+    it "creates resource on gcp and hops to wait_postgres_resource" do
+      sa_json = '{"project_id":"test-project","client_email":"test@test.iam.gserviceaccount.com"}'
+      expect(Config).to receive(:e2e_gcp_credentials_base64_json).and_return(Base64.strict_encode64(sa_json))
+      gcp_location = Location[provider: "gcp", project_id: nil, name: "gcp-us-central1"]
+      PgGceImage.dataset.destroy
+      PgGceImage.create(
+        gce_image_name: "postgres-ubuntu-2604-arm64-20260218",
+        arch: "arm64",
+        family: "ubuntu-2604",
+        pg_versions: ["16", "17", "18"],
+      )
+      gcp_strand = described_class.assemble(provider: "gcp")
+      gcp_pgr_test = described_class.new(gcp_strand)
+      expect { gcp_pgr_test.start }.to hop("wait_postgres_resource")
+      credential = LocationCredentialGcp[gcp_location.id]
+      expect(credential.project_id).to eq("test-project")
+      expect(credential.service_account_email).to eq("test@test.iam.gserviceaccount.com")
+      expect(credential.credentials_json).to eq(sa_json)
+    end
+
+    it "routes to an explicitly selected GCP region via gcp_location_name (gcp-us-east4)" do
+      sa_json = '{"project_id":"test-project","client_email":"test@test.iam.gserviceaccount.com"}'
+      expect(Config).to receive(:e2e_gcp_credentials_base64_json).and_return(Base64.strict_encode64(sa_json))
+      east4 = Location[provider: "gcp", project_id: nil, name: "gcp-us-east4"]
+      PgGceImage.dataset.destroy
+      PgGceImage.create(
+        gce_image_name: "postgres-ubuntu-2604-arm64-20260218",
+        arch: "arm64",
+        family: "ubuntu-2604",
+        pg_versions: ["16", "17", "18"],
+      )
+      gcp_strand = described_class.assemble(provider: "gcp", gcp_location_name: "gcp-us-east4")
+      gcp_pgr_test = described_class.new(gcp_strand)
+      expect { gcp_pgr_test.start }.to hop("wait_postgres_resource")
+      pr = PostgresResource[gcp_pgr_test.strand.stack.first["postgres_resource_id"]]
+      expect(pr.location_id).to eq(east4.id)
+      expect(LocationCredentialGcp[east4.id]).not_to be_nil
+    end
+
+    it "skips gcp credential creation when credential already exists" do
+      location = Location[provider: "gcp", project_id: nil, name: "gcp-us-central1"]
+      LocationCredentialGcp.create_with_id(location, credentials_json: "{}", project_id: "existing-project", service_account_email: "existing@test.iam.gserviceaccount.com")
+      PgGceImage.dataset.destroy
+      PgGceImage.create(
+        gce_image_name: "postgres-ubuntu-2604-arm64-20260218",
+        arch: "arm64",
+        family: "ubuntu-2604",
+        pg_versions: ["16", "17", "18"],
+      )
+      gcp_strand = described_class.assemble(provider: "gcp")
+      gcp_pgr_test = described_class.new(gcp_strand)
+      expect { gcp_pgr_test.start }.to hop("wait_postgres_resource")
+      expect(LocationCredentialGcp[location.id].project_id).to eq("existing-project")
+    end
+
+    it "creates resource on gcp with c4a-standard family and hops to wait_postgres_resource" do
+      sa_json = '{"project_id":"test-project","client_email":"test@test.iam.gserviceaccount.com"}'
+      expect(Config).to receive(:e2e_gcp_credentials_base64_json).and_return(Base64.strict_encode64(sa_json))
+      PgGceImage.dataset.destroy
+      PgGceImage.create(
+        gce_image_name: "postgres-ubuntu-2604-arm64-20260225",
+        arch: "arm64",
+        family: "ubuntu-2604",
+        pg_versions: ["16", "17", "18"],
+      )
+      gcp_strand = described_class.assemble(provider: "gcp", family: "c4a-standard")
+      gcp_pgr_test = described_class.new(gcp_strand)
+      expect { gcp_pgr_test.start }.to hop("wait_postgres_resource")
+      pr = PostgresResource[gcp_pgr_test.strand.stack.first["postgres_resource_id"]]
+      expect(pr.target_vm_size).to eq("c4a-standard-4")
+      expect(pr.target_storage_size_gib).to eq(375)
     end
   end
 
@@ -79,22 +214,134 @@ RSpec.describe Prog::Test::PostgresResource do
 
     it "fails if the basic connectivity test fails" do
       expect(sshable).to receive(:_cmd).and_return("\n")
-      expect { pgr_test.test_postgres }.to hop("destroy_postgres")
+      expect { pgr_test.test_postgres }.to hop("destroy")
     end
 
-    it "hops to destroy_postgres if the basic connectivity test passes" do
+    it "hops to destroy if the basic connectivity test passes" do
       expect(sshable).to receive(:_cmd).and_return("DROP TABLE\nCREATE TABLE\nINSERT 0 10\n4159.90\n415.99\n4.1\n")
-      expect { pgr_test.test_postgres }.to hop("destroy_postgres")
+      expect { pgr_test.test_postgres }.to hop("destroy")
+    end
+  end
+
+  context "with an AWS server" do
+    before do
+      setup_postgres_resource(with_server: false)
+      test_project.set_ff_aws_cloudwatch_logs(true)
+      server
+    end
+
+    let(:aws_location) { Location.create(name: "us-west-2", display_name: "aws-us-west-2", ui_name: "aws-us-west-2", visible: true, provider: "aws") }
+    let(:aws_timeline) { create_postgres_timeline(location_id: aws_location.id) }
+    let(:server) { create_postgres_server(resource: postgres_resource, timeline: aws_timeline) }
+    # Stub the instances the prog's own loop loads, not the spec's copies.
+    let(:sshable) { pgr_test.postgres_resource.servers.first.vm.sshable }
+
+    def expect_check(command, result)
+      expect(sshable).to receive(:_cmd).with(command).and_return(result)
+    end
+
+    describe "#verify_cloudwatch_cutover" do
+      it "passes when the agent is inactive and the collector runs both pipelines" do
+        expect_check("systemctl is-active amazon-cloudwatch-agent || true", "inactive\n")
+        expect_check("systemctl is-active otelcol-contrib || true", "active\n")
+        expect_check("sudo grep -c -e logs/auth/cloudwatch -e logs/postgresql/cloudwatch /etc/otelcol-contrib/config.yaml || true", "2\n")
+        pgr_test.verify_cloudwatch_cutover
+        expect(pgr_test.fail_message).to be_nil
+      end
+
+      it "fails when the agent is still active" do
+        expect_check("systemctl is-active amazon-cloudwatch-agent || true", "active\n")
+        pgr_test.verify_cloudwatch_cutover
+        expect(pgr_test.fail_message).to eq("CloudWatch agent is active on #{server.ubid}, expected inactive")
+      end
+
+      it "fails when the collector is not running" do
+        expect_check("systemctl is-active amazon-cloudwatch-agent || true", "inactive\n")
+        expect_check("systemctl is-active otelcol-contrib || true", "failed\n")
+        pgr_test.verify_cloudwatch_cutover
+        expect(pgr_test.fail_message).to eq("Collector is failed on #{server.ubid}, expected active")
+      end
+
+      it "fails when the collector config lacks a cloudwatch pipeline" do
+        expect_check("systemctl is-active amazon-cloudwatch-agent || true", "inactive\n")
+        expect_check("systemctl is-active otelcol-contrib || true", "active\n")
+        expect_check("sudo grep -c -e logs/auth/cloudwatch -e logs/postgresql/cloudwatch /etc/otelcol-contrib/config.yaml || true", "1\n")
+        pgr_test.verify_cloudwatch_cutover
+        expect(pgr_test.fail_message).to eq("Collector config on #{server.ubid} has 1 cloudwatch pipelines, expected 2")
+      end
+    end
+
+    describe "#verify_guardduty_agent" do
+      it "passes when the agent package is installed" do
+        expect_check("dpkg-query --show --showformat='${Status}' amazon-guardduty-agent || true", "install ok installed")
+        pgr_test.verify_guardduty_agent
+        expect(pgr_test.fail_message).to be_nil
+      end
+
+      it "fails when the agent package is missing" do
+        expect_check("dpkg-query --show --showformat='${Status}' amazon-guardduty-agent || true", "")
+        pgr_test.verify_guardduty_agent
+        expect(pgr_test.fail_message).to eq("GuardDuty agent is not installed on #{server.ubid}")
+      end
+    end
+  end
+
+  describe "#destroy" do
+    before do
+      setup_postgres_resource(with_server: true)
+      pgr_test.strand.update(label: "destroy")
+    end
+
+    it "hops to destroy postgres and does not page if no failure" do
+      expect { pgr_test.destroy }.to hop("destroy_postgres")
+      expect(Page.count).to eq 0
+    end
+
+    it "hops to destroy postgres and does not page if failure but not local e2e" do
+      refresh_frame(pgr_test, new_values: {"fail_message" => "Test failed"})
+      expect { pgr_test.destroy }.to hop("destroy_postgres")
+      expect(Page.count).to eq 0
+    end
+
+    it "hops to destroy postgres and does not page if local e2e but no failure" do
+      refresh_frame(pgr_test, new_values: {"local_e2e" => true})
+      expect { pgr_test.destroy }.to hop("destroy_postgres")
+      expect(Page.count).to eq 0
+    end
+
+    it "hops to destroy postgres and does not page if failure and local e2e but destroy semaphore set" do
+      refresh_frame(pgr_test, new_values: {"fail_message" => "Test failed", "local_e2e" => true})
+      pgr_test.incr_destroy
+      expect { pgr_test.destroy }.to hop("destroy_postgres")
+      expect(Page.count).to eq 0
+    end
+
+    it "naps and pages if failure and local e2e, but allows destruction if destroy semaphore set" do
+      refresh_frame(pgr_test, new_values: {"fail_message" => "Test failed", "local_e2e" => true})
+      expect { pgr_test.destroy }.to nap(60 * 60 * 24 * 365)
+      pages = Page.all
+      expect(pages.size).to eq 1
+      expect(pages[0].severity).to eq "info"
+      expect(pages[0].resource_id).to eq pgr_strand.id
+      expect(pages[0].resolve_set?(cached: false)).to be false
+
+      pgr_test.incr_destroy
+      expect { pgr_test.destroy }.to hop("destroy_postgres")
+      expect(pages[0].resolve_set?(cached: false)).to be true
     end
   end
 
   describe "#destroy_postgres" do
-    before { setup_postgres_resource(with_server: true) }
-
     it "increments the destroy count and hops to wait_resources_destroyed" do
+      setup_postgres_resource(with_server: true)
       expect { pgr_test.destroy_postgres }.to hop("wait_resources_destroyed")
       expect(Semaphore.where(strand_id: postgres_resource.id, name: "destroy").count).to eq(1)
-      expect(Semaphore.where(strand_id: timeline.strand.id, name: "destroy").count).to eq(1)
+      expect(pgr_test.strand.stack[0]["timeline_ids"]).not_to be_empty
+    end
+
+    it "works without postgres resource (jump from start to destroy before creating resource)" do
+      expect { pgr_test.destroy_postgres }.to hop("wait_resources_destroyed")
+      expect(pgr_test.strand.stack[0]).not_to have_key("timeline_ids")
     end
   end
 
@@ -105,9 +352,33 @@ RSpec.describe Prog::Test::PostgresResource do
     end
 
     it "naps if the private subnet isn't deleted yet" do
-      project_id = pgr_test.strand.stack.first["postgres_test_project_id"]
-      PrivateSubnet.create(name: "subnet", project_id:, location_id:, net4: "10.0.0.0/26", net6: "fd00::/64")
+      project_id = pgr_test.frame["postgres_test_project_id"]
+      ps = PrivateSubnet.create(name: "subnet", project_id:, location_id:, net4: "10.0.0.0/26", net6: "fd00::/64")
+      refresh_frame(pgr_test, new_values: {"private_subnet_id" => ps.id})
       expect { pgr_test.wait_resources_destroyed }.to nap(5)
+    end
+
+    it "naps if the GCP VPC isn't deleted yet" do
+      project_id = pgr_test.strand.stack.first["postgres_test_project_id"]
+      ps = PrivateSubnet.create(name: "subnet", project_id:, location_id:, net4: "10.0.0.0/26", net6: "fd00::/64")
+      refresh_frame(pgr_test, new_values: {"private_subnet_id" => ps.id})
+      GcpVpc.create(project_id:, location_id:, name: "vpc", dedicated_for_subnet_id: ps.id)
+      expect { pgr_test.wait_resources_destroyed }.to nap(5)
+    end
+
+    it "naps if the GCP VPC isn't deleted yet when not dedicating VPCs to subnets" do
+      project_id = pgr_test.strand.stack.first["postgres_test_project_id"]
+      Project[project_id].update(gcp_dedicated_subnet_vpcs: false)
+      GcpVpc.create(project_id:, location_id:, name: "vpc")
+      expect { pgr_test.wait_resources_destroyed }.to nap(5)
+    end
+
+    it "verifies timelines are retained and explicitly destroys them" do
+      tl = PostgresTimeline.create(location_id:)
+      Strand.create_with_id(tl, prog: "Postgres::PostgresTimelineNexus", label: "wait")
+      refresh_frame(pgr_test, new_values: {"timeline_ids" => [tl.id]})
+      expect { pgr_test.wait_resources_destroyed }.to nap(5)
+      expect(Semaphore.where(strand_id: tl.id, name: "destroy").count).to eq(1)
     end
 
     it "hops to finish if the postgres resource destroyed" do
@@ -116,14 +387,28 @@ RSpec.describe Prog::Test::PostgresResource do
   end
 
   describe "#finish" do
-    it "exits successfully if no failure happened" do
+    it "delete project and exits successfully if no failure happened" do
+      pgr_test
       expect { pgr_test.finish }.to exit({"msg" => "Postgres tests are finished!"})
+        .and change { Project.select_order_map(:name) }.from(["Postgres-Test-Project", "service-project"]).to(["service-project"])
+    end
+
+    it "not delete project if Config.local_e2e_postgres_test_project_id" do
+      pgr_test
+      project = Project.create(name: "foo")
+      expect(Config).to receive(:local_e2e_postgres_test_project_id).and_return(project.id).at_least(:once)
+      expect { pgr_test.finish }.to exit({"msg" => "Postgres tests are finished!"})
+        .and not_change { Project.select_order_map(:name) }
+    end
+
+    it "exits if a failure happened and it is a local e2e strand" do
+      refresh_frame(pgr_test, new_values: {"fail_message" => "Test failed", "local_e2e" => true})
+      fresh_pgr_test = described_class.new(pgr_test.strand)
+      expect { fresh_pgr_test.finish }.to exit({"msg" => "Test failed"})
     end
 
     it "hops to failed if a failure happened" do
-      pgr_test.strand.stack.first["fail_message"] = "Test failed"
-      pgr_test.strand.modified!(:stack)
-      pgr_test.strand.save_changes
+      refresh_frame(pgr_test, new_values: {"fail_message" => "Test failed"})
       fresh_pgr_test = described_class.new(pgr_test.strand)
       expect { fresh_pgr_test.finish }.to hop("failed")
     end

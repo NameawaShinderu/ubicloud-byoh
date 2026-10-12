@@ -74,20 +74,12 @@ class Clover
 
         validate_postgres_input(pg.name, postgres_params)
 
-        if target_storage_size_gib < pg.representative_server.storage_size_gib && (tsdb_client = PostgresServer.victoria_metrics_client)
-          disk_usage = begin
-            query = Metrics::POSTGRES_METRICS[:disk_usage].series[0].query.gsub("$ubicloud_resource_id", pg.ubid)
-            tsdb_client.query(query:).last
-          rescue
-            nil
-          end
+        if target_storage_size_gib < pg.representative_server.billed_storage_size_gib
+          usage_gib = pg.observed_disk_usage_gib
 
-          fail CloverError.new(400, "InvalidRequest", "Metrics unavailable right now to verify scale down safety", {}) unless disk_usage
+          fail CloverError.new(400, "InvalidRequest", "Metrics unavailable right now to verify scale down safety", {}) unless usage_gib
 
-          disk_usage_percentage = disk_usage["value"][1].to_f
-          current_disk_usage = disk_usage_percentage * pg.representative_server.storage_size_gib / 100
-
-          if target_storage_size_gib * 0.8 < current_disk_usage
+          unless pg.storage_size_fits_usage?(target_storage_size_gib, usage_gib)
             fail Validation::ValidationFailed.new({storage_size: "Insufficient storage size is requested. It is only possible to reduce the storage size if the current usage is less than 80% of the requested size."})
           end
         end
@@ -101,9 +93,13 @@ class Clover
 
         Validation.validate_vcpu_quota(@project, "PostgresVCpu", requested_postgres_vcpu_count - current_postgres_vcpu_count)
 
+        current_vm_size = pg.target_vm_size
+        current_storage_size_gib = pg.target_storage_size_gib
+        current_ha_type = pg.ha_type
+        current_standby_count = pg.target_standby_count
+
         DB.transaction do
-          pg.update(target_vm_size: requested_parsed_size.name, target_storage_size_gib:, ha_type:, tags:)
-          pg.read_replicas_dataset.update(target_vm_size: requested_parsed_size.name, target_storage_size_gib:)
+          pg.update_target_sizes_with_replicas(target_vm_size: requested_parsed_size.name, target_storage_size_gib:, ha_type:, tags:)
 
           # Updating target_vm_size and target_storage_size_gib might undo what
           # we did in auto-scaling, so we are decrementing related semaphores
@@ -123,6 +119,20 @@ class Clover
           audit_log(pg, "update")
         end
 
+        if current_vm_size != pg.target_vm_size || current_storage_size_gib != pg.target_storage_size_gib
+          postgres_action_log(pg, :postgres_scale,
+            current_vm_size:, target_vm_size: pg.target_vm_size,
+            current_storage_size_gib:, target_storage_size_gib: pg.target_storage_size_gib,
+            current_vcpu_count: current_postgres_vcpu_count, target_vcpu_count: requested_postgres_vcpu_count)
+        end
+
+        if current_ha_type != pg.ha_type
+          postgres_action_log(pg, :postgres_ha_change,
+            current_ha_type:, target_ha_type: pg.ha_type,
+            current_standby_count:, target_standby_count: pg.target_standby_count,
+            vcpu_count: requested_parsed_size.vcpu_count, storage_size_gib: pg.target_storage_size_gib)
+        end
+
         if api?
           Serializers::Postgres.serialize(pg, {detailed: true})
         else
@@ -133,20 +143,22 @@ class Clover
 
       r.rename pg, perm: "Postgres:edit", serializer: Serializers::Postgres, template_prefix: "postgres" do
         pg.incr_refresh_dns_record
-        pg.incr_refresh_certificates
+        pg.incr_refresh_certificates unless pg.hostname_version == "v3"
+        pg.server_incr("configure_metrics")
+        pg.server_incr("configure_logs")
       end
 
       show_actions = if pg.read_replica?
-        %w[overview connection charts networking config settings]
+        %w[overview connection charts networking config settings].freeze
       else
-        %w[overview connection charts networking resize high-availability read-replica backup-restore config upgrade settings]
+        %w[overview connection charts networking resize high-availability read-replica backup-restore config upgrade settings].freeze
       end
       r.show_object(pg, actions: show_actions, perm: "Postgres:view", template: "postgres/show")
 
       r.post "restart" do
         authorize("Postgres:edit", pg)
         DB.transaction do
-          pg.incr_restart
+          pg.server_incr("restart")
           audit_log(pg, "restart")
         end
 
@@ -170,6 +182,8 @@ class Clover
 
         DB.transaction do
           pg.dns_zone.insert_record(record_name: pg.hostname, type: "AAAA", ttl: 10, data: pg.representative_server.vm.ip6_string)
+          pg.dns_zone.delete_record(record_name: pg.private_hostname, type: "AAAA")
+          pg.dns_zone.insert_record(record_name: pg.private_hostname, type: "AAAA", ttl: 10, data: pg.representative_server.vm.private_ipv6_string)
           pg.incr_refresh_dns_record
           audit_log(pg, "add_aaaa_record")
         end
@@ -251,14 +265,21 @@ class Clover
           authorize("Postgres:edit", pg)
           handle_validation_failure("postgres/show") { @page = "charts" }
 
-          password_param = (api? ? "password" : "metric-destination-password")
-          url, username, password = typecast_params.nonempty_str!(["url", "username", password_param])
+          url = typecast_params.nonempty_str!("url")
+          if api?
+            username = typecast_params.nonempty_str("username")
+            password = typecast_params.nonempty_str("password")
+            options = typecast_params.Hash("options")
+          else
+            username, password = typecast_params.nonempty_str!(["username", "metric-destination-password"])
+          end
 
           Validation.validate_url(url)
+          Validation.validate_metric_destination_auth(username, password, options)
 
           DB.transaction do
-            md = PostgresMetricDestination.create(postgres_resource_id: pg.id, url:, username:, password:)
-            pg.servers.each(&:incr_configure_metrics)
+            md = PostgresMetricDestination.create(postgres_resource_id: pg.id, url:, username:, password:, options:)
+            pg.server_incr("configure_metrics")
             audit_log(md, "create", pg)
           end
 
@@ -276,7 +297,7 @@ class Clover
           if (md = pg.metric_destinations_dataset[id:])
             DB.transaction do
               md.destroy
-              pg.servers.each(&:incr_configure_metrics)
+              pg.server_incr("configure_metrics")
               audit_log(md, "destroy")
             end
           else
@@ -286,6 +307,79 @@ class Clover
           if web?
             flash["notice"] = "PostgreSQL metric destination deleted."
             r.redirect pg, "/charts"
+          else
+            204
+          end
+        end
+      end
+
+      r.on "log-destination" do
+        r.post true do
+          authorize("Postgres:edit", pg)
+          handle_validation_failure("postgres/show") { @page = "logs" }
+
+          name, type = typecast_params.nonempty_str!(["name", "type"])
+          url = typecast_params.nonempty_str!("url")
+          (type == "otlp") ? Validation.validate_url(url) : Validation.validate_syslog_url(url)
+
+          options = if web?
+            if type == "otlp"
+              keys = typecast_params.array(:str, "header_keys") || []
+              values = typecast_params.array(:str, "header_values") || []
+              result = {}
+              keys.zip(values).each do |key, val|
+                next if key.to_s.empty?
+                result[key] = val.to_s
+              end
+              result.empty? ? nil : {"headers" => result}
+            else
+              sd_ids = typecast_params.array(:str, "structured_data_ids") || []
+              sd_keys = typecast_params.array(:str, "structured_data_keys") || []
+              sd_values = typecast_params.array(:str, "structured_data_values") || []
+              result = {}
+              sd_ids.zip(sd_keys, sd_values).each do |id, key, val|
+                next if id.to_s.empty? || key.to_s.empty?
+                (result[id] ||= {})[key] = val.to_s
+              end
+              result.empty? ? nil : {"structured_data" => result}
+            end
+          else
+            opts = typecast_params.Hash("options")
+            Validation.validate_log_destination_options(type, opts)
+            opts
+          end
+
+          ld = DB.transaction do
+            ld = PostgresLogDestination.create(postgres_resource_id: pg.id, name:, type:, url:, options:)
+            pg.server_incr("configure_logs")
+            audit_log(ld, "create", pg)
+            ld
+          end
+
+          if api?
+            {id: ld.ubid, name: ld.name, type: ld.type, url: ld.url}
+          else
+            flash["notice"] = "Log destination is created"
+            r.redirect pg, "/logs"
+          end
+        end
+
+        r.delete :ubid_uuid do |id|
+          authorize("Postgres:edit", pg)
+
+          if (ld = pg.log_destinations_dataset[id:])
+            DB.transaction do
+              ld.destroy
+              pg.server_incr("configure_logs")
+              audit_log(ld, "destroy")
+            end
+          else
+            no_audit_log
+          end
+
+          if web?
+            flash["notice"] = "PostgreSQL log destination deleted."
+            r.redirect pg, "/logs"
           else
             204
           end
@@ -309,10 +403,13 @@ class Clover
           fail CloverError.new(400, "InvalidRequest", error_msg)
         end
 
-        validate_postgres_config(pg.version, user_config, pgbouncer_user_config)
+        validate_postgres_config(pg.version, user_config, pgbouncer_user_config, memory_gib: Option::POSTGRES_SIZE_OPTIONS[pg.target_vm_size].memory_gib)
 
         replica = nil
         DB.transaction do
+          pg.lock!
+          Validation.validate_postgres_restart_sensitive_params(pg.version, user_config, parent: pg)
+
           replica = Prog::Postgres::PostgresResourceNexus.assemble(
             project_id: @project.id,
             location_id: pg.location_id,
@@ -331,7 +428,6 @@ class Clover
           ).subject
           audit_log(pg, "create_replica", replica)
         end
-        send_notification_mail_to_partners(replica, current_account.email)
 
         if api?
           Serializers::Postgres.serialize(replica, {detailed: true})
@@ -352,7 +448,6 @@ class Clover
 
         DB.transaction do
           pg.update(restore_target: Time.now)
-          pg.representative_server.switch_to_new_timeline
           pg.representative_server.incr_promote_read_replica
 
           audit_log(pg, "promote_read_replica")
@@ -380,7 +475,7 @@ class Clover
 
         Validation.validate_vcpu_quota(@project, "PostgresVCpu", Option::POSTGRES_SIZE_OPTIONS[pg.target_vm_size].vcpu_count)
 
-        validate_postgres_config(pg.version, user_config, pgbouncer_user_config)
+        validate_postgres_config(pg.version, user_config, pgbouncer_user_config, memory_gib: Option::POSTGRES_SIZE_OPTIONS[pg.target_vm_size].memory_gib)
 
         restored = nil
         DB.transaction do
@@ -401,7 +496,6 @@ class Clover
           ).subject
           audit_log(pg, "restore", restored)
         end
-        send_notification_mail_to_partners(restored, current_account.email)
 
         if api?
           Serializers::Postgres.serialize(restored, {detailed: true})
@@ -441,6 +535,8 @@ class Clover
 
         DB.transaction do
           pg.update(superuser_password: password)
+          # Per-instance: a dataset update would bypass column encryption
+          pg.read_replicas.each { it.update(superuser_password: password) }
           pg.representative_server.incr_update_superuser_password
           audit_log(pg, "reset_superuser_password")
         end
@@ -455,17 +551,25 @@ class Clover
 
       r.post "set-maintenance-window" do
         authorize("Postgres:edit", pg)
-        maintenance_window_start_at = typecast_params.int("maintenance_window_start_at")
+        update_params = {maintenance_window_start_at: typecast_params.int("maintenance_window_start_at")}
+        maintenance_window_days = typecast_params.array(:str, "maintenance_window_days")
+        if @project.get_ff_postgres_enable_maintenance_window_days
+          update_params[:maintenance_window_days_bitmask] = PostgresResource.maintenance_window_days_mask(maintenance_window_days)
+        elsif maintenance_window_days
+          raise CloverError.new(400, "InvalidRequest", "Maintenance window days are not enabled for this project.")
+        end
+
+        update_params[:maintenance_window_days_bitmask] = 0 if update_params[:maintenance_window_start_at].nil?
 
         DB.transaction do
-          pg.update(maintenance_window_start_at:)
+          pg.update(**update_params)
           audit_log(pg, "set_maintenance_window")
         end
 
         if api?
           Serializers::Postgres.serialize(pg, {detailed: true})
         else
-          flash["notice"] = "Maintenance window is set"
+          flash["notice"] = "Maintenance window is #{"un" unless pg.maintenance_window_start_at}set"
           r.redirect pg, "/settings"
         end
       end
@@ -485,8 +589,16 @@ class Clover
 
       r.get "ca-certificates" do
         authorize("Postgres:view", pg)
+        handle_validation_failure("postgres/show") { @page = "connection" }
 
-        next unless (certs = pg.ca_certificates)
+        unless (certs = pg.ca_certificates)
+          message = if pg.uses_publicly_signed_certificates?
+            "This database uses certificates from a public signed certificate authority"
+          else
+            "Certificate authority certificates for this database have not yet been generated"
+          end
+          raise CloverError.new(404, "NotFound", message)
+        end
 
         response.attachment "#{pg.name}.pem"
         response.content_type = :pem
@@ -504,7 +616,7 @@ class Clover
             raise CloverError.new(400, "InvalidRequest", "Certificate expiry should be less than 367 days.")
           elsif !common_name.match?(/\A[a-zA-Z0-9_-]{1,64}\z/)
             raise CloverError.new(400, "InvalidRequest", "Common Name must only contain alphanumeric characters, underscores, and hyphens. It must not exceed 64 characters.")
-          elsif %w[postgres ubi_replication].include?(common_name)
+          elsif %w[postgres ubi_replication].freeze.include?(common_name)
             raise CloverError.new(400, "InvalidRequest", "Common Name must not be postgres or ubi_replication.")
           end
 
@@ -527,13 +639,14 @@ class Clover
 
         r.post "add-auth-user" do
           name = typecast_params.nonempty_str!("name")
+          Validation.validate_postgres_cert_auth_user_name(name)
           cert_auth_users = Sequel.pg_jsonb_op(:cert_auth_users)
           DB.transaction do
             n = pg.this
               .exclude(cert_auth_users.contains([name]))
               .update(cert_auth_users: cert_auth_users.concat([name]))
             if n == 1
-              pg.servers.each(&:incr_configure)
+              pg.server_incr("configure")
               audit_log(pg, "add_cert_auth_user")
               pg.refresh
             else
@@ -551,7 +664,7 @@ class Clover
               .where(cert_auth_users.contains([name]))
               .update(cert_auth_users: cert_auth_users - name)
             if n == 1
-              pg.servers.each(&:incr_configure)
+              pg.server_incr("configure")
               audit_log(pg, "remove_cert_auth_user")
               pg.refresh
             else
@@ -587,88 +700,171 @@ class Clover
         }
       end
 
+      r.post "backup-credentials" do
+        authorize("Postgres:view", pg)
+
+        if (message = pg.backup_download_unavailable_message)
+          raise CloverError.new(400, "InvalidRequest", message)
+        end
+
+        timeline = pg.timeline
+        credentials =
+          begin
+            timeline.create_download_credentials
+          rescue Aws::STS::Errors::AccessDenied
+            # Writer users created before this feature shipped lack sts:GetFederationToken;
+            # their policy needs a refresh before downloads work (see aws_setup_blob_storage).
+            raise CloverError.new(400, "InvalidRequest", "Backup downloads are not yet available for this database. Please contact support if this persists.")
+          end
+        audit_log(pg, "create_backup_credentials")
+
+        response_data = {
+          bucket: timeline.bucket_name,
+          endpoint: timeline.blob_storage_endpoint,
+          region: timeline.walg_config_region,
+          access_key_id: credentials[:access_key_id],
+          secret_access_key: credentials[:secret_access_key],
+          session_token: credentials[:session_token],
+          expiration: credentials[:expiration].utc.iso8601,
+        }
+
+        if api?
+          response_data
+        else
+          @backup_credentials = response_data
+          @page = "backup-restore"
+          view "postgres/show"
+        end
+      end
+
       r.get "metrics", r.accepts_json? do
         authorize("Postgres:view", pg)
 
-        start_time, end_time = typecast_params.str(%w[start end])
-        start_time ||= (DateTime.now.new_offset(0) - 30.0 / 1440).rfc3339
-        start_time = Validation.validate_rfc3339_datetime_str(start_time, "start")
+        metrics_response(Metrics::POSTGRES_METRICS, pg.ubid, PostgresServer.victoria_metrics_client)
+      end
 
-        end_time ||= DateTime.now.new_offset(0).rfc3339
-        end_time = Validation.validate_rfc3339_datetime_str(end_time, "end")
+      r.get "logs" do
+        authorize("Postgres:view", pg)
 
-        start_ts = start_time.to_i
-        end_ts = end_time.to_i
+        begin
+          start_time, end_time = typecast_params.nonempty_str(%w[start end].freeze)
+          now = Time.now.utc
+          start_time ||= (now - 60 * 30).strftime("%FT%T%:z")
+          start_time = Validation.validate_rfc3339_datetime_str(start_time, "start")
 
-        if end_ts < start_ts
-          raise CloverError.new(400, "InvalidRequest", "End timestamp must be greater than start timestamp")
-        end
+          end_time ||= now.strftime("%FT%T%:z")
+          end_time = Validation.validate_rfc3339_datetime_str(end_time, "end")
 
-        if end_ts - start_ts > 31 * 24 * 60 * 60 + 5 * 60
-          raise CloverError.new(400, "InvalidRequest", "Maximum time range is 31 days")
-        end
-
-        if start_ts < Time.now.utc.to_i - 31 * 24 * 60 * 60
-          raise CloverError.new(400, "InvalidRequest", "Cannot query metrics older than 31 days")
-        end
-
-        metric_key = typecast_params.str("key")&.to_sym
-        single_query = !metric_key.nil?
-
-        if single_query && !Metrics::POSTGRES_METRICS.key?(metric_key)
-          raise CloverError.new(400, "InvalidRequest", "Invalid metric name")
-        end
-
-        metric_keys = metric_key ? [metric_key] : Metrics::POSTGRES_METRICS.keys
-
-        unless (tsdb_client = PostgresServer.victoria_metrics_client)
-          raise CloverError.new(404, "NotFound", "Metrics are not configured for this instance")
-        end
-
-        results = metric_keys.map do |key|
-          metric_definition = Metrics::POSTGRES_METRICS[key]
-
-          series_results = metric_definition.series.filter_map do |s|
-            query = s.query.gsub("$ubicloud_resource_id", pg.ubid)
-            begin
-              series_query_result = tsdb_client.query_range(
-                query:,
-                start_ts:,
-                end_ts:,
-              )
-
-              # This can be a two cases:
-              # 1. Missing data (e.g. no data for the given time range)
-              # 2. No data for the given query (maybe bad query)
-              if series_query_result.empty?
-                next
-              end
-
-              # Combine labels with configured series labesls.
-              series_query_result.each { it["labels"].merge!(s.labels) }
-
-              series_query_result
-            rescue VictoriaMetrics::ClientError => e
-              Clog.emit("Could not query VictoriaMetrics", {error: e.message, query:})
-
-              if single_query
-                raise CloverError.new(500, "InternalError", "Internal error while querying metrics", {query:})
-              end
-            end
+          if end_time <= start_time
+            raise CloverError.new(400, "InvalidRequest", "End time must be after start time")
           end
 
-          {
-            key: key.to_s,
-            name: metric_definition.name,
-            unit: metric_definition.unit,
-            description: metric_definition.description,
-            series: series_results.flatten,
-          }
+          if start_time.to_i < now.to_i - 7 * 24 * 60 * 60
+            raise CloverError.new(400, "InvalidRequest", "Cannot query logs older than 7 days")
+          end
+
+          if end_time.to_i - start_time.to_i > 24 * 60 * 60
+            raise CloverError.new(400, "InvalidRequest", "Maximum time range for log queries is 24 hours")
+          end
+
+          max_log_lines = typecast_params.pos_int("max_log_lines") || 50
+          if max_log_lines > 500
+            raise CloverError.new(400, "InvalidRequest", "Maximum limit is 500")
+          end
+
+          stream_name = typecast_params.nonempty_str("stream_name")
+          query_pattern = typecast_params.nonempty_str("query_pattern")
+          server_role = typecast_params.nonempty_str("server_role")
+          severity_level = typecast_params.nonempty_str("severity_level")
+          pagination_key = typecast_params.nonempty_str("pagination_key")
+
+          if web?
+            stream_name = "postgres" if typecast_params.str("stream_name").nil?
+            server_role = "primary" if typecast_params.str("server_role").nil?
+          end
+
+          if query_pattern
+            raise CloverError.new(400, "InvalidRequest", "query_pattern must be less than 200 chars") if query_pattern.length > 200
+          end
+
+          unless (parseable_client = ParseableResource.client_for_project(Config.postgres_service_project_id))
+            raise CloverError.new(400, "NotFound", "Log aggregation is not enabled for this instance")
+          end
+
+          ds = DB.from(Sequel.identifier(pg.ubid))
+            .no_auto_parameterize
+            .select(:log_id, :time_unix_nano, :stream, :severity_text, :body, :instance, :server_role, :remote_host_port, :dbname, :pid, :user)
+            .exclude(log_id: nil)
+            .reverse(:log_id)
+            .limit(max_log_lines + 1)
+
+          ds = ds.where(stream: stream_name) if stream_name
+          ds = ds.where(server_role:) if server_role
+          ds = ds.where(severity_text: severity_level.upcase) if severity_level
+          ds = ds.where(Sequel.like(:message, "%#{ds.escape_like(query_pattern)}%")) if query_pattern
+          ds = ds.where { log_id < pagination_key } if pagination_key
+
+          sql = ds.sql
+
+          start_str = start_time.iso8601
+          end_str = end_time.iso8601
+
+          begin
+            rows = parseable_client.query(sql, start_time: start_str, end_time: end_str)
+          rescue Parseable::Client::Error => e
+            Clog.emit("Could not query Parseable", {error: e.message})
+            raise CloverError.new(503, "ServiceUnavailable", "Log service is temporarily unavailable. Please try again in a few moments.")
+          end
+
+          has_more = rows.count > max_log_lines
+          rows.pop if has_more
+          rows.reverse!
+
+          result = {logs: rows.map { |row|
+            context = {
+              remote_host_port: row["remote_host_port"],
+              dbname: row["dbname"],
+              pid: row["pid"],
+              user: row["user"],
+            }.compact
+
+            entry = {
+              timestamp: row["time_unix_nano"] + "Z",
+              stream_name: row["stream"],
+              severity_level: row["severity_text"],
+              message: row["body"],
+              server_ubid: row["instance"],
+              server_role: row["server_role"],
+            }
+            entry[:context] = context unless context.empty?
+            entry
+          }}
+
+          result[:pagination_key] = rows.first["log_id"] if has_more
+        rescue CloverError => e
+          raise unless web?
+          @logs_error = e.message
         end
 
-        {
-          metrics: results,
-        }
+        if web?
+          @logs_start = start_time.iso8601
+          @logs_end = end_time.iso8601
+          @stream_name = stream_name
+          @server_role = server_role
+          @severity_level = severity_level
+          @query_pattern = query_pattern
+          @max_log_lines = max_log_lines
+
+          if result
+            @logs = result[:logs]
+            @pagination_key = result[:pagination_key]
+          end
+          response.headers["cache-control"] = "no-store"
+          @page = "logs"
+          view "postgres/show"
+        else
+          result
+        end
       end
 
       r.is "config" do
@@ -705,13 +901,23 @@ class Clover
             pgbouncer_config = typecast_params.Hash!("pgbouncer_config")
           end
 
-          validate_postgres_config(pg.version, pg_config, pgbouncer_config)
-          old_pg_config = pg.user_config
-          pg.update(user_config: pg_config, pgbouncer_user_config: pgbouncer_config)
+          validate_postgres_config(pg.version, pg_config, pgbouncer_config, memory_gib: Option::POSTGRES_SIZE_OPTIONS[pg.target_vm_size].memory_gib)
 
-          pg.servers.each(&:incr_configure)
+          old_pg_config = DB.transaction do
+            parent = pg.parent
+            parent&.lock!
+            pg.lock!
+            Validation.validate_postgres_restart_sensitive_params(pg.version, pg_config, parent:, children: pg.read_replicas)
 
-          audit_log(pg, "update_config")
+            old_config = pg.user_config
+            pg.update(user_config: pg_config, pgbouncer_user_config: pgbouncer_config)
+
+            pg.server_incr("configure")
+
+            audit_log(pg, "update_config")
+
+            old_config
+          end
 
           validator = Validation::PostgresConfigValidator.new(pg.version)
           restart_requiring_changed_params = (pg_config.keys | old_pg_config.keys).select { |k|
@@ -755,11 +961,15 @@ class Clover
 
           Validation.validate_postgres_upgrade(pg)
 
-          DB.transaction do
+          read_replica_count = DB.transaction do
             pg.update(target_version: pg.version.to_i + 1)
-            pg.read_replicas_dataset.update(target_version: pg.target_version)
             audit_log(pg, "upgrade")
+
+            pg.read_replicas_dataset.update(target_version: pg.target_version)
           end
+
+          postgres_action_log(pg, :postgres_upgrade,
+            current_version: pg.version, target_version: pg.target_version, read_replica_count:)
 
           if api?
             Serializers::PostgresUpgrade.serialize(pg)

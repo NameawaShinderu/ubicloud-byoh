@@ -30,13 +30,18 @@ class IoThrottle
     @data_dir = "/dat/#{instance.split("-").first}/data"
   end
 
-  # Main entry point for the systemd timer: reads the archival backlog,
-  # calculates the appropriate throttle tier, and applies it.
+  # Main entry point for the systemd timer: reads the archival backlog
+  # and disk usage, calculates appropriate throttle, and applies it.
   def run
     backlog = Dir.glob("#{@data_dir}/pg_wal/archive_status/*.ready").length
-    throttle_mbps = calculate_throttle(backlog)
-    @logger.info("Archival backlog: #{backlog} files, throttle: #{throttle_mbps ? "#{throttle_mbps} MB/s" : "none"}")
-    apply(throttle_mbps)
+    archival_throttle_mbps = calculate_archival_throttle(backlog)
+    disk_usage_throttle_mbps = calculate_disk_usage_throttle
+    throttle_mbps = [archival_throttle_mbps, disk_usage_throttle_mbps].compact.min
+    return unless apply(throttle_mbps)
+
+    @logger.info("Archival backlog: #{backlog} files (#{archival_throttle_mbps || "none"}), " \
+      "disk usage throttle: #{disk_usage_throttle_mbps || "none"}, " \
+      "effective: #{throttle_mbps ? "#{throttle_mbps} MB/s" : "none"}")
   end
 
   def apply(throttle_mbps, data_mount_path = "/dat")
@@ -53,21 +58,22 @@ class IoThrottle
 
   def remove_throttle
     io_max_file = "#{@throttled_cgroup}/io.max"
+    had_limit = File.read(io_max_file).match?(/wbps=\d/)
     File.write(io_max_file, "#{@dev_id} wbps=max")
-    @logger.info("Removed I/O throttle")
+    had_limit
   rescue Errno::ENOENT
-    @logger.info("No throttle to remove")
+    false
   end
 
   def apply_throttle(throttle_mbps)
-    return unless enable_io_controller
-    set_io_limit(throttle_mbps)
-    immune_pids = classify_processes
-    @logger.info("Applied I/O throttle: #{throttle_mbps} MB/s (immune pids: #{immune_pids.join(", ")})")
+    return false unless enable_io_controller
+    changed = set_io_limit(throttle_mbps)
+    classify_processes
+    changed
   end
 
   def find_postmaster_pid
-    output = r("systemctl show postgresql@#{@instance}.service --property=MainPID --value").strip
+    output = r("systemctl", "show", "postgresql@#{@instance}.service", "--property=MainPID", "--value").strip
     pid = Integer(output, 10)
     fail "postgresql@#{@instance}.service is not running" if pid == 0
     pid
@@ -80,11 +86,18 @@ class IoThrottle
     immune_pids = [postmaster_pid]
     children.each do |pid|
       cmdline = File.read("/proc/#{pid}/cmdline").tr("\0", " ")
-      immune_pids << pid if IMMUNE_PATTERNS.any? { |pattern| cmdline.include?(pattern) }
+      immune_pids << pid if immune_patterns.any? { |pattern| cmdline.include?(pattern) }
     rescue Errno::ENOENT
       # Process exited between enumeration and read
+      nil
     end
     immune_pids
+  end
+
+  # Patterns matching the Postgres children throttling must leave alone, because
+  # throttling them would slow the very work that relieves the pressure.
+  def immune_patterns
+    IMMUNE_PATTERNS
   end
 
   def get_cgroup_pids(cgroup_path)
@@ -97,19 +110,35 @@ class IoThrottle
     File.write("#{cgroup_path}/cgroup.procs", pid.to_s)
   rescue Errno::ESRCH
     # Process no longer exists
+    nil
   end
 
   private
 
-  def calculate_throttle(backlog_count)
+  def calculate_archival_throttle(backlog_count)
     IO_THROTTLE_RATIOS.each do |threshold, ratio|
       return (@disk_throughput_baseline_mbps * ratio).round if backlog_count >= threshold
     end
     nil
   end
 
+  # descend to 1% of baseline, starting at 91% disk usage
+  def calculate_disk_usage_throttle
+    return nil if in_recovery?
+    disk_usage_percent = Integer(r("df --output=pcent /dat | tail -n 1").strip.delete_suffix("%"), 10)
+    return nil if disk_usage_percent < 91
+    ratio = 1.0 - 0.11 * (disk_usage_percent - 91)
+    (@disk_throughput_baseline_mbps * ratio).round
+  end
+
+  # Recovery throttles the startup process and walreceiver, which drive
+  # replay, so a near-full disk fills faster instead of slower.
+  def in_recovery?
+    File.exist?("#{@data_dir}/standby.signal") || File.exist?("#{@data_dir}/recovery.signal")
+  end
+
   def find_device_id(mount_path)
-    data_disk = File.realpath(r("findmnt -n -o SOURCE #{mount_path}").strip)
+    data_disk = File.realpath(r("findmnt", "-n", "-o", "SOURCE", mount_path).strip)
     dev_stat = File.stat(data_disk)
     "#{dev_stat.rdev_major}:#{dev_stat.rdev_minor}"
   end
@@ -133,8 +162,11 @@ class IoThrottle
   end
 
   def set_io_limit(throttle_mbps)
+    io_max_file = "#{@throttled_cgroup}/io.max"
     throttle_bytes = throttle_mbps * 1024 * 1024
-    File.write("#{@throttled_cgroup}/io.max", "#{@dev_id} wbps=#{throttle_bytes}")
+    changed = !File.read(io_max_file).match?(/wbps=#{throttle_bytes}\b/)
+    File.write(io_max_file, "#{@dev_id} wbps=#{throttle_bytes}")
+    changed
   end
 
   def classify_processes
@@ -156,3 +188,5 @@ class IoThrottle
     immune_pids
   end
 end
+
+require_relative "override/io_throttle"

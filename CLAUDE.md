@@ -39,8 +39,8 @@ Product direction from the user:
 |---|---|---|
 | `origin` | github.com/ubicloud/ubicloud | upstream |
 | `byoh-fork` | github.com/NameawaShinderu/ubicloud-byoh | our fork; push here |
-| local `main` | 43a2241e2 (2026-04-10) | this is the merge base; it is 2298 commits behind origin/main |
-| local `byoh-driver` | tracks `byoh-fork/byoh-driver` | fast-forwarded to 06f359de4 on 2026-10-11, then 971a3d608 (backported upstream DNS fix, see §10a) |
+| local `main` | 43a2241e2 (2026-04-10) | old merge base; stale since the M1 merge |
+| local `byoh-driver` | tracks `byoh-fork/byoh-driver` | contains the M1 merge of origin/main fad16215c (§8) |
 | `byoh-fork/dependabot/*` | fae63fb24, a20708ee0 | only Gemfile.lock bumps on top of 06f359de4 |
 | `origin/main` | fad16215c (committed 2026-10-09) | fetched 2026-10-11 |
 
@@ -97,17 +97,15 @@ Product direction from the user:
 
 | Path | Status | Role |
 |---|---|---|
-| `lib/hosting/apis.rb` | M | Adds `DELEGATING_PROVIDERS = [hetzner, generic]`; leaseweb or a nil provider still raises "unknown provider". |
 | `lib/hosting/capability_missing.rb` | A | `Hosting::CapabilityMissing`. (`Hosting::Base` was deleted on 2026-10-12; `GenericApis` is standalone with its own `IpInfo` Struct `(ip_address, source_host_ip, is_failover)`, like HetznerApis.) |
 | `lib/hosting/generic_apis.rb` | A | Driven by config; never calls a remote API (see the methods below). |
-| `lib/hosting/redfish_client.rb` | A | Excon client: GET Systems, then the Reset target, then POST ResetType. Timeouts: connect 10s, read/write 60s. |
+| `lib/hosting/redfish_client.rb` | A | Excon client: GET Systems, then the Reset target, then POST ResetType. Also `power_state`. Timeouts: connect 5s, read/write 20s. |
 | `lib/byoh_registration.rb` | A | Validation, `provider_config` builder, keypair handling, and the call to `HostNexus.assemble`. |
 | `bin/register-byoh-host` | A | OptionParser CLI with no extension. Defaults RACK_ENV to development. |
-| `prog/vm/host_nexus.rb` | M | `assemble` gains `provider_config:` and `ssh_private_key:` kwargs plus a generic branch; `setup_ssh_keys` gets a Hetzner guard. |
-| `model/host_provider.rb` | M | Adds `GENERIC_PROVIDER_NAME = "generic"`. The schema annotation was **not** updated for `config`. |
-| `migrate/20260412000000_add_generic_provider.rb` | A | Inserts `provider('generic')` and adds `host_provider.config jsonb NULL`. Note the 14-digit name. |
+| `prog/vm/host_nexus.rb` | M | `assemble` gains `provider_config:` and `ssh_private_key:` kwargs plus a generic branch; `setup_ssh_keys` skips the root-key bootstrap for generic hosts; `check_ip_reachability` is skipped for generic hosts. |
+| `model/host_provider.rb` | M | Adds `GENERIC_PROVIDER_NAME = "generic"` and the `config` annotation. |
+| `migrate/20260412_add_generic_provider.rb` | A | Inserts `provider('generic')` and adds `host_provider.config jsonb NULL`. Renamed from the 14-digit name in M1 (§8 step 3 for existing DBs). |
 | `cache/schema.cache` | M | Regenerated binary. |
-| `package-lock.json` | M | Accidental churn from `npm install`; package.json is unchanged. Drop it on rebase. |
 | `.gitignore` | M | `/backups/` |
 | `spec/lib/hosting/{generic_apis,redfish_client}_spec.rb`, `spec/lib/byoh_registration_spec.rb`, `spec/lib/byoh_registration_end_to_end_spec.rb` | A | BYOH specs; every BYOH file is at 100% line and branch coverage. |
 | `spec/prog/vm/host_nexus_spec.rb` | M | Adds a "generic (BYOH) provider" block (+10 `it` blocks, 81 in total). |
@@ -117,11 +115,10 @@ Product direction from the user:
 
 **GenericApis methods** (`lib/hosting/generic_apis.rb`):
 
-- `pull_ips` returns the declared IPv4 `routed_networks`. It prepends a management `/32` unless the management IP is already inside a declared block (`mgmt_covered?`).
-- `pull_dc` returns `location_label`; nothing calls it for generic hosts.
+- `pull_ips` returns `IpInfo`s for the declared IPv4 `routed_networks`, preceded by the management `/32` (`host_only?`, claimed by the host) unless a declared block covers it.
 - `reimage` always raises `CapabilityMissing`.
-- `reset` uses Redfish if a BMC is configured, otherwise raises `CapabilityMissing`.
-- `set_server_name`, `add_key`, and `delete_key` are no-ops.
+- `hardware_reset`, `power_on` (skipped when already on) and `power_status` use Redfish when a BMC is configured; otherwise the first two raise `CapabilityMissing` and `power_status` says so.
+- No `pull_data_center`, `pull_inventory` or `set_server_name`: `assemble` never calls them for generic hosts.
 - `bmc_password`:
   - If `password_env` is set, it returns `ENV[that]`, even when that is nil. It does **not** fall back.
   - It uses `bmc.password` only when `password_env` is absent.
@@ -129,7 +126,7 @@ Product direction from the user:
 
 ### Dispatch
 
-`VmHost#{create_addresses,set_data_center,set_server_name,reimage,hardware_reset}` → `Hosting::Apis.*` → whitelist check → `HostProvider#api` → `Object.const_get("Hosting::#{name.capitalize}Apis")`.
+`VmHost#{create_addresses,reimage,hardware_reset,power_on,power_status,…}` → `HostProvider#api` → `Hosting::ProviderApis.for` → `Hosting::#{provider_name.split("-").first.capitalize}Apis`. Provider names must not contain `-` beyond an org suffix.
 The file and class names are load-bearing: `"generic"` must resolve to `Hosting::GenericApis`.
 
 ### `host_provider.config` (jsonb)
@@ -161,7 +158,7 @@ The file and class names are load-bearing: `"generic"` must resolve to `Hosting:
 
 ### HostNexus label walk (generic)
 
-`start → setup_ssh_keys → bootstrap_rhizome → prep → wait_prep → setup_hugepages → setup_storage_backend → download_boot_images → wait_download_boot_images → prep_reboot → reboot → [verify_spdk if SPDK installs exist] → verify_hugepages → start_slices → start_vms → configure_metrics → wait`
+`start → setup_ssh_keys → bootstrap_rhizome → check_ip_reachability (skipped for generic) → prep → wait_prep → setup_hugepages → setup_storage_backend → download_boot_images → wait_download_boot_images → prep_reboot → reboot → [verify_spdk if SPDK installs exist] → verify_hugepages → start_slices → start_vms → configure_metrics → wait`
 
 - **`bootstrap_rhizome`:**
   - This is the first SSH, as root using the sshable key.
@@ -354,36 +351,52 @@ docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test u
 - **Never run `RACK_ENV=test` on a real control plane.** It disables SSH.
 - **Never run `rake setup_database[test]` on a control plane.** It drops `clover_test`, which is the deployment DB.
 
-## 8. Upstream drift and rebase plan
+## 8. Upstream merge (M1, 2026-10-12)
 
-Dry merge: `git merge-tree --write-tree --name-only origin/main byoh-driver` reports 7 conflicts:
-- `.gitignore`
-- `cache/schema.cache` (regenerate it)
-- `config.rb` (our `generic_*` entries were already removed on 2026-10-12)
-- **`lib/hosting/apis.rb` (modify/delete)**: upstream replaced it with `Hosting::ProviderApis.for(provider)` in ad6bba614
-- `package-lock.json` (take theirs)
-- `prog/vm/host_nexus.rb`
-- `spec/prog/vm/host_nexus_spec.rb`
+`byoh-driver` merged `origin/main` fad16215c (2298 commits) as a merge commit, not a rebase, so the published fork history and the `aws-mumbai-*` tags stay valid. Stay close from now on: merge upstream at least once per milestone.
 
-What has to change:
-- **GenericApis must move to the new contract.**
-  - Upstream `IpInfo` is `Data.define(:ip_address, :source_host_ip)`, so our `is_failover:` kwarg breaks.
-  - `ProviderApis.for` splits `provider_name` on `-`, so the name must not contain `-`.
-  - Methods take no server_id: `pull_ips`, `pull_data_center`, `pull_inventory`, `set_server_name(name)`, `reimage`, `hardware_reset`, `power_on`, `power_status`.
-  - `IpInfo` needs `host_only?` (`ip == "#{source}/32"`) and `host_connectivity?`. Without them, `create_addresses` raises NoMethodError.
-  - `ProviderApis.for` still resolves `"generic"` to `Hosting::GenericApis`.
-- **host_nexus conflict trap.** `effective_server_identifier` and `hp.config` sit outside the markers but are defined inside our hunk.
-  - Keep our kwargs and our default.
-  - Keep upstream's `install_os`.
-  - Use `[HETZNER, *LEASEWEB_PROVIDER_NAMES, GENERIC]`.
-  - Our setup_ssh_keys guard would skip the bootstrap for leaseweb-eu as well.
-- **Migration name.** Upstream rejects numbers outside `20230117..today+5` unless `validate_migration_dates=false` (`bin/rake-task-runner`, bae0347fd, for forks). `20260412000000` is out of range. Either rename it to an 8-digit name (and fix `schema_migrations` on existing DBs) or opt out.
-- **Upstream `prep` changes.** It now buds `SetupNdpProxy` (when `ndp_needed`) and `LearnStorage` with `format_storage: install_os`. `install_os` defaults to false; keep it false for generic hosts.
-- **New `check_ip_reachability` label.** It runs after `bootstrap_rhizome` and pings 1.1.1.1/8.8.8.8/9.9.9.9 from every host IP and pool IP. On failure it naps 60s and retries forever, paging after 5 failures. This is likely to block private or partial-EIP BYOH pools. Decide on a skip policy.
-- **`verify_hugepages` now needs MemAvailable ≥ 2 GiB.** This hurts the low-tier Proxmox setup.
-- **SSH host keys are now TOFU-pinned.** Reinstalling a host requires re-registering it.
-- **Ruby 4.0.7.** Upstream uses `mise.toml` and has dropped `.tool-versions`. Bump the bootstrap default and the hard-coded mise path.
-- **Address semantics changed** (07a15651e): `after_create` no longer fills the pool. The reconfigure script's comments are obsolete.
+How the 22 conflicts were resolved:
+- **Provider layer.** Upstream replaced `Hosting::Apis` with `Hosting::ProviderApis.for(provider)`. `GenericApis < Hosting::ProviderApis` now has:
+  - `IpInfo = Data.define(:ip_address, :source_host_ip)`, where the management `/32` is `host_only?` (an `AssignedHostAddress`) and declared blocks are VM pools
+  - `reimage` (always `CapabilityMissing`)
+  - `hardware_reset`, `power_on` and `power_status`, all through Redfish (`RedfishClient#power_state`; timeouts 5s connect and 20s read/write, kept under respirate's ~91s apoptosis)
+- **`HostNexus.assemble`** keeps our `provider_config:`/`ssh_private_key:` kwargs and the `byoh-<id>` default, and takes upstream's `install_os` (false for generic). The provider list is `[HETZNER, *LEASEWEB_PROVIDER_NAMES, GENERIC]`.
+  - `setup_ssh_keys` skips the root-key bootstrap **only** for generic hosts, which restores upstream behaviour for leaseweb.
+  - **Generic hosts skip `check_ip_reachability`.** It would put pool IPs on `lo` (contract C5), and it loops forever behind NAT or without ICMP. PrepHost's downloads prove egress instead.
+- **IO CPUs.** Upstream renamed `vm_host_cpu.spdk` to `io` and added `numa_node`. The generic override (`io_cpu_count = 0`, in the LearnCpu reaper) now writes `io`.
+- **Storage.** `Metal::Vm#storage_volumes` takes upstream's version: `allowed_cpus` is set only for slices, which supersedes our M0 "cpus unset" fix.
+  - Rhizome `DeviceResolver` (upstream) gained `NoPersistentDeviceId`.
+  - `StorageVolume#io_limit_device` falls back to the storage path.
+  - `CryptSwapSetup` falls back to `/dev/disk/by-partuuid` for EBS/virtio swap partitions, and skips when fstab has no swap entry. Upstream failed both cases, which blocked cloud-image hosts.
+- **Allocator.** Upstream's `CandidateHosts`, NUMA-aware `select_cpuset`, `score_offset`, `os_filter` and reserved storage are taken. On top of them we re-applied:
+  - grow-on-reuse shared slices
+  - `CounterDrift`
+  - capacity-only `CheckConstraintViolation` conversion
+  - `host_capacity_summary`, which now also applies the data-center and OS filters
+- **Hugepages:** ours, which already contains every upstream hugepage commit, plus upstream's `MemAvailable ≥ 2 GiB` and `lock!` in `verify_hugepages`.
+- **LearnStorage:** our relearn refusal runs **before** upstream's `format_storage`.
+- **Migration** renamed `20260412000000_add_generic_provider.rb` → `20260412_add_generic_provider.rb`, inside upstream's date validation.
+- **Registration** rejects an IPv4 pool block that contains `--main-ip`; `<main-ip>/32` itself is allowed.
+- **Ruby 4.0.7** (`mise.toml`). The bootstrap default is bumped; the test image is `ubi-bundler-m1` (`docker build --target bundler -t ubi-bundler-m1 .`).
+- Upstream's read-only **Serial Log** (tab, API, `ubi vm … serial-log`) arrives with the merge, covering C0.
+
+**Known failures inherited from upstream** (they fail identically on pure `origin/main` here):
+- `spec/db_spec.rb:189,193` (Rodauth role isolation). Our `ubi-pg-test` superuser is `clover`; upstream CI uses a non-superuser app role.
+- `spec/routes/web/admin/model/resource_discount_spec.rb:13`. `resource_discount.name` defaults to `''`, so `admin_label` renders an empty link; this is an upstream bug.
+
+**Upgrading an existing control plane to the merge** (the live AWS one, a planned window):
+1. Stop the `puma` and `respirate` tmux sessions. Back up with `pg_dump` and `.env.rb`.
+2. Pull the code, install Ruby 4.0.7 via mise, run `bundle install` and `npm ci`, and fix the hard-coded mise Ruby path in PATH.
+3. **Before migrating**, exactly once (Sequel aborts on an applied file that no longer exists):
+   `UPDATE schema_migrations SET filename='20260412_add_generic_provider.rb' WHERE filename='20260412000000_add_generic_provider.rb';`
+4. Delete `~/.ubi-bootstrap/{migrations,caches-refreshed}`. Run `bin/rake-task-runner migrate "" 0`, then `FORCE_AUTOLOAD=1 bin/rake-task-runner refresh_sequel_caches`.
+5. Verify:
+   - `assigned_host_address` holds only management IPs (upstream 20260731 deletes stale pool rows).
+   - The `ipv4_address` count is unchanged.
+   - `vm_host_cpu` has `io` and no `spdk`.
+   - `host_provider.config` is intact.
+6. Start the services, then run `VmHost.all.each(&:install_rhizome)` in pry. Existing hosts keep running VMs; recreate VMs only if they need the new rhizome behaviour.
+7. SSH host keys are now TOFU-pinned on first connect. Reinstalling a host's OS requires destroying and re-registering the VmHost.
 
 ## 9. Secrets and sensitive local files (gitignored — never print or commit)
 
@@ -396,12 +409,12 @@ What has to change:
 ## 10. Known bugs / discrepancies (fix list)
 
 Code:
-1. A management IP inside a declared v4 block enters the VM pool (`generic_apis.rb` `mgmt_covered?`, `model/address.rb:35`). The spec only checks `assigned_subnets`.
+1. ~~A management IP inside a declared v4 block enters the VM pool~~: registration rejects such blocks since M1 (configs registered earlier are not re-checked).
 2. Network and broadcast addresses of declared blocks are allocatable.
 3. Every BYOH host lands in hetzner-fsn1 and `data_center` is NULL. The `'generic'` provider row is unused. Fix: add a CLI `--location-id` plus a BYOH Location row with billing rates.
 4. The BMC password can be stored in plaintext despite the comment in `byoh_registration.rb`.
-5. Hardware Reset without a BMC wedges the strand.
-6. The leaseweb `setup_ssh_keys` behaviour changed.
+5. Hardware Reset without a BMC wedges the strand (`CapabilityMissing` retried forever), and admin "Power On" without a BMC returns a 500. Still open after M1.
+6. ~~The leaseweb `setup_ssh_keys` behaviour changed~~: fixed in M1 (only generic hosts skip the root-key bootstrap).
 7. Default ULA net6 plus the in-netns `2000::/3` route: private IPsec between VMs is likely broken. Inferred, UNVERIFIED.
 8. Validation gaps:
    - No IPv4 size/overlap check (more than /24 fails late in `Address#validate`).

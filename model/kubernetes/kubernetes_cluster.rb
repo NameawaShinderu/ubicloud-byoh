@@ -11,28 +11,54 @@ class KubernetesCluster < Sequel::Model
   many_to_one :project, read_only: true
   many_to_many :cp_vms, join_table: :kubernetes_node, right_key: :vm_id, class: :Vm, order: :created_at, conditions: {kubernetes_nodepool_id: nil}, read_only: true
   one_to_many :nodes, class: :KubernetesNode, order: :created_at, conditions: {kubernetes_nodepool_id: nil}, read_only: true
-  one_to_many :functional_nodes, class: :KubernetesNode, order: :created_at, conditions: {kubernetes_nodepool_id: nil, state: "active"}, read_only: true
-  one_to_many :nodepools, class: :KubernetesNodepool, read_only: true
+  one_to_many :functional_nodes, class: :KubernetesNode, order: :created_at, conditions: {kubernetes_nodepool_id: nil, state: ["active", "renewing_certs"]}, read_only: true
+  one_to_many :nodepools, class: :KubernetesNodepool, read_only: true, order: :name
   one_to_many :active_billing_records, class: :BillingRecord, key: :resource_id, read_only: true, &:active
   many_to_one :location, read_only: true
   one_to_one :kubernetes_etcd_backup, read_only: true
 
   dataset_module Pagination
 
-  plugin ResourceMethods
-  plugin SemaphoreMethods, :destroy, :sync_kubernetes_services, :upgrade, :install_metrics_server, :sync_worker_mesh, :install_csi, :update_billing_records, :sync_internal_dns_config
+  plugin ResourceMethods, encrypted_columns: :kubeconfig
+  plugin SemaphoreMethods, :destroy, :sync_kubernetes_services, :upgrade, :upgrade_nodepools, :install_metrics_server, :sync_worker_mesh, :install_csi, :sync_csi_config, :update_billing_records, :sync_internal_dns_config, :sync_kubeconfig, :install_prometheus_rbac
   include HealthMonitorMethods
 
   def validate
     super
     errors.add(:cp_node_count, "must be a positive integer") unless cp_node_count.is_a?(Integer) && cp_node_count > 0
     errors.add(:version, "must be a valid Kubernetes version") unless Option.kubernetes_versions.include?(version)
+    Validation::CsiConfigValidator.validate(csi_config || {}, errors)
+  end
+
+  def rendered_csi_config
+    Validation::CsiConfigValidator::DEFAULTS.merge(csi_config)
+  end
+
+  def set_csi_external_endpoints(value)
+    update_csi_config("EXTERNAL_ENDPOINTS" => value)
+  end
+
+  def set_csi_disk_limit_gb(value)
+    update_csi_config("DISK_LIMIT_GB" => value)
+  end
+
+  def set_csi_reserve_percent(value)
+    update_csi_config("RESERVE_PERCENT" => value)
+  end
+
+  def update_csi_config(config)
+    config = config.to_h { |key, value| [key, value && Validation::CsiConfigValidator.canonicalize(key, value.to_s)] }
+    DB.transaction do
+      update(csi_config: csi_config.merge(config).compact)
+      incr_sync_csi_config
+    end
   end
 
   def display_state
     label = strand.label
     return "deleting" if destroying_set? || destroy_set?
-    return "running" if label == "wait"
+    return "upgrading" if upgrading?
+    return "running" if label == "wait" && !kubeconfig.nil?
 
     "creating"
   end
@@ -77,7 +103,7 @@ class KubernetesCluster < Sequel::Model
     kubeconfig.to_yaml
   end
 
-  def kubeconfig(swallow_connection_exception: false)
+  def generate_kubeconfig(swallow_connection_exception: false)
     self.class.kubeconfig(cp_vms.first)
   rescue *Sshable::SSH_CONNECTION_ERRORS
     raise unless swallow_connection_exception
@@ -92,9 +118,9 @@ class KubernetesCluster < Sequel::Model
   end
 
   def vm_diff_for_lb(load_balancer)
-    worker_vms = nodepools.flat_map(&:vms)
+    worker_vms = nodepools(eager: :vms).flat_map(&:vms)
     worker_vm_ids = worker_vms.map(&:id).to_set
-    lb_vms = load_balancer.load_balancer_vms.map(&:vm)
+    lb_vms = load_balancer.load_balancer_vms(eager: :vm).map(&:vm)
     lb_vm_ids = lb_vms.map(&:id).to_set
 
     extra_vms = lb_vms.reject { |vm| worker_vm_ids.include?(vm.id) }
@@ -110,23 +136,30 @@ class KubernetesCluster < Sequel::Model
     [extra_ports, missing_ports]
   end
 
-  def cluster_health_report
-    return unless connectivity_check_target
+  def firewall_rule_diff_for_lb(load_balancer)
+    existing = internal_worker_vm_firewall
+      .firewall_rules_dataset
+      .where(Sequel[:description].like("k8s-svc-lb:%"))
+      .all
+    existing_by_key = existing.to_h { |r| [[r.cidr.to_s, r.port_range.begin], r] }
+    desired_keys = load_balancer.ports_dataset.all.flat_map { |p| [["0.0.0.0/0", p.src_port], ["::/0", p.src_port]] }
 
-    nodepools.flat_map(&:nodes).map do |kd|
-      pod_name = client.kubectl(
-        "get pods -n ubicsi --field-selector spec.nodeName=:nodename -o jsonpath='{.items[*].metadata.name}'",
-        nodename: kd.name,
-      ).split.find { it.start_with?("ubicsi-nodeplugin-") }
+    missing_keys = desired_keys - existing_by_key.keys
+    extra_rules = (existing_by_key.keys - desired_keys).map { existing_by_key[it] }
+    [extra_rules, missing_keys]
+  end
 
-      next {node: kd.ubid, healthy: false} unless pod_name
+  def kubeadm_recorded_version
+    raw = client.kubectl("-n kube-system get cm kubeadm-config -o jsonpath='{.data.ClusterConfiguration}'")
+    YAML.safe_load(raw)["kubernetesVersion"]
+  end
 
-      host, port = connectivity_check_target.split(":", 2)
-      cmd = NetSsh.command("echo > /dev/tcp/:host/:port", host:, port:)
-      cmd = NetSsh.command("timeout 3 bash -c :cmd && echo OK-:nodename || echo FAIL", nodename: kd.name, cmd:)
-      res = client.kubectl("exec -n ubicsi :pod_name -- sh -c :cmd", pod_name:, cmd:)
-      {node: kd.ubid, healthy: res[/OK-#{kd.name}/] ? true : false}
-    end
+  def kubeadm_recorded_minor_version
+    kubeadm_recorded_version&.[](/^v\d+\.\d+/)
+  end
+
+  def available_upgrade_version
+    Option.kubernetes_upgrade_candidate(version)
   end
 
   def init_health_monitor_session
@@ -138,7 +171,7 @@ class KubernetesCluster < Sequel::Model
   def check_pulse(session:, previous_pulse:)
     reading = begin
       k8s_client = client(session: session[:ssh_session])
-      incr_sync_kubernetes_services if k8s_client.any_lb_services_modified?
+      incr_sync_kubernetes_services if !sync_kubernetes_services_set?(cached: false) && k8s_client.any_lb_services_modified?
 
       pvs = JSON.parse(k8s_client.kubectl("get pv -ojson"))["items"]
       stuck_pvs = pvs.select { Integer(it.dig("metadata", "annotations", "csi.ubicloud.com/migration-retry-count") || "0", 10) >= 3 }
@@ -146,7 +179,7 @@ class KubernetesCluster < Sequel::Model
       if stuck_pvs.any?
         Prog::PageNexus.assemble("#{ubid} PV migration stuck",
           ["KubernetesClusterPVMigrationStuck", id], ubid,
-          extra_data: {stuck_pvs: stuck_pvs.map { it.dig("metadata", "name") }})
+          resource_id: id, extra_data: {stuck_pvs: stuck_pvs.map { it.dig("metadata", "name") }})
         "down"
       else
         Page.from_tag_parts("KubernetesClusterPVMigrationStuck", id)&.incr_resolve
@@ -162,25 +195,70 @@ class KubernetesCluster < Sequel::Model
   end
 
   def install_rhizome
-    cp_vms.each do |vm|
-      Strand.create(prog: "InstallRhizome", label: "start", stack: [{subject_id: vm.sshable.id, target_folder: "kubernetes"}])
+    nodes.map(&:install_rhizome)
+  end
+
+  def all_nodes(eager: nil)
+    nodes(eager:) + nodepools(eager: {nodes: eager}).flat_map(&:nodes)
+  end
+
+  def all_functional_nodes(eager: nil)
+    functional_nodes(eager:) + nodepools(eager: {functional_nodes: eager}).flat_map(&:functional_nodes)
+  end
+
+  def all_functional_nodes_ready?
+    nodes_by_name = JSON.parse(client.kubectl("get nodes -ojson"))
+      .fetch("items")
+      .to_h { [it.dig("metadata", "name"), it] }
+    all_functional_nodes.all? do |fn|
+      conditions = nodes_by_name[fn.name]&.dig("status", "conditions") || []
+      conditions.any? { it["type"] == "Ready" && it["status"] == "True" }
     end
   end
 
-  def all_nodes
-    nodes + nodepools.flat_map(&:nodes)
-  end
-
-  def all_functional_nodes
-    functional_nodes + nodepools.flat_map(&:functional_nodes)
-  end
-
   def worker_vms
-    nodepools.flat_map(&:vms)
+    nodepools(eager: :vms).flat_map(&:vms)
   end
 
   def worker_functional_nodes
-    nodepools.flat_map(&:functional_nodes)
+    nodepools(eager: :functional_nodes).flat_map(&:functional_nodes)
+  end
+
+  def worker_mesh_nodes
+    nodepools(eager: :mesh_nodes).flat_map(&:mesh_nodes)
+  end
+
+  UPGRADE_LABELS = %w[upgrade wait_upgrade].freeze
+
+  def upgrading?
+    UPGRADE_LABELS.include?(strand.label) || upgrade_set? || upgrade_nodepools_set?
+  end
+
+  IDLE_BLOCKING_SEMAPHORES = %w[destroy destroying upgrade upgrade_nodepools].freeze
+
+  def idle?
+    strand.label == "wait" && semaphores.none? { IDLE_BLOCKING_SEMAPHORES.include?(it.name) } && nodepools(eager: [:strand, :semaphores]).all?(&:idle?)
+  end
+
+  def nodepools_within_version_skew?
+    cluster_minor = Option.kubernetes_minor_version(version)
+    nodepools_dataset.select_map(:version).all? { Option.kubernetes_minor_version(it) >= cluster_minor - 2 }
+  end
+
+  def ready_for_upgrade?
+    !available_upgrade_version.nil? && idle?
+  end
+
+  def request_upgrade
+    fail "Cluster #{ubid} has nodepools more than two minor versions behind" unless nodepools_within_version_skew?
+    fail "Cluster #{ubid} is not ready to be upgraded" unless ready_for_upgrade?
+
+    DB.transaction do
+      update(version: available_upgrade_version)
+      incr_upgrade
+    end
+
+    version
   end
 end
 
@@ -198,7 +276,8 @@ end
 #  target_node_storage_size_gib | bigint                   |
 #  location_id                  | uuid                     | NOT NULL
 #  services_lb_id               | uuid                     |
-#  connectivity_check_target    | text                     |
+#  kubeconfig                   | text                     |
+#  csi_config                   | jsonb                    | NOT NULL DEFAULT '{}'::jsonb
 # Indexes:
 #  kubernetes_cluster_pkey                             | PRIMARY KEY btree (id)
 #  kubernetes_cluster_project_id_location_id_name_uidx | UNIQUE btree (project_id, location_id, name)

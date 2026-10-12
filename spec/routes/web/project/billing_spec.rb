@@ -73,8 +73,8 @@ RSpec.describe Clover, "billing" do
       # rubocop:enable RSpec/VerifiedDoubles
       expect(checkout_sessions_service).to receive(:retrieve).with("session_123").and_return({"setup_intent" => "st_123456790"})
       expect(setup_intents_service).to receive(:retrieve).with("st_123456790").and_return({"customer" => "cs_1234567890", "payment_method" => "pm_1234567890"})
-      expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "ACME Inc.", "address" => {"line1" => "Test Rd", "country" => "NL"}, "metadata" => {"company_name" => "Foo Company Name"}}).exactly(3)
-      expect(payment_methods_service).to receive(:retrieve).with("pm_1234567890").and_return(stripe_object("card" => {"brand" => "visa"}, "billing_details" => {})).thrice
+      expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "ACME Inc.", "address" => {"line1" => "Test Rd", "country" => "NL"}, "metadata" => {"company_name" => "Foo Company Name"}}).exactly(4)
+      expect(payment_methods_service).to receive(:retrieve).with("pm_1234567890").and_return(stripe_object("card" => {"brand" => "visa"}, "billing_details" => {})).exactly(4)
 
       visit project.path
 
@@ -96,10 +96,22 @@ RSpec.describe Clover, "billing" do
       expect(page).to have_content "Visa"
       expect(page).to have_no_content "100%"
 
-      project.this.update(discount: 100)
+      now = Time.now.utc
+      ResourceDiscount.create(project_id: project.id, discount_percent: 100, active_from: Time.utc(now.year, now.month), name: "Full discount")
+      ResourceCredit.create(project_id: project.id, amount: 3.5, active_from: Time.utc(now.year, now.month), name: "LNM")
       page.refresh
       expect(page).to have_content "Discount"
+      expect(page).to have_content "Full discount"
       expect(page).to have_content "100%"
+      expect(page).to have_content "LNM"
+      expect(page).to have_content "$3.50"
+
+      ResourceDiscount.first(project_id: project.id).update(name: "")
+      ResourceCredit.create(project_id: project.id, amount: 1, active_from: Time.utc(now.year, now.month), name: "Used Credit").update(amount: 0)
+      page.refresh
+      expect(page).to have_content "Discount: 100%"
+      expect(page).to have_content "LNM: $3.50"
+      expect(page).to have_no_content "Used Credit"
     end
 
     it "can not create billing info with unauthorized payment" do
@@ -127,7 +139,7 @@ RSpec.describe Clover, "billing" do
 
     it "can update billing info" do
       expect(customers_service).to receive(:retrieve).with(billing_info.stripe_id).and_return(
-        {"name" => "New Inc.", "address" => {"country" => "DE"}, "metadata" => {"tax_id" => "DE456789"}},
+        {"name" => "New Inc.", "email" => "new@example.com", "address" => {"country" => "DE", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "DE456789"}},
       ).at_least(:once)
       expect(customers_service).to receive(:update).with(billing_info.stripe_id, anything)
       visit "#{project.path}/billing"
@@ -144,55 +156,77 @@ RSpec.describe Clover, "billing" do
       expect(page).to have_field("Country", with: "DE")
     end
 
-    it "can update billing info without address" do
+    it "shows error when updating billing info without an address" do
       expect(customers_service).to receive(:retrieve).with(billing_info.stripe_id).and_return(
-        {"name" => "Old Inc.", "address" => nil, "metadata" => {}},
-        {"name" => "New Inc.", "address" => nil, "metadata" => {}},
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => nil, "metadata" => {}},
       ).at_least(:once)
-      expect(customers_service).to receive(:update).with(billing_info.stripe_id, anything)
       visit "#{project.path}/billing"
 
       expect(page.title).to eq("Ubicloud - Project Billing")
       expect(page).to have_field("Billing Name", with: "Old Inc.")
 
       fill_in "Billing Name", with: "New Inc."
+      select "Netherlands", from: "Country"
 
       click_button "Update"
 
-      expect(page.status_code).to eq(200)
-      expect(page).to have_field("Billing Name", with: "New Inc.")
+      expect(page.status_code).to eq(400)
+      expect(page).to have_flash_error("empty string provided for parameter address")
     end
 
     it "can update tax id" do
       expect(customers_service).to receive(:retrieve).with(billing_info.stripe_id).and_return(
-        {"name" => "Old Inc.", "address" => {"country" => "NL"}, "metadata" => {"tax_id" => "123456"}},
-        {"name" => "Old Inc.", "address" => {"country" => "NL"}, "metadata" => {"tax_id" => "123456"}},
-        {"name" => "New Inc.", "address" => {"country" => "US"}, "metadata" => {"tax_id" => "DE456789"}},
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => {"country" => "NL", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "123456"}},
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => {"country" => "NL", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "123456"}},
+        {"name" => "New Inc.", "email" => "old@example.com", "address" => {"country" => "NL", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "NL456789"}},
       ).at_least(:once)
       expect(customers_service).to receive(:update).with(billing_info.stripe_id, anything).at_least(:once)
       visit "#{project.path}/billing"
 
       expect(page.title).to eq("Ubicloud - Project Billing")
-      select "United States", from: "Country"
-      fill_in "VAT ID", with: "DE 456-789"
+      fill_in "VAT ID", with: "NL 456-789"
 
       click_button "Update"
 
       expect(page.status_code).to eq(200)
       expect(page).to have_field("Billing Name", with: "New Inc.")
-      expect(page).to have_field("Country", with: "US")
-      expect(page).to have_field("Tax ID", with: "DE456789")
+      expect(page).to have_field("Country", with: "NL")
+      expect(page).to have_field("VAT ID", with: "NL456789")
       expect(Strand.where(prog: "ValidateVat").count).to eq(1)
       expect(Strand.where(prog: "ValidateVat").first.stack.first["subject_id"]).to eq(billing_info.id)
     end
 
-    it "can remove tax id" do
+    it "does not schedule VAT validation when the tax id changes together with a change to a non-EU country" do
+      billing_info.update(valid_vat: true)
       expect(customers_service).to receive(:retrieve).with(billing_info.stripe_id).and_return(
-        {"name" => "Old Inc.", "address" => {"country" => "NL"}, "metadata" => {"tax_id" => "123456"}},
-        {"name" => "Old Inc.", "address" => {"country" => "NL"}, "metadata" => {"tax_id" => "123456"}},
-        {"name" => "Old Inc.", "address" => {"country" => nil}, "metadata" => {"tax_id" => nil}},
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => {"country" => "NL", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "123456"}},
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => {"country" => "NL", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "123456"}},
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => {"country" => "US", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "US456789"}},
       ).at_least(:once)
-      expect(customers_service).to receive(:update).with(billing_info.stripe_id, anything).at_least(:once)
+      expect(customers_service).to receive(:update).with(billing_info.stripe_id, anything)
+      visit "#{project.path}/billing"
+
+      expect(page.title).to eq("Ubicloud - Project Billing")
+      select "United States", from: "Country"
+      fill_in "VAT ID", with: "US 456-789"
+
+      click_button "Update"
+
+      expect(page.status_code).to eq(200)
+      expect(page).to have_field("Country", with: "US")
+      expect(page).to have_field("Tax ID", with: "US456789")
+      expect(Strand.where(prog: "ValidateVat").all).to be_empty
+      expect(billing_info.reload.valid_vat).to be_nil
+    end
+
+    it "can remove tax id" do
+      billing_info.update(valid_vat: true)
+      expect(customers_service).to receive(:retrieve).with(billing_info.stripe_id).and_return(
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => {"country" => "NL", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "123456"}},
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => {"country" => "NL", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "123456"}},
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => {"country" => "NL", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => nil}},
+      ).at_least(:once)
+      expect(customers_service).to receive(:update).with(billing_info.stripe_id, anything)
 
       visit "#{project.path}/billing"
 
@@ -201,14 +235,15 @@ RSpec.describe Clover, "billing" do
 
       click_button "Update"
 
-      fill_in "Tax ID", with: "TR123123"
-
-      click_button "Update"
+      expect(page.status_code).to eq(200)
+      expect(page.find_field("VAT ID").value).to be_nil
+      expect(Strand.where(prog: "ValidateVat").all).to be_empty
+      expect(billing_info.reload.valid_vat).to be_nil
     end
 
     it "shows error if billing info update failed" do
       expect(customers_service).to receive(:retrieve).with(billing_info.stripe_id).and_return(
-        {"name" => "Old Inc.", "address" => {"country" => "NL"}, "metadata" => {"tax_id" => "123456"}},
+        {"name" => "Old Inc.", "email" => "old@example.com", "address" => {"country" => "NL", "line1" => "Main Street 1"}, "metadata" => {"tax_id" => "123456"}},
       ).at_least(:once)
       expect(customers_service).to receive(:update).and_raise(Stripe::InvalidRequestError.new("Invalid email address:    test@test.com", "email"))
 
@@ -318,17 +353,24 @@ RSpec.describe Clover, "billing" do
     end
 
     it "can't delete last payment method" do
-      expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "ACME Inc.", "address" => {"country" => "NL"}, "metadata" => {"company_name" => "Foo Company Name"}})
-      expect(payment_methods_service).to receive(:retrieve).with(payment_method.stripe_id).and_return(stripe_object("card" => {"brand" => "visa"}))
+      expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "ACME Inc.", "address" => {"country" => "NL"}, "metadata" => {"company_name" => "Foo Company Name"}}).at_least(:once)
+      expect(payment_methods_service).to receive(:retrieve).with(payment_method.stripe_id).and_return(stripe_object("card" => {"brand" => "visa"})).at_least(:once)
 
       visit "#{project.path}/billing"
 
       within("#payment-method-#{payment_method.ubid}") do
+        expect(page).to have_no_content("Delete")
+      end
+
+      pm2 = PaymentMethod.create(billing_info_id: billing_info.id, stripe_id: "pm_1234567891")
+      expect(payment_methods_service).to receive(:retrieve).with("pm_1234567891").and_return(stripe_object("card" => {"brand" => "visa"}))
+      page.refresh
+      pm2.this.delete(force: true)
+      within("#payment-method-#{payment_method.ubid}") do
         click_button "Delete"
       end
 
-      expect(page.status_code).to eq(400)
-      expect(page.body).to eq({error: {message: "You can't delete the last payment method of a project."}}.to_json)
+      expect(page).to have_flash_error("You can't delete the last payment method of a project.")
       expect(billing_info.reload.payment_methods.count).to eq(1)
     end
 
@@ -351,6 +393,8 @@ RSpec.describe Clover, "billing" do
     it "returns 404 if payment method does not exist" do
       expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "ACME Inc.", "address" => {"country" => "NL"}, "metadata" => {"company_name" => "Foo Company Name"}})
       expect(payment_methods_service).to receive(:retrieve).with(payment_method.stripe_id).and_return(stripe_object("card" => {"brand" => "visa"}))
+      payment_method_2 = PaymentMethod.create(billing_info_id: billing_info.id, stripe_id: "pm_2222222222")
+      expect(payment_methods_service).to receive(:retrieve).with(payment_method_2.stripe_id).and_return(stripe_object("card" => {"brand" => "mastercard"})).at_least(:once)
       visit "#{project.path}/billing"
       payment_method.this.delete(force: true)
 
@@ -375,7 +419,7 @@ RSpec.describe Clover, "billing" do
 
         expect(page).to have_flash_notice "Discount code successfully applied."
         expect(page).to have_content "$33.00"
-        expect(project.reload.credit).to eq(33.00)
+        expect(project.active_resource_credits_dataset.sum(:amount).to_f).to eq(33.00)
       end
 
       it "shows error for invalid discount code" do
@@ -385,7 +429,7 @@ RSpec.describe Clover, "billing" do
 
         expect(page).to have_flash_error "Discount code not found."
         expect(page).to have_content "$0.00"
-        expect(project.reload.credit).to eq(0.00)
+        expect(project.active_resource_credits_dataset.sum(:amount).to_f).to eq(0.00)
       end
 
       it "shows error when submitted without discount code" do
@@ -394,7 +438,7 @@ RSpec.describe Clover, "billing" do
 
         expect(page).to have_flash_error "Discount code not found."
         expect(page).to have_content "$0.00"
-        expect(project.reload.credit).to eq(0.00)
+        expect(project.active_resource_credits_dataset.sum(:amount).to_f).to eq(0.00)
       end
 
       it "shows error for expired discount code" do
@@ -405,7 +449,7 @@ RSpec.describe Clover, "billing" do
 
         expect(page).to have_flash_error "Discount code not found."
         expect(page).to have_content "$0.00"
-        expect(project.reload.credit).to eq(0.00)
+        expect(project.active_resource_credits_dataset.sum(:amount).to_f).to eq(0.00)
       end
 
       it "shows error if discount code has already been applied" do
@@ -417,7 +461,7 @@ RSpec.describe Clover, "billing" do
 
         expect(page).to have_flash_error "Discount code has already been applied to this project."
         expect(page).to have_content "$0.00"
-        expect(project.reload.credit).to eq(0.00)
+        expect(project.active_resource_credits_dataset.sum(:amount).to_f).to eq(0.00)
       end
     end
 
@@ -447,8 +491,8 @@ RSpec.describe Clover, "billing" do
 
         expect(page).to have_flash_notice "Discount code successfully applied."
         expect(page).to have_content "$33.00"
-        expect(project.reload.credit).to eq(33.00)
-        expect(project.billing_info_id).not_to be_nil
+        expect(project.active_resource_credits_dataset.sum(:amount).to_f).to eq(33.00)
+        expect(project.reload.billing_info_id).not_to be_nil
       end
 
       it "shows error if the discount code is invalid without creating billing info" do
@@ -477,7 +521,7 @@ RSpec.describe Clover, "billing" do
           resource_id: vm.id,
           resource_name: vm.name,
           span: Sequel::Postgres::PGRange.new(begin_time, end_time),
-          billing_rate_id: BillingRate.from_resource_properties("VmVCpu", vm.family, vm.location.name)["id"],
+          billing_rate_id: BillingRate.from_resource_properties("VmVCpu", vm.family, vm.location.name, false, BILLING_RATE_ACTIVE_AT)["id"],
           amount: vm.vcpus,
         )
       end
@@ -521,20 +565,39 @@ RSpec.describe Clover, "billing" do
         expect(page.title).to eq("Ubicloud - Current Usage Summary")
         expect(page).to have_content "Aggregated"
         expect(page).to have_content "40420 minutes"
-        expect(page).to have_content "$24.700"
+        expect(page).to have_content "$31.10"
         expect(page.has_css?("#invoice-discount")).to be false
         expect(page.has_css?("#invoice-credit")).to be false
 
         content = invoice.content
-        content["discount"] = 1
-        content["credit"] = 2
-        content["free_inference_tokens_credit"] = 3
+        content["discounts"] = [{"name" => "Discount", "amount" => 1}]
+        content["credits"] = [{"name" => "Credit", "amount" => 2}, {"name" => "Free Inference Tokens", "amount" => 3}]
         invoice.this.update(content:)
 
         page.refresh
         expect(find_by_id("invoice-discount").text).to eq "-$1.00"
         expect(find_by_id("invoice-credit").text).to eq "-$2.00"
         expect(find_by_id("invoice-free-inference-tokens").text).to eq "-$3.00"
+      end
+
+      it "shows a named resource discount and credit on the per-item line" do
+        expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "John Doe", "address" => {"country" => "NL"}, "metadata" => {}}).at_least(:once)
+        bi = billing_record(Time.utc(2023, 6), Time.utc(2023, 7))
+        ResourceDiscount.create(project_id: billing_info.project.id, discount_percent: 20, active_from: Time.utc(2023, 6), name: "YC Discount")
+        ResourceCredit.create(project_id: billing_info.project.id, amount: 3.50, active_from: Time.utc(2023, 6), name: "YC Credit")
+
+        invoice = InvoiceGenerator.new(bi.span.begin, bi.span.end, save_result: true, eur_rate: 1.1).run.first
+        invoice.update(status: "current")
+        generator = InvoiceGenerator.new(bi.span.begin, bi.span.end, project_ids: [billing_info.project.id])
+        allow(generator).to receive(:run).and_return([invoice])
+        expect(InvoiceGenerator).to receive(:new).and_return(generator).at_least(:once)
+
+        visit "#{project.path}/billing/invoice/current"
+
+        expect(page.status_code).to eq(200)
+        expect(page).to have_content(/YC Discount \(-20\.0%\)/)
+        expect(page).to have_content "YC Credit"
+        expect(page).to have_content "-$3.500"
       end
 
       it "show current invoice when no usage" do
@@ -597,7 +660,7 @@ RSpec.describe Clover, "billing" do
       it "show finalized invoice as PDF from EU issuer with 21% VAT" do
         expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "John Doe", "address" => {"country" => "DE"}, "metadata" => {"company_name" => ""}}).at_least(:once)
         bi = billing_record(Time.utc(2023, 6), Time.utc(2023, 7))
-        invoice = InvoiceGenerator.new(bi.span.begin, bi.span.end, save_result: true, eur_rate: 1.1).run.first
+        invoice = InvoiceGenerator.new(bi.span.begin, bi.span.end, save_result: true, eur_rate: 0.85).run.first
 
         visit "#{project.path}/billing"
         expect(page).to have_content "EU registered business can enter their VAT ID to remove VAT from future invoices."
@@ -608,16 +671,18 @@ RSpec.describe Clover, "billing" do
         expect(text).to include("Ubicloud B.V.")
         expect(text).to include("John Doe")
         expect(text).to include("test-vm")
-        expect(text).to include("VAT (21%): (€5.68) $5.17")
+        expect(text).to include("VAT (21%): (€5.53) $6.51")
       end
 
       it "show finalized invoice as PDF from EU issuer with reversed charge" do
         expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "ACME Inc.", "address" => {"country" => "DE"}, "metadata" => {"tax_id" => "123123123"}}).at_least(:once)
+        billing_info.update(valid_vat: true)
         bi = billing_record(Time.utc(2023, 6), Time.utc(2023, 7))
         invoice = InvoiceGenerator.new(bi.span.begin, bi.span.end, save_result: true, eur_rate: 1.1).run.first
 
         visit "#{project.path}/billing"
         expect(page).to have_content "VAT subject to reverse charge."
+        expect(page).to have_no_content "could not be validated in the VIES database"
         click_link invoice.name
 
         expect(page.status_code).to eq(200)
@@ -625,6 +690,16 @@ RSpec.describe Clover, "billing" do
         expect(text).to include("Ubicloud B.V.")
         expect(text).to include("test-vm")
         expect(text).to include("VAT subject to reverse charge")
+      end
+
+      it "warns when the entered VAT ID could not be validated" do
+        expect(customers_service).to receive(:retrieve).with("cs_1234567890").and_return({"name" => "ACME Inc.", "address" => {"country" => "DE"}, "metadata" => {"tax_id" => "123123123"}}).at_least(:once)
+        billing_info.update(valid_vat: false)
+
+        visit "#{project.path}/billing"
+
+        expect(page.status_code).to eq(200)
+        expect(page).to have_content "The VAT ID you entered could not be verified in the VIES database."
       end
 
       it "show finalized invoice as PDF without bank transfer info" do

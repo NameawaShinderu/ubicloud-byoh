@@ -8,41 +8,83 @@ require "pagerduty"
 RSpec.describe Page do
   subject(:p) { described_class.create(tag: "dummy-tag") }
 
-  describe ".group_by_vm_host" do
-    it "groups pages by the VmHost they are related to" do
-      expect(described_class.group_by_vm_host).to eq({})
+  if Config.unfrozen_test?
+    after do
+      described_class.instance_variable_set(:@client, nil)
+    end
+  end
 
-      p1 = described_class.create(tag: "a")
-      expect(described_class.group_by_vm_host).to eq({nil => [p1]})
+  it "#project_id_match? should return false" do
+    expect(p.project_id_match?(Project.generate_uuid)).to be false
+  end
 
-      p2 = described_class.create(tag: "b", details: {"related_resources" => []})
-      expect(described_class.order(:tag).group_by_vm_host).to eq({nil => [p1, p2]})
+  describe ".root_resources" do
+    it "returns array of root resource ids for the related object" do
+      expect(described_class.root_resources(Nic.new)).to eq []
 
-      p3 = described_class.create(tag: "c", details: {"related_resources" => [p2.ubid]})
-      expect(described_class.order(:tag).group_by_vm_host).to eq({nil => [p1, p2, p3]})
+      gi = GithubInstallation.new_with_id(installation_id: 1, name: "foo", type: "bar")
+      expect(described_class.root_resources(GithubRepository.new(installation: gi))).to eq [gi.id]
 
-      vmh = Prog::Vm::HostNexus.assemble("1.2.3.4").subject
-      p4 = described_class.create(tag: "d", details: {"related_resources" => [vmh.ubid]})
-      expect(described_class.order(:tag).group_by_vm_host).to eq({nil => [p1, p2, p3], vmh.ubid => [p4]})
+      pt = PostgresTimeline.create(location_id: Location::HETZNER_FSN1_ID, access_key: "dummy-access-key", secret_key: "dummy-secret-key")
+      expect(described_class.root_resources(pt)).to eq []
 
-      pj = Project.create(name: "test")
-      vm = Prog::Vm::Nexus.assemble("a a", pj.id).subject
-      p5 = described_class.create(tag: "e", details: {"related_resources" => [p3.ubid, vm.ubid]})
-      expect(described_class.order(:tag).group_by_vm_host).to eq({nil => [p1, p2, p3, p5], vmh.ubid => [p4]})
+      project = Project.create(name: "test")
+      pg = create_postgres_resource(project:, location_id: Location::HETZNER_FSN1_ID)
+      expect(described_class.root_resources(pg)).to eq [pg.id]
 
-      vm.update(vm_host_id: vmh.id)
-      expect(described_class.order(:tag).group_by_vm_host).to eq({nil => [p1, p2, p3], vmh.ubid => [p4, p5]})
+      pv = PostgresServer.create(timeline: pt, resource_id: pg.id, is_representative: false, version: PostgresResource.default_version)
+      expect(described_class.root_resources(pv)).to eq [pg.id]
 
-      p6 = described_class.create(tag: "f", details: {"related_resources" => [vm.nic.ubid]})
-      expect(described_class.order(:tag).group_by_vm_host).to eq({nil => [p1, p2, p3], vmh.ubid => [p4, p5, p6]})
+      pv = create_postgres_server(resource: pg)
+      expect(described_class.root_resources(pv)).to eq [pg.id]
+      expect(described_class.root_resources(pv.timeline)).to eq [pg.id]
 
-      gi = GithubInstallation.create(installation_id: 1, name: "t", type: "t")
-      gr = Prog::Github::GithubRunnerNexus.assemble(gi, repository_name: "a", label: "ubicloud").subject
-      p7 = described_class.create(tag: "g", details: {"related_resources" => [gr.ubid]})
-      expect(described_class.order(:tag).group_by_vm_host).to eq({nil => [p1, p2, p3, p7], vmh.ubid => [p4, p5, p6]})
+      pv.vm.update(vm_host_id: create_vm_host.id)
+      pv.refresh
+      expect(described_class.root_resources(pv)).to eq [pv.vm.vm_host_id, pg.id]
+      expect(described_class.root_resources(pv.timeline)).to eq [pv.vm.vm_host_id, pg.id]
 
-      gr.update(vm_id: vm.id)
-      expect(described_class.order(:tag).group_by_vm_host).to eq({nil => [p1, p2, p3], vmh.ubid => [p4, p5, p6, p7]})
+      project = Project.create(name: "test")
+      private_subnet = Prog::Vnet::SubnetNexus.assemble(project.id, name: "test").subject
+      lb = Prog::Vnet::LoadBalancerNexus.assemble(private_subnet.id, name: "test", src_port: 1234, dst_port: 4321).subject
+      lb.add_vm(pv.vm)
+      expect(described_class.root_resources(LoadBalancerVmPort.first)).to eq [pv.vm.vm_host_id]
+
+      kn = KubernetesNode.new(kubernetes_cluster_id: KubernetesCluster.generate_uuid)
+      expect(described_class.root_resources(kn)).to eq [kn.kubernetes_cluster_id]
+
+      knp = KubernetesNodepool.new(kubernetes_cluster_id: KubernetesCluster.generate_uuid)
+      expect(described_class.root_resources(knp)).to eq [knp.kubernetes_cluster_id]
+
+      keb = KubernetesEtcdBackup.new(kubernetes_cluster_id: KubernetesCluster.generate_uuid)
+      expect(described_class.root_resources(keb)).to eq [keb.kubernetes_cluster_id]
+    end
+
+    it "returns empty array for exceptions" do
+      nic = Nic.new
+      expect(nic).to receive(:vm).and_raise(RuntimeError)
+      expect(Clog).to receive(:emit).with("error determining root resource for page", instance_of(Hash)).and_call_original
+      expect(described_class.root_resources(nic)).to eq []
+    end
+  end
+
+  describe ".for_resource" do
+    it "matches pages stamped with the id and unstamped pages whose tag ends with it" do
+      id = PostgresServer.generate_uuid
+      other = PostgresServer.generate_uuid
+      matching = [
+        described_class.create(tag: "PGDiskUsageHigh-#{id}", resource_id: id),
+        described_class.create(tag: "Deadline-#{id}-Prog-wait", resource_id: id),
+        described_class.create(tag: "PGReplicaLagHigh-#{id}"),
+      ]
+      described_class.create(tag: "Deadline-#{id}-Prog-start")
+      described_class.create(tag: "PGDiskUsageHigh-#{other}")
+      described_class.create(tag: "PGRootDiskUsageHigh-#{other}", resource_id: other)
+      described_class.create(tag: "PGIOThrottleStale-#{id}", resource_id: other)
+      resolved = described_class.create(tag: "PGArchivalBacklogHigh-#{id}", resource_id: id, resolved_at: Time.now)
+
+      expect(described_class.active.for_resource(id).all).to match_array(matching)
+      expect(described_class.for_resource(id).all).to match_array(matching + [resolved])
     end
   end
 
@@ -89,9 +131,7 @@ RSpec.describe Page do
 
     describe "#trigger" do
       it "triggers a page if key is present" do
-        Excon.stub({
-          url: "https://api.incident.io/v2/alert_events/http/source-id",
-          method: "post",
+        stub_request(:post, "https://api.incident.io/v2/alert_events/http/source-id").with(
           body: {
             deduplication_key: p.client.send(:deduplication_key, p.tag),
             status: "firing",
@@ -103,14 +143,12 @@ RSpec.describe Page do
             "Authorization" => "Bearer dummy-key",
             "Content-Type" => "application/json",
           },
-        }, {status: 202})
+        ).to_return(status: 202)
         expect(p.trigger.status).to eq(202)
       end
 
       it "triggers a page with extra links" do
-        Excon.stub({
-          url: "https://api.incident.io/v2/alert_events/http/source-id",
-          method: "post",
+        stub_request(:post, "https://api.incident.io/v2/alert_events/http/source-id").with(
           body: {
             deduplication_key: p.client.send(:deduplication_key, p.tag),
             status: "firing",
@@ -125,16 +163,14 @@ RSpec.describe Page do
             "Authorization" => "Bearer dummy-key",
             "Content-Type" => "application/json",
           },
-        }, {status: 202})
+        ).to_return(status: 202)
         expect(p.client.trigger(p.tag, summary: "title", severity: "low", details: {}, links: [nil, "https://example.com"]).status).to eq(202)
       end
     end
 
     describe "#resolve" do
       it "resolves the page if key is present" do
-        Excon.stub({
-          url: "https://api.incident.io/v2/alert_events/http/source-id",
-          method: "post",
+        stub_request(:post, "https://api.incident.io/v2/alert_events/http/source-id").with(
           body: {
             deduplication_key: p.client.send(:deduplication_key, p.tag),
             status: "resolved",
@@ -144,7 +180,7 @@ RSpec.describe Page do
             "Authorization" => "Bearer dummy-key",
             "Content-Type" => "application/json",
           },
-        }, {status: 202})
+        ).to_return(status: 202)
         expect(p.resolve.status).to eq(202)
       end
     end

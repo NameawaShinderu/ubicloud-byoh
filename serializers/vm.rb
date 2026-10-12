@@ -10,9 +10,11 @@ class Serializers::Vm < Serializers::Base
       size: vm.display_size,
       unix_user: vm.unix_user,
       storage_size_gib: vm.storage_size_gib,
+      boot_image: vm.boot_image,
       ip6: vm.ip6,
       ip4_enabled: vm.ip4_enabled,
       ip4: vm.ip4,
+      maintenance_window_start_at: vm.maintenance_window_start_at,
     }
 
     if options[:detailed]
@@ -20,7 +22,7 @@ class Serializers::Vm < Serializers::Base
         firewalls: Serializers::Firewall.serialize(vm.firewalls(eager: [:location, :firewall_rules]), {include_path: true}),
         private_ipv4: vm.private_ipv4,
         private_ipv6: vm.private_ipv6,
-        subnet: vm.nics.first.private_subnet.name,
+        subnet: vm.user_nic&.private_subnet&.name,
         gpu: vm.display_gpu,
       )
     end

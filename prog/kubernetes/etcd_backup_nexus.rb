@@ -40,6 +40,18 @@ class Prog::Kubernetes::EtcdBackupNexus < Prog::Base
   end
 
   label def wait
+    if kubernetes_cluster.strand.label == "wait"
+      # Treat creation time as the first backup so a freshly-assembled etcd
+      # backup gets a grace period before paging.
+      latest_backup_completed_at = kubernetes_etcd_backup.backups.map(&:last_modified).max || kubernetes_etcd_backup.created_at
+      tag_parts = ["MissingEtcdBackup", kubernetes_etcd_backup.id]
+      if latest_backup_completed_at < Time.now - 6 * 60 * 60
+        Prog::PageNexus.assemble("Missing etcd backup at #{kubernetes_etcd_backup}!", tag_parts, kubernetes_etcd_backup.ubid, resource_id: kubernetes_etcd_backup.id)
+      else
+        Page.from_tag_parts(*tag_parts)&.incr_resolve
+      end
+    end
+
     if kubernetes_etcd_backup.need_backup?
       hop_run_backup
     end
@@ -74,6 +86,8 @@ class Prog::Kubernetes::EtcdBackupNexus < Prog::Base
       admin_client.admin_remove_user(kubernetes_etcd_backup.access_key)
       admin_client.admin_policy_remove(kubernetes_etcd_backup.ubid)
     end
+
+    Page.from_tag_parts("MissingEtcdBackup", kubernetes_etcd_backup.id)&.incr_resolve
 
     kubernetes_etcd_backup.destroy
     pop "kubernetes etcd backup is deleted"

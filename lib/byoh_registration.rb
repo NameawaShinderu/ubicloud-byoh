@@ -164,6 +164,11 @@ class ByohRegistration
       if parsed.ipv6? && parsed.prefix != 64
         raise ValidationError, "IPv6 routed_networks must be /64 (got #{cidr}); Ubicloud slices a /64 per host"
       end
+      # Every address of a declared block becomes VM-allocatable, so a block
+      # around the management IP would hand the host's own address to a VM.
+      if parsed.ipv4? && parsed.include?(@main_ip) && parsed.prefix != 32
+        raise ValidationError, "routed_network #{cidr} contains main_ip #{@main_ip}; declare VM pools that exclude the management IP"
+      end
     rescue IPAddr::InvalidAddressError
       raise ValidationError, "routed_network is not a valid CIDR: #{cidr}"
     end

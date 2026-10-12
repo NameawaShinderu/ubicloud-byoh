@@ -9,8 +9,9 @@ class KubernetesNode < Sequel::Model
   many_to_one :kubernetes_nodepool, read_only: true
 
   plugin ResourceMethods
-  plugin SemaphoreMethods, :destroy, :retire, :checkup
+  plugin SemaphoreMethods, :destroy, :retire, :checkup, :renew_certs, :configure_metrics
   include HealthMonitorMethods
+  include MetricsTargetMethods
 
   MESH_STATUS_FILE_PATH = "/var/lib/ubicsi/mesh_status.json"
 
@@ -18,10 +19,63 @@ class KubernetesNode < Sequel::Model
     vm.sshable
   end
 
+  def control_plane?
+    kubernetes_nodepool_id.nil?
+  end
+
   def init_health_monitor_session
     {
       ssh_session: sshable.start_fresh_session,
     }
+  end
+
+  def init_metrics_export_session
+    {
+      ssh_session: sshable.start_fresh_session,
+    }
+  end
+
+  FEDERATE_MATCHES = [
+    "{__name__=~\"ubicloud:.*\"}",
+    "apiserver_current_inflight_requests",
+    "apiserver_storage_size_bytes",
+    "scheduler_pending_pods",
+  ].freeze
+
+  def metrics_config
+    endpoints = ["http://localhost:9100/metrics"]
+    if control_plane?
+      query = URI.encode_www_form(FEDERATE_MATCHES.map { ["match[]", it] })
+      endpoints << "http://localhost:9090/federate?#{query}"
+    end
+
+    {
+      endpoints:,
+      max_file_retention: 120,
+      interval: "15s",
+      additional_labels: {
+        ubicloud_resource_id: kubernetes_cluster.ubid,
+        ubicloud_resource_role: control_plane? ? "control-plane" : "worker",
+        instance: name,
+        nodepool: kubernetes_nodepool&.name,
+      }.compact,
+      exclude_metrics: ["^(# (HELP|TYPE) )?node_scrape_collector_"],
+      metrics_dir: "/home/ubi/kubernetes/metrics",
+      project_id: Config.kubernetes_service_project_id,
+    }
+  end
+
+  def metrics_backlog_page_tag
+    "KubernetesMetricsBacklogHigh"
+  end
+
+  def export_metrics(session:, tsdb_client:)
+    session[:export_count] ||= 0
+    session[:export_count] += 1
+
+    observe_metrics_backlog(session) if session[:export_count] % 12 == 1
+
+    super
   end
 
   def check_pulse(session:, previous_pulse:)
@@ -41,7 +95,7 @@ class KubernetesNode < Sequel::Model
     end
     pulse = aggregate_readings(previous_pulse:, reading:)
 
-    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !checkup_set?
+    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !checkup_set?(cached: false)
       incr_checkup
     end
 
@@ -57,14 +111,22 @@ class KubernetesNode < Sequel::Model
 
   # ssh_session is optional to allow nexus to call available? without an active session
   def check_mesh_availability(ssh_session = nil)
-    file_content = if ssh_session
-      ssh_session.exec!("cat :MESH_STATUS_FILE_PATH 2>/dev/null || echo -n", MESH_STATUS_FILE_PATH:)
+    command = "echo $(date +%s) $(stat -c %Y :MESH_STATUS_FILE_PATH 2>/dev/null || echo 0); cat :MESH_STATUS_FILE_PATH 2>/dev/null || echo -n"
+    output = if ssh_session
+      ssh_session.exec!(command, MESH_STATUS_FILE_PATH:)
     else
-      sshable.cmd("cat :MESH_STATUS_FILE_PATH 2>/dev/null || echo -n", MESH_STATUS_FILE_PATH:)
+      sshable.cmd(command, MESH_STATUS_FILE_PATH:)
     end
+    timestamps, file_content = output.split("\n", 2)
+    now, modified_at = timestamps.split.map! { Integer(it, 10) }
 
     if file_content.empty?
       return {available: true} # File doesn't exist yet - CSI not updated, consider healthy
+    end
+
+    stale_for = now - modified_at
+    if stale_for > 15 * 60
+      return {available: false, stale_for:}
     end
 
     status = JSON.parse(file_content)
@@ -109,6 +171,11 @@ class KubernetesNode < Sequel::Model
 
   def install_rhizome
     Strand.create(prog: "InstallRhizome", label: "start", stack: [{subject_id: vm.sshable.id, target_folder: "kubernetes"}])
+  end
+
+  def cert_expire_at
+    enddate = sshable.cmd("sudo openssl x509 -enddate -noout -in /etc/kubernetes/pki/apiserver.crt").chomp.delete_prefix("notAfter=")
+    Time.strptime(enddate.sub(/\bGMT\z/, "+0000"), "%b %e %H:%M:%S %Y %z")
   end
 
   def name

@@ -2,6 +2,21 @@
 
 module Validation
   class PostgresConfigValidator
+    # Custom option keys have two parts separated by a dot:
+    # https://www.postgresql.org/docs/18/runtime-config-custom.html
+    #
+    # Each part must start with a letter or underscore followed by letters,
+    # digits, or underscores.
+    # https://github.com/postgres/postgres/blob/0392fb900eb89f52988cccd33046443c39c70d1c/src/backend/utils/misc/guc.c#L957
+    #
+    # Notes:
+    # - Postgres implementation allows >= 2 parts, but docs only mention 2
+    #   parts, so we enforce 2 parts per the docs.
+    # - Postgres allows dollars and high-bit characters in option names, but the
+    #   PgCommon.pm preloader rejects them before passing them to postgres, so
+    #   disallow them here.
+    EXTENSION_KEY_REGEX = /\A[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\z/
+
     def initialize(version)
       case version
       when "17"
@@ -25,6 +40,14 @@ module Validation
       restart_required_params.include?(key)
     end
 
+    def default(key)
+      @config_schema.dig(key, :default)
+    end
+
+    def valid_config?(key)
+      @config_schema.key?(key)
+    end
+
     def validate(config)
       errors = validation_errors(config)
 
@@ -36,13 +59,14 @@ module Validation
     def validation_errors(config)
       errors = {}
       config.each do |key, value|
-        errors[key] = if value.to_s.empty?
+        str = value.to_s
+        errors[key] = if str.empty?
           "Value cannot be empty"
+        elsif str.include?("\n")
+          "Value cannot contain newlines"
         elsif valid_config?(key)
           validate_config(key, value)
-        elsif key.split(".").length == 2
-          # Unknown customized option, ignore validation for it.
-          # Ref: https://www.postgresql.org/docs/17/runtime-config-custom.html#RUNTIME-CONFIG-CUSTOM
+        elsif EXTENSION_KEY_REGEX.match?(key)
           nil
         else
           "Unknown configuration parameter"
@@ -53,10 +77,6 @@ module Validation
     end
 
     private
-
-    def valid_config?(key)
-      @config_schema.key?(key)
-    end
 
     def validate_config(key, value)
       config = @config_schema[key]
@@ -88,7 +108,7 @@ module Validation
       when :enum
         errors << validate_enum(value, config[:allowed_values])
       when :string
-        errors << validate_string(value, config[:pattern])
+        errors << validate_string(value.to_s, config[:pattern])
       when :bool
         errors << validate_bool(value)
       else
@@ -123,28 +143,14 @@ module Validation
         return "must match pattern: #{pattern.source.gsub(/[\\Az]/, "")}"
       end
 
-      # Check if string value needs quoting and is properly quoted
-      quoting_error = validate_string_quoting(value)
-      return quoting_error if quoting_error
-
-      nil
-    end
-
-    def validate_string_quoting(value)
-      # Ref: https://www.postgresql.org/docs/9.3/config-setting.html#CONFIG-SETTING-CONFIGURATION-FILE
-      is_quoted = value.start_with?("'") && value.end_with?("'")
-
-      if is_quoted
-        inner_value = value[1...-1]
-
-        # Single quotes inside should be escaped as '' or '\
-        escaped_quotes_removed = inner_value.gsub("''", "").gsub("\\'", "")
-
-        if escaped_quotes_removed.include?("'")
-          "contains unescaped single quotes - single quotes must be doubled ('') inside quoted strings"
-        end
-      elsif !value.match?(/\A[a-zA-Z0-9_]+\z/)
-        "must be wrapped in single quotes (e.g., '#{value.gsub("'", "''")}') because it contains special characters"
+      # Values are auto-quoted when written to postgresql.conf, so users
+      # should not wrap them in single quotes. Reject quoted values.
+      starts = value.start_with?("'")
+      ends = value.end_with?("'")
+      if starts && ends && value.length >= 2
+        "must not be wrapped in single quotes - quoting is handled automatically"
+      elsif starts != ends
+        "has a mismatched single quote"
       end
     end
 

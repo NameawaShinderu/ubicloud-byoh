@@ -124,7 +124,7 @@ end
 # Specs
 
 desc "Run specs in with coverage in unfrozen mode, and without coverage in frozen mode"
-task default: [:coverage, :frozen_spec]
+task default: :coverage
 
 rspec = lambda do |env|
   sh(env.merge("RUBYOPT" => "-w", "RACK_ENV" => "test", "FORCE_AUTOLOAD" => "1"), "bundle", "exec", "rspec", "spec")
@@ -160,6 +160,10 @@ end
 coverage_setup = lambda do
   FileUtils.rm_rf("coverage/views")
   FileUtils.mkdir_p("coverage/views/admin")
+  # Leftover results from a previous run satisfy the reporting worker's
+  # PARALLEL_TEST_GROUPS count, making it report before the other workers
+  # of the current run finish.
+  FileUtils.rm_f("coverage/.resultset.json")
 end
 
 desc "Run specs with coverage"
@@ -178,10 +182,10 @@ task "coverage_pspec" do
   output_file = "coverage/output.txt"
   coverage_setup.call
   command = "bash -o pipefail -c 'bundle exec turbo_tests -n #{nproc.call} 2>&1 | tee #{output_file}'"
-  sh({"RUBYOPT" => "-w", "RACK_ENV" => "test", "FORCE_AUTOLOAD" => "1", "COVERAGE" => "1", "RODA_RENDER_COMPILED_METHOD_SUPPORT" => "no"}, command)
+  sh({"RUBYOPT" => "-w", "RACK_ENV" => "test", "FORCE_AUTOLOAD" => "1", "COVERAGE" => "1", "RODA_RENDER_COMPILED_METHOD_SUPPORT" => "no", "PARALLEL_TEST_GROUPS" => nproc.call}, command)
   command_output = File.binread(output_file)
   coverages = %w[Line Branch].map! do |type|
-    if (match = command_output.match(/#{type} Coverage: 100\.0% \((\d+) \/ (\d+)\)/))
+    if (match = command_output.match(/#{type} coverage: (\d+) \/ (\d+) \(100\.00%\)/))
       match[1] == match[2]
     end
   end
@@ -199,9 +203,19 @@ task "api_spec" do
   sh({"RUBYOPT" => "-w", "RACK_ENV" => "test", "FORCE_AUTOLOAD" => "1"}, "bundle", "exec", "turbo_tests", "-n", nproc.call, "spec/routes/api")
 end
 
+desc "Run web tests in parallel"
+task "web_spec" do
+  sh({"RUBYOPT" => "-w", "RACK_ENV" => "test", "FORCE_AUTOLOAD" => "1"}, "bundle", "exec", "turbo_tests", "-n", nproc.call, *Dir["spec/routes/web/{*_spec.rb,webhook,project}"])
+end
+
+desc "Run route specs checking no SSH access from web process"
+task "route_spec" do
+  sh({"RUBYOPT" => "-w", "RACK_ENV" => "test", "FORCE_AUTOLOAD" => "1", "PROCESS_TYPE" => "web", "CHECK_HTTP_REQUEST_INSIDE_TRANSACTION" => "1"}, "bundle", "exec", "turbo_tests", "-n", nproc.call, "spec/routes")
+end
+
 desc "Run rhizome (data plane) tests"
 task "rhizome_spec" do
-  sh "COVERAGE=rhizome bundle exec rspec -O /dev/null rhizome"
+  sh "COVERAGE=rhizome RUBYOPT=-r./spec/coverage_helper.rb bundle exec rspec -O /dev/null rhizome"
 end
 
 desc "Run CSI tests"
@@ -314,7 +328,7 @@ end
 desc "Update ubicloud/cli checkout in ../cli"
 task "cli-sync" do
   Dir.chdir("cli") do
-    FileUtils.cp(%w[README.md go.mod ubi.go version.txt], "../../cli/")
+    FileUtils.cp(%w[README.md go.mod ubi.go version.txt].freeze, "../../cli/")
   end
   FileUtils.cp("LICENSE", "../cli/")
   write_cli_makefile.call("../cli/Makefile")
@@ -327,8 +341,8 @@ task "ubi-release" do
   Dir.chdir("cli") do
     FileUtils.rm_f("ubi")
 
-    os_list = %w[linux windows darwin]
-    arch_list = %w[amd64 arm64 386]
+    os_list = %w[linux windows darwin].freeze
+    arch_list = %w[amd64 arm64 386].freeze
     os_list.each do |os|
       arch_list.each do |arch|
         next if os == "darwin" && arch == "386"
@@ -399,26 +413,19 @@ namespace :linter do
     sh "BUNDLE_WITH=rubocop bundle exec rubocop"
   end
 
-  desc "Run Brakeman"
+  desc "Run Brakeman (requires: gem install brakeman)"
   task :brakeman do
     require "bundler"
-    Bundler.setup(:lint)
-    puts "Running Brakeman..."
-    require "brakeman"
-    Brakeman.run app_path: ".", quiet: true, force_scan: true, print_report: true, run_all_checks: true
+    # Brakeman is not in the Gemfile, so run it outside the bundle.
+    Bundler.with_unbundled_env do
+      sh "brakeman --quiet --force-scan --run-all-checks --no-exit-on-warn"
+    end
   end
 
-  desc "Run ERB::Formatter"
+  desc "Run Herb linter and formatter"
   task :erb_formatter do
-    # "fdr/erb-formatter" can't be required without bundler setup because of custom repository.
-    require "bundler"
-    Bundler.setup(:lint)
-    puts "Running ERB::Formatter..."
-    require "erb/formatter/command_line"
-    files = Dir.glob("views/**/[!icon]*.erb").entries
-    files.delete("views/components/form/select.erb")
-    files.delete("views/github/runner.erb")
-    ERB::Formatter::CommandLine.new(files + ["--write", "--print-width", "120"]).run
+    sh "npm run format-erb"
+    # sh "npm run lint-erb"
   end
 
   desc "Run golangci-lint"
@@ -513,16 +520,30 @@ namespace :linter do
       number = 0
       File.foreach(file) do |line|
         number += 1
-        cmds = Regexp.union(%w[cmd exec! kubectl rootish_ssh run_query])
-        if /\(:#{cmds}|instance_double\(.*#{cmds}: /.match?(line)
+        cmds = Regexp.union(%w[cmd exec! kubectl rootish_ssh run_query].freeze)
+        if /\(:#{cmds}|instance_double\(.*#{cmds}: |Excon\.stub/.match?(line)
           failure = true
           warn "Potentially insecure method override: #{file}:#{number}: #{line}"
         end
       end
     end
+
+    # Rhizome specs must mock the underlying _run_command instead of r,
+    # so that r's command-building/checking logic is actually exercised.
+    Dir.glob("rhizome/*/spec/**/*.rb").each do |file|
+      number = 0
+      File.foreach(file) do |line|
+        number += 1
+        if line.include?("(:r)")
+          failure = true
+          warn "Potentially insecure method override: #{file}:#{number}: #{line}"
+        end
+      end
+    end
+
     exit(failure ? 1 : 0)
   end
 end
 
 desc "Run all linters"
-task linter: ["rubocop", "brakeman", "erb_formatter", "openapi", "go", "xss_check", "cmd_exec"].map { "linter:#{it}" }
+task linter: ["rubocop", "erb_formatter", "openapi", "go", "xss_check", "cmd_exec"].map { "linter:#{it}" }

@@ -3,102 +3,112 @@
 require_relative "../../model/spec_helper"
 
 RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
-  subject(:nx) { described_class.new(st) }
-
-  let(:st) { Strand.new(id: "8148ebdf-66b8-8ed0-9c2f-8cfe93f5aa77") }
-
-  let(:customer_project) { Project.create(name: "default") }
-  let(:subnet) { kubernetes_cluster.private_subnet }
-  let(:session) { Net::SSH::Connection::Session.allocate }
-
-  let(:kubernetes_cluster) {
+  subject(:nx) {
     kc = described_class.assemble(
-      name: "k8scluster",
-      version: Option.kubernetes_versions.first,
+      name: "cluster",
+      version: Option.selectable_kubernetes_versions.first,
       cp_node_count: 3,
       location_id: Location::HETZNER_FSN1_ID,
       project_id: customer_project.id,
       target_node_size: "standard-2",
     ).subject
-    KubernetesNodepool.create(name: "k8stest-np", node_count: 2, kubernetes_cluster_id: kc.id, target_node_size: "standard-2")
+    Prog::Kubernetes::KubernetesNodepoolNexus.assemble(name: "cluster-np", node_count: 2, kubernetes_cluster_id: kc.id, target_node_size: "standard-2")
 
-    dns_zone = DnsZone.create(project_id: Project.first.id, name: "somezone", last_purged_at: Time.now)
+    dns_zone = DnsZone.create(project_id: Project.first.id, name: "k8s.ubicloud.com", last_purged_at: Time.now)
 
     subnet = kc.private_subnet
-    apiserver_lb = LoadBalancer.create(private_subnet_id: subnet.id, name: "somelb", health_check_endpoint: "/foo", project_id: Config.kubernetes_service_project_id)
-    LoadBalancerPort.create(load_balancer_id: apiserver_lb.id, src_port: 123, dst_port: 456)
-    [create_vm(name: "cp-0", created_at: Time.now - 1), create_vm(name: "cp-1", created_at: Time.now)].each do |vm|
-      KubernetesNode.create(vm_id: vm.id, kubernetes_cluster_id: kc.id)
+    apiserver_lb = Prog::Vnet::LoadBalancerNexus.assemble(
+      subnet.id,
+      name: kc.apiserver_load_balancer_name,
+      algorithm: "hash_based",
+      src_port: 443,
+      dst_port: 6443,
+      health_check_endpoint: "/healthz",
+      health_check_protocol: "tcp",
+    ).subject
+    2.times do
+      Prog::Kubernetes::KubernetesNodeNexus.assemble(
+        Config.kubernetes_service_project_id,
+        sshable_unix_user: "ubi",
+        name: "#{kc.ubid}-#{SecureRandom.alphanumeric(5).downcase}",
+        location_id: kc.location_id,
+        size: kc.target_node_size,
+        storage_volumes: [{encrypted: true, size_gib: kc.target_node_storage_size_gib}],
+        boot_image: "kubernetes-#{kc.version.tr(".", "_")}",
+        enable_ip4: true,
+        kubernetes_cluster_id: kc.id,
+      )
     end
     kc.update(api_server_lb_id: apiserver_lb.id)
 
-    services_lb = Prog::Vnet::LoadBalancerNexus.assemble(
+    services_lb = Prog::Vnet::LoadBalancerNexus.assemble_with_multiple_ports(
       subnet.id,
-      name: "somelb2",
+      ports: [],
+      name: kc.services_load_balancer_name,
       algorithm: "hash_based",
-      # TODO: change the api to support LBs without ports
-      # The next two fields will be later modified by the sync_kubernetes_services label
-      # These are just set for passing the creation validations
-      src_port: 443,
-      dst_port: 6443,
       health_check_endpoint: "/",
       health_check_protocol: "tcp",
       custom_hostname_dns_zone_id: dns_zone.id,
-      custom_hostname_prefix: "someprefix",
+      custom_hostname_prefix: "#{kc.name}-services-#{kc.ubid.to_s[-5...]}",
       stack: LoadBalancer::Stack::IPV4,
     ).subject
 
     kc.update(services_lb_id: services_lb.id)
+
+    described_class.new(kc.strand)
   }
+
+  let(:st) { nx.strand }
+  let(:customer_project) { Project.create(name: "default") }
+  let(:subnet) { kubernetes_cluster.private_subnet }
+  let(:session) { Net::SSH::Connection::Session.allocate }
+  let(:kubernetes_cluster) { nx.kubernetes_cluster }
 
   before do
     allow(Config).to receive(:kubernetes_service_project_id).and_return(Project.create(name: "UbicloudKubernetesService").id)
-    allow(nx).to receive(:kubernetes_cluster).and_return(kubernetes_cluster)
   end
 
   describe ".assemble" do
     it "validates input" do
       expect {
-        described_class.assemble(project_id: "88c8beda-0718-82d2-9948-7569acc26b80", name: "k8stest", location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3, private_subnet_id: subnet.id)
+        described_class.assemble(project_id: "88c8beda-0718-82d2-9948-7569acc26b80", name: "k8stest", location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3)
       }.to raise_error RuntimeError, "No existing project"
 
       expect {
-        described_class.assemble(version: "v1.30", project_id: customer_project.id, name: "k8stest", location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3, private_subnet_id: subnet.id)
-      }.to raise_error Validation::ValidationFailed, "Validation failed for following fields: version"
+        described_class.assemble(version: "v1.30", project_id: customer_project.id, name: "k8stest", location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3)
+      }.to raise_error Sequel::ValidationFailed, "version must be a valid Kubernetes version"
 
       expect {
-        described_class.assemble(name: "Uppercase", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3, private_subnet_id: subnet.id)
+        described_class.assemble(name: "Uppercase", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3)
       }.to raise_error Validation::ValidationFailed, "Validation failed for following fields: name"
 
       expect {
-        described_class.assemble(name: "hyph_en", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3, private_subnet_id: subnet.id)
+        described_class.assemble(name: "hyph_en", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3)
       }.to raise_error Validation::ValidationFailed, "Validation failed for following fields: name"
 
       expect {
-        described_class.assemble(name: "onetoolongnameforatestkubernetesclustername", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3, private_subnet_id: subnet.id)
+        described_class.assemble(name: "onetoolongnameforatestkubernetesclustername", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3)
       }.to raise_error Validation::ValidationFailed, "Validation failed for following fields: name"
 
       expect {
-        described_class.assemble(name: "somename", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 2, private_subnet_id: subnet.id)
+        described_class.assemble(name: "somename", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 2)
       }.to raise_error Validation::ValidationFailed, "Validation failed for following fields: control_plane_node_count"
 
-      p = Project.create(name: "another")
-      subnet.update(project_id: p.id)
       expect {
-        described_class.assemble(name: "normalname", project_id: Project.create(name: "t").id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3, private_subnet_id: subnet.id)
-      }.to raise_error RuntimeError, "Given subnet is not available in the project"
+        described_class.assemble(name: "somename", project_id: customer_project.id, location_id: Location::HETZNER_HEL1_ID, cp_node_count: 3)
+      }.to raise_error Validation::ValidationFailed, "Validation failed for following fields: location"
     end
 
     it "creates a kubernetes cluster" do
-      st = described_class.assemble(name: "k8stest", version: Option.kubernetes_versions.first, private_subnet_id: subnet.id, project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3, target_node_size: "standard-8", target_node_storage_size_gib: 100)
+      st = described_class.assemble(name: "k8stest", version: Option.selectable_kubernetes_versions.first, project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3, target_node_size: "standard-8", target_node_storage_size_gib: 100)
 
       kc = st.subject
       expect(kc.name).to eq "k8stest"
       expect(kc.ubid).to start_with("kc")
-      expect(kc.version).to eq Option.kubernetes_versions.first
+      expect(kc.version).to eq Option.selectable_kubernetes_versions.first
       expect(kc.location_id).to eq Location::HETZNER_FSN1_ID
       expect(kc.cp_node_count).to eq 3
-      expect(kc.private_subnet.id).to eq subnet.id
+      expect(kc.private_subnet.name).to eq "#{kc.ubid}-subnet"
       expect(kc.project.id).to eq customer_project.id
       expect(kc.strand.label).to eq "start"
       expect(kc.target_node_size).to eq "standard-8"
@@ -106,30 +116,41 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
 
       internal_firewall = kc.internal_cp_vm_firewall
       expect(internal_firewall.project_id).to eq Config.kubernetes_service_project_id
-      expect(internal_firewall.firewall_rules.map { "#{it.cidr}:#{it.port_range.to_range}" }.sort).to eq [
-        "0.0.0.0/0:22...23",
-        "0.0.0.0/0:443...444",
-        "#{kc.private_subnet.net4}:10250...10251",
-        "::/0:22...23",
-        "::/0:443...444",
-        "#{kc.private_subnet.net6}:10250...10251",
+      expect(internal_firewall.firewall_rules.map { "#{it.cidr}:#{it.port_range.to_range}:#{it.protocol}" }.sort).to eq [
+        "0.0.0.0/0:22...23:tcp",
+        "0.0.0.0/0:443...444:tcp",
+        "#{kc.private_subnet.net4}:0...65536:tcp",
+        "#{kc.private_subnet.net4}:0...65536:udp",
+        "::/0:22...23:tcp",
+        "::/0:443...444:tcp",
+        "#{kc.private_subnet.net6}:0...65536:tcp",
+        "#{kc.private_subnet.net6}:0...65536:udp",
       ]
 
       internal_firewall = kc.internal_worker_vm_firewall
       expect(internal_firewall.project_id).to eq Config.kubernetes_service_project_id
-      expect(internal_firewall.firewall_rules.map { "#{it.cidr}:#{it.port_range.to_range}" }.sort).to eq [
-        "0.0.0.0/0:22...23",
-        "#{kc.private_subnet.net4}:10250...10251",
-        "::/0:22...23",
-        "#{kc.private_subnet.net6}:10250...10251",
+      expect(internal_firewall.firewall_rules.map { "#{it.cidr}:#{it.port_range.to_range}:#{it.protocol}" }.sort).to eq [
+        "0.0.0.0/0:22...23:tcp",
+        "#{kc.private_subnet.net4}:0...65536:tcp",
+        "#{kc.private_subnet.net4}:0...65536:udp",
+        "::/0:22...23:tcp",
+        "#{kc.private_subnet.net6}:0...65536:tcp",
+        "#{kc.private_subnet.net6}:0...65536:udp",
       ]
+    end
+
+    it "creates a kubernetes cluster with a supported version that is not selectable" do
+      version = (Option.kubernetes_versions - Option.selectable_kubernetes_versions).first
+      kc = described_class.assemble(name: "k8stest", version:, project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3).subject
+
+      expect(kc.version).to eq version
     end
 
     it "has defaults for node size, storage size, version and subnet" do
       st = described_class.assemble(name: "k8stest", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, cp_node_count: 3)
       kc = st.subject
 
-      expect(kc.version).to eq Option.kubernetes_versions.first
+      expect(kc.version).to eq Option.selectable_kubernetes_versions.first
       expect(kc.private_subnet.net4.to_s[-3..]).to eq "/16"
       expect(kc.private_subnet.name).to eq kc.ubid.to_s + "-subnet"
       expect(kc.private_subnet.firewalls.first.name).to eq kc.ubid.to_s + "-firewall"
@@ -139,41 +160,56 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
       customer_firewall = Firewall.first(name: "#{kc.ubid}-firewall", project_id: customer_project.id)
       expect(kc.private_subnet.firewalls).to eq [customer_firewall]
       expect(customer_firewall.project_id).to eq customer_project.id
-      expect(customer_firewall.firewall_rules.map { "#{it.cidr}:#{it.port_range.to_range}" }.sort).to eq [
-        "0.0.0.0/0:0...65536",
-        "::/0:0...65536",
-      ]
+      expect(customer_firewall.firewall_rules).to eq []
+      expect(st.stack.first["hostname_version"]).to eq 2
+    end
+
+    it "supports hostname_version" do
+      st = described_class.assemble(name: "k8stest", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID, hostname_version: 1)
+      expect(st.stack.first["hostname_version"]).to eq 1
     end
   end
 
   describe "#before_destroy" do
     it "finalizes billing records" do
       expect { nx.update_billing_records }.to hop("wait")
+      # Billing records cannot be finalized within the second they were created.
+      kubernetes_cluster.active_billing_records_dataset.update(span: Sequel.lit("tstzrange(lower(span) - interval '10 seconds', NULL)"))
       kubernetes_cluster.reload
-      expect(kubernetes_cluster.active_billing_records).not_to be_empty
-      expect(kubernetes_cluster.active_billing_records).to all(receive(:finalize))
-      nx.before_destroy
+
+      expect { nx.before_destroy }.to change { kubernetes_cluster.reload.active_billing_records.count }.from(2).to(0)
     end
   end
 
   describe "#start" do
     it "registers deadline and hops" do
-      expect(nx).to receive(:register_deadline)
-      expect(nx).to receive(:incr_install_metrics_server)
-      expect(nx).to receive(:incr_sync_worker_mesh)
-      expect(nx).to receive(:incr_sync_internal_dns_config)
-      expect(nx).to receive(:incr_install_csi)
       expect { nx.start }.to hop("create_load_balancers")
+      expect(nx.strand.stack.first["deadline_target"]).to eq "wait"
+      expect(Time.new(nx.strand.stack.first["deadline_at"])).to be_within(60).of(Time.now + 120 * 60)
+      expect(nx.install_metrics_server_set?).to be true
+      expect(nx.install_prometheus_rbac_set?).to be true
+      expect(nx.sync_worker_mesh_set?).to be true
+      expect(nx.sync_internal_dns_config_set?).to be true
+      expect(nx.install_csi_set?).to be true
+      expect(nx.sync_csi_config_set?).to be true
+      expect(nx.sync_kubeconfig_set?).to be true
       expect(KubernetesEtcdBackup.first.kubernetes_cluster_id).to eq(kubernetes_cluster.id)
     end
   end
 
   describe "#create_load_balancers" do
-    it "creates api server and services load balancers with the right dns zone on prod and hops" do
+    before do
+      api_server_lb = kubernetes_cluster.api_server_lb
+      services_lb = kubernetes_cluster.services_lb
       kubernetes_cluster.update(api_server_lb_id: nil, services_lb_id: nil)
+      api_server_lb.destroy
+      services_lb.destroy
+    end
 
+    it "creates api server and services load balancers with the right dns zone on prod for hostname_version 1 and hops" do
       allow(Config).to receive(:kubernetes_service_hostname).and_return("k8s.ubicloud.com")
-      dns_zone = DnsZone.create(project_id: Project.first.id, name: "k8s.ubicloud.com", last_purged_at: Time.now)
+      dns_zone = DnsZone[name: "k8s.ubicloud.com"]
+      refresh_frame(nx, new_values: {"hostname_version" => 1})
 
       expect { nx.create_load_balancers }.to hop("bootstrap_control_plane_nodes")
 
@@ -185,14 +221,28 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
       expect(kubernetes_cluster.api_server_lb.stack).to eq LoadBalancer::Stack::DUAL
       expect(kubernetes_cluster.api_server_lb.private_subnet_id).to eq subnet.id
       expect(kubernetes_cluster.api_server_lb.custom_hostname_dns_zone_id).to eq dns_zone.id
-      expect(kubernetes_cluster.api_server_lb.custom_hostname).to eq "k8scluster-apiserver-#{kubernetes_cluster.ubid[-5...]}.k8s.ubicloud.com"
+      expect(kubernetes_cluster.api_server_lb.custom_hostname).to eq "cluster-apiserver-#{kubernetes_cluster.ubid[-5...]}.k8s.ubicloud.com"
 
       expect(kubernetes_cluster.services_lb.name).to eq "#{kubernetes_cluster.ubid}-services"
       expect(kubernetes_cluster.services_lb.stack).to eq LoadBalancer::Stack::DUAL
       expect(kubernetes_cluster.services_lb.ports.count).to eq 0
       expect(kubernetes_cluster.services_lb.private_subnet_id).to eq subnet.id
       expect(kubernetes_cluster.services_lb.custom_hostname_dns_zone_id).to eq dns_zone.id
-      expect(kubernetes_cluster.services_lb.custom_hostname).to eq "k8scluster-services-#{kubernetes_cluster.ubid[-5...]}.k8s.ubicloud.com"
+      expect(kubernetes_cluster.services_lb.custom_hostname).to eq "cluster-services-#{kubernetes_cluster.ubid[-5...]}.k8s.ubicloud.com"
+    end
+
+    it "uses Config.kubernetes_service_hostname_v2 for hostname_version 2" do
+      expect(Config).to receive(:kubernetes_service_hostname_v2).and_return("k8s.ubicloud.app")
+      dns_zone = DnsZone.create(project_id: Project.first.id, name: "k8s.ubicloud.app")
+
+      expect { nx.create_load_balancers }.to hop("bootstrap_control_plane_nodes")
+
+      services_hostname = "cluster-services-#{kubernetes_cluster.ubid[-5...]}.k8s.ubicloud.app"
+      expect(kubernetes_cluster.api_server_lb.custom_hostname_dns_zone_id).to eq dns_zone.id
+      expect(kubernetes_cluster.api_server_lb.custom_hostname).to eq "cluster-apiserver-#{kubernetes_cluster.ubid[-5...]}.k8s.ubicloud.app"
+      expect(kubernetes_cluster.services_lb.custom_hostname_dns_zone_id).to eq dns_zone.id
+      expect(kubernetes_cluster.services_lb.custom_hostname).to eq services_hostname
+      expect(dns_zone.records_dataset.select_map([:name, :type, :data])).to eq [["*.#{services_hostname}.", "CNAME", "#{services_hostname}."]]
     end
 
     it "creates load balancers with dns zone id on development for api server and services, then hops" do
@@ -214,51 +264,83 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
   end
 
   describe "#bootstrap_control_plane_nodes" do
+    def assemble_cp_node
+      Prog::Kubernetes::KubernetesNodeNexus.assemble(
+        Config.kubernetes_service_project_id,
+        sshable_unix_user: "ubi",
+        name: "#{kubernetes_cluster.ubid}-#{SecureRandom.alphanumeric(5).downcase}",
+        location_id: kubernetes_cluster.location_id,
+        size: kubernetes_cluster.target_node_size,
+        storage_volumes: [{encrypted: true, size_gib: kubernetes_cluster.target_node_storage_size_gib}],
+        boot_image: "kubernetes-#{kubernetes_cluster.version.tr(".", "_")}",
+        enable_ip4: true,
+        kubernetes_cluster_id: kubernetes_cluster.id,
+      )
+    end
+
     it "waits until the load balancer endpoint is set" do
       expect(kubernetes_cluster.api_server_lb).to receive(:hostname).and_return nil
       expect { nx.bootstrap_control_plane_nodes }.to nap(5)
     end
 
     it "creates a prog for the first control plane node" do
-      expect(kubernetes_cluster).to receive(:nodes).and_return([]).twice
-      expect(nx).to receive(:bud).with(Prog::Kubernetes::ProvisionKubernetesNode, {"subject_id" => kubernetes_cluster.id})
+      kubernetes_cluster.nodes_dataset.destroy
       expect { nx.bootstrap_control_plane_nodes }.to hop("wait_control_plane_node")
+      child = st.children.first
+      expect(child.prog).to eq "Kubernetes::ProvisionKubernetesNode"
+      expect(child.stack.first["subject_id"]).to eq kubernetes_cluster.id
     end
 
-    it "incrs start_bootstrapping on KubernetesNodepool on 3 node control plane setup" do
-      expect(kubernetes_cluster).to receive(:nodes).and_return([1, 2, 3]).twice
-      expect(kubernetes_cluster.nodepools.first).to receive(:incr_start_bootstrapping)
-      expect { nx.bootstrap_control_plane_nodes }.to hop("wait_nodes")
+    it "incrs start_bootstrapping on KubernetesNodepool when the first control plane node is up" do
+      kubernetes_cluster.nodes.last.destroy
+      kubernetes_cluster.reload
+      expect(kubernetes_cluster.nodes_dataset.count).to eq 1
+      expect { nx.bootstrap_control_plane_nodes }.to hop("wait_control_plane_node")
+      expect(kubernetes_cluster.nodepools.first.start_bootstrapping_set?).to be true
     end
 
     it "incrs start_bootstrapping on KubernetesNodepool on 1 node control plane setup" do
       kubernetes_cluster.update(cp_node_count: 1)
-      expect(kubernetes_cluster).to receive(:nodes).and_return([1]).twice
-      expect(kubernetes_cluster.nodepools.first).to receive(:incr_start_bootstrapping)
+      kubernetes_cluster.nodes.last.destroy
+      kubernetes_cluster.reload
+      expect(kubernetes_cluster.nodes_dataset.count).to eq 1
       expect { nx.bootstrap_control_plane_nodes }.to hop("wait_nodes")
+      expect(kubernetes_cluster.nodepools.first.start_bootstrapping_set?).to be true
+    end
+
+    it "incrs start_bootstrapping only for the first control plane node" do
+      assemble_cp_node
+      kubernetes_cluster.reload
+      expect(kubernetes_cluster.nodes.count).to eq 3
+      expect { nx.bootstrap_control_plane_nodes }.to hop("wait_nodes")
+      expect(kubernetes_cluster.nodepools.first.start_bootstrapping_set?).to be false
     end
 
     it "hops wait_nodes if the target number of CP nodes is reached" do
-      expect(kubernetes_cluster).to receive(:nodes).and_return([1, 2, 3]).twice
+      assemble_cp_node
+      kubernetes_cluster.reload
+      expect(kubernetes_cluster.nodes.count).to eq 3
       expect { nx.bootstrap_control_plane_nodes }.to hop("wait_nodes")
     end
 
     it "buds ProvisionKubernetesNode prog to create Nodes" do
       kubernetes_cluster.nodes.last.destroy
-      expect(kubernetes_cluster).to receive(:endpoint).and_return "endpoint"
-      expect(nx).to receive(:bud).with(Prog::Kubernetes::ProvisionKubernetesNode, {"subject_id" => kubernetes_cluster.id})
+      expect(kubernetes_cluster.endpoint).not_to be_nil
       expect { nx.bootstrap_control_plane_nodes }.to hop("wait_control_plane_node")
+      child = st.children.first
+      expect(child.prog).to eq "Kubernetes::ProvisionKubernetesNode"
+      expect(child.stack.first["subject_id"]).to eq kubernetes_cluster.id
     end
   end
 
   describe "#wait_control_plane_node" do
     it "hops back to bootstrap_control_plane_nodes if there are no sub-programs running" do
-      st.update(prog: "Kubernetes::KubernetesClusterNexus", label: "wait_control_plane_node", stack: [{}])
+      st.update(label: "wait_control_plane_node")
       expect { nx.wait_control_plane_node }.to hop("bootstrap_control_plane_nodes")
     end
 
     it "donates if there are sub-programs running" do
-      st.update(prog: "Kubernetes::KubernetesClusterNexus", label: "wait_control_plane_node", stack: [{}])
+      st.update(label: "wait_control_plane_node")
       Strand.create(parent_id: st.id, prog: "Kubernetes::ProvisionKubernetesNode", label: "start", stack: [{}], lease: Time.now + 10)
       expect { nx.wait_control_plane_node }.to nap(120)
     end
@@ -266,12 +348,12 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
 
   describe "#wait_nodes" do
     it "naps until all nodepools are ready" do
-      expect(kubernetes_cluster.nodepools.first).to receive(:strand).and_return(instance_double(Strand, label: "not_wait"))
-      expect { nx.wait_nodes }.to nap(10)
+      expect(kubernetes_cluster.nodepools.first.strand.label).not_to eq "wait"
+      expect { nx.wait_nodes }.to nap(60)
     end
 
     it "hops to wait when all nodepools are ready" do
-      expect(kubernetes_cluster.nodepools.first).to receive(:strand).and_return(instance_double(Strand, label: "wait"))
+      kubernetes_cluster.nodepools.first.strand.update(label: "wait")
       expect { nx.wait_nodes }.to hop("wait")
     end
   end
@@ -279,7 +361,18 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
   describe "#update_billing_records" do
     before do
       @nodepool = kubernetes_cluster.nodepools.first
-      KubernetesNode.create(vm_id: create_vm.id, kubernetes_cluster_id: kubernetes_cluster.id, kubernetes_nodepool_id: @nodepool.id)
+      Prog::Kubernetes::KubernetesNodeNexus.assemble(
+        Config.kubernetes_service_project_id,
+        sshable_unix_user: "ubi",
+        name: "#{@nodepool.ubid}-#{SecureRandom.alphanumeric(5).downcase}",
+        location_id: kubernetes_cluster.location_id,
+        size: @nodepool.target_node_size,
+        storage_volumes: [{encrypted: true, size_gib: @nodepool.target_node_storage_size_gib}],
+        boot_image: "kubernetes-#{kubernetes_cluster.version.tr(".", "_")}",
+        enable_ip4: true,
+        kubernetes_cluster_id: kubernetes_cluster.id,
+        kubernetes_nodepool_id: @nodepool.id,
+      )
 
       expect(kubernetes_cluster.active_billing_records.length).to eq 0
 
@@ -297,7 +390,6 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
 
     it "can be run idempotently" do
       expect(kubernetes_cluster.active_billing_records.length).to eq 4
-      expect(BillingRecord).not_to receive(:create)
       records = kubernetes_cluster.active_billing_records.map(&:id)
 
       5.times do
@@ -334,7 +426,7 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
         ["KubernetesControlPlaneVCpu", "standard", 8], # new bigger CP node
         ["KubernetesWorkerVCpu", "standard", 2], # old worker node
         ["KubernetesWorkerVCpu", "standard", 16], # new worker node
-        ["KubernetesWorkerStorage", "standard", 0], # old worker node
+        ["KubernetesWorkerStorage", "standard", 40], # old worker node
         ["KubernetesWorkerStorage", "standard", 37], # new worker node
       ]
 
@@ -358,8 +450,7 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
 
     it "removes the nodes marked for retirement from the billing calcuation" do
       expect(kubernetes_cluster.active_billing_records.length).to eq 4
-      n = kubernetes_cluster.nodepools.first.nodes.first
-      expect(n).to receive(:retire_set?).and_return(true)
+      kubernetes_cluster.nodepools.first.nodes.first.incr_retire
       expect { nx.update_billing_records }.to hop("wait")
       kubernetes_cluster.reload
 
@@ -370,88 +461,151 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
   describe "#sync_kubernetes_services" do
     it "calls the sync_kubernetes_services function" do
       client = instance_double(Kubernetes::Client)
-      expect(nx).to receive(:decr_sync_kubernetes_services)
+      nx.incr_sync_kubernetes_services
       expect(kubernetes_cluster).to receive(:client).and_return(client)
       expect(client).to receive(:sync_kubernetes_services)
       expect { nx.sync_kubernetes_services }.to hop("wait")
+      expect(nx.sync_kubernetes_services_set?).to be false
     end
   end
 
   describe "#wait" do
+    before do
+      kubernetes_cluster.nodes.each do |n|
+        allow(n.sshable).to receive(:_cmd).with("sudo openssl x509 -enddate -noout -in /etc/kubernetes/pki/apiserver.crt").and_return("notAfter=#{(Time.now + 365 * 24 * 60 * 60).utc.strftime("%b %e %H:%M:%S %Y")} GMT\n")
+      end
+    end
+
     it "hops to the right sync_kubernetes_service when its semaphore is set" do
-      expect(nx).to receive(:when_sync_kubernetes_services_set?).and_yield
+      nx.incr_sync_kubernetes_services
       expect { nx.wait }.to hop("sync_kubernetes_services")
     end
 
     it "hops to upgrade when semaphore is set" do
-      expect(nx).to receive(:when_upgrade_set?).and_yield
+      nx.incr_upgrade
       expect { nx.wait }.to hop("upgrade")
     end
 
+    it "sequences requested nodepool upgrades one at a time and consumes the semaphore when done" do
+      np1 = kubernetes_cluster.nodepools.first
+      np2 = Prog::Kubernetes::KubernetesNodepoolNexus.assemble(name: "cluster-np2", node_count: 1, kubernetes_cluster_id: kubernetes_cluster.id).subject
+      nps = [np1, np2]
+      nps.each { it.strand.update(label: "wait") }
+      nps.each(&:incr_upgrade_requested)
+      nx.incr_upgrade_nodepools
+
+      expect { nx.wait }.to nap(30)
+      expect(nps.map { it.reload.upgrade_requested_set? }).to eq([false, true])
+      expect(nps.map(&:upgrade_set?)).to eq([true, false])
+
+      np1.strand.update(label: "upgrade")
+      Semaphore.where(strand_id: np1.id, name: "upgrade").delete
+      kubernetes_cluster.nodepools(reload: true)
+      expect { nx.wait }.to nap(30)
+      expect(np2.upgrade_set?(cached: false)).to be false
+
+      np1.strand.update(label: "wait")
+      kubernetes_cluster.nodepools(reload: true)
+      expect { nx.wait }.to nap(30)
+      expect(np2.reload.upgrade_requested_set?).to be false
+      expect(np2.upgrade_set?).to be true
+
+      np2.strand.update(label: "wait")
+      Semaphore.where(strand_id: np2.id, name: "upgrade").delete
+      kubernetes_cluster.nodepools(reload: true)
+      expect { nx.wait }.to nap(6 * 60 * 60)
+      expect(kubernetes_cluster.upgrade_nodepools_set?(cached: false)).to be false
+    end
+
     it "hops to install_metrics_server when semaphore is set" do
-      expect(nx).to receive(:when_install_metrics_server_set?).and_yield
+      nx.incr_install_metrics_server
       expect { nx.wait }.to hop("install_metrics_server")
     end
 
     it "hops to sync_worker_mesh when semaphore is set" do
-      expect(nx).to receive(:when_sync_worker_mesh_set?).and_yield
+      nx.incr_sync_worker_mesh
       expect { nx.wait }.to hop("sync_worker_mesh")
     end
 
     it "hops to install_csi when semaphore is set" do
-      expect(nx).to receive(:when_install_csi_set?).and_yield
+      nx.incr_install_csi
       expect { nx.wait }.to hop("install_csi")
     end
 
+    it "hops to sync_csi_config when its semaphore is set" do
+      nx.incr_sync_csi_config
+      expect { nx.wait }.to hop("sync_csi_config")
+    end
+
     it "hops to sync_internal_dns_config when its semaphore is set" do
-      expect(nx).to receive(:when_sync_internal_dns_config_set?).and_yield
+      nx.incr_sync_internal_dns_config
       expect { nx.wait }.to hop("sync_internal_dns_config")
     end
 
+    it "hops to sync_kubeconfig when its semaphore is set" do
+      nx.incr_sync_kubeconfig
+      expect { nx.wait }.to hop("sync_kubeconfig")
+    end
+
+    it "hops to install_prometheus_rbac when its semaphore is set" do
+      nx.incr_install_prometheus_rbac
+      expect { nx.wait }.to hop("install_prometheus_rbac")
+    end
+
     it "hops to update_billing_records" do
-      expect(nx).to receive(:when_update_billing_records_set?).and_yield
+      nx.incr_update_billing_records
       expect { nx.wait }.to hop("update_billing_records")
     end
 
-    it "naps 6 hours if no semaphore is set and no connectivity_check_target" do
-      expect(kubernetes_cluster.connectivity_check_target).to be_nil
+    it "naps 6 hours if no semaphore is set" do
       expect { nx.wait }.to nap(6 * 60 * 60)
     end
 
-    it "creates or resolves depending on the connectivity to the connectivity_check_target set" do
-      kubernetes_cluster.update(connectivity_check_target: "some.pg.ubicloud.com:5432")
-
-      report = [{node: "n1", healthy: true}, {node: "n2", healthy: false}]
-      expect(kubernetes_cluster).to receive(:cluster_health_report).and_return(report)
-      expect { nx.wait }.to nap(120)
-
-      page = Page.from_tag_parts("K8sExternalConnectivityFailed", kubernetes_cluster.ubid)
-      expect(page).not_to be_nil
-      expect(page.details["report"]).to eq report.map { it.transform_keys(&:to_s) }
-
-      report[1][:healthy] = true
-      expect(kubernetes_cluster).to receive(:cluster_health_report).and_return(report)
-      expect(Page).to receive(:from_tag_parts).with("K8sExternalConnectivityFailed", kubernetes_cluster.ubid).and_return(page)
-      expect(page).to receive(:incr_resolve)
-
-      expect { nx.wait }.to nap(120)
+    it "naps 30 seconds while a CP node is renewing its certs" do
+      kubernetes_cluster.nodes.first.update(state: "renewing_certs")
+      expect { nx.wait }.to nap(30)
     end
 
-    it "creates the page if cluster_health_report raises 3 times" do
-      kubernetes_cluster.update(connectivity_check_target: "some.pg.ubicloud.com:5432")
-      expect(kubernetes_cluster).to receive(:cluster_health_report).and_raise(RuntimeError.new("kubectl failed")).exactly(3).times
-      expect(Clog).to receive(:emit).with("Failed to get cluster health report", hash_including(kubernetes_cluster_id: kubernetes_cluster.id)).exactly(3).times
-      expect { nx.wait }.to nap(120)
+    it "naps 30 seconds while a CP node still has its renew_certs semaphore set" do
+      kubernetes_cluster.nodes.first.incr_renew_certs
+      expect { nx.wait }.to nap(30)
+    end
+  end
+
+  describe "#renew_expiring_cp_certs" do
+    it "increments renew_certs on the first CP node whose cert is within the renewal window and naps" do
+      n1, n2 = kubernetes_cluster.nodes
+      expect(n1.sshable).to receive(:_cmd).with("sudo openssl x509 -enddate -noout -in /etc/kubernetes/pki/apiserver.crt").and_return("notAfter=#{(Time.now + 30 * 24 * 60 * 60).utc.strftime("%b %e %H:%M:%S %Y")} GMT\n")
+      expect { nx.renew_expiring_cp_certs }.to nap(30)
+      expect(n1.renew_certs_set?).to be true
+      expect(n2.renew_certs_set?).to be false
     end
 
-    it "succeeds if cluster_health_report raises less than 3 times and then succeeds" do
-      kubernetes_cluster.update(connectivity_check_target: "some.pg.ubicloud.com:5432")
-      expect(kubernetes_cluster).to receive(:cluster_health_report).and_raise(RuntimeError.new("kubectl failed")).twice
-      expect(kubernetes_cluster).to receive(:cluster_health_report).and_raise(RuntimeError.new("kubectl failed")).once.and_return([{node: "n1", healthy: true}, {node: "n2", healthy: true}])
-      expect(Clog).to receive(:emit).with("Failed to get cluster health report", hash_including(kubernetes_cluster_id: kubernetes_cluster.id)).twice
-      expect { nx.wait }.to nap(120)
+    it "does nothing when no CP node's cert is within the renewal window" do
+      n1, n2 = kubernetes_cluster.nodes
+      expect(n1.sshable).to receive(:_cmd).with("sudo openssl x509 -enddate -noout -in /etc/kubernetes/pki/apiserver.crt").and_return("notAfter=#{(Time.now + 365 * 24 * 60 * 60).utc.strftime("%b %e %H:%M:%S %Y")} GMT\n")
+      expect(n2.sshable).to receive(:_cmd).with("sudo openssl x509 -enddate -noout -in /etc/kubernetes/pki/apiserver.crt").and_return("notAfter=#{(Time.now + 365 * 24 * 60 * 60).utc.strftime("%b %e %H:%M:%S %Y")} GMT\n")
+      nx.renew_expiring_cp_certs
+      expect(n1.renew_certs_set?).to be false
+      expect(n2.renew_certs_set?).to be false
+    end
 
-      expect(Page.from_tag_parts("K8sExternalConnectivityFailed", kubernetes_cluster.ubid)).to be_nil
+    it "naps without checking certs while a CP node is already renewing" do
+      n1, n2 = kubernetes_cluster.nodes
+      n1.update(state: "renewing_certs")
+      expect(n1.sshable).not_to receive(:_cmd)
+      expect(n2.sshable).not_to receive(:_cmd)
+      expect { nx.renew_expiring_cp_certs }.to nap(30)
+      expect(n2.renew_certs_set?).to be false
+    end
+
+    it "naps without checking certs while a CP node has the renew_certs semaphore set" do
+      n1, n2 = kubernetes_cluster.nodes
+      n1.incr_renew_certs
+      expect(n1.sshable).not_to receive(:_cmd)
+      expect(n2.sshable).not_to receive(:_cmd)
+      expect { nx.renew_expiring_cp_certs }.to nap(30)
+      expect(n2.renew_certs_set?).to be false
     end
   end
 
@@ -459,82 +613,92 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
     let(:first_node) { kubernetes_cluster.nodes[0] }
     let(:second_node) { kubernetes_cluster.nodes[1] }
     let(:client) { instance_double(Kubernetes::Client) }
+    let(:cluster_version) { Option.kubernetes_versions[0] }
+    let(:older_version) { Option.kubernetes_versions[1] }
+    let(:much_older_version) { Option.kubernetes_versions[2] }
+    let(:newer_version) {
+      major, minor = cluster_version.match(/^v(\d+)\.(\d+)$/).captures.map(&:to_i)
+      "v#{major}.#{minor + 1}"
+    }
 
-    before do
-      sshable0, sshable1 = Sshable.new, instance_double(Sshable)
-      expect(first_node).to receive(:sshable).and_return(sshable0).at_least(:once)
-      allow(second_node).to receive(:sshable).and_return(sshable1)
-      allow(sshable0).to receive(:connect)
-      allow(sshable1).to receive(:connect)
-
-      expect(kubernetes_cluster).to receive(:client).and_return(client).at_least(:once)
+    # The nodes are visited in order, and the walk stops at the first one that is behind,
+    # so a caller passes only the versions it expects to be read.
+    def expect_reported_versions(*versions)
+      versions.each_with_index do |version, i|
+        node_session = Net::SSH::Connection::Session.allocate
+        expect(kubernetes_cluster.nodes[i].sshable).to receive(:connect).and_return(node_session)
+        expect(node_session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s version --client").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("Client Version: #{version}.0\n", 0))
+      end
     end
 
     it "selects a Node with minor version one less than the cluster's version" do
-      expect(kubernetes_cluster).to receive(:version).and_return("v1.32").twice
-      expect(client).to receive(:version).and_return("v1.32", "v1.31")
-      expect(nx).to receive(:bud).with(Prog::Kubernetes::UpgradeKubernetesNode, {"old_node_id" => second_node.id})
+      expect_reported_versions(cluster_version, older_version)
       expect { nx.upgrade }.to hop("wait_upgrade")
+      expect(st.children.map { [it.prog, it.stack.first["old_node_id"]] }).to eq [["Kubernetes::UpgradeKubernetesNode", second_node.id]]
     end
 
     it "hops to wait when all nodes are at the cluster's version" do
-      expect(kubernetes_cluster).to receive(:version).and_return("v1.32").twice
-      expect(client).to receive(:version).and_return("v1.32", "v1.32")
+      expect_reported_versions(cluster_version, cluster_version)
       expect { nx.upgrade }.to hop("wait")
     end
 
     it "does not select a node with minor version more than one less than the cluster's version" do
-      expect(kubernetes_cluster).to receive(:version).and_return("v1.32").twice
-      expect(client).to receive(:version).and_return("v1.30", "v1.32")
+      expect_reported_versions(much_older_version, cluster_version)
       expect { nx.upgrade }.to hop("wait")
     end
 
     it "skips node with invalid version formats" do
-      expect(kubernetes_cluster).to receive(:version).and_return("v1.32").twice
-      expect(client).to receive(:version).and_return("invalid", "v1.32")
+      [first_node, second_node].each { expect(it.sshable).to receive(:connect) }
+      expect(kubernetes_cluster).to receive(:client).and_return(client).twice
+      expect(client).to receive(:version).and_return("invalid", cluster_version)
       expect { nx.upgrade }.to hop("wait")
+
+      page = Page.from_tag_parts("K8sInvalidVersion", kubernetes_cluster.ubid, first_node.name)
+      expect(page.summary).to eq "Invalid version format for #{first_node.name} of cluster #{kubernetes_cluster.ubid}"
+      expect(page.resource_id).to eq first_node.id
     end
 
     it "selects the first node that is one minor version behind" do
-      expect(kubernetes_cluster).to receive(:version).and_return("v1.32")
-      expect(client).to receive(:version).and_return("v1.31")
-      expect(nx).to receive(:bud).with(Prog::Kubernetes::UpgradeKubernetesNode, {"old_node_id" => first_node.id})
+      expect_reported_versions(older_version)
       expect { nx.upgrade }.to hop("wait_upgrade")
-    end
-
-    it "hops to wait if cluster version is invalid" do
-      expect(kubernetes_cluster).to receive(:version).and_return("invalid").twice
-      expect(client).to receive(:version).and_return("v1.31", "v1.31")
-      expect { nx.upgrade }.to hop("wait")
+      expect(st.children.map { [it.prog, it.stack.first["old_node_id"]] }).to eq [["Kubernetes::UpgradeKubernetesNode", first_node.id]]
     end
 
     it "does not select a node with a higher minor version than the cluster" do
-      expect(kubernetes_cluster).to receive(:version).and_return("v1.32").twice
-      expect(client).to receive(:version).and_return("v1.33", "v1.32")
+      expect_reported_versions(newer_version, cluster_version)
       expect { nx.upgrade }.to hop("wait")
     end
   end
 
   describe "#wait_upgrade" do
     it "hops back to upgrade if there are no sub-programs running" do
-      st.update(prog: "Kubernetes::KubernetesClusterNexus", label: "destroy", stack: [{}])
+      st.update(label: "destroy")
       expect { nx.wait_upgrade }.to hop("upgrade")
     end
 
     it "donates if there are sub-programs running" do
-      st.update(prog: "Kubernetes::KubernetesClusterNexus", label: "destroy", stack: [{}])
+      st.update(label: "destroy")
       Strand.create(parent_id: st.id, prog: "Kubernetes::ProvisionKubernetesNode", label: "start", stack: [{}], lease: Time.now + 10)
       expect { nx.wait_upgrade }.to nap(120)
     end
   end
 
-  describe "#install_metrics_server" do
-    let(:sshable) { Sshable.new }
-    let(:node) { KubernetesNode.create(vm_id: create_vm.id, kubernetes_cluster_id: kubernetes_cluster.id) }
+  describe "#install_prometheus_rbac" do
+    it "applies the rbac manifest and reconfigures metrics on the control plane nodes" do
+      nx.incr_install_prometheus_rbac
+      ssh_session = Net::SSH::Connection::Session.allocate
+      expect(kubernetes_cluster.sshable).to receive(:connect).and_return(ssh_session)
+      expect(ssh_session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s apply -f /home/ubi/kubernetes/lib/prometheus-rbac.yaml").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
 
-    before do
-      allow(kubernetes_cluster.cp_vms.first).to receive(:sshable).and_return(sshable)
+      expect { nx.install_prometheus_rbac }.to hop("wait")
+
+      expect(kubernetes_cluster.install_prometheus_rbac_set?).to be false
+      expect(kubernetes_cluster.reload.nodes.map { it.configure_metrics_set? }).to eq [true, true]
     end
+  end
+
+  describe "#install_metrics_server" do
+    let(:sshable) { kubernetes_cluster.cp_vms.first.sshable }
 
     it "runs install_metrics_server and naps when not started" do
       expect(sshable).to receive(:d_check).with("install_metrics_server").and_return("NotStarted")
@@ -568,6 +732,7 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
     let(:first_ssh_key) { SshKey.generate }
     let(:second_vm) { Prog::Vm::Nexus.assemble_with_sshable(customer_project.id).subject }
     let(:second_ssh_key) { SshKey.generate }
+    let(:worker_mesh_nodes) { kubernetes_cluster.worker_mesh_nodes }
 
     before do
       KubernetesNode.create(vm_id: first_vm.id, kubernetes_cluster_id: kubernetes_cluster.id, kubernetes_nodepool_id: kubernetes_cluster.nodepools.first.id, created_at: Time.now - 1)
@@ -576,13 +741,53 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
     end
 
     it "creates full mesh connectivity on cluster worker nodes" do
-      expect(kubernetes_cluster.worker_functional_nodes.first.vm.sshable).to receive(:_cmd).with("tee ~/.ssh/id_ed25519 > /dev/null && chmod 0600 ~/.ssh/id_ed25519", stdin: first_ssh_key.private_key)
-      first_vm_authorized_keys = [first_vm.sshable.keys.first.public_key, first_ssh_key.public_key, second_ssh_key.public_key].join("\n") + "\n"
-      expect(kubernetes_cluster.worker_functional_nodes.first.vm.sshable).to receive(:_cmd).with("tee ~/.ssh/authorized_keys > /dev/null && chmod 0600 ~/.ssh/authorized_keys", stdin: first_vm_authorized_keys)
+      first_sshable = worker_mesh_nodes.first.vm.sshable
+      second_sshable = worker_mesh_nodes.last.vm.sshable
 
-      expect(kubernetes_cluster.worker_functional_nodes.last.vm.sshable).to receive(:_cmd).with("tee ~/.ssh/id_ed25519 > /dev/null && chmod 0600 ~/.ssh/id_ed25519", stdin: second_ssh_key.private_key)
+      expect(first_sshable).to receive(:_cmd).with("tee ~/.ssh/id_ed25519 > /dev/null && chmod 0600 ~/.ssh/id_ed25519", stdin: first_ssh_key.private_key)
+      first_vm_authorized_keys = [first_sshable.keys.first.public_key, first_ssh_key.public_key, second_ssh_key.public_key].join("\n") + "\n"
+      expect(first_sshable).to receive(:_cmd).with("tee /home/ubi/.ssh/authorized_keys > /dev/null", stdin: first_vm_authorized_keys)
+
+      expect(second_sshable).to receive(:_cmd).with("tee ~/.ssh/id_ed25519 > /dev/null && chmod 0600 ~/.ssh/id_ed25519", stdin: second_ssh_key.private_key)
+      second_vm_authorized_keys = [second_sshable.keys.first.public_key, first_ssh_key.public_key, second_ssh_key.public_key].join("\n") + "\n"
+      expect(second_sshable).to receive(:_cmd).with("tee /home/ubi/.ssh/authorized_keys > /dev/null", stdin: second_vm_authorized_keys)
+
+      expect { nx.sync_worker_mesh }.to hop("wait")
+    end
+
+    it "appends operator keys to the mesh when configured" do
+      operator_key = "ssh-ed25519 AAAAoperator operator@ubicloud"
+      allow(Config).to receive(:operator_ssh_public_keys).and_return(operator_key)
+      first_sshable = worker_mesh_nodes.first.vm.sshable
+      second_sshable = worker_mesh_nodes.last.vm.sshable
+
+      expect(first_sshable).to receive(:_cmd).with("tee ~/.ssh/id_ed25519 > /dev/null && chmod 0600 ~/.ssh/id_ed25519", stdin: first_ssh_key.private_key)
+      first_vm_authorized_keys = [first_sshable.keys.first.public_key, first_ssh_key.public_key, second_ssh_key.public_key, operator_key].join("\n") + "\n"
+      expect(first_sshable).to receive(:_cmd).with("tee /home/ubi/.ssh/authorized_keys > /dev/null", stdin: first_vm_authorized_keys)
+
+      expect(second_sshable).to receive(:_cmd).with("tee ~/.ssh/id_ed25519 > /dev/null && chmod 0600 ~/.ssh/id_ed25519", stdin: second_ssh_key.private_key)
+      second_vm_authorized_keys = [second_sshable.keys.first.public_key, first_ssh_key.public_key, second_ssh_key.public_key, operator_key].join("\n") + "\n"
+      expect(second_sshable).to receive(:_cmd).with("tee /home/ubi/.ssh/authorized_keys > /dev/null", stdin: second_vm_authorized_keys)
+
+      expect { nx.sync_worker_mesh }.to hop("wait")
+    end
+
+    it "keeps draining nodes in the mesh so in-flight CSI migrations don't lose ssh access" do
+      kubernetes_cluster.nodepools.first.nodes.last.update(state: "draining")
+
+      first_vm = worker_mesh_nodes.first.vm
+      second_vm = worker_mesh_nodes.last.vm
+
+      expect(kubernetes_cluster.worker_functional_nodes.map(&:vm)).to eq [first_vm]
+      expect(worker_mesh_nodes.map(&:vm)).to eq [first_vm, second_vm]
+
+      expect(first_vm.sshable).to receive(:_cmd).with("tee ~/.ssh/id_ed25519 > /dev/null && chmod 0600 ~/.ssh/id_ed25519", stdin: first_ssh_key.private_key)
+      first_vm_authorized_keys = [first_vm.sshable.keys.first.public_key, first_ssh_key.public_key, second_ssh_key.public_key].join("\n") + "\n"
+      expect(first_vm.sshable).to receive(:_cmd).with("tee /home/ubi/.ssh/authorized_keys > /dev/null", stdin: first_vm_authorized_keys)
+
+      expect(second_vm.sshable).to receive(:_cmd).with("tee ~/.ssh/id_ed25519 > /dev/null && chmod 0600 ~/.ssh/id_ed25519", stdin: second_ssh_key.private_key)
       second_vm_authorized_keys = [second_vm.sshable.keys.first.public_key, first_ssh_key.public_key, second_ssh_key.public_key].join("\n") + "\n"
-      expect(kubernetes_cluster.worker_functional_nodes.last.vm.sshable).to receive(:_cmd).with("tee ~/.ssh/authorized_keys > /dev/null && chmod 0600 ~/.ssh/authorized_keys", stdin: second_vm_authorized_keys)
+      expect(second_vm.sshable).to receive(:_cmd).with("tee /home/ubi/.ssh/authorized_keys > /dev/null", stdin: second_vm_authorized_keys)
 
       expect { nx.sync_worker_mesh }.to hop("wait")
     end
@@ -590,22 +795,127 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
 
   describe "#install_csi" do
     it "installs the ubicsi on the cluster" do
-      client = Kubernetes::Client.new(kubernetes_cluster, session)
-      expect(kubernetes_cluster).to receive(:client).and_return(client)
+      expect(kubernetes_cluster.sshable).to receive(:connect).and_return(session)
       response = Net::SSH::Connection::Session::StringWithExitstatus.new("", 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f kubernetes/manifests/ubicsi").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s apply -f kubernetes/manifests/ubicsi").and_return(response)
       expect { nx.install_csi }.to hop("wait")
     end
   end
 
-  describe "#sync_internal_dns_config" do
+  describe "#sync_csi_config" do
     let(:client) { Kubernetes::Client.new(kubernetes_cluster, session) }
-    let(:sshable) { Sshable.new }
-    let(:node) { KubernetesNode.create(vm_id: create_vm.id, kubernetes_cluster_id: kubernetes_cluster.id) }
+    let(:rendered_config_map) {
+      <<~YAML
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ubicsi-config
+          namespace: ubicsi
+        data:
+          EXTERNAL_ENDPOINTS: ipv4.google.com:443
+          DISK_LIMIT_GB: '50'
+          RESERVE_PERCENT: '20'
+      YAML
+    }
 
     before do
+      kubernetes_cluster.update(csi_config: {"DISK_LIMIT_GB" => "50"})
       expect(kubernetes_cluster).to receive(:client).and_return(client)
-      allow(kubernetes_cluster).to receive(:sshable).and_return(sshable)
+    end
+
+    def stub_live_config_map(output)
+      response = Net::SSH::Connection::Session::StringWithExitstatus.new(output, 0)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s -n ubicsi get cm ubicsi-config -ojson --ignore-not-found").and_return(response)
+    end
+
+    def expect_config_map_applied
+      response = Net::SSH::Connection::Session::StringWithExitstatus.new("configmap/ubicsi-config configured", 0)
+      expect(session).to receive(:_exec!).with("printf '%s' #{rendered_config_map.shellescape} | sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s apply -f -").and_return(response)
+    end
+
+    it "creates the config map when the cluster does not have one" do
+      stub_live_config_map("")
+      expect_config_map_applied
+
+      expect { nx.sync_csi_config }.to hop("restart_csi_workloads")
+      expect(nx.changed_csi_config_keys).to eq ["EXTERNAL_ENDPOINTS", "DISK_LIMIT_GB", "RESERVE_PERCENT"]
+      expect(kubernetes_cluster.sync_csi_config_set?).to be false
+    end
+
+    it "records only the keys whose value changed" do
+      stub_live_config_map(JSON.generate({"data" => {"EXTERNAL_ENDPOINTS" => "ipv4.google.com:443", "DISK_LIMIT_GB" => "10", "RESERVE_PERCENT" => "20"}}))
+      expect_config_map_applied
+
+      expect { nx.sync_csi_config }.to hop("restart_csi_workloads")
+      expect(nx.changed_csi_config_keys).to eq ["DISK_LIMIT_GB"]
+    end
+
+    it "leaves the config map alone when it already matches" do
+      stub_live_config_map(JSON.generate({"data" => kubernetes_cluster.rendered_csi_config}))
+
+      expect { nx.sync_csi_config }.to hop("wait")
+    end
+  end
+
+  describe "#restart_csi_workloads" do
+    let(:client) { Kubernetes::Client.new(kubernetes_cluster, session) }
+
+    before { expect(kubernetes_cluster).to receive(:client).and_return(client) }
+
+    def expect_rollout_restart(resource)
+      response = Net::SSH::Connection::Session::StringWithExitstatus.new("#{resource} restarted", 0)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s -n ubicsi rollout restart #{resource}").and_return(response)
+    end
+
+    it "restarts both workloads when keys for both changed" do
+      nx.changed_csi_config_keys = ["EXTERNAL_ENDPOINTS", "DISK_LIMIT_GB"]
+      expect_rollout_restart("daemonset/ubicsi-nodeplugin")
+      expect_rollout_restart("deployment/ubicsi-provisioner")
+
+      expect { nx.restart_csi_workloads }.to hop("wait")
+      expect(nx.changed_csi_config_keys).to be_nil
+    end
+
+    it "restarts only the provisioner when a provisioner key changed" do
+      nx.changed_csi_config_keys = ["RESERVE_PERCENT"]
+      expect_rollout_restart("deployment/ubicsi-provisioner")
+
+      expect { nx.restart_csi_workloads }.to hop("wait")
+    end
+
+    it "restarts only the nodeplugin when a nodeplugin key changed" do
+      nx.changed_csi_config_keys = ["EXTERNAL_ENDPOINTS"]
+      expect_rollout_restart("daemonset/ubicsi-nodeplugin")
+
+      expect { nx.restart_csi_workloads }.to hop("wait")
+    end
+  end
+
+  describe "#sync_kubeconfig" do
+    it "generates the kubeconfig and stores it base64-encoded" do
+      sshable = kubernetes_cluster.cp_vms.first.sshable
+      expect(sshable).to receive(:_cmd).with("kubectl --kubeconfig <(sudo cat /etc/kubernetes/admin.conf) -n kube-system get secret k8s-access -o jsonpath='{.data.token}' | base64 -d", log: false).and_return("mocked_rbac_token")
+      expect(sshable).to receive(:_cmd).with("sudo cat /etc/kubernetes/admin.conf", log: false).and_return(<<~YAML)
+        users:
+          - name: admin
+            user:
+              client-certificate-data: "cert"
+              client-key-data: "key"
+      YAML
+
+      expect { nx.sync_kubeconfig }.to hop("wait")
+
+      stored = YAML.safe_load(kubernetes_cluster.reload.kubeconfig)
+      expect(stored["users"].first["user"]["token"]).to eq("mocked_rbac_token")
+    end
+  end
+
+  describe "#sync_internal_dns_config" do
+    let(:sshable) { kubernetes_cluster.sshable }
+
+    before do
+      expect(sshable).to receive(:connect).and_return(session)
     end
 
     it "returns early if Corefile is not found" do
@@ -617,20 +927,16 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
       namespace: kube-system
       YAML
       response = Net::SSH::Connection::Session::StringWithExitstatus.new(get_cm, 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get cm coredns -oyaml").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s -n kube-system get cm coredns -oyaml").and_return(response)
       expect { nx.sync_internal_dns_config }.to hop("wait")
     end
 
-    it "adds the ubicloud block and replaces the configmap" do
+    it "adds the ubicloud block for functional nodes and replaces the configmap" do
+      KubernetesNode.create(vm_id: create_vm.id, kubernetes_cluster_id: kubernetes_cluster.id, state: "draining")
+      KubernetesNode.create(vm_id: create_vm.id, kubernetes_cluster_id: kubernetes_cluster.id, kubernetes_nodepool_id: kubernetes_cluster.nodepools.first.id, state: "draining")
       nodes = kubernetes_cluster.functional_nodes
-      expect(nodes.first.vm).to receive_messages(
-        ip4: NetAddr.parse_ip("1.2.3.4"),
-        ip6: NetAddr.parse_ip("2001:db8::1234"),
-      )
-      expect(nodes.last.vm).to receive_messages(
-        ip4: NetAddr.parse_ip("5.6.7.8"),
-        ip6: NetAddr.parse_ip("2001:db8::5678"),
-      )
+      nodes.first.vm.user_nic.update(private_ipv4: "10.39.0.5/32", private_ipv6: "fd8c:1234::/79")
+      nodes.last.vm.user_nic.update(private_ipv4: "10.39.0.9/32", private_ipv6: "fd8c:5678::/79")
       get_cm = <<~YAML
     apiVersion: v1
     data:
@@ -682,10 +988,10 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
             }
             hosts {
                 # Ubicloud Hosts
-                1.2.3.4 cp-0
-                2001:db8::1234 cp-0
-                5.6.7.8 cp-1
-                2001:db8::5678 cp-1
+                10.39.0.5 #{nodes.first.name}
+                fd8c:1234::2 #{nodes.first.name}
+                10.39.0.9 #{nodes.last.name}
+                fd8c:5678::2 #{nodes.last.name}
                 # End of Ubicloud Hosts
                 fallthrough
             }
@@ -708,8 +1014,9 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
       YAML
 
       response = Net::SSH::Connection::Session::StringWithExitstatus.new(get_cm, 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get cm coredns -oyaml").and_return(response)
-      expect(sshable).to receive(:_cmd).with("sudo kubectl --kubeconfig /etc/kubernetes/admin.conf replace -f -", stdin: replace_cm)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s -n kube-system get cm coredns -oyaml").and_return(response)
+      replace_response = Net::SSH::Connection::Session::StringWithExitstatus.new("configmap/coredns replaced", 0)
+      expect(session).to receive(:_exec!).with("printf '%s' #{replace_cm.shellescape} | sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s replace -f -").and_return(replace_response)
       expect { nx.sync_internal_dns_config }.to hop("wait")
     end
 
@@ -748,7 +1055,7 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
       YAML
 
       response = Net::SSH::Connection::Session::StringWithExitstatus.new(invalid_corefile, 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get cm coredns -oyaml").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s -n kube-system get cm coredns -oyaml").and_return(response)
       expect { nx.sync_internal_dns_config }.to raise_error(RuntimeError, "Kubernetes block not found.")
     end
 
@@ -771,20 +1078,20 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
       YAML
 
       response = Net::SSH::Connection::Session::StringWithExitstatus.new(broken_corefile, 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf -n kube-system get cm coredns -oyaml").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s -n kube-system get cm coredns -oyaml").and_return(response)
       expect { nx.sync_internal_dns_config }.to raise_error(RuntimeError, "Closing brace not found.")
     end
   end
 
   describe "#destroy" do
     it "donates if there are sub-programs running (Provision...)" do
-      st.update(prog: "Kubernetes::KubernetesClusterNexus", label: "destroy", stack: [{}])
+      st.update(label: "destroy")
       Strand.create(parent_id: st.id, prog: "Kubernetes::ProvisionKubernetesNode", label: "start", stack: [{}], lease: Time.now + 10)
       expect { nx.destroy }.to nap(120)
     end
 
     it "naps until all nodepools are gone" do
-      st.update(prog: "Kubernetes::KubernetesClusterNexus", label: "destroy", stack: [{}])
+      st.update(label: "destroy")
       kubernetes_nodepool = kubernetes_cluster.nodepools.first
       Prog::Kubernetes::KubernetesNodeNexus.assemble(
         Config.kubernetes_service_project_id,
@@ -794,65 +1101,74 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
         size: kubernetes_nodepool.target_node_size,
         storage_volumes: [{encrypted: true, size_gib: kubernetes_nodepool.target_node_storage_size_gib}],
         boot_image: "kubernetes-#{kubernetes_cluster.version.tr(".", "_")}",
-        private_subnet_id: kubernetes_cluster.private_subnet_id,
         enable_ip4: true,
         kubernetes_cluster_id: kubernetes_cluster.id,
         kubernetes_nodepool_id: kubernetes_nodepool.id,
       ).subject
-      expect(kubernetes_cluster.nodes).to all(receive(:incr_destroy))
-      expect(kubernetes_cluster.nodepools).to all(receive(:incr_destroy))
-
       expect(kubernetes_cluster).not_to receive(:destroy)
 
       expect { nx.destroy }.to nap(5)
+      expect(kubernetes_cluster.nodes.map(&:destroy_set?)).to all(be true)
+      expect(kubernetes_cluster.nodepools.map(&:destroy_set?)).to all(be true)
       expect(kubernetes_cluster.private_subnet.semaphores_dataset.select_map(:name)).to eq []
     end
 
     it "naps until all control plane nodes are gone" do
-      st.update(prog: "Kubernetes::KubernetesClusterNexus", label: "destroy", stack: [{}])
+      st.update(label: "destroy")
       kubernetes_cluster.nodepools_dataset.destroy
-      expect(kubernetes_cluster.nodes).to all(receive(:incr_destroy))
       expect(kubernetes_cluster.nodepools).to be_empty
 
       expect { nx.destroy }.to nap(5)
+      expect(kubernetes_cluster.nodes.map(&:destroy_set?)).to all(be true)
       expect(kubernetes_cluster.private_subnet.semaphores_dataset.select_map(:name)).to eq []
     end
 
     it "does not incr_destroy private_subnet with other resources" do
-      st.update(prog: "Kubernetes::KubernetesClusterNexus", label: "destroy", stack: [{}])
+      st.update(label: "destroy")
       kubernetes_cluster.nodepools_dataset.destroy
-      expect(kubernetes_cluster.nodes).to all(receive(:incr_destroy))
       expect(kubernetes_cluster.nodepools).to be_empty
 
       Firewall.create(name: "t", project_id: customer_project.id, location_id: Location::HETZNER_FSN1_ID)
         .associate_with_private_subnet(kubernetes_cluster.private_subnet, apply_firewalls: false)
 
       expect { nx.destroy }.to nap(5)
+      expect(kubernetes_cluster.nodes.map(&:destroy_set?)).to all(be true)
       expect(kubernetes_cluster.private_subnet.semaphores_dataset.select_map(:name)).to eq []
     end
 
+    it "naps until etcd backup is gone" do
+      Prog::Kubernetes::EtcdBackupNexus.assemble(kubernetes_cluster.id)
+      st.update(label: "destroy")
+      kubernetes_cluster.nodepools_dataset.destroy
+      kubernetes_cluster.nodes_dataset.destroy
+      kubernetes_cluster.reload
+
+      expect { nx.destroy }.to nap(5)
+
+      expect(kubernetes_cluster.kubernetes_etcd_backup.destroy_set?).to be true
+    end
+
     it "triggers deletion of associated resources and completes destroy when nodepools are gone" do
-      KubernetesEtcdBackup.create(kubernetes_cluster_id: kubernetes_cluster.id, access_key: "access", secret_key: "secret", location_id: Location::HETZNER_FSN1_ID)
-      st.update(prog: "Kubernetes::KubernetesClusterNexus", label: "destroy", stack: [{}])
+      st.update(label: "destroy")
+      api_server_lb = kubernetes_cluster.api_server_lb
+      services_lb = kubernetes_cluster.services_lb
+      cp_vms = kubernetes_cluster.cp_vms
       kubernetes_cluster.nodepools.first.destroy
+      cp_vms.each(&:incr_destroy)
       kubernetes_cluster.nodes.map(&:destroy)
       kubernetes_cluster.reload
 
-      expect(kubernetes_cluster.api_server_lb).to receive(:incr_destroy)
-      expect(kubernetes_cluster.services_lb).to receive(:incr_destroy)
-      expect(kubernetes_cluster.cp_vms).to all(receive(:incr_destroy))
-      expect(kubernetes_cluster.nodes).to all(receive(:incr_destroy))
-
-      expect(kubernetes_cluster.kubernetes_etcd_backup).to receive(:incr_destroy)
-      kubernetes_cluster.kubernetes_etcd_backup.destroy
-
       expect(kubernetes_cluster.nodepools).to be_empty
+      expect(kubernetes_cluster.kubernetes_etcd_backup).to be_nil
 
       expect(kubernetes_cluster.internal_cp_vm_firewall.exists?).to be true
       expect(kubernetes_cluster.internal_worker_vm_firewall.exists?).to be true
 
       expect(kubernetes_cluster.private_subnet.semaphores_dataset.select_map(:name)).to eq []
       expect { nx.destroy }.to exit({"msg" => "kubernetes cluster is deleted"})
+      expect(api_server_lb.destroy_set?).to be true
+      expect(services_lb.destroy_set?).to be true
+      expect(cp_vms.map(&:destroy_set?)).to all(be true)
       expect(kubernetes_cluster.private_subnet.semaphores_dataset.select_order_map(:name)).to eq ["destroy", "update_firewall_rules"]
 
       expect(kubernetes_cluster.internal_cp_vm_firewall).to be_nil
@@ -862,7 +1178,7 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
     it "deletes the sub-subdomain DNS record if the DNS zone exists" do
       kubernetes_cluster.nodepools_dataset.destroy
       kubernetes_cluster.nodes_dataset.destroy
-      dns_zone = DnsZone.create(project_id: Project.first.id, name: "k8s.ubicloud.com", last_purged_at: Time.now)
+      dns_zone = DnsZone[name: "k8s.ubicloud.com"]
       kubernetes_cluster.services_lb.update(custom_hostname_dns_zone_id: dns_zone.id)
 
       dns_zone.insert_record(record_name: "*.#{kubernetes_cluster.services_lb.hostname}.", type: "CNAME", ttl: 123, data: "whatever.")
@@ -880,11 +1196,25 @@ RSpec.describe Prog::Kubernetes::KubernetesClusterNexus do
     end
 
     it "completes the destroy process even if the load balancers do not exist" do
+      api_server_lb = kubernetes_cluster.api_server_lb
+      services_lb = kubernetes_cluster.services_lb
       kubernetes_cluster.update(api_server_lb_id: nil, services_lb_id: nil)
+      api_server_lb.destroy
+      services_lb.destroy
       kubernetes_cluster.nodepools_dataset.destroy
       kubernetes_cluster.nodes_dataset.destroy
 
       expect { nx.destroy }.to exit({"msg" => "kubernetes cluster is deleted"})
+    end
+
+    it "resolves the node version pages" do
+      st.update(label: "destroy")
+      node = kubernetes_cluster.nodes.first
+      Prog::PageNexus.assemble("existing", ["K8sInvalidVersion", kubernetes_cluster.ubid, node.name], node.ubid, resource_id: node.id)
+
+      expect { nx.destroy }.to nap(5)
+
+      expect(Page.from_tag_parts("K8sInvalidVersion", kubernetes_cluster.ubid, node.name).resolve_set?).to be true
     end
   end
 end

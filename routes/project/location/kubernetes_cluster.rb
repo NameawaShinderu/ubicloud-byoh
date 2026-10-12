@@ -47,24 +47,88 @@ class Clover
         end
       end
 
+      r.get "metrics", r.accepts_json? do
+        authorize("KubernetesCluster:view", kc)
+
+        metrics_response(Metrics::KUBERNETES_METRICS, kc.ubid, VictoriaMetricsResource.client_for_project(Config.kubernetes_service_project_id))
+      end
+
       r.rename kc, perm: "KubernetesCluster:edit", serializer: Serializers::KubernetesCluster, template_prefix: "kubernetes-cluster"
 
-      r.show_object(kc, actions: %w[overview nodes settings], perm: "KubernetesCluster:view", template: "kubernetes-cluster/show")
+      r.show_object(kc, actions: %w[overview nodepools charts networking settings].freeze, perm: "KubernetesCluster:view", template: "kubernetes-cluster/show")
+
+      r.post web?, "connect-postgres", :ubid_uuid, :ubid_uuid do |pg_id, fw_id|
+        authorize("KubernetesCluster:view", kc)
+        handle_validation_failure("kubernetes-cluster/show") { @page = "networking" }
+
+        pg = @project.postgres_resources_dataset.first(location_id: kc.location_id, id: pg_id)
+        check_found_object(pg)
+        authorize("Postgres:view", pg)
+
+        kc_ps = kc.private_subnet
+        pg_ps = pg.private_subnet
+
+        authorize("PrivateSubnet:connect", kc_ps.id)
+        authorize("PrivateSubnet:connect", pg_ps.id)
+
+        fw = pg_ps.firewalls_dataset.first(id: fw_id)
+        if fw.private_subnets_dataset.count > 1
+          flash["error"] = "Unable to connect to #{pg.name} as the requested firewall is used by other subnets."
+          r.redirect kc, "/networking"
+        end
+        authorize("Firewall:edit", fw.id)
+
+        cidrs = [kc_ps.net4.to_s, kc_ps.net6.to_s]
+        ranges = [Sequel.pg_range(5432...5433), Sequel.pg_range(6432...6433)]
+
+        fw_rules = fw.firewall_rules_dataset
+          .where(cidr: cidrs, port_range: ranges)
+          .select_map([:cidr, :port_range])
+          .to_set do |cidr, port_range|
+            [cidr.to_s, port_range.begin, port_range.end]
+          end
+
+        DB.transaction do
+          kc_ps.connect_subnet(pg_ps)
+          audit_log(kc_ps, "connect", pg_ps)
+
+          fwrs = DB.ignore_duplicate_queries do
+            ranges.flat_map do |range|
+              cidrs.map do |cidr|
+                unless fw_rules.include?([cidr, range.begin, range.end])
+                  fw.insert_firewall_rule(cidr, range)
+                end
+              end
+            end
+          end
+          fwrs.compact!
+          if (fwr = fwrs.shift)
+            audit_log(fwr, "create", fwrs << fw)
+          end
+        end
+
+        flash["notice"] = "Connecting to #{pg.name}. Firewall rules will be updated in a few seconds."
+        r.redirect kc, "/networking"
+      end
 
       r.get "kubeconfig" do
         authorize("KubernetesCluster:edit", kc)
         handle_validation_failure("kubernetes-cluster/show") { @page = "overview" }
 
-        # TODO: Avoid SSH connection from console to k8s cp nodes
-        unless (kubeconfig = kc.kubeconfig(swallow_connection_exception: true))
-          raise CloverError.new(503, "ServiceUnavailable", "Temporary error downloading kubeconfig.yaml. Please try again.")
+        unless kc.kubeconfig
+          fail_kubernetes_unprocessable("Cluster is not ready, kubeconfig is not available yet")
         end
 
         response.attachment "#{kc.name}-kubeconfig.yaml"
-        kubeconfig
+        kc.kubeconfig
       end
 
-      r.post "nodepool", KUBERNETES_NODEPOOL_NAME_OR_UBID, "resize" do |kn_name, kn_id|
+      r.post "nodepool" do
+        handle_validation_failure("kubernetes-cluster/show") { @page = "nodepools" }
+        kubernetes_nodepool_post(typecast_params.nonempty_str!("name"))
+      end
+
+      r.on "nodepool", KUBERNETES_NODEPOOL_NAME_OR_UBID do |kn_name, kn_id|
         filter = if kn_name
           {Sequel[:kubernetes_nodepool][:name] => kn_name}
         else
@@ -76,28 +140,149 @@ class Clover
 
         check_found_object(kn)
 
-        authorize("KubernetesCluster:edit", kc.id)
-        handle_validation_failure("kubernetes-cluster/show") { @page = "settings" }
-        node_count = typecast_params.pos_int!("node_count")
-        Validation.validate_kubernetes_worker_node_count(node_count)
-
-        if node_count > kn.node_count
-          node_size = Validation.validate_vm_size(kn.target_node_size, "x64")
-          extra_vcpu_count = (node_count - kn.node_count) * node_size.vcpus
-
-          Validation.validate_vcpu_quota(@project, "KubernetesVCpu", extra_vcpu_count, name: :node_count)
+        r.get web? do
+          authorize("KubernetesCluster:view", kc.id)
+          r.redirect kn, "/overview"
         end
 
+        r.rename kn, perm: "KubernetesCluster:edit", serializer: Serializers::KubernetesNodepool, template_prefix: "kubernetes-cluster/nodepool"
+
+        r.show_object(kn, actions: %w[overview nodes settings], perm: "KubernetesCluster:view", template: "kubernetes-cluster/nodepool/show")
+
+        r.post "resize" do
+          authorize("KubernetesCluster:edit", kc.id)
+          handle_validation_failure("kubernetes-cluster/nodepool/show") { @page = "settings" }
+
+          unless kn.idle?
+            fail_kubernetes_unprocessable("Nodepool is not ready to be resized")
+          end
+
+          unless kc.idle?
+            fail_kubernetes_unprocessable("Cluster is not ready to resize a nodepool")
+          end
+
+          node_count = typecast_params.pos_int!("node_count")
+          Validation.validate_kubernetes_worker_node_count(node_count)
+
+          if node_count > kn.node_count
+            node_size = Validation.validate_vm_size(kn.target_node_size, "x64")
+            extra_vcpu_count = (node_count - kn.node_count) * node_size.vcpus
+
+            Validation.validate_vcpu_quota(@project, "KubernetesVCpu", extra_vcpu_count, name: :node_count)
+          end
+
+          DB.transaction do
+            kn.update(node_count:)
+            kn.incr_scale_worker_count
+            audit_log(kn, "update", [kc])
+          end
+
+          if api?
+            Serializers::KubernetesNodepool.serialize(kn, {detailed: true})
+          else
+            flash["notice"] = "#{kc.name} node pool #{kn.name} will be resized"
+            r.redirect kn, "/settings"
+          end
+        end
+
+        r.post "upgrade" do
+          authorize("KubernetesCluster:edit", kc.id)
+          handle_validation_failure("kubernetes-cluster/nodepool/show") { @page = "settings" }
+
+          unless kn.ready_for_upgrade?
+            fail_kubernetes_unprocessable("Nodepool is not ready to be upgraded")
+          end
+
+          upgrade_candidate = kn.available_upgrade_version
+          DB.transaction do
+            kn.request_upgrade
+            audit_log(kn, "upgrade", [kc])
+          end
+
+          if api?
+            Serializers::KubernetesNodepool.serialize(kn, {detailed: true})
+          else
+            flash["notice"] = "#{kc.name} node pool #{kn.name} will be upgraded to #{upgrade_candidate}"
+            r.redirect kn, "/settings"
+          end
+        end
+
+        r.delete true do
+          authorize("KubernetesCluster:edit", kc.id)
+
+          DB.transaction do
+            kc.lock!
+
+            if !kn.destroying? && kc.nodepools(eager: [:strand, :semaphores]).count { !it.destroying? } == 1
+              fail_kubernetes_unprocessable("You cannot delete the last nodepool of a cluster")
+            end
+
+            kn.incr_destroy
+            audit_log(kn, "destroy", [kc])
+          end
+
+          if web?
+            flash["notice"] = "#{kn.name} nodepool is scheduled for deletion"
+            r.redirect kc, "/nodepools"
+          else
+            204
+          end
+        end
+      end
+
+      r.post "node", :object_name, "retire" do |node_name|
+        node = kc.nodepools_dataset.eager(nodes: :vm).all.flat_map(&:nodes).find { it.name == node_name }
+
+        check_found_object(node)
+
+        authorize("KubernetesCluster:edit", kc.id)
+
+        handle_validation_failure("kubernetes-cluster/nodepool/show") { @page = "nodes" }
+
+        np = nil
         DB.transaction do
-          kn.update(node_count:)
-          kn.incr_scale_worker_count
-          audit_log(kn, "update")
+          np = @kn = node.kubernetes_nodepool(&:for_update)
+
+          if node.retire_set?
+            fail_kubernetes_unprocessable("Node #{node.name} is already being retired")
+          end
+
+          if np.node_count <= 1
+            fail_kubernetes_unprocessable("You cannot retire the last node of a nodepool")
+          end
+
+          node.incr_retire
+          np.this.update(node_count: Sequel[:node_count] - 1)
+          audit_log(node, "retire", [kc, np])
         end
 
         if api?
-          Serializers::KubernetesNodepool.serialize(kn, {detailed: true})
+          Serializers::KubernetesNodepool.serialize(np.reload, {detailed: true})
         else
-          flash["notice"] = "#{kc.name} node pool #{kn.name} will be resized"
+          flash["notice"] = "Node #{node.name} is scheduled to be retired"
+          r.redirect np, "/nodes"
+        end
+      end
+
+      r.post "upgrade" do
+        authorize("KubernetesCluster:edit", kc)
+        unless kc.nodepools_within_version_skew?
+          fail_kubernetes_unprocessable("All nodepools must be upgraded to within two minor versions of the cluster first")
+        end
+        unless kc.ready_for_upgrade?
+          fail_kubernetes_unprocessable("Cluster is not ready to be upgraded")
+        end
+
+        upgrade_candidate = kc.available_upgrade_version
+        DB.transaction do
+          kc.request_upgrade
+          audit_log(kc, "upgrade")
+        end
+
+        if api?
+          Serializers::KubernetesCluster.serialize(kc, {detailed: true})
+        else
+          flash["notice"] = "#{kc.name} will be upgraded to #{upgrade_candidate}"
           r.redirect kc
         end
       end

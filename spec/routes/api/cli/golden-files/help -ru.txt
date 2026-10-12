@@ -36,12 +36,17 @@ ubi help [options] [command [subcommand]]
 ubi kc command [...]
 ubi kc (location/kc-name | kc-id) post-command [...]
 ubi kc list [options]
+ubi kc (location/kc-name | kc-id) create-nodepool np-name node-size node-count
 ubi kc location/kc-name create [options]
+ubi kc (location/kc-name | kc-id) destroy-nodepool [options] (np-name | np-id)
 ubi kc (location/kc-name | kc-id) destroy [options]
 ubi kc (location/kc-name | kc-id) kubeconfig
 ubi kc (location/kc-name | kc-id) rename new-name
 ubi kc (location/kc-name | kc-id) resize-nodepool (np-name | np-id) node-count
+ubi kc (location/kc-name | kc-id) retire-node node-name
 ubi kc (location/kc-name | kc-id) show [options]
+ubi kc (location/kc-name | kc-id) upgrade-nodepool (np-name | np-id)
+ubi kc (location/kc-name | kc-id) upgrade
 ubi lb command [...]
 ubi lb (location/lb-name | lb-id) post-command [...]
 ubi lb list [options]
@@ -54,21 +59,38 @@ ubi lb (location/lb-name | lb-id) enable-ssl-certificate
 ubi lb (location/lb-name | lb-id) rename new-name
 ubi lb (location/lb-name | lb-id) show [options]
 ubi lb (location/lb-name | lb-id) update algorithm src-port dst-port health-check-endpoint cert-enabled [(vm-name | vm-id) [...]]
+ubi mi command [...]
+ubi mi (location/mi-name | mi-id) post-command [...]
+ubi mi list [options]
+ubi mi (location/mi-name | mi-id) create-version [options] (vm-name | vm-id)
+ubi mi location/mi-name create [options] (vm-name | vm-id)
+ubi mi (location/mi-name | mi-id) destroy-version [options] version
+ubi mi (location/mi-name | mi-id) destroy [options]
+ubi mi (location/mi-name | mi-id) list-versions [options]
+ubi mi (location/mi-name | mi-id) rename new-name
+ubi mi (location/mi-name | mi-id) set-latest version
+ubi mi (location/mi-name | mi-id) show [options]
 ubi pg command [...]
 ubi pg (location/pg-name | pg-id) [post-options] post-command [...]
 ubi pg list [options]
+ubi pg (location/pg-name | pg-id) add-bearer-metric-destination url token [header_name=value [...]]
 ubi pg (location/pg-name | pg-id) add-cert-auth-user name
 ubi pg (location/pg-name | pg-id) add-config-entries key=value [...]
 ubi pg (location/pg-name | pg-id) add-firewall-rule [options] cidr
 ubi pg (location/pg-name | pg-id) add-metric-destination username password url
+ubi pg (location/pg-name | pg-id) add-otlp-log-destination name url [header_name=value [...]]
 ubi pg (location/pg-name | pg-id) add-pgbouncer-config-entries key=value [...]
+ubi pg (location/pg-name | pg-id) add-syslog-log-destination name host [port] [sd-id/key=value [...]]
 ubi pg (location/pg-name | pg-id) ca-certificates
+ubi pg (location/pg-name | pg-id) create-backup-credentials [options]
 ubi pg (location/pg-name | pg-id) create-client-cert-keypair common-name duration
 ubi pg (location/pg-name | pg-id) create-read-replica [options] name
 ubi pg location/pg-name create [options]
 ubi pg (location/pg-name | pg-id) delete-firewall-rule rule-id
+ubi pg (location/pg-name | pg-id) delete-log-destination ld-id
 ubi pg (location/pg-name | pg-id) delete-metric-destination md-id
 ubi pg (location/pg-name | pg-id) destroy [options]
+ubi pg (location/pg-name | pg-id) get-logs [options]
 ubi pg (location/pg-name | pg-id) list-backups [options]
 ubi pg (location/pg-name | pg-id) list-servers [options]
 ubi pg (location/pg-name | pg-id) modify-firewall-rule [options] rule-id
@@ -85,7 +107,7 @@ ubi pg (location/pg-name | pg-id) rename new-name
 ubi pg (location/pg-name | pg-id) reset-superuser-password new-password
 ubi pg (location/pg-name | pg-id) restart
 ubi pg (location/pg-name | pg-id) restore [options] new-db-name restore-time
-ubi pg (location/pg-name | pg-id) set-maintenance-window start-hour
+ubi pg (location/pg-name | pg-id) set-maintenance-window [options] start-hour
 ubi pg (location/pg-name | pg-id) show-config
 ubi pg (location/pg-name | pg-id) show-default-config
 ubi pg (location/pg-name | pg-id) show-pgbouncer-config
@@ -118,6 +140,8 @@ ubi vm (location/vm-name | vm-id) destroy [options]
 ubi vm (location/vm-name | vm-id) rename new-name
 ubi vm (location/vm-name | vm-id) restart
 ubi vm (location/vm-name | vm-id) [options] scp [scp-options] (local-path :remote-path | :remote-path local-path)
+ubi vm (location/vm-name | vm-id) serial-log [options]
+ubi vm (location/vm-name | vm-id) set-maintenance-window start-hour
 ubi vm (location/vm-name | vm-id) [options] sftp [sftp-options]
 ubi vm (location/vm-name | vm-id) show [options]
 ubi vm (location/vm-name | vm-id) [options] ssh [ssh-options --] [remote-cmd [remote-cmd-arg ...]]

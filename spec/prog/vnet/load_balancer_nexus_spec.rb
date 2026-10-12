@@ -7,7 +7,7 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
 
   let(:st) {
     cert = Prog::Vnet::CertNexus.assemble("test-host-name", dns_zone.id).subject
-    lb = described_class.assemble(ps.id, name: "test-lb", src_port: 80, dst_port: 8080, health_check_protocol: "https", cert_enabled: true).subject
+    lb = described_class.assemble(ps.id, name: "test-lb", src_port: 80, dst_port: 8080, health_check_protocol: "https", cert_enabled: true, hostname_version:).subject
     lb.add_cert(cert)
     lb.strand
   }
@@ -16,13 +16,22 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
     Prog::Vnet::SubnetNexus.assemble(prj.id, name: "test-ps").subject
   }
   let(:dns_zone) {
-    dz = DnsZone.create(project_id: ps.project_id, name: "lb.ubicloud.com")
+    dz = DnsZone.create(project_id: ps.project_id, name: "lb#{2 if hostname_version == 2}.ubicloud.com")
     Strand.create_with_id(dz, prog: "DnsZone::DnsZoneNexus", label: "wait")
     dz
   }
+  let(:hostname_version) { 2 }
+
+  def set_hostname_version(hostname_version)
+    define_singleton_method(:hostname_version) { 1 } if hostname_version == 1
+  end
 
   before do
-    allow(Config).to receive_messages(load_balancer_service_hostname: "lb.ubicloud.com", load_balancer_service_project_id: ps.project_id)
+    allow(Config).to receive_messages(
+      load_balancer_service_hostname: "lb.ubicloud.com",
+      load_balancer_service_hostname_v2: "lb2.ubicloud.com",
+      load_balancer_service_project_id: ps.project_id,
+    )
   end
 
   def create_vm_with_ips(name:, private_ipv4:, private_ipv6:, public_ipv4: nil, public_ipv6: nil)
@@ -47,11 +56,45 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
       }.to raise_error RuntimeError, "Given subnet doesn't exist with the id 0a9a166c-e7e7-4447-ab29-7ea442b5bb0e"
     end
 
-    it "creates a new load balancer" do
-      lb = described_class.assemble(ps.id, name: "test-lb2", src_port: 80, dst_port: 8080).subject
+    it "creates a new load balancer with hostname_version 1" do
+      lb = described_class.assemble(ps.id, name: "test-lb2", src_port: 80, dst_port: 8080, hostname_version: 1).subject
       expect(LoadBalancer.count).to eq 1
       expect(lb.project).to eq ps.project
       expect(lb.hostname).to eq "test-lb2.#{ps.ubid[-5...]}.lb.ubicloud.com"
+      expect(lb.hostname_version).to eq 1
+    end
+
+    it "creates a new load balancer with hostname_version 2" do
+      lb = described_class.assemble(ps.id, name: "test-lb2", src_port: 80, dst_port: 8080, hostname_version: 2).subject
+      expect(LoadBalancer.count).to eq 1
+      expect(lb.project).to eq ps.project
+      expect(lb.hostname).to eq "test-lb2.#{lb.ubid}.lb2.ubicloud.com"
+      expect(lb.hostname_version).to eq 2
+    end
+
+    it "uses presigned cert if available for hostname version 2 and cert enabled" do
+      st = Strand.create_with_id(Prog::Vnet::MaintainPresignedLoadBalancerCerts::STRAND_ID, prog: "Vnet::MaintainPresignedLoadBalancerCerts", label: "wait", schedule: Time.now - 100)
+      load_balancer_id = LoadBalancer.generate_uuid
+      cert = Cert.create(hostname: "*.#{UBID.to_ubid(load_balancer_id)}.lb2.ubicloud.com")
+      DB[:presigned_load_balancer_cert].insert(load_balancer_id:, cert_id: cert.id)
+      lb = described_class.assemble(ps.id, name: "test-lb2", src_port: 80, dst_port: 8080, hostname_version: 2, cert_enabled: true).subject
+      expect(LoadBalancer.count).to eq 1
+      expect(lb.id).to eq load_balancer_id
+      expect(lb.project).to eq ps.project
+      expect(lb.hostname).to eq "test-lb2.#{UBID.to_ubid(load_balancer_id)}.lb2.ubicloud.com"
+      expect(lb.hostname_version).to eq 2
+      expect(DB[:presigned_load_balancer_cert].count).to eq 0
+      expect(DB[:certs_load_balancers].where(load_balancer_id:, cert_id: cert.id).count).to eq 1
+      expect(st.reload.schedule).to be_within(5).of(Time.now)
+    end
+
+    it "handles case where presigned cert isn't available for hostname version 2 and cert enabled" do
+      lb = described_class.assemble(ps.id, name: "test-lb2", src_port: 80, dst_port: 8080, hostname_version: 2, cert_enabled: true).subject
+      expect(LoadBalancer.count).to eq 1
+      expect(lb.project).to eq ps.project
+      expect(lb.hostname).to eq "test-lb2.#{lb.ubid}.lb2.ubicloud.com"
+      expect(lb.hostname_version).to eq 2
+      expect(DB[:certs_load_balancers].count).to eq 0
     end
 
     it "creates a new load balancer with custom hostname" do
@@ -98,12 +141,17 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
   end
 
   describe "#create_new_cert" do
-    it "creates a new cert" do
-      expect { nx.create_new_cert }.to hop("wait_cert_provisioning")
-        .and change { Strand.where(prog: "Vnet::CertNexus").count }.from(1).to(2)
-        .and change { Strand.where(prog: "Vnet::CertNexus").all.select { it.stack[0]["add_private"] }.count }.from(0).to(1)
-        .and change { nx.load_balancer.certs.count }.from(1).to(2)
-      expect(st.reload.stack[0]["cert"]).to be_a String
+    [1, 2].each do |hostname_version|
+      it "creates a new cert with hostname_version #{hostname_version}" do
+        set_hostname_version(hostname_version)
+        cert_ds = Cert.where(hostname: st.subject.cert_hostname, private_hostname: st.subject.cert_private_hostname)
+        expect { nx.create_new_cert }.to hop("wait_cert_provisioning")
+          .and change { Strand.where(prog: "Vnet::CertNexus").count }.from(1).to(2)
+          .and change { cert_ds.count }.from(0).to(1)
+          .and change { nx.load_balancer.certs.count }.from(1).to(2)
+        expect(st.stack[0]["cert"]).to be_a String
+        expect(cert_ds.first.strand.stack[0]["waiting_strand_id"]).to eq st.id
+      end
     end
 
     it "creates a cert without dns zone in development" do
@@ -116,15 +164,15 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
   end
 
   describe "#wait_cert_provisioning" do
-    it "naps for 60 seconds if need_certificates? is true" do
+    it "naps for 600 seconds if need_certificates? is true" do
       expect(nx.load_balancer).to receive(:need_certificates?).and_return(true)
-      expect { nx.wait_cert_provisioning }.to nap(60)
+      expect { nx.wait_cert_provisioning }.to nap(600)
     end
 
-    it "naps for 60 seconds if cert is set in frame but does not have valid cert entry" do
+    it "naps for 600 seconds if cert is set in frame but does not have valid cert entry" do
       cert = Cert.create(hostname: nx.load_balancer.hostname)
       refresh_frame(nx, new_values: {"cert" => cert.id})
-      expect { nx.wait_cert_provisioning }.to nap(60)
+      expect { nx.wait_cert_provisioning }.to nap(600)
     end
 
     it "hops to wait_cert_broadcast if certificate is ready and refresh_cert is set" do
@@ -144,7 +192,7 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
       expect(Strand.where(prog: "Vnet::CertServer", label: "setup_cert_server").count).to eq 1
       expect(nx.load_balancer).to receive(:need_certificates?).and_return(false)
       expect { nx.wait_cert_provisioning }.to hop("wait")
-      expect(st.reload.stack[0].fetch("cert")).to be_nil
+      expect(st.stack[0].fetch("cert")).to be_nil
       expect(Strand.where(prog: "Vnet::CertServer", label: "reshare_certificate").all).to be_empty
     end
   end
@@ -156,7 +204,12 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
       expect { nx.wait_cert_broadcast }.to nap(1)
     end
 
-    it "hops to wait if all children are done and no certs to remove" do
+    it "hops to wait if all children are done and no certs to remove and there is no active cert" do
+      expect(nx).to receive(:reap).and_yield
+      expect { nx.wait_cert_broadcast }.to hop("wait")
+    end
+
+    it "hops to wait if all children are done and no certs to remove and there is an active cert" do
       expect(nx).to receive(:reap).and_yield
       active_cert = Prog::Vnet::CertNexus.assemble("active-cert", dns_zone.id).subject
       expect(nx.load_balancer).to receive(:active_cert).and_return(active_cert)
@@ -176,7 +229,7 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
       expect { nx.wait_cert_broadcast }.to hop("wait")
         .and change { cert_to_remove.strand.semaphores_dataset.where(name: "destroy").count }.from(0).to(1)
       expect(nx.load_balancer.reload.certs.count).to eq 1
-      expect(st.reload.stack[0].fetch("cert")).to be_nil
+      expect(st.stack[0].fetch("cert")).to be_nil
     end
   end
 
@@ -270,38 +323,46 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
     ["ipv4", "ipv6", "dual"].each do |stack|
       bools.each do |has_pub4|
         bools.each do |has_pub6|
-          # If ipv6 is enabled for this stack but no public ipv6 assigned, code naps
-          expects_nap = ipv6_on[stack] && !has_pub6
+          bools.each do |has_private|
+            [1, 2].freeze.each do |hostname_version|
+              # If ipv6 is enabled for this stack but no public ipv6 assigned, code naps
+              expects_nap = ipv6_on[stack] && !has_pub6
 
-          it "#{stack} stack, pub4=#{has_pub4}, pub6=#{has_pub6}" do
-            vm_args = {name: "vm", private_ipv4: "10.0.0.1/32", private_ipv6: "fd10:9b0b:6b4b:8fb2::/64"}
-            vm_args[:public_ipv4] = "203.0.113.1/32" if has_pub4
-            vm_args[:public_ipv6] = "2001:db8:1::/64" if has_pub6
-            add_lb_vm(stack:, **vm_args)
+              it "#{stack} stack, pub4=#{has_pub4}, pub6=#{has_pub6}, private=#{has_private}, hostname_version=#{hostname_version}" do
+                set_hostname_version(hostname_version)
 
-            if expects_nap
-              expect { nx.rewrite_dns_records }.to nap(5)
-              expect(DnsRecord.where(dns_zone_id: dns_zone.id, tombstoned: false).all).to be_empty
-            else
-              expect { nx.rewrite_dns_records }.to hop("wait")
+                vm_args = {name: "vm", private_ipv4: "10.0.0.1/32", private_ipv6: "fd10:9b0b:6b4b:8fb2::/64"}
+                vm_args[:public_ipv4] = "203.0.113.1/32" if has_pub4
+                vm_args[:public_ipv6] = "2001:db8:1::/64" if has_pub6
+                add_lb_vm(stack:, **vm_args)
+                hostname = nx.load_balancer.hostname
+                nx.load_balancer.custom_hostname = hostname unless has_private
 
-              expected = []
-              if ipv4_on[stack]
-                expected << [:pub, "A", "203.0.113.1"] if has_pub4
-                expected << [:priv, "A", "10.0.0.1"]
+                if expects_nap
+                  expect { nx.rewrite_dns_records }.to nap(5)
+                  expect(DnsRecord.where(dns_zone_id: dns_zone.id, tombstoned: false).all).to be_empty
+                else
+                  expect { nx.rewrite_dns_records }.to hop("wait")
+
+                  expected = []
+                  if ipv4_on[stack]
+                    expected << [:pub, "A", "203.0.113.1"] if has_pub4
+                    expected << [:priv, "A", "10.0.0.1"] if has_private
+                  end
+                  if ipv6_on[stack]
+                    expected << [:pub, "AAAA", "2001:db8:1::2"] if has_pub6
+                    expected << [:priv, "AAAA", "fd10:9b0b:6b4b:8fb2::2"] if has_private
+                  end
+
+                  expected_records = expected.map { |prefix, type, data|
+                    name = (prefix == :pub) ? hostname : nx.load_balancer.private_hostname
+                    [name, type, data]
+                  }
+                  domain = Config.send((hostname_version == 1) ? :load_balancer_service_hostname : :load_balancer_service_hostname_v2)
+                  records = dns_records_for(domain).map { [it.name.chomp("."), it.type, it.data] }.uniq
+                  expect(records).to match_array(expected_records)
+                end
               end
-              if ipv6_on[stack]
-                expected << [:pub, "AAAA", "2001:db8:1::2"] if has_pub6
-                expected << [:priv, "AAAA", "fd10:9b0b:6b4b:8fb2::2"]
-              end
-
-              hostname = nx.load_balancer.hostname
-              expected_records = expected.map { |prefix, type, data|
-                name = (prefix == :pub) ? hostname : "private.#{hostname}"
-                [name, type, data]
-              }
-              records = dns_records_for(hostname).map { [it.name.chomp("."), it.type, it.data] }.uniq
-              expect(records).to match_array(expected_records)
             end
           end
         end
@@ -349,6 +410,21 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
       100.times { expect { nx.rewrite_dns_records }.to hop("wait") }
 
       expect(dns_zone.reload.records.count).to eq(804) # 4 records to tombstone the previous ones and 4 records to add
+    end
+
+    it "writes public records to the custom zone and does not write private records when a custom hostname is used" do
+      dns_zone
+      custom_zone = DnsZone.create(project_id: ps.project_id, name: "k8s.ubicloud.com")
+      lb = described_class.assemble(ps.id, name: "custom-lb", src_port: 80, dst_port: 8080,
+        custom_hostname_prefix: "apiserver", custom_hostname_dns_zone_id: custom_zone.id).subject
+      custom_nx = described_class.new(lb.strand)
+      vm = create_vm_with_ips(name: "cvm", private_ipv4: "10.0.0.5/32", private_ipv6: "fd10:9b0b:6b4b:8fb2::/64", public_ipv4: "203.0.113.5/32", public_ipv6: "2001:db8:9::/64")
+      lb.add_vm(vm)
+
+      expect { custom_nx.rewrite_dns_records }.to hop("wait")
+
+      expect(custom_zone.reload.records.map(&:name).uniq).to eq(["apiserver.k8s.ubicloud.com."])
+      expect(dns_zone.reload.records.map(&:name).uniq).to eq([])
     end
   end
 end

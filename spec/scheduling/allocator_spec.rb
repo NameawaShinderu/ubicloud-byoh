@@ -6,7 +6,7 @@ require "netaddr"
 Al = Scheduling::Allocator
 TestAllocation = Struct.new(:score, :is_valid)
 TestResourceAllocation = Struct.new(:utilization, :is_valid)
-RSpec.describe Al do
+RSpec.describe Scheduling::Allocator do
   let(:vm) {
     Vm.new(family: "standard", vcpus: 2, cpu_percent_limit: 200, cpu_burst_percent_limit: 0, memory_gib: 8, name: "dummy-vm", arch: "x64", location_id: Location::HETZNER_FSN1_ID, ip4_enabled: "true", created_at: Time.now, unix_user: "", public_key: "", boot_image: "ubuntu-jammy").tap {
       it.id = "2464de61-7501-8374-9ab0-416caebe31da"
@@ -15,7 +15,7 @@ RSpec.describe Al do
 
   # Creates a Request object with the given parameters
   #
-  def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_storage_devices: false, gpu_count: 0, gpu_device: nil, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], data_center_exclusion_filter: [], location_filter: [], location_preference: [], use_slices: true, require_shared_slice: false, diagnostics: false, family_filter: [], os_filter: nil, minimum_vhost_block_backend_version: nil)
+  def create_req(vm, storage_volumes, target_host_utilization: 0.55, distinct_storage_devices: false, gpu_count: 0, gpu_device: nil, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], data_center_exclusion_filter: [], location_filter: [], location_preference: [], use_slices: true, require_shared_slice: false, diagnostics: false, family_filter: [], minimum_vhost_block_backend_version: nil, os_filter: nil)
     Al::Request.new(
       vm.id,
       vm.vcpus,
@@ -41,9 +41,13 @@ RSpec.describe Al do
       require_shared_slice,
       diagnostics,
       family_filter,
-      os_filter,
       minimum_vhost_block_backend_version,
+      os_filter,
     )
+  end
+
+  def create_storage_volumes(vm, storage_volume_params)
+    vm.create_storage_volumes(storage_volume_params.map { it.transform_keys(&:to_sym) })
   end
 
   describe "allocation_request" do
@@ -61,13 +65,15 @@ RSpec.describe Al do
 
     let(:project) { Project.create(name: "test-project") }
     let(:vm) {
-      Vm.create(
+      vm = Vm.create(
         project_id: project.id, family: "standard", cores: 0, vcpus: 2, cpu_percent_limit: 200,
         cpu_burst_percent_limit: 0, memory_gib: 8, name: "dummy-vm", arch: "x64",
         location_id: Location::HETZNER_FSN1_ID, ip4_enabled: true, created_at: Time.now,
         unix_user: "ubi", public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINYf51IA6bHApuggkz/VksM1cZ0elj2gNQQfPBFdlpRW",
         boot_image: "ubuntu-jammy",
       )
+      create_storage_volumes(vm, storage_volumes)
+      vm
     }
 
     it "fails if no valid allocation is found" do
@@ -80,7 +86,7 @@ RSpec.describe Al do
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
       StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
 
       described_class.allocate(vm, storage_volumes)
       expect(vm.reload.vm_host_id).to eq(vmh.id)
@@ -97,10 +103,25 @@ RSpec.describe Al do
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
       StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
 
       described_class.allocate(vm, storage_volumes, family_filter: ["premium", "standard"])
       expect(vm.reload.vm_host_id).to eq(vmh.id)
+    end
+
+    it "prefers the host with the lower additional score among otherwise equal hosts" do
+      plain = create_vm_host(total_cpus: 16, total_cores: 8, used_cores: 1, total_hugepages_1g: 54, used_hugepages_1g: 2)
+      preferred = create_vm_host(total_cpus: 16, total_cores: 8, used_cores: 1, total_hugepages_1g: 54, used_hugepages_1g: 2, score_offset: -1)
+      [[plain, "1.1.1.0/30"], [preferred, "2.1.1.0/30"]].each do |vmh, cidr|
+        BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+        StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+        SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
+        Address.create(cidr:, routed_to_host_id: vmh.id).populate_ipv4_addresses
+      end
+      expect(Al::Allocation).to receive(:random_score).and_return(0).at_least(:once)
+
+      described_class.allocate(vm, storage_volumes)
+      expect(vm.reload.vm_host_id).to eq(preferred.id)
     end
   end
 
@@ -116,9 +137,10 @@ RSpec.describe Al do
     }
 
     it "prints diagnostics if flagged" do
-      expect(req).to receive(:diagnostics).and_return(true)
+      expect(req).to receive(:diagnostics).and_return(true).at_least(:once)
       expect(Clog).to receive(:emit).with("Allocator query for vm", instance_of(Hash)) do |_, b|
-        expect(b[:allocator_query].keys).to eq([:vm_id, :sql])
+        expect(b[:allocator_query].keys).to eq([:vm_id, :sql, :counts])
+        expect(b[:allocator_query][:counts]).to eq [[:base, 0]]
       end
       Al::Allocation.best_allocation(req)
     end
@@ -146,18 +168,26 @@ RSpec.describe Al do
       StorageDevice.create(vm_host_id: vmh4.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh5.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100, enabled: false)
 
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
-      Address.create(cidr: "3.1.1.0/30", routed_to_host_id: vmh3.id)
-      Address.create(cidr: "4.1.1.0/30", routed_to_host_id: vmh4.id)
-      Address.create(cidr: "5.1.1.0/30", routed_to_host_id: vmh5.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
+      Address.create(cidr: "3.1.1.0/30", routed_to_host_id: vmh3.id).populate_ipv4_addresses
+      Address.create(cidr: "4.1.1.0/30", routed_to_host_id: vmh4.id).populate_ipv4_addresses
+      Address.create(cidr: "5.1.1.0/30", routed_to_host_id: vmh5.id).populate_ipv4_addresses
 
+      expect(Clog).to receive(:emit).twice.with("Allocator query for vm", instance_of(Hash)) do |_, b|
+        expect(b[:allocator_query][:counts]).to eq [[:base, 3], [:space, 1], [:boot_image, 0]]
+      end
+      Al::Allocation.best_allocation(req)
+      expect(Al::Allocation.candidate_hosts(req)).to eq([])
+
+      req.boot_image = "github-ubuntu-2404"
+      expect(Clog).not_to receive(:emit)
       expect(Al::Allocation.candidate_hosts(req)).to eq([])
     end
 
     it "retrieves correct values" do
       vmh = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 3, total_hugepages_1g: 10, used_hugepages_1g: 2)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
       sd1 = StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 123, total_storage_gib: 345)
       sd2 = StorageDevice.create(vm_host_id: vmh.id, name: "stor2", available_storage_gib: 12, total_storage_gib: 99)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
@@ -182,17 +212,33 @@ RSpec.describe Al do
                  available_iommu_groups: nil,
                  vm_provisioning_count: 0,
                  accepts_slices: false,
-                 family: "standard"}])
+                 family: "standard",
+                 score_offset: 0.0}])
+    end
+
+    it "does not filter out storage devices with >= threshold available for a small request" do
+      large = Config.allocator_large_storage_device_gib
+      vmh = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 3, total_hugepages_1g: 10, used_hugepages_1g: 2)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
+      StorageDevice.create(vm_host_id: vmh.id, name: "big", available_storage_gib: large, total_storage_gib: large)
+      BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+      req.location_filter = [Location::HETZNER_FSN1_ID]
+
+      expect(Al::Allocation.candidate_hosts(req).map { it[:vm_host_id] }).to eq([vmh.id])
     end
 
     it "retrieves provisioning count" do
       vmh = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 3, total_hugepages_1g: 10, used_hugepages_1g: 2)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
       sd1 = StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 123, total_storage_gib: 345)
       create_vm(vm_host_id: vmh.id, location_id: vmh.location_id, boot_image: "", display_state: "creating")
       create_vm(vm_host_id: vmh.id, location_id: vmh.location_id, boot_image: "ubuntu-jammy", display_state: "creating")
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
 
+      expect(req).to receive(:diagnostics).and_return(true).at_least(:once)
+      expect(Clog).to receive(:emit).with("Allocator query for vm", instance_of(Hash)) do |_, b|
+        expect(b[:allocator_query][:counts]).to eq [[:base, 1], [:space, 1], [:boot_image, 1], [:ipv4, 1], [:allocation_state, 1], [:non_gpu, 1]]
+      end
       expect(Al::Allocation.candidate_hosts(req))
         .to eq([{location_id: vmh.location_id,
                  num_storage_devices: 1,
@@ -212,7 +258,8 @@ RSpec.describe Al do
                  available_iommu_groups: nil,
                  vm_provisioning_count: 2,
                  accepts_slices: false,
-                 family: "standard"}])
+                 family: "standard",
+                 score_offset: 0.0}])
     end
 
     it "applies host filter" do
@@ -220,8 +267,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
 
@@ -237,8 +284,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
 
@@ -254,8 +301,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(data_center: "dc2", total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
 
@@ -271,8 +318,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(location_id: "6b9ef786-b842-8420-8c65-c25e3d4bdf3d", total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
 
@@ -288,8 +335,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(family: "standard", total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
 
@@ -301,20 +348,19 @@ RSpec.describe Al do
     end
 
     it "applies os filter" do
-      vmh1 = create_vm_host(family: "standard", os_version: "ubuntu-24.04", total_cpus: 10, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
-      vmh2 = create_vm_host(family: "standard", os_version: "ubuntu-22.04", total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+      vmh1 = create_vm_host(os_version: "ubuntu-24.04", total_cpus: 10, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+      vmh2 = create_vm_host(os_version: "ubuntu-22.04", total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
 
       req.os_filter = "ubuntu-24.04"
       cand = Al::Allocation.candidate_hosts(req)
 
-      expect(cand.size).to eq(1)
-      expect(cand.first[:vm_host_id]).to eq(vmh1.id)
+      expect(cand.map { it[:vm_host_id] }).to eq([vmh1.id])
     end
 
     it "filters hosts by minimum vhost block backend version" do
@@ -322,8 +368,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
       create_vhost_block_backend(version: "v0.4.0", vm_host_id: vmh1.id, allocation_weight: 100)
@@ -340,7 +386,7 @@ RSpec.describe Al do
     it "excludes hosts with zero-weight vhost block backend even if version matches" do
       vmh1 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       create_vhost_block_backend(version: "v0.4.0", vm_host_id: vmh1.id, allocation_weight: 0)
 
@@ -353,7 +399,7 @@ RSpec.describe Al do
     it "does not filter by vhost block backend version when not requested" do
       vmh1 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
 
       cand = Al::Allocation.candidate_hosts(req)
@@ -367,8 +413,8 @@ RSpec.describe Al do
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor2", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
 
@@ -383,8 +429,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      address = Address.create(cidr: "2.1.1.0/32", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      address = Address.create(cidr: "2.1.1.0/32", routed_to_host_id: vmh2.id).tap(&:populate_ipv4_addresses)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
 
@@ -404,8 +450,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/32", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/32", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh1.id, activated_at: Time.now, size_gib: 3)
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh2.id, activated_at: Time.now, size_gib: 3)
 
@@ -429,8 +475,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       PciDevice.create(vm_host_id: vmh2.id, slot: "01:00.0", device_class: "0300", vendor: "vd", device: "dv1", numa_node: 0, iommu_group: 3)
       PciDevice.create(vm_host_id: vmh2.id, slot: "02:00.0", device_class: "0300", vendor: "vd", device: "dv2", numa_node: 0, iommu_group: 9)
       PciDevice.create(vm_host_id: vmh2.id, slot: "03:00.0", device_class: "1234", vendor: "vd", device: "dv3", numa_node: 0, iommu_group: 11)
@@ -452,8 +498,8 @@ RSpec.describe Al do
       vmh2 = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
       StorageDevice.create(vm_host_id: vmh1.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh1.id).populate_ipv4_addresses
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       PciDevice.create(vm_host_id: vmh2.id, slot: "01:00.0", device_class: "0300", vendor: "vd", device: "dv1", numa_node: 0, iommu_group: 3)
       PciDevice.create(vm_host_id: vmh2.id, slot: "02:00.0", device_class: "0300", vendor: "vd", device: "dv2", numa_node: 0, iommu_group: 9)
       PciDevice.create(vm_host_id: vmh2.id, slot: "03:00.0", device_class: "1234", vendor: "vd", device: "dv3", numa_node: 0, iommu_group: 11)
@@ -468,6 +514,19 @@ RSpec.describe Al do
         a_hash_including("iommu_group" => 3, "numa_node" => 0),
         a_hash_including("iommu_group" => 9, "numa_node" => 0),
       )
+    end
+
+    it "retrieves candidates with gpu if gpu_count is zero but host is in a ubicloud provided location" do
+      loc = Location.first(provider: "ubicloud")
+      vmh = create_vm_host(location_id: loc.id, total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+      StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
+      PciDevice.create(vm_host_id: vmh.id, slot: "01:00.0", device_class: "0300", vendor: "vd", device: "dv1", numa_node: 0, iommu_group: 3)
+      BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+      req.location_filter = [loc.id]
+      cand = Al::Allocation.candidate_hosts(req)
+      expect(req).to be_single_ubicloud_location
+      expect(cand.size).to eq(1)
     end
   end
 
@@ -496,7 +555,8 @@ RSpec.describe Al do
        num_gpus: 0,
        available_gpus: 0,
        vm_host_id: "15e11815-3d4f-8771-9cac-ce4cdcbda5c1",
-       vm_provisioning_count: 0}
+       vm_provisioning_count: 0,
+       score_offset: 0}
     }
 
     it "initializes individual resource allocations" do
@@ -567,6 +627,50 @@ RSpec.describe Al do
       expect(Al::Allocation.new(vmhds, req).score).to eq(5.0)
     end
 
+    it "penalizes breaking up a large storage device in a protected location" do
+      large = Config.allocator_large_storage_device_gib
+      vmhds[:location_id] = Config.allocator_protected_large_storage_location_ids.first
+      vmhds[:storage_devices] = [{"available_storage_gib" => 10, "id" => "sd1id", "total_storage_gib" => 10},
+        {"available_storage_gib" => large, "id" => "sd2id", "total_storage_gib" => large}]
+      vmhds[:available_storage_gib] = large + 10
+      vmhds[:total_storage_gib] = large + 10
+
+      score_protected = Al::Allocation.new(vmhds, req).score
+
+      vmhds[:location_id] = Location::HETZNER_HEL1_ID
+      score_unprotected = Al::Allocation.new(vmhds, req).score
+
+      expect(score_protected - score_unprotected).to be_within(0.0001).of(5)
+    end
+
+    it "does not penalize an allocation that keeps the large storage device's whole multiples intact" do
+      large = Config.allocator_large_storage_device_gib
+      vmhds[:location_id] = Config.allocator_protected_large_storage_location_ids.first
+      vmhds[:storage_devices] = [{"available_storage_gib" => 2 * large + 100, "id" => "sd1id", "total_storage_gib" => 2 * large + 100}]
+      vmhds[:available_storage_gib] = 2 * large + 100
+      vmhds[:total_storage_gib] = 2 * large + 100
+
+      score_protected = Al::Allocation.new(vmhds, req).score
+
+      vmhds[:location_id] = Location::HETZNER_HEL1_ID
+      expect(score_protected).to be_within(0.0001).of(Al::Allocation.new(vmhds, req).score)
+    end
+
+    it "does not penalize a request that needs a large storage device" do
+      large = Config.allocator_large_storage_device_gib
+      vmhds[:location_id] = Config.allocator_protected_large_storage_location_ids.first
+      vmhds[:storage_devices] = [{"available_storage_gib" => 2 * large, "id" => "sd1id", "total_storage_gib" => 2 * large}]
+      vmhds[:available_storage_gib] = 2 * large
+      vmhds[:total_storage_gib] = 2 * large
+      req.storage_gib = large
+      req.storage_volumes = [[0, {"use_bdev_ubi" => false, "size_gib" => large, "boot" => true}]]
+
+      score_protected = Al::Allocation.new(vmhds, req).score
+
+      vmhds[:location_id] = Location::HETZNER_HEL1_ID
+      expect(score_protected).to be_within(0.0001).of(Al::Allocation.new(vmhds, req).score)
+    end
+
     it "penalizes concurrent provisioning for github runners" do
       expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
       expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
@@ -584,6 +688,14 @@ RSpec.describe Al do
       vmhds[:total_cores] = 32
       vmhds[:total_cpus] = 64
       expect(Al::Allocation.new(vmhds, req).score).to eq(0.5)
+    end
+
+    it "adds the host's additional score" do
+      expect(Al::VmHostCpuAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+      expect(Al::VmHostAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+      expect(Al::StorageAllocation).to receive(:new).and_return(TestResourceAllocation.new(req.target_host_utilization, true))
+      vmhds[:score_offset] = -0.7
+      expect(Al::Allocation.new(vmhds, req).score).to eq(-0.7)
     end
 
     it "prioritize AX102 github runners for premium CPU testers" do
@@ -683,6 +795,46 @@ RSpec.describe Al do
       expect(storage_allocation.is_valid).to be_falsey
     end
 
+    it "skips a device that would be left with less than the reserved space" do
+      reserved = Al::StorageAllocation::RESERVED_STORAGE_GIB
+      vmhds[:storage_devices] = [{"available_storage_gib" => reserved + 100, "id" => "sd1id", "total_storage_gib" => reserved + 100},
+        {"available_storage_gib" => reserved + 500, "id" => "sd2id", "total_storage_gib" => reserved + 500}]
+      vmhds[:available_storage_gib] = 2 * reserved + 600
+      vmhds[:total_storage_gib] = 2 * reserved + 600
+      req.storage_gib = 150
+      req.storage_volumes = [[0, {"size_gib" => 150}]]
+      storage_allocation = Al::StorageAllocation.new(vmhds, req)
+      expect(storage_allocation.is_valid).to be_truthy
+      expect(storage_allocation.volume_to_device_map).to eq({0 => "sd2id"})
+    end
+
+    it "uses the smallest device that keeps the reserved space" do
+      reserved = Al::StorageAllocation::RESERVED_STORAGE_GIB
+      vmhds[:storage_devices] = [{"available_storage_gib" => reserved + 100, "id" => "sd1id", "total_storage_gib" => reserved + 100},
+        {"available_storage_gib" => reserved + 500, "id" => "sd2id", "total_storage_gib" => reserved + 500}]
+      vmhds[:available_storage_gib] = 2 * reserved + 600
+      vmhds[:total_storage_gib] = 2 * reserved + 600
+      req.storage_gib = 50
+      req.storage_volumes = [[0, {"size_gib" => 50}]]
+      storage_allocation = Al::StorageAllocation.new(vmhds, req)
+      expect(storage_allocation.volume_to_device_map).to eq({0 => "sd1id"})
+    end
+
+    it "uses the reserved space if no device can hold the volume without it" do
+      req.storage_gib = 50
+      req.storage_volumes = [[0, {"size_gib" => 50}]]
+      storage_allocation = Al::StorageAllocation.new(vmhds, req)
+      expect(storage_allocation.is_valid).to be_truthy
+      expect(storage_allocation.volume_to_device_map).to eq({0 => "sd2id"})
+    end
+
+    it "reduces_large_device_multiples? is false when volumes were never mapped to devices" do
+      req.storage_gib = 10000
+      storage_allocation = Al::StorageAllocation.new(vmhds, req)
+      expect(storage_allocation.is_valid).to be_falsey
+      expect(storage_allocation.reduces_large_device_multiples?).to be false
+    end
+
     it "fails if distinct devices are requested but not available" do
       req.distinct_storage_devices = true
       req.storage_volumes = [[1, {"size_gib" => 1}], [0, {"size_gib" => 1}], [2, {"size_gib" => 1}]]
@@ -716,7 +868,7 @@ RSpec.describe Al do
       StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh.id, name: "stor2", available_storage_gib: 90, total_storage_gib: 90)
       SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
     end
 
     it "updates resources" do
@@ -725,8 +877,10 @@ RSpec.describe Al do
       used_cores = vmh.used_cores
       used_hugepages_1g = vmh.used_hugepages_1g
       available_storage = vmh.storage_devices.sum { it.available_storage_gib }
-      described_class.allocate(vm, [{"size_gib" => 85, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false},
-        {"size_gib" => 95, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false}])
+      storage_volumes = [{"size_gib" => 85, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false},
+        {"size_gib" => 95, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false}]
+      create_storage_volumes(vm, storage_volumes)
+      described_class.allocate(vm, storage_volumes)
       vmh.reload
       expect(vm.vm_storage_volumes.detect { it.disk_index == 0 }.size_gib).to eq(85)
       expect(vm.vm_storage_volumes.detect { it.disk_index == 1 }.size_gib).to eq(95)
@@ -745,8 +899,10 @@ RSpec.describe Al do
       used_cores = vmh.used_cores
       used_hugepages_1g = vmh.used_hugepages_1g
       available_storage = vmh.storage_devices.sum { it.available_storage_gib }
-      described_class.allocate(vm, [{"size_gib" => 85, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false},
-        {"size_gib" => 95, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false}], gpu_count: 1)
+      storage_volumes = [{"size_gib" => 85, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false},
+        {"size_gib" => 95, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false}]
+      create_storage_volumes(vm, storage_volumes)
+      described_class.allocate(vm, storage_volumes, gpu_count: 1)
       vmh.reload
       expect(vm.vm_storage_volumes.detect { it.disk_index == 0 }.size_gib).to eq(85)
       expect(vm.vm_storage_volumes.detect { it.disk_index == 1 }.size_gib).to eq(95)
@@ -936,66 +1092,26 @@ RSpec.describe Al do
       expect { al.update(vm1) }.to raise_error(RuntimeError, "concurrent GPU partition allocation")
     end
 
-    it "creates volume without encryption key if storage is not encrypted" do
-      vm = create_vm
-      described_class.allocate(vm, vol)
-      expect(StorageKeyEncryptionKey.count).to eq(0)
-      expect(vm.reload.vm_storage_volumes.first.key_encryption_key_1_id).to be_nil
-      expect(vm.storage_secrets.count).to eq(0)
-    end
-
-    it "creates volume with rate limits" do
-      vm = create_vm
-      vol = [{
-        "size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false,
-        "boot" => false, "max_read_mbytes_per_sec" => 200,
-        "max_write_mbytes_per_sec" => 300, "rate_limit_bytes_write" => 400,
-      }]
-      described_class.allocate(vm, vol)
-      expect(vm.vm_storage_volumes.first.max_read_mbytes_per_sec).to eq(200)
-      expect(vm.vm_storage_volumes.first.max_write_mbytes_per_sec).to eq(300)
-    end
-
-    it "creates volume with track_written set to true" do
-      create_vhost_block_backend(vm_host_id: VmHost.first.id, version: "v0.4.0", allocation_weight: 100)
-      vm = create_vm
-      vol = [{
-        "size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false,
-        "boot" => false, "track_written" => true, "vring_workers" => 1,
-      }]
-      described_class.allocate(vm, vol)
-      expect(vm.vm_storage_volumes.first.track_written).to be(true)
-    end
-
-    it "creates volume with track_written defaulting to false" do
-      vm = create_vm
-      vol = [{
-        "size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false,
-        "boot" => false,
-      }]
-      described_class.allocate(vm, vol)
-      expect(vm.vm_storage_volumes.first.track_written).to be(false)
-    end
-
-    it "succeeds allocation when track_written is set and host has vhost block backend v0.4.0+" do
+    it "succeeds allocation when track_written is set and host has vhost block backend v0.4.1+" do
       vmh = VmHost.first
-      create_vhost_block_backend(vm_host_id: vmh.id, version: "v0.4.0", allocation_weight: 100)
+      create_vhost_block_backend(vm_host_id: vmh.id, version: "v0.4.1", allocation_weight: 100)
 
       vm = create_vm
       vol = [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false, "track_written" => true, "vring_workers" => 1}]
+      create_storage_volumes(vm, vol)
       described_class.allocate(vm, vol)
       expect(vm.reload.vm_host_id).to eq(vmh.id)
       expect(vm.vm_storage_volumes.first.track_written).to be(true)
     end
 
-    it "fails allocation when track_written is set but no host has vhost block backend v0.4.0+" do
+    it "fails allocation when track_written is set but no host has vhost block backend v0.4.1+" do
       vm = create_vm
       vol = [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false, "track_written" => true}]
       expect { described_class.allocate(vm, vol) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/)
     end
 
     it "allocates without boot image filter when using machine_image_version_id" do
-      create_vhost_block_backend(vm_host_id: VmHost.first.id, version: "v0.4.0", allocation_weight: 100)
+      create_vhost_block_backend(vm_host_id: VmHost.first.id, version: "v0.4.1", allocation_weight: 100)
       vm = create_vm
       miv = create_machine_image_version_metal
       vol = [{
@@ -1003,24 +1119,39 @@ RSpec.describe Al do
         "boot" => true, "machine_image_version_id" => miv.id,
         "vring_workers" => 1,
       }]
+      create_storage_volumes(vm, vol)
       BootImage.dataset.destroy
       described_class.allocate(vm, vol)
       expect(vm.vm_storage_volumes.first.boot_image_id).to be_nil
       expect(vm.vm_storage_volumes.first.machine_image_version_id).to eq(miv.id)
     end
 
-    it "fails allocation when machine_image_version_id is set but no host has vhost block backend v0.4.0+" do
+    it "allocates without boot image filter when using remote_storage_server_id" do
+      create_vhost_block_backend(vm_host_id: VmHost.first.id, version: "v0.5.1", allocation_weight: 100)
+      vm = create_vm
+      source_vm = create_archive_ready_vm(project_id: vm.project_id, name: "source-vm")
+      source_vm.strand.update(label: "stopped_by_admin")
+      create_vhost_block_backend(vm_host_id: source_vm.vm_host_id, version: "v0.5.1", allocation_weight: 100)
+      VmHost.dataset.update(total_cpus: 96, total_cores: 96, used_cores: 2)
+      rss = Prog::Storage::RemoteStorageServer::Nexus.assemble(source_vm.vm_storage_volumes.first.id).subject
+      vol = [{
+        "size_gib" => 5, "encrypted" => true,
+        "boot" => true, "remote_storage_server_id" => rss.id,
+        "vring_workers" => 1,
+      }]
+      create_storage_volumes(vm, vol)
+      BootImage.dataset.destroy
+      described_class.allocate(vm, vol)
+      expect(vm.vm_storage_volumes.first.boot_image_id).to be_nil
+      expect(vm.vm_storage_volumes.first.remote_storage_server_id).to eq(rss.id)
+    end
+
+    it "fails allocation when machine_image_version_id is set but no host has vhost block backend v0.4.1+" do
       vm = create_vm
       miv = create_machine_image_version_metal
       vol = [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => true, "machine_image_version_id" => miv.id}]
+      create_storage_volumes(vm, vol)
       expect { described_class.allocate(vm, vol) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/)
-    end
-
-    it "creates volume with no rate limits" do
-      vm = create_vm
-      described_class.allocate(vm, vol)
-      expect(vm.vm_storage_volumes.first.max_read_mbytes_per_sec).to be_nil
-      expect(vm.vm_storage_volumes.first.max_write_mbytes_per_sec).to be_nil
     end
 
     it "can have empty allocation state filter" do
@@ -1037,30 +1168,51 @@ RSpec.describe Al do
       expect(al).to be_truthy
     end
 
-    it "creates volume with encryption key if storage is encrypted" do
-      vm = create_vm
-      described_class.allocate(vm, [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false}])
-      expect(StorageKeyEncryptionKey.count).to eq(1)
-      expect(vm.vm_storage_volumes.first.key_encryption_key_1_id).not_to be_nil
-      expect(vm.storage_secrets.count).to eq(1)
-    end
-
     it "uses vhost block backend if available" do
       vmh = VmHost.first
       vhost_backend = create_vhost_block_backend(vm_host_id: vmh.id)
       vm = create_vm
-      described_class.allocate(vm, [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false, "vring_workers" => 3}])
+      storage_volumes = [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false, "vring_workers" => 3}]
+      create_storage_volumes(vm, storage_volumes)
+      described_class.allocate(vm, storage_volumes)
       volume = vm.vm_storage_volumes.first
       expect(volume.vhost_block_backend_id).to eq(vhost_backend.id)
       expect(volume.spdk_installation_id).to be_nil
       expect(volume.vring_workers).to eq(3)
     end
 
+    it "assigns correct params to each volume when volumes have different sizes" do
+      vmh = VmHost.first
+      vhost_backend = create_vhost_block_backend(vm_host_id: vmh.id)
+      vm = create_vm
+      volumes = [
+        {"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => true, "vring_workers" => 2},
+        {"size_gib" => 20, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false, "vring_workers" => 3},
+        {"size_gib" => 14, "use_bdev_ubi" => false, "encrypted" => false, "boot" => false, "vring_workers" => 1},
+      ]
+      create_storage_volumes(vm, volumes)
+      described_class.allocate(vm, volumes)
+      vol1 = vm.vm_storage_volumes.find { |v| v.disk_index == 0 }
+      vol2 = vm.vm_storage_volumes.find { |v| v.disk_index == 1 }
+      vol3 = vm.vm_storage_volumes.find { |v| v.disk_index == 2 }
+      expect(vol1.size_gib).to eq(5)
+      expect(vol1.vhost_block_backend_id).to eq(vhost_backend.id)
+      expect(vol1.vring_workers).to eq(2)
+      expect(vol2.size_gib).to eq(20)
+      expect(vol2.vhost_block_backend_id).to eq(vhost_backend.id)
+      expect(vol2.vring_workers).to eq(3)
+      expect(vol3.size_gib).to eq(14)
+      expect(vol3.vhost_block_backend_id).to eq(vhost_backend.id)
+      expect(vol3.vring_workers).to eq(1)
+    end
+
     it "uses SPDK if vhost block backend has allocation_weight 0" do
       vmh = VmHost.first
       create_vhost_block_backend(vm_host_id: vmh.id, allocation_weight: 0)
+      storage_volumes = [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false, "vring_workers" => 3}]
       vm = create_vm
-      described_class.allocate(vm, [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false, "vring_workers" => 3}])
+      create_storage_volumes(vm, storage_volumes)
+      described_class.allocate(vm, storage_volumes)
       volume = vm.vm_storage_volumes.first
       expect(volume.vhost_block_backend_id).to be_nil
       expect(volume.spdk_installation_id).to eq(vmh.spdk_installations.first.id)
@@ -1071,10 +1223,12 @@ RSpec.describe Al do
       vmh = VmHost.first
       BootImage.where(vm_host_id: vmh.id).update(activated_at: nil)
       bi = BootImage.create(vm_host_id: vmh.id, name: "ubuntu-jammy", version: "20230303", activated_at: Time.now, size_gib: 3)
-      BootImage.create(vm_host_id: vmh.id, name: "ubuntu-jammy", version: nil, activated_at: Time.now, size_gib: 3)
+      BootImage.create(vm_host_id: vmh.id, name: "ubuntu-jammy", version: "20200101", activated_at: Time.now, size_gib: 3)
       BootImage.create(vm_host_id: vmh.id, name: "ubuntu-jammy", version: "20240404", activated_at: nil, size_gib: 3)
       vm = create_vm
-      described_class.allocate(vm, [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => true}])
+      storage_volumes = [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => true}]
+      create_storage_volumes(vm, storage_volumes)
+      described_class.allocate(vm, storage_volumes)
       expect(vm.vm_storage_volumes.first.boot_image_id).to eq(bi.id)
     end
 
@@ -1093,8 +1247,10 @@ RSpec.describe Al do
       bi = BootImage.create(vm_host_id: vmh.id, name: "ubuntu-jammy", version: "20230303", activated_at: Time.now, size_gib: 3)
       mi = BootImage.create(vm_host_id: vmh.id, name: "ai-model-test-model", version: "20240406", activated_at: Time.now, size_gib: 3)
       BootImage.create(vm_host_id: vmh.id, name: "ai-model-test-model", version: "20240404", activated_at: Time.now, size_gib: 3)
+      storage_volumes = [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => true}, {"size_gib" => 0, "read_only" => true, "image" => "ai-model-test-model", "boot" => false, "encrypted" => false, "use_bdev_ubi" => false}]
       vm = create_vm
-      described_class.allocate(vm, [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => true, "boot" => true}, {"size_gib" => 0, "read_only" => true, "image" => "ai-model-test-model", "boot" => false, "encrypted" => false, "use_bdev_ubi" => false}])
+      create_storage_volumes(vm, storage_volumes)
+      described_class.allocate(vm, storage_volumes)
       expect(vm.vm_storage_volumes.first.boot_image_id).to eq(bi.id)
       expect(vm.vm_storage_volumes.last.boot_image_id).to eq(mi.id)
     end
@@ -1149,37 +1305,15 @@ RSpec.describe Al do
       expect { al.update(vm) }.to raise_error(Sequel::CheckConstraintViolation, /vring_workers_positive_if_ubiblk/)
     end
 
-    it "allocates standard-gpu VM correctly on GEX44 host" do
-      vmh = VmHost.first
-      # Set the host to match GEX44 specs - it is an x64 host, but with one thread per core
-      PciDevice.create(vm_host_id: VmHost.first.id, slot: "01:00.0", device_class: "0300", vendor: "vd", device: "27b0", numa_node: 0, iommu_group: 3)
-      PciDevice.create(vm_host_id: VmHost.first.id, slot: "01:00.1", device_class: "0420", vendor: "vd", device: "27b0", numa_node: 0, iommu_group: 3)
-      vmh.update(arch: "x64", total_dies: 1, total_sockets: 1, total_cpus: 14, total_cores: 14, used_cores: 2)
-      used_cores = vmh.used_cores
-      used_memory = vmh.used_hugepages_1g
-
-      vm = create_vm_from_size("standard-gpu-6", "x64")
-      described_class.allocate(vm, [{"size_gib" => 85, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false},
-        {"size_gib" => 95, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false}], gpu_count: 1, gpu_device: "27b0")
-      vmh.reload
-      vm.reload
-
-      expect(vm.vcpus).to eq(6)
-      expect(vm.cores).to eq(6)
-      expect(vm.memory_gib).to eq(32)
-      expect(vmh.used_cores).to eq(used_cores + vm.cores)
-      expect(vmh.used_hugepages_1g).to eq(used_memory + vm.memory_gib)
-    end
-
     it "allocates standard VM correctly on arm64 host" do
       vmh = create_vm_host(arch: "arm64", total_cpus: 8, total_cores: 8, used_cores: 1, total_hugepages_1g: 26, used_hugepages_1g: 3, net6: "2001:db8::/64")
       BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
       StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh.id, name: "stor2", available_storage_gib: 90, total_storage_gib: 90)
       SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh.id)
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
       (0..8).each do |i|
-        VmHostCpu.create(vm_host_id: vmh.id, cpu_number: i, spdk: i < 1)
+        VmHostCpu.create(vm_host_id: vmh.id, cpu_number: i, io: i < 1)
       end
 
       used_cores = vmh.used_cores
@@ -1199,17 +1333,20 @@ RSpec.describe Al do
       expect(vmh.used_hugepages_1g).to eq(used_memory + vm.memory_gib)
     end
 
-    it "only allocates standard-gpu vms on GEX44 host" do
-      vmh = VmHost.first
-      PciDevice.create(vm_host_id: VmHost.first.id, slot: "01:00.0", device_class: "0300", vendor: "vd", device: "27b0", numa_node: 0, iommu_group: 3)
-      PciDevice.create(vm_host_id: VmHost.first.id, slot: "01:00.1", device_class: "0420", vendor: "vd", device: "27b0", numa_node: 0, iommu_group: 3)
-      vmh.update(arch: "x64", total_dies: 1, total_sockets: 1, total_cpus: 14, total_cores: 14, used_cores: 2)
-
+    it "updates associations on pre-existing storage volumes" do
       vm = create_vm
-      expect {
-        described_class.allocate(vm, [{"size_gib" => 85, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false},
-          {"size_gib" => 95, "use_bdev_ubi" => false, "encrypted" => true, "boot" => false}])
-      }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/)
+      vm.create_storage_volumes([
+        {boot: true, size_gib: 5, encrypted: false, track_written: false},
+      ])
+      existing_id = vm.vm_storage_volumes_dataset.first.id
+
+      described_class.allocate(vm, [{"size_gib" => 5, "use_bdev_ubi" => false, "encrypted" => false, "boot" => true}])
+
+      volumes = vm.vm_storage_volumes_dataset.all
+      expect(volumes.length).to eq 1
+      expect(volumes.first.id).to eq(existing_id)
+      expect(volumes.first.storage_device_id).not_to be_nil
+      expect(volumes.first.spdk_installation_id).not_to be_nil
     end
   end
 
@@ -1224,9 +1361,9 @@ RSpec.describe Al do
       StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh.id, name: "stor2", available_storage_gib: 90, total_storage_gib: 90)
       SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
       (0..16).each do |i|
-        VmHostCpu.create(vm_host_id: vmh.id, cpu_number: i, spdk: i < 2)
+        VmHostCpu.create(vm_host_id: vmh.id, cpu_number: i, io: i < 2)
       end
     end
 
@@ -1292,9 +1429,9 @@ RSpec.describe Al do
       StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh.id, name: "stor2", available_storage_gib: 90, total_storage_gib: 90)
       SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
       (0..16).each do |i|
-        VmHostCpu.create(vm_host_id: vmh.id, cpu_number: i, spdk: i < 2)
+        VmHostCpu.create(vm_host_id: vmh.id, cpu_number: i, io: i < 2)
       end
     end
 
@@ -1311,6 +1448,7 @@ RSpec.describe Al do
 
     it "creates a vm with a slice" do
       vm = create_vm
+      create_storage_volumes(vm, vol)
       vmh = VmHost.first
       used_cores = vmh.used_cores
       used_hugepages_1g = vmh.used_hugepages_1g
@@ -1461,7 +1599,7 @@ RSpec.describe Al do
       StorageDevice.create(vm_host_id: vh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vh2.id, name: "stor2", available_storage_gib: 90, total_storage_gib: 90)
       SpdkInstallation.create_with_id(vh2, vm_host_id: vh2.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "1.1.2.0/30", routed_to_host_id: vh2.id)
+      Address.create(cidr: "1.1.2.0/30", routed_to_host_id: vh2.id).populate_ipv4_addresses
       PciDevice.create(vm_host_id: vh2.id, slot: "01:00.0", device_class: "0300", vendor: "vd", device: "dv1", numa_node: 0, iommu_group: 3)
       PciDevice.create(vm_host_id: vh2.id, slot: "01:00.1", device_class: "0420", vendor: "vd", device: "dv2", numa_node: 0, iommu_group: 3)
       vh2.update(used_cores: 4, used_hugepages_1g: 26)
@@ -1534,9 +1672,9 @@ RSpec.describe Al do
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor2", available_storage_gib: 90, total_storage_gib: 90)
       SpdkInstallation.create_with_id(vmh2, vm_host_id: vmh2.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "1.2.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.2.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       (0..16).each do |i|
-        VmHostCpu.create(vm_host_id: vmh2.id, cpu_number: i, spdk: i < 2)
+        VmHostCpu.create(vm_host_id: vmh2.id, cpu_number: i, io: i < 2)
       end
 
       vm = create_vm
@@ -1560,11 +1698,11 @@ RSpec.describe Al do
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh2.id, name: "stor2", available_storage_gib: 90, total_storage_gib: 90)
       SpdkInstallation.create_with_id(vmh2, vm_host_id: vmh2.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "1.2.1.0/30", routed_to_host_id: vmh2.id)
+      Address.create(cidr: "1.2.1.0/30", routed_to_host_id: vmh2.id).populate_ipv4_addresses
       PciDevice.create(vm_host_id: vmh2.id, slot: "01:00.0", device_class: "0300", vendor: "vd", device: "dv1", numa_node: 0, iommu_group: 3)
       PciDevice.create(vm_host_id: vmh2.id, slot: "01:00.1", device_class: "0420", vendor: "vd", device: "dv2", numa_node: 0, iommu_group: 3)
       (0..16).each do |i|
-        VmHostCpu.create(vm_host_id: vmh2.id, cpu_number: i, spdk: i < 2)
+        VmHostCpu.create(vm_host_id: vmh2.id, cpu_number: i, io: i < 2)
       end
 
       vm = create_vm(family: "burstable", vcpus: 1, memory_gib: 2, cpu_percent_limit: 50, cpu_burst_percent_limit: 50)
@@ -1579,9 +1717,9 @@ RSpec.describe Al do
       StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
       StorageDevice.create(vm_host_id: vmh.id, name: "stor2", available_storage_gib: 90, total_storage_gib: 90)
       SpdkInstallation.create_with_id(vmh, vm_host_id: vmh.id, version: "v1", allocation_weight: 100)
-      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh.id)
+      Address.create(cidr: "2.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
       (0..12).each do |i|
-        VmHostCpu.create(vm_host_id: vmh.id, cpu_number: i, spdk: i < 1)
+        VmHostCpu.create(vm_host_id: vmh.id, cpu_number: i, io: i < 1)
       end
 
       used_cores = vmh.used_cores
@@ -1799,7 +1937,7 @@ RSpec.describe Al do
         Vm.where(vm_host_slice_id: slice.id).update(vm_host_slice_id: nil)
 
         nx = Prog::Vm::VmHostSliceNexus.new(slice.strand)
-        expect(nx.host.sshable).to receive(:_cmd).with("sudo host/bin/setup-slice delete sl1.slice")
+        expect(nx.host.sshable).to receive(:_cmd).with("sudo host/bin/setup-slice delete sl1.slice", log: :on_error)
         expect { nx.destroy }.to exit({"msg" => "vm_host_slice destroyed"})
 
         vh.reload
@@ -1813,13 +1951,6 @@ RSpec.describe Al do
       req = create_req(vm, vol)
 
       expect(req.memory_gib_for_vcpus(vm.vcpus)).to eq 8
-    end
-
-    it "memory_gib_for_vcpus returns correct ratio for standard-gpu" do
-      vm = create_vm(family: "standard-gpu", arch: "x64", vcpus: 6, cpu_percent_limit: 600)
-      req = create_req(vm, vol)
-
-      expect(req.memory_gib_for_vcpus(vm.vcpus)).to eq 32
     end
 
     it "memory_gib_for_vcpus handles arm64" do
@@ -1899,6 +2030,58 @@ RSpec.describe Al do
       expect(vm.reload.vm_host_id).to be_nil
       expect(vh.reload.used_hugepages_1g).to eq(50)
       expect(VmHostSlice.count).to eq(0)
+    end
+
+    it "select_cpuset picks the lowest free cpu numbers when the host has no numa data" do
+      vm = create_vm
+      req = create_req(vm, vol)
+      al = Scheduling::Allocator::VmHostSliceAllocation.new(nil, req, nil)
+
+      vh = VmHost.first
+      expect(al.select_cpuset(vh.id, 4)).to eq([2, 3, 4, 5])
+    end
+
+    it "select_cpuset chooses the best fitting numa node" do
+      vm = create_vm
+      req = create_req(vm, vol)
+      al = Scheduling::Allocator::VmHostSliceAllocation.new(nil, req, nil)
+
+      vh = VmHost.first
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 2..6).update(numa_node: 0) # 5 free cpus
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 7..10).update(numa_node: 1) # 4 free cpus
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 11..16).update(numa_node: 2) # 6 free cpus
+
+      expect(al.select_cpuset(vh.id, 4)).to eq([7, 8, 9, 10])
+    end
+
+    it "select_cpuset spans numa nodes when no single node has enough free cpus" do
+      vm = create_vm
+      req = create_req(vm, vol)
+      al = Scheduling::Allocator::VmHostSliceAllocation.new(nil, req, nil)
+
+      vh = VmHost.first
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 2..4).update(numa_node: 0)
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 5..7).update(numa_node: 1)
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 8..10).update(numa_node: 2)
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 11..13).update(numa_node: 3)
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 14..16).update(numa_node: 4)
+
+      expect(al.select_cpuset(vh.id, 6)).to eq([2, 3, 4, 5, 6, 7])
+    end
+
+    it "keeps a slice's cpuset within a single numa node when allocating" do
+      vh = VmHost.first
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 2..9).update(numa_node: 0) # 8 free cpus
+      VmHostCpu.where(vm_host_id: vh.id, cpu_number: 10..16).update(numa_node: 1) # 7 free cpus
+
+      vm = create_vm(vcpus: 4, memory_gib: 16, cpu_percent_limit: 400)
+      al = Al::Allocation.best_allocation(create_req(vm, vol, use_slices: true))
+      al.update(vm)
+      vh.reload
+
+      slice = vm.vm_host_slice
+      expect(slice).not_to be_nil
+      expect(slice.allowed_cpus_cgroup).to eq("10-13")
     end
   end
 

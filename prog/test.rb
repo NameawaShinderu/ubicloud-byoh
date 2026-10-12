@@ -4,6 +4,7 @@
 class Prog::Test < Prog::Base
   subject_is :sshable
   semaphore :test_semaphore, :destroy
+  frame_reader :test_level
 
   label def start
   end
@@ -51,12 +52,12 @@ class Prog::Test < Prog::Base
   end
 
   label def pusher2
-    pop frame["test_level"] if retval
+    pop test_level if retval
     push Prog::Test, {test_level: "3"}, :pusher3
   end
 
   label def pusher3
-    pop frame["test_level"]
+    pop test_level
   end
 
   label def hop_entry
@@ -76,6 +77,18 @@ class Prog::Test < Prog::Base
     reap { pop({msg: "reap_exit_no_children"}) }
   end
 
+  label def reap_when_idle
+    reap(nap: 5, fallthrough: :when_idle)
+    pop({msg: "reap_when_idle"})
+  end
+
+  label def reap_emit_reaped_children
+    reaper = lambda do |child|
+      Clog.emit("child exit", strand_exited: {strand: [child.exitval["msg"], child.ubid]})
+    end
+    reap(reaper:)
+  end
+
   label def failer
     fail "failure"
   end
@@ -90,6 +103,16 @@ class Prog::Test < Prog::Base
   end
 
   label def napper
+    nap(123)
+  end
+
+  label def late_signal_napper
+    Semaphore.incr(strand.id, "late_signal")
+    nap(123)
+  end
+
+  label def snap_signal_napper
+    incr_test_semaphore
     nap(123)
   end
 
@@ -135,8 +158,23 @@ class Prog::Test < Prog::Base
     nap 1
   end
 
+  label def nap_with_expired_deadline
+    register_deadline("pusher2", -10)
+    nap(10)
+  end
+
   label def set_expired_deadline
     register_deadline("pusher2", -1)
+    hop_pusher1
+  end
+
+  label def set_expired_no_page_deadline
+    register_deadline("pusher2", -1, page: false)
+    hop_pusher1
+  end
+
+  label def set_expired_warning_deadline
+    register_deadline("pusher2", -1, page: "warning")
     hop_pusher1
   end
 

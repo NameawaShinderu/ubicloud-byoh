@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "rodish"
+require "csv"
 require_relative "../sdk/ruby/lib/ubicloud"
 
 class UbiCli
@@ -11,6 +12,7 @@ class UbiCli
     "ak" => "inference_api_key",
     "kc" => "kubernetes_cluster",
     "lb" => "load_balancer",
+    "mi" => "machine_image",
     "pg" => "postgres",
     "ps" => "private_subnet",
     "vm" => "vm",
@@ -21,6 +23,7 @@ class UbiCli
     "ak" => "Inference API key",
     "kc" => "Kubernetes cluster",
     "lb" => "Load balancer",
+    "mi" => "Machine image",
     "pg" => "PostgreSQL database",
     "ps" => "Private subnet",
     "vm" => "Virtual machine",
@@ -32,7 +35,7 @@ class UbiCli
   LOWERCASE_LABELS["ak"] = "inference API key"
   LOWERCASE_LABELS.freeze
 
-  OBJECT_INFO_REGEXP = /((fw|kc|1b|pg|ps|vm)[a-tv-z0-9]{24})/
+  OBJECT_INFO_REGEXP = /((fw|kc|1b|m1|pg|ps|vm)[a-tv-z0-9]{24})/
   EXACT_OBJECT_INFO_REGEXP = /\A#{OBJECT_INFO_REGEXP}\z/
   UBI_VERSION_REGEXP = /\A\d{1,4}\.\d{1,4}\.\d{1,4}\z/
 
@@ -56,12 +59,13 @@ class UbiCli
     help_example "ubi vm list    # List virtual machines"
     help_example "ubi help vm    # Get help for vm subcommand"
 
-    # :nocov:
+    # simplecov:disable
     autoload_subcommand_dir("cli-commands") unless force_autoload
-    # :nocov:
+    # simplecov:enable
   end
 
   def self.process(argv, env)
+    env["clover.logged_argv"] = argv.map(&:dup)
     super
   rescue Ubicloud::Error => e
     status = e.code
@@ -82,6 +86,11 @@ class UbiCli
     message += "\n" unless message.end_with?("\n")
 
     [status, {"content-type" => "text/plain", "content-length" => message.bytesize.to_s}, [message]]
+  ensure
+    argv = env.delete("clover.logged_argv")
+    logged_argv = argv[0...25].map { |s| (s.bytesize > 25) ? [s.bytesize, s[0...5], s[-5..]] : s }
+    logged_argv << argv.length if argv.length > 25
+    Clog.emit("cli command", cli_command: {argv: logged_argv, project: env["clover.project_ubid"]})
   end
 
   def self.base(cmd, &block)
@@ -90,12 +99,12 @@ class UbiCli
 
       desc "Manage #{label}s"
 
-      # :nocov:
+      # simplecov:disable
       unless Config.production? || ENV["FORCE_AUTOLOAD"] == "1"
         autoload_subcommand_dir("cli-commands/#{cmd}")
         autoload_post_subcommand_dir("cli-commands/#{cmd}/post")
       end
-      # :nocov:
+      # simplecov:enable
 
       args(2...)
 
@@ -210,7 +219,7 @@ class UbiCli
 
       args(0...)
 
-      run do |argv, opts|
+      run do |argv, opts, command|
         pg = sdk_object.info
         conn_string = URI(pg.connection_string)
         opts = opts[:pg_psql]
@@ -221,6 +230,8 @@ class UbiCli
           pgpassword = conn_string.password
           conn_string.password = nil
           headers = {"ubi-pgpassword" => pgpassword}
+        else
+          command.raise_failure("Using the pg #{cmd} subcommand with your current ubi program is disallowed for security reasons. Please update your ubi program to version 1.1.0+.")
         end
 
         if (database = opts[:dbname])
@@ -239,6 +250,10 @@ class UbiCli
   end
 
   private
+
+  def logged_argv
+    @env["clover.logged_argv"]
+  end
 
   def project_ubid
     @project_ubid ||= @env["clover.project_ubid"]
@@ -267,7 +282,19 @@ class UbiCli
     params_to_hash(params, :tags, "tag", cmd)
   end
 
-  def config_entries_to_hash(args, cmd)
+  def metric_destinations_response(data)
+    body = []
+    body << "Metric destination added to PostgreSQL database.\n"
+    body << "Current metric destinations:\n"
+    data[:metric_destinations].each_with_index do |md, i|
+      body << "  " << (i + 1).to_s << ": " << md[:id] << "  " << md[:auth_methods].join(",")
+      body << "  " << md[:username] if md[:username]
+      body << "  " << md[:url] << "\n"
+    end
+    response(body)
+  end
+
+  def kv_entries_to_hash(args, cmd)
     args.to_h do
       if it.include?("=")
         it.split("=", 2)
@@ -275,6 +302,22 @@ class UbiCli
         raise Rodish::CommandFailure.new("invalid argument, does not include `=`: #{it.inspect}", cmd)
       end
     end
+  end
+
+  def structured_data_args_to_hash(args, cmd)
+    result = {}
+    args.each do |arg|
+      sd_id, rest = arg.split("/", 2)
+      unless rest
+        raise Rodish::CommandFailure.new("invalid structured_data argument, expected sd-id/key=value format: #{arg.inspect}", cmd)
+      end
+      unless rest.include?("=")
+        raise Rodish::CommandFailure.new("invalid structured_data argument, expected sd-id/key=value format: #{arg.inspect}", cmd)
+      end
+      key, value = rest.split("=", 2)
+      (result[sd_id] ||= {})[key] = value
+    end
+    result.empty? ? nil : result
   end
 
   def handle_ssh(opts)
@@ -340,6 +383,20 @@ class UbiCli
     else
       allowed_fields
     end
+  end
+
+  def format_paginated_csv(page, continuation_cmd, no_headers:, header_row:)
+    body = []
+    body << header_row << "\n" if no_headers != false
+    page.each { |row| body << CSV.generate_line(yield(row)) }
+    if page.next_page_args
+      body << "Continue search: #{continuation_cmd} "
+      page.next_page_args.each do |key, value|
+        body << "--" << key.to_s.tr("_", "-") << "=" << value.to_s << " " if value
+      end
+      body << "\n"
+    end
+    body
   end
 
   def format_rows(keys, rows, headers: false, col_sep: "  ")
@@ -471,7 +528,7 @@ class UbiCli
     raise Rodish::CommandFailure.new(error_message, cmd) if string.include?("/")
   end
 
-  # :nocov:
+  # simplecov:disable
   if Config.frozen_test?
     singleton_class.prepend(Module.new do
       def process(argv, env)
@@ -491,15 +548,38 @@ class UbiCli
       end
     end)
   end
-  # :nocov:
+  # simplecov:enable
 
-  Unreloader.record_dependency("lib/rodish.rb", __FILE__)
+  class DirectModelAccess < StandardError; end
+
+  if Config.unfrozen_test? && ENV["FORCE_AUTOLOAD"] == "1"
+    def self.models_loaded
+      Sequel::Model.descendants.each do |model|
+        name = model.name
+        autoload(name, "./vendor/hidden_class") if /\A[A-Za-z0-9]+\z/.match?(name)
+      end
+      autoload(:DB, "./vendor/hidden_class")
+    end
+  # simplecov:disable
+  else
+    def self.models_loaded
+      # nothing
+    end
+  end
+  # simplecov:enable
+
+  # Allow direct access to DB here for the sole purpose of ignoring
+  # duplicate queries.
+  def ignore_duplicate_queries(&)
+    ::DB.ignore_duplicate_queries(&)
+  end
+
   Unreloader.record_dependency(__FILE__, "cli-commands")
   if force_autoload
     Unreloader.require("cli-commands") {}
-  # :nocov:
+  # simplecov:disable
   else
     Unreloader.autoload("cli-commands") {}
   end
-  # :nocov:
+  # simplecov:enable
 end

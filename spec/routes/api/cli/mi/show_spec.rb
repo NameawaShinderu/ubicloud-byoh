@@ -1,0 +1,38 @@
+# frozen_string_literal: true
+
+require_relative "../spec_helper"
+
+RSpec.describe Clover, "cli mi show" do
+  let(:location_id) { Location[display_name: TEST_LOCATION].id }
+
+  before do
+    @mi_metal = create_machine_image_version_metal(project_id: @project.id, location_id:, set_latest_version: true)
+    @mi = @mi_metal.machine_image_version.machine_image
+  end
+
+  it "shows machine image details" do
+    body = cli(%W[mi eu-central-h1/#{@mi.name} show -f id,name,arch,latest-version])
+    expect(body).to eq <<~END
+      id: #{@mi.ubid}
+      name: #{@mi.name}
+      arch: x64
+      latest-version: v1
+    END
+  end
+
+  it "restricts fields with -f" do
+    body = cli(%W[mi eu-central-h1/#{@mi.name} show -f id,name])
+    expect(body).to eq("id: #{@mi.ubid}\nname: #{@mi.name}\n")
+  end
+
+  it "supports lookup by ubid" do
+    body = cli(%W[mi #{@mi.ubid} show -f name])
+    expect(body).to eq("name: #{@mi.name}\n")
+  end
+
+  it "rejects invalid fields" do
+    expect(cli(%W[mi eu-central-h1/#{@mi.name} show -f bogus], status: 400)).to start_with(
+      "! Invalid field(s) given in mi show -f option",
+    )
+  end
+end

@@ -43,6 +43,8 @@ class Clover < Roda
           else
             if object.is_a?(KubernetesCluster)
               Validation.validate_kubernetes_name(name)
+            elsif object.is_a?(KubernetesNodepool)
+              Validation.validate_kubernetes_name(name)
             else
               Validation.validate_name(name)
             end
@@ -50,7 +52,7 @@ class Clover < Roda
             DB.transaction do
               object.update(name:)
               yield if block_given?
-              audit_log(object, "update")
+              audit_log(object, "rename")
             end
           end
 
@@ -86,11 +88,11 @@ class Clover < Roda
       "x-frame-options" => "deny",
       "x-content-type-options" => "nosniff",
     )
-    # :nocov:
+    # simplecov:disable
     if Config.production?
       WEB_DEFAULT_HEADERS["strict-transport-security"] = "max-age=63072000; includeSubDomains"
     end
-    # :nocov:
+    # simplecov:enable
     WEB_DEFAULT_HEADERS.freeze
 
     attr_accessor :json
@@ -112,12 +114,15 @@ class Clover < Roda
     cancel_storage_auto_scale
     connect
     create
+    create_backup_credentials
     create_cert
     create_replica
+    create_version
     decline_invitation
     delete_all_cache_entries
     destroy
     destroy_invitation
+    destroy_version
     detach_vm
     disable_cache
     disable_cache_scope
@@ -134,10 +139,12 @@ class Clover < Roda
     remove_account
     remove_cert_auth_user
     remove_member
+    rename
     reset_superuser_password
     restart
     restore
     restrict
+    retire
     set_maintenance_window
     start
     stop
@@ -146,6 +153,7 @@ class Clover < Roda
     update_billing
     update_config
     update_invitation
+    update_latest_version
     upgrade
   ACTIONS
 
@@ -200,6 +208,9 @@ class Clover < Roda
   def after_rodauth_create_account(account_id)
     account = Account[account_id]
     account.default_project = account.create_project_with_default_policy("Default")
+    if (sources = session["account_source"])
+      DB[:account_source].import([:account_id, :source, :detail], sources.map { [account.id, *it] })
+    end
     Strand.create(prog: "CheckDomainBlacklist", label: "start", stack: [{subject_id: account_id}])
   end
 
@@ -260,6 +271,78 @@ class Clover < Roda
       values = ds.union(DB.values([[Sequel.cast(values, :uuid)]]), from_self: false, all: true)
     end
     super
+  end
+
+  def metrics_response(definitions, resource_ubid, tsdb_client)
+    unless tsdb_client
+      raise CloverError.new(404, "NotFound", "Metrics are not configured for this instance")
+    end
+
+    start_time, end_time = typecast_params.str(%w[start end].freeze)
+    start_time = start_time ? Validation.validate_rfc3339_datetime_str(start_time, "start") : (Time.now.utc - 60 * 30)
+    end_time = end_time ? Validation.validate_rfc3339_datetime_str(end_time, "end") : Time.now.utc
+
+    start_ts = start_time.to_i
+    end_ts = end_time.to_i
+
+    if end_ts < start_ts
+      raise CloverError.new(400, "InvalidRequest", "End timestamp must be greater than start timestamp")
+    end
+
+    if end_ts - start_ts > 31 * 24 * 60 * 60 + 5 * 60
+      raise CloverError.new(400, "InvalidRequest", "Maximum time range is 31 days")
+    end
+
+    if start_ts < Time.now.utc.to_i - 31 * 24 * 60 * 60
+      raise CloverError.new(400, "InvalidRequest", "Cannot query metrics older than 31 days")
+    end
+
+    metrics = if (metric_key = typecast_params.str("key"))
+      key = definitions.keys.find { it.name == metric_key }
+
+      unless key
+        raise CloverError.new(400, "InvalidRequest", "Invalid metric name")
+      end
+
+      {key => definitions[key]}
+    else
+      definitions
+    end
+
+    results = metrics.map do |key, metric_definition|
+      series_results = metric_definition.series.filter_map do |s|
+        query = s.query.gsub("$ubicloud_resource_id", resource_ubid)
+        begin
+          series_query_result = tsdb_client.query_range(query:, start_ts:, end_ts:)
+
+          # This can be a two cases:
+          # 1. Missing data (e.g. no data for the given time range)
+          # 2. No data for the given query (maybe bad query)
+          next if series_query_result.empty?
+
+          # Combine labels with configured series labesls.
+          series_query_result.each { it["labels"].merge!(s.labels) }
+
+          series_query_result
+        rescue VictoriaMetrics::ClientError => e
+          Clog.emit("Could not query VictoriaMetrics", {victoria_metrics_query_failure: {error: e.message, query:}})
+
+          if metric_key
+            raise CloverError.new(500, "InternalError", "Internal error while querying metrics", {query:})
+          end
+        end
+      end
+
+      {
+        key: key.to_s,
+        name: metric_definition.name,
+        unit: metric_definition.unit,
+        description: metric_definition.description,
+        series: series_results.flatten,
+      }
+    end
+
+    {metrics: results}
   end
 
   def authorize(actions, object_id)
@@ -352,10 +435,10 @@ class Clover < Roda
       .group_by { [it["resource_type"], it["resource_family"], it["location"]] }
       .map { |_, brs| brs.max_by { it["active_from"] } }
       .each_with_object(Hash.new { |h, k| h[k] = h.class.new(&h.default_proc) }) do |br, hash|
-        hash[br["location"]][br["resource_type"]][br["resource_family"]] = {
-          hourly: br["unit_price"].to_f * 60,
-          monthly: br["unit_price"].to_f * 60 * 672,
-        }
+      hash[br["location"]][br["resource_type"]][br["resource_family"]] = {
+        hourly: br["unit_price"].to_f * 60,
+        monthly: br["unit_price"].to_f * 60 * 672,
+      }
     end
   end
 

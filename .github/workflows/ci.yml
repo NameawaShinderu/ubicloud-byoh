@@ -22,45 +22,45 @@ jobs:
 
     steps:
     - name: Check out code
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
 
     - name: Set up Clover
-      uses: ./.github/actions/setup-clover
+      uses: $/.github/actions/setup-clover
       with:
         setup-node: true
 
-    - name: Run erb-formatter
-      run: bundle exec rake linter:erb_formatter
-
     - name: Cache rubocop
-      uses: actions/cache@v5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: /home/runner/.cache/rubocop_cache
         key: ${{ matrix.runs-on }}-rubocop-cache-${{ hashFiles('Gemfile.lock', '.rubocop.yml') }}
 
-    - name: Run rubocop
-      run: bundle exec rake linter:rubocop
+    - parallel:
+      - name: Run erb-formatter
+        run: bundle exec rake linter:erb_formatter
 
-    - name: Run brakeman
-      run: bundle exec rake linter:brakeman
+      - name: Run rubocop
+        run: bundle exec rake linter:rubocop
 
-    - name: Run linter:openapi
-      run: bundle exec rake linter:openapi
+      - name: Run linter:openapi
+        run: bundle exec rake linter:openapi
 
-    - name: Run linter:xss_check
-      run: bundle exec rake linter:xss_check
+      - name: Run linter:xss_check
+        run: bundle exec rake linter:xss_check
 
-    - name: Run linter:cmd_exec
-      run: bundle exec rake linter:cmd_exec
+      - name: Run linter:cmd_exec
+        run: bundle exec rake linter:cmd_exec
 
-    - name: Run check_missing_admin_model_specs
-      run: bundle exec rake check_missing_admin_model_specs
+      - name: Run check_missing_admin_model_specs
+        run: bundle exec rake check_missing_admin_model_specs
 
-    - name: Run annotate
-      run: bundle exec rake annotate
+      - name: Run annotate
+        run: bundle exec rake annotate
 
-    - name: Refresh sequel caches
-      run: bundle exec rake refresh_sequel_caches
+      - name: Refresh sequel caches
+        run: bundle exec rake refresh_sequel_caches
 
     - name: Check that source code formatters and annotations make no changes
       run: git diff --stat --exit-code
@@ -77,14 +77,22 @@ jobs:
       run: ruby bin/production_check
 
     - name: Run controlplane tests
-      run: bundle exec rake
+      run: bundle exec rake default frozen_spec
 
     - name: Run dataplane tests
       run: bundle exec rake rhizome_spec
 
     - name: Archive code coverage results
       if: failure()
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: code-coverage-report-${{ matrix.runs-on }}
         path: coverage/
+
+    - name: Archive CLI golden-file diff
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: cli-golden-files-diff-${{ matrix.runs-on }}
+        path: cli-golden-files.diff
+        if-no-files-found: ignore

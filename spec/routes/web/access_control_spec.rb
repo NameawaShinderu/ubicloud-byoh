@@ -375,7 +375,7 @@ RSpec.describe Clover, "access control" do
       expect(AccessControlEntry.count).to eq 2
     end
 
-    %w[subject action object].each do |type|
+    %w[subject action object].freeze.each do |type|
       cap_type = type.capitalize
       model = Object.const_get(:"#{cap_type}Tag")
       perm_type = "Project:#{cap_type.sub(/(ect|ion)\z/, "").downcase}tag"
@@ -869,6 +869,18 @@ RSpec.describe Clover, "access control" do
       ]
     end
 
+    it "fails when removing members not in project" do
+      st = SubjectTag.create(project_id: project.id, name: "stt")
+      sst = SubjectTag.create(project_id: project.id, name: "sst")
+      st.add_member(sst.id)
+      visit "#{project.path}/user/access-control/tag/subject/#{st.ubid}"
+      st.remove_members([sst.id])
+      check "remove[]"
+      click_button "Remove Members"
+      expect(page).to have_flash_error "Attempt to remove a member not in the tag"
+      expect(page.title).to eq "Ubicloud - Default - stt"
+    end
+
     it "cannot remove all accounts from Admin subject tag" do
       admin = SubjectTag[project_id: project.id, name: "Admin"]
       visit "#{project.path}/user/access-control/tag/subject/#{admin.ubid}"
@@ -891,6 +903,7 @@ RSpec.describe Clover, "access control" do
         click_button "Add Members"
         expect(page).to have_flash_error "There was a temporary error attempting to make this change, please try again."
       end
+      expect(Page.count).to eq 0
 
       expect(UBID).to receive(:class_match?).and_return(false)
       click_button "Add Members"

@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require "digest"
+require "openssl"
 require "excon"
 require "forwardable"
 
@@ -76,7 +76,7 @@ class Prog::Ai::InferenceRouterReplicaNexus < Prog::Base
     asset_name = "inference-router-#{release_tag}-x86_64-unknown-linux-gnu"
     vm.sshable.cmd("id -u inference-router >/dev/null 2>&1 || sudo useradd --system --no-create-home --shell /usr/sbin/nologin inference-router")
     vm.sshable.cmd("sudo chown -R inference-router:inference-router :workdir", workdir:)
-    vm.sshable.cmd("sudo wget -O :workdir/fetch_linux_amd64 https://github.com/gruntwork-io/fetch/releases/download/v0.4.6/fetch_linux_amd64", workdir:)
+    vm.sshable.cmd("sudo curl -fsSL -o :workdir/fetch_linux_amd64 https://github.com/gruntwork-io/fetch/releases/download/v0.4.6/fetch_linux_amd64", workdir:)
     vm.sshable.cmd("sudo chmod +x :workdir/fetch_linux_amd64", workdir:)
     vm.sshable.cmd("sudo :workdir/fetch_linux_amd64 --github-oauth-token=:access_token --repo=\"https://github.com/ubicloud/inference-router\" --tag=:release_tag --release-asset=\"inference-router-*\" :workdir/", workdir:, access_token:, release_tag:)
     vm.sshable.cmd("sudo tar -xzf :workdir/:asset_name.tar.gz -C :workdir", workdir:, asset_name:)
@@ -224,7 +224,7 @@ class Prog::Ai::InferenceRouterReplicaNexus < Prog::Base
     Prog::PageNexus.assemble(
       format(page_details[:message], inference_router_replica.ubid.to_s[0..7], inference_router.name),
       [page_details[:tag], inference_router_replica.ubid],
-      inference_router_replica.ubid, extra_data:,
+      inference_router_replica.ubid, resource_id: inference_router_replica.id, extra_data:,
     )
   end
 
@@ -241,6 +241,7 @@ class Prog::Ai::InferenceRouterReplicaNexus < Prog::Base
     ).exists
 
     free_quota_exhausted_projects_ds = FreeQuota.get_exhausted_projects("inference-tokens")
+    active_credit_projects_ds = ResourceCredit.active_project_ids_ds
     valid_payment_method_ds = DB[:payment_method]
       .where(fraud: false)
       .select_group(:billing_info_id)
@@ -251,7 +252,7 @@ class Prog::Ai::InferenceRouterReplicaNexus < Prog::Base
         if inference_router.location.visible
           ds
             .left_outer_join(valid_payment_method_ds, billing_info_id: :billing_info_id)
-            .exclude(valid_payment_method: nil, credit: 0.0, id: free_quota_exhausted_projects_ds)
+            .exclude(Sequel.~(id: active_credit_projects_ds) & {valid_payment_method: nil, id: free_quota_exhausted_projects_ds})
         else
           ds.where(
             Sequel.pg_jsonb_op(:feature_flags)["visible_locations"]
@@ -263,13 +264,13 @@ class Prog::Ai::InferenceRouterReplicaNexus < Prog::Base
     eligible_projects = eligible_projects_ds.all
       .select(&:active?)
       .map do
-        {
-          ubid: it.ubid,
-          api_keys: it.api_keys
-            .select { |k| k.used_for == "inference_endpoint" && k.is_valid }
-            .sort_by { |k| k.id }
-            .map { |k| Digest::SHA2.hexdigest(k.key) },
-        }
+      {
+        ubid: it.ubid,
+        api_keys: it.api_keys
+          .select { |k| k.used_for == "inference_endpoint" && k.is_valid }
+          .sort_by { |k| k.id }
+          .map { |k| OpenSSL::Digest::SHA256.hexdigest(k.key) },
+      }
     end
 
     targets = inference_router.targets.group_by(&:inference_router_model)
@@ -286,9 +287,9 @@ class Prog::Ai::InferenceRouterReplicaNexus < Prog::Base
             targets
               .select { |target| target.enabled }
               .map do |target|
-                target.values.slice(:host, :inflight_limit)
-                  .merge(id: target.name, api_key: target.api_key)
-                  .merge(target.extra_configs)
+              target.values.slice(:host, :inflight_limit)
+                .merge(id: target.name, api_key: target.api_key)
+                .merge(target.extra_configs)
             end
           end,
       }
@@ -303,7 +304,7 @@ class Prog::Ai::InferenceRouterReplicaNexus < Prog::Base
     }
     new_config = new_config.merge(JSON.parse(File.read("config/inference_router_config.json")))
     new_config_json = JSON.generate(new_config)
-    new_md5 = Digest::MD5.hexdigest(new_config_json)
+    new_md5 = OpenSSL::Digest::MD5.hexdigest(new_config_json)
     config_path = "/ir/workdir/config.json"
     current_md5 = vm.sshable.cmd("md5sum :config_path | awk '{ print $1 }'", config_path:).strip
     if current_md5 != new_md5

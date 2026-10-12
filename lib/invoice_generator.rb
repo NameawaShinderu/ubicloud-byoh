@@ -4,22 +4,43 @@ require "time"
 require "stripe"
 
 class InvoiceGenerator
-  def initialize(begin_time, end_time, save_result: false, project_ids: [], eur_rate: nil)
+  CURRENT_INVOICE_VERSION = 2
+
+  def initialize(begin_time, end_time, save_result: false, project_ids: [], discounts_and_credits_hashes: nil, eur_rate: nil)
     @begin_time = begin_time
     @end_time = end_time
     @save_result = save_result
     @project_ids = project_ids
+    @discounts_and_credits_hashes = discounts_and_credits_hashes
     @eur_rate = eur_rate
     if @save_result && !@eur_rate
       raise ArgumentError, "eur_rate must be provided when save_result is true"
     end
   end
 
+  def self.discounts_and_credits_hashes(begin_time, end_time, project_ids)
+    [ResourceDiscount, ResourceCredit].map! do |model|
+      ds = model
+        .for_project(project_ids)
+        .active_during(begin_time, end_time)
+
+      ds = ds.remaining if model == ResourceCredit
+      ds.to_hash_groups(:project_id)
+    end
+  end
+
   def run
     invoices = []
 
+    billing_records_by_project = active_billing_records.group_by { |br| br[:project] }
+    billing_record_project_ids = billing_records_by_project.keys.map!(&:id)
+    # Collect and cache stripe information outside of the transaction
+    billing_records_by_project.each_key { it.billing_info&.stripe_data }
+
     DB.transaction do
-      active_billing_records.group_by { |br| br[:project] }.each do |project, project_records|
+      all_resource_discounts, all_resource_credits = @discounts_and_credits_hashes || self.class.discounts_and_credits_hashes(@begin_time, @end_time, billing_record_project_ids)
+
+      billing_records_by_project.each do |project, project_records|
         project_content = {}
         project_content[:project_id] = project.id
         project_content[:project_name] = project.name
@@ -58,8 +79,8 @@ class InvoiceGenerator
         # Invoices are issued by Ubicloud Inc. for non-EU customers without VAT applied.
         # Invoices are issued by Ubicloud B.V. for EU customers.
         #   - If the customer has provided a VAT number from the Netherlands, we charge 21% VAT.
-        #   - If the customer has provided a VAT number from another European country, we include a reverse charge notice along with 0% VAT.
-        #   - If the customer hasn't provided a VAT number, we charge 21% VAT until non-Dutch EU sales exceed annual threshold, than we charge local VAT.
+        #   - If the customer has provided a VAT number from another European country that we have validated, we include a reverse charge notice along with 0% VAT.
+        #   - If the customer hasn't provided a VAT number, or the one they provided has not been validated, we charge 21% VAT until non-Dutch EU sales exceed annual threshold, than we charge local VAT.
         project_content[:issuer_info] = if is_eu
           {
             name: "Ubicloud B.V.",
@@ -82,14 +103,28 @@ class InvoiceGenerator
           }
         end
         vat_info = if is_eu
-          if (tax_id = project_content[:billing_info]["tax_id"]) && !tax_id.empty? && country.alpha2 != "NL"
+          if (tax_id = project_content[:billing_info]["tax_id"]) && !tax_id.empty? && country.alpha2 != "NL" && bi.valid_vat == true
             {rate: 0, reversed: true}
           else
             {rate: Config.annual_non_dutch_eu_sales_exceed_threshold ? country.vat_rates["standard"] : 21, reversed: false, eur_rate: @eur_rate}
           end
         end
+        resource_discounts = all_resource_discounts[project.id] || []
+        resource_credits = all_resource_credits[project.id] || []
+        resource_credits.sort_by! do
+          if it.active_to
+            days = (it.active_to - @end_time) / (60 * 60 * 24)
+            days -= 95
+            days = nil if days > 0
+          end
+          [days || 0, it.broadness, it.active_from, it.created_at]
+        end
+
         project_content[:resources] = []
         project_content[:subtotal] = 0
+        discounts_by_name = {}
+        credit_items = []
+
         project_records.group_by { |pr| [pr[:resource_id], pr[:resource_name]] }.each do |(resource_id, resource_name), line_items|
           resource_content = {}
           resource_content[:resource_id] = resource_id
@@ -109,41 +144,71 @@ class InvoiceGenerator
             line_item_content[:begin_time] = li[:begin_time].utc
             line_item_content[:unit_price] = li[:unit_price].to_f
 
+            if (rd = resource_discounts.find { |d| d.matches?(li) })
+              percent = rd.discount_percent.to_f
+              discount_amount = (line_item_content[:cost] * percent / 100.0).round(3)
+              discount_name = rd.name.to_s.empty? ? "Discount" : rd.name
+              line_item_content[:discount] = {
+                name: discount_name,
+                percent:,
+                amount: discount_amount,
+              }
+              discounts_by_name[discount_name] = (discounts_by_name[discount_name] || 0.0) + discount_amount
+            end
+
             resource_content[:line_items].push(line_item_content)
-            resource_content[:cost] += line_item_content[:cost]
+            # Subtotal reflects cost before discount
+            resource_content[:cost] = (resource_content[:cost] + line_item_content[:cost]).round(3)
+
+            cost = line_item_content[:cost]
+            if (discount = line_item_content[:discount])
+              cost = (cost - discount[:amount]).round(3)
+            end
+            credit_items << li.slice(:resource_id, :resource_type, :resource_family, :location, :byoc)
+              .merge!(line_item: line_item_content, cost:, remaining: cost)
           end
 
           project_content[:resources].push(resource_content)
-          project_content[:subtotal] += resource_content[:cost]
+          project_content[:subtotal] = (project_content[:subtotal] + resource_content[:cost]).round(3)
         end
 
-        # We first apply discounts then credits, this is more beneficial for users as it
-        # would be possible to cover total cost with fewer credits.
-        project_content[:cost] = project_content[:subtotal]
-        project_content[:discount] = 0
-        if project.discount > 0
-          project_content[:discount] = (project_content[:cost] * (project.discount / 100.0)).round(3)
-          project_content[:cost] -= project_content[:discount]
+        project_content[:discount] = discounts_by_name.values.sum.round(3)
+        project_content[:discounts] = discounts_by_name.map { |name, amount| {name:, amount: amount.round(3)} }
+        project_content[:cost] = (project_content[:subtotal] - project_content[:discount]).round(3)
+
+        credits_by_name = {}
+        resource_credit_consumptions = []
+
+        # Use as much available credit as is available for each line item, deliberately
+        # do not attempt to apply a credit evenly across line items that it could apply to.
+        attribute_credit = lambda do |matches, consumed, name|
+          remaining_to_allocate = consumed
+          matches.each do |m|
+            break if remaining_to_allocate <= 0
+            allocated = m[:remaining].clamp(nil, remaining_to_allocate)
+            next if allocated <= 0
+            (m[:line_item][:credits] ||= []) << {name:, amount: allocated}
+            m[:remaining] = (m[:remaining] - allocated).round(3)
+            remaining_to_allocate = (remaining_to_allocate - allocated).round(3)
+          end
         end
 
-        project_content[:credit] = 0
-        if project.credit > 0
-          project_content[:credit] = [project_content[:cost], project.credit.to_f].min.round(3)
-          project_content[:cost] -= project_content[:credit]
-        end
-
-        # Each project have $1 github runner credit every month
-        # 1$ github credit won't be shown on the portal billing page for now.
-        github_usage = project_content[:resources].flat_map { it[:line_items] }.select { it[:resource_type] == "GitHubRunnerMinutes" }.sum { it[:cost] }
-        github_credit = [1.0, github_usage, project_content[:cost]].min
+        # Each project have 1250 minutes (2.5$) runner credit every month.
+        # Apply this before resource credits, so resource credits are not
+        # consumed for usage the free runner credit would cover.
+        github_items = credit_items.select { it[:resource_type] == "GitHubRunnerMinutes" }
+        github_credit = [2.5, github_items.sum { it[:remaining] }, project_content[:cost]].min.round(3)
         if github_credit > 0
           project_content[:github_credit] = github_credit
-          project_content[:credit] += project_content[:github_credit]
-          project_content[:cost] -= project_content[:github_credit]
+          credits_by_name["GitHub Runner Credit"] = github_credit
+          project_content[:cost] = (project_content[:cost] - github_credit).round(3)
+          attribute_credit.call(github_items, github_credit, "GitHub Runner Credit")
         end
 
         # Each project have some free AI inference tokens every month
         # Free AI tokens WILL be shown on the portal billing page as a separate credit.
+        # Apply this before resource credits, so resource credits are not
+        # consumed for usage the free inference tokens would cover.
         free_inference_tokens_remaining = FreeQuota.free_quotas["inference-tokens"]["value"]
         free_inference_tokens_credit = 0.0
         project_content[:resources]
@@ -155,11 +220,32 @@ class InvoiceGenerator
             free_inference_tokens_remaining -= used_amount
             free_inference_tokens_credit += used_amount * li[:unit_price]
           end
-        free_inference_tokens_credit = [free_inference_tokens_credit, project_content[:cost]].min
+        inference_items = credit_items.select { it[:resource_type] == "InferenceTokens" }
+        free_inference_tokens_credit = [free_inference_tokens_credit, inference_items.sum { it[:remaining] }, project_content[:cost]].min.round(3)
         if free_inference_tokens_credit > 0
           project_content[:free_inference_tokens_credit] = free_inference_tokens_credit
-          project_content[:cost] -= project_content[:free_inference_tokens_credit]
+          credits_by_name["Free Inference Tokens"] = free_inference_tokens_credit
+          project_content[:cost] = (project_content[:cost] - free_inference_tokens_credit).round(3)
+          attribute_credit.call(inference_items, free_inference_tokens_credit, "Free Inference Tokens")
         end
+
+        # Do not allow a resource credit to remove more than the cost of the resource
+        # or remove more than the total cost.
+        resource_credits.each do |rc|
+          matches = credit_items.select { rc.matches?(it) }
+          base = matches.sum { it[:remaining] }.clamp(nil, project_content[:cost])
+          consumed = base.clamp(nil, rc.amount.to_f).clamp(nil, project_content[:cost]).round(3)
+          next if consumed <= 0
+
+          credits_by_name[rc.name] = (credits_by_name[rc.name] || 0.0) + consumed
+          project_content[:cost] = (project_content[:cost] - consumed).round(3)
+          resource_credit_consumptions.push([rc, consumed])
+          attribute_credit.call(matches, consumed, rc.name)
+        end
+
+        project_content[:credit] = credits_by_name.values.sum.round(3)
+        project_content[:credits] = credits_by_name.map { |name, amount| {name:, amount: amount.round(3)} }
+        project_content[:cost] = project_content[:cost].round(3)
 
         if project_content[:cost] < Config.minimum_invoice_charge_threshold
           vat_info = nil
@@ -171,6 +257,7 @@ class InvoiceGenerator
           project_content[:cost] += project_content[:vat_info][:amount]
         end
         project_content[:cost] = project_content[:cost].round(3)
+        project_content[:invoice_version] = CURRENT_INVOICE_VERSION
 
         if @save_result
           invoice_month = @begin_time.strftime("%y%m")
@@ -180,22 +267,10 @@ class InvoiceGenerator
 
           invoice = Invoice.create(project_id: project.id, invoice_number:, content: project_content, begin_time: @begin_time, end_time: @end_time)
 
-          # Don't substract the 1$ credit from customer's overall credit as it will be applied each month to each customer
-          project_content[:credit] -= project_content.fetch(:github_credit, 0)
-          if project_content[:credit] > 0
-            # We don't use project.credit here, because credit might get updated between
-            # the time we read and write. Referencing credit column here prevents such
-            # race conditions. If credit got increased, then there is no problem. If it
-            # got decreased, CHECK constraint in the DB will prevent credit balance to go
-            # negative.
-            # We also need to disable Sequel validations, because Sequel simplychecks if
-            # the new value is BigDecimal, but "Sequel[:credit] - project_content[:credit]" expression
-            # is Sequel::SQL::NumericExpression, not BigDecimal. Eventhough it resolves to
-            # BigDecimal, it fails the check.
-            # Finally, we use save_changes instead of update because it is not possible to
-            # pass validate: false to update.
-            project.credit = Sequel[:credit] - project_content[:credit].round(3)
-            project.save_changes(validate: false)
+          # Use dataset update instead of model update because model updates deal with
+          # values and this requires an expression.
+          resource_credit_consumptions.each do |rc, consumed|
+            rc.this.update(amount: Sequel[:amount] - consumed)
           end
         else
           invoice = Invoice.new(project_id: project.id, content: JSON.parse(project_content.to_json), begin_time: @begin_time, end_time: @end_time, created_at: Time.now, status: "current")
@@ -212,24 +287,40 @@ class InvoiceGenerator
     active_billing_records = BillingRecord.eager(project: [:invoices, billing_info: :payment_methods])
       .where { |br| Sequel.pg_range(br.span).overlaps(Sequel.pg_range(@begin_time...@end_time)) }
     active_billing_records = active_billing_records.where(project_id: @project_ids) unless @project_ids.empty?
-    active_billing_records.all.map do |br|
-      # We cap the billable duration at 672 hours. In this way, we can
-      # charge the users same each month no matter the number of days
-      # in that month.
-      duration = [672 * 60, br.duration(@begin_time, @end_time).ceil].min
-      {
-        project: br.project,
-        resource_id: br.resource_id,
-        location: br.billing_rate["location"],
-        resource_name: br.resource_name,
-        resource_type: br.billing_rate["resource_type"],
-        resource_family: br.billing_rate["resource_family"],
-        amount: br.amount,
-        cost: (br.amount * duration * br.billing_rate["unit_price"]).round(3),
-        duration:,
-        begin_time: br.span.begin,
-        unit_price: br.billing_rate["unit_price"],
-      }
+
+    # We cap the billable duration at 672 hours. In this way, we can
+    # charge the users same each month no matter the number of days
+    # in that month. When records share a (resource_id, slot) tag — e.g.
+    # a Postgres primary that was scaled mid-month produces two records —
+    # the cap is applied to their combined duration so transitions don't
+    # let a customer exceed 28 days of charges for the same slot.
+    groups = active_billing_records.all.group_by do |br|
+      slot = br.resource_tags["slot"]
+      slot ? [br.resource_id, slot] : br.id
+    end
+
+    monthly_cap = 672 * 60
+    groups.flat_map do |_, group|
+      group_raw_durations = group.map { it.duration(@begin_time, @end_time).ceil }
+      group_total_duration = group_raw_durations.sum
+      scale_factor = [monthly_cap.fdiv(group_total_duration), 1.0].min
+      group.zip(group_raw_durations).map do |br, raw_duration|
+        duration = (raw_duration * scale_factor).round
+        {
+          project: br.project,
+          resource_id: br.resource_id,
+          location: br.billing_rate["location"],
+          resource_name: br.resource_name,
+          resource_type: br.billing_rate["resource_type"],
+          resource_family: br.billing_rate["resource_family"],
+          byoc: br.billing_rate["byoc"],
+          amount: br.amount,
+          cost: (br.amount * duration * br.billing_rate["unit_price"]).round(3),
+          duration:,
+          begin_time: br.span.begin,
+          unit_price: br.billing_rate["unit_price"],
+        }
+      end
     end
   end
 end

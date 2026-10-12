@@ -86,13 +86,26 @@ class Strand < Sequel::Model
     respirate_metrics.old_strand = true
   end
 
-  # :nocov:
+  # simplecov:disable
   ps_sch = if Config.development?
     Sequel.function(:least, 5, :try)
-  # :nocov:
+  # simplecov:enable
   else
     Sequel.function(:least, Sequel[2]**Sequel.function(:least, :try, 20), 600) * Sequel.function(:random)
   end
+
+  # schedule also is an optimistic concurrency control key for the nap
+  # handler's compare-and-set in #unsynchronized_run, which detects a
+  # mid-run wake-up only by the stored value having changed.
+  #
+  # Subtracting a microsecond makes every wake write strictly smaller
+  # than the value it read, so the comparison always fails after a
+  # wake, at a microsecond's cost to dispatch order.
+  #
+  # Finally, the LEAST expression prevents starvation: overwriting an
+  # old schedule with now() would demote an overdue strand in dispatch
+  # priority, e.g. when strand handling is running behind.
+  SCHEDULE_NO_LATER_THAN_NOW = Sequel.function(:least, Sequel[:schedule], Sequel::CURRENT_TIMESTAMP) - Sequel.cast("1 microsecond", :interval)
 
   TAKE_LEASE_PS = DB[:strand]
     .returning
@@ -137,27 +150,42 @@ SQL
           end
         ensure
           if @exited
-            active_siblings_ds = Strand.from { strand.as(:siblings) }
+            # Siblings that have not finished yet. This child has already set its
+            # own exitval above, so it doesn't count itself.
+            unfinished_siblings_ds = Strand.from { strand.as(:siblings) }
               .where(parent_id: Sequel[:strand][:id])
-              .where(Sequel.lit("lease < now() AND exitval IS NOT NULL"))
+              .where(exitval: nil)
               .select(1)
 
-            # If exited child has no active siblings, schedule parent immediately,
-            # so all exited children can be reaped.
+            # When this is the last child to finish, schedule the parent
+            # immediately so it can reap right away instead of waiting out reap's
+            # 120s fallback nap.
             #
-            # To avoid race conditions, we do this after the lease for the child
-            # has been released. It's possible that multiple children could be
-            # calling this update concurrently, but that is fine. We must avoid
-            # the case where this is not called by the last exiting child, as
-            # that otherwise can result in up to 120s delay in parent strand
-            # execution.
+            # We do this after the lease for the child has been released. It's
+            # possible that multiple children could be calling this update
+            # concurrently, but that is fine. We must avoid the case where this
+            # is not called by the last exiting child, as that otherwise can
+            # result in up to 120s delay in parent strand execution. Guarding on
+            # unfinished (exitval IS NULL) siblings does that: the last child to
+            # commit its exitval sees no remaining unfinished siblings and wakes
+            # the parent.
             Strand
               .where(id: parent_id)
-              .exclude(active_siblings_ds.exists)
-              .update(schedule: Sequel::CURRENT_TIMESTAMP)
+              .exclude(unfinished_siblings_ds.exists)
+              .update(schedule: SCHEDULE_NO_LATER_THAN_NOW)
           end
         end
       end
+    end
+  end
+
+  # Dispatch the strand as soon as possible, for use by a strand that
+  # finished work another strand waits for. A strand that is already
+  # overdue keeps its schedule, so waking it cannot demote it.
+  def wakeup_waiting_strand(key = "waiting_strand_id")
+    if (id = stack[0].delete(key))
+      modified!(:stack)
+      Strand.where(id:).update(schedule: SCHEDULE_NO_LATER_THAN_NOW)
     end
   end
 
@@ -187,17 +215,20 @@ SQL
       top_frame.delete("deadline_target")
       top_frame.delete("deadline_at")
       top_frame.delete("deadline_start")
+      top_frame.delete("deadline_page")
+      top_frame.delete("deadline_notified")
 
       modified!(:stack)
     end
 
     effective_prog = prog
     stack.each do |frame|
-      if (deadline_at = frame["deadline_at"]) && start_time > Time.parse(deadline_at)
+      if (deadline_at = frame["deadline_at"]) && !frame["deadline_notified"] && start_time > Time.new(deadline_at)
         sbj = subject
         extra_data = case sbj
         when Vm
-          {vm_host: sbj.vm_host&.ubid, data_center: sbj.vm_host&.data_center, boot_image: sbj.boot_image, location: sbj.location.display_name, arch: sbj.arch, vcpus: sbj.vcpus, ipv4: sbj.ip4_string}
+          {vm_host: sbj.vm_host&.ubid, data_center: sbj.vm_host&.data_center, boot_image: sbj.boot_image, location: sbj.location.display_name, arch: sbj.arch, vcpus: sbj.vcpus, ipv4: sbj.ip4_string,
+           required_availability_zone: top_frame["required_availability_zone"]}
         when VmHost
           {data_center: sbj.data_center, location: sbj.location.display_name, arch: sbj.arch, ipv4: sbj.sshable.host, total_cores: sbj.total_cores, allocation_state: sbj.allocation_state, os_version: sbj.os_version, vm_count: sbj.vms_dataset.count}
         when VmHostSlice
@@ -211,7 +242,14 @@ SQL
           {}
         end
         extra_data.compact!
-        Prog::PageNexus.assemble("#{ubid} has an expired deadline! #{effective_prog}.#{label} did not reach #{frame["deadline_target"]} on time", ["Deadline", id, effective_prog, frame["deadline_target"]], ubid, extra_data:)
+        summary = "#{ubid} has an expired deadline! #{effective_prog}.#{label} did not reach #{frame["deadline_target"]} on time"
+        if frame["deadline_page"] == false
+          Clog.emit(summary, {expired_deadline: {strand: ubid, prog: effective_prog, label:, deadline_target: frame["deadline_target"]}.merge(extra_data)})
+        else
+          severity = (page = frame["deadline_page"]).is_a?(String) ? page : "error"
+          Prog::PageNexus.assemble(summary, ["Deadline", id, effective_prog, frame["deadline_target"]], ubid, resource_id: id, severity:, extra_data:)
+        end
+        frame["deadline_notified"] = true
         modified!(:stack)
       end
 
@@ -225,53 +263,79 @@ SQL
       modified!(:stack)
     end
 
-    DB.transaction do
-      SemSnap.use(id) do |snap|
+    # Savepoint needed for correct error handling behavior when parent runs
+    # child strands via #reap
+    DB.transaction(savepoint: true) do
+      prog_action = SemSnap.use(id) do |snap|
         prg = load(snap)
-        prg.public_send(:before_run)
-        prg.public_send(label)
+        catch(:prog_return) do
+          prg.public_send(:before_run)
+          prg.public_send(label)
+          nil
+        end
       end
-    rescue Prog::Base::Nap => e
-      save_changes
 
-      scheduled = DB[<<SQL, schedule, e.seconds, id].get
+      case prog_action
+      when Prog::Base::Nap
+        save_changes
+        seconds = prog_action.seconds
+        unless seconds == 0
+          closest_unnotified_deadline = stack.filter_map do |frame|
+            if frame["deadline_at"] && !frame["deadline_notified"]
+              Time.new(frame["deadline_at"])
+            end
+          end.min
+          if closest_unnotified_deadline
+            deadline_seconds = (closest_unnotified_deadline - Time.now).clamp(0, nil)
+            seconds = seconds.clamp(0, deadline_seconds) + 0.001
+          end
+        end
+
+        # Compare-and-set with schedule as the optimistic concurrency
+        # control key: apply the nap only if schedule still holds the
+        # lease-time value. A concurrent wake wrote through
+        # SCHEDULE_NO_LATER_THAN_NOW, guaranteed to differ from it, so
+        # the wake-up schedule survives the nap.
+        scheduled = DB[<<SQL, schedule, seconds, id].get
 UPDATE strand
 SET try = 0,
     schedule = CASE WHEN schedule = ? THEN now() + (? * '1 second'::interval)
-                    ELSE schedule END
+                      ELSE schedule END
 WHERE id = ?
 RETURNING schedule
 SQL
-      # For convenience, reflect the updated record's schedule content
-      # in the model object, but since it's fresh, remove it from the
-      # changed columns so save_changes won't update it again.
-      self.schedule = scheduled
-      changed_columns.delete(:schedule)
-      e
-    rescue Prog::Base::Hop => hp
-      last_changed_at = Time.parse(top_frame["last_label_changed_at"])
-      Clog.emit("hopped", {strand_hopped: {strand: ubid, duration: Time.now - last_changed_at, from: prog_label, to: "#{hp.new_prog}.#{hp.new_label}"}})
-      top_frame["last_label_changed_at"] = Time.now.to_s
-      modified!(:stack)
+        # For convenience, reflect the updated record's schedule content
+        # in the model object, but since it's fresh, remove it from the
+        # changed columns so save_changes won't update it again.
+        self.schedule = scheduled
+        changed_columns.delete(:schedule)
+      when Prog::Base::Hop
+        hp = prog_action
+        last_changed_at = Time.new(top_frame["last_label_changed_at"])
+        Clog.emit("hopped", {strand_hopped: {strand: ubid, duration: Time.now - last_changed_at, from: prog_label, to: "#{hp.new_prog}.#{hp.new_label}"}})
+        top_frame["last_label_changed_at"] = time_string(Time.now)
+        modified!(:stack)
 
-      update(**hp.strand_update_args, try: 0)
+        update(**hp.strand_update_args, try: 0)
+      when Prog::Base::Exit
+        ext = prog_action
+        last_changed_at = Time.new(top_frame["last_label_changed_at"])
+        Clog.emit("exited", {strand_exited: {strand: ubid, duration: Time.now - last_changed_at, from: prog_label}})
 
-      hp
-    rescue Prog::Base::Exit => ext
-      last_changed_at = Time.parse(top_frame["last_label_changed_at"])
-      Clog.emit("exited", {strand_exited: {strand: ubid, duration: Time.now - last_changed_at, from: prog_label}})
-
-      update(exitval: ext.exitval, retval: nil)
-      if parent_id
-        @exited = true
+        update(exitval: ext.exitval, retval: nil)
+        if parent_id
+          @exited = true
+        else
+          # No parent Strand to reap here, so self-reap.
+          semaphores_dataset.destroy
+          destroy
+          @deleted = true
+        end
       else
-        # No parent Strand to reap here, so self-reap.
-        semaphores_dataset.destroy
-        destroy
-        @deleted = true
+        raise InternalError, "BUG: Prog #{prog}##{label} did not provide flow control"
       end
 
-      ext
+      prog_action
     rescue RunError, InternalError, Sequel::DatabaseDisconnectError, Sequel::DatabaseConnectionError
       raise
     rescue => ex
@@ -282,8 +346,6 @@ SQL
       duration = Time.now - start_time
       Clog.emit("exception terminates strand run", Util.exception_to_hash(ex, into: {strand_error: {strand: ubid, try:, duration:, from: prog_label}}))
       raise RunError.new(self)
-    else
-      raise InternalError, "BUG: Prog #{prog}##{label} did not provide flow control"
     end
   ensure
     duration = Time.now - start_time
@@ -297,6 +359,9 @@ SQL
     take_lease_and_reload do
       loop do
         ret = unsynchronized_run
+
+        raise(ret.exception) if ret.is_a?(Prog::Base::ChildRunError)
+
         now = Time.now
         if now > deadline ||
             (ret.is_a?(Prog::Base::Nap) && ret.seconds != 0) ||
@@ -309,6 +374,16 @@ SQL
 
   def time_string(time)
     time.strftime("%F %T.%6N %z")
+  end
+
+  PROGS_WITHOUT_DELETED_RECORD = [
+    prog_verify(Prog::LearnHypervisor),
+  ].freeze
+
+  private
+
+  def create_deleted_record
+    super unless prog.end_with?("Nexus") || PROGS_WITHOUT_DELETED_RECORD.include?(prog)
   end
 end
 
@@ -325,7 +400,9 @@ end
 #  retval    | jsonb                    |
 #  try       | integer                  | NOT NULL DEFAULT 0
 # Indexes:
-#  strand_pkey | PRIMARY KEY btree (id)
+#  strand_pkey                  | PRIMARY KEY btree (id)
+#  strand_parent_id_idx         | btree (parent_id) WHERE parent_id IS NOT NULL
+#  strand_schedule_id_lease_idx | btree (schedule, id, lease) WHERE exitval IS NULL
 # Foreign key constraints:
 #  strand_parent_id_fkey | (parent_id) REFERENCES strand(id)
 # Referenced By:

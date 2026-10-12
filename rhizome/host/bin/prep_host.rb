@@ -1,11 +1,13 @@
 #!/bin/env ruby
 # frozen_string_literal: true
 
-require_relative "../../common/lib/arch"
 require_relative "../../common/lib/util"
 require_relative "../lib/cloud_hypervisor"
+require_relative "../lib/crypt_swap_setup"
+require_relative "../lib/htcat_setup"
 require_relative "../lib/kvm_check"
 require_relative "../lib/spdk_setup"
+require_relative "../lib/uplink_mac_pin"
 require "fileutils"
 require "socket"
 
@@ -31,7 +33,7 @@ original_hostname = Socket.gethostname
 is_prod_env = (env_type == "production")
 
 safe_write_to_file("/etc/hosts", File.read("/etc/hosts").gsub(original_hostname, hostname))
-r "sudo hostnamectl set-hostname " + hostname
+r "sudo", "hostnamectl", "set-hostname", hostname
 
 # Color prompt and MOTD to cue operators as to production-level
 # status.
@@ -86,6 +88,20 @@ net.ipv4.ip_forward=1
 CONF
 r "sysctl --system"
 
+# VmHosts make no use of RDMA, and the irdma driver that auto-loads on
+# Intel E810/X710 NICs preallocates gigabytes of DMA memory, starving
+# the non-hugepage remainder the host OS runs in.
+File.write("/etc/modprobe.d/blacklist-irdma.conf", <<CONF)
+blacklist irdma
+CONF
+r "update-initramfs -u"
+
+# The blacklist only applies from the next boot, but SetupHugepages sizes the
+# reservation from MemAvailable before that reboot, and it would then hold the
+# driver's memory back from hugepages for the host's whole life. Unload the
+# driver now so the measurement matches the host the reservation lands on.
+r "modprobe -r irdma" if File.directory?("/sys/module/irdma")
+
 # OS images.
 
 # For qemu-image convert and mcopy for cloud-init with the nocloud
@@ -100,13 +116,15 @@ r "apt-get -y install qemu-utils mtools acl"
 r "apt-get -y install nvme-cli systemd-coredump" if is_prod_env
 
 # We need smartmontools, nvme-cli and jq in order to probe the disk status of VmHosts
-r "apt-get -y install smartmontools nvme-cli jq"
+r "apt-get -y install smartmontools nvme-cli jq ethtool"
 
-# htcat is able to download a file from signed URLs concurrently
-r "wget https://github.com/ubicloud/htcat/releases/download/v2.0.0-ubi1/htcat_2.0.0-ubi1_linux_#{Arch.render(x64: "amd64", arm64: "arm64")}.tar.gz -O htcat.tar.gz"
-r "tar xvf htcat.tar.gz -C /usr/local/bin/"
+puts UplinkMacPin.new.run
+
+HtcatSetup.new.run
 
 SpdkSetup.prep
+
+CryptSwapSetup.run
 
 # cron job to store serial.log files
 FileUtils.mkdir_p("/var/log/ubicloud/serials")

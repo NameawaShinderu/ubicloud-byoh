@@ -69,58 +69,75 @@ class Page < Sequel::Model
   end
 
   dataset_module do
-    def group_by_vm_host
-      pages = all
-      related_resources = pages.flat_map { it.details["related_resources"] }.compact.to_h { [UBID.to_uuid(it), nil] }
-      related_resources = UBID.resolve_map(related_resources, assume_et_is_api_key: false)
-      related_resources.compact!
-      # ubid => VmHost ubid
-      host_map = {}
-      # Vm id => ubid
-      vm_id_map = {}
+    where :active, resolved_at: nil
+    where :info, severity: "info"
+    exclude :non_info, severity: "info"
 
-      related_resources.transform_values do
-        case it
-        when VmHost
-          host_map[it.ubid] = it.ubid
-        when Vm, VmHostSlice, VhostBlockBackend, StorageDevice, SpdkInstallation, PciDevice
-          host_map[it.ubid] = UBID.to_ubid(it.vm_host_id) if it.vm_host_id
-        when VmStorageVolume, VictoriaMetricsServer, Nic, MinioServer, GithubRunner, PostgresServer, InferenceEndpointReplica, InferenceRouterReplica
-          (vm_id_map[it.vm_id] ||= []) << it.ubid if it.vm_id
-        end
-      end
+    snoozed_page_ids_ds = PageSnooze.active.select(:page_id)
+    where :snoozed, id: snoozed_page_ids_ds
+    exclude :not_snoozed, id: snoozed_page_ids_ds
 
-      # Vm id => VmHost ubid
-      vm_to_vm_host_map = Vm
-        .where(id: vm_id_map.keys)
-        .to_hash(:id, :vm_host_id)
-        .compact
-        .transform_values! { UBID.to_ubid(it) }
-
-      vm_id_map.each do |vm_id, ubids|
-        ubids.each do |ubid|
-          host_map[ubid] = vm_to_vm_host_map[vm_id]
-        end
-      end
-
-      grouped_pages = {}
-      pages.each do |page|
-        vm_host_ubid = nil
-        page.details["related_resources"]&.find { vm_host_ubid = host_map[it] }
-        (grouped_pages[vm_host_ubid] ||= []) << page
-      end
-
-      grouped_pages
+    # Legacy pages have a NULL resource_id and end their tag with the id.
+    def for_resource(id)
+      where(Sequel[resource_id: id] | (Sequel[resource_id: nil] & Sequel.like(:tag, "%-#{escape_like(id)}")))
     end
   end
 
+  # Used by PageNexus to eager load appropriately.
+  # Kept here as it is easier to keep in sync with root_resources directly below.
+  EAGER_ROOT_RESOURCES = {}
+  %w[VmStorageVolume
+    VictoriaMetricsServer
+    Nic
+    MinioServer
+    PostgresServer
+    InferenceEndpointReplica
+    InferenceRouterReplica
+    GithubRunner
+    KubernetesNode].freeze.each do |name|
+      EAGER_ROOT_RESOURCES[name] = :vm
+    end
+  EAGER_ROOT_RESOURCES["PostgresTimeline"] = :leader
+  EAGER_ROOT_RESOURCES.freeze
+
+  def self.root_resources(obj)
+    ids = case obj
+    when VmHost, GithubInstallation, PostgresResource, KubernetesCluster
+      [obj.id]
+    when Vm, VmHostSlice, VhostBlockBackend, StorageDevice, SpdkInstallation, PciDevice
+      [obj.vm_host_id]
+    when VmStorageVolume, VictoriaMetricsServer, Nic, MinioServer, InferenceEndpointReplica, InferenceRouterReplica, LoadBalancerVm
+      [obj.vm&.vm_host_id]
+    when PostgresServer
+      [obj.vm&.vm_host_id, obj.resource_id]
+    when PostgresTimeline
+      [*(root_resources(obj.leader) if obj.leader)]
+    when LoadBalancerVmPort
+      root_resources(obj.load_balancer_vm)
+    when GithubRunner
+      [obj.installation_id, obj.vm&.vm_host_id]
+    when GithubRepository
+      [obj.installation_id]
+    when KubernetesNode
+      [obj.vm&.vm_host_id, obj.kubernetes_cluster_id]
+    when KubernetesNodepool, KubernetesEtcdBackup
+      [obj.kubernetes_cluster_id]
+    end
+
+    ids&.compact!
+    ids || [].freeze
+  rescue => e
+    Clog.emit("error determining root resource for page", {page_root_resource_error: Util.exception_to_hash(e, into: {object: obj})})
+    [].freeze
+  end
+
   # This cannot be covered, as the current coverage tests run without freezing models.
-  # :nocov:
+  # simplecov:disable
   def self.freeze
     client
     super
   end
-  # :nocov:
+  # simplecov:enable
 
   def self.client
     @client ||= Client.new
@@ -142,10 +159,19 @@ class Page < Sequel::Model
     client.trigger(tag, summary:, severity:, details:, links:)
   end
 
-  def resolve
-    this.update(resolved_at: Sequel::CURRENT_TIMESTAMP)
+  # Ends the snoozes that hide the page. Keeps the rows as a record of the
+  # operator and the note.
+  def unsnooze
+    PageSnooze.active.where(page_id: id).update(snooze_until: Sequel::CURRENT_TIMESTAMP)
+  end
 
-    client.resolve(tag, summary:)
+  def resolve(notify: true)
+    DB.transaction do
+      this.update(resolved_at: Sequel::CURRENT_TIMESTAMP)
+      DB[:page_root_resource].where(page_id: id).delete
+    end
+
+    client.resolve(tag, summary:) if notify
   end
 
   def self.generate_tag(*tag_parts)
@@ -154,10 +180,14 @@ class Page < Sequel::Model
 
   def self.from_tag_parts(*tag_parts)
     tag = Page.generate_tag(tag_parts)
-    Page.where(tag:).first
+    Page.active.first(tag:)
   end
 
   SEVERITY_ORDER = {"info" => 0, "warning" => 1, "error" => 2, "critical" => 3}.freeze
+
+  SUPPRESSING_SEVERITIES = SEVERITY_ORDER.to_h do |severity, order|
+    [severity, SEVERITY_ORDER.filter_map { |sev, o| sev if o >= order }.freeze]
+  end.freeze
 
   def self.severity_order(severity)
     SEVERITY_ORDER.fetch(severity)
@@ -173,6 +203,11 @@ end
 #  tag         | text                     | NOT NULL
 #  details     | jsonb                    | NOT NULL DEFAULT '{}'::jsonb
 #  severity    | page_severity            | NOT NULL DEFAULT 'error'::page_severity
+#  resource_id | uuid                     |
 # Indexes:
-#  page_pkey      | PRIMARY KEY btree (id)
-#  page_tag_index | UNIQUE btree (tag) WHERE resolved_at IS NULL
+#  page_pkey              | PRIMARY KEY btree (id)
+#  page_tag_index         | UNIQUE btree (tag) WHERE resolved_at IS NULL
+#  page_resource_id_index | btree (resource_id) WHERE resolved_at IS NULL
+# Referenced By:
+#  page_root_resource | page_root_resource_page_id_fkey | (page_id) REFERENCES page(id) ON DELETE CASCADE
+#  page_snooze        | page_snooze_page_id_fkey        | (page_id) REFERENCES page(id) ON DELETE CASCADE

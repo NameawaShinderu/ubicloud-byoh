@@ -6,6 +6,11 @@ require "octokit"
 RSpec.describe Project do
   subject(:project) { described_class.create(name: "test") }
 
+  it "#project_id_match? should return whether the given project_id matches the project's id" do
+    expect(project.project_id_match?(project.id)).to be true
+    expect(project.project_id_match?(described_class.generate_uuid)).to be false
+  end
+
   describe "#validate" do
     invalid_name = "must be less than 64 characters and only include ASCII letters, numbers, and dashes, and must start and end with an ASCII letter or number"
 
@@ -57,7 +62,7 @@ RSpec.describe Project do
 
     it "returns true when discount is 100" do
       expect(Config).to receive(:stripe_secret_key).and_return("secret_key")
-      project.discount = 100
+      ResourceDiscount.create(project_id: project.id, discount_percent: 100, active_from: Time.utc(Time.now.year, Time.now.month), name: "Full discount")
       expect(project.has_valid_payment_method?).to be true
     end
 
@@ -84,7 +89,8 @@ RSpec.describe Project do
     it "returns true when has some credits" do
       expect(Config).to receive(:stripe_secret_key).and_return("secret_key")
       bi = BillingInfo.create(stripe_id: "cus")
-      project.update(billing_info_id: bi.id, credit: 100)
+      project.update(billing_info_id: bi.id)
+      ResourceCredit.create(project_id: project.id, amount: 100, active_from: Time.utc(Time.now.year, Time.now.month), name: "Test credit")
       expect(project.has_valid_payment_method?).to be true
     end
   end
@@ -142,6 +148,18 @@ RSpec.describe Project do
     end
   end
 
+  describe "#current_invoice" do
+    it "works even if most recent invoice end date is in the future" do
+      project = described_class.create(name: "dummy-name")
+      t = Time.now
+      expect(project.current_invoice).to be_a Invoice
+      Invoice.create(project_id: project.id, content: {}, begin_time: t, end_time: t + 86400, status: "current", invoice_number: "2")
+      expect(project.current_invoice).to be_a Invoice
+      Invoice.create(project_id: project.id, content: {}, begin_time: t, end_time: t - 86400, status: "current", invoice_number: "1", created_at: t - 1)
+      expect(project.current_invoice).to be_a Invoice
+    end
+  end
+
   it "sets and gets feature flags" do
     mod = Module.new
     described_class.feature_flag(:dummy_flag1, :dummy_flag2, into: mod)
@@ -169,14 +187,18 @@ RSpec.describe Project do
 
     gi = GithubInstallation.create(installation_id: 1, name: "a", project_id: project.id, type: "a")
     gr = gi.add_runner(label: "ubicloud", repository_name: "a/a")
-    gr.update(vm_id: vm1.id)
+    gr.update(vm_id: vm1.id, location_id: vm1.location_id)
     expect(project.current_resource_usage("GithubRunnerVCpu")).to eq 0
     grst = Strand.new(id: gr.id, label: "start", prog: "Prog::Github::GithubRunnerNexus")
     expect { grst.update(label: "wait_vm") }.to change { project.current_resource_usage("GithubRunnerVCpu") }.from(0).to(2)
     gr2 = gi.add_runner(label: "ubicloud-standard-16-arm", repository_name: "a/a")
+    vm2 = create_vm(project_id: project.id, name: "test-vm-2")
+    gr2.update(vm_id: vm2.id, location_id: vm2.location_id)
     grst2 = Strand.new(id: gr2.id, label: "wait_concurrency_limit", prog: "Prog::Github::GithubRunnerNexus")
     expect { grst2.update(label: "wait_vm") }.to change { project.current_resource_usage("GithubRunnerVCpuArm") }.from(0).to(16)
     gr3 = gi.add_runner(label: "ubicloud-standard-60", repository_name: "a/a")
+    vm3 = create_vm(project_id: project.id, name: "test-vm-3")
+    gr3.update(vm_id: vm3.id, location_id: vm3.location_id)
     grst3 = Strand.new(id: gr3.id, label: "wait_concurrency_limit", prog: "Prog::Github::GithubRunnerNexus")
     expect { grst3.update(label: "wait_vm") }.to change { project.current_resource_usage("GithubRunnerVCpu") }.from(2).to(62)
 
@@ -198,7 +220,53 @@ RSpec.describe Project do
       Prog::Kubernetes::KubernetesNodepoolNexus.assemble(name: "a-np", node_count: 3, kubernetes_cluster_id: cluster.id, target_node_size: "standard-4").subject
     }.to change { project.current_resource_usage("KubernetesVCpu") }.from(2).to(14)
 
+    expect(project.current_resource_usage("MachineImageVersion")).to eq 0
+    mi = MachineImage.create(name: "img", arch: "x64", project_id: project.id, location_id: Location::HETZNER_FSN1_ID)
+    expect {
+      MachineImageVersion.create(machine_image_id: mi.id, version: "1.0", actual_size_mib: 100)
+      MachineImageVersion.create(machine_image_id: mi.id, version: "1.1", actual_size_mib: 100)
+    }.to change { project.current_resource_usage("MachineImageVersion") }.from(0).to(2)
+
     expect { project.current_resource_usage("UnknownResource") }.to raise_error(RuntimeError)
+  end
+
+  it "calculates github runner vcpu usage separately for metal and alien (aws) placements" do
+    expect(Config).to receive(:github_runner_aws_location_id).and_return(Location::HETZNER_HEL1_ID).at_least(:once)
+    gi = GithubInstallation.create(installation_id: 2, name: "b", project_id: project.id, type: "a")
+
+    metal_vm = create_vm(location_id: Location::HETZNER_FSN1_ID, vcpus: 2, project_id: project.id)
+    gr_metal = gi.add_runner(label: "ubicloud", repository_name: "a/a")
+    gr_metal.update(vm_id: metal_vm.id, location_id: metal_vm.location_id)
+    Strand.create(id: gr_metal.id, label: "wait_vm", prog: "Prog::Github::GithubRunnerNexus")
+
+    expect(project.current_resource_usage("GithubRunnerVCpu")).to eq 2
+    expect(project.current_resource_usage("GithubRunnerVCpuAws")).to eq 0
+
+    alien_vm = create_vm(location_id: Location::HETZNER_HEL1_ID, vcpus: 4, project_id: project.id, name: "alien-vm")
+    gr_alien = gi.add_runner(label: "ubicloud-standard-4", repository_name: "a/a")
+    gr_alien.update(vm_id: alien_vm.id, location_id: alien_vm.location_id)
+    Strand.create(id: gr_alien.id, label: "wait_vm", prog: "Prog::Github::GithubRunnerNexus")
+
+    expect(project.current_resource_usage("GithubRunnerVCpu")).to eq 2
+    expect(project.current_resource_usage("GithubRunnerVCpuAws")).to eq 4
+
+    alien_arm_vm = create_vm(location_id: Location::HETZNER_HEL1_ID, vcpus: 16, project_id: project.id, name: "alien-arm-vm")
+    gr_alien_arm = gi.add_runner(label: "ubicloud-standard-16-arm", repository_name: "a/a")
+    gr_alien_arm.update(vm_id: alien_arm_vm.id, location_id: alien_arm_vm.location_id)
+    Strand.create(id: gr_alien_arm.id, label: "wait_vm", prog: "Prog::Github::GithubRunnerNexus")
+
+    expect(project.current_resource_usage("GithubRunnerVCpuArmAws")).to eq 16
+  end
+
+  it "counts no alien vcpu usage when the aws alien location isn't configured" do
+    gi = GithubInstallation.create(installation_id: 3, name: "c", project_id: project.id, type: "a")
+    vm = create_vm(project_id: project.id, name: "no-alien-vm", vcpus: 2)
+    gr = gi.add_runner(label: "ubicloud", repository_name: "a/a")
+    gr.update(vm_id: vm.id, location_id: vm.location_id)
+    Strand.create(id: gr.id, label: "wait_vm", prog: "Prog::Github::GithubRunnerNexus")
+
+    expect(project.current_resource_usage("GithubRunnerVCpu")).to eq 2
+    expect(project.current_resource_usage("GithubRunnerVCpuAws")).to eq 0
   end
 
   it "calculates effective quota value" do
@@ -220,7 +288,13 @@ RSpec.describe Project do
     expect(project.effective_quota_value("VmVCpu")).to eq 16
     expect(project.effective_quota_value("GithubRunnerVCpu")).to eq 128
     expect(project.effective_quota_value("GithubRunnerVCpuArm")).to eq 50
+    expect(project.effective_quota_value("GithubRunnerVCpuAws")).to eq 0
+    expect(project.effective_quota_value("GithubRunnerVCpuArmAws")).to eq 0
     expect(project.effective_quota_value("PostgresVCpu")).to eq 16
+
+    project.reputation = "verified"
+    expect(project.effective_quota_value("GithubRunnerVCpuAws")).to eq 500
+    expect(project.effective_quota_value("GithubRunnerVCpuArmAws")).to eq 500
   end
 
   it "checks if quota is available" do
@@ -230,5 +304,55 @@ RSpec.describe Project do
     project.add_quota(quota_id: ProjectQuota.default_quotas["VmVCpu"]["id"], value: 20)
     expect(project.quota_available?("VmVCpu", 5)).to be true
     expect(project.quota_available?("VmVCpu", 20)).to be false
+  end
+
+  it "#sole_admin? returns whether the given admin is the sole admin on the project" do
+    st = SubjectTag.create(project_id: project.id, name: "Admin")
+    account = Account.create(email: "test@example.com")
+    expect(project.sole_admin?(account)).to be false
+
+    project.add_account(account)
+    expect(project.sole_admin?(account)).to be false
+
+    st.add_member(account.id)
+    expect(project.sole_admin?(account)).to be true
+
+    account2 = Account.create(email: "test2@example.com")
+    expect(project.sole_admin?(account)).to be true
+    expect(project.sole_admin?(account2)).to be false
+
+    project.add_account(account2)
+    expect(project.sole_admin?(account)).to be true
+    expect(project.sole_admin?(account2)).to be false
+
+    st.add_member(account2.id)
+    expect(project.sole_admin?(account)).to be false
+    expect(project.sole_admin?(account2)).to be false
+
+    st.remove_members([account.id])
+    expect(project.sole_admin?(account)).to be false
+    expect(project.sole_admin?(account2)).to be true
+
+    mst = SubjectTag.create(project_id: project.id, name: "Member")
+    st.add_member(mst.id)
+    expect(project.sole_admin?(account)).to be false
+    expect(project.sole_admin?(account2)).to be true
+  end
+
+  it "defaults gcp_dedicated_subnet_vpcs to false for new projects" do
+    expect(project.gcp_dedicated_subnet_vpcs).to be false
+  end
+
+  describe ".service_project?" do
+    it "is true for the id of any configured service project" do
+      p = described_class.create(name: "svc")
+      allow(Config).to receive(:kubernetes_service_project_id).and_return(p.id)
+      expect(described_class.service_project?(p.id)).to be true
+    end
+
+    it "is false for a regular customer project" do
+      p = described_class.create(name: "customer")
+      expect(described_class.service_project?(p.id)).to be false
+    end
   end
 end

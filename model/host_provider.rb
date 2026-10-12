@@ -7,19 +7,13 @@ class HostProvider < Sequel::Model
 
   HETZNER_PROVIDER_NAME = "hetzner"
   LEASEWEB_PROVIDER_NAME = "leaseweb"
+  LEASEWEB_EU_PROVIDER_NAME = "leaseweb-eu"
+  LEASEWEB_PROVIDER_NAMES = [LEASEWEB_PROVIDER_NAME, LEASEWEB_EU_PROVIDER_NAME].freeze
   AWS_PROVIDER_NAME = "aws"
   GENERIC_PROVIDER_NAME = "generic"
 
-  PROVIDER_METHODS = %w[connection_string user password].freeze
-
-  PROVIDER_METHODS.each do |method_name|
-    define_method(method_name) do
-      Config.send(:"#{provider_name}_#{method_name}")
-    end
-  end
-
   def api
-    @api ||= Object.const_get("Hosting::#{provider_name.capitalize}Apis").new(self)
+    @api ||= Hosting::ProviderApis.for(self)
   end
 end
 
@@ -29,6 +23,7 @@ end
 #  id                | uuid |
 #  server_identifier | text |
 #  provider_name     | text |
+#  config            | jsonb |
 # Indexes:
 #  host_provider_pkey | PRIMARY KEY btree (provider_name, server_identifier)
 # Foreign key constraints:

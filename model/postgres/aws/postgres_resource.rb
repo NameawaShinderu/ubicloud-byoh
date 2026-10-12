@@ -2,7 +2,32 @@
 
 class PostgresResource < Sequel::Model
   module Aws
+    GATED_SIZE_SUFFIX = ".48xlarge"
+
+    def self.available_families_and_sizes(location, project)
+      postgres_families = Option::POSTGRES_FAMILY_OPTIONS.keys.to_set
+      allow_48xlarge = project.get_ff_enable_aws_48xlarge
+      Set.new(
+        OptionTreeFilter.filter(provider: "aws", location: location.name)
+          .filter_map { |e|
+            family = e[:family]
+            next unless postgres_families.include?(family)
+            next unless ["m8gd", "i8g"].include?(family) || project.send(:"get_ff_enable_#{family}")
+            next if e[:size].end_with?(GATED_SIZE_SUFFIX) && !allow_48xlarge
+            [family, e[:size]]
+          },
+      )
+    end
+
+    def self.storage_sizes(_location, family, vcpu_count)
+      Option::AWS_STORAGE_SIZE_OPTIONS[family][vcpu_count]
+    end
+
     private
+
+    def aws_boot_image(pg_version, arch, family)
+      location.pg_aws_ami(pg_version, arch, family)
+    end
 
     def aws_upgrade_candidate_server
       # TODO: We check if the AWS server is running the latest AMI version tracked in
@@ -14,7 +39,15 @@ class PostgresResource < Sequel::Model
         .max_by(&:created_at)
     end
 
+    def aws_lockout_mechanisms
+      ["pg_stop", "hba", "detach_nic"].freeze
+    end
+
     def aws_new_server_exclusion_filters
+      if availability_zone_required?
+        return ServerExclusionFilters.new(exclude_host_ids: [], exclude_data_centers: [], exclude_availability_zones: [], availability_zone: requested_availability_zone_suffix, availability_zone_required: true)
+      end
+
       exclude_availability_zones, availability_zone = if use_different_az_set?
         # Only exclude AZs of servers that will remain after convergence. Servers
         # that need recycling or are being destroyed will leave their AZ, so it
@@ -26,11 +59,12 @@ class PostgresResource < Sequel::Model
           .distinct
           .select_map(:subnet_az)
 
-        [subnet_azs, nil]
+        preferred_az = requested_availability_zone_suffix
+        [subnet_azs, subnet_azs.include?(preferred_az) ? nil : preferred_az]
       else
-        [[], representative_server.vm.nic.nic_aws_resource.subnet_az]
+        [[], requested_availability_zone_suffix || representative_server.vm.user_nic.nic_aws_resource.subnet_az]
       end
-      ServerExclusionFilters.new(exclude_host_ids: [], exclude_data_centers: [], exclude_availability_zones:, availability_zone:)
+      ServerExclusionFilters.new(exclude_host_ids: [], exclude_data_centers: [], exclude_availability_zones:, availability_zone:, availability_zone_required: false)
     end
   end
 end

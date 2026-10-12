@@ -17,6 +17,7 @@
 # See https://rubydoc.info/gems/rspec-core/RSpec/Core/Configuration
 ENV["RACK_ENV"] = "test"
 ENV["MAIL_DRIVER"] = "test"
+ENV["API_METRICS_REPORT_ENABLED"] = "true"
 ENV["HETZNER_CONNECTION_STRING"] = "https://robot-ws.your-server.de"
 ENV["HETZNER_USER"] = "user1"
 ENV["HETZNER_PASSWORD"] = "pass"
@@ -25,6 +26,8 @@ ENV["OMNIAUTH_GOOGLE_ID"] = "1234567890"
 
 require "warning"
 Warning.ignore(:void_context, /.*ubicloud\/loader\.rb/)
+Warning.ignore(:unused_var, /.*lib\/acme\/client\/certificate_request\.rb/)
+Warning.ignore(:mismatched_indentations, /.*lib\/omniauth\/strategies\/oauth2\.rb/)
 Warning.ignore(/URI::RFC3986_PARSER.make_regexp is obsolete/, /.*lib\/capybara\/session\/config\.rb/)
 # https://github.com/prawnpdf/prawn/issues/1349
 Warning.ignore(/circular require considered harmful/, /.*lib\/prawn\/fonts\.rb/)
@@ -40,6 +43,11 @@ require "webmock/rspec"
 
 RSpec::Matchers.define_negated_matcher :not_change, :change
 
+# Specs that assert concrete costs must keep resolving the same billing rate
+# after a price change activates, so they pin their rate lookups to this date
+# instead of letting them drift with Time.now.
+BILLING_RATE_ACTIVE_AT = Time.utc(2026, 6, 1)
+
 def Object.method_added(method)
   if self == Object && method != :Nokogiri && method != :CSV
     raise "unexpected Object##{method} defined\n#{caller(1, 3).join("\n")}"
@@ -49,14 +57,28 @@ end
 RSpec.configure do |config|
   config.before(:suite) do
     clover_freeze
+
+    DeletedRecord.ensure_partitions(through: Time.now.utc.to_date + 1)
+  end
+
+  config.after(:suite) do
+    DeletedRecord.partition_days.each { DeletedRecord.drop_partition(it) }
   end
 
   leaked_threads = ObjectSpace::WeakMap.new
   leaked_threads[Thread.current] = true
 
   config.around do |example|
-    DB.transaction(rollback: :always, auto_savepoint: true) do
+    if example.metadata[:no_db_transaction]
+      # Real concurrency specs check out multiple connections and commit
+      # on their own. They must opt out of the wrapping rollback-only
+      # transaction so writes are visible across connections, and are
+      # responsible for their own cleanup.
       example.run
+    else
+      DB.transaction(rollback: :always, auto_savepoint: true) do
+        example.run
+      end
     end
     Thread.current[:clover_ssh_cache] = nil
     Mail::TestMailer.deliveries.clear if defined?(Mail)
@@ -167,27 +189,44 @@ RSpec.configure do |config|
     supports_block_expectations
 
     match do |block|
-      block.call
-      false
-    rescue Prog::Base::Hop => hop
-      @hop = hop
-      (expected_label.nil? || hop.new_label == expected_label) &&
-        ((expected_prog.nil? && hop.old_prog == hop.new_prog) || hop.new_prog == expected_prog)
+      @hop = hop = catch(:prog_return) do
+        block.call
+        nil
+      end
+
+      if hop.is_a?(Prog::Base::Hop)
+        (expected_label.nil? || hop.new_label == expected_label) &&
+          ((expected_prog.nil? && hop.old_prog == hop.new_prog) || hop.new_prog == expected_prog) &&
+          (block_arg.nil? || block_arg.call(hop))
+      else
+        false
+      end
+    end
+
+    default_prog = ->(hop, new_prog) do
+      prog = new_prog || (hop.old_prog if hop.is_a?(Prog::Base::Hop))
+      prog.nil? ? "" : "#{prog}#"
+    end
+
+    expected_value_message = ->(hop, prefix) do
+      got = case hop
+      when Prog::Base::Hop
+        "hop to #{default_prog.call(hop, hop.new_prog) + hop.new_label}"
+      when nil
+        "no prog action returned"
+      else
+        hop.class.name
+      end
+      "#{prefix}expected: ".rjust(16) + "hop to " + default_prog.call(hop, expected_prog) + (expected_label || "any_label") + "\n" +
+        "got: ".rjust(16) + got
     end
 
     failure_message do
-      "expected: ".rjust(16) + default_prog(expected_prog) + (expected_label || "any_label") + "\n" +
-        "got: ".rjust(16) + default_prog(@hop&.new_prog) + (@hop&.new_label || "not hopped") + "\n "
+      expected_value_message.call(@hop, "")
     end
 
     failure_message_when_negated do
-      "not expected: ".rjust(16) + default_prog(expected_prog) + (expected_label || "any_label") + "\n" +
-        "got: ".rjust(16) + default_prog(@hop&.new_prog) + (@hop&.new_label || "not hopped") + "\n "
-    end
-
-    def default_prog(new_prog)
-      prog = new_prog || @hop&.old_prog
-      prog.nil? ? "" : "#{prog}#"
+      expected_value_message.call(@hop, "not ")
     end
   end
 
@@ -197,21 +236,37 @@ RSpec.configure do |config|
     supports_block_expectations
 
     match do |block|
-      block.call
-      false
-    rescue Prog::Base::Exit => ext
-      @ext = ext
-      expected_exitval.nil? || ext.exitval == expected_exitval
+      @ext = ext = catch(:prog_return) do
+        block.call
+        nil
+      end
+
+      if ext.is_a?(Prog::Base::Exit)
+        expected_exitval.nil? || ext.exitval == expected_exitval
+      else
+        false
+      end
+    end
+
+    expected_value_message = ->(ext, prefix) do
+      exitval = case ext
+      when Prog::Base::Exit
+        "exit with #{ext.exitval}"
+      when nil
+        "no prog action returned"
+      else
+        ext.class.name
+      end
+      "#{prefix}expected: ".rjust(16) + "exit with " + (expected_exitval.nil? ? "any value" : expected_exitval.to_s) + "\n" +
+        "got: ".rjust(16) + exitval + "\n "
     end
 
     failure_message do
-      "expected: ".rjust(16) + (expected_exitval.nil? ? "exit with any value" : expected_exitval.to_s) + "\n" +
-        "got: ".rjust(16) + (@ext.nil? ? "not exited" : @ext.exitval.to_s) + "\n "
+      expected_value_message.call(@ext, "")
     end
 
     failure_message_when_negated do
-      "not expected: ".rjust(16) + (expected_exitval.nil? ? "exit with any value" : expected_exitval.to_s) + "\n" +
-        "got: ".rjust(16) + (@ext.nil? ? "not exited" : @ext.exitval.to_s) + "\n "
+      expected_value_message.call(@ext, "not ")
     end
   end
 
@@ -221,21 +276,37 @@ RSpec.configure do |config|
     supports_block_expectations
 
     match do |block|
-      block.call
-      false
-    rescue Prog::Base::Nap => nap
-      @nap = nap
-      expected_seconds.nil? || nap.seconds == expected_seconds
+      @nap = nap = catch(:prog_return) do
+        block.call
+        nil
+      end
+
+      if nap.is_a?(Prog::Base::Nap)
+        expected_seconds.nil? || expected_seconds === nap.seconds
+      else
+        false
+      end
+    end
+
+    expected_value_message = ->(nap, prefix) do
+      seconds = case nap
+      when Prog::Base::Nap
+        "nap #{nap.seconds} seconds"
+      when nil
+        "no prog action returned"
+      else
+        nap.class.name
+      end
+      "#{prefix}expected: ".rjust(16) + "nap" + (expected_seconds.nil? ? "" : " #{expected_seconds} seconds") + "\n" +
+        "got: ".rjust(16) + seconds + "\n "
     end
 
     failure_message do
-      "expected: ".rjust(16) + "nap" + (expected_seconds.nil? ? "" : " #{expected_seconds} seconds") + "\n" +
-        "got: ".rjust(16) + (@nap.nil? ? "not nap" : "nap #{@nap.seconds} seconds") + "\n "
+      expected_value_message.call(@nap, "")
     end
 
     failure_message_when_negated do
-      "not expected: ".rjust(16) + "nap" + (expected_seconds.nil? ? "" : " #{expected_seconds} seconds") + "\n" +
-        "got: ".rjust(16) + (@nap.nil? ? "not nap" : "nap #{@nap.seconds} seconds") + "\n "
+      expected_value_message.call(@nap, "not ")
     end
   end
 
@@ -277,13 +348,34 @@ RSpec.configure do |config|
       VhostBlockBackend.create(**args)
     end
 
-    def create_machine_image_version_metal(project_id: nil, machine_image_id: nil, machine_image_store_id: nil, version: "v1", location_id: Location::HETZNER_FSN1_ID, store_prefix: "prefix/path")
+    def create_archive_ready_vm(project_id: nil, location_id: Location::HETZNER_FSN1_ID, **vm_args)
+      project_id ||= Project.create(name: "archive-ready-vm-project").id
+      vm_host = create_vm_host(location_id:)
+      vbb = create_vhost_block_backend(version: "v0.4.1", allocation_weight: 50, vm_host_id: vm_host.id)
+      vm = create_vm(vm_host_id: vm_host.id, project_id:, location_id:, **vm_args)
+      Strand.create_with_id(vm, prog: "Vm::Nexus", label: "stopped")
+      sd = StorageDevice.create(name: "vda", total_storage_gib: 100, available_storage_gib: 50, vm_host_id: vm_host.id)
+      VmStorageVolume.create(
+        vm_id: vm.id, boot: true, size_gib: 5, disk_index: 0,
+        storage_device_id: sd.id, vhost_block_backend_id: vbb.id,
+        key_encryption_key_1_id: StorageKeyEncryptionKey.create_random(auth_data: "src").id,
+        vring_workers: 1, track_written: true,
+      )
+      vm
+    end
+
+    def create_machine_image_version_metal(project_id: nil, machine_image_id: nil, machine_image_store_id: nil, name: "test-mi", version: "v1", location_id: Location::HETZNER_FSN1_ID, store_prefix: "prefix/path", set_latest_version: false)
       project_id ||= Project.create(name: "miv-metal-project").id
       machine_image_store_id ||= MachineImageStore.create(project_id:, location_id:, provider: "r2", region: "auto", endpoint: "https://r2.cloudflare.com/", bucket: "test-bucket", access_key: "ak", secret_key: "sk").id
-      machine_image_id ||= MachineImage.create(name: "test-mi", project_id:, arch: "x64", location_id:).id
-      miv = MachineImageVersion.create(machine_image_id:, version:)
+      machine_image_id ||= MachineImage.create(name:, project_id:, arch: "x64", location_id:).id
+      miv = MachineImageVersion.create(machine_image_id:, version:, actual_size_mib: 5 * 1024)
       archive_kek = StorageKeyEncryptionKey.create_random(auth_data: "auth_data")
-      MachineImageVersionMetal.create_with_id(miv, archive_kek_id: archive_kek.id, store_id: machine_image_store_id, store_prefix:)
+      metal = MachineImageVersionMetal.create_with_id(miv, archive_kek_id: archive_kek.id, store_id: machine_image_store_id, store_prefix:, status: "ready", archive_size_mib: 1024)
+      Strand.create_with_id(miv, prog: "MachineImage::VersionMetalNexus", label: "wait", stack: [{}])
+      if set_latest_version
+        MachineImage[machine_image_id].update(latest_version_id: miv.id)
+      end
+      metal
     end
 
     def create_vm_host_slice(**args)
@@ -293,10 +385,15 @@ RSpec.configure do |config|
     end
 
     def create_hosted_vm(project, private_subnet, name)
-      Prog::Vm::Nexus.assemble_with_sshable(
+      vm = Prog::Vm::Nexus.assemble_with_sshable(
         project.id, name:, private_subnet_id: private_subnet.id,
         location_id: location.id, unix_user: "ubi",
       ).subject
+      # YYY: We moved storage volume creation from allocation to Nexus.assemble,
+      # but many of the tests rely on VMs without storage volumes. We will need
+      # to update those tests and remove the following hack.
+      vm.vm_storage_volumes_dataset.each(&:destroy)
+      vm
     end
 
     def create_vm_from_size(size, arch, **args)
@@ -323,6 +420,12 @@ RSpec.configure do |config|
       sshable
     end
 
+    # Wraps kubernetes mesh status file contents in the "<now> <mtime>" line the node emits before them.
+    def kubernetes_mesh_status(content, age: 0)
+      now = Time.now.to_i
+      "#{now} #{now - age}\n#{content}"
+    end
+
     def add_ipv4_to_vm(vm, ipv4)
       host = create_vm_host(total_cores: 10, used_cores: 3)
       cidr = IPAddr.new(ipv4)
@@ -331,10 +434,35 @@ RSpec.configure do |config|
       AssignedVmAddress.create(ip: ipv4, address_id: addr.id, dst_vm_id: vm.id)
     end
 
-    def refresh_frame(prog, new_frame: nil, new_values: nil)
+    # Stubs Google::Apis::Core::BaseService#fetch_all on a doubled CRM-like
+    # client so existing list_tag_keys / list_tag_values / list_tag_bindings
+    # stubs continue to work after callers were switched to fetch_all. The
+    # returned Enumerator paginates by invoking the caller's block (which in
+    # turn calls the doubled list_* method whose stubs the spec defines), and
+    # short-circuits when the consumer breaks (so .find still avoids fetching
+    # later pages when a match lands on the first page).
+    def stub_fetch_all_via_list(client)
+      allow(client).to receive(:fetch_all) do |items:, &block|
+        Enumerator.new do |yielder|
+          page_token = nil
+          loop do
+            resp = block.call(page_token, client)
+            resp.send(items)&.each(&yielder)
+            page_token = resp.next_page_token
+            break if page_token.to_s.empty?
+          end
+        end
+      end
+    end
+
+    def refresh_frame(prog, new_frame: nil, new_values: nil, parent_values: nil)
       st = prog.strand
       fail "cannot pass both new_frame and new_values" if new_frame && new_values
+      fail "refresh_frame: parent_values requires a 2+ frame stack (has #{st.stack.length})" \
+        if parent_values && st.stack.length < 2
+
       st.stack.first.merge!(new_values) if new_values
+      st.stack[1].merge!(parent_values) if parent_values
       st.stack[0] = new_frame if new_frame
       st.modified!(:stack)
       st.save_changes
@@ -342,8 +470,11 @@ RSpec.configure do |config|
     end
 
     def frame_value(prog, key)
-      prog.strand.reload
       prog.strand.stack.first[key]
+    end
+
+    def hibernate
+      nap(60 * 60 * 24 * 365 * 1000)
     end
   end)
 end

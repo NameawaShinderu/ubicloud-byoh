@@ -2,20 +2,23 @@
 
 RSpec.describe Kubernetes::Client do
   let(:project) { Project.create(name: "test") }
-  let(:private_subnet) { PrivateSubnet.create(project_id: project.id, name: "test", location_id: Location::HETZNER_FSN1_ID, net6: "fe80::/64", net4: "192.168.0.0/24") }
   let(:kubernetes_cluster) {
-    KubernetesCluster.create(
+    Prog::Kubernetes::KubernetesClusterNexus.assemble(
       name: "test",
-      version: Option.kubernetes_versions.first,
+      version: Option.selectable_kubernetes_versions.first,
       cp_node_count: 3,
-      private_subnet_id: private_subnet.id,
       location_id: Location::HETZNER_FSN1_ID,
       project_id: project.id,
       target_node_size: "standard-2",
-    )
+    ).subject
   }
+  let(:private_subnet) { kubernetes_cluster.private_subnet }
   let(:session) { Net::SSH::Connection::Session.allocate }
   let(:kubernetes_client) { described_class.new(kubernetes_cluster, session) }
+
+  before do
+    allow(Config).to receive(:kubernetes_service_project_id).and_return(Project.create(name: "UbicloudKubernetesService").id)
+  end
 
   describe "service_deleted?" do
     it "detects deleted service" do
@@ -198,7 +201,7 @@ RSpec.describe Kubernetes::Client do
   describe "kubectl" do
     it "runs kubectl command in the right format" do
       response = Net::SSH::Connection::Session::StringWithExitstatus.new("", 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s get nodes").and_return(response)
       expect { kubernetes_client.kubectl("get nodes") }.not_to raise_error
     end
 
@@ -208,7 +211,7 @@ RSpec.describe Kubernetes::Client do
 
     it "raises an error" do
       response = Net::SSH::Connection::Session::StringWithExitstatus.new("error happened", 1)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s get nodes").and_return(response)
       expect { kubernetes_client.kubectl("get nodes") }.to raise_error(RuntimeError, "error happened")
     end
   end
@@ -216,7 +219,7 @@ RSpec.describe Kubernetes::Client do
   describe "version" do
     it "runs a version command on kubectl" do
       response = Net::SSH::Connection::Session::StringWithExitstatus.new("Client Version: v1.33.0\nKustomize Version: v5.6.0", 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf version --client").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s version --client").and_return(response)
       expect(kubernetes_client.version).to eq("v1.33")
     end
   end
@@ -224,21 +227,29 @@ RSpec.describe Kubernetes::Client do
   describe "delete_node" do
     it "deletes a node" do
       response = Net::SSH::Connection::Session::StringWithExitstatus.new("node deleted", 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf delete node asdf").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s delete node asdf --ignore-not-found").and_return(response)
       kubernetes_client.delete_node("asdf")
+    end
+  end
+
+  describe "retain_pv" do
+    it "patches the PV reclaim policy to Retain" do
+      response = Net::SSH::Connection::Session::StringWithExitstatus.new("persistentvolume/my-pv patched", 0)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s patch pv my-pv --type=merge -p \\{\\\"spec\\\":\\{\\\"persistentVolumeReclaimPolicy\\\":\\\"Retain\\\"\\}\\}").and_return(response)
+      kubernetes_client.retain_pv("my-pv")
     end
   end
 
   describe "get_csr" do
     it "returns the pending csr name for the node" do
       response = Net::SSH::Connection::Session::StringWithExitstatus.new("csr-abc123\n", 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get csr --sort-by=.metadata.creationTimestamp | awk /Pending/' && /kubelet-serving/ && /'my-node'/ {print $1}' | tail -1").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s get csr --sort-by=.metadata.creationTimestamp | awk /Pending/' && /kubelet-serving/ && /'my-node'/ {print $1}' | tail -1").and_return(response)
       expect(kubernetes_client.get_csr("my-node", csr_status: "Pending")).to eq("csr-abc123")
     end
 
     it "returns the approved csr name for the node" do
       response = Net::SSH::Connection::Session::StringWithExitstatus.new("csr-xyz789\n", 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get csr --sort-by=.metadata.creationTimestamp | awk /Approved/' && /kubelet-serving/ && /'my-node'/ {print $1}' | tail -1").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s get csr --sort-by=.metadata.creationTimestamp | awk /Approved/' && /kubelet-serving/ && /'my-node'/ {print $1}' | tail -1").and_return(response)
       expect(kubernetes_client.get_csr("my-node", csr_status: "Approved")).to eq("csr-xyz789")
     end
   end
@@ -246,7 +257,7 @@ RSpec.describe Kubernetes::Client do
   describe "approve_csr" do
     it "approves the given csr" do
       response = Net::SSH::Connection::Session::StringWithExitstatus.new("approved", 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf certificate approve csr-abc123").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s certificate approve csr-abc123").and_return(response)
       kubernetes_client.approve_csr("csr-abc123")
     end
   end
@@ -260,7 +271,7 @@ RSpec.describe Kubernetes::Client do
         },
       }
       response = Net::SSH::Connection::Session::StringWithExitstatus.new("node deleted", 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf -n default patch service test-svc --type=merge -p \\{\\\"status\\\":\\{\\\"loadBalancer\\\":\\{\\\"ingress\\\":\\[\\{\\\"hostname\\\":\\\"asdf.com\\\"\\}\\]\\}\\}\\} --subresource=status").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s -n default patch service test-svc --type=merge -p \\{\\\"status\\\":\\{\\\"loadBalancer\\\":\\{\\\"ingress\\\":\\[\\{\\\"hostname\\\":\\\"asdf.com\\\"\\}\\]\\}\\}\\} --subresource=status").and_return(response)
       kubernetes_client.set_load_balancer_hostname(svc, "asdf.com")
     end
   end
@@ -273,7 +284,7 @@ RSpec.describe Kubernetes::Client do
         "items" => ["metadata" => {"name" => "svc", "namespace" => "default", "creationTimestamp" => "2024-01-03T00:00:00Z"}],
       }.to_json
       response = Net::SSH::Connection::Session::StringWithExitstatus.new(@response, 0)
-      allow(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
+      allow(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
       expect(kubernetes_client.instance_variable_get(:@kubernetes_cluster)).to receive(:reload).at_least(:once)
       expect(kubernetes_client.instance_variable_get(:@load_balancer)).to receive(:reload).at_least(:once)
     end
@@ -283,7 +294,7 @@ RSpec.describe Kubernetes::Client do
         "items" => [],
       }.to_json
       response = Net::SSH::Connection::Session::StringWithExitstatus.new(response, 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
       expect(kubernetes_client.any_lb_services_modified?).to be(true)
     end
 
@@ -306,27 +317,13 @@ RSpec.describe Kubernetes::Client do
     end
 
     it "determintes the modification because hostname is not set" do
-      response = {
-        "items" => [
-          {
-            "metadata" => {"name" => "svc", "namespace" => "default", "creationTimestamp" => "2024-01-03T00:00:00Z"},
-            "status" => {
-              "loadBalancer" => {
-                "ingress" => [
-                  {},
-                ],
-              },
-            },
-          },
-        ],
-      }.to_json
+      response = {"items" => [{
+        "metadata" => {"name" => "svc", "namespace" => "default", "creationTimestamp" => "2024-01-03T00:00:00Z"},
+        "spec" => {"ports" => [{"port" => 80, "nodePort" => 8000}]},
+        "status" => {"loadBalancer" => {"ingress" => [{}]}},
+      }]}.to_json
       response = Net::SSH::Connection::Session::StringWithExitstatus.new(response, 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
-
-      allow(kubernetes_cluster).to receive_messages(
-        vm_diff_for_lb: [[], []],
-        port_diff_for_lb: [[], []],
-      )
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
       expect(kubernetes_client.any_lb_services_modified?).to be(true)
     end
   end
@@ -341,7 +338,7 @@ RSpec.describe Kubernetes::Client do
         ],
       }.to_json
       response = Net::SSH::Connection::Session::StringWithExitstatus.new(@response, 0)
-      allow(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
+      allow(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
     end
 
     it "reconciles with pre existing lb with not ready loadbalancer" do
@@ -375,8 +372,66 @@ RSpec.describe Kubernetes::Client do
       session = Net::SSH::Connection::Session.allocate
       kubernetes_client = described_class.new(instance_double(KubernetesCluster, services_lb: nil), session)
       response = Net::SSH::Connection::Session::StringWithExitstatus.new({"items" => [{}]}.to_json, 0)
-      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
+      expect(session).to receive(:_exec!).with("sudo kubectl --kubeconfig=/etc/kubernetes/admin.conf --request-timeout=30s get service --all-namespaces --field-selector spec.type=LoadBalancer -ojson").and_return(response)
       expect { kubernetes_client.sync_kubernetes_services }.to raise_error("services load balancer does not exist.")
+    end
+  end
+
+  describe "sync_lb_firewall_rules" do
+    let(:firewall) { kubernetes_cluster.internal_worker_vm_firewall }
+
+    before do
+      lb = Prog::Vnet::LoadBalancerNexus.assemble_with_multiple_ports(
+        private_subnet.id, ports: [], name: kubernetes_cluster.services_load_balancer_name,
+        algorithm: "hash_based", health_check_endpoint: "/", health_check_protocol: "tcp",
+      ).subject
+      kubernetes_cluster.update(services_lb: lb)
+    end
+
+    def lb_rule_keys
+      firewall.firewall_rules_dataset
+        .where(Sequel[:description].like("k8s-svc-lb:%"))
+        .select_map([Sequel[:cidr].cast(String).as(:cidr), Sequel.function(:lower, :port_range).as(:port), :description])
+        .sort
+    end
+
+    it "adds rules for new LB ports" do
+      kubernetes_cluster.services_lb.add_port(443, 31234)
+      kubernetes_cluster.services_lb.add_port(80, 31235)
+      kubernetes_client.sync_lb_firewall_rules
+      expect(lb_rule_keys).to eq [
+        ["0.0.0.0/0", 80, "k8s-svc-lb:80"],
+        ["0.0.0.0/0", 443, "k8s-svc-lb:443"],
+        ["::/0", 80, "k8s-svc-lb:80"],
+        ["::/0", 443, "k8s-svc-lb:443"],
+      ]
+    end
+
+    it "removes rules whose LB port is gone" do
+      kubernetes_cluster.services_lb.add_port(443, 31234)
+      kubernetes_client.sync_lb_firewall_rules
+      kubernetes_cluster.services_lb.remove_port(kubernetes_cluster.services_lb.ports.first)
+      kubernetes_client.sync_lb_firewall_rules
+      expect(lb_rule_keys).to be_empty
+    end
+
+    it "increments update_firewall_rules on attached VMs when rules change" do
+      kn = Prog::Kubernetes::KubernetesNodepoolNexus.assemble(name: "test-np", node_count: 1, kubernetes_cluster_id: kubernetes_cluster.id, target_node_size: "standard-2").subject
+      vm = Prog::Kubernetes::KubernetesNodeNexus.assemble(Config.kubernetes_service_project_id, sshable_unix_user: "ubi", name: "worker-vm", location_id: Location::HETZNER_FSN1_ID, size: "standard-2", storage_volumes: [{encrypted: true, size_gib: 40}], boot_image: "kubernetes-#{kubernetes_cluster.version.tr(".", "_")}", enable_ip4: true, kubernetes_cluster_id: kubernetes_cluster.id, kubernetes_nodepool_id: kn.id).subject.vm
+      vm.semaphores_dataset.destroy
+      kubernetes_cluster.services_lb.add_port(443, 31234)
+      kubernetes_client.sync_lb_firewall_rules
+      expect(vm.semaphores_dataset.select_map(:name)).to eq ["update_firewall_rules"]
+    end
+
+    it "is idempotent when rules already match the LB ports" do
+      kubernetes_cluster.services_lb.add_port(443, 31234)
+      kubernetes_client.sync_lb_firewall_rules
+      rule_ids_before = firewall.firewall_rules.select { it.description&.start_with?("k8s-svc-lb:") }.map(&:id).sort
+      kubernetes_client.sync_lb_firewall_rules
+      firewall.reload
+      rule_ids_after = firewall.firewall_rules.select { it.description&.start_with?("k8s-svc-lb:") }.map(&:id).sort
+      expect(rule_ids_after).to eq rule_ids_before
     end
   end
 end

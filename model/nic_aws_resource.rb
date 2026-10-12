@@ -4,17 +4,20 @@ require_relative "../model"
 
 class NicAwsResource < Sequel::Model
   many_to_one :nic, key: :id, read_only: true, is_used: true
+  many_to_one :aws_subnet, read_only: true, is_used: true
   plugin ResourceMethods, referencing: UBID::TYPE_NIC
 end
 
 # Table: nic_aws_resource
 # Columns:
-#  id                   | uuid | PRIMARY KEY
-#  eip_allocation_id    | text |
-#  network_interface_id | text |
-#  subnet_id            | text |
-#  subnet_az            | text |
-#  aws_subnet_id        | uuid |
+#  id                       | uuid    | PRIMARY KEY
+#  eip_allocation_id        | text    |
+#  network_interface_id     | text    |
+#  subnet_id                | text    |
+#  subnet_az                | text    |
+#  aws_subnet_id            | uuid    |
+#  use_eip                  | boolean | NOT NULL DEFAULT true
+#  create_network_interface | boolean | NOT NULL DEFAULT true
 # Indexes:
 #  nic_aws_resource_pkey | PRIMARY KEY btree (id)
 # Foreign key constraints:

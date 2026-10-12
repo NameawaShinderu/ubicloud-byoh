@@ -3,7 +3,7 @@
 class Prog::Vnet::SubnetNexus < Prog::Base
   subject_is :private_subnet
 
-  def self.assemble(project_id, name: nil, location_id: Location::HETZNER_FSN1_ID, ipv6_range: nil, ipv4_range: nil, allow_only_ssh: false, firewall_id: nil, firewall_name: nil, ipv4_range_size: nil, preferred_azs: [])
+  def self.assemble(project_id, name: nil, location_id: Location::HETZNER_FSN1_ID, ipv6_range: nil, ipv4_range: nil, allow_only_ssh: false, firewall_id: nil, ipv4_range_size: nil, aws_subnet_ipv4_range_size: nil)
     unless (project = Project[project_id])
       fail "No existing project"
     end
@@ -34,29 +34,34 @@ class Prog::Vnet::SubnetNexus < Prog::Base
       else
         port_range = allow_only_ssh ? 22..22 : 0..65535
 
-        unless firewall_name
-          firewall_name = "#{name[0, 55]}-default"
-          # As is typical when checking before inserting, there is a race condition here with
-          # a user concurrently manually creating a firewall with the same name.  However,
-          # the worst case scenario is a bogus error message, and the user could try creating
-          # the private subnet again.
-          unless firewall_dataset.where(Sequel[:firewall][:name] => firewall_name).empty?
-            firewall_name = "#{name[0, 47]}-default-#{Array.new(7) { UBID.from_base32(rand(32)) }.join}"
-          end
+        firewall_name = "#{name[0, 55]}-default"
+        # As is typical when checking before inserting, there is a race condition here with
+        # a user concurrently manually creating a firewall with the same name.  However,
+        # the worst case scenario is a bogus error message, and the user could try creating
+        # the private subnet again.
+        unless firewall_dataset.where(Sequel[:firewall][:name] => firewall_name).empty?
+          firewall_name = "#{name[0, 47]}-default-#{Array.new(7) { UBID.from_base32(rand(32)) }.join}"
         end
 
         firewall = Firewall.create(name: firewall_name, location_id: location.id, project_id:)
-        DB.ignore_duplicate_queries do
-          ["0.0.0.0/0", "::/0"].each { |cidr| FirewallRule.create(firewall_id: firewall.id, cidr:, port_range: Sequel.pg_range(port_range)) }
-        end
+        pg_port_range = Sequel.pg_range(port_range)
+        protocols = allow_only_ssh ? ["tcp"] : ["tcp", "udp"]
+        FirewallRule.import(
+          [:id, :firewall_id, :cidr, :port_range, :protocol],
+          protocols.flat_map { |protocol|
+            %w[0.0.0.0/0 ::/0].freeze.map { |cidr| [FirewallRule.generate_uuid, firewall.id, cidr, pg_port_range, protocol] }
+          },
+        )
       end
       firewall.associate_with_private_subnet(ps, apply_firewalls: false)
 
       prog = if location.aws?
         # Create PrivateSubnetAwsResource and pre-create AwsSubnet records for each AZ
         ps_aws_resource = PrivateSubnetAwsResource.create_with_id(ps.id)
-        create_aws_subnet_records(ps, ps_aws_resource, location, ipv4_range_size, preferred_azs:)
+        create_aws_subnet_records(ps, ps_aws_resource, location, ipv4_range_size, aws_subnet_ipv4_range_size:)
         "Vnet::Aws::VpcNexus"
+      elsif location.gcp?
+        "Vnet::Gcp::SubnetNexus"
       else
         "Vnet::Metal::SubnetNexus"
       end
@@ -64,32 +69,23 @@ class Prog::Vnet::SubnetNexus < Prog::Base
     end
   end
 
-  def self.create_aws_subnet_records(private_subnet, ps_aws_resource, location, ipv4_range_size, preferred_azs: [])
+  def self.create_aws_subnet_records(private_subnet, ps_aws_resource, location, ipv4_range_size, aws_subnet_ipv4_range_size: nil)
     vpc_ipv4 = private_subnet.net4
 
-    ipv4_prefix = [ipv4_range_size + 8, 28].min
+    ipv4_prefix = aws_subnet_ipv4_range_size || [ipv4_range_size + 8, 28].min
 
-    available_azs = preferred_azs.empty? ? location.azs : preferred_azs
-    azs = available_azs.sample(2**(ipv4_prefix - ipv4_range_size))
+    azs = location.azs.sample(2**(ipv4_prefix - ipv4_range_size))
 
     raise "Not enough subnet space for even a single AZ. Use a range size <= 28" if azs.empty?
 
-    azs.each_with_index do |az, idx|
+    rows = azs.map.with_index do |az, idx|
       ipv4_cidr = vpc_ipv4.nth_subnet(ipv4_prefix, idx)
-      # if the vpc size and the subnet sizes are the same, nth_subnet will
-      # return nil. For example:
-      # NetAddr::IPv4Net.parse("10.159.0.0/16").nth_subnet(16,0)
-      # => nil
+      # if vpc size and subnet sizes are the same, nth_subnet returns nil, eg
+      # NetAddr::IPv4Net.parse("10.159.0.0/16").nth_subnet(16,0) => nil
       ipv4_cidr = vpc_ipv4 if vpc_ipv4.netmask.prefix_len == ipv4_prefix && idx == 0
-
-      AwsSubnet.create(
-        private_subnet_aws_resource_id: ps_aws_resource.id,
-        location_aws_az_id: az.id,
-        ipv4_cidr: ipv4_cidr.to_s,
-        ipv6_cidr: nil,  # Will be set when VPC is created
-        subnet_id: nil,   # Will be set when AWS subnet is created
-      )
+      [ps_aws_resource.id, az.id, ipv4_cidr.to_s]
     end
+    AwsSubnet.import([:private_subnet_aws_resource_id, :location_aws_az_id, :ipv4_cidr], rows)
   end
 
   def self.random_private_ipv6(location, project)
@@ -121,7 +117,7 @@ class Prog::Vnet::SubnetNexus < Prog::Base
 
     failure_message = if PrivateSubnet::BANNED_IPV4_SUBNETS.any? { it.rel(selected_addr) }
       "Selected IPv4 subnet #{selected_addr} is banned"
-    elsif (private_subnet = project.private_subnets_dataset[net4: selected_addr.to_s, location_id: location.id])
+    elsif !Config.ipv4_subnet_collision_check_disabled && (private_subnet = project.private_subnets_dataset[net4: selected_addr.to_s, location_id: location.id])
       "Selected IPv4 subnet #{selected_addr} is already in use by #{private_subnet.ubid}"
     end
 

@@ -15,6 +15,31 @@ RSpec.describe Firewall do
     private_subnet
   }
 
+  describe "deleted records" do
+    it "keeps a deleted record for a customer firewall" do
+      fw
+      expect { fw.destroy }.to change { DeletedRecord.where(model_name: "Firewall").count }.by(1)
+    end
+
+    it "does not keep a deleted record for a vm pool firewall, whose vms exist only to become runners" do
+      pool_project_id = Project.create(name: "vm-pool-service").id
+      expect(Config).to receive(:vm_pool_project_id).at_least(:once).and_return(pool_project_id)
+      pool_fw = described_class.create(name: "pool-fw", location_id: Location::HETZNER_FSN1_ID, project_id: pool_project_id)
+
+      expect(pool_fw.runner_firewall?).to be true
+      expect { pool_fw.destroy }.not_to change { DeletedRecord.where(model_name: "Firewall").count }
+    end
+
+    it "does not keep a deleted record for a github runner firewall, which is one per runner subnet" do
+      runner_project_id = Project.create(name: "runner-service").id
+      expect(Config).to receive(:github_runner_service_project_id).at_least(:once).and_return(runner_project_id)
+      runner_fw = described_class.create(name: "runner-fw", location_id: Location::HETZNER_FSN1_ID, project_id: runner_project_id)
+
+      expect(runner_fw.runner_firewall?).to be true
+      expect { runner_fw.destroy }.not_to change { DeletedRecord.where(model_name: "Firewall").count }
+    end
+  end
+
   it "inserts firewall rules" do
     fw.insert_firewall_rule("10.0.0.16/28", Sequel.pg_range(80..5432))
     expect(fw.firewall_rules.count).to eq(1)
@@ -27,8 +52,8 @@ RSpec.describe Firewall do
   it "increments update_firewall_rules semaphore on associated private subnets" do
     fw.associate_with_private_subnet(ps, apply_firewalls: false)
     expect {
-      fw.insert_firewall_rule("0.0.0.0/0", nil)
-    }.to change { ps.reload.update_firewall_rules_set? }.from(false).to(true)
+      fw.insert_firewall_rule("0.0.0.0/0", Sequel.pg_range(0..65535))
+    }.to change { ps.update_firewall_rules_set?(cached: false) }.from(false).to(true)
   end
 
   it "bulk sets firewall rules" do
@@ -39,10 +64,18 @@ RSpec.describe Firewall do
     expect(fw.reload.firewall_rules.first.cidr.to_s).to eq("0.0.0.0/32")
   end
 
+  it "keeps existing rules when replacing firewall rules fails partway" do
+    fw.insert_firewall_rule("10.0.0.16/28", Sequel.pg_range(80..5432))
+    expect {
+      fw.replace_firewall_rules([{cidr: "not-a-cidr", port_range: Sequel.pg_range(5432..5432)}])
+    }.to raise_error(Sequel::InvalidValue)
+    expect(fw.reload.firewall_rules.map { it.cidr.to_s }).to eq(["10.0.0.16/28"])
+  end
+
   it "associates with a private subnet" do
     expect {
       fw.associate_with_private_subnet(ps)
-    }.to change { ps.reload.update_firewall_rules_set? }.from(false).to(true)
+    }.to change { ps.update_firewall_rules_set?(cached: false) }.from(false).to(true)
 
     expect(fw.private_subnets.count).to eq(1)
     expect(fw.private_subnets.first.id).to eq(ps.id)
@@ -54,7 +87,7 @@ RSpec.describe Firewall do
 
     expect {
       fw.disassociate_from_private_subnet(ps)
-    }.to change { ps.reload.update_firewall_rules_set? }.from(false).to(true)
+    }.to change { ps.update_firewall_rules_set?(cached: false) }.from(false).to(true)
 
     expect(fw.reload.private_subnets.count).to eq(0)
     expect(PrivateSubnetFirewall.where(firewall_id: fw.id).count).to eq(0)
@@ -66,7 +99,7 @@ RSpec.describe Firewall do
 
     expect {
       fw.disassociate_from_private_subnet(ps, apply_firewalls: false)
-    }.not_to change { ps.reload.update_firewall_rules_set? }.from(false)
+    }.not_to change { ps.update_firewall_rules_set?(cached: false) }.from(false)
 
     expect(fw.reload.private_subnets.count).to eq(0)
     expect(PrivateSubnetFirewall.where(firewall_id: fw.id).count).to eq(0)
@@ -79,6 +112,246 @@ RSpec.describe Firewall do
     fw.destroy
     expect(PrivateSubnetFirewall.where(firewall_id: fw.id).count).to eq(0)
     expect(described_class[fw.id]).to be_nil
+  end
+
+  describe "GCP semaphore plumbing" do
+    let(:gcp_location) {
+      Location.create(name: "gcp-us-central1", provider: "gcp", project_id:,
+        display_name: "GCP US Central 1", ui_name: "GCP US Central 1", visible: true)
+    }
+    let(:gcp_vpc) {
+      vpc = GcpVpc.create(project_id:, location_id: gcp_location.id, name: "ubicloud-vpc")
+      Strand.create_with_id(vpc, prog: "Vnet::Gcp::VpcNexus", label: "wait")
+      vpc
+    }
+    let(:gcp_ps) {
+      sub = PrivateSubnet.create(name: "gcp-ps-1", location_id: gcp_location.id, project_id:,
+        net6: "fd10:9b0b:6b4b:8fbb::/64", net4: "10.0.0.0/26", state: "waiting")
+      Strand.create_with_id(sub, prog: "Vnet::Gcp::SubnetNexus", label: "wait")
+      DB[:private_subnet_gcp_vpc].insert(private_subnet_id: sub.id, gcp_vpc_id: gcp_vpc.id)
+      sub
+    }
+    let(:gcp_fw) {
+      described_class.create(name: "gcp-fw", description: "d", location_id: gcp_location.id, project_id:)
+    }
+
+    it "rule edit on a GCP firewall bumps the subnet (which propagates to VPC via SubnetNexus)" do
+      gcp_fw.associate_with_private_subnet(gcp_ps, apply_firewalls: false)
+      # Clean slate after associate so we measure just the rule-edit path.
+      Semaphore.where(strand_id: gcp_ps.id, name: "update_firewall_rules").delete
+      Semaphore.where(strand_id: gcp_vpc.id, name: "update_firewall_rules").delete
+
+      gcp_fw.insert_firewall_rule("0.0.0.0/0", Sequel.pg_range(0..65535))
+
+      expect(Semaphore.where(strand_id: gcp_ps.id, name: "update_firewall_rules").count).to eq(1)
+      expect(Semaphore.where(strand_id: gcp_vpc.id, name: "update_firewall_rules").count).to eq(0)
+    end
+
+    it "rule edit is a no-op when firewall is attached to no subnets" do
+      expect { gcp_fw.insert_firewall_rule("0.0.0.0/0", Sequel.pg_range(0..65535)) }
+        .not_to change { Semaphore.where(name: "update_firewall_rules").count }
+    end
+
+    it "associate fires VPC + every VM in the subnet (not the subnet)" do
+      vm1 = create_vm(project_id:, location_id: gcp_location.id, name: "vm-1")
+      Strand.create_with_id(vm1, prog: "Vm::Gcp::Nexus", label: "wait")
+      vm2 = create_vm(project_id:, location_id: gcp_location.id, name: "vm-2")
+      Strand.create_with_id(vm2, prog: "Vm::Gcp::Nexus", label: "wait")
+      [vm1, vm2].each_with_index do |vm, i|
+        Nic.create(private_subnet_id: gcp_ps.id, vm_id: vm.id, name: "n-#{i}",
+          private_ipv4: gcp_ps.net4.nth(i + 2).to_s,
+          private_ipv6: gcp_ps.net6.nth(i + 2).to_s,
+          mac: "00:00:00:00:00:%02x" % i, state: "active")
+      end
+
+      Semaphore.where(name: "update_firewall_rules").delete
+      gcp_fw.associate_with_private_subnet(gcp_ps)
+
+      expect(Semaphore.where(strand_id: gcp_vpc.id, name: "update_firewall_rules").count).to eq(1)
+      expect(Semaphore.where(strand_id: vm1.id, name: "update_firewall_rules").count).to eq(1)
+      expect(Semaphore.where(strand_id: vm2.id, name: "update_firewall_rules").count).to eq(1)
+      expect(Semaphore.where(strand_id: gcp_ps.id, name: "update_firewall_rules").count).to eq(0)
+    end
+
+    it "disassociate fires VPC + subnet VMs" do
+      gcp_fw.associate_with_private_subnet(gcp_ps, apply_firewalls: false)
+      vm1 = create_vm(project_id:, location_id: gcp_location.id, name: "vm-1")
+      Strand.create_with_id(vm1, prog: "Vm::Gcp::Nexus", label: "wait")
+      Nic.create(private_subnet_id: gcp_ps.id, vm_id: vm1.id, name: "n-1",
+        private_ipv4: "10.0.0.5", private_ipv6: "fd10:9b0b:6b4b:8fbb:abc::",
+        mac: "00:00:00:00:00:aa", state: "active")
+
+      Semaphore.where(name: "update_firewall_rules").delete
+      gcp_fw.disassociate_from_private_subnet(gcp_ps)
+
+      expect(Semaphore.where(strand_id: gcp_vpc.id, name: "update_firewall_rules").count).to eq(1)
+      expect(Semaphore.where(strand_id: vm1.id, name: "update_firewall_rules").count).to eq(1)
+    end
+
+    it "associate with apply_firewalls: false fires no semaphores" do
+      expect { gcp_fw.associate_with_private_subnet(gcp_ps, apply_firewalls: false) }
+        .not_to change { Semaphore.where(name: "update_firewall_rules").count }
+    end
+
+    it "direct VM firewall attach fires VM + VPC semaphores" do
+      vm = create_vm(project_id:, location_id: gcp_location.id, name: "vm-1")
+      Strand.create_with_id(vm, prog: "Vm::Gcp::Nexus", label: "wait")
+      Nic.create(private_subnet_id: gcp_ps.id, vm_id: vm.id, name: "n-1",
+        private_ipv4: "10.0.0.5", private_ipv6: "fd10:9b0b:6b4b:8fbb:abc::",
+        mac: "00:00:00:00:00:aa", state: "active")
+      Semaphore.where(name: "update_firewall_rules").delete
+
+      vm.add_vm_firewall(gcp_fw)
+
+      expect(Semaphore.where(strand_id: vm.id, name: "update_firewall_rules").count).to eq(1)
+      expect(Semaphore.where(strand_id: gcp_vpc.id, name: "update_firewall_rules").count).to eq(1)
+    end
+  end
+
+  describe "GCP firewall-per-VM limit" do
+    let(:gcp_location) {
+      Location.create(name: "gcp-us-central1", provider: "gcp",
+        display_name: "GCP US Central 1", ui_name: "GCP US Central 1", visible: true,
+        project_id:)
+    }
+
+    let(:gcp_ps) {
+      PrivateSubnet.create(name: "gcp-ps", location_id: gcp_location.id, project_id:,
+        net6: "fd10:9b0b:6b4b:8fbb::/64", net4: "10.0.0.0/26", state: "active")
+    }
+
+    def make_fw(name)
+      described_class.create(name:, description: "desc", location_id: gcp_location.id, project_id:)
+    end
+
+    def attach_vm(name, idx)
+      vm = create_vm(project_id:, location_id: gcp_location.id, name:)
+      Nic.create(private_subnet_id: gcp_ps.id, vm_id: vm.id, name: "nic-#{idx}",
+        private_ipv4: gcp_ps.net4.nth(idx + 2).to_s,
+        private_ipv6: gcp_ps.net6.nth(idx + 2).to_s,
+        mac: "00:00:00:00:00:%02x" % idx, state: "active")
+      vm
+    end
+
+    it "allows associating up to 9 firewalls on a GCP subnet with a VM" do
+      attach_vm("gcp-vm", 1)
+      9.times { |i| make_fw("fw-#{i}").associate_with_private_subnet(gcp_ps, apply_firewalls: false) }
+      expect(gcp_ps.reload.firewalls.count).to eq(9)
+    end
+
+    it "raises when associating a 10th firewall on a GCP subnet with a VM" do
+      attach_vm("gcp-vm", 1)
+      9.times { |i| make_fw("fw-#{i}").associate_with_private_subnet(gcp_ps, apply_firewalls: false) }
+      tenth = make_fw("fw-10")
+      expect {
+        tenth.associate_with_private_subnet(gcp_ps, apply_firewalls: false)
+      }.to raise_error(Validation::ValidationFailed) { |e|
+        expect(e.details[:firewall]).to include("more than 9 firewalls")
+      }
+      expect(gcp_ps.reload.firewalls.count).to eq(9)
+    end
+
+    it "allows associating a 10th firewall on a GCP subnet with no VMs" do
+      10.times { |i| make_fw("fw-#{i}").associate_with_private_subnet(gcp_ps, apply_firewalls: false) }
+      expect(gcp_ps.reload.firewalls.count).to eq(10)
+    end
+
+    # Wiring smoke tests, not a real race. These stub private_subnet.lock!
+    # and inject "peer" writes from inside the same RSpec transaction, so they
+    # verify ordering and basic wiring but cannot catch a regression that
+    # silently drops the FOR UPDATE row lock. See
+    # spec/model/firewall_concurrency_spec.rb for the real two-connection
+    # concurrency specs that exercise the lock.
+    describe "TOCTOU race serialization (wiring smoke test, not a real race)" do
+      it "locks the subnet row before cap validation in associate_with_private_subnet (race B)" do
+        attach_vm("gcp-vm", 1)
+        8.times { |i| make_fw("fw-#{i}").associate_with_private_subnet(gcp_ps, apply_firewalls: false) }
+        fw9 = make_fw("fw-9")
+
+        lock_calls = []
+        expect(gcp_ps).to receive(:lock!).and_wrap_original do |m|
+          lock_calls << gcp_ps.id
+          m.call
+        end
+
+        fw9.associate_with_private_subnet(gcp_ps, apply_firewalls: false)
+        expect(lock_calls).to eq([gcp_ps.id])
+        # The 9th firewall attached successfully (count now 9), so cap
+        # validation must have run inside the locked region and passed.
+        expect(gcp_ps.reload.firewalls.count).to eq(9)
+      end
+
+      it "sees firewalls committed by a prior transaction that held the lock (race B)" do
+        attach_vm("gcp-vm", 1)
+        # Simulate T1 (subnet-attach path) having committed 9 firewalls onto the
+        # subnet just before T2 tries to attach its own firewall; T2 acquires the
+        # lock after T1 releases it, and its cap read now sees the 9 committed rows.
+        9.times { |i| make_fw("fw-#{i}").associate_with_private_subnet(gcp_ps, apply_firewalls: false) }
+        tenth = make_fw("fw-10")
+        expect {
+          tenth.associate_with_private_subnet(gcp_ps, apply_firewalls: false)
+        }.to raise_error(Validation::ValidationFailed) { |e|
+          expect(e.details[:firewall]).to include("more than 9 firewalls")
+        }
+        expect(gcp_ps.reload.firewalls.count).to eq(9)
+      end
+
+      it "rejects a firewall attach when a concurrent attach commits first (simulated race B)" do
+        attach_vm("gcp-vm", 1)
+        8.times { |i| make_fw("fw-#{i}").associate_with_private_subnet(gcp_ps, apply_firewalls: false) }
+        fw9 = make_fw("fw-9")
+        tenth = make_fw("fw-10")
+
+        # Stub the lock acquisition to simulate "concurrent" commit from a peer
+        # transaction that also takes the subnet lock: when T2 (tenth) acquires
+        # the lock, the peer's write (fw9 attached) is already visible.
+        peer_committed = false
+        expect(gcp_ps).to receive(:lock!).and_wrap_original do |m|
+          result = m.call
+          unless peer_committed
+            peer_committed = true
+            # Bypass the locking path to emulate another committed transaction
+            # that already attached fw9 before the lock was granted to us.
+            fw9.add_private_subnet(gcp_ps)
+          end
+          result
+        end
+
+        expect {
+          tenth.associate_with_private_subnet(gcp_ps, apply_firewalls: false)
+        }.to raise_error(Validation::ValidationFailed) { |e|
+          expect(e.details[:firewall]).to include("more than 9 firewalls")
+        }
+      end
+
+      it "wraps the attach in a DB transaction so the lock is held with the write" do
+        attach_vm("gcp-vm", 1)
+        fw = make_fw("fw-x")
+        in_tx = nil
+        expect(gcp_ps).to receive(:lock!).and_wrap_original do |m|
+          in_tx = DB.in_transaction?
+          m.call
+        end
+        fw.associate_with_private_subnet(gcp_ps, apply_firewalls: false)
+        expect(in_tx).to be true
+      end
+    end
+
+    it "allows associating a 10th firewall when the subnet is non-GCP" do
+      hetzner_ps = PrivateSubnet.create(name: "hz-ps", location_id: Location::HETZNER_FSN1_ID, project_id:,
+        net6: "fd10:9b0b:6b4b:1000::/64", net4: "10.1.0.0/26", state: "active")
+      vm = create_vm(project_id:, location_id: Location::HETZNER_FSN1_ID, name: "hz-vm")
+      Nic.create(private_subnet_id: hetzner_ps.id, vm_id: vm.id, name: "nic-1",
+        private_ipv4: hetzner_ps.net4.nth(3).to_s,
+        private_ipv6: hetzner_ps.net6.nth(3).to_s,
+        mac: "00:00:00:00:01:01", state: "active")
+      10.times do |i|
+        described_class.create(name: "hz-fw-#{i}", description: "d",
+          location_id: Location::HETZNER_FSN1_ID, project_id:)
+          .associate_with_private_subnet(hetzner_ps, apply_firewalls: false)
+      end
+      expect(hetzner_ps.reload.firewalls.count).to eq(10)
+    end
   end
 
   it "removes referencing access control entries and object tag memberships" do

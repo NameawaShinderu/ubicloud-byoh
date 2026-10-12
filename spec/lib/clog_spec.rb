@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 RSpec.describe Clog do
-  let(:now) { Time.parse("2023-01-17 12:10:54 -0800") }
+  let(:now) { Time.utc(2023, 1, 17, 20, 10, 54) }
 
   before do
     allow(Time).to receive(:now).and_return(now)
@@ -11,6 +11,14 @@ RSpec.describe Clog do
     allow(Config).to receive(:test?).and_return(false)
     expect($stdout).to receive(:write).with('{"message":"hello","time":"' + now.to_s + '"}' + "\n")
     described_class.emit "hello"
+  end
+
+  it "scrubs non-UTF-8 string values anywhere in the payload instead of raising" do
+    allow(Config).to receive(:test?).and_return(false)
+    captured = nil
+    expect($stdout).to receive(:write) { |line| captured = line }
+    described_class.emit("boom", {stderr: "bad\xff", list: ["ok", "\xfe".b]})
+    expect(captured).to include('"stderr":"bad').and include('"list":["ok",')
   end
 
   it "adds the thread name to the structured data" do

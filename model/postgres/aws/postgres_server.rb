@@ -7,7 +7,6 @@ class PostgresServer < Sequel::Model
     private
 
     def aws_add_provider_configs(configs)
-      configs[:log_line_prefix] = "'%m [%p:%l] (%x,%v): host=%r,db=%d,user=%u,app=%a,client=%h '"
       configs[:log_connections] = "on"
       configs[:log_disconnections] = "on"
     end
@@ -16,12 +15,15 @@ class PostgresServer < Sequel::Model
       # nothing
     end
 
+    def aws_open_session_failure_page_threshold
+      MonitorableResource::OPEN_SESSION_FAILURE_PAGE_THRESHOLD
+    end
+
     def aws_storage_device_paths
-      # On AWS, pick the largest block device to use as the data disk,
-      # since the device path detected by the VmStorageVolume is not always
-      # correct.
-      storage_device_count = vm.vm_storage_volumes.count { it.boot == false }
-      vm.sshable.cmd("lsblk -b -d -o NAME,SIZE | sort -n -k2 | tail -n:storage_device_count |  awk '{print \"/dev/\"$1}'", storage_device_count:).strip.split
+      # Sort whole block devices by size and drop the smallest (EBS boot, fixed
+      # at 16 GiB). Remaining devices are instance-store NVMes — the disks we
+      # RAID for data.
+      vm.sshable.cmd("lsblk -b -d -n -e 7 -o NAME,SIZE | sort -n -k2 | tail -n +2 | awk '{print \"/dev/\"$1}'").strip.split
     end
 
     def aws_attach_s3_policy_if_needed
@@ -34,6 +36,10 @@ class PostgresServer < Sequel::Model
     def _aws_detach_parent_s3_policy
       client.detach_role_policy(role_name: vm.aws_instance.iam_role, policy_arn: timeline.parent.aws_s3_policy_arn) if timeline.parent
     rescue ::Aws::IAM::Errors::NoSuchEntity
+    end
+
+    def aws_detach_s3_policy(detached_timeline)
+      # No-op: the S3 policy is attached to the VM's IAM role and dies with it.
     end
 
     def aws_increment_s3_new_timeline

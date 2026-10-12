@@ -5,6 +5,8 @@ require "json"
 require "fileutils"
 require_relative "../../common/lib/util"
 require_relative "../lib/pg_bouncer_setup"
+require_relative "../lib/postgres_config"
+require_relative "../lib/postgres_setup"
 
 if ARGV.count != 1
   fail "Wrong number of arguments. Expected 1, Given #{ARGV.count}"
@@ -12,6 +14,14 @@ end
 
 v = ARGV[0]
 configure_hash = JSON.parse($stdin.read)
+
+shared_memory_percent = Integer(configure_hash["user_config"]["ubicloud.shared_memory_percent"] || 25)
+
+pgsetup = PostgresSetup.new(v)
+pgsetup.configure_memory_overcommit(strict: configure_hash["strict_overcommit"], hugepage_percent: shared_memory_percent)
+pgsetup.configure_service_slice
+pgsetup.configure_journald
+pgsetup.quiet_periodic_units
 
 # Update /etc/hosts
 hosts = <<-HOSTS
@@ -35,8 +45,17 @@ upgrade_override = "/etc/postgresql/#{v}/main/conf.d/100-upgrade.conf"
 FileUtils.rm_f(upgrade_override)
 
 # Update postgresql.conf with custom settings
-user_configs = configure_hash["user_config"].map { |k, v| "#{k} = #{v}" }.join("\n")
+user_configs = PostgresConfig.format(configure_hash["user_config"])
 safe_write_to_file("/etc/postgresql/#{v}/main/conf.d/099-user.conf", user_configs)
+
+# Append include_dir = 'conf.d' to postgresql.conf to ensure that the custom
+# settings override the default pg_createcluster stub.
+base_conf = "/etc/postgresql/#{v}/main/postgresql.conf"
+base_lines = File.readlines(base_conf).reject { _1.match?(/\Ainclude_dir\s*=\s*'conf\.d'\s*\z/) }
+base_lines << "\n" unless base_lines.last&.end_with?("\n")
+base_lines << "include_dir = 'conf.d'\n"
+safe_write_to_file(base_conf, base_lines.join)
+r "chown", "postgres:postgres", base_conf
 
 # Update pg_hba.conf
 private_subnets = configure_hash["private_subnets"].flat_map {
@@ -63,9 +82,11 @@ local   all             postgres                                peer map=system2
 local   all             pgbouncer                               peer map=system2pgbouncer
 
 # Allow connections from localhost with ubi_monitoring OS user as
-# ubi_monitoring database user. This will be used by postgres_exporter
-# to scrape metrics and expose them to prometheus.
-local   all             ubi_monitoring                          peer
+# ubi_monitoring database user (postgres_exporter and other on-box
+# collectors). The system2monitoring map also lets the SSH-tunnelled
+# control plane, which lands as OS user ubi, authenticate as
+# ubi_monitoring.
+local   all             ubi_monitoring                          peer map=system2monitoring
 
 # "local" is for Unix domain socket connections only
 # Use md5 authentication for all local connections to allow pgbouncer
@@ -119,6 +140,8 @@ pg_ident_entries = <<-PG_IDENT
 system2postgres       postgres                postgres
 system2pgbouncer      postgres                pgbouncer
 system2postgres       ubi                     postgres
+system2monitoring     ubi_monitoring          ubi_monitoring
+system2monitoring     ubi                     ubi_monitoring
 standby2replication   #{identity}             ubi_replication
 PG_IDENT
 safe_write_to_file("/etc/postgresql/#{v}/main/pg_ident.conf", pg_ident_entries)
@@ -163,10 +186,38 @@ safe_write_to_file("/etc/systemd/system/io-throttle@.timer", <<~TIMER)
 TIMER
 
 r "systemctl daemon-reload"
-r "systemctl enable --now io-throttle@#{v}-main.timer"
+r "systemctl", "enable", "--now", "io-throttle@#{v}-main.timer"
 
 # Reload the postmaster to apply changes
-r "pg_ctlcluster #{v} main reload || pg_ctlcluster #{v} main restart"
+r "pg_ctlcluster :v main reload || pg_ctlcluster :v main restart", v: v
+
+# Re-apply the privileges that the control plane reads through. Both roles get
+# them from PUBLIC, and a customer superuser can revoke that at any time. Only
+# the primary runs this, because a standby refuses a write, and physical
+# replication carries pg_database to each standby.
+#
+# The statement writes only when a privilege is absent, and it changes a
+# failure into a warning. configure must not stop. The first configure of a
+# server runs before post-installation-script, so the database and the roles
+# can be absent. disk-full-check also makes a full primary read-only, and a
+# read-only server refuses a GRANT. The health pulse pages if the privilege
+# stays absent.
+if r("sudo -u postgres psql -t -c 'SELECT pg_catalog.pg_is_in_recovery();' 2>/dev/null || echo 't'").strip == "f"
+  r "sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-c", <<~SQL
+    DO $$ BEGIN
+      IF EXISTS (SELECT FROM pg_database WHERE datname = 'ubi_admin')
+        AND EXISTS (SELECT FROM pg_roles WHERE rolname = 'ubi_monitoring')
+        AND EXISTS (SELECT FROM pg_roles WHERE rolname = 'pgbouncer')
+        AND EXISTS (SELECT FROM pg_database d, pg_roles r
+                    WHERE d.datname = 'ubi_admin' AND r.rolname IN ('ubi_monitoring', 'pgbouncer')
+                      AND NOT pg_catalog.has_database_privilege(r.oid, d.oid, 'CONNECT')) THEN
+        EXECUTE 'GRANT CONNECT ON DATABASE ubi_admin TO ubi_monitoring, pgbouncer';
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE WARNING 'could not re-apply the monitoring grants: %', SQLERRM;
+    END $$;
+  SQL
+end
 
 if configure_hash["physical_slots"]
   if configure_hash["physical_slots"].size == 0
@@ -179,5 +230,6 @@ if configure_hash["physical_slots"]
   end
 end
 
-pgbouncer_setup = PgBouncerSetup.new(v, configure_hash["configs"]["max_connections"], configure_hash["pgbouncer_instances"], configure_hash["pgbouncer_user_config"])
+max_connections = configure_hash["user_config"]["max_connections"] || configure_hash["configs"]["max_connections"]
+pgbouncer_setup = PgBouncerSetup.new(v, max_connections, configure_hash["pgbouncer_instances"], configure_hash["pgbouncer_user_config"])
 pgbouncer_setup.setup

@@ -2,11 +2,24 @@
 
 source "https://rubygems.org"
 
-# Update ruby version in Dockerfile and .tool_versions when updating this
+# Updating the Ruby version requires updating the version in the following files:
 #
-# Update BUNDLED WITH version in Gemfile.lock to match bundler version that
-# ships with this Ruby version.
-ruby "4.0.2"
+# * Gemfile (this file)
+# * Dockerfile (2 places)
+# * mise.toml
+#
+# Then update the setup-ruby action hash/tag comment in the following action/workflow files:
+#
+# * .github/actions/setup-clover/action.yml
+# * .github/workflows/csi-build.yml
+# * .github/workflows/kubernetes-csi-ci.yml
+# * .github/workflows/rhizome.yml
+#
+# Then update BUNDLED WITH version in Gemfile.lock to match bundler version that
+# ships with the new Ruby version.
+#
+# Then run `mise install`, `mise lock`, and `bundle install`.
+ruby "4.0.7"
 
 gem "acme-client"
 gem "argon2"
@@ -15,8 +28,13 @@ gem "autoforme", ">= 1.15"
 gem "aws-sdk-ec2", "~> 1.512"
 gem "aws-sdk-iam"
 gem "aws-sdk-s3"
+gem "cgi" # google-cloud-storage requires it; cgi is removed from Ruby 4.0 stdlib
+gem "google-apis-cloudresourcemanager_v3"
+gem "google-apis-iam_v1"
+gem "google-cloud-compute-v1", "~> 3.4"
+gem "google-cloud-storage", "~> 1.58"
 gem "bcrypt_pbkdf"
-gem "committee", ">= 5.5.4"
+gem "committee", ">= 5.6.4"
 gem "countries"
 gem "ed25519"
 gem "erubi", ">= 1.5"
@@ -33,18 +51,19 @@ gem "omniauth-google-oauth2"
 gem "pagerduty", ">= 4.0"
 gem "prawn"
 gem "prawn-table"
+gem "prometheus-client", "~> 4.2"
 gem "pry"
 gem "puma", ">= 6.2.2"
 gem "rack-unreloader", ">= 1.8"
 gem "rake"
 gem "refrigerator", ">= 1"
-gem "roda", github: "jeremyevans/roda", ref: "f40733e1c22b994b2831fcbf7d5f6f52ee19d044"
-gem "rodauth", ">= 2.41"
+gem "roda", ">= 3.108"
+gem "rodauth", ">= 2.48"
 gem "rodauth-omniauth", ">= 0.6.2"
 gem "rodish", ">= 2.0.1"
 gem "rotp"
 gem "rqrcode"
-gem "sequel", ">= 5.103.0"
+gem "sequel", github: "jeremyevans/sequel", ref: "9d5b67466bb3a172176925eb8a18c82a193af643"
 gem "sequel_pg", ">= 1.8", require: "sequel"
 gem "shellwords"
 gem "stripe", ">= 13"
@@ -56,8 +75,16 @@ group :aws_kms do
   gem "aws-sdk-kms"
 end
 
+group :gcp_kms do
+  gem "google-apis-cloudkms_v1"
+end
+
 group :aws_rds_iam do
   gem "pg-aws_rds_iam", github: "haines/pg-aws_rds_iam", ref: "fb91b9232837e350aa9c8440b7340346adae845e"
+end
+
+group :gcp_cloudsql_iam do
+  gem "google-apis-iamcredentials_v1"
 end
 
 group :development do
@@ -78,15 +105,11 @@ group :rubocop do
   gem "standard", ">= 1.24.3"
 end
 
-group :lint do
-  gem "brakeman"
-  gem "erb-formatter", github: "ubicloud/erb-formatter", ref: "df3174476986706828f7baf3e5e6f5ec8ecd849b"
-end
-
 group :test do
   gem "capybara"
   gem "capybara-validate_html5", ">= 2.1"
   gem "pdf-reader"
+  gem "perfect_toml", "0.9.0"
   gem "rspec"
   gem "simplecov"
   gem "turbo_tests"

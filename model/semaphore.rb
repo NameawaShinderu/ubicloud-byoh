@@ -5,7 +5,15 @@ require_relative "../model"
 class Semaphore < Sequel::Model
   plugin ResourceMethods
 
-  def self.incr(id, name)
+  dataset_module do
+    private
+
+    def check_delete_callstack!
+      nil
+    end
+  end
+
+  def self.incr(id, name, wake: true)
     case name
     when Symbol
       name = name.to_s
@@ -15,13 +23,17 @@ class Semaphore < Sequel::Model
       raise "invalid name given to Semaphore.incr: #{name.inspect}"
     end
 
-    with(:updated_strand,
-      Strand
-        .where(id:)
-        .returning(:id)
-        .with_sql(:update_sql, schedule: Sequel::CURRENT_TIMESTAMP))
-      .insert([:id, :strand_id, :name],
-        DB[:updated_strand].select(Sequel[:gen_timestamp_ubid_uuid].function(820), :id, name))
+    values_ds = Strand.where(id:)
+    insert_ds = self
+    if wake
+      insert_ds = with(:updated_strand,
+        values_ds
+          .returning(:id)
+          .with_sql(:update_sql, schedule: Strand::SCHEDULE_NO_LATER_THAN_NOW))
+      values_ds = DB[:updated_strand]
+    end
+    insert_ds.insert([:id, :strand_id, :name],
+      values_ds.select(Sequel[:gen_timestamp_ubid_uuid].function(820), :id, name))
   end
 
   def self.set_at(id)
@@ -36,6 +48,13 @@ class Semaphore < Sequel::Model
     hash = super
     hash[:set_at] = set_at.strftime("%F %T")
     hash
+  end
+
+  private
+
+  # Do not create deleted records of semaphores
+  def create_deleted_record
+    nil
   end
 end
 

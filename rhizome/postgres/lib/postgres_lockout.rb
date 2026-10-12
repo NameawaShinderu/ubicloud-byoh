@@ -23,20 +23,22 @@ class PostgresLockout
 local   all             postgres                                peer map=system2postgres
 
 # Allow connections from localhost with ubi_monitoring OS user as
-# ubi_monitoring database user. This will be used by postgres_exporter
-# to scrape metrics and expose them to prometheus.
-local   all             ubi_monitoring                          peer
+# ubi_monitoring database user. Mirrors the system2monitoring map
+# from rhizome/postgres/bin/configure; pg_ident is not rewritten
+# during lockout, so the map still resolves.
+local   all             ubi_monitoring                          peer map=system2monitoring
 
 # Allow replication connection using special replication user for
 # HA standbys (SSL connections from ubi_replication user only)
 hostssl replication     ubi_replication all                     cert map=standby2replication
+hostssl postgres        ubi_replication all                     cert map=standby2replication
     PG_HBA
   end
 
   def write_lockout_pg_hba
     safe_write_to_file("/etc/postgresql/#{@version}/main/pg_hba.conf", PostgresLockout.lockout_pg_hba)
     @logger.info("Written lockout pg_hba.conf for PostgreSQL #{@version}")
-    r "sudo pg_ctlcluster #{@version} main reload"
+    r "sudo", "pg_ctlcluster", @version.to_s, "main", "reload"
     @logger.info("Reloaded PostgreSQL #{@version} configuration to apply lockout pg_hba.conf")
   end
 

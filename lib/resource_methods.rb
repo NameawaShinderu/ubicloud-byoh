@@ -1,7 +1,16 @@
 # frozen_string_literal: true
 
 module ResourceMethods
-  def self.configure(model, etc_type: false, redacted_columns: nil, encrypted_columns: nil, referencing: nil)
+  # Serialization format for encrypted columns that hold text.  Sequel's
+  # column_encryption plugin returns decrypted data with BINARY encoding, and a
+  # BINARY string with non-ASCII characters cannot be concatenated with the UTF-8
+  # strings that template rendering and JSON generation use.
+  UTF8_FORMAT = [
+    :itself.to_proc,
+    ->(data) { data.force_encoding(Encoding::UTF_8) },
+  ].freeze
+
+  def self.configure(model, etc_type: false, redacted_columns: nil, encrypted_columns: nil, referencing: nil, define_project_id_match: true)
     model.instance_exec do
       @ubid_type = if referencing
         include NoSetUuid
@@ -22,17 +31,39 @@ module ResourceMethods
         UBID.const_get(:"TYPE_#{lookup_name}")
       end
 
+      if define_project_id_match
+        include(columns.include?(:project_id) ? ProjectIdMatch : NoProjectIdMatch)
+      end
+
       @ubid_format = /\A#{ubid_type}[a-tv-z0-9]{24}\z/
-      @encrypted_columns = Array(encrypted_columns).freeze
+      encrypted_columns_with_opts = case encrypted_columns
+      when nil then {}
+      when Hash then encrypted_columns
+      when Array then encrypted_columns.each_with_object({}) { |col, h| h[col] = {} }
+      else {encrypted_columns => {}}
+      end
+      @encrypted_columns = encrypted_columns_with_opts.keys.freeze
       @redacted_columns = (Array(redacted_columns) + @encrypted_columns).freeze
 
       unless @encrypted_columns.empty?
         plugin :column_encryption do |enc|
-          @encrypted_columns.each do |col|
-            enc.column col
+          encrypted_columns_with_opts.each do |col, opts|
+            enc.column col, **opts
           end
         end
       end
+    end
+  end
+
+  module ProjectIdMatch
+    def project_id_match?(project_id)
+      self.project_id == project_id
+    end
+  end
+
+  module NoProjectIdMatch
+    def project_id_match?(_)
+      false
     end
   end
 
@@ -96,7 +127,7 @@ module ResourceMethods
         next if k == :id
 
         inspect_values[k] = if v
-          if (converter = INSPECT_CONVERTERS[sch[k][:db_type]])
+          if (converter = INSPECT_CONVERTERS[sch.dig(k, :db_type)])
             converter.call(v)
           else
             v
@@ -113,20 +144,23 @@ module ResourceMethods
       inspect_values_hash.inspect
     end
 
-    NON_ARCHIVED_MODELS = ["ArchivedRecord", "Semaphore"].freeze
     def before_destroy
+      create_deleted_record
+      super
+    end
+
+    private
+
+    def create_deleted_record
       model_name = self.class.name
-      unless NON_ARCHIVED_MODELS.include?(model_name)
-        model_values = values.merge(model_name:)
+      model_values = values.dup
+      model_values[:model_name] = model_name
 
-        self.class.encrypted_columns.each do |key|
-          model_values.delete(key)
-        end
-
-        ArchivedRecord.create(model_name:, model_values:)
+      self.class.encrypted_columns.each do |key|
+        model_values.delete(key)
       end
 
-      super
+      DeletedRecord.create(model_name:, record_id: values[:id], model_values:)
     end
   end
 

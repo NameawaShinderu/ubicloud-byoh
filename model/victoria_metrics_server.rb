@@ -48,7 +48,7 @@ class VictoriaMetricsServer < Sequel::Model
     end
     pulse = aggregate_readings(previous_pulse:, reading:)
 
-    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !reload.checkup_set?
+    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !checkup_set?(cached: false)
       incr_checkup
     end
 
@@ -59,11 +59,12 @@ class VictoriaMetricsServer < Sequel::Model
     true
   end
 
-  def client(socket: nil)
+  def client(socket: nil, endpoint: self.endpoint, verify_host: nil)
     VictoriaMetrics::Client.new(
       endpoint:,
       ssl_ca_data: resource.root_certs,
       socket:,
+      verify_host:,
       username: resource.admin_user,
       password: resource.admin_password,
     )
@@ -79,8 +80,10 @@ end
 #  certificate_last_checked_at  | timestamp with time zone | NOT NULL DEFAULT now()
 #  victoria_metrics_resource_id | uuid                     | NOT NULL
 #  vm_id                        | uuid                     | NOT NULL
+#  is_representative            | boolean                  | NOT NULL DEFAULT false
 # Indexes:
-#  victoria_metrics_server_pkey | PRIMARY KEY btree (id)
+#  victoria_metrics_server_pkey                              | PRIMARY KEY btree (id)
+#  victoria_metrics_server_resource_id_is_representative_idx | UNIQUE btree (victoria_metrics_resource_id) WHERE is_representative IS TRUE
 # Foreign key constraints:
 #  victoria_metrics_server_victoria_metrics_resource_id_fkey | (victoria_metrics_resource_id) REFERENCES victoria_metrics_resource(id)
 #  victoria_metrics_server_vm_id_fkey                        | (vm_id) REFERENCES vm(id)

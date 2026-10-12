@@ -9,9 +9,9 @@ rescue LoadError
   nil
 end
 
-# :nocov:
+# simplecov:disable
 $stdout.sync = $stderr.sync = true if ENV["SYNC"] == "1"
-# :nocov:
+# simplecov:enable
 
 # Adapted from
 # https://github.com/interagent/pliny/blob/fcc8f3b103ec5296bd754898fdefeb2fda2ab292/lib/template/config/config.rb.
@@ -56,8 +56,12 @@ module Config
   override :clover_admin_links_to_clover, false, bool
   optional :clover_runtime_token_secret, base64, clear: true
   optional :kms_decrypt_clover_column_encryption_key_with_arn, string
+  optional :kms_decrypt_clover_column_encryption_key_with_gcp_kms_key, string
   optional :heartbeat_url, string
   optional :clover_database_root_certs, string
+  override :clover_database_gcp_iam_auth_enabled, false, bool
+  optional :clover_database_gcp_clover_login_sa, string
+  optional :clover_database_gcp_clover_password_login_sa, string
   override :max_health_monitor_threads, 32, int
   override :max_metrics_export_threads, 32, int
   optional :omniauth_github_id, string, clear: true
@@ -71,10 +75,10 @@ module Config
   override :clover_freeze, false, bool
   optional :override_dir, string
 
-  # :nocov:
+  # simplecov:disable
   override :mail_driver, (production? ? :smtp : :logger), symbol
   override :mail_from, (production? ? nil : "dev@example.com"), string
-  # :nocov:
+  # simplecov:enable
   # Some email services use a secret token for both user and password,
   # so clear them both.
   optional :smtp_user, string, clear: true
@@ -93,27 +97,38 @@ module Config
   override :db_pool_web, Config.db_pool, int
   override :db_pool_respirate, Config.db_pool, int
   override :db_pool_monitor, Config.db_pool, int
+  override :validate_migration_dates, true, bool
   override :dispatcher_max_threads, 8, int
   override :dispatcher_min_threads, 1, int
   override :dispatcher_queue_size_ratio, 4, float
   override :recursive_tag_limit, 32, int
   override :root, File.expand_path(__dir__), string
   override :aws_role_session_name, "ubi", string
-  override :provider_resource_tag_value, "true", string
+  # simplecov:disable
+  override :provider_resource_tag_value, (development? ? ENV.fetch("USER", "true") : "true"), string
+  # simplecov:enable
   override :clover_database_rds_iam_auth_enabled, false, bool
   optional :hetzner_user, string, clear: true
   optional :hetzner_password, string, clear: true
   override :hetzner_connection_string, "https://robot-ws.your-server.de", string
+  optional :leaseweb_api_key, string, clear: true
+  optional :leaseweb_eu_api_key, string, clear: true
+  override :leaseweb_connection_string, "https://api.leaseweb.com", string
   override :managed_service, false, bool
   override :sanctioned_countries, "CU,IR,KP,SY", array(string)
   override :hetzner_ssh_public_key, nil, string
   override :minimum_invoice_charge_threshold, 0.5, float
   optional :cloudflare_turnstile_site_key, string
   optional :cloudflare_turnstile_secret_key, string
+  optional :e2e_cloudflare_api_token, string, clear: true
+  optional :e2e_cloudflare_parent_zone_name, string
   override :allow_unspread_servers, !production?, bool
   override :control_plane_outbound_cidrs, "0.0.0.0/0,::/0", array(string)
+  override :pg_network_metering_enabled, false, bool
   optional :git_commit_hash, string
   optional :ip_from_header, string
+  optional :ubid_routing_stamp, match?(/\A[0-9a-hj-km-np-tv-z]{2}\z/)
+  optional :ipv4_subnet_collision_check_disabled, bool
 
   # GitHub Runner App
   optional :github_app_name, string
@@ -130,6 +145,7 @@ module Config
   optional :github_runner_aws_spot_instance_max_price_per_vcpu, float
   override :github_runner_aws_spill_threshold_seconds, 30, int
   override :github_runner_aws_spill_vcpu_capacity, 100, int
+  override :github_runner_aws_spill_runner_capacity, 50, int
 
   # GitHub Cache
   optional :github_cache_blob_storage_endpoint, string
@@ -145,20 +161,35 @@ module Config
   optional :minio_service_project_id, uuid
   override :minio_version, "minio_20250723155402.0.0_amd64", string
 
+  # Parseable
+  optional :parseable_service_project_id, uuid
+  override :parseable_host_name, "logs.ubicloud.com", string
+  override :parseable_version, "v2.6.5", string
+  optional :parseable_endpoint_override, string
+
   # VictoriaMetrics
   optional :victoria_metrics_service_project_id, uuid
   override :victoria_metrics_host_name, "metrics.ubicloud.com", string
-  override :victoria_metrics_version, "v1.113.0", string
+  override :victoria_metrics_version, "v1.149.0", string
   optional :victoria_metrics_endpoint_override, string
+  override :api_metrics_report_enabled, false, bool
+  override :api_metrics_store_dir, File.join(Dir.pwd, "var", "api_metrics"), string
 
   # Spdk
   override :spdk_version, "v23.09-ubi-0.3", string
 
   # Vhost Block Backend
-  override :vhost_block_backend_version, "v0.2.2", string
+  override :vhost_block_backend_version, "v0.4.2", string
+
+  # Rotate a storage volume's key-encryption key once it reaches this age.
+  override :storage_kek_rotation_interval_days, 700, int
 
   # Boot Images
-  override :default_boot_image_name, "ubuntu-jammy", string
+  override :default_boot_image_name, "ubuntu-noble", string
+
+  # Machine Images
+  override :machine_image_max_size_gib, 40, int
+  optional :machine_images_service_project_id, uuid
 
   # Pagerduty
   optional :pagerduty_key, string, clear: true
@@ -170,19 +201,31 @@ module Config
 
   # Postgres
   optional :postgres_service_project_id, uuid
+  override :postgres_boot_disk_size_gib, 16, int
   override :postgres_service_hostname, "postgres.ubicloud.com", string
+  override :postgres_service_hostname_v3, "pg.ubicloud.app", string
+  override :postgres_hostname_version_default, "v3", string
+  override :postgres_default_image_family, "ubuntu-2604", string
   override :postgres_monitor_database_url, Config.clover_database_url, string
   optional :postgres_monitor_database_root_certs, string
-  optional :postgres_paradedb_notification_email, string
-  optional :postgres_lantern_notification_email, string
   optional :postgres_notification_email, string
   override :aws_postgres_iam_access, false, bool
+  override :aws_postgres_blob_storage_iam_sweep, true, bool
+  override :gcp_postgres_iam_access, false, bool
+  override :postgres_internal_firewall_cidrs, "", array(string)
 
   # Logging
   optional :database_logger_level, string
   optional :ingest_key, string, clear: true
   optional :otel_exporter_otlp_endpoint, string
-  override :pry_logger_truncate_limit, 500, int
+
+  # Pry audit archive (S3 Object Lock, Compliance mode)
+  optional :pry_audit_bucket, string
+  optional :pry_audit_region, string
+  optional :pry_audit_endpoint, string
+  optional :pry_audit_access_key, string, clear: true
+  optional :pry_audit_secret_key, string, clear: true
+  override :pry_audit_retention_years, 6, int
 
   # Ubicloud Images (Minio)
   override :ubicloud_images_bucket_name, "ubicloud-images", string
@@ -191,21 +234,35 @@ module Config
   optional :ubicloud_images_blob_storage_secret_key, string, clear: true
   optional :ubicloud_images_blob_storage_certs, string
 
+  # Deleted record archival
+  optional :deleted_record_archive_endpoint, string
+  optional :deleted_record_archive_bucket, string
+  optional :deleted_record_archive_access_key, string, clear: true
+  optional :deleted_record_archive_secret_key, string, clear: true
+  override :deleted_record_archive_window_seconds, 60 * 60, int
+
   # Ubicloud Images (R2)
   optional :ubicloud_images_r2_bucket_name, string
   optional :ubicloud_images_r2_endpoint, string
   optional :ubicloud_images_r2_access_key, string, clear: true
   optional :ubicloud_images_r2_secret_key, string, clear: true
 
-  override :github_ubuntu_2204_x64_aws_ami_version, "ami-08855bdd06e27855c", string
-  override :github_ubuntu_2404_x64_aws_ami_version, "ami-086d34c41ddb969fa", string
-  override :github_ubuntu_2204_arm64_aws_ami_version, "ami-08781e52ef55da0ae", string
-  override :github_ubuntu_2404_arm64_aws_ami_version, "ami-0d90f4c3402fceb4b", string
+  override :github_ubuntu_2204_x64_aws_ami_version, "ami-0f1fbe99fe0b007bd", string
+  override :github_ubuntu_2404_x64_aws_ami_version, "ami-038c8beee8816e610", string
+  override :github_ubuntu_2604_x64_aws_ami_version, "ami-0b279d51ff437b9df", string
+  override :github_ubuntu_2204_arm64_aws_ami_version, "ami-0f96a092b8dacaa0b", string
+  override :github_ubuntu_2404_arm64_aws_ami_version, "ami-011a891ee685bf937", string
+  override :github_ubuntu_2604_arm64_aws_ami_version, "ami-06b8362ceda7c4240", string
+  override :postgres_gce_image_gcp_project_id, "ubicloud-images", string
 
   # Allocator
   override :allocator_target_host_utilization, 0.72, float
   override :allocator_target_premium_host_utilization, 0.85, float
   override :allocator_max_random_score, 0.1, float
+  override :allocator_large_storage_device_gib, 4096, int
+  override :allocator_protected_large_storage_location_ids, "caa7a807-36c5-8420-a75c-f906839dad71", array(uuid)
+  # Percentage of GitHub Action VMs to run with CloudHypervisor 53.0, while it is being gradually rolled out
+  override :github_actions_ch_53_percent, 0.0, float
 
   # e2e
   override :e2e_hetzner_server_id, nil, string
@@ -213,11 +270,25 @@ module Config
   override :is_e2e, false, bool
   optional :e2e_aws_access_key, string, clear: true
   optional :e2e_aws_secret_key, string, clear: true
+  optional :e2e_aws_assume_role, string
+  optional :e2e_gcp_credentials_base64_json, string, clear: true
   optional :e2e_cache_proxy_download_url, string
+  optional :e2e_machine_images_endpoint, string
+  optional :e2e_machine_images_bucket, string
+  optional :e2e_machine_images_access_key, string, clear: true
+  optional :e2e_machine_images_secret_key, string, clear: true
+
+  # Local e2e
+  optional :local_e2e_postgres_test_project_id, uuid
+
+  # Rollouts
+  optional :rollouts_project_id, uuid
 
   # Load Balancer
   optional :load_balancer_service_project_id, uuid
   optional :load_balancer_service_hostname, string
+  override :load_balancer_service_hostname_v2, Config.load_balancer_service_hostname, string
+  override :load_balancer_hostname_version_default, 2, int
 
   # ACME
   # The following are optional because they are only needed in production.
@@ -241,6 +312,8 @@ module Config
   # Kubernetes
   optional :kubernetes_service_project_id, uuid
   optional :kubernetes_service_hostname, string
+  override :kubernetes_service_hostname_v2, Config.kubernetes_service_hostname, string
+  override :kubernetes_hostname_version_default, 2, int
 
   # Billing
   optional :stripe_secret_key, string, clear: true

@@ -1,77 +1,42 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/util"
-
-class Prog::Test::Kubernetes < Prog::Test::Base
+class Prog::Test::Kubernetes < Prog::Test::KubernetesBase
   MIGRATION_TRIES = 1
+  frame_accessor :normal_pod_restart_test_node,
+    :rsync_retry_source_node, :chained_migration_source_node, :drain_test_node_name, :reboot_node_id,
+    :nat_rules_before_reboot, :pod_access_rules_before_reboot, :migration_number,
+    :cert_expire_at_before_renew, :node_dns_deadline
 
   def self.assemble
-    kubernetes_test_project = Project.create(name: "Kubernetes-Test-Project")
-    kubernetes_service_project = Project[Config.kubernetes_service_project_id] ||
-      Project.create_with_id(Config.kubernetes_service_project_id, name: "Ubicloud-Kubernetes-Resources")
-    Strand.create(
-      prog: "Test::Kubernetes",
-      label: "start",
-      stack: [{
-        "kubernetes_service_project_id" => kubernetes_service_project.id,
-        "kubernetes_test_project_id" => kubernetes_test_project.id,
-        "migration_number" => 0,
-      }],
-    )
-  end
-
-  label def start
-    kc = Prog::Kubernetes::KubernetesClusterNexus.assemble(
-      name: "kubernetes-test-standard",
-      project_id: frame["kubernetes_test_project_id"],
-      location_id: Location::HETZNER_FSN1_ID,
-      version: Option.kubernetes_versions.first,
-      cp_node_count: 1,
-    ).subject
-    Prog::Kubernetes::KubernetesNodepoolNexus.assemble(
-      name: "kubernetes-test-standard-nodepool",
-      node_count: 3,
-      kubernetes_cluster_id: kc.id,
-      target_node_size: "standard-2",
-    )
-
-    update_stack({"kubernetes_cluster_id" => kc.id})
-    hop_update_loadbalancer_hostname
-  end
-
-  label def update_loadbalancer_hostname
-    nap 5 unless kubernetes_cluster.api_server_lb
-    kubernetes_cluster.api_server_lb.update(custom_hostname: "k8s-e2e-test.ubicloud.test")
-    hop_update_all_nodes_hosts_entries
-  end
-
-  label def update_all_nodes_hosts_entries
-    expected_node_count = kubernetes_cluster.cp_node_count + nodepool.node_count
-    current_nodes = kubernetes_cluster.nodes + nodepool.nodes
-    current_node_count = current_nodes.count
-
-    current_nodes.each { |node|
-      unless node_host_entries_set?(node.name)
-        nap 5 unless vm_ready?(node.vm)
-        ensure_hosts_entry(node.sshable, kubernetes_cluster.api_server_lb.hostname)
-        set_node_entries_status(node.name)
-      end
-    }
-
-    hop_wait_for_kubernetes_bootstrap if current_node_count == expected_node_count
-    nap 10
+    st = super(cluster_name: "kubernetes-test-standard", worker_node_count: 3)
+    st.update(stack: [st.stack.first.merge("migration_number" => 0)])
+    st
   end
 
   label def wait_for_kubernetes_bootstrap
-    hop_test_nodes if kubernetes_cluster.strand.label == "wait"
+    hop_trigger_renew_certs if cluster_bootstrapped?
     nap 10
+  end
+
+  label def trigger_renew_certs
+    cp_node = kubernetes_cluster.nodes.first
+    self.cert_expire_at_before_renew = cp_node.cert_expire_at.to_s
+    cp_node.incr_renew_certs
+    hop_wait_for_renew_certs
+  end
+
+  label def wait_for_renew_certs
+    cp_node = kubernetes_cluster.nodes.first
+    nap 10 unless cp_node.strand.label == "wait" && cp_node.state == "active" && !cp_node.renew_certs_set?
+    nap 10 unless cp_node.cert_expire_at > Time.new(cert_expire_at_before_renew)
+    hop_test_nodes
   end
 
   label def test_nodes
     begin
       nodes_output = kubernetes_cluster.client.kubectl("get nodes")
     rescue RuntimeError => ex
-      update_stack({"fail_message" => "Failed to run test kubectl command: #{ex.message}"})
+      self.fail_message = "Failed to run test kubectl command: #{ex.message}"
       hop_destroy_kubernetes
     end
     missing_nodes = []
@@ -79,49 +44,57 @@ class Prog::Test::Kubernetes < Prog::Test::Base
       missing_nodes.append(node.name) unless nodes_output.include?(node.name)
     }
     if missing_nodes.any?
-      update_stack({"fail_message" => "node #{missing_nodes.join(", ")} not found in cluster"})
+      self.fail_message = "node #{missing_nodes.join(", ")} not found in cluster"
+      hop_destroy_kubernetes
+    end
+    hop_test_nodepool_label
+  end
+
+  label def test_nodepool_label
+    nodepool_ubid = nodepool.ubid
+    labeled_nodes = kubernetes_cluster.client.kubectl("get nodes -l ubicloud.com/nodepool=:nodepool_ubid -o name", nodepool_ubid:).split.map! { it.delete_prefix("node/") }.sort!
+    expected_nodes = nodepool.nodes.map(&:name).sort!
+    if labeled_nodes != expected_nodes
+      self.fail_message = "nodes labeled with nodepool #{nodepool_ubid} are #{labeled_nodes.join(", ")}, expected #{expected_nodes.join(", ")}"
       hop_destroy_kubernetes
     end
     hop_test_csi
   end
 
   label def test_csi
-    sts = <<STS
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: ubuntu-statefulset
-spec:
-  serviceName: ubuntu
-  replicas: 1
-  selector:
-    matchLabels: { app: ubuntu }
-  template:
-    metadata:
-      labels: { app: ubuntu }
-    spec:
-      containers:
-      - name: ubuntu
-        image: ubuntu:24.04
-        command: ["/bin/sh", "-c", "sleep infinity"]
-        volumeMounts:
-        - { name: data-volume, mountPath: /etc/data }
-  volumeClaimTemplates:
-  - metadata:
-      name: data-volume
-    spec:
-      accessModes: [ "ReadWriteOnce" ]
-      resources:
-        requests: { storage: 5Gi }
-      storageClassName: ubicloud-standard
-STS
-    kubernetes_cluster.sshable.cmd("sudo kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f -", stdin: sts)
+    apply_statefulset
     hop_wait_for_statefulset
   end
 
   label def wait_for_statefulset
     pod_status = kubernetes_cluster.client.kubectl("get pods ubuntu-statefulset-0 -ojsonpath={.status.phase}").strip
     nap 5 unless pod_status == "Running"
+    self.node_dns_deadline = Time.now.to_i + 3 * 60
+    hop_test_node_dns
+  end
+
+  label def test_node_dns
+    client = kubernetes_cluster.client
+    kubernetes_cluster.all_nodes(eager: {vm: :nics}).each do |node|
+      {"ahostsv4" => node.vm.private_ipv4_string, "ahostsv6" => node.vm.private_ipv6_string}.each do |database, expected_ip|
+        command = NetSsh.command("getent :database :name | awk '{print $1; exit}'", database:, name: node.name)
+        resolved_ip = client.kubectl("exec -t ubuntu-statefulset-0 -- sh -c :command", command:).strip
+        if resolved_ip != expected_ip
+          remaining = node_dns_deadline - Time.now.to_i
+          nap remaining if remaining > 0
+          self.fail_message = "#{node.name} resolved to #{resolved_ip.inspect} from a pod, expected #{expected_ip}"
+          hop_destroy_kubernetes
+        end
+
+        connect = NetSsh.command("exec 3<>/dev/tcp/:ip/10250", ip: expected_ip)
+        begin
+          client.kubectl("exec -t ubuntu-statefulset-0 -- timeout 5 bash -c :connect", connect:)
+        rescue RuntimeError
+          self.fail_message = "#{node.name} (#{expected_ip}) is not reachable on port 10250 from a pod"
+          hop_destroy_kubernetes
+        end
+      end
+    end
     hop_test_lsblk
   end
 
@@ -129,21 +102,14 @@ STS
     begin
       verify_mount
     rescue => e
-      update_stack({"fail_message" => e.message})
+      self.fail_message = e.message
       hop_destroy_kubernetes
     end
     hop_test_data_write
   end
 
   label def test_data_write
-    (1..3).each do |i|
-      unit_name = "csi_data_write_#{i}"
-      kubernetes_cluster.sshable.d_run(
-        unit_name,
-        "bash", "-c",
-        "sudo kubectl --kubeconfig /etc/kubernetes/admin.conf exec -t ubuntu-statefulset-0 -- sh -c \"head -c 500M /dev/urandom | tee /etc/data/random-data-#{i} | sha256sum | awk '{print \\$1}'\" > /dev/shm/#{unit_name}.hash",
-      )
-    end
+    write_data_files
     hop_wait_data_write
   end
 
@@ -154,7 +120,7 @@ STS
       when "InProgress"
         nap 30
       when "Failed"
-        update_stack({"fail_message" => "daemonized write for random-data-#{i} failed"})
+        self.fail_message = "daemonized write for random-data-#{i} failed"
         hop_destroy_kubernetes
       end
     end
@@ -172,12 +138,12 @@ STS
       read_hash = kubernetes_cluster.client.kubectl("exec -t ubuntu-statefulset-0 -- sh -c :command", command:).strip
       kubernetes_cluster.sshable.d_clean(unit_name)
       if write_hash != read_hash
-        update_stack({"fail_message" => "wrong read hash for #{file}, expected: #{write_hash}, got: #{read_hash}"})
+        self.fail_message = "wrong read hash for #{file}, expected: #{write_hash}, got: #{read_hash}"
         hop_destroy_kubernetes
       end
       read_hashes[file] = read_hash
     end
-    update_stack({"read_hashes" => read_hashes})
+    self.read_hashes = read_hashes
     hop_test_pod_data_migration
   end
 
@@ -197,14 +163,14 @@ STS
     nap 5 unless pod_status == "Running"
     verify_data_hashes("migration")
     hop_test_normal_pod_restart if migration_number == MIGRATION_TRIES
-    increment_migration_number
+    self.migration_number += 1
     hop_test_pod_data_migration
   end
 
   label def test_normal_pod_restart
     client = kubernetes_cluster.client
     pod_node = client.kubectl("get pods ubuntu-statefulset-0 -ojsonpath={.spec.nodeName}").strip
-    update_stack({"normal_pod_restart_test_node" => pod_node})
+    self.normal_pod_restart_test_node = pod_node
     client.kubectl("delete pod ubuntu-statefulset-0 --wait=false")
     hop_verify_normal_pod_restart
   end
@@ -212,16 +178,16 @@ STS
   label def verify_normal_pod_restart
     nap 5 unless pod_status == "Running"
     pod_node = kubernetes_cluster.client.kubectl("get pods ubuntu-statefulset-0 -ojsonpath={.spec.nodeName}").strip
-    expected_pod_node = strand.stack.first["normal_pod_restart_test_node"]
+    expected_pod_node = normal_pod_restart_test_node
     if pod_node != expected_pod_node
-      update_stack({"fail_message" => "unexpected pod node change after restart, expected: #{expected_pod_node}, got: #{pod_node}"})
+      self.fail_message = "unexpected pod node change after restart, expected: #{expected_pod_node}, got: #{pod_node}"
       hop_destroy_kubernetes
     end
 
     begin
       verify_mount
     rescue => e
-      update_stack({"fail_message" => e.message})
+      self.fail_message = e.message
       hop_destroy_kubernetes
     end
     hop_test_rsync_retry
@@ -233,7 +199,7 @@ STS
     pod_node_name = client.kubectl("get pods ubuntu-statefulset-0 -ojsonpath={.spec.nodeName}").strip
     client.kubectl("cordon :pod_node_name", pod_node_name:)
     client.kubectl("delete pod ubuntu-statefulset-0 --wait=false")
-    update_stack({"rsync_retry_source_node" => pod_node_name})
+    self.rsync_retry_source_node = pod_node_name
     hop_kill_rsync_process
   end
 
@@ -258,7 +224,7 @@ STS
     pod_node_name = client.kubectl("get pods ubuntu-statefulset-0 -ojsonpath={.spec.nodeName}").strip
     client.kubectl("cordon :pod_node_name", pod_node_name:)
     client.kubectl("delete pod ubuntu-statefulset-0 --wait=false")
-    update_stack({"chained_migration_source_node" => pod_node_name})
+    self.chained_migration_source_node = pod_node_name
     hop_cordon_chained_target
   end
 
@@ -287,7 +253,7 @@ STS
     }
 
     pod_node_name = client.kubectl("get pods ubuntu-statefulset-0 -ojsonpath={.spec.nodeName}").strip
-    update_stack({"drain_test_node_name" => pod_node_name})
+    self.drain_test_node_name = pod_node_name
 
     pod_node = nodepool.nodes.find { it.name == pod_node_name }
     pod_node.incr_retire
@@ -296,7 +262,7 @@ STS
   end
 
   label def verify_node_not_deleted_during_copy
-    drain_node_name = strand.stack.first["drain_test_node_name"]
+    drain_node_name = drain_test_node_name
     drain_node = kubernetes_cluster.all_nodes.detect { it.name == drain_node_name }
 
     # Node record destroyed means the nexus completed the full retire flow
@@ -306,7 +272,7 @@ STS
       begin
         kubernetes_cluster.client.kubectl("get node :drain_node_name", drain_node_name:)
       rescue => e
-        update_stack({"fail_message" => "Node #{drain_node_name} was removed while CSI data copy was still in progress: #{e.message}"})
+        self.fail_message = "Node #{drain_node_name} was removed while CSI data copy was still in progress: #{e.message}"
         hop_destroy_kubernetes
       end
     end
@@ -322,13 +288,13 @@ STS
 
   label def test_reboot_nftables
     node = nodepool.nodes.first
-    nat_rules = node.vm.sshable.cmd("sudo nft list chain ip nat postrouting")
-    pod_access_rules = node.vm.sshable.cmd("sudo nft list chain ip6 pod_access ingress_egress_control")
-    update_stack({
-      "reboot_node_id" => node.id,
-      "nat_rules_before_reboot" => nat_rules,
-      "pod_access_rules_before_reboot" => pod_access_rules,
-    })
+    nat_rules = node.vm.sshable.cmd("sudo nft --stateless list chain ip nat postrouting")
+    pod_access_rules = node.vm.sshable.cmd("sudo nft --stateless list chain ip6 pod_access ingress_egress_control")
+
+    self.reboot_node_id = node.id
+    self.nat_rules_before_reboot = nat_rules
+    self.pod_access_rules_before_reboot = pod_access_rules
+
     begin
       node.vm.sshable.cmd("sudo systemctl reboot")
     rescue
@@ -339,44 +305,18 @@ STS
   end
 
   label def verify_reboot_nftables
-    reboot_node = nodepool.nodes.find { |n| n.id == frame["reboot_node_id"] }
+    reboot_node = nodepool.nodes.find { |n| n.id == reboot_node_id }
     nap 5 unless vm_ready?(reboot_node.vm)
-    nat_rules = reboot_node.vm.sshable.cmd("sudo nft list chain ip nat postrouting")
-    pod_access_rules = reboot_node.vm.sshable.cmd("sudo nft list chain ip6 pod_access ingress_egress_control")
-    if nat_rules != frame["nat_rules_before_reboot"]
-      update_stack({"fail_message" => "ip nat rules changed after reboot"})
+    nat_rules = reboot_node.vm.sshable.cmd("sudo nft --stateless list chain ip nat postrouting")
+    pod_access_rules = reboot_node.vm.sshable.cmd("sudo nft --stateless list chain ip6 pod_access ingress_egress_control")
+    if nat_rules != nat_rules_before_reboot
+      self.fail_message = "ip nat rules changed after reboot"
       hop_destroy_kubernetes
     end
-    if pod_access_rules != frame["pod_access_rules_before_reboot"]
-      update_stack({"fail_message" => "ip6 pod_access rules changed after reboot"})
+    if pod_access_rules != pod_access_rules_before_reboot
+      self.fail_message = "ip6 pod_access rules changed after reboot"
     end
     hop_destroy_kubernetes
-  end
-
-  label def destroy_kubernetes
-    kubernetes_cluster.incr_destroy
-    hop_finish
-  end
-
-  label def finish
-    nap 5 if kubernetes_cluster
-    kubernetes_test_project.destroy
-
-    fail_test(frame["fail_message"]) if frame["fail_message"]
-
-    pop "Kubernetes tests are finished!"
-  end
-
-  label def failed
-    nap 15
-  end
-
-  def ensure_hosts_entry(sshable, api_hostname)
-    host_line = "#{kubernetes_cluster.sshable.host} #{api_hostname}"
-    output = sshable.cmd("cat /etc/hosts")
-    unless output.include?(host_line)
-      sshable.cmd("echo :host_line | sudo tee -a /etc/hosts > /dev/null", host_line:)
-    end
   end
 
   def vm_ready?(vm)
@@ -386,86 +326,5 @@ STS
     true
   rescue
     false
-  end
-
-  def kubernetes_test_project
-    @kubernetes_test_project ||= Project.with_pk(frame["kubernetes_test_project_id"])
-  end
-
-  def kubernetes_cluster
-    @kubernetes_cluster ||= KubernetesCluster.with_pk(frame["kubernetes_cluster_id"])
-  end
-
-  def nodepool
-    kubernetes_cluster.nodepools.first
-  end
-
-  def node_host_entries_set?(node_name)
-    strand.stack.first.dig("nodes_status", node_name) == true
-  end
-
-  def set_node_entries_status(node_name)
-    frame = strand.stack.first
-    frame["nodes_status"] ||= {}
-    frame["nodes_status"][node_name] = true
-    update_stack(frame)
-  end
-
-  def migration_number
-    strand.stack.first["migration_number"]
-  end
-
-  def increment_migration_number
-    update_stack({"migration_number" => migration_number + 1})
-  end
-
-  def verify_mount
-    lsblk_output = kubernetes_cluster.client.kubectl("exec -t ubuntu-statefulset-0 -- lsblk")
-    lines = lsblk_output.split("\n")[1..]
-    data_mount = lines.find { |line| line.include?("/etc/data") }
-    if data_mount
-      cols = data_mount.split
-      device_name = cols[0]  # e.g. "loop3"
-      size = cols[3]         # e.g. "1G"
-      mountpoint = cols[6]   # e.g. "/etc/data"
-
-      if device_name.start_with?("loop") && size == "5G" && mountpoint == "/etc/data"
-        # no op
-      else
-        raise "/etc/data is mounted incorrectly: #{data_mount}"
-      end
-    else
-      raise "No /etc/data mount found in lsblk output"
-    end
-  end
-
-  # we are not using jsonpath for extracting the status because even though a pod is termination, its phase
-  # from API Server's point of view is Running, in order to detect that using jsonpath, we needed to check for
-  # deletion timestamp, all conditions in status and .status.phase.
-  # to keep the query simple, we let the kubectl do the processing and observe the system from the eyes of a
-  # customer. This also keeps the logic simpler
-  def pod_status
-    status = kubernetes_cluster.client.kubectl("get pods ubuntu-statefulset-0 | grep -v NAME | awk '{print $3}'").strip
-    if status != "Running"
-      client = kubernetes_cluster.client
-      Clog.emit("pod not running", {
-        pod_status: status,
-        events: begin; client.kubectl("get events --field-selector involvedObject.name=ubuntu-statefulset-0 --sort-by=.lastTimestamp"); rescue => e; e.message; end,
-        pv_pvc: begin; client.kubectl("get pv,pvc"); rescue => e; e.message; end,
-      })
-    end
-    status
-  end
-
-  def verify_data_hashes(context)
-    expected_hashes = strand.stack.first["read_hashes"]
-    expected_hashes.each do |file, expected_hash|
-      command = NetSsh.command("sha256sum /etc/data/:file | awk '{print $1}'", file:)
-      new_hash = kubernetes_cluster.client.kubectl("exec -t ubuntu-statefulset-0 -- sh -c :command", command:).strip
-      if new_hash != expected_hash
-        update_stack({"fail_message" => "data hash changed after #{context} for #{file}, expected: #{expected_hash}, got: #{new_hash}"})
-        hop_destroy_kubernetes
-      end
-    end
   end
 end

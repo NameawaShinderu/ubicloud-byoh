@@ -5,23 +5,6 @@ require_relative "spec_helper"
 RSpec.describe Vm do
   subject(:vm) { described_class.new(display_state: "creating", created_at: Time.now) }
 
-  describe "#display_size" do
-    it "returns the catalog size name" do
-      vm = described_class.new(family: "standard", arch: "x64", vcpus: 4, cpu_percent_limit: 400, memory_gib: 16)
-      expect(vm.display_size).to eq("standard-4")
-    end
-
-    it "returns the catalog size name when cpu_percent_limit is not set" do
-      vm = described_class.new(family: "burstable", arch: "x64", vcpus: 2, memory_gib: 4)
-      expect(vm.display_size).to eq("burstable-2")
-    end
-
-    it "returns a descriptive name when no catalog size matches" do
-      vm = described_class.new(family: "standard", arch: "x64", vcpus: 3, cpu_percent_limit: 300, memory_gib: 12)
-      expect(vm.display_size).to eq("standard-3c-12g")
-    end
-  end
-
   describe "#display_state" do
     let(:vm) {
       v = create_vm(display_state: "creating")
@@ -92,6 +75,23 @@ RSpec.describe Vm do
 
     it "return same if semaphores not increased" do
       expect(vm.display_state).to eq("creating")
+    end
+  end
+
+  describe "#display_size" do
+    it "returns the catalog size name" do
+      vm = described_class.new(family: "standard", arch: "x64", vcpus: 4, cpu_percent_limit: 400, memory_gib: 16)
+      expect(vm.display_size).to eq("standard-4")
+    end
+
+    it "returns the catalog size name when cpu_percent_limit is not set" do
+      vm = described_class.new(family: "burstable", arch: "x64", vcpus: 2, memory_gib: 4)
+      expect(vm.display_size).to eq("burstable-2")
+    end
+
+    it "returns a descriptive name when no catalog size matches" do
+      vm = described_class.new(family: "standard", arch: "x64", vcpus: 3, cpu_percent_limit: 300, memory_gib: 12)
+      expect(vm.display_size).to eq("standard-3c-12g")
     end
   end
 
@@ -202,7 +202,7 @@ RSpec.describe Vm do
       vm.update_spdk_version("b")
 
       expect(vm.vm_storage_volumes.first.spdk_installation_id).to eq(spdk_installation.id)
-      expect(vm.reload.update_spdk_dependency_set?).to be true
+      expect(vm.update_spdk_dependency_set?(cached: false)).to be true
     end
 
     it "fails if spdk installation not found" do
@@ -241,18 +241,28 @@ RSpec.describe Vm do
       expect(vm.ip6).to be_nil
     end
 
-    it "returns the right private_ipv4 based on the netmask" do
+    it "#provider_dispatcher_group_name returns the provider group name from location" do
+      vm = create_vm(project_id: project.id)
+      expect(vm.provider_dispatcher_group_name).to eq("metal")
+    end
+
+    it "returns the right private_ipv{4,6} based on the netmask" do
       ps = PrivateSubnet.create(name: "test-ps", location_id: Location::HETZNER_FSN1_ID, net6: "fd10::/64", net4: "192.168.12.0/24", project_id: project.id)
       nic = Prog::Vnet::NicNexus.assemble(ps.id, name: "test-nic-1", ipv4_addr: "192.168.12.13").subject
       vm = create_vm(project_id: project.id, name: "vm-ipv4-test-1")
+      expect(vm.private_ipv4).to be_nil
+      expect(vm.private_ipv6).to be_nil
       nic.update(vm_id: vm.id)
+      vm.reload
       expect(vm.private_ipv4.to_s).to eq("192.168.12.13")
+      expect(vm.private_ipv6.to_s).to eq(nic.private_ipv6&.nth(2).to_s)
 
       ps2 = PrivateSubnet.create(name: "test-ps2", location_id: Location::HETZNER_FSN1_ID, net6: "fd11::/64", net4: "10.10.240.0/24", project_id: project.id)
       nic2 = Prog::Vnet::NicNexus.assemble(ps2.id, name: "test-nic-2", ipv4_addr: "10.10.240.1").subject
       vm2 = create_vm(project_id: project.id, name: "vm-ipv4-test-2")
       nic2.update(vm_id: vm2.id)
       expect(vm2.private_ipv4.to_s).to eq("10.10.240.1")
+      expect(vm2.private_ipv6.to_s).to eq(nic2.private_ipv6&.nth(2).to_s)
     end
   end
 
@@ -337,14 +347,14 @@ RSpec.describe Vm do
       expect(session[:ssh_session]).to receive(:_exec!).and_return("active\ninactive\n")
       result = pulse_vm.check_pulse(session:, previous_pulse: pulse)
       expect(result[:reading]).to eq("down")
-      expect(pulse_vm.reload.checkup_set?).to be true
+      expect(pulse_vm.checkup_set?(cached: false)).to be true
     end
 
     it "returns down and increments checkup on SSH error" do
       expect(session[:ssh_session]).to receive(:_exec!).and_raise Sshable::SshError
       result = pulse_vm.check_pulse(session:, previous_pulse: pulse)
       expect(result[:reading]).to eq("down")
-      expect(pulse_vm.reload.checkup_set?).to be true
+      expect(pulse_vm.checkup_set?(cached: false)).to be true
     end
   end
 
@@ -353,6 +363,7 @@ RSpec.describe Vm do
     vmh = create_vm_host(total_cpus: 12, total_cores: 12, total_dies: 1, total_sockets: 1, accepts_slices: true)
     vm = Prog::Vm::Nexus.assemble("a a", project_id).subject
     vm.update(vm_host_id: vmh.id)
+    vm.vm_storage_volumes_dataset.destroy
 
     expect(JSON.parse(vm.params_json)["init_script"]).to eq ""
     VmInitScript.create_with_id(vm, init_script: "c")
@@ -391,7 +402,7 @@ RSpec.describe Vm do
         VmHostCpu.create(
           vm_host_id: vm_host.id,
           cpu_number: cpu,
-          spdk: cpu < vm_host.spdk_cpu_count,
+          io: cpu < vm_host.io_cpu_count,
         )
       end
     end
@@ -426,25 +437,6 @@ RSpec.describe Vm do
       expect(volumes[1]["track_written"]).to be(true)
     end
 
-    it "adds the cpus field to the params json when needed" do
-      vm_host.update(accepts_slices: false)
-      VmStorageVolume.where(vm_id: vm.id).update(spdk_installation_id: nil)
-      vm_host.spdk_installations.first.destroy
-      storage_volumes = vm.storage_volumes
-      expect(storage_volumes[0]["cpus"].count).to eq(1)
-      expect(storage_volumes[1]["cpus"].sort).to eq([0, 1])
-    end
-
-    it "leaves the cpus field unset when the host has no IO cpus" do
-      vm_host.update(accepts_slices: false)
-      VmStorageVolume.where(vm_id: vm.id).update(spdk_installation_id: nil)
-      vm_host.spdk_installations.first.destroy
-      VmHostCpu.where(vm_host_id: vm_host.id).update(spdk: false)
-      storage_volumes = vm.storage_volumes
-      expect(storage_volumes[0]).not_to have_key("cpus")
-      expect(storage_volumes[1]).not_to have_key("cpus")
-    end
-
     it "adds archive_source when volume has machine_image_version_id" do
       project_id = Project.create(name: "test").id
       store = MachineImageStore.create(
@@ -466,8 +458,63 @@ RSpec.describe Vm do
       expect(src).to have_key("encrypted_access_key_id")
       expect(src).to have_key("encrypted_secret_access_key")
       expect(src).to have_key("encrypted_archive_kek")
+      expect(src["autofetch"]).to be(true)
 
       expect(volumes[1]).not_to have_key("archive_source")
+    end
+
+    it "adds remote_source when volume has remote_storage_server_id" do
+      source_vm = create_archive_ready_vm
+      source_volume = VmStorageVolume.first(vm_id: source_vm.id)
+      source_vm.vm_host.sshable.update(host: "10.0.0.9")
+      rss = RemoteStorageServer.create(
+        source_vm_storage_volume_id: source_volume.id,
+        vm_host_id: source_vm.vm_host_id,
+        psk: Base64.strict_encode64("raw-psk-bytes-0123456789abcdef"),
+        psk_identity: "ubiblk-rss", port: 4600,
+      )
+      VmStorageVolume.where(vm_id: vm.id, disk_index: 0).update(remote_storage_server_id: rss.id, boot_image_id: nil)
+      source_disk_size = 40 * 1024 * 1024 * 1024 + 8 * 1024 * 1024
+      source_sshable = vm.vm_storage_volumes.find { |s| s.disk_index == 0 }.remote_storage_server.vm_host.sshable
+      expect(source_sshable).to receive(:_cmd).with("sudo stat -c %s #{File.join(source_volume.path, "disk.raw")}").and_return("#{source_disk_size}\n")
+
+      volumes = vm.storage_volumes
+
+      expect(volumes[0]).to have_key("remote_source")
+      src = volumes[0]["remote_source"]
+      expect(src["address"]).to eq("10.0.0.9:4600")
+      expect(src["psk_identity"]).to eq("ubiblk-rss")
+      expect(src).to have_key("encrypted_psk")
+      expect(src["autofetch"]).to be(true)
+      expect(src["disk_size_bytes"]).to eq(source_disk_size)
+
+      expect(volumes[1]).not_to have_key("remote_source")
+    end
+  end
+
+  describe "storage IO cpu pool" do
+    def pool_vm(on_slice: true)
+      vmh = create_vm_host(accepts_slices: true, total_cpus: 16, total_cores: 8, total_dies: 4, total_sockets: 2)
+      sd = StorageDevice.create(vm_host_id: vmh.id, name: "default", available_storage_gib: 200, total_storage_gib: 200)
+      slice = (VmHostSlice.create(vm_host_id: vmh.id, name: "standard0", family: "standard", cores: 1, total_cpu_percent: 200, used_cpu_percent: 200, total_memory_gib: 8, used_memory_gib: 8) if on_slice)
+      vm = create_vm(vm_host_id: vmh.id, vm_host_slice_id: slice&.id)
+      # cpus 0-1 are idle IO-reserved cpus; 2-3 belong to the VM's slice
+      4.times do |cpu_number|
+        io = cpu_number < 2
+        VmHostCpu.create(vm_host_id: vmh.id, cpu_number:, io:, vm_host_slice_id: (slice&.id unless io))
+      end
+      VmStorageVolume.create(vm_id: vm.id, disk_index: 0, size_gib: 20, boot: true, use_bdev_ubi: false, storage_device_id: sd.id)
+      vm
+    end
+
+    it "runs the storage service in a shared cpuset on a slice host" do
+      volume = pool_vm.storage_volumes.first
+      expect(volume["slice_name"]).to eq("system.slice")
+      expect(volume["allowed_cpus"]).to eq([0, 1, 2, 3])
+    end
+
+    it "does not use the pool when the VM is not on a slice" do
+      expect(pool_vm(on_slice: false).storage_volumes.first).not_to have_key("allowed_cpus")
     end
   end
 
@@ -501,6 +548,7 @@ RSpec.describe Vm do
       vm.ephemeral_net6 = vm_host.ip6_random_vm_network.to_s
       expect(vm_host).not_to receive(:ip6_random_vm_network)
       DB[:nic].where(vm_id: vm.id).delete
+      DB[:vm_storage_volume].where(vm_id: vm.id).delete
       DB[:vm].where(id: vm.id).delete
       expect { vm.save_with_ephemeral_net6_error_retrying(vm_host) }.to raise_error(Sequel::NoExistingObject)
     end
@@ -539,7 +587,14 @@ RSpec.describe Vm do
       expect(json["hypervisor"]).to eq("qemu")
     end
 
-    it "defaults hypervisor to 'ch' when no B200 GPU is present" do
+    it "sets hypervisor to 'qemu' when a B300 GPU (device 3182) is present" do
+      PciDevice.create(vm_host_id: vmh.id, vm_id: vm.id, slot: "00:00.0", device_class: "0300", vendor: "nvidia", device: "3182", numa_node: 0, iommu_group: 0)
+
+      json = JSON.parse(vm.params_json)
+      expect(json["hypervisor"]).to eq("qemu")
+    end
+
+    it "defaults hypervisor to 'ch' when no B200/B300 GPU is present" do
       PciDevice.create(vm_host_id: vmh.id, vm_id: vm.id, slot: "00:00.0", device_class: "0300", vendor: "nvidia", device: "1234", numa_node: 0, iommu_group: 0)
 
       json = JSON.parse(vm.params_json)
@@ -559,6 +614,15 @@ RSpec.describe Vm do
       json = JSON.parse(vm.params_json)
       expect(json["gpu_partition_id"]).to eq(3)
     end
+
+    it "does not append the serial console for non-runner vms" do
+      expect(JSON.parse(vm.params_json)["append_serial_console"]).to be false
+    end
+
+    it "appends the serial console for github runner vms" do
+      vm.update(location_id: Location::GITHUB_RUNNERS_ID)
+      expect(JSON.parse(vm.params_json)["append_serial_console"]).to be true
+    end
   end
 
   describe "#private_ipv4_string" do
@@ -572,6 +636,90 @@ RSpec.describe Vm do
     it "includes the private IPv6 address as a string" do
       vm.define_singleton_method(:private_ipv6) { NetAddr.parse_ip("::2") }
       expect(vm.private_ipv6_string).to eq "::2"
+    end
+  end
+
+  describe "#create_storage_volumes" do
+    it "creates storage volumes" do
+      vm = create_vm
+      params = [
+        {boot: true, size_gib: 10, disk_index: 0},
+        {boot: false, size_gib: 20, disk_index: 1},
+      ]
+      vm.create_storage_volumes(params)
+      expect(vm.vm_storage_volumes_dataset.count).to eq(2)
+      vol1 = vm.vm_storage_volumes_dataset.first(disk_index: 0)
+      expect(vol1.boot).to be true
+      expect(vol1.size_gib).to eq(10)
+      vol2 = vm.vm_storage_volumes_dataset.first(disk_index: 1)
+      expect(vol2.boot).to be false
+      expect(vol2.size_gib).to eq(20)
+    end
+
+    it "creates storage volumes with machine image if specified" do
+      miv = create_machine_image_version_metal
+      vm = create_vm
+      params = [
+        {boot: true, size_gib: 10, disk_index: 0, machine_image_version_id: miv.id},
+      ]
+      vm.create_storage_volumes(params)
+      expect(vm.vm_storage_volumes_dataset.count).to eq(1)
+      vol = vm.vm_storage_volumes_dataset.first
+      expect(vol.boot).to be true
+      expect(vol.size_gib).to eq(10)
+      expect(vol.machine_image_version_id).to eq(miv.id)
+    end
+
+    it "fails if machine image version is specified but not found" do
+      miv = create_machine_image_version_metal
+      miv_id = miv.id
+      vm = create_vm
+      params = [
+        {boot: true, size_gib: 10, disk_index: 0, machine_image_version_id: miv_id},
+      ]
+      miv.destroy
+      expect { vm.create_storage_volumes(params) }.to raise_error(RuntimeError, "machine image version #{miv_id} is not available")
+    end
+
+    it "fails if machine image version is specified but is destroying" do
+      miv = create_machine_image_version_metal
+      vm = create_vm
+      params = [
+        {boot: true, size_gib: 10, disk_index: 0, machine_image_version_id: miv.id},
+      ]
+      miv.update(status: "destroying")
+      expect { vm.create_storage_volumes(params) }.to raise_error(RuntimeError, "machine image version #{miv.id} is not available")
+    end
+
+    it "fails if machine image version is specified but still being created" do
+      miv = create_machine_image_version_metal
+      vm = create_vm
+      params = [
+        {boot: true, size_gib: 10, disk_index: 0, machine_image_version_id: miv.id},
+      ]
+      miv.update(status: "creating", archive_size_mib: nil)
+      expect { vm.create_storage_volumes(params) }.to raise_error(RuntimeError, "machine image version #{miv.id} is not available")
+    end
+  end
+
+  describe "maintenance window" do
+    let(:vm) { create_vm }
+
+    it "validates maintenance_window_start_at" do
+      expect { vm.update(maintenance_window_start_at: 24) }.to raise_error(Sequel::ValidationFailed, /maintenance_window_start_at must be between 0 and 23/)
+      expect { vm.update(maintenance_window_start_at: -1) }.to raise_error(Sequel::ValidationFailed, /maintenance_window_start_at must be between 0 and 23/)
+      expect { vm.update(maintenance_window_start_at: 9) }.not_to raise_error
+    end
+
+    it "returns in_maintenance_window? correctly" do
+      vm.update(maintenance_window_start_at: nil)
+      expect(vm.in_maintenance_window?).to be(true)
+
+      vm.update(maintenance_window_start_at: 1)
+      expect(Time).to receive(:now).and_return(Time.utc(2025, 5, 1, 2), Time.utc(2025, 5, 1, 4), Time.utc(2025, 5, 1, 0))
+      expect(vm.in_maintenance_window?).to be(true)
+      expect(vm.in_maintenance_window?).to be(false)
+      expect(vm.in_maintenance_window?).to be(false)
     end
   end
 end

@@ -3,48 +3,59 @@
 class Prog::DnsZone::SetupDnsServerVm < Prog::Base
   subject_is :vm, :sshable
 
-  def self.assemble(dns_server_id, name: nil, vm_size: "standard-2", storage_size_gib: 30, location_id: Location::HETZNER_FSN1_ID, boot_image: "ubuntu-jammy")
-    unless (dns_server = DnsServer[dns_server_id])
-      fail "No existing Dns Server"
-    end
+  frame_reader :dns_server_id
 
-    unless Project[Config.dns_service_project_id]
-      fail "No existing Project"
-    end
-
-    unless Location[location_id]
-      fail "No existing Location"
-    end
+  def self.assemble(dns_server, name: nil, vm_size: "standard-2", storage_size_gib: 30, location_id: Location::HETZNER_FSN1_ID, boot_image: "ubuntu-noble", restrict_ssh_to_control_plane: false)
+    fail "No existing Dns Server" unless dns_server
+    fail "No existing Project" unless (project = Project[Config.dns_service_project_id])
+    fail "No existing Location" unless (location = Location[location_id])
 
     # The .assemble function is meant to be run by an operator manually. If/when we want to make this more programmatic
     # we should move this check to a pre-validation label of the prog.
     fail "Existing DNS Server VMs are not in sync, try again later" unless vms_in_sync?(dns_server.vms)
 
     name ||= "#{dns_server.ubid}-#{SecureRandom.alphanumeric(8).downcase}"
+    arches = Option::VmSizes.select { it.name == vm_size }.map(&:arch)
+    arch = arches.include?("x64") ? "x64" : arches.first
 
     DB.transaction do
+      Prog::DnsZone::DnsServerNexus.assemble(dns_server)
+      private_subnet_id = if restrict_ssh_to_control_plane
+        subnet_name = "dns-#{location.display_name}"
+        subnet = project.private_subnets_dataset.first(location_id:, name: subnet_name)
+        unless subnet
+          firewall = Firewall.create(name: subnet_name, location_id:, project_id: project.id)
+          Config.control_plane_outbound_cidrs.each { firewall.add_firewall_rule(cidr: it, port_range: 22..22) }
+          subnet = Prog::Vnet::SubnetNexus.assemble(project.id, name: subnet_name, location_id:, firewall_id: firewall.id).subject
+        end
+        subnet.id
+      end
+
       vm_st = Prog::Vm::Nexus.assemble_with_sshable(
         Config.dns_service_project_id,
         sshable_unix_user: "ubi",
         location_id:,
         name:,
         size: vm_size,
+        arch:,
         storage_volumes: [
           {encrypted: true, size_gib: storage_size_gib},
         ],
         boot_image:,
         enable_ip4: true,
+        private_subnet_id:,
+        exclude_host_ids: Config.allow_unspread_servers ? [] : dns_server.vms_dataset.where(location_id:).exclude(vm_host_id: nil).select_map(:vm_host_id),
       )
 
-      Strand.create(prog: "DnsZone::SetupDnsServerVm", label: "start", stack: [{subject_id: vm_st.id, dns_server_id:}])
+      Strand.create(prog: "DnsZone::SetupDnsServerVm", label: "start", stack: [{subject_id: vm_st.id, dns_server_id: dns_server.id}])
     end
   end
 
   def self.vms_in_sync?(vms)
-    return true if vms.nil? || vms.empty?
+    return true if vms.size <= 1
 
     outputs = vms.map do |vm|
-      lines = vm.sshable.cmd("sudo -u knot knotc", stdin: "zone-read --").split("\n")
+      lines = vm.sshable.cmd("sudo -u knot knotc", stdin: "zone-read --", log: false).split("\n")
 
       lines.map do |line|
         parts = line.split
@@ -62,15 +73,15 @@ class Prog::DnsZone::SetupDnsServerVm < Prog::Base
   end
 
   def ds
-    @ds ||= DnsServer[frame["dns_server_id"]]
+    @ds ||= DnsServer[dns_server_id]
   end
 
   label def start
     nap 5 unless vm.strand.label == "wait"
     register_deadline(nil, 15 * 60)
-    if vm.location.aws?
-      # Open UDP & TCP port 53 for DNS queries on AWS
-      fw = Firewall[name: "dns", project_id: Config.dns_service_project_id]
+    if vm.location.aws? || vm.location.gcp?
+      # Open UDP & TCP port 53 for DNS queries on AWS & GCP
+      fw = Firewall[name: "dns", project_id: Config.dns_service_project_id, location_id: vm.location_id]
       unless fw
         fw = Firewall.create(name: "dns", location: vm.location, project_id: Config.dns_service_project_id)
         fw.add_firewall_rule(cidr: "0.0.0.0/0", port_range: 53..53, protocol: "udp")
@@ -86,14 +97,16 @@ class Prog::DnsZone::SetupDnsServerVm < Prog::Base
 
   label def prepare
     sshable.cmd(<<~SH, inhost_name: vm.inhost_name)
+set -euo pipefail
 sudo sed -i 's/#DNSStubListener=yes/DNSStubListener=no/' /etc/systemd/resolved.conf
 sudo sed -i ':a;N;$!ba;s/127.0.0.1 localhost\\n\\n#/127.0.0.1 localhost\\n127.0.0.1 ':inhost_name'\\n\\n#/' /etc/hosts
 sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
 sudo apt-get update
-sudo apt-get -y install apt-transport-https ca-certificates wget
-sudo wget -O /usr/share/keyrings/cznic-labs-pkg.gpg https://pkg.labs.nic.cz/gpg
-echo "deb [signed-by=/usr/share/keyrings/cznic-labs-pkg.gpg] https://pkg.labs.nic.cz/knot-dns jammy main" | sudo tee /etc/apt/sources.list.d/cznic-labs-knot-dns.list
+sudo apt-get -y install apt-transport-https ca-certificates curl
+sudo curl -fsSL -o /usr/share/keyrings/cznic-labs-pkg.gpg https://pkg.labs.nic.cz/gpg
+echo "deb [signed-by=/usr/share/keyrings/cznic-labs-pkg.gpg] https://pkg.labs.nic.cz/knot-dns noble main" | sudo tee /etc/apt/sources.list.d/cznic-labs-knot-dns.list
 sudo apt-get update
+sudo apt-get -y install knot
 sudo systemctl reboot
     SH
 
@@ -103,50 +116,16 @@ sudo systemctl reboot
   label def setup_knot
     nap 5 unless sshable.available?
 
-    sshable.cmd <<~SH
-sudo apt-get -y install knot
-echo "KNOTD_ARGS="-C /var/lib/knot/confdb"" | sudo tee -a /etc/default/knot
-    SH
-
-    knot_config = <<-CONF
-server:
-    rundir: "/run/knot"
-    user: "knot:knot"
-    listen: [ "0.0.0.0@53", "::@53" ]
-
-log:
-  - target: "syslog"
-    any: "info"
-
-database:
-    storage: "/var/lib/knot"
-
-acl:
-  - id: "allow_dynamic_updates"
-    address: "127.0.0.1/32"
-    action: "update"
-
-template:
-  - id: "default"
-    storage: "/var/lib/knot"
-    file: "%s.zone"
-    acl: "allow_dynamic_updates"
-    zonefile-sync: "60"
-    zonefile-load: "difference"
-    journal-content: "all"
-
-
-zone:
-  #{ds.dns_zones.map { |dz| "- domain: \"#{dz.name}.\"" }.join("\n  ")}
-    CONF
-
-    sshable.write_file("/etc/knot/knot.conf", knot_config)
+    sshable.write_file("/etc/default/knot", "KNOTD_ARGS=\"-C /var/lib/knot/confdb\"")
+    sshable.write_file("/etc/knot/knot.conf", ds.knot_config)
 
     hop_sync_zones
   end
 
   label def sync_zones
     nap 5 if ds.dns_zones.any?(&:refresh_dns_servers_set?)
+
+    sshable.cmd "sudo rm -f /var/lib/knot/*.zone /var/lib/knot/journal/*"
 
     ds.dns_zones.each do |dz|
       zone_config = <<-CONF

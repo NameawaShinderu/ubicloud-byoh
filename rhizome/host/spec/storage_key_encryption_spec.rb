@@ -21,6 +21,32 @@ RSpec.describe StorageKeyEncryption do
     expect(sek.unwrap_key(sek.wrap_key(key))).to eq(key)
   end
 
+  it "round-trips a secret through aes256gcm_encrypt/decrypt" do
+    key = OpenSSL::Cipher.new("aes-256-gcm").random_key
+    plaintext = "the-xts-key-material"
+    wrapped = described_class.aes256gcm_encrypt(key, "xts-key", plaintext)
+    expect(described_class.aes256gcm_decrypt(key, "xts-key", wrapped)).to eq(plaintext)
+  end
+
+  it "fails aes256gcm_decrypt when the auth_data does not match" do
+    key = OpenSSL::Cipher.new("aes-256-gcm").random_key
+    wrapped = described_class.aes256gcm_encrypt(key, "xts-key", "secret")
+    expect { described_class.aes256gcm_decrypt(key, "other", wrapped) }.to raise_error(OpenSSL::Cipher::CipherError)
+  end
+
+  it "fails aes256gcm_decrypt when the key does not match" do
+    wrapped = described_class.aes256gcm_encrypt(OpenSSL::Cipher.new("aes-256-gcm").random_key, "xts-key", "secret")
+    other_key = OpenSSL::Cipher.new("aes-256-gcm").random_key
+    expect { described_class.aes256gcm_decrypt(other_key, "xts-key", wrapped) }.to raise_error(OpenSSL::Cipher::CipherError)
+  end
+
+  it "fails aes256gcm_decrypt when the encrypted data is modified" do
+    key = OpenSSL::Cipher.new("aes-256-gcm").random_key
+    wrapped = described_class.aes256gcm_encrypt(key, "xts-key", "secret")
+    wrapped[12] = (wrapped[12].ord ^ 1).chr
+    expect { described_class.aes256gcm_decrypt(key, "xts-key", wrapped) }.to raise_error(OpenSSL::Cipher::CipherError)
+  end
+
   it "can wrap a key" do
     dek = OpenSSL::Cipher.new("aes-256-xts").random_key.unpack1("H*")
     r1 = sek.wrap_key(dek[..63])

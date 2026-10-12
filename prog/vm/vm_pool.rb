@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/net_ssh"
-
 class Prog::Vm::VmPool < Prog::Base
   subject_is :vm_pool
 
@@ -20,12 +18,16 @@ class Prog::Vm::VmPool < Prog::Base
   end
 
   label def create_new_vm
-    storage_params = {size_gib: vm_pool.storage_size_gib}
+    storage_params = {size_gib: vm_pool.storage_size_gib, track_written: false}
     ps = Prog::Vnet::SubnetNexus.assemble(
       Config.vm_pool_project_id,
       location_id: vm_pool.location_id,
       allow_only_ssh: true,
     ).subject
+
+    if rand * 100 < Config.github_actions_ch_53_percent
+      ch_version = "53.0"
+    end
 
     Prog::Vm::Nexus.assemble_with_sshable(
       Config.vm_pool_project_id,
@@ -40,6 +42,7 @@ class Prog::Vm::VmPool < Prog::Base
       arch: vm_pool.arch,
       swap_size_bytes: 4294963200,
       private_subnet_id: ps.id,
+      ch_version:,
     )
 
     hop_wait
@@ -64,7 +67,7 @@ class Prog::Vm::VmPool < Prog::Base
   end
 
   label def wait_vms_destroy
-    nap 10 if vm_pool.vms.count > 0
+    nap 10 unless vm_pool.vms_dataset.empty?
 
     vm_pool.destroy
     pop "pool destroyed"

@@ -8,14 +8,15 @@ require "tilt"
 require "tilt/erubi"
 
 class Clover < Roda
-  # :nocov:
+  # simplecov:disable
   linting = Config.test? && !defined?(SimpleCov)
   use Rack::Lint if linting
   if linting || Config.development? # Assume Rack::Lint added automatically in development
     require "rack/rewindable_input"
     use Rack::RewindableInput::Middleware
   end
-  # :nocov:
+  use ApiMetricsMiddleware if Config.api_metrics_report_enabled?
+  # simplecov:enable
 
   include AuditLog
 
@@ -38,10 +39,10 @@ class Clover < Roda
   Unreloader.require("helpers") {}
   Unreloader.record_split_class(__FILE__, "helpers")
 
-  # :nocov:
+  # simplecov:disable
   default_fixed_locals = if Config.production? || Config.frozen_test?
     "()"
-  # :nocov:
+  # simplecov:enable
   else
     "(_no_kw: nil)"
   end
@@ -58,7 +59,7 @@ class Clover < Roda
   plugin :json
   plugin :response_attachment
   plugin :invalid_request_body, :raise
-  plugin :json_parser, wrap: :unless_hash, error_handler: lambda { |r| raise Roda::RodaPlugins::InvalidRequestBody::Error, "invalid JSON uploaded" }
+  plugin :json_parser, wrap: :unless_hash, error_handler: lambda { |r| raise Roda::RodaPlugins::InvalidRequestBody::Error, "invalid JSON uploaded" }, content_type_regexp: /\Aapplication\/json\b/i
   plugin :public
   plugin :render, escape: true, layout: "./layouts/app", template_opts: {chain_appends: !defined?(SimpleCov), freeze: true, skip_compiled_encoding_detection: true, scope_class: self, default_fixed_locals:, extract_fixed_locals: true}, assume_fixed_locals: true
   plugin :part
@@ -77,9 +78,13 @@ class Clover < Roda
   end
 
   plugin :symbol_matchers
-  symbol_matcher(:ubid_uuid, /([a-tv-z0-9]{26})/) do |s|
+
+  symbol_matcher(:object_name, /([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)/, segment: true)
+
+  symbol_matcher(:ubid_uuid, /([a-tv-z0-9]{26})/, segment: true) do |s|
     UBID.to_uuid(s)
   end
+
   [
     Firewall,
     [GithubInstallation, /([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/],
@@ -87,19 +92,27 @@ class Clover < Roda
     KubernetesCluster,
     KubernetesNodepool,
     LoadBalancer,
+    MachineImage,
     PostgresResource,
     PrivateSubnet,
     SshPublicKey,
     Vm,
   ].each do |model, regexp|
-    sym = :"#{model.table_name}_ubid_uuid"
-    symbol_matcher(sym, /(#{model.ubid_type}[a-tv-z0-9]{24})/) do |ubid|
+    ubid_sym = :"#{model.table_name}_ubid_uuid"
+    symbol_matcher(ubid_sym, /(#{model.ubid_type}[a-tv-z0-9]{24})/, segment: true) do |ubid|
       if (uuid = UBID.to_uuid(ubid))
         # yield nil as first element to differentiate case where name matches
         [nil, uuid]
       end
     end
-    const_set(:"#{model.table_name.upcase}_NAME_OR_UBID", [sym, regexp || /([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)/])
+
+    if regexp
+      name_sym = :"#{model.table_name}_name"
+      symbol_matcher(name_sym, regexp, segment: true)
+    else
+      name_sym = :object_name
+    end
+    const_set(:"#{model.table_name.upcase}_NAME_OR_UBID", [ubid_sym, name_sym])
   end
 
   plugin :response_content_type,
@@ -124,6 +137,7 @@ class Clover < Roda
     KubernetesNodepool
     LoadBalancer
     Location
+    MachineImage
     ObjectTag
     PaymentMethod
     PostgresResource
@@ -131,19 +145,19 @@ class Clover < Roda
     SshPublicKey
     SubjectTag
     Vm
-  ].each { path(it, class_name: true, &under_project_path) }
+  ].freeze.each { path(it, class_name: true, &under_project_path) }
 
   path("Project", class_name: true, &:path)
   path("GithubInstallation", class_name: true) { "#{it.project.path}/github/#{it.ubid}" }
   path("Invoice", class_name: true) { "#{it.project.path}/billing#{it.path}" }
 
-  # :nocov:
+  # simplecov:disable
   if Config.test? && defined?(SimpleCov)
     plugin :render_coverage
   end
 
   plugin :ip_from_header, Config.ip_from_header if Config.ip_from_header
-  # :nocov:
+  # simplecov:enable
 
   plugin :host_routing, scope_predicates: true do |hosts|
     hosts.register :api, :web, :runtime, :admin
@@ -152,7 +166,7 @@ class Clover < Roda
         :api
       elsif host.start_with?("admin.")
         :admin
-      elsif request.path_info.start_with?("/runtime")
+      elsif request.path_info == "/runtime" || request.path_info.start_with?("/runtime/")
         :runtime
       end
     end
@@ -182,7 +196,7 @@ class Clover < Roda
     csp.style_src :self, "https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css"
     csp.img_src :self, "data: image/svg+xml", "https://github.com", "https://avatars.githubusercontent.com"
     csp.form_action :self, "https://checkout.stripe.com", "https://github.com/login/oauth/authorize", "https://accounts.google.com/o/oauth2/auth"
-    csp.script_src :self, "https://cdn.jsdelivr.net/npm/jquery@3.7.0/dist/jquery.min.js", "https://cdn.jsdelivr.net/npm/dompurify@3.0.5/dist/purify.min.js", "https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js", "https://challenges.cloudflare.com/turnstile/v0/api.js", "https://cdn.jsdelivr.net/npm/marked@15.0.5/marked.min.js", "https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"
+    csp.script_src :self, "https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js", "https://cdn.jsdelivr.net/npm/dompurify@3.4.0/dist/purify.min.js", "https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js", "https://challenges.cloudflare.com/turnstile/v0/api.js", "https://cdn.jsdelivr.net/npm/marked@15.0.5/marked.min.js", "https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"
     csp.frame_src :self, "https://challenges.cloudflare.com"
     csp.connect_src :self
     csp.base_uri :none
@@ -195,9 +209,9 @@ class Clover < Roda
       end
     }.new
   else
-    # :nocov:
+    # simplecov:disable
     $stderr
-    # :nocov:
+    # simplecov:enable
   end
   plugin :common_logger, logger
 
@@ -218,7 +232,7 @@ class Clover < Roda
   end
 
   if Config.development?
-    # :nocov:
+    # simplecov:disable
     plugin :exception_page
 
     class RodaRequest
@@ -227,7 +241,7 @@ class Clover < Roda
         super
       end
     end
-    # :nocov:
+    # simplecov:enable
   end
 
   plugin :error_handler do |e|
@@ -236,10 +250,14 @@ class Clover < Roda
     end
 
     case e
-    when Sequel::ValidationFailed, Roda::RodaPlugins::InvalidRequestBody::Error, Roda::RodaPlugins::TypecastParams::Error
+    when Sequel::ValidationFailed, Roda::RodaPlugins::InvalidRequestBody::Error, Roda::RodaPlugins::TypecastParams::Error, Roda::RodaPlugins::DisallowFileUploads::Error
       code = 400
       type = "InvalidRequest"
       message = e.to_s
+    when Rack::BadRequest
+      code = 400
+      type = "BadRequest"
+      message = e.message
     when CloverError
       code = e.code
       type = e.type
@@ -271,14 +289,28 @@ class Clover < Roda
       code = 500
       type = "InternalServerError"
       message = "There was a temporary error attempting to make this change, please try again."
-      Clog.emit("route exception", Util.exception_to_hash(e))
+      Clog.emit("route exception", Util.exception_to_hash(e, into: {request: request.inspect}))
     else
       raise e if Config.test? && e.message != "test error"
 
-      Clog.emit("route exception", Util.exception_to_hash(e))
+      Clog.emit("route exception", Util.exception_to_hash(e, into: {request: request.inspect}))
+
+      begin
+        exception_class = e.class.name
+        Prog::PageNexus.assemble(
+          "Unexpected #{exception_class} in Clover web request",
+          ["Clover500", exception_class],
+          [],
+          resource_id: nil,
+          severity: "warning",
+          extra_data: {exception_class:, request_method: request.request_method, request_path: request.path, backtrace: e.backtrace[0...50]},
+        )
+      rescue => page_exception
+        Clog.emit("failed to page for unexpected error", Util.exception_to_hash(page_exception, into: {unexpected_error_page_failure: {original_exception: exception_class, request_path: request.path}}))
+      end
 
       code = 500
-      type = "UnexceptedError"
+      type = "UnexpectedError"
       message = "Sorry, we couldn’t process your request because of an unexpected error."
     end
 
@@ -291,7 +323,7 @@ class Clover < Roda
 
     if runtime?
       error
-    elsif api? || request.accepts_json? || !%w[GET POST].include?(request.request_method)
+    elsif api? || request.accepts_json? || !%w[GET POST].freeze.include?(request.request_method)
       {error:}
     else
       @error = error
@@ -312,9 +344,9 @@ class Clover < Roda
         redirect_back_with_inputs(e)
       end
 
-      # :nocov:
+      # simplecov:disable
       next exception_page(e, assets: true) if Config.development? && code == 500
-      # :nocov:
+      # simplecov:enable
 
       view "error"
     end
@@ -353,14 +385,27 @@ class Clover < Roda
   plugin :rodauth do
     enable :argon2, :change_login, :change_password, :close_account, :create_account,
       :lockout, :login, :logout, :remember, :reset_password,
-      :disallow_password_reuse, :password_grace_period, :active_sessions,
+      :password_grace_period, :active_sessions,
       :verify_login_change, :change_password_notify, :confirm_password,
       :otp, :webauthn, :recovery_codes, :omniauth, :otp_unlock, :otp_lockout_email,
-      :audit_logging
+      :audit_logging, :close_account_email
 
     title_instance_variable :@page_title
     check_csrf? false
+    domain URI(Config.base_url).host
     base_url Config.base_url
+    transaction_opts do
+      opts = super()
+
+      if current_route == :close_account
+        opts = opts.dup
+        opts[:isolation] = :serializable
+      end
+
+      opts
+    end
+
+    uses_instance_variables(:@removed_webauthn_credential_name, :@previous_login)
 
     audit_logging_table :account_authentication_audit_log
     audit_log_metadata do |action|
@@ -400,8 +445,9 @@ class Clover < Roda
     end
     serialize_audit_log_metadata { it }
     audit_log_message_for(:omniauth_create_account, "create_account")
+    convert_token_id { it if it.match?(/\A\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\z/) }
 
-    # :nocov:
+    # simplecov:disable
     unless Config.development?
       enable :disallow_common_passwords, :verify_account,
         :reset_password_verifies_account
@@ -445,11 +491,11 @@ class Clover < Roda
         DB.ignore_duplicate_queries { super(password) } && password.match?(/[a-z]/) && password.match?(/[A-Z]/) && password.match?(/[0-9]/)
       end
 
-      invalid_password_message = "Password must have 8 characters minimum and contain at least one lowercase letter, one uppercase letter, and one digit. Password cannot be the same as a previous password."
+      invalid_password_message = "Password must have 8 characters minimum and contain at least one lowercase letter, one uppercase letter, and one digit. Password cannot be the same as your current password."
       password_does_not_meet_requirements_message invalid_password_message
       password_too_short_message invalid_password_message
     end
-    # :nocov:
+    # simplecov:enable
 
     hmac_secret Config.clover_session_secret
 
@@ -476,7 +522,13 @@ class Clover < Roda
           add_audit_log(account_session_value, :login_failure, hash)
           redirect "/login"
         end
+      elsif omniauth_identity && omniauth_provider.bytesize == 26 && (provider = OidcProvider[omniauth_provider]) && !provider.allowed_domain?(domain_for_email(email))
+        flash["error"] = "Login via #{provider.display_name} is not allowed for the #{domain_for_email(email)} domain."
+        add_audit_log(account_session_value, :login_failure, {"provider" => scope.omniauth_provider_name(omniauth_provider)})
+        redirect "/login"
       end
+
+      @saved_login_redirect = "/?setup=github_actions" if session["github_actions_setup"]
     end
 
     after_login do
@@ -485,8 +537,9 @@ class Clover < Roda
         if (groups = omniauth_info["groups"]) &&
             omniauth_provider.bytesize == 26 &&
             (provider = OidcProvider[omniauth_provider]) &&
-            (group_prefix = provider.group_prefix)
-          groups = groups.to_a.map(&:to_s)
+            (group_prefix = provider.group_prefix) &&
+            provider.groups_claim
+          groups = Array(groups).map(&:to_s)
           session["oidc_groups"] = groups
           session["oidc_group_prefix"] = group_prefix
           Clog.emit("OIDC groups login", oidc_groups_login: {groups:, group_prefix:})
@@ -541,7 +594,7 @@ class Clover < Roda
     need_password_notice_flash "Login recognized"
     multi_phase_login_view { login_view }
 
-    # :nocov:
+    # simplecov:disable
     if Config.omniauth_github_id
       require "omniauth-github"
       omniauth_provider :github, Config.omniauth_github_id, Config.omniauth_github_secret, scope: "user:email", name: "github"
@@ -550,7 +603,7 @@ class Clover < Roda
       require "omniauth-google-oauth2"
       omniauth_provider :google_oauth2, Config.omniauth_google_id, Config.omniauth_google_secret, name: "google"
     end
-    # :nocov:
+    # simplecov:enable
 
     require_relative "vendor/omniauth_oidc"
     omniauth_provider :oidc
@@ -617,6 +670,7 @@ class Clover < Roda
 
     after_omniauth_create_account do
       scope.after_rodauth_create_account(account_id)
+      session[login_redirect_session_key] = "/?setup=github_actions" if session["github_actions_setup"]
     end
 
     omniauth_on_failure do
@@ -625,15 +679,14 @@ class Clover < Roda
     end
 
     before_omniauth_callback_route do
-      account = Account[account_from_omniauth&.[](:id)]
       if authenticated?
-        unless account && account.id == scope.current_account.id
+        unless (account = Account[account_from_omniauth&.[](:id)]) && account.id == scope.current_account.id
           provider_name = scope.omniauth_provider_name(omniauth_provider)
           flash["error"] = "Your account's email address is different from the email address associated with the #{provider_name} account."
           add_audit_log(session_value, :connect_provider_failure, {"reason" => "different email", "provider" => provider_name})
           redirect "/account/login-method"
         end
-      elsif account && account.identities_dataset.where(provider: omniauth_provider).empty?
+      elsif omniauth_identity.nil? && Account[account_from_omniauth&.[](:id)]
         provider_name = scope.omniauth_provider_name(omniauth_provider)
         add_audit_log(account_session_value, :login_failure, {"reason" => "unlinked existing account", "provider" => provider_name})
         flash["error"] = "There is already an account with this email address, and it has not been linked to the #{provider_name} account.
@@ -711,7 +764,7 @@ class Clover < Roda
     verify_login_change_view { view "auth/verify_login_change", "Verify Email Change" }
     send_verify_login_change_email do |new_login|
       user = Account[account_id]
-      Util.send_email(email_to, "Please Verify New Email Address for Ubicloud",
+      Util.send_email(new_login, "Please Verify New Email Address for Ubicloud",
         greeting: "Hello #{user.name},",
         body: ["We received a request to change your account email to '#{new_login}'. To verify new email, click the button below.",
           "If you did not initiate this request, no action is needed. Current email address can be used to login your account.",
@@ -726,6 +779,14 @@ class Clover < Roda
     close_account_redirect "/login"
     close_account_route "account/close-account"
     close_account_view { view "account/close_account", "My Account" }
+    send_close_account_email do
+      user = Account[account_id]
+      Util.send_email(user.email, "Ubicloud Account Closed",
+        greeting: "Hello #{user.name},",
+        body: ["This email is a confirmation that you have closed your account.",
+          "If you did not initiate this request, reach out to our team at support@ubicloud.com.",
+          "Otherwise, thank you for using Ubicloud, and we hope you see you again in the future."])
+    end
 
     before_close_account do
       scope.handle_validation_failure(true) do
@@ -757,9 +818,9 @@ class Clover < Roda
     two_factor_auth_view { view "auth/two_factor_auth", "Two-factor Authentication" }
     two_factor_auth_notice_flash { login_notice_flash }
     # don't show error message when redirected after login
-    # :nocov:
+    # simplecov:disable
     two_factor_need_authentication_error_flash { (flash["notice"] == login_notice_flash) ? nil : super() }
-    # :nocov:
+    # simplecov:enable
 
     # If the single multifactor auth method is setup, redirect to it
     before_two_factor_auth_route do
@@ -775,13 +836,13 @@ class Clover < Roda
     otp_setup_notice_flash "One-time password authentication is now setup, please make note of your recovery codes"
     otp_setup_error_flash "Error setting up one-time password authentication"
 
-    # :nocov:
+    # simplecov:disable
     after_otp_setup do
       flash["notice"] = otp_setup_notice_flash
       add_audit_log(session_value, :otp_setup)
       redirect "/" + recovery_codes_route
     end
-    # :nocov:
+    # simplecov:enable
 
     # OTP Disable
     otp_disable_route "account/multifactor/otp-disable"
@@ -838,13 +899,13 @@ class Clover < Roda
       super(webauthn_id)
     end
 
-    # :nocov:
+    # simplecov:disable
     after_webauthn_setup do
       flash["notice"] = webauthn_setup_notice_flash
       add_audit_log(session_value, :webauthn_setup, {key_name: scope.typecast_params.nonempty_str!("name")})
       redirect "/" + recovery_codes_route
     end
-    # :nocov:
+    # simplecov:enable
 
     # Webauthn Remove
     webauthn_remove_route "account/multifactor/webauthn-remove"
@@ -884,9 +945,37 @@ class Clover < Roda
     end
   end
 
-  # :nocov:
+  # simplecov:disable
   if Config.test?
-    # :nocov:
+    hash_branch(:webhook_prefix, "test-ssh-access") do |r|
+      response = +""
+
+      response << (defined?(Net::SSH::Connection) ? "defined-" : "undefined-")
+
+      # Use absolute constant reference to work around model hiding (only acceptable
+      # as this is test-only code)
+      sshable = ::Sshable.new(host: "127.1.2.3")
+
+      begin
+        sshable.start_fresh_session
+      rescue NameError => e
+        response << e.message << "-"
+      else
+        raise
+      end
+
+      begin
+        sshable.cmd("true")
+      rescue RuntimeError => e
+        response << e.message
+      else
+        raise
+      end
+
+      response
+    end
+
+    # simplecov:enable
     hash_branch(:webhook_prefix, "test-error") do |r|
       raise(typecast_params.str("message") || "test error")
     end
@@ -909,9 +998,24 @@ class Clover < Roda
       end
 
       r.post "bad" do
-        @project = Account.first.projects.first
-        audit_log(@project, "bad_action")
+        audit_log(nil, "bad_action", project_id: nil)
       end
+    end
+
+    hash_branch(:webhook_prefix, "hidden-model-access") do |r|
+      begin
+        GpuPartition
+      rescue DirectModelAccess => e
+        e.message
+      end.to_s
+    end
+
+    hash_branch(:webhook_prefix, "hidden-model-method-call") do |r|
+      begin
+        Account.inspect
+      rescue DirectModelAccess => e
+        e.message
+      end.to_s
     end
 
     hash_branch("test-no-authorization-needed") do |r|
@@ -966,7 +1070,7 @@ class Clover < Roda
 
   if Config.production? || ENV["FORCE_AUTOLOAD"] == "1"
     Unreloader.require("routes")
-  # :nocov:
+  # simplecov:disable
   else
     plugin :autoload_hash_branches
     Dir["routes/**/*.rb"].each do |full_path|
@@ -983,7 +1087,7 @@ class Clover < Roda
     end
     Unreloader.autoload("routes", delete_hook: proc { |f| hash_branch(File.basename(f, ".rb").tr("_", "-")) }) {}
   end
-  # :nocov:
+  # simplecov:enable
 
   route do |r|
     if api?
@@ -1047,6 +1151,39 @@ class Clover < Roda
       rodauth.check_active_session
 
       r.root do
+        if !current_account && (source = typecast_params.nonempty_str("source")) && /\A[-a-z0-9]{1,32}\z/.match?(source)
+          if (detail = typecast_params.nonempty_str("source_detail"))
+            detail.gsub!(/[^-a-z0-9A-Z]/, "")
+            detail = detail[0...36]
+            detail = nil if detail.empty?
+          end
+          session["account_source"] = [[source, detail]]
+        end
+
+        if typecast_params.str("setup") == "github_actions" && Config.omniauth_github_id && Config.github_app_name && Config.stripe_secret_key
+          @step = if current_account
+            if (@project = current_account.default_project || current_account.projects_dataset.order(:created_at, :name).first)
+              if @project.github_installations_dataset.empty?
+                2
+              elsif @project.payment_methods_dataset.empty?
+                3
+              else
+                4
+              end
+            else
+              redirect_default_project_dashboard
+            end
+          else
+            source = session["account_source"] ||= []
+            source << ["github-actions-setup", "standard"]
+            source.uniq!
+            1
+          end
+
+          session["github_actions_setup"] = true unless @step == 4
+          next view "github/actions-setup"
+        end
+
         if current_account
           redirect_default_project_dashboard
         else
@@ -1063,11 +1200,14 @@ class Clover < Roda
       # (which is thought to be cheaper)
       begin
         @schema_validator = SCHEMA_ROUTER.build_schema_validator(r)
+        if (operation = @schema_validator.operation_object)
+          env["clover.api_operation"] = operation.original_path
+        end
         @schema_validator.request_validate(r)
 
         unless @schema_validator.link_exist?
           if Config.test? && !ENV["IGNORE_INVALID_API_PATHS"]
-            raise "request not found in openapi schema: #{r.request_method} #{r.path_info}"
+            raise Committee::InvalidRequest.new("request not found in openapi schema: #{r.request_method} #{r.path_info}")
           end
 
           next
@@ -1092,9 +1232,9 @@ class Clover < Roda
     raise Committee::InvalidResponse.new("Response body wasn't valid JSON.", original_error: e)
   end
 
-  # :nocov:
+  # simplecov:disable
   if Config.unfrozen_test?
-    # :nocov:
+    # simplecov:enable
 
     # This section is included when running non-frozen specs, and ensures that all routes
     # either call an authorization method, or explicitly indicate that no additional authorization

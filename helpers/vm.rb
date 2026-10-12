@@ -5,6 +5,33 @@ class Clover
     authorized_object(association: :vms, key: "vm_id", perm:, location_id:)
   end
 
+  # Ignore an explicitly requested refresh this soon after the last one, but
+  # always start a new fetch once a result is this stale, requested or not.
+  SERIAL_LOG_FETCH_COOLDOWN = 60
+  SERIAL_LOG_STALE_AFTER = 60 * 60
+
+  def vm_serial_log(vm, refresh: false)
+    rc = vm.most_recent_serial_log
+    return vm_fetch_serial_log(vm) unless rc
+    return rc if rc.status == "created"
+
+    age = Time.now - rc.run_at
+    ((refresh && age >= SERIAL_LOG_FETCH_COOLDOWN) || age >= SERIAL_LOG_STALE_AFTER) ? vm_fetch_serial_log(vm) : rc
+  end
+
+  def vm_fetch_serial_log(vm)
+    Prog::Vm::RunCommandNexus.assemble(vm_id: vm.id, command: "fetch_serial_log").subject
+  end
+
+  def serial_log_fetch_button_attributes(rc)
+    return {"disabled" => true} if rc.status == "created"
+
+    retry_at = rc.run_at + SERIAL_LOG_FETCH_COOLDOWN
+    return {} unless retry_at > Time.now
+
+    {"disabled" => true, "data-countdown-until" => retry_at.to_i}
+  end
+
   def vm_list
     dataset = dataset_authorize(@project.vms_dataset, "Vm:view")
       .eager(:strand, :semaphores, :assigned_vm_address, :vm_storage_volumes, :location)
@@ -44,6 +71,27 @@ class Clover
       tp.bool("enable_ip4")
     end
     assemble_params.compact!
+
+    # Web-only: translate the MI sentinel into "<name>@latest". API/CLI
+    # callers pass boot_image="name@version" directly; if they pass the
+    # sentinel, it falls through to validate_boot_image as an invalid name.
+    if web? && assemble_params[:boot_image] == "__machine_image"
+      machine_image = typecast_params.nonempty_str("machine_image")
+      fail Validation::ValidationFailed.new({machine_image: "Pick a machine image"}) unless machine_image
+      assemble_params[:boot_image] = "#{machine_image}@latest"
+    end
+
+    # Any boot_image containing "@" refers to a machine image. Verify the
+    # user can view a matching MI in @location. Version validity is checked
+    # downstream by Vm::Nexus.assemble; we only need the auth check here.
+    # Covers both web (sentinel-translated) and api/cli (direct) submissions.
+    if assemble_params[:boot_image]&.include?("@")
+      mi_name = assemble_params[:boot_image].split("@", 2).first
+      unless dataset_authorize(@project.machine_images_dataset, "MachineImage:view").first(location_id: @location.id, name: mi_name, arch: "x64")
+        key = web? ? :machine_image : :boot_image
+        fail Validation::ValidationFailed.new({key => "Selected machine image is not available"})
+      end
+    end
 
     # Generally parameter validation is handled in progs while creating resources.
     # Since Vm::Nexus both handles VM creation requests from user and also Postgres
@@ -212,7 +260,24 @@ class Clover
 
     boot_images = Option::BootImages.map(&:name)
     boot_images.reject! { |name| name == "gpu-ubuntu-noble" } unless @show_gpu != false
-    options.add_option(name: "boot_image", values: boot_images)
+
+    # VM create is currently x64-only, so only surface x64 MIs.
+    machine_image_options = dataset_authorize(@project.machine_images_dataset, "MachineImage:view")
+      .exclude(latest_version_id: nil)
+      .where(arch: "x64")
+      .map { |mi| {location_id: mi.location_id, value: mi.name, display_name: "#{mi.name}@latest"} }
+
+    boot_images << "__machine_image" if machine_image_options.any?
+    options.add_option(name: "boot_image", values: boot_images, parent: "location") do |location, bi|
+      bi != "__machine_image" || machine_image_options.any? { |mi| mi[:location_id] == location.id }
+    end
+
+    if machine_image_options.any?
+      options.add_option(name: "machine_image", values: machine_image_options, parent: "location") do |location, mi|
+        mi[:location_id] == location.id
+      end
+    end
+
     options.add_option(name: "unix_user")
     options.add_option(name: "ssh_public_key", values: @project.ssh_public_keys)
     options.add_option(name: "public_key")

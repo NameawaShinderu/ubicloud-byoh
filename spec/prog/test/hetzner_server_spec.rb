@@ -16,7 +16,7 @@ RSpec.describe Prog::Test::HetznerServer do
       "hetzner_ssh_keypair" => "oOtAbOGFVHJjFyeQBgSfghi+YBuyQzBRsKABGZhOmDpmwxqx681mscsGBLaQ\n2iWQsOYBBVLDtQWe/gf3NRNyBw==\n",
       "server_id" => "1234",
       "additional_boot_images" => [],
-      "setup_host" => true,
+      "setup_host?" => true,
     })
     allow(hs_test).to receive(:hetzner_api).and_return(hetzner_api)
   }
@@ -36,18 +36,18 @@ RSpec.describe Prog::Test::HetznerServer do
       st = described_class.assemble(vm_host_id: vm_host.id)
       expect(st.stack.first["vm_host_id"]).to eq(vm_host.id)
       expect(st.stack.first["hostname"]).to eq("1.1.1.1")
-      expect(st.stack.first["setup_host"]).to be(false)
+      expect(st.stack.first["setup_host?"]).to be(false)
     end
   end
 
   describe "#start" do
     it "hops to fetch_hostname if setup_host is true" do
-      refresh_frame(hs_test, new_values: {"setup_host" => true})
+      refresh_frame(hs_test, new_values: {"setup_host?" => true})
       expect { hs_test.start }.to hop("fetch_hostname")
     end
 
     it "hops to wait_setup_host if vm_host_id is given" do
-      refresh_frame(hs_test, new_values: {"vm_host_id" => "123", "setup_host" => false})
+      refresh_frame(hs_test, new_values: {"vm_host_id" => "123", "setup_host?" => false})
       expect { hs_test.start }.to hop("wait_setup_host")
     end
   end
@@ -55,36 +55,48 @@ RSpec.describe Prog::Test::HetznerServer do
   describe "#fetch_hostname" do
     it "can fetch hostname" do
       expect(hetzner_api).to receive(:get_main_ip4)
-      expect { hs_test.fetch_hostname }.to hop("reimage")
+      expect { hs_test.fetch_hostname }.to hop("enable_rescue")
     end
   end
 
-  describe "#reimage" do
-    it "can reimage" do
-      expect(hetzner_api).to receive(:reimage).with("1234", dist: "Ubuntu 24.04 LTS base")
-      expect { hs_test.reimage }.to hop("wait_reimage")
+  describe "#enable_rescue" do
+    it "enables rescue mode and triggers a hardware reset" do
+      expect(hetzner_api).to receive(:enable_rescue)
+      expect(hetzner_api).to receive(:hardware_reset)
+      expect { hs_test.enable_rescue }.to hop("wait_rescue")
     end
   end
 
-  describe "#wait_reimage" do
-    it "hops to setup_host if the server is up" do
+  describe "#wait_rescue" do
+    it "hops to setup_host once the server is in rescue mode" do
       session = Net::SSH::Connection::Session.allocate
       expect(Net::SSH).to receive(:start).and_yield(session)
-      expect(session).to receive(:_exec!).with("echo 1").and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
-      expect { hs_test.wait_reimage }.to hop("setup_host")
+      expect(session).to receive(:_exec!).with('[ "$(hostname)" = "rescue" ]').and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
+      expect { hs_test.wait_rescue }.to hop("setup_host")
     end
 
-    it "naps if the server is not up yet" do
+    it "naps if the server is not reachable yet" do
       session = Net::SSH::Connection::Session.allocate
       expect(Net::SSH).to receive(:start).and_yield(session)
       expect(session).to receive(:_exec!).and_raise(RuntimeError, "ssh failed")
-      expect { hs_test.wait_reimage }.to nap(15)
+      expect { hs_test.wait_rescue }.to nap(5)
+    end
+
+    it "naps if the server is up but not in rescue mode yet" do
+      session = Net::SSH::Connection::Session.allocate
+      expect(Net::SSH).to receive(:start).and_yield(session)
+      expect(session).to receive(:_exec!).with('[ "$(hostname)" = "rescue" ]').and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 1))
+      expect { hs_test.wait_rescue }.to nap(5)
     end
   end
 
   describe "#setup_host" do
-    it "hops to wait_setup_host" do
-      expect(Prog::Vm::HostNexus).to receive(:assemble).and_return(vm_host.strand)
+    it "assembles the vm host with install_os and hops to wait_setup_host" do
+      expect(Prog::Vm::HostNexus).to receive(:assemble) do |_hostname, **kwargs|
+        expect(kwargs[:install_os]).to be(true)
+        expect(kwargs[:provider_name]).to eq(HostProvider::HETZNER_PROVIDER_NAME)
+        vm_host.strand
+      end
       expect { hs_test.setup_host }.to hop("wait_setup_host")
     end
   end
@@ -102,60 +114,22 @@ RSpec.describe Prog::Test::HetznerServer do
       expect { hs_test.wait_setup_host }.to nap(15)
     end
 
-    it "hops to install_integration_specs if the host is ready" do
+    it "hops to verify_encrypted_swap if the host is ready" do
       vm_host.strand.update(label: "wait")
-      expect { hs_test.wait_setup_host }.to hop("install_integration_specs")
+      expect { hs_test.wait_setup_host }.to hop("verify_encrypted_swap")
     end
   end
 
-  describe "#install_integration_specs" do
-    it "hops to run_integration_specs if rhizome installed" do
-      expect(hs_test).to receive(:retval).and_return({"msg" => "installed rhizome"})
-      expect(hs_test).to receive(:verify_specs_installation).with(installed: true)
-      expect { hs_test.install_integration_specs }.to hop("run_integration_specs")
+  describe "#verify_encrypted_swap" do
+    it "hops to wait if swap is on dm-crypt" do
+      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("swapon --show=NAME --noheadings").and_return("/dev/dm-0\n")
+      expect { hs_test.verify_encrypted_swap }.to hop("wait")
     end
 
-    it "verifies specs haven't been installed when we setup the host & installs rhizome with specs" do
-      refresh_frame(hs_test, new_values: {"setup_host" => true})
-      expect(hs_test).to receive(:verify_specs_installation).with(installed: false)
-      expect { hs_test.install_integration_specs }.to hop("start", "InstallRhizome")
-    end
-
-    it "doesn't verify specs not installed if we didn't setup the host" do
-      refresh_frame(hs_test, new_values: {"setup_host" => false})
-      expect(hs_test).not_to receive(:verify_specs_installation)
-      expect { hs_test.install_integration_specs }.to hop("start", "InstallRhizome")
-    end
-  end
-
-  describe "#verify_specs_installation" do
-    it "succeeds when installed=false & not exists" do
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).and_return("0\n")
-      expect { hs_test.verify_specs_installation(installed: false) }.not_to raise_error
-    end
-
-    it "succeeds when installed=true & exists" do
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).and_return("5\n")
-      expect { hs_test.verify_specs_installation(installed: true) }.not_to raise_error
-    end
-
-    it "succeeds when installed=false & exists" do
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).and_return("5\n")
-      expect(hs_test).to receive(:fail_test).with("verify_specs_installation(installed: false) failed")
-      hs_test.verify_specs_installation(installed: false)
-    end
-  end
-
-  describe "#run_integration_specs" do
-    it "hops to wait" do
-      tmp_dir = "/var/storage/tests"
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo mkdir -p #{tmp_dir}")
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo chmod a+rw #{tmp_dir}")
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).with(
-        "sudo RUN_E2E_TESTS=1 bundle exec rspec host/e2e",
-      )
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo rm -rf #{tmp_dir}")
-      expect { hs_test.run_integration_specs }.to hop("wait")
+    it "fails if swap is not on dm-crypt" do
+      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("swapon --show=NAME --noheadings").and_return("/dev/nvme0n1p2\n")
+      expect(hs_test.strand).to receive(:update).with(hash_including(exitval: {msg: "swap is not on a dm-crypt device: /dev/nvme0n1p2"}))
+      expect { hs_test.verify_encrypted_swap }.to hop("failed")
     end
   end
 
@@ -165,21 +139,8 @@ RSpec.describe Prog::Test::HetznerServer do
       expect { hs_test.wait }.to hop("verify_cleanup")
     end
 
-    it "hops to disallow_slices when signaled" do
-      hs_test.incr_disallow_slices
-      expect { hs_test.wait }.to hop("disallow_slices")
-    end
-
     it "naps" do
       expect { hs_test.wait }.to nap(15)
-    end
-  end
-
-  describe "#disallow_slices" do
-    it "disallows slices" do
-      vm_host.update(accepts_slices: true)
-      expect { hs_test.disallow_slices }.to hop("wait")
-      expect(vm_host.reload.accepts_slices).to be(false)
     end
   end
 
@@ -209,22 +170,35 @@ RSpec.describe Prog::Test::HetznerServer do
 
   describe "#verify_storage_files_purged" do
     it "succeeds if /var/storage and /var/storage/vhost are empty" do
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /var/storage").and_return("vhost\nimages\n")
+      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /var/storage").and_return("vhost\nimages\ndevices\n")
       expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /var/storage/vhost").and_return("")
-      expect { hs_test.verify_storage_files_purged }.to hop("verify_resources_reclaimed")
+      expect { hs_test.verify_storage_files_purged }.to hop("verify_slices_purged")
     end
 
     it "fails if /var/storage has disks" do
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /var/storage").and_return("vhost\nimages\ndisk1\ndisk2\n")
+      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /var/storage").and_return("vhost\nimages\ndevices\ndisk1\ndisk2\n")
       expect { hs_test.verify_storage_files_purged }.to hop("failed")
       expect(strand.reload.exitval).to eq({"msg" => "VM disks not empty: [\"disk1\", \"disk2\"]"})
     end
 
     it "fails if /var/storage/vhost has files" do
-      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /var/storage").and_return("vhost\nimages\n")
+      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /var/storage").and_return("vhost\nimages\ndevices\n")
       expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /var/storage/vhost").and_return("file1\nfile2\n")
       expect { hs_test.verify_storage_files_purged }.to hop("failed")
       expect(strand.reload.exitval).to eq({"msg" => "vhost directory not empty: [\"file1\", \"file2\"]"})
+    end
+  end
+
+  describe "#verify_slices_purged" do
+    it "hops to verify_resources_reclaimed when no VM slice units remain, ignoring unrelated slices" do
+      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /etc/systemd/system").and_return("multi-user.target.wants\nsshd.service\nsystem-modprobe.slice\n")
+      expect { hs_test.verify_slices_purged }.to hop("verify_resources_reclaimed")
+    end
+
+    it "fails if any slice unit files remain" do
+      expect(hs_test.vm_host.sshable).to receive(:_cmd).with("sudo ls -1 /etc/systemd/system").and_return("sshd.service\nstandard_vm123456.slice\nburstable_vm654321.slice\n")
+      expect { hs_test.verify_slices_purged }.to hop("failed")
+      expect(strand.reload.exitval).to eq({"msg" => "VM host slices not purged: [\"standard_vm123456.slice\", \"burstable_vm654321.slice\"]"})
     end
   end
 
@@ -241,7 +215,7 @@ RSpec.describe Prog::Test::HetznerServer do
     end
 
     it "allows the SPDK-reserved cores to remain in used_cores" do
-      2.times { |i| VmHostCpu.create(vm_host_id: vm_host.id, cpu_number: i, spdk: true) }
+      2.times { |i| VmHostCpu.create(vm_host_id: vm_host.id, cpu_number: i, io: true) }
       vm_host.update(used_cores: 1)
       refresh_frame(hs_test, new_values: {"available_storage_gib" => 860})
       expect { hs_test.verify_resources_reclaimed }.to hop("destroy_vm_host")
@@ -263,16 +237,23 @@ RSpec.describe Prog::Test::HetznerServer do
       refresh_frame(hs_test, new_values: {"available_storage_gib" => 860})
       expect { hs_test.verify_resources_reclaimed }.to hop("destroy_vm_host")
     end
+
+    it "counts boot images downloaded after the baseline as reclaimed storage" do
+      vm_host.storage_devices.first.update(available_storage_gib: 710)
+      BootImage.create(vm_host_id: vm_host.id, name: "github-ubuntu-2404", version: "1", activated_at: Time.now, size_gib: 150)
+      refresh_frame(hs_test, new_values: {"available_storage_gib" => 860})
+      expect { hs_test.verify_resources_reclaimed }.to hop("destroy_vm_host")
+    end
   end
 
   describe "#destroy" do
     it "does not delete key and vm host if existing vm host used" do
-      refresh_frame(hs_test, new_values: {"setup_host" => false})
+      refresh_frame(hs_test, new_values: {"setup_host?" => false})
       expect { hs_test.destroy_vm_host }.to hop("finish")
     end
 
     it "deletes vm host" do
-      refresh_frame(hs_test, new_values: {"setup_host" => true})
+      refresh_frame(hs_test, new_values: {"setup_host?" => true})
       expect { hs_test.destroy_vm_host }.to hop("wait_vm_host_destroyed")
       expect(vm_host.destroy_set?).to be true
     end

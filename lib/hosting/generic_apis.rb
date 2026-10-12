@@ -1,101 +1,101 @@
 # frozen_string_literal: true
 
 require "ipaddr"
-require_relative "redfish_client"
 
-class Hosting::GenericApis
-  IpInfo = Struct.new(:ip_address, :source_host_ip, :is_failover, keyword_init: true)
+# Provider API for BYOH ("bring your own host") machines. Nothing here calls a
+# hosting provider: the operator declares the host's routed networks and an
+# optional Redfish BMC at registration, and this class replays that
+# declaration from host_provider.config:
+#
+#   { "main_ip4" => "192.168.1.10",
+#     "location_label" => "homelab-rack-A",
+#     "routed_networks" => [{"cidr" => "10.99.0.0/29"}, {"cidr" => "fd00:feed::/64"}],
+#     "bmc" => {"endpoint" => "https://...", "username" => "...", "password_env" => "..."} }
+class Hosting::GenericApis < Hosting::ProviderApis
+  IpInfo = Data.define(:ip_address, :source_host_ip) do
+    # The management address is claimed by the host; every declared block is
+    # routed to it and stays VM-allocatable.
+    def host_only? = ip_address == "#{source_host_ip}/32"
 
-  def initialize(host_provider)
-    @host = host_provider
+    def host_connectivity? = false
   end
 
-  def config_hash
-    @config_hash ||= @host.config || {}
-  end
-
-  # For BYOH hosts the operator declares which networks are routed to this
-  # host at registration time. We just replay that declaration — no provider
-  # API is called.
-  #
-  # Expected shape in host_provider.config:
-  #   { "routed_networks" => [
-  #       { "cidr" => "10.99.0.0/24" },
-  #       { "cidr" => "fd00:feed::/64" }    # stored on vm_host.net6 instead
-  #     ],
-  #     "main_ip4" => "192.168.1.10",
-  #     "location_label" => "homelab-rack-A",
-  #     "bmc" => { ... optional ... } }
-  #
-  # Returns only IPv4 entries — the IPv6 /64 is stored directly on
-  # vm_host.net6 at registration. The management IPv4 is auto-prepended
-  # as a /32 if it isn't already covered by a declared block, so the operator
-  # only needs to declare their VM-allocatable networks.
+  # The declared IPv4 networks, preceded by the management address as a /32
+  # unless a declared block already covers it. The IPv6 /64 is stored on
+  # vm_host.net6 at registration instead.
   def pull_ips
-    source_ip = @host.vm_host.sshable.host
-    declared = Array(config_hash["routed_networks"]).filter_map do |net|
-      cidr = net["cidr"]
-      [cidr, net] unless cidr.include?(":")
+    mgmt_ip = @provider.vm_host.sshable.host
+    cidrs = Array(config["routed_networks"]).map { it["cidr"] }.reject { it.include?(":") }
+    ip_infos = cidrs.map { IpInfo.new(ip_address: it, source_host_ip: mgmt_ip) }
+
+    mgmt_addr = IPAddr.new(mgmt_ip)
+    unless cidrs.any? { IPAddr.new(it).include?(mgmt_addr) }
+      ip_infos.unshift(IpInfo.new(ip_address: "#{mgmt_ip}/32", source_host_ip: mgmt_ip))
     end
 
-    records = declared.map do |cidr, net|
-      IpInfo.new(
-        ip_address: cidr,
-        source_host_ip: net["source_host_ip"] || source_ip,
-        is_failover: net.fetch("is_failover", false),
-      )
-    end
-
-    mgmt_ip = IPAddr.new(source_ip)
-    unless declared.any? { |cidr, _| IPAddr.new(cidr).include?(mgmt_ip) }
-      records.unshift(IpInfo.new(ip_address: "#{source_ip}/32", source_host_ip: source_ip, is_failover: false))
-    end
-
-    records
+    ip_infos
   end
 
-  def pull_dc(_server_id)
-    config_hash["location_label"] || "byoh-unknown"
-  end
-
-  # Even with a working Redfish BMC, automated reimage requires a PXE/iPXE
-  # server on the operator's network that Ubicloud does not provision for
-  # BYOH hosts. The operator must reinstall out-of-band.
-  def reimage(server_id, **)
+  # Automated reimage would need a PXE/iPXE server on the operator's network,
+  # which Ubicloud does not run for BYOH hosts.
+  def reimage
     raise Hosting::CapabilityMissing,
-      "generic provider host #{server_id} does not support automated reimage; " \
+      "generic provider host #{@provider.server_identifier} does not support automated reimage; " \
       "Ubicloud does not run a PXE/iPXE server for BYOH hosts. Reinstall the " \
       "OS out-of-band and re-run host registration."
   end
 
-  def reset(server_id)
-    bmc = config_hash["bmc"]
-    unless bmc && bmc["endpoint"] && bmc.fetch("protocol", "redfish") == "redfish"
+  def hardware_reset
+    redfish_client("hardware reset").power_reset(reset_type: bmc["reset_type"] || Hosting::RedfishClient::DEFAULT_RESET_TYPE)
+    nil
+  end
+
+  # Many BMCs reject an "On" reset for a system that is already on.
+  def power_on
+    client = redfish_client("power on")
+    client.power_reset(reset_type: "On") unless client.power_state == "On"
+    nil
+  end
+
+  def power_status
+    return "no Redfish BMC configured" unless redfish?
+
+    "redfish: #{redfish_client("power status").power_state}"
+  end
+
+  private
+
+  def config
+    @provider.config || {}
+  end
+
+  def bmc
+    config["bmc"] || {}
+  end
+
+  def redfish?
+    !bmc["endpoint"].nil? && bmc.fetch("protocol", "redfish") == "redfish"
+  end
+
+  def redfish_client(operation)
+    unless redfish?
       raise Hosting::CapabilityMissing,
-        "generic provider host #{server_id} has no Redfish BMC endpoint configured; " \
-        "hardware reset must be performed manually"
+        "generic provider host #{@provider.server_identifier} has no Redfish BMC endpoint configured; " \
+        "#{operation} must be performed manually"
     end
 
     Hosting::RedfishClient.new(
       bmc["endpoint"],
       username: bmc["username"],
-      password: bmc_password(bmc),
+      password: bmc_password,
       verify_ssl: bmc.fetch("verify_ssl", true),
       system_id: bmc["system_id"],
-    ).power_reset(reset_type: bmc["reset_type"] || Hosting::RedfishClient::DEFAULT_RESET_TYPE)
-    nil
+    )
   end
 
-  def set_server_name(_server_id, _name)
-    nil
-  end
-
-  private
-
-  # Prefer password_env (reference an env var on the control plane) over
-  # storing the password in the host_provider.config JSONB column. The DB
-  # should never hold a BMC secret in a production deployment.
-  def bmc_password(bmc)
+  # Prefer password_env (an env var on the control plane) over a password
+  # stored in the host_provider.config JSONB column.
+  def bmc_password
     if (env_key = bmc["password_env"])
       ENV[env_key]
     else

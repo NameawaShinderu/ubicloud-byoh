@@ -1,0 +1,82 @@
+# frozen_string_literal: true
+
+class Prog::Test::LocalE2eLoop < Prog::Test::Base
+  frame_reader :prog_args, :nap_between
+  frame_accessor :progs, :starts, :successes, :failures, :nap, :current_strand
+  alias_method :nap_between_seconds, :nap_between
+  alias_method :nap?, :nap
+  remove_method :nap
+
+  ALLOWED_PROGS = %w[
+    PostgresResource
+    HaPostgresResource
+    UpgradePostgresResource
+  ].freeze
+
+  semaphore :pause, :destroy
+
+  def self.check_prog(prog)
+    raise "invalid local E2E prog" unless ALLOWED_PROGS.include?(prog)
+  end
+
+  def self.assemble(progs:, nap_between: 60, **args)
+    progs.each { check_prog(it) }
+
+    Strand.create(
+      prog: name.delete_prefix("Prog::"),
+      label: "start",
+      stack: [{
+        "progs" => progs,
+        "prog_args" => args,
+        "starts" => 0,
+        "successes" => 0,
+        "failures" => 0,
+        "nap" => false,
+        "nap_between" => nap_between.clamp(0, nil),
+        "current_strand" => nil,
+      }],
+    )
+  end
+
+  def before_run
+    super
+
+    if pause_set?
+      nap(60 * 60)
+    end
+  end
+
+  label def start
+    st = Prog::Test.const_get(progs.first).assemble(local_e2e: true, **prog_args.transform_keys(&:to_sym))
+    st.update(parent_id: strand.id)
+    self.current_strand = st.id
+    self.starts += 1
+    progs.rotate!
+    hop_wait
+  end
+
+  label def wait
+    reap(:nap_between, reaper: lambda do |child|
+      self.current_strand = nil
+      if child.exitval["msg"] == "Postgres tests are finished!"
+        self.successes += 1
+      else
+        self.failures += 1
+      end
+      self.nap = true
+    end)
+  end
+
+  label def nap_between
+    if nap?
+      self.nap = false
+      nap nap_between_seconds
+    else
+      hop_start
+    end
+  end
+
+  label def destroy
+    reap { pop "destruction of local E2E loop prog requested" }
+  end
+end

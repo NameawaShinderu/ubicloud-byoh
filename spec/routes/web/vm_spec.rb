@@ -159,6 +159,7 @@ RSpec.describe Clover, "vm" do
           spdk_installation_id: spdk_installation.id,
           storage_device_id: storage_device.id,
         )
+        vm.vm_storage_volumes_dataset.destroy
         vm.add_vm_storage_volume(storage_volume)
 
         visit "#{project.path}/vm"
@@ -213,6 +214,140 @@ RSpec.describe Clover, "vm" do
         expect(Vm.first.project_id).to eq(project.id)
         expect(Vm.first.private_subnets.first.id).not_to be_nil
         expect(Vm.first.public_key).to eq "a a"
+      end
+
+      it "does not show the Machine Image card when no MI has a published latest version" do
+        create_machine_image_version_metal(project_id: project.id, location_id: Location::HETZNER_FSN1_ID, name: "unpublished", version: "v1")
+        visit "#{project.path}/vm/create"
+        expect(page).to have_no_field("boot_image", with: "__machine_image", disabled: :all)
+        expect(page).to have_no_select("machine_image")
+      end
+
+      describe "with a published machine image" do
+        let(:miv) { create_machine_image_version_metal(project_id: project.id, location_id: Location::HETZNER_FSN1_ID, name: "my-image", version: "v1", set_latest_version: true).machine_image_version }
+
+        before do
+          miv
+        end
+
+        it "shows the Machine Image boot card and machine_image select" do
+          visit "#{project.path}/vm/create"
+          expect(page).to have_field("boot_image", with: "__machine_image", count: 1, disabled: false)
+          expect(page).to have_select("machine_image", with_options: ["my-image@latest"])
+        end
+
+        it "scopes the Machine Image card to locations with a published MI" do
+          visit "#{project.path}/vm/create"
+          expect(page).to have_css("label.form_location_#{Location::HETZNER_FSN1_UBID} input[value=__machine_image]", visible: :all)
+          expect(page).to have_no_css("label.form_location_#{Location::HETZNER_HEL1_UBID} input[value=__machine_image]", visible: :all)
+        end
+
+        it "excludes other machine images without a latest version" do
+          create_machine_image_version_metal(project_id: project.id, location_id: Location::HETZNER_FSN1_ID, machine_image_store_id: miv.metal.store_id, name: "unpublished", version: "v1")
+          visit "#{project.path}/vm/create"
+          expect(page).to have_select("machine_image", with_options: ["my-image@latest"])
+          expect(page).to have_no_select("machine_image", with_options: ["unpublished@latest"])
+        end
+
+        it "is hidden when the user lacks MachineImage:view permission" do
+          other_user = create_account("other_user@example.com", with_project: false)
+          other_user.add_project(project)
+          AccessControlEntry.create(project_id: project.id, subject_id: other_user.id, action_id: ActionType::NAME_MAP["Vm:create"])
+          AccessControlEntry.create(project_id: project.id, subject_id: other_user.id, action_id: ActionType::NAME_MAP["PrivateSubnet:view"])
+          click_button "Log out"
+          login(other_user.email)
+
+          visit "#{project.path}/vm/create"
+          expect(page).to have_no_field("boot_image", with: "__machine_image", disabled: :all)
+        end
+
+        it "rejects a submission naming an MI the user cannot view" do
+          other_user = create_account("other_user@example.com", with_project: false)
+          other_user.add_project(project)
+          click_button "Log out"
+
+          AccessControlEntry.create(project_id: project.id, subject_id: other_user.id, action_id: ActionType::NAME_MAP["Vm:create"])
+          AccessControlEntry.create(project_id: project.id, subject_id: other_user.id, action_id: ActionType::NAME_MAP["PrivateSubnet:view"])
+
+          # When opening the create VM page, the user has MachineImage:view
+          # permissions so the MI card is visible.
+          mi_view_ace = AccessControlEntry.create(project_id: project.id, subject_id: other_user.id, action_id: ActionType::NAME_MAP["MachineImage:view"])
+
+          login(other_user.email)
+          visit "#{project.path}/vm/create"
+
+          fill_in "Name", with: "dummy-vm"
+          fill_in "SSH Public Key", with: "a a"
+          choose option: Location::HETZNER_FSN1_UBID
+          choose option: "__machine_image"
+          select "my-image@latest", from: "machine_image"
+          choose option: "standard-2"
+
+          # Revoke MachineImage:view before submitting the form.
+          mi_view_ace.destroy
+
+          click_button "Create"
+          expect(page).to have_flash_error("Validation failed for following fields: machine_image")
+          expect(Vm.count).to eq(0)
+        end
+
+        it "creates a vm from the picked machine image" do
+          visit "#{project.path}/vm/create"
+          fill_in "Name", with: "dummy-vm"
+          fill_in "SSH Public Key", with: "a a"
+          choose option: Location::HETZNER_FSN1_UBID
+          choose option: "__machine_image"
+          select "my-image@latest", from: "machine_image"
+          choose option: "standard-2"
+          click_button "Create"
+
+          expect(page).to have_flash_notice("'dummy-vm' will be ready in a few minutes")
+          expect(Vm.first.boot_image).to eq("my-image@latest")
+        end
+
+        it "shows an actionable inline error when the boot disk is smaller than the machine image" do
+          miv.update(actual_size_mib: 100 * 1024)
+          visit "#{project.path}/vm/create"
+          fill_in "Name", with: "dummy-vm"
+          fill_in "SSH Public Key", with: "a a"
+          choose option: Location::HETZNER_FSN1_UBID
+          choose option: "__machine_image"
+          select "my-image@latest", from: "machine_image"
+          choose option: "standard-2"
+          click_button "Create"
+
+          expect(page).to have_flash_error("Validation failed for following fields: storage_size")
+          expect(page).to have_css("#storage_size-error", exact_text: "Machine image \"my-image@latest\" requires at least 100 GiB of storage")
+          expect(Vm.count).to eq(0)
+        end
+
+        it "ignores machine_image when a base boot image is picked" do
+          visit "#{project.path}/vm/create"
+          fill_in "Name", with: "dummy-vm"
+          fill_in "SSH Public Key", with: "a a"
+          choose option: Location::HETZNER_FSN1_UBID
+          choose option: "ubuntu-jammy"
+          select "my-image@latest", from: "machine_image"
+          choose option: "standard-2"
+          click_button "Create"
+
+          expect(page).to have_flash_notice("'dummy-vm' will be ready in a few minutes")
+          expect(Vm.first.boot_image).to eq("ubuntu-jammy")
+        end
+
+        it "rejects the Machine Image card without a machine_image selection" do
+          visit "#{project.path}/vm/create"
+          fill_in "Name", with: "dummy-vm"
+          fill_in "SSH Public Key", with: "a a"
+          choose option: Location::HETZNER_FSN1_UBID
+          choose option: "__machine_image"
+          choose option: "standard-2"
+          click_button "Create"
+
+          expect(page).to have_flash_error("Validation failed for following fields: machine_image")
+          expect(page).to have_content("Pick a machine image")
+          expect(Vm.count).to eq(0)
+        end
       end
 
       it "can create new virtual machine using init script" do
@@ -712,6 +847,24 @@ RSpec.describe Clover, "vm" do
 
         expect(page.title).to eq("Ubicloud - #{vm.name}")
         expect(page).to have_content vm.name
+        expect(page).to have_content "Ubuntu Noble 24.04 LTS"
+      end
+
+      it "shows the raw boot image reference when the boot image is a machine image" do
+        vm.update(boot_image: "my-image@latest")
+        visit "#{project.path}#{vm.path}"
+        expect(page).to have_content "my-image@latest"
+      end
+
+      it "does not show storage size when virtual machine has no storage volumes" do
+        expect(vm.storage_size_gib).to be > 0
+        visit "#{project.path}#{vm.path}"
+        expect(page).to have_content "#{vm.storage_size_gib} GB"
+
+        vm.vm_storage_volumes_dataset.destroy
+        visit "#{project.path}#{vm.path}"
+        expect(page).to have_content vm.name
+        expect(page).to have_no_content(/\d+ GB/)
       end
 
       it "raises forbidden when does not have permissions" do
@@ -744,8 +897,10 @@ RSpec.describe Clover, "vm" do
         visit "#{project.path}#{vm.path}"
         within("#vm-submenu") { click_link "Networking" }
         expect(page.all("#vm-firewall-rules td").map(&:text)).to eq [
-          "default-eu-central-h1-default", "0.0.0.0/0", "0..65535",
-          "default-eu-central-h1-default", "::/0", "0..65535",
+          "default-eu-central-h1-default", "0.0.0.0/0", "TCP 0..65535",
+          "default-eu-central-h1-default", "0.0.0.0/0", "UDP 0..65535",
+          "default-eu-central-h1-default", "::/0", "TCP 0..65535",
+          "default-eu-central-h1-default", "::/0", "UDP 0..65535",
         ]
         page.all("#vm-firewall-rules td a").first.click
         expect(page.title).to eq "Ubicloud - default-eu-central-h1-default"
@@ -755,10 +910,59 @@ RSpec.describe Clover, "vm" do
         AccessControlEntry.create(project_id: project_wo_permissions.id, subject_id: user.id, action_id: ActionType::NAME_MAP["Vm:view"])
         visit "#{project_wo_permissions.path}#{vm_wo_permission.path}/networking"
         expect(page.all("#vm-firewall-rules td").map(&:text)).to eq [
-          "default-eu-central-h1-default", "0.0.0.0/0", "0..65535",
-          "default-eu-central-h1-default", "::/0", "0..65535",
+          "default-eu-central-h1-default", "0.0.0.0/0", "TCP 0..65535",
+          "default-eu-central-h1-default", "0.0.0.0/0", "UDP 0..65535",
+          "default-eu-central-h1-default", "::/0", "TCP 0..65535",
+          "default-eu-central-h1-default", "::/0", "UDP 0..65535",
         ]
         expect(page.all("#vm-firewall-rules td a").to_a).to eq []
+      end
+    end
+
+    describe "serial-log" do
+      before { vm.update(vm_host_id: create_vm_host.id) }
+
+      it "starts a fetch automatically the first time the page is visited" do
+        visit "#{project.path}#{vm.path}"
+        within("#vm-submenu") { click_link "Serial Log" }
+        expect(page).to have_content "Fetching serial console log"
+        expect(page).to have_button("Fetch latest", disabled: true)
+      end
+
+      it "shows the output once a fetch has succeeded" do
+        RunCommand.create(vm_id: vm.id, command: "fetch_serial_log", status: "succeeded", output: "boot ok", run_at: Time.now)
+        visit "#{project.path}#{vm.path}/serial-log"
+        expect(page).to have_content "boot ok"
+      end
+
+      it "disables the fetch button with a countdown while in the fetch cooldown" do
+        RunCommand.create(vm_id: vm.id, command: "fetch_serial_log", status: "succeeded", output: "boot ok", run_at: Time.now)
+        visit "#{project.path}#{vm.path}/serial-log"
+
+        button = find_button("Fetch latest", disabled: true)
+        expect(button["data-countdown-until"].to_i).to be_within(5).of(Time.now.to_i + 60)
+      end
+
+      it "does not disable the fetch button once the cooldown has passed" do
+        RunCommand.create(vm_id: vm.id, command: "fetch_serial_log", status: "succeeded", output: "boot ok", run_at: Time.now - 61)
+        visit "#{project.path}#{vm.path}/serial-log"
+        expect(page).to have_button("Fetch latest", disabled: false)
+      end
+
+      it "starts a new fetch when the fetch latest button is clicked after the cooldown" do
+        RunCommand.create(vm_id: vm.id, command: "fetch_serial_log", status: "succeeded", output: "boot ok", run_at: Time.now - 61)
+        visit "#{project.path}#{vm.path}/serial-log"
+
+        click_button "Fetch latest"
+
+        expect(page).to have_content "Fetching serial console log"
+        expect(RunCommand.where(vm_id: vm.id, command: "fetch_serial_log").first.status).to eq "created"
+      end
+
+      it "shows the error message when the last fetch failed, without exposing internal details" do
+        RunCommand.create(vm_id: vm.id, command: "fetch_serial_log", status: "failed", output: nil, run_at: Time.now)
+        visit "#{project.path}#{vm.path}/serial-log"
+        expect(page).to have_content "Failed to fetch serial console log."
       end
     end
 
@@ -786,6 +990,28 @@ RSpec.describe Clover, "vm" do
       end
     end
 
+    describe "set-maintenance-window" do
+      it "sets maintenance window to nil when empty string is passed" do
+        vm.update(maintenance_window_start_at: 9)
+        visit "#{project.path}#{vm.path}/settings"
+
+        select "No Maintenance Window", from: "maintenance_window_start_at"
+        click_button "Set"
+        expect(page).to have_flash_notice "Maintenance window is unset"
+        expect(vm.reload.maintenance_window_start_at).to be_nil
+      end
+
+      it "sets maintenance window to 0 when 0 is passed" do
+        vm.update(maintenance_window_start_at: 9)
+        visit "#{project.path}#{vm.path}/settings"
+
+        select "00:00 - 02:00 (UTC)", from: "maintenance_window_start_at"
+        click_button "Set"
+        expect(page).to have_flash_notice "Maintenance window is set"
+        expect(vm.reload.maintenance_window_start_at).to eq(0)
+      end
+    end
+
     describe "delete" do
       it "can delete virtual machine" do
         visit "#{project.path}#{vm.path}"
@@ -808,9 +1034,20 @@ RSpec.describe Clover, "vm" do
 
         expect { find ".delete-btn" }.to raise_error Capybara::ElementNotFound
       end
+
+      it "can not delete a VM that is being captured as a machine image version" do
+        metal = create_machine_image_version_metal
+        metal.update(pinned_source_vm_id: vm.id)
+
+        visit "#{project.path}#{vm.path}/settings"
+        within("#vm-delete-#{vm.ubid}") { click_button "Delete" }
+
+        expect(page).to have_flash_error("Cannot delete VM while it is being captured as a machine image version")
+        expect(SemSnap.new(vm.id).set?("destroy")).to be false
+      end
     end
 
-    %w[restart start stop].each do |action|
+    %w[restart start stop].freeze.each do |action|
       describe action do
         it "can #{action} vm" do
           if action == "start"
@@ -859,6 +1096,20 @@ RSpec.describe Clover, "vm" do
 
           expect(page).to have_no_content action.capitalize
         end
+      end
+    end
+
+    describe "start" do
+      it "can not start a VM that is being captured as a machine image version" do
+        vm.strand.update(label: "stopped")
+        metal = create_machine_image_version_metal(project_id: project.id, location_id: vm.location_id, name: "my-image", version: "v1")
+        metal.update(pinned_source_vm_id: vm.id)
+
+        visit "#{project.path}#{vm.path}"
+        within("#vm-submenu") { click_link "Settings" }
+        click_button "Start"
+        expect(page).to have_flash_error("Cannot start VM while it is being captured as a machine image version")
+        expect(vm.start_set?).to be false
       end
     end
   end

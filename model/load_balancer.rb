@@ -151,25 +151,69 @@ class LoadBalancer < Sequel::Model
       DB.ignore_duplicate_queries do
         vm_ports_dataset.where(Sequel[:load_balancer_vm_port][:id] => vm_port.id).destroy
       end
-      if vm_ports_dataset.where(load_balancer_vm_id: vm_port.load_balancer_vm_id).count.zero?
+      if vm_ports_dataset.where(load_balancer_vm_id: vm_port.load_balancer_vm_id).empty?
         load_balancer_vms_dataset[id: vm_port.load_balancer_vm_id].destroy
       end
       incr_rewrite_dns_records
     end
   end
 
+  def domain
+    (hostname_version == 2) ? Config.load_balancer_service_hostname_v2 : Config.load_balancer_service_hostname
+  end
+
   def hostname
-    custom_hostname || "#{name}.#{private_subnet.ubid[-5...]}.#{Config.load_balancer_service_hostname}"
+    if (hostname = custom_hostname)
+      return hostname
+    end
+
+    if hostname_version == 2
+      "#{name}.#{ubid}.#{domain}"
+    else
+      "#{name}.#{private_subnet.ubid[-5...]}.#{domain}"
+    end
+  end
+
+  def cert_hostname
+    if (hostname = custom_hostname)
+      return hostname
+    end
+
+    if hostname_version == 2
+      "*.#{ubid}.#{domain}"
+    else
+      self.hostname
+    end
+  end
+
+  def private_hostname
+    return if custom_hostname
+
+    if hostname_version == 2
+      "#{name}.#{ubid}.private.#{domain}"
+    else
+      "private.#{name}.#{private_subnet.ubid[-5...]}.#{domain}"
+    end
+  end
+
+  def cert_private_hostname
+    return if custom_hostname
+
+    if hostname_version == 2
+      "*.#{ubid}.private.#{domain}"
+    else
+      private_hostname
+    end
   end
 
   def dns_zone
-    custom_hostname_dns_zone || DnsZone[project_id: Config.load_balancer_service_project_id, name: Config.load_balancer_service_hostname]
+    custom_hostname_dns_zone || DnsZone[project_id: Config.load_balancer_service_project_id, name: domain]
   end
 
   def need_certificates?
     return false unless cert_enabled
 
-    certs_dataset.with_cert.needing_recert.empty?
+    certs_dataset.with_cert.fresh.empty?
   end
 
   def active_cert
@@ -213,6 +257,7 @@ end
 #  project_id                  | uuid                     | NOT NULL
 #  created_at                  | timestamp with time zone | NOT NULL DEFAULT CURRENT_TIMESTAMP
 #  cert_enabled                | boolean                  | DEFAULT false
+#  hostname_version            | integer                  | NOT NULL DEFAULT 2
 # Indexes:
 #  load_balancer_pkey                        | PRIMARY KEY btree (id)
 #  load_balancer_custom_hostname_key         | UNIQUE btree (custom_hostname)
@@ -224,6 +269,7 @@ end
 #  health_check_timeout_gt_0                     | (health_check_timeout > 0)
 #  health_check_timeout_lt_health_check_interval | (health_check_timeout <= health_check_interval)
 #  health_check_up_threshold_gt_0                | (health_check_up_threshold > 0)
+#  hostname_version_check                        | (hostname_version = ANY (ARRAY[1, 2]))
 # Foreign key constraints:
 #  load_balancer_custom_hostname_dns_zone_id_fkey | (custom_hostname_dns_zone_id) REFERENCES dns_zone(id)
 #  load_balancer_private_subnet_id_fkey           | (private_subnet_id) REFERENCES private_subnet(id)

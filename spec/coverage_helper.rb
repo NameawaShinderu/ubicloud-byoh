@@ -8,31 +8,41 @@ elsif (suite = ENV.delete("COVERAGE"))
   require "simplecov"
 
   SimpleCov.start do
-    enable_coverage :branch
-    minimum_coverage line: 100, branch: 100
-    minimum_coverage_by_file line: 100, branch: 100
-
-    command_name "#{suite}#{ENV["TEST_ENV_NUMBER"]}"
-
-    if suite == "rhizome"
-      require "pathname"
-      LOCKED_FILES = ["rhizome/kubernetes/lib/ubi_cni.rb"].map do |file|
-        Pathname.new(File.expand_path("..", __dir__)).join(file).to_s
-      end
-
-      add_filter do |file|
-        !LOCKED_FILES.include?(file.filename)
-      end
-    else
-      add_filter do |file|
-        path = file.filename.delete_prefix(File.dirname(__dir__))
-        path.match?(/\A\/(coverage|rhizome|kubernetes|migrate|spec|var|(db|model|loader|\.env)\.rb)/)
-      end
+    coverage :line, minimum: 100 do
+      minimum 100, per: :file
+    end
+    coverage :branch, minimum: 100 do
+      minimum 100, per: :file
     end
 
-    add_group("Missing") { |src| src.covered_percent < 100 }
-    add_group("Covered") { |src| src.covered_percent == 100 }
+    command_name "#{suite}#{ENV["TEST_ENV_NUMBER"]}"
+    parallel_wait_timeout 600
 
-    track_files "**/*.rb"
+    if suite == "rhizome"
+      skip do |file|
+        path = file.filename.delete_prefix(File.dirname(__dir__))
+        !path.start_with?("/rhizome/") || !path.include?("/lib/")
+      end
+
+      cover "rhizome/**/*.rb"
+    else
+      skip do |file|
+        path = file.filename.delete_prefix(File.dirname(__dir__))
+        path.match?(/\A\/(rhizome|kubernetes|migrate|ruby_lsp|spec|var|(db|model|loader|\.env)\.rb)/) ||
+          (file.relevant_lines.zero? && file.no_branches?)
+      end
+
+      # Not "**/*.rb": cover parses every matching file on disk before skip
+      # filters apply, and gems vendored into vendor/bundle in CI include
+      # fixtures that do not parse.
+      root = File.dirname(__dir__)
+      dir_globs = Dir.children(root).filter_map do |entry|
+        "#{entry}/**/*.rb" if entry != "vendor" && !entry.start_with?(".") && File.directory?(File.join(root, entry))
+      end
+      cover "*.rb", "vendor/*.rb", *dir_globs
+    end
+
+    group("Missing") { |src| src.covered_percent < 100 }
+    group("Covered") { |src| src.covered_percent == 100 }
   end
 end

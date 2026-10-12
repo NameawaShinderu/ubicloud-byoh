@@ -30,29 +30,47 @@ class Prog::Vnet::Aws::VpcNexus < Prog::Base
       enable_dns_hostnames: {value: true},
     })
 
-    security_group_response = begin
+    sg_types = private_subnet.nics.any?(&:is_management) ? ["user", "mgmt"] : ["user"]
+    user_security_group_id, mgmt_security_group_id = sg_types.map do |sg_type|
       client.create_security_group({
-        group_name: "aws-#{location.name}-#{private_subnet.ubid}",
-        description: "Security group for aws-#{location.name}-#{private_subnet.ubid}",
+        group_name: "aws-#{location.name}-#{private_subnet.ubid}-#{sg_type}",
+        description: "#{sg_type.capitalize} security group for aws-#{location.name}-#{private_subnet.ubid}",
         vpc_id: private_subnet_aws_resource.vpc_id,
         tag_specifications: Util.aws_tag_specifications("security-group", private_subnet.name),
-      })
+      }).group_id
     rescue Aws::EC2::Errors::InvalidGroupDuplicate
-      client.describe_security_groups({filters: [{name: "group-name", values: ["aws-#{location.name}-#{private_subnet.ubid}"]}]}).security_groups[0]
+      client.describe_security_groups({filters: [{name: "group-name", values: ["aws-#{location.name}-#{private_subnet.ubid}-#{sg_type}"]}]}).security_groups[0].group_id
     end
+    mgmt_security_group_id ||= user_security_group_id
 
-    private_subnet_aws_resource.update(security_group_id: security_group_response.group_id)
+    private_subnet_aws_resource.update(user_security_group_id:, mgmt_security_group_id:)
 
     private_subnet.firewalls(eager: :firewall_rules).flat_map(&:firewall_rules).each do |firewall_rule|
       next if firewall_rule.ip6?
-      allow_ingress(security_group_response.group_id, firewall_rule.port_range.first, firewall_rule.port_range.last - 1, firewall_rule.cidr.to_s)
+      allow_ingress(private_subnet_aws_resource.user_security_group_id, firewall_rule.port_range.first, firewall_rule.port_range.last - 1, firewall_rule.cidr.to_s)
     end
 
-    # Allow SSH ingress from the internet so that the controlplane can verify
-    # that the VM is running.
-    allow_ingress(security_group_response.group_id, 22, 22, "0.0.0.0/0")
-    hop_create_route_table
+    Config.control_plane_outbound_cidrs.each do |cidr|
+      allow_ingress(private_subnet_aws_resource.mgmt_security_group_id, 22, 22, cidr)
+    end
+    allow_ingress(private_subnet_aws_resource.mgmt_security_group_id, 443, 443, private_subnet.net4.to_s) if private_subnet.project.get_ff_aws_cloudwatch_logs
 
+    # The VPC's auto-created default security group can't be deleted, so
+    # strip its rules to make it inert. It may not be visible yet due to
+    # EC2's eventual consistency.
+    default_sg = client.describe_security_groups({filters: [
+      {name: "vpc-id", values: [private_subnet_aws_resource.vpc_id]},
+      {name: "group-name", values: ["default"]},
+    ]}).security_groups.first
+    nap 1 unless default_sg
+    unless default_sg.ip_permissions.empty?
+      client.revoke_security_group_ingress({group_id: default_sg.group_id, ip_permissions: default_sg.ip_permissions.map(&:to_h)})
+    end
+    unless default_sg.ip_permissions_egress.empty?
+      client.revoke_security_group_egress({group_id: default_sg.group_id, ip_permissions: default_sg.ip_permissions_egress.map(&:to_h)})
+    end
+
+    hop_create_route_table
   end
 
   label def create_route_table
@@ -146,6 +164,25 @@ class Prog::Vnet::Aws::VpcNexus < Prog::Base
     rescue Aws::EC2::Errors::ResourceAlreadyAssociated
     end
 
+    hop_create_guardduty_endpoint
+  end
+
+  label def create_guardduty_endpoint
+    hop_wait unless private_subnet.project.get_ff_aws_cloudwatch_logs
+
+    unless guardduty_endpoint
+      client.create_vpc_endpoint({
+        vpc_endpoint_type: "Interface",
+        vpc_id: private_subnet_aws_resource.vpc_id,
+        service_name: guardduty_service_name,
+        subnet_ids: private_subnet_aws_resource.aws_subnets.map(&:subnet_id),
+        security_group_ids: [private_subnet_aws_resource.mgmt_security_group_id],
+        private_dns_enabled: true,
+        tag_specifications: Util.aws_tag_specifications("vpc-endpoint", private_subnet.name),
+        client_token: private_subnet.id,
+      })
+    end
+
     hop_wait
   end
 
@@ -171,15 +208,22 @@ class Prog::Vnet::Aws::VpcNexus < Prog::Base
     private_subnet.nics.each(&:incr_destroy)
     private_subnet.remove_all_firewalls
 
-    hop_finish unless private_subnet_aws_resource
+    hop_finish unless private_subnet_aws_resource&.vpc_id
 
-    begin
+    if (endpoint = guardduty_endpoint)
+      client.delete_vpc_endpoints({vpc_endpoint_ids: [endpoint.vpc_endpoint_id]})
+    end
+
+    security_groups = client.describe_security_groups({filters: [{name: "vpc-id", values: [private_subnet_aws_resource.vpc_id]}]}).security_groups
+    security_groups.each do |sg|
+      next if sg.group_name == "default"
+
       ignore_invalid_id do
-        client.delete_security_group({group_id: private_subnet_aws_resource.security_group_id})
+        client.delete_security_group({group_id: sg.group_id})
       end
     rescue Aws::EC2::Errors::DependencyViolation => e
-      if e.message.include?("resource #{private_subnet_aws_resource.security_group_id} has a dependent object")
-        Clog.emit("Security group is in use", {security_group_in_use: {security_group_id: private_subnet_aws_resource.security_group_id}})
+      if e.message.include?("resource #{sg.group_id} has a dependent object")
+        Clog.emit("Security group is in use", {security_group_in_use: {security_group_id: sg.group_id}})
         nap 5
       end
       raise e
@@ -213,6 +257,8 @@ class Prog::Vnet::Aws::VpcNexus < Prog::Base
   end
 
   label def delete_vpc
+    hop_finish unless private_subnet_aws_resource.vpc_id
+
     begin
       client.delete_vpc({vpc_id: private_subnet_aws_resource.vpc_id})
     rescue Aws::EC2::Errors::DependencyViolation => e
@@ -252,13 +298,18 @@ class Prog::Vnet::Aws::VpcNexus < Prog::Base
   end
 
   def allow_ingress(group_id, from_port, to_port, cidr)
+    ranges = if cidr.include?(":")
+      {ipv_6_ranges: [{cidr_ipv_6: cidr}]}
+    else
+      {ip_ranges: [{cidr_ip: cidr}]}
+    end
     client.authorize_security_group_ingress({
       group_id:,
       ip_permissions: [{
         ip_protocol: "tcp",
         from_port:,
         to_port:,
-        ip_ranges: [{cidr_ip: cidr}],
+        **ranges,
       }],
     })
   rescue Aws::EC2::Errors::InvalidPermissionDuplicate
@@ -266,5 +317,16 @@ class Prog::Vnet::Aws::VpcNexus < Prog::Base
 
   def private_subnet_aws_resource
     @private_subnet_aws_resource ||= private_subnet.private_subnet_aws_resource
+  end
+
+  def guardduty_service_name
+    "com.amazonaws.#{location.name}.guardduty-data"
+  end
+
+  def guardduty_endpoint
+    client.describe_vpc_endpoints({filters: [
+      {name: "vpc-id", values: [private_subnet_aws_resource.vpc_id]},
+      {name: "service-name", values: [guardduty_service_name]},
+    ]}).vpc_endpoints.first
   end
 end

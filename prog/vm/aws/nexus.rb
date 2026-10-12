@@ -2,6 +2,16 @@
 
 class Prog::Vm::Aws::Nexus < Prog::Base
   subject_is :vm, :aws_instance
+  frame_reader :alternative_families, :private_subnet_id, :required_availability_zone, :use_eip, :create_network_interface
+  frame_accessor :unsupported_azs, :exclude_availability_zones, :use_separate_management_nic, :ssh_port_open
+
+  NETWORKD_DROPINS = <<~SCRIPT
+    mkdir -p /etc/systemd/network/10-netplan-mgmt-nic.network.d
+    cat > /etc/systemd/network/10-netplan-mgmt-nic.network.d/10-ubicloud-ipv6.conf <<'CONF'
+    [IPv6AcceptRA]
+    RouteTable=100
+    CONF
+  SCRIPT
 
   def before_destroy
     register_deadline(nil, 5 * 60)
@@ -10,7 +20,7 @@ class Prog::Vm::Aws::Nexus < Prog::Base
 
   label def start
     register_deadline("wait", 10 * 60)
-    nap 1 unless nic.strand.label == "wait"
+    nap 1 unless vm.nics.all? { it.strand.label == "wait" }
     # Cloudwatch is not needed for runner instances
     hop_create_instance if is_runner?
 
@@ -26,7 +36,7 @@ class Prog::Vm::Aws::Nexus < Prog::Base
     }.to_json
 
     ignore_invalid_entity do
-      iam_client.create_role({role_name:, assume_role_policy_document:})
+      iam_client.create_role({role_name:, assume_role_policy_document:, tags: Util.aws_tags(role_name)})
     end
 
     hop_create_role_policy
@@ -56,11 +66,16 @@ class Prog::Vm::Aws::Nexus < Prog::Base
             "arn:aws:logs:*:*:log-group:/#{vm.name}/postgresql:*",
           ],
         },
+        {
+          Effect: "Allow",
+          Action: "guardduty:SendSecurityTelemetry",
+          Resource: "*",
+        },
       ],
     }.to_json
 
     ignore_invalid_entity do
-      iam_client.create_policy({policy_name:, policy_document:})
+      iam_client.create_policy({policy_name:, policy_document:, tags: Util.aws_tags(policy_name)})
     end
 
     hop_attach_role_policy
@@ -76,7 +91,7 @@ class Prog::Vm::Aws::Nexus < Prog::Base
 
   label def create_instance_profile
     ignore_invalid_entity do
-      iam_client.create_instance_profile({instance_profile_name:})
+      iam_client.create_instance_profile({instance_profile_name:, tags: Util.aws_tags(instance_profile_name)})
     end
 
     hop_add_role_to_instance_profile
@@ -100,33 +115,20 @@ class Prog::Vm::Aws::Nexus < Prog::Base
   end
 
   label def create_instance
-    public_keys = (vm.sshable.keys.map(&:public_key) + (vm.project.get_ff_vm_public_ssh_keys || [])).join("\n")
-    # Define user data script to set a custom username
-    user_data = <<~USER_DATA
-      #!/bin/bash
-      custom_user="#{vm.unix_user}"
-      if [ ! -d /home/$custom_user ]; then
-        # Create the custom user
-        adduser $custom_user --disabled-password --gecos ""
-        # Add the custom user to the sudo group
-        usermod -aG sudo $custom_user
-        # disable password for the custom user
-        echo "$custom_user ALL=(ALL:ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/$custom_user
-        # Set up SSH access for the custom user
-        mkdir -p /home/$custom_user/.ssh
-        cp /home/ubuntu/.ssh/authorized_keys /home/$custom_user/.ssh/
-        chown -R $custom_user:$custom_user /home/$custom_user/.ssh
-        chmod 700 /home/$custom_user/.ssh
-        chmod 600 /home/$custom_user/.ssh/authorized_keys
-      fi
-      echo #{NetSsh.command(":public_keys", public_keys:)} > /home/$custom_user/.ssh/authorized_keys
-      usermod -L ubuntu
-    USER_DATA
+    public_keys = vm.sshable.keys.map(&:public_key) + (vm.project.get_ff_vm_public_ssh_keys || [])
+
+    # Accumulate commands to run as a part of cloud-init.
+    runcmd = ["usermod -L ubuntu"]
+
+    if use_separate_management_nic
+      runcmd << dual_nic_netplan_script(
+        vm.management_nic.nic_aws_resource,
+        vm.user_nic.nic_aws_resource,
+      )
+    end
 
     instance_market_options = nil
     if is_runner?
-      # Normally we use dnsmasq to resolve our transparent cache domain to local IP, but we use /etc/hosts for AWS runners
-      user_data += "\necho \"#{vm.private_ipv4} ubicloudhostplaceholder.blob.core.windows.net\" >> /etc/hosts"
       instance_market_options = if Config.github_runner_aws_spot_instance_enabled
         spot_options = {
           spot_instance_type: "one-time",
@@ -138,6 +140,44 @@ class Prog::Vm::Aws::Nexus < Prog::Base
         end
         {market_type: "spot", spot_options:}
       end
+    end
+
+    user_data = "#cloud-config\n" + {
+      "users" => [
+        "default",
+        {
+          "name" => vm.unix_user,
+          "groups" => "sudo",
+          "sudo" => "ALL=(ALL:ALL) NOPASSWD:ALL",
+          "shell" => "/bin/bash",
+          "ssh_authorized_keys" => public_keys,
+        },
+      ],
+      "runcmd" => runcmd,
+    }.to_yaml.delete_prefix("---\n")
+
+    network_interfaces_param = if !user_nic.nic_aws_resource.create_network_interface
+      # NICs we don't create ourselves have AWS create the primary network interface at
+      # launch and assign it a public IP, which is released automatically when
+      # the instance terminates.
+      [
+        {
+          device_index: 0,
+          subnet_id: user_nic.nic_aws_resource.subnet_id,
+          private_ip_address: user_nic.private_ipv4&.network&.to_s,
+          groups: [user_nic.private_subnet.private_subnet_aws_resource.user_security_group_id],
+          associate_public_ip_address: true,
+          ipv_6_address_count: 1,
+          delete_on_termination: true,
+        }.compact,
+      ]
+    elsif use_separate_management_nic
+      [
+        {network_interface_id: vm.management_nic.nic_aws_resource.network_interface_id, device_index: 0},
+        {network_interface_id: vm.user_nic.nic_aws_resource.network_interface_id, device_index: 1},
+      ]
+    else
+      [{network_interface_id: vm.user_nic.nic_aws_resource.network_interface_id, device_index: 0}]
     end
 
     params = {
@@ -156,12 +196,7 @@ class Prog::Vm::Aws::Nexus < Prog::Base
           },
         },
       ],
-      network_interfaces: [
-        {
-          network_interface_id: nic.nic_aws_resource.network_interface_id,
-          device_index: 0,
-        },
-      ],
+      network_interfaces: network_interfaces_param,
       private_dns_name_options: {
         hostname_type: "ip-name",
         enable_resource_name_dns_a_record: false,
@@ -171,8 +206,8 @@ class Prog::Vm::Aws::Nexus < Prog::Base
       min_count: 1,
       max_count: 1,
       user_data: Base64.encode64(user_data.gsub(/^(\s*# .*)?\n/, "")),
-      tag_specifications: Util.aws_tag_specifications("instance", vm.name),
-      client_token: vm.id,
+      tag_specifications: Util.aws_tag_specifications("instance", vm.name) + Util.aws_tag_specifications("volume", vm.name),
+      client_token: "#{vm.id}-#{vm.family}",
       instance_market_options:,
     }
     params[:iam_instance_profile] = {name: instance_profile_name} unless is_runner?
@@ -183,7 +218,7 @@ class Prog::Vm::Aws::Nexus < Prog::Base
       raise
     rescue Aws::EC2::Errors::InsufficientInstanceCapacity => e
       if is_runner? && (runner = GithubRunner[vm_id: vm.id])
-        next_family = if (families = frame["alternative_families"])
+        next_family = if (families = alternative_families)
           index = families.index(vm.family) || -1
           families[index + 1]
         end
@@ -197,9 +232,9 @@ class Prog::Vm::Aws::Nexus < Prog::Base
         nap 60
       end
 
-      retry_in_different_az(e)
+      retry_in_different_az(e, :transient)
     rescue Aws::EC2::Errors::Unsupported => e
-      retry_in_different_az(e)
+      retry_in_different_az(e, :unsupported)
     end
     instance = instance_response.instances.first
     instance_id = instance.instance_id
@@ -208,34 +243,71 @@ class Prog::Vm::Aws::Nexus < Prog::Base
     az_id = subnet_response.subnets.first.availability_zone_id
     ipv4_dns_name = instance.public_dns_name
 
+    unless user_nic.nic_aws_resource.create_network_interface
+      network_interface = instance.network_interfaces.first
+      user_nic.update(private_ipv4: network_interface.private_ip_address)
+      user_nic.nic_aws_resource.update(network_interface_id: network_interface.network_interface_id)
+    end
+
     AwsInstance.create_with_id(vm, instance_id:, az_id:, ipv4_dns_name:, iam_role: role_name)
 
     hop_wait_instance_created
   end
 
   label def wait_old_nic_deleted
-    nap 1 if nic&.reload
-    nic = Prog::Vnet::NicNexus.assemble(frame["private_subnet_id"], name: vm.name + "-nic", exclude_availability_zones: frame["exclude_availability_zones"]).subject
-    nic.update(vm_id: vm.id)
+    nap 1 if vm.nics.any?
+    # Combine permanent (unsupported_azs) and transient (exclude_availability_zones)
+    # exclusions when creating the replacement NIC in a different AZ.
+    all_excluded_azs = ((unsupported_azs || []) + (exclude_availability_zones || [])).uniq
+    availability_zone = Prog::Vnet::NicNexus.select_aws_subnet(PrivateSubnet[private_subnet_id], nil, all_excluded_azs).az_suffix if use_separate_management_nic
+    user_nic = Prog::Vnet::NicNexus.assemble(private_subnet_id, name: vm.name + "-nic", exclude_availability_zones: all_excluded_azs, availability_zone:, use_eip: use_eip != false, create_network_interface: create_network_interface != false).subject
+    user_nic.update(vm_id: vm.id)
+    if use_separate_management_nic
+      management_nic = Prog::Vnet::NicNexus.assemble(private_subnet_id, name: vm.name + "-mgmt-nic", exclude_availability_zones: all_excluded_azs, availability_zone:, is_management: true, use_eip: !postgres_aws_ssh_ipv6?).subject
+      management_nic.update(vm_id: vm.id)
+    end
     hop_wait_nic_recreated
   end
 
   label def wait_nic_recreated
-    nap 1 unless nic.strand.label == "wait"
+    nap 1 unless vm.nics.all? { it.strand.label == "wait" }
     hop_create_instance
   end
 
   label def wait_instance_created
-    unless (reservation = client.describe_instances({filters: [{name: "instance-id", values: [aws_instance.instance_id]}, {name: "tag:Ubicloud", values: ["true"]}]}).reservations.first) &&
-        (instance_response = reservation.instances.first) &&
-        instance_response.dig(:state, :name) == "running"
-      nap 1
+    reservation = client.describe_instances({filters: [{name: "instance-id", values: [aws_instance.instance_id]}, {name: "tag:Ubicloud", values: [Config.provider_resource_tag_value]}]}).reservations.first
+    instance_response = reservation&.instances&.first
+    state = instance_response&.dig(:state, :name)
+
+    if state == "terminated" && instance_response.dig(:state_reason, :code) == "Server.InternalError" && is_runner? && (runner = GithubRunner[vm_id: vm.id])
+      if runner.provision_spare_runner
+        Clog.emit("aws internal error on launch", {aws_internal_error_on_launch: {vm:, message: instance_response.dig(:state_reason, :message)}})
+        runner.incr_destroy
+      end
+      nap 60 * 60
     end
-    public_ipv4 = instance_response.dig(:network_interfaces, 0, :association, :public_ip)
-    public_ipv6 = instance_response.dig(:network_interfaces, 0, :ipv_6_addresses, 0, :ipv_6_address)
+
+    nap 1 unless state == "running"
+
+    user_nic_response = instance_response.network_interfaces.find { it.network_interface_id == user_nic.nic_aws_resource.network_interface_id }
+    public_ipv4 = user_nic_response.association.public_ip
+    public_ipv6 = user_nic_response.ipv_6_addresses.first.ipv_6_address
+    ssh_host = if use_separate_management_nic
+      aws_instance.update(ipv4_dns_name: user_nic_response.association.public_dns_name)
+
+      mgmt_nic_response = instance_response.network_interfaces.find { it.attachment.device_index == 0 }
+      if postgres_aws_ssh_ipv6?
+        mgmt_nic_response.ipv_6_addresses.first.ipv_6_address
+      else
+        mgmt_nic_response.association.public_ip
+      end
+    else
+      public_ipv4
+    end
     AssignedVmAddress.create(dst_vm_id: vm.id, ip: public_ipv4)
-    vm.sshable&.update(host: public_ipv4)
+    vm.sshable&.update(host: ssh_host)
     vm.update(cores: vm.vcpus / 2, allocated_at: Time.now, ephemeral_net6: public_ipv6)
+    wakeup_waiting_strand("allocated_waiting_strand_id")
 
     hop_wait_sshable
   end
@@ -248,13 +320,27 @@ class Prog::Vm::Aws::Nexus < Prog::Base
       # to reduce the amount of load on the control plane unnecessarily.
       nap 6
     end
-    addr = vm.ip4
-    hop_create_billing_record unless addr
 
-    begin
-      Socket.tcp(addr.to_s, 22, connect_timeout: 1) {}
-    rescue SystemCallError
-      nap 1
+    unless ssh_port_open
+      addr = use_separate_management_nic ? vm.sshable.host : vm.ip4
+      hop_create_billing_record unless addr
+
+      begin
+        Socket.tcp(addr.to_s, 22, connect_timeout: 1) {}
+      rescue SystemCallError
+        nap 1
+      end
+    end
+
+    # An open port is not enough: cloud-init installs the key after sshd starts.
+    if (sshable = vm.sshable)
+      begin
+        sshable.cmd("true", timeout: 5)
+      rescue Net::SSH::AuthenticationFailed, Sshable::SshTimeout, *Sshable::SSH_CONNECTION_ERRORS
+        # The port answered, so the next tick can go straight to ssh.
+        self.ssh_port_open = true
+        nap 1
+      end
     end
 
     hop_create_billing_record
@@ -266,7 +352,7 @@ class Prog::Vm::Aws::Nexus < Prog::Base
     Clog.emit("vm provisioned", [vm, {provision: {vm_ubid: vm.ubid, instance_id: vm.aws_instance.instance_id, duration: (Time.now - vm.allocated_at).round(3)}}])
 
     project = vm.project
-    hop_wait unless project.billable
+    hop_wait_and_wakeup_waiting_strand unless project.billable
 
     BillingRecord.create(
       project_id: project.id,
@@ -276,7 +362,7 @@ class Prog::Vm::Aws::Nexus < Prog::Base
       amount: vm.vcpus,
     )
 
-    hop_wait
+    hop_wait_and_wakeup_waiting_strand
   end
 
   label def wait
@@ -289,7 +375,7 @@ class Prog::Vm::Aws::Nexus < Prog::Base
   end
 
   label def update_firewall_rules
-    if retval&.dig("msg") == "firewall rule is added"
+    if retval&.dig("msg") == "firewall rules synced"
       hop_wait
     end
 
@@ -357,6 +443,15 @@ class Prog::Vm::Aws::Nexus < Prog::Base
       end
     end
 
+    # Inline policies block delete_role, so drop them before deleting the role.
+    ignore_invalid_entity do
+      iam_client.list_role_policies(role_name:).policy_names.each do |policy_name|
+        ignore_invalid_entity do
+          iam_client.delete_role_policy(role_name:, policy_name:)
+        end
+      end
+    end
+
     ignore_invalid_entity do
       iam_client.delete_role({role_name:})
     end
@@ -366,13 +461,20 @@ class Prog::Vm::Aws::Nexus < Prog::Base
   end
 
   def final_clean_up
-    nic.update(vm_id: nil)
-    nic.incr_destroy
+    vm.nics.each do |nic|
+      nic.update(vm_id: nil)
+      nic.incr_destroy
+    end
     vm.destroy
   end
 
-  def nic
-    @nic ||= vm.nic
+  def user_nic
+    @user_nic ||= vm.user_nic
+  end
+
+  def postgres_aws_ssh_ipv6?
+    subnet = PrivateSubnet[private_subnet_id]
+    subnet.project.get_ff_postgres_aws_ssh_ipv6 && subnet.dedicated_mgmt_security_group?
   end
 
   def client
@@ -419,18 +521,79 @@ class Prog::Vm::Aws::Nexus < Prog::Base
     @is_runner = vm.unix_user == "runneradmin"
   end
 
-  def retry_in_different_az(e)
-    if (retry_count = frame["retry_count"] || 0) >= 5
-      Clog.emit("resetting excluding azs to retry", {retry_different_az_failed: {vm:, error: e.class.name, message: e.message, retry_count:}})
-      update_stack({"exclude_availability_zones" => nil, "retry_count" => 0})
-      nap 5 * 60
+  # Two-tier AZ exclusion: unsupported_azs (permanent, from multi-AZ constraints
+  # and Unsupported errors) and exclude_availability_zones (transient, InsufficientCapacity only).
+  # All unsupported: try family fallback, else page + 1hr nap. All tried: try family fallback, else reset transient + 5min.
+  def retry_in_different_az(e, az_failure_type)
+    return retry_in_required_az(e) if required_availability_zone
+
+    unsupported_azs = self.unsupported_azs || []
+    exclude_availability_zones = self.exclude_availability_zones || []
+    current_az = user_nic.nic_aws_resource.subnet_az
+
+    unless [:unsupported, :transient].include?(az_failure_type)
+      fail "unexpected az_failure_type: #{az_failure_type}"
+    end
+    if az_failure_type == :unsupported
+      unsupported_azs = (unsupported_azs + [current_az]).uniq
+    else
+      exclude_availability_zones = (exclude_availability_zones + [current_az]).uniq
     end
 
-    Clog.emit("retrying in different az", {retry_different_az: {vm:, error: e.class.name, message: e.message, retry_count: retry_count + 1}})
-    azs_excluded = ((nic.strand.stack.first["exclude_availability_zones"] || []) + [nic.nic_aws_resource.subnet_az]).uniq
-    update_stack({"exclude_availability_zones" => azs_excluded, "retry_count" => retry_count + 1})
-    nic.incr_destroy
-    hop_wait_old_nic_deleted
+    total_azs = user_nic.private_subnet.private_subnet_aws_resource.aws_subnets.count
+    all_tried = (unsupported_azs + exclude_availability_zones).uniq.size >= total_azs
+
+    if all_tried && try_postgres_family_fallback
+      self.unsupported_azs = []
+      self.exclude_availability_zones = []
+      nap 0
+    end
+
+    if all_tried && unsupported_azs.size >= total_azs
+      Clog.emit("all azs unsupported for instance type", {retry_different_az_unsupported: {vm:, error: e.class.name, message: e.message, unsupported_azs:}})
+      Prog::PageNexus.assemble("#{vm.name} instance type unsupported in all AZs", ["InstanceTypeUnsupported", vm.id], vm.ubid, resource_id: vm.id)
+      self.unsupported_azs = unsupported_azs
+      self.exclude_availability_zones = []
+      nap 60 * 60
+    elsif all_tried
+      Clog.emit("resetting transient az exclusions", {retry_different_az_reset: {vm:, error: e.class.name, message: e.message, unsupported_azs:, exclude_availability_zones:}})
+      self.unsupported_azs = unsupported_azs
+      self.exclude_availability_zones = []
+      nap 5 * 60
+    else
+      Clog.emit("retrying in different az", {retry_different_az: {vm:, error: e.class.name, message: e.message, unsupported_azs:, exclude_availability_zones:}})
+      self.unsupported_azs = unsupported_azs
+      self.exclude_availability_zones = exclude_availability_zones
+      vm.nics.each(&:incr_destroy)
+      hop_wait_old_nic_deleted
+    end
+  end
+
+  def retry_in_required_az(e)
+    Clog.emit("retrying in required az", {retry_required_az: {vm:, error: e.class.name, message: e.message, availability_zone: required_availability_zone}})
+    try_postgres_family_fallback
+    nap 60
+  end
+
+  def try_postgres_family_fallback
+    ps = PostgresServer[vm_id: vm.id]
+    return false unless ps&.fallback_eligible?
+
+    candidates = Option.postgres_fallback_candidates(vm.family)
+    return false if candidates.empty?
+
+    option_tree, parents = PostgresResource.generate_postgres_options(ps.resource.project, flavor: ps.resource.flavor, location: ps.resource.location)
+    allowed_families = OptionTreeGenerator.generate_allowed_options("family", option_tree, parents).map { it["family"] }.uniq
+
+    next_family = candidates.find { |f| allowed_families.include?(f) }
+    return false unless next_family
+
+    Clog.emit("postgres az exhausted, trying fallback family", {postgres_family_fallback: {vm:, from: vm.family, to: next_family}})
+    DB.transaction do
+      vm.update(family: next_family)
+      ps.incr_ignore_instance_size_mismatch unless ps.ignore_instance_size_mismatch_set?
+    end
+    true
   end
 
   def ignore_invalid_entity
@@ -440,5 +603,42 @@ class Prog::Vm::Aws::Nexus < Prog::Base
     Aws::IAM::Errors::NoSuchEntity,
     Aws::IAM::Errors::EntityAlreadyExists => e
     Clog.emit("ID not found or already exists for aws instance", {ignored_aws_instance_failure: Util.exception_to_hash(e, backtrace: nil)})
+  end
+
+  def dual_nic_netplan_script(mgmt_nar, user_nar)
+    nis = client.describe_network_interfaces(network_interface_ids: [mgmt_nar.network_interface_id, user_nar.network_interface_id])
+      .network_interfaces.to_h { [it.network_interface_id, it] }
+
+    guardduty_ips = if vm.project.get_ff_aws_cloudwatch_logs
+      endpoint = client.describe_vpc_endpoints(filters: [
+        {name: "vpc-id", values: [vm.user_nic.private_subnet.private_subnet_aws_resource.vpc_id]},
+        {name: "service-name", values: ["com.amazonaws.#{vm.location.name}.guardduty-data"]},
+      ]).vpc_endpoints.first
+      client.describe_network_interfaces(network_interface_ids: endpoint.network_interface_ids).network_interfaces.map(&:private_ip_address)
+    else
+      [].freeze
+    end
+
+    subnet6 = if postgres_aws_ssh_ipv6?
+      fail "AWS subnet #{user_nar.aws_subnet.id} is missing ipv6_cidr" if user_nar.aws_subnet.ipv6_cidr.to_s.empty?
+      NetAddr::IPv6Net.parse(user_nar.aws_subnet.ipv6_cidr.to_s)
+    end
+
+    netplan = AwsDualNicNetplan.new(
+      mgmt: nis[mgmt_nar.network_interface_id],
+      user: nis[user_nar.network_interface_id],
+      subnet: NetAddr::IPv4Net.parse(user_nar.aws_subnet.ipv4_cidr.to_s),
+      guardduty_ips:,
+      subnet6:,
+    )
+    <<~SCRIPT
+      set -e
+      echo 'network: {config: disabled}' > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+      rm -f /etc/netplan/50-cloud-init.yaml
+      echo #{NetSsh.command(":yaml", yaml: netplan.to_yaml.chomp)} > /etc/netplan/61-ubicloud.yaml
+      chmod 600 /etc/netplan/61-ubicloud.yaml
+      #{NETWORKD_DROPINS if netplan.networkd_dropin?}
+      netplan apply
+    SCRIPT
   end
 end

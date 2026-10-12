@@ -150,6 +150,28 @@ RSpec.describe Prog::Vnet::SubnetNexus do
       expect(SecureRandom).to receive(:random_number).with(2**(10 - 8) - 1).and_return(1)
       expect(described_class.random_private_ipv4(Location[name: "hetzner-fsn1"], project, 10).to_s).to eq("10.128.0.0/10")
     end
+
+    context "when ipv4_subnet_collision_check_disabled is set" do
+      before do
+        allow(Config).to receive(:ipv4_subnet_collision_check_disabled).and_return(true)
+      end
+
+      it "returns the selected subnet even if it is already taken" do
+        expect(PrivateSubnet).to receive(:random_subnet).once.and_return("10.0.0.0/8")
+        project = Project.create(name: "test-project")
+        described_class.assemble(project.id, location_id: Location::HETZNER_FSN1_ID, name: "test-subnet", ipv4_range: "10.0.0.128/26")
+        allow(SecureRandom).to receive(:random_number).with(2**(26 - 8) - 1).and_return(1)
+        expect(described_class.random_private_ipv4(Location[name: "hetzner-fsn1"], project).to_s).to eq("10.0.0.128/26")
+      end
+
+      it "still finds a new subnet if the one it found is banned" do
+        expect(PrivateSubnet).to receive(:random_subnet).and_return("172.16.0.0/16", "10.0.0.0/8")
+        project = Project.create(name: "test-project")
+        allow(SecureRandom).to receive(:random_number).with(2**(26 - 16) - 1).and_return(1)
+        allow(SecureRandom).to receive(:random_number).with(2**(26 - 8) - 1).and_return(1)
+        expect(described_class.random_private_ipv4(Location[name: "hetzner-fsn1"], project).to_s).to eq("10.0.0.128/26")
+      end
+    end
   end
 
   describe ".create_aws_subnet_records" do
@@ -167,7 +189,7 @@ RSpec.describe Prog::Vnet::SubnetNexus do
       ps_aws_resource = PrivateSubnetAwsResource.create_with_id(small_ps.id)
 
       expect {
-        described_class.create_aws_subnet_records(small_ps, ps_aws_resource, aws_location, 30, preferred_azs: [])
+        described_class.create_aws_subnet_records(small_ps, ps_aws_resource, aws_location, 30)
       }.to raise_error("Not enough subnet space for even a single AZ. Use a range size <= 28")
     end
 
@@ -184,6 +206,15 @@ RSpec.describe Prog::Vnet::SubnetNexus do
 
       # Should have created 4 subnets, not 5
       expect(AwsSubnet.where(private_subnet_aws_resource_id: ps_aws_resource.id).count).to eq(4)
+    end
+
+    it "creates AZ subnets of the given size" do
+      LocationAz.create(location_id: aws_location.id, az: "a", zone_id: "usw2-az1")
+      LocationAz.create(location_id: aws_location.id, az: "b", zone_id: "usw2-az2")
+
+      ps = described_class.assemble(prj.id, location_id: aws_location.id, ipv4_range: "10.1.0.0/16", aws_subnet_ipv4_range_size: 20).subject
+
+      expect(ps.private_subnet_aws_resource.aws_subnets_dataset.order(:ipv4_cidr).map { it.ipv4_cidr.to_s }).to eq(["10.1.0.0/20", "10.1.16.0/20"])
     end
   end
 

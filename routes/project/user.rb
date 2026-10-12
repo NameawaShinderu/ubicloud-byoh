@@ -34,7 +34,7 @@ class Clover
             end
           end
 
-          user = Account.exclude(status_id: 3)[email:]
+          user = Account.open_with_email(email)
 
           DB.transaction do
             @project.add_invitation(email:, policy: (policy if tag), inviter_id: current_account_id, expires_at: Time.now + 7 * 24 * 60 * 60)
@@ -122,7 +122,7 @@ class Clover
           additions.transform_keys!(&:name)
           removals.transform_keys!(&:name)
 
-          if @project.subject_tags_dataset.first(name: "Admin").member_ids.empty?
+          unless @project.subject_tags_dataset.first(name: "Admin").member_ids.any? { UBID.uuid_class_match?(it, Account) }
             raise_web_error("The project must have at least one admin.")
           end
 
@@ -240,7 +240,7 @@ class Clover
           end
         end
 
-        r.on "tag", %w[subject action object] do |tag_type|
+        r.on "tag", %w[subject action object].freeze do |tag_type|
           @tag_type = tag_type
           @display_tag_type = tag_type.capitalize
           @tag_model = Object.const_get(:"#{@display_tag_type}Tag")
@@ -335,6 +335,10 @@ class Clover
               # entries and that will not introduce loops
               DB.transaction do
                 num_removed = @tag.remove_members(to_remove)
+                if num_removed != to_remove.length
+                  raise Sequel::ValidationFailed, "Attempt to remove a member not in the tag"
+                end
+
                 audit_log(@tag, "remove_member", to_remove)
 
                 if @tag_type == "subject" && @tag.name == "Admin" && !@tag.member_ids.find { UBID.uuid_class_match?(it, Account) }
@@ -371,13 +375,22 @@ class Clover
 
         next unless (user = @project.accounts_dataset[id:])
 
-        unless @project.accounts_dataset.count > 1
-          raise_web_error("You can't remove the last user from '#{@project.name}' project. Delete project instead.")
-        end
+        DB.transaction(isolation: :serializable) do
+          unless @project.accounts_dataset.count > 1
+            raise_web_error("You can't remove the last user from '#{@project.name}' project. Delete project instead.")
+          end
+          if @project.sole_admin?(user)
+            raise_web_error("You can't remove the last admin from '#{@project.name}' project.")
+          end
 
-        @project.disassociate_subject(user.id)
-        user.remove_project(@project)
-        audit_log(@project, "remove_account", user)
+          @project.disassociate_subject(user.id)
+          # ProjectInvitation doesn't use ResourceMethods
+          DB.ignore_duplicate_queries do
+            @project.invitations_dataset.where(inviter_id: user.id).destroy
+          end
+          user.remove_project(@project)
+          audit_log(@project, "remove_account", user)
+        end
 
         if project_list
           flash["notice"] = "Removed your access to the project"

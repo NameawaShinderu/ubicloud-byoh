@@ -3,7 +3,7 @@
 require_relative "../lib/hugepages_setup"
 
 RSpec.describe HugepagesSetup do
-  let(:logger) { instance_double(Logger, warn: nil) }
+  let(:logger) { instance_double(Logger, warn: nil, info: nil) }
   let(:hugepages_setup) { described_class.new("17-main", logger) }
 
   describe "#setup_postgres_hugepages" do
@@ -42,6 +42,142 @@ RSpec.describe HugepagesSetup do
       expect(hugepages_setup).not_to receive(:update_postgres_hugepages_conf)
       expect(logger).to receive(:warn).with("No hugepages configured, skipping setup.")
       expect { hugepages_setup.setup_postgres_hugepages }.not_to raise_error
+    end
+  end
+
+  describe "#hugepage_info" do
+    it "parses hugepage count and size from /proc/meminfo" do
+      meminfo = "HugePages_Total:     512\nHugepagesize:       2048 kB\n"
+      expect(File).to receive(:read).with("/proc/meminfo").and_return(meminfo)
+      count, size = hugepages_setup.hugepage_info
+      expect(count).to eq(512)
+      expect(size).to eq(2048)
+    end
+  end
+
+  describe "#get_postgres_param" do
+    it "returns the integer value of a postgres parameter" do
+      expect(hugepages_setup).to receive(:_run_command).with(
+        "sudo", "-u", "postgres", "/usr/lib/postgresql/17/bin/postgres", "-D", "/dat/17/data", "-c", "config_file=/etc/postgresql/17/main/postgresql.conf", "-C", "shared_buffers",
+      ).and_return("131072\n")
+      expect(hugepages_setup.get_postgres_param("shared_buffers")).to eq(131072)
+    end
+  end
+
+  describe "#stop_postgres_cluster" do
+    it "stops the postgres cluster (exit 0 or 2)" do
+      expect(hugepages_setup).to receive(:_run_command).with("sudo", "pg_ctlcluster", "stop", "17", "main", expect: [0, 2])
+      hugepages_setup.stop_postgres_cluster
+    end
+  end
+
+  describe "#update_postgres_hugepages_conf" do
+    it "writes the hugepages configuration file" do
+      expect(hugepages_setup).to receive(:safe_write_to_file).with(
+        "/etc/postgresql/17/main/conf.d/002-hugepages.conf",
+        satisfy { |s| s.include?("huge_pages = 'on'") && s.include?("524288kB") },
+      )
+      hugepages_setup.update_postgres_hugepages_conf(524288)
+    end
+  end
+
+  describe "#postgres_running?" do
+    it "returns false when postgres is not running (exit 3)" do
+      expect(hugepages_setup).to receive(:_run_command).with("sudo", "pg_ctlcluster", "status", "17", "main", expect: [3]).and_return("")
+      expect(hugepages_setup.postgres_running?).to be false
+    end
+
+    it "returns true when postgres is running (r raises CommandFail)" do
+      expect(hugepages_setup).to receive(:_run_command).with("sudo", "pg_ctlcluster", "status", "17", "main", expect: [3]).and_raise(CommandFail.new("error", "", ""))
+      expect(hugepages_setup.postgres_running?).to be true
+    end
+  end
+
+  describe "#target_percent" do
+    it "returns the configured percent" do
+      expect(hugepages_setup).to receive(:get_postgres_param)
+        .with("ubicloud.shared_memory_percent").and_return(50)
+      expect(hugepages_setup.target_percent).to eq(50)
+    end
+
+    it "returns the configured percent as-is, leaving the bounds to the control plane" do
+      expect(hugepages_setup).to receive(:get_postgres_param)
+        .with("ubicloud.shared_memory_percent").and_return(90)
+      expect(hugepages_setup.target_percent).to eq(90)
+    end
+
+    it "falls back to 25 when the percent is set nowhere" do
+      expect(hugepages_setup).to receive(:get_postgres_param)
+        .with("ubicloud.shared_memory_percent").and_raise(CommandFail.new("failed", "", "unrecognized configuration parameter"))
+      expect(logger).not_to receive(:warn)
+      expect(hugepages_setup.target_percent).to eq(25)
+    end
+  end
+
+  describe "#reconcile_hugepages" do
+    # 8 GiB, 2 MiB hugepages, 1024 currently allocated == 25% of memory.
+    let(:meminfo) { "MemTotal:        8388608 kB\nHugepagesize:       2048 kB\nHugePages_Total:    1024\n" }
+    # Same VM after the pool grew to 50% (2048 pages).
+    let(:meminfo_allocated) { "MemTotal:        8388608 kB\nHugepagesize:       2048 kB\nHugePages_Total:    2048\n" }
+
+    it "does nothing when the current allocation already matches the target" do
+      allow(hugepages_setup).to receive(:target_percent).and_return(25)
+      expect(File).to receive(:read).with("/proc/meminfo").and_return(meminfo)
+      expect(hugepages_setup).not_to receive(:_run_command)
+      hugepages_setup.reconcile_hugepages
+    end
+
+    it "reclaims memory before growing the pool" do
+      allow(hugepages_setup).to receive(:target_percent).and_return(50)
+      # 50% of 8 GiB / 2 MiB = 2048 pages; the second read confirms the allocation landed.
+      expect(File).to receive(:read).with("/proc/meminfo").and_return(meminfo, meminfo_allocated)
+      expect(hugepages_setup).to receive(:_run_command).with("echo vm.nr_hugepages\\ \\=\\ 2048 | sudo tee /etc/sysctl.d/10-hugepages.conf")
+      expect(hugepages_setup).to receive(:_run_command).with("sync")
+      expect(hugepages_setup).to receive(:_run_command).with("echo 3 | sudo tee /proc/sys/vm/drop_caches")
+      expect(hugepages_setup).to receive(:_run_command).with("echo 1 | sudo tee /proc/sys/vm/compact_memory")
+      expect(hugepages_setup).to receive(:_run_command).with("sudo sysctl --system")
+      expect(logger).not_to receive(:warn)
+      hugepages_setup.reconcile_hugepages
+    end
+
+    it "shrinks the pool without dropping caches or compacting" do
+      allow(hugepages_setup).to receive(:target_percent).and_return(25)
+      # Starts at 50% (2048 pages) and drops back to 25% (1024). Handing pages
+      # back needs no contiguous memory, so the reclaim steps are skipped.
+      expect(File).to receive(:read).with("/proc/meminfo").and_return(meminfo_allocated, meminfo)
+      expect(hugepages_setup).to receive(:_run_command).with("echo vm.nr_hugepages\\ \\=\\ 1024 | sudo tee /etc/sysctl.d/10-hugepages.conf")
+      expect(hugepages_setup).to receive(:_run_command).with("sudo sysctl --system")
+      expect(hugepages_setup).not_to receive(:_run_command).with("sync")
+      expect(hugepages_setup).not_to receive(:_run_command).with("echo 3 | sudo tee /proc/sys/vm/drop_caches")
+      expect(hugepages_setup).not_to receive(:_run_command).with("echo 1 | sudo tee /proc/sys/vm/compact_memory")
+      expect(logger).not_to receive(:warn)
+      hugepages_setup.reconcile_hugepages
+    end
+
+    it "warns but proceeds when the allocation falls short of the target" do
+      allow(hugepages_setup).to receive(:target_percent).and_return(50)
+      # Both reads show only 1024 allocated: the grow partially failed under fragmentation.
+      expect(File).to receive(:read).with("/proc/meminfo").and_return(meminfo, meminfo)
+      allow(hugepages_setup).to receive(:_run_command)
+      expect(logger).to receive(:warn).with("Hugepage allocation fell short: requested 2048, allocated 1024.")
+      hugepages_setup.reconcile_hugepages
+    end
+  end
+
+  describe "#setup" do
+    it "reconciles, stops postgres and runs hugepages setup when postgres is not running" do
+      expect(hugepages_setup).to receive(:postgres_running?).and_return(false)
+      expect(hugepages_setup).to receive(:stop_postgres_cluster)
+      expect(hugepages_setup).to receive(:reconcile_hugepages)
+      expect(hugepages_setup).to receive(:setup_postgres_hugepages)
+      hugepages_setup.setup
+    end
+
+    it "does nothing when postgres is already running" do
+      expect(hugepages_setup).to receive(:postgres_running?).and_return(true)
+      expect(hugepages_setup).not_to receive(:stop_postgres_cluster)
+      expect(hugepages_setup).not_to receive(:setup_postgres_hugepages)
+      hugepages_setup.setup
     end
   end
 end

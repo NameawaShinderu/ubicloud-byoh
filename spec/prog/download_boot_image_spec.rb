@@ -12,6 +12,20 @@ RSpec.describe Prog::DownloadBootImage do
   let(:sshable) { dbi.sshable }
   let(:vm_host) { dbi.vm_host }
 
+  describe ".sha256sum" do
+    it "fails if image is unknown in production" do
+      allow(Config).to receive(:production?).and_return(true)
+      refresh_frame(dbi, new_values: {"version" => "20260101"})
+      expect { dbi.sha256sum }.to raise_error RuntimeError, "Cannot download images without a SHA256 checksum in production"
+    end
+
+    it "allows to download unknown images in development" do
+      allow(Config).to receive(:production?).and_return(false)
+      refresh_frame(dbi, new_values: {"version" => "20260101"})
+      expect(dbi.sha256sum).to be_nil
+    end
+  end
+
   describe "#start" do
     it "creates database record and hops" do
       expect { dbi.start }.to hop("download")
@@ -58,6 +72,27 @@ RSpec.describe Prog::DownloadBootImage do
       expect(dbi.url).to eq("https://minio.example.com/my-image.raw")
     end
 
+    it "builds the blob-storage key for the metal postgres-ubuntu-2604 image" do
+      vm_host.arch = "x64"
+      version = described_class::BOOT_IMAGE_SHA256.dig("postgres-ubuntu-2604", "x64").keys.max
+      refresh_frame(dbi, new_values: {"image_name" => "postgres-ubuntu-2604", "version" => nil, "custom_url" => nil})
+      client = instance_double(Minio::Client)
+      expect(Minio::Client).to receive(:new).and_return(client)
+      expect(client).to receive(:get_presigned_url).with("GET", anything, "postgres-ubuntu-2604-x64-#{version}.raw", anything).and_return("https://minio.example.com/pg-2604.raw")
+      expect(dbi.url).to eq("https://minio.example.com/pg-2604.raw")
+    end
+
+    it "returns URL for x64 ubuntu-resolute image" do
+      refresh_frame(dbi, new_values: {"image_name" => "ubuntu-resolute", "version" => "20260520", "custom_url" => nil})
+      expect(dbi.url).to eq("https://cloud-images.ubuntu.com/releases/resolute/release-20260520/ubuntu-26.04-server-cloudimg-amd64.img")
+    end
+
+    it "returns URL for arm64 ubuntu-resolute image" do
+      refresh_frame(dbi, new_values: {"image_name" => "ubuntu-resolute", "version" => "20260520", "custom_url" => nil})
+      vm_host.arch = "arm64"
+      expect(dbi.url).to eq("https://cloud-images.ubuntu.com/releases/resolute/release-20260520/ubuntu-26.04-server-cloudimg-arm64.img")
+    end
+
     it "returns URL for x64 ubuntu-noble image" do
       refresh_frame(dbi, new_values: {"image_name" => "ubuntu-noble", "version" => "20240523.1", "custom_url" => nil})
       expect(dbi.url).to eq("https://cloud-images.ubuntu.com/releases/noble/release-20240523.1/ubuntu-24.04-server-cloudimg-amd64.img")
@@ -78,6 +113,17 @@ RSpec.describe Prog::DownloadBootImage do
       refresh_frame(dbi, new_values: {"image_name" => "ubuntu-jammy", "version" => "20240319", "custom_url" => nil})
       vm_host.arch = "arm64"
       expect(dbi.url).to eq("https://cloud-images.ubuntu.com/releases/jammy/release-20240319/ubuntu-22.04-server-cloudimg-arm64.img")
+    end
+
+    it "returns URL for arm64 debian-13 image" do
+      refresh_frame(dbi, new_values: {"image_name" => "debian-13", "version" => "20260601-2496", "custom_url" => nil})
+      vm_host.arch = "arm64"
+      expect(dbi.url).to eq("https://cloud.debian.org/images/cloud/trixie/20260601-2496/debian-13-genericcloud-arm64-20260601-2496.raw")
+    end
+
+    it "returns URL for x64 debian-13 image" do
+      refresh_frame(dbi, new_values: {"image_name" => "debian-13", "version" => "20260601-2496", "custom_url" => nil})
+      expect(dbi.url).to eq("https://cloud.debian.org/images/cloud/trixie/20260601-2496/debian-13-genericcloud-amd64-20260601-2496.raw")
     end
 
     it "returns URL for arm64 debian-12 image" do
@@ -101,6 +147,18 @@ RSpec.describe Prog::DownloadBootImage do
       vm_host.update(arch: "arm64")
 
       expect(dbi.url).to eq("https://repo.almalinux.org/almalinux/9/cloud/aarch64/images/AlmaLinux-9-GenericCloud-9.5-20241120.aarch64.qcow2")
+    end
+
+    it "returns URL for x64 almalinux-10 image" do
+      refresh_frame(dbi, new_values: {"image_name" => "almalinux-10", "version" => "10.2-20260526.0", "custom_url" => nil})
+      expect(dbi.url).to eq("https://repo.almalinux.org/almalinux/10/cloud/x86_64/images/AlmaLinux-10-GenericCloud-10.2-20260526.0.x86_64.qcow2")
+    end
+
+    it "returns URL for arm64 almalinux-10 image" do
+      refresh_frame(dbi, new_values: {"image_name" => "almalinux-10", "version" => "10.2-20260526.0", "custom_url" => nil})
+      vm_host.update(arch: "arm64")
+
+      expect(dbi.url).to eq("https://repo.almalinux.org/almalinux/10/cloud/aarch64/images/AlmaLinux-10-GenericCloud-10.2-20260526.0.aarch64.qcow2")
     end
 
     it "returns URL for ai model image" do
@@ -208,8 +266,16 @@ RSpec.describe Prog::DownloadBootImage do
       expect { dbi.download }.to nap(15)
     end
 
-    it "waits for the download to complete" do
-      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer --check download_my-image_20230303").and_return("InProgess")
+    it "updates current size while the download is in progress" do
+      BootImage.create(vm_host_id: vm_host.id, name: "my-image", version: "20230303", size_gib: 0)
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer --check download_my-image_20230303").and_return("InProgress")
+      expect(sshable).to receive(:_cmd).with("stat -c %s /var/storage/images/my-image-20230303.raw.tmp").and_return("2361393152")
+      expect { dbi.download }.to nap(15)
+        .and change { dbi.strand.stack.first["current_size_gib"] }.from(nil).to(3)
+    end
+
+    it "naps if unknown state" do
+      expect(sshable).to receive(:_cmd).with("common/bin/daemonizer --check download_my-image_20230303").and_return("Unknown")
       expect { dbi.download }.to nap(15)
     end
 
@@ -221,6 +287,20 @@ RSpec.describe Prog::DownloadBootImage do
   end
 
   describe "#update_available_storage_space" do
+    it "pops early and removes the downloaded image when cancel semaphore is set" do
+      bi = BootImage.create(vm_host_id: vm_host.id, name: "my-image", version: "20230303", size_gib: 0)
+      expect(sshable).to receive(:_cmd).with("sudo rm -f /var/storage/images/my-image-20230303.raw")
+      dbi.incr_cancel
+      expect { dbi.update_available_storage_space }.to exit({"msg" => "operation cancelled"})
+      expect(bi).not_to exist
+    end
+
+    it "fails if image size is zero" do
+      BootImage.create(vm_host_id: vm_host.id, name: "my-image", version: "20230303", size_gib: 0)
+      expect(sshable).to receive(:_cmd).with("stat -c %s /var/storage/images/my-image-20230303.raw").and_return("0")
+      expect { dbi.update_available_storage_space }.to raise_error RuntimeError, "Downloaded boot image has zero size"
+    end
+
     it "updates available storage space" do
       bi = BootImage.create(vm_host_id: vm_host.id, name: "my-image", version: "20230303", size_gib: 0)
       sd = StorageDevice.create(
@@ -269,6 +349,12 @@ RSpec.describe Prog::DownloadBootImage do
       expect { dbi.activate_boot_image }.to exit({"msg" => "operation cancelled"})
       expect(bi.reload.activated_at).to be_nil
       expect(Strand.where(prog: "RemoveBootImage", stack: Sequel.pg_jsonb_wrap([{"subject_id" => bi.id}])).count).to eq(1)
+    end
+  end
+
+  describe "render_arch" do
+    it "errors on an unexpected architecture" do
+      expect { described_class.render_arch("nope", arm64: "a", x64: "x") }.to raise_error RuntimeError, "BUG: inexhaustive render code (arch: nope)"
     end
   end
 end

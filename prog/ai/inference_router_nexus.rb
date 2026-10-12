@@ -2,8 +2,6 @@
 
 require "forwardable"
 
-require_relative "../../lib/util"
-
 class Prog::Ai::InferenceRouterNexus < Prog::Base
   subject_is :inference_router
 
@@ -98,7 +96,7 @@ class Prog::Ai::InferenceRouterNexus < Prog::Base
                   !(it.destroy_set? || it.strand.label == "destroy")
                 }
         .sort_by { |r|
-          [(r.strand.label == "wait") ? 1 : 0, r.created_at]
+        [(r.strand.label == "wait") ? 1 : 0, r.created_at]
       }.take(actual_replica_count - desired_replica_count)
       victims.each(&:incr_destroy)
     end

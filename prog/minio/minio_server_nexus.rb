@@ -7,6 +7,8 @@ require_relative "../../lib/util"
 class Prog::Minio::MinioServerNexus < Prog::Base
   subject_is :minio_server
 
+  frame_accessor :refresh_cert_id, :current_cert_id
+
   extend Forwardable
 
   def_delegators :minio_server, :vm
@@ -46,14 +48,36 @@ class Prog::Minio::MinioServerNexus < Prog::Base
 
   label def start
     nap 5 unless vm.strand.label == "wait"
+
+    nap 10 if cluster.uses_publicly_signed_certificates? && !cluster.server_cert
+
     minio_server.incr_initial_provisioning
+    minio_server.incr_pin_net_threads
 
     register_deadline("wait", 10 * 60)
 
     minio_server.cluster.dns_zone&.insert_record(record_name: cluster.hostname, type: "A", ttl: 10, data: vm.ip4_string)
-    cert, cert_key = create_certificate
-    minio_server.update(cert:, cert_key:)
 
+    if cluster.uses_publicly_signed_certificates?
+      hop_initialize_certificates
+    else
+      cert, cert_key = create_certificate
+      minio_server.update(cert:, cert_key:)
+      hop_bootstrap_rhizome
+    end
+  end
+
+  label def initialize_certificates
+    self.current_cert_id = Prog::Vnet::CertNexus.assemble(
+      minio_server.hostname,
+      cluster.dns_zone.id,
+      waiting_strand_id: minio_server.id,
+    ).id
+    hop_wait_certificates
+  end
+
+  label def wait_certificates
+    wait_public_cert(current_cert_id)
     hop_bootstrap_rhizome
   end
 
@@ -90,14 +114,19 @@ class Prog::Minio::MinioServerNexus < Prog::Base
   end
 
   label def wait
-    when_checkup_set? do
-      hop_unavailable if !available?
-      decr_checkup
-    end
-
     when_reconfigure_set? do
       bud Prog::Minio::SetupMinio, {}, :configure_minio
       hop_wait_reconfigure
+    end
+
+    when_switch_to_public_certs_set? do
+      register_deadline("wait", 30 * 60)
+      hop_switch_to_public_certs
+    end
+
+    when_checkup_set? do
+      hop_unavailable if !available?
+      decr_checkup
     end
 
     when_restart_set? do
@@ -109,10 +138,17 @@ class Prog::Minio::MinioServerNexus < Prog::Base
         decr_initial_provisioning
       end
 
-      push self.class, frame, "minio_restart"
+      push self.class, {}, "minio_restart"
     end
 
-    if minio_server.certificate_last_checked_at < Time.now - 60 * 60 * 24 * 30 # ~1 month
+    when_pin_net_threads_set? do
+      decr_pin_net_threads
+      vm.vm_host.sshable.cmd("sudo host/bin/pin-vm-net-threads install :vm_name :cpus :thread_count", vm_name: vm.inhost_name, cpus: net_pin_allowed_cpus, thread_count: net_pin_thread_count.to_s)
+    end
+
+    refresh_after = cluster.uses_publicly_signed_certificates? ? 60 * 60 * 24 * 7 : 60 * 60 * 24 * 30
+    if minio_server.certificate_last_checked_at < Time.now - refresh_after
+      register_deadline("wait", 30 * 60)
       hop_refresh_certificates
     end
 
@@ -120,9 +156,59 @@ class Prog::Minio::MinioServerNexus < Prog::Base
   end
 
   label def refresh_certificates
+    if cluster.uses_publicly_signed_certificates?
+      minio_server.update(certificate_last_checked_at: Time.now)
+
+      if OpenSSL::X509::Certificate.new(minio_server.cert).not_after < Time.now + 60 * 60 * 24 * 21
+        self.current_cert_id = self.refresh_cert_id = Prog::Vnet::CertNexus.assemble(
+          minio_server.hostname,
+          cluster.dns_zone.id,
+          waiting_strand_id: minio_server.id,
+        ).id
+        hop_wait_refresh_public_cert
+      end
+
+      hop_wait
+    end
+
     cert, cert_key = create_certificate
     minio_server.update(cert:, cert_key:, certificate_last_checked_at: Time.now)
 
+    incr_reconfigure
+    hop_wait
+  end
+
+  label def wait_refresh_public_cert
+    wait_for_public_cert("refresh_cert_id")
+    incr_reconfigure
+    hop_wait
+  end
+
+  label def switch_to_public_certs
+    nap 10 unless cluster.uses_publicly_signed_certificates? && cluster.server_cert
+
+    decr_switch_to_public_certs
+
+    bud Prog::InstallRhizome, {"target_folder" => "minio", "subject_id" => vm.id}
+    hop_wait_switch_rhizome
+  end
+
+  label def wait_switch_rhizome
+    reap(:switch_certificates)
+  end
+
+  label def switch_certificates
+    self.current_cert_id = Prog::Vnet::CertNexus.assemble(
+      minio_server.hostname,
+      cluster.dns_zone.id,
+      waiting_strand_id: minio_server.id,
+    ).id
+    hop_wait_switch_certificates
+  end
+
+  label def wait_switch_certificates
+    wait_public_cert(current_cert_id)
+    minio_server.update(certificate_last_checked_at: Time.now)
     incr_reconfigure
     hop_wait
   end
@@ -154,7 +240,7 @@ class Prog::Minio::MinioServerNexus < Prog::Base
       hop_wait
     end
 
-    bud self.class, frame, :minio_restart
+    bud self.class, {}, :minio_restart
     nap 5
   end
 
@@ -162,6 +248,7 @@ class Prog::Minio::MinioServerNexus < Prog::Base
     register_deadline(nil, 10 * 60)
     decr_destroy
     minio_server.cluster.dns_zone&.delete_record(record_name: cluster.hostname, type: "A", data: vm.ip4_string)
+    Cert.incr_destroy(current_cert_id) if current_cert_id
     minio_server.vm.sshable.destroy
     minio_server.vm.nics.each { it.incr_destroy }
     minio_server.vm.incr_destroy
@@ -178,6 +265,31 @@ class Prog::Minio::MinioServerNexus < Prog::Base
   rescue => ex
     Clog.emit("Minio server is down", {minio_server_down: Util.exception_to_hash(ex, into: {ubid: minio_server.ubid})})
     false
+  end
+
+  def wait_public_cert(cert_id)
+    cert = Cert.with_pk!(cert_id)
+    nap(10 * 60) unless cert.cert
+
+    minio_server.update(cert: cert.cert, cert_key: OpenSSL::PKey::EC.new(cert.csr_key).to_pem)
+  end
+
+  def wait_for_public_cert(frame_key)
+    wait_public_cert(send(frame_key))
+    delete_from_stack(frame_key)
+  end
+
+  # A slice VM can only run on its own cpuset; elsewhere it can run on every
+  # cpu the host does not keep for IO.
+  def net_pin_allowed_cpus
+    vm.vm_host_slice&.allowed_cpus_cgroup ||
+      vm.vm_host.cpus_dataset.where(io: false).order(:cpu_number).select_map(:cpu_number).join(",")
+  end
+
+  # Cloud-hypervisor gives each nic max_vcpus * 2 + 1 queues, which comes out
+  # as one worker thread per vcpu per nic.
+  def net_pin_thread_count
+    vm.vcpus * vm.nics_dataset.count
   end
 
   def create_certificate

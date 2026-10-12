@@ -9,12 +9,12 @@ class Prog::RemoveBootImage < Prog::Base
   end
 
   label def wait_volumes
-    nap 30 if boot_image.vm_storage_volumes.count > 0
+    nap 30 unless boot_image.vm_storage_volumes_dataset.empty?
     hop_remove
   end
 
   label def remove
-    boot_image.vm_host.sshable.cmd("sudo rm -rf :path", path: boot_image.path)
+    boot_image.vm_host.sshable.cmd("sudo rm -f :path", path: boot_image.path)
 
     hop_update_database
   end

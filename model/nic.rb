@@ -9,11 +9,12 @@ class Nic < Sequel::Model
   one_to_many :dst_ipsec_tunnels, key: :dst_nic_id, class: :IpsecTunnel, read_only: true
   one_to_one :strand, key: :id
   one_to_one :nic_aws_resource, key: :id, read_only: true
-  plugin :association_dependencies, src_ipsec_tunnels: :destroy, dst_ipsec_tunnels: :destroy, nic_aws_resource: :destroy
+  one_to_one :nic_gcp_resource, key: :id, read_only: true
+  plugin :association_dependencies, src_ipsec_tunnels: :destroy, dst_ipsec_tunnels: :destroy, nic_aws_resource: :destroy, nic_gcp_resource: :destroy
 
   plugin ResourceMethods, encrypted_columns: :encryption_key
   plugin SemaphoreMethods, :destroy, :start_rekey, :trigger_outbound_update,
-    :old_state_drop_trigger, :setup_nic, :repopulate, :lock, :vm_allocated,
+    :old_state_drop_trigger, :setup_nic, :repopulate, :vm_allocated,
     :migrate_to_separate_prog
 
   def self.ubid_to_name(ubid)
@@ -25,7 +26,9 @@ class Nic < Sequel::Model
   end
 
   def private_ipv4_address
-    (private_ipv4.netmask.prefix_len == 32) ? private_ipv4.network.to_s : private_ipv4.nth(1).to_s
+    if private_ipv4
+      (private_ipv4.netmask.prefix_len == 32) ? private_ipv4.network.to_s : private_ipv4.nth(1).to_s
+    end
   end
 
   def private_ipv6_address
@@ -39,25 +42,32 @@ end
 
 # Table: nic
 # Columns:
-#  id                | uuid                     | PRIMARY KEY
-#  private_subnet_id | uuid                     | NOT NULL
-#  mac               | macaddr                  |
-#  created_at        | timestamp with time zone | NOT NULL DEFAULT now()
-#  private_ipv4      | cidr                     | NOT NULL
-#  private_ipv6      | cidr                     | NOT NULL
-#  vm_id             | uuid                     |
-#  encryption_key    | text                     |
-#  name              | text                     | NOT NULL
-#  rekey_payload     | jsonb                    |
-#  state             | text                     | NOT NULL
+#  id                   | uuid                     | PRIMARY KEY
+#  private_subnet_id    | uuid                     | NOT NULL
+#  mac                  | macaddr                  |
+#  created_at           | timestamp with time zone | NOT NULL DEFAULT now()
+#  private_ipv4         | cidr                     |
+#  private_ipv6         | cidr                     | NOT NULL
+#  vm_id                | uuid                     |
+#  encryption_key       | text                     |
+#  name                 | text                     | NOT NULL
+#  rekey_payload        | jsonb                    |
+#  state                | text                     | NOT NULL
+#  is_management        | boolean                  | NOT NULL DEFAULT false
+#  rekey_phase          | text                     | NOT NULL DEFAULT 'idle'::text
+#  rekey_coordinator_id | uuid                     |
 # Indexes:
-#  nic_pkey | PRIMARY KEY btree (id)
+#  nic_pkey                                 | PRIMARY KEY btree (id)
+#  nic_private_subnet_id_private_ipv4_index | UNIQUE btree (private_subnet_id, private_ipv4)
 # Check constraints:
-#  state | (state = ANY (ARRAY['initializing'::text, 'creating'::text, 'active'::text]))
+#  rekey_phase_check | (rekey_phase = ANY (ARRAY['idle'::text, 'inbound'::text, 'outbound'::text, 'old_drop'::text]))
+#  state             | (state = ANY (ARRAY['initializing'::text, 'creating'::text, 'active'::text]))
 # Foreign key constraints:
-#  nic_private_subnet_id_fkey | (private_subnet_id) REFERENCES private_subnet(id)
-#  nic_vm_id_fkey             | (vm_id) REFERENCES vm(id)
+#  nic_private_subnet_id_fkey    | (private_subnet_id) REFERENCES private_subnet(id)
+#  nic_rekey_coordinator_id_fkey | (rekey_coordinator_id) REFERENCES private_subnet(id)
+#  nic_vm_id_fkey                | (vm_id) REFERENCES vm(id)
 # Referenced By:
 #  ipsec_tunnel     | ipsec_tunnel_dst_nic_id_fkey | (dst_nic_id) REFERENCES nic(id)
 #  ipsec_tunnel     | ipsec_tunnel_src_nic_id_fkey | (src_nic_id) REFERENCES nic(id)
 #  nic_aws_resource | nic_aws_resource_id_fkey     | (id) REFERENCES nic(id)
+#  nic_gcp_resource | nic_gcp_resource_id_fkey     | (id) REFERENCES nic(id)

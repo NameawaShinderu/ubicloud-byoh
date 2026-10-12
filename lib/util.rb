@@ -38,6 +38,14 @@ module Util
     ).map(&:to_pem)
   end
 
+  def self.cert_expires_at(cert)
+    cert = OpenSSL::X509::Certificate.new(cert)
+  rescue
+    nil
+  else
+    cert.not_after
+  end
+
   def self.create_certificate(subject:, duration:, extensions: [], issuer_cert: nil, issuer_key: nil)
     cert = OpenSSL::X509::Certificate.new
     key = OpenSSL::PKey::EC.generate("prime256v1")
@@ -46,6 +54,9 @@ module Util
     if issuer_cert.nil?
       issuer_cert = cert
       issuer_key = key
+    else
+      # Distinguish roots with matching names during rotation.
+      extensions += ["authorityKeyIdentifier=keyid:always"]
     end
 
     # Set certificate details
@@ -71,8 +82,14 @@ module Util
     [cert, key]
   end
 
+  # Retain only the tail of very long stderr when serializing exceptions.
+  STDERR_LOG_TAIL = 2000
+
   def self.exception_to_hash(ex, backtrace: ex.backtrace[0...50], into: {})
-    into[:exception] = {message: ex.message, class: ex.class.to_s, backtrace:}
+    exception = into[:exception] = {message: ex.message, class: ex.class.to_s, backtrace:}
+    if ex.respond_to?(:stderr) && !(stderr = ex.stderr).to_s.empty?
+      exception[:stderr] = (stderr.bytesize > STDERR_LOG_TAIL) ? "...#{stderr.byteslice(-STDERR_LOG_TAIL..)}" : stderr
+    end
     # Don't log causes if we aren't logging backtraces
     if backtrace && (cause = ex.cause)
       array = into[:causes] = []
@@ -101,9 +118,12 @@ module Util
     raise CloverError.new(400, "InvalidRequest", "Invalid email address used")
   end
 
+  def self.aws_tags(name, additional_tags = {})
+    [{key: "Ubicloud", value: Config.provider_resource_tag_value}, {key: "Name", value: name}].concat(additional_tags.map { |k, v| {key: k.to_s, value: v.to_s} })
+  end
+
   def self.aws_tag_specifications(resource_type, name, additional_tags = {})
-    tags = [{key: "Ubicloud", value: Config.provider_resource_tag_value}, {key: "Name", value: name}].concat(additional_tags.map { |k, v| {key: k.to_s, value: v.to_s} })
-    [{resource_type:, tags:}].compact
+    [{resource_type:, tags: aws_tags(name, additional_tags)}]
   end
 
   def self.calculate_ips_v4

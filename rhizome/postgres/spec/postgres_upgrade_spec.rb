@@ -8,7 +8,6 @@ RSpec.describe PostgresUpgrade do
 
   before do
     # Mock the util methods from common/lib/util
-    allow(postgres_upgrade).to receive(:r)
     stub_const("EXTENSION_UPGRADE_SCRIPTS", {
       17 => {
         "postgis" => "SELECT postgis_extensions_upgrade();",
@@ -32,36 +31,42 @@ RSpec.describe PostgresUpgrade do
 
   describe "#create_upgrade_dir" do
     it "creates upgrade directory with correct permissions" do
-      expect(postgres_upgrade).to receive(:r).with("sudo mkdir -p /dat/upgrade/17")
-      expect(postgres_upgrade).to receive(:r).with("sudo chown postgres:postgres /dat/upgrade/17")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "mkdir", "-p", "/dat/upgrade/17")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "chown", "postgres:postgres", "/dat/upgrade/17")
       postgres_upgrade.create_upgrade_dir
     end
   end
 
   describe "#disable_archiving" do
     it "disables archiving without reload by default" do
-      expect(postgres_upgrade).to receive(:r).with("echo 'archive_mode = on\narchive_command = false' | sudo tee /etc/postgresql/17/main/conf.d/100-upgrade.conf")
-      expect(postgres_upgrade).not_to receive(:r).with("sudo pg_ctlcluster 17 main reload")
+      expect(postgres_upgrade).to receive(:_run_command).with("echo 'archive_mode = on\narchive_command = false' | sudo tee /etc/postgresql/17/main/conf.d/100-upgrade.conf")
+      expect(postgres_upgrade).not_to receive(:_run_command).with("sudo", "pg_ctlcluster", "17", "main", "reload")
       postgres_upgrade.disable_archiving(17)
     end
 
     it "disables archiving and reloads when reload: true" do
-      expect(postgres_upgrade).to receive(:r).with("echo 'archive_mode = on\narchive_command = false' | sudo tee /etc/postgresql/16/main/conf.d/100-upgrade.conf")
-      expect(postgres_upgrade).to receive(:r).with("sudo pg_ctlcluster 16 main reload")
+      expect(postgres_upgrade).to receive(:_run_command).with("echo 'archive_mode = on\narchive_command = false' | sudo tee /etc/postgresql/16/main/conf.d/100-upgrade.conf")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "pg_ctlcluster", "16", "main", "reload")
       postgres_upgrade.disable_archiving(16, reload: true)
     end
   end
 
   describe "#promote" do
     it "promotes server using pg_promote" do
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -t -c 'SELECT pg_catalog.pg_is_in_recovery();' 2>/dev/null || echo 't'").and_return("t\n")
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -c \"SELECT pg_promote(true, 300)\"")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres psql -t -c 'SELECT pg_catalog.pg_is_in_recovery();' 2>/dev/null || echo 't'").and_return("t\n")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres psql -t -c \"SELECT pg_promote(true, 300)\"").and_return("t\n")
       postgres_upgrade.promote(16)
     end
 
+    it "fails when pg_promote returns false" do
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres psql -t -c 'SELECT pg_catalog.pg_is_in_recovery();' 2>/dev/null || echo 't'").and_return("t\n")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres psql -t -c \"SELECT pg_promote(true, 300)\"").and_return("f\n")
+      expect { postgres_upgrade.promote(16) }.to raise_error(RuntimeError, /pg_promote returned "f"/)
+    end
+
     it "skips promotion if server is already promoted" do
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -t -c 'SELECT pg_catalog.pg_is_in_recovery();' 2>/dev/null || echo 't'").and_return("f\n")
-      expect(postgres_upgrade).not_to receive(:r).with("sudo -u postgres psql -c \"SELECT pg_promote(true, 300)\"")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres psql -t -c 'SELECT pg_catalog.pg_is_in_recovery();' 2>/dev/null || echo 't'").and_return("f\n")
+      expect(postgres_upgrade).not_to receive(:_run_command).with("sudo -u postgres psql -t -c \"SELECT pg_promote(true, 300)\"")
       expect(logger).to receive(:info).with("Server is already promoted (not in recovery mode)")
       postgres_upgrade.promote(16)
     end
@@ -69,15 +74,16 @@ RSpec.describe PostgresUpgrade do
 
   describe "#remove_walg_credentials" do
     it "stops wal-g daemon and removes credentials file" do
-      expect(postgres_upgrade).to receive(:r).with("sudo systemctl stop wal-g", expect: [0, 1, 4, 5])
-      expect(postgres_upgrade).to receive(:r).with("sudo rm -f /etc/postgresql/wal-g.env")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo systemctl stop wal-g", expect: [0, 1, 4, 5])
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo rm -f /etc/postgresql/wal-g.env")
       postgres_upgrade.remove_walg_credentials
     end
   end
 
   describe "#disable_previous_version" do
     it "disables and stops previous version service" do
-      expect(postgres_upgrade).to receive(:r).with("sudo systemctl disable --now postgresql@16-main")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "systemctl", "disable", "--now", "postgresql@16-main")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "systemctl", "disable", "--now", "disk-full-check@17.timer")
       postgres_upgrade.disable_previous_version
     end
   end
@@ -89,7 +95,21 @@ RSpec.describe PostgresUpgrade do
       expect(pg_setup).to receive(:install_packages)
       expect(pg_setup).to receive(:setup_data_directory)
       expect(pg_setup).to receive(:create_cluster)
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "systemctl", "disable", "--now", "postgresql@16-main")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "systemctl", "disable", "--now", "disk-full-check@17.timer")
       postgres_upgrade.initialize_new_version
+    end
+  end
+
+  describe "#apply_user_config" do
+    it "writes user config to 099-user.conf" do
+      expect(postgres_upgrade).to receive(:safe_write_to_file).with("/etc/postgresql/17/main/conf.d/099-user.conf", "wal_level = 'logical'\nmax_replication_slots = '20'")
+      postgres_upgrade.apply_user_config({"wal_level" => "logical", "max_replication_slots" => "20"})
+    end
+
+    it "writes an empty file when user config is empty" do
+      expect(postgres_upgrade).to receive(:safe_write_to_file).with("/etc/postgresql/17/main/conf.d/099-user.conf", "")
+      postgres_upgrade.apply_user_config({})
     end
   end
 
@@ -109,36 +129,43 @@ RSpec.describe PostgresUpgrade do
 
   describe "#enable_new_version" do
     it "enables and starts new version service" do
-      expect(postgres_upgrade).to receive(:r).with("sudo systemctl enable --now postgresql@17-main")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "systemctl", "enable", "--now", "postgresql@17-main")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "systemctl", "enable", "--now", "disk-full-check@17.timer")
       postgres_upgrade.enable_new_version
     end
   end
 
   describe "#wait_for_postgres_to_start" do
     it "waits for postgres to become ready" do
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres pg_isready").and_raise(StandardError).once
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres pg_isready").and_return("")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres pg_isready").and_raise(StandardError).once
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres pg_isready").and_return("")
       expect(postgres_upgrade).to receive(:sleep).with(1)
 
       postgres_upgrade.wait_for_postgres_to_start
+    end
+
+    it "raises when postgres fails to start before deadline" do
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres pg_isready").and_raise(StandardError)
+      expect(Time).to receive(:now).and_return(Time.at(0), Time.at(61))
+      expect { postgres_upgrade.wait_for_postgres_to_start }.to raise_error("Postgres failed to start")
     end
   end
 
   describe "#run_post_upgrade_scripts" do
     it "executes all SQL scripts in upgrade directory" do
       expect(Dir).to receive(:glob).with("/dat/upgrade/17/*.sql").and_yield("/dat/upgrade/17/script1.sql").and_yield("/dat/upgrade/17/script2.sql")
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -v 'ON_ERROR_STOP=1' -f /dat/upgrade/17/script1.sql")
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -v 'ON_ERROR_STOP=1' -f /dat/upgrade/17/script2.sql")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-f", "/dat/upgrade/17/script1.sql")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-f", "/dat/upgrade/17/script2.sql")
       postgres_upgrade.run_post_upgrade_scripts
     end
   end
 
   describe "#run_post_upgrade_extension_update" do
     it "updates extensions on databases where they are installed" do
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -t -c 'SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false;'").and_return("postgres\nmydb\n")
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -d postgres -v 'ON_ERROR_STOP=1' -t", stdin: "SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'postgis'").and_return("1")
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -d mydb -v 'ON_ERROR_STOP=1' -t", stdin: "SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'postgis'").and_return("")
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -d postgres -v 'ON_ERROR_STOP=1'", stdin: "SELECT postgis_extensions_upgrade();")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres psql -t -c 'SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false;'").and_return("postgres\nmydb\n")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "-u", "postgres", "psql", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-t", stdin: "SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'postgis'").and_return("1")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "-u", "postgres", "psql", "-d", "mydb", "-v", "ON_ERROR_STOP=1", "-t", stdin: "SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'postgis'").and_return("")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "-u", "postgres", "psql", "-d", "postgres", "-v", "ON_ERROR_STOP=1", stdin: "SELECT postgis_extensions_upgrade();")
       expect(logger).to receive(:info).with("Running post upgrade extension update for postgis")
       expect(logger).to receive(:info).with("Running post upgrade extension update for postgis on database postgres")
 
@@ -146,9 +173,9 @@ RSpec.describe PostgresUpgrade do
     end
 
     it "skips databases where extension is not installed" do
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -t -c 'SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false;'").and_return("postgres\n")
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -d postgres -v 'ON_ERROR_STOP=1' -t", stdin: "SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'postgis'").and_return("")
-      expect(postgres_upgrade).not_to receive(:r).with("sudo -u postgres psql -d postgres -v 'ON_ERROR_STOP=1'", stdin: anything)
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres psql -t -c 'SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false;'").and_return("postgres\n")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "-u", "postgres", "psql", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-t", stdin: "SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'postgis'").and_return("")
+      expect(postgres_upgrade).not_to receive(:_run_command).with("sudo", "-u", "postgres", "psql", "-d", "postgres", "-v", "ON_ERROR_STOP=1", stdin: anything)
       expect(logger).to receive(:info).with("Running post upgrade extension update for postgis")
 
       postgres_upgrade.run_post_upgrade_extension_update
@@ -160,10 +187,10 @@ RSpec.describe PostgresUpgrade do
           "ext'sname" => "ALTER EXTENSION \"ext'sname\" UPDATE;",
         },
       })
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -t -c 'SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false;'").and_return("mydb$(pwd)\n")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo -u postgres psql -t -c 'SELECT datname FROM pg_catalog.pg_database WHERE datistemplate = false;'").and_return("mydb$(pwd)\n")
       expect(logger).to receive(:info).with("Running post upgrade extension update for ext'sname")
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -d mydb\\$\\(pwd\\) -v 'ON_ERROR_STOP=1' -t", stdin: "SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'ext''sname'").and_return("1")
-      expect(postgres_upgrade).to receive(:r).with("sudo -u postgres psql -d mydb\\$\\(pwd\\) -v 'ON_ERROR_STOP=1'", stdin: "ALTER EXTENSION \"ext'sname\" UPDATE;")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "-u", "postgres", "psql", "-d", "mydb$(pwd)", "-v", "ON_ERROR_STOP=1", "-t", stdin: "SELECT 1 FROM pg_catalog.pg_extension WHERE extname = 'ext''sname'").and_return("1")
+      expect(postgres_upgrade).to receive(:_run_command).with("sudo", "-u", "postgres", "psql", "-d", "mydb$(pwd)", "-v", "ON_ERROR_STOP=1", stdin: "ALTER EXTENSION \"ext'sname\" UPDATE;")
       expect(logger).to receive(:info).with("Running post upgrade extension update for ext'sname on database mydb$(pwd)")
 
       postgres_upgrade.run_post_upgrade_extension_update
@@ -173,8 +200,8 @@ RSpec.describe PostgresUpgrade do
   describe "#run_pg_upgrade_cmd" do
     it "changes directory and runs pg_upgrade command" do
       expect(Dir).to receive(:chdir).with("/dat/upgrade/17").and_yield
-      expect(postgres_upgrade).to receive(:pg_upgrade_cmdline).with("--check").and_return("pg_upgrade_command")
-      expect(postgres_upgrade).to receive(:r).with("pg_upgrade_command")
+      expect(postgres_upgrade).to receive(:pg_upgrade_cmdline).with("--check").and_return(["pg_upgrade_command"])
+      expect(postgres_upgrade).to receive(:_run_command).with("pg_upgrade_command")
 
       postgres_upgrade.run_pg_upgrade_cmd("--check")
     end
@@ -182,19 +209,26 @@ RSpec.describe PostgresUpgrade do
 
   describe "#pg_upgrade_cmdline" do
     it "constructs correct pg_upgrade command" do
-      expected_cmd = "sudo -u postgres /usr/lib/postgresql/17/bin/pg_upgrade --old-bindir /usr/lib/postgresql/16/bin --old-datadir /etc/postgresql/16/main/ --new-bindir /usr/lib/postgresql/17/bin --new-datadir /etc/postgresql/17/main/ --check"
+      expected_cmd = ["sudo", "-u", "postgres", "/usr/lib/postgresql/17/bin/pg_upgrade",
+        "--old-bindir", "/usr/lib/postgresql/16/bin",
+        "--old-datadir", "/etc/postgresql/16/main/",
+        "--new-bindir", "/usr/lib/postgresql/17/bin",
+        "--new-datadir", "/etc/postgresql/17/main/",
+        "--check"]
       expect(postgres_upgrade.pg_upgrade_cmdline("--check")).to eq(expected_cmd)
     end
   end
 
   describe "#upgrade" do
     it "executes complete upgrade workflow in correct order" do
+      user_config = {"wal_level" => "logical"}
       expect(postgres_upgrade).to receive(:create_upgrade_dir).ordered
       expect(postgres_upgrade).to receive(:remove_walg_credentials).ordered
       expect(postgres_upgrade).to receive(:disable_archiving).with(16, reload: true).ordered
       expect(postgres_upgrade).to receive(:wait_for_postgres_to_start).ordered
       expect(postgres_upgrade).to receive(:promote).with(16).ordered
       expect(postgres_upgrade).to receive(:initialize_new_version).ordered
+      expect(postgres_upgrade).to receive(:apply_user_config).with(user_config).ordered
       expect(postgres_upgrade).to receive(:run_check).ordered
       expect(postgres_upgrade).to receive(:run_pg_upgrade).ordered
       expect(postgres_upgrade).to receive(:disable_archiving).with(17).ordered
@@ -202,11 +236,7 @@ RSpec.describe PostgresUpgrade do
       expect(postgres_upgrade).to receive(:wait_for_postgres_to_start).ordered
       expect(postgres_upgrade).to receive(:run_post_upgrade_scripts).ordered
       expect(postgres_upgrade).to receive(:run_post_upgrade_extension_update).ordered
-
-      # Mock puts calls
-      allow(postgres_upgrade).to receive(:puts)
-
-      postgres_upgrade.upgrade
+      postgres_upgrade.upgrade({"user_config" => user_config})
     end
   end
 end

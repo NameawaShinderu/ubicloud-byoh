@@ -44,14 +44,14 @@ autoload_normal = ->(subdirectory, include_first: false, flat: false, exclude_di
     # No matter how deep the file system traversal, this Regexp
     # only matches the filename in its capturing group,
     # i.e. it's like File.basename.
-    Regexp.new('\A.*?([^/]*)\.rb\z')
+    /\A.*?([^\/]*)\.rb\z/
   else
     # Capture the relative path of a traversed file, by using
     # Regexp.escape on the prefix that should *not* be
     # interpreted as modules/namespaces.  Since this is works on
     # absolute paths, the ignored content will often be like
     # "/home/myuser/..."
-    Regexp.new('\A' + Regexp.escape((File.file?(absolute) ? File.dirname(absolute) : absolute) + "/") + '(.*)\.rb\z')
+    /\A#{Regexp.escape((File.file?(absolute) ? File.dirname(absolute) : absolute) + "/")}(.*)\.rb\z/
   end
 
   # Copied from sequel/model/inflections.rb's camelize, to convert
@@ -85,15 +85,22 @@ module Prog::DnsZone; end
 
 module Prog::Github; end
 
+module Prog::Hetzner; end
+
 module Prog::Kubernetes; end
+
+module Prog::Leaseweb; end
 
 module Prog::MachineImage; end
 
 module Prog::Minio; end
 
+module Prog::Parseable; end
+
 module Prog::Postgres; end
 
 module Prog::Storage; end
+module Prog::Storage::RemoteStorageServer; end
 
 module Prog::VictoriaMetrics; end
 
@@ -101,11 +108,15 @@ module Prog::Vm; end
 
 module Prog::Vm::Aws; end
 
+module Prog::Vm::Gcp; end
+
 module Prog::Vm::Metal; end
 
 module Prog::Vnet; end
 
 module Prog::Vnet::Aws; end
+
+module Prog::Vnet::Gcp; end
 
 module Prog::Vnet::Metal; end
 
@@ -113,20 +124,24 @@ module Scheduling; end
 
 module Serializers; end
 
+module Parseable; end
+
 module VictoriaMetrics; end
 
-autoload_normal.call("model", flat: true, exclude_dirs: %w[aws metal])
-%w[lib clover.rb clover_admin.rb].each { autoload_normal.call(it) }
-%w[scheduling prog serializers].each { autoload_normal.call(it, include_first: true) }
+provider_dirs = %w[aws metal gcp].freeze
+autoload_normal.call("model", flat: true, exclude_dirs: provider_dirs)
+%w[lib clover.rb clover_admin.rb].freeze.each { autoload_normal.call(it) }
+%w[scheduling prog serializers].freeze.each { autoload_normal.call(it, include_first: true) }
 
 if ENV["LOAD_FILES_SEPARATELY_CHECK"] == "1"
-  files = %w[model lib scheduling prog serializers].flat_map { Dir["#{it}/**/*.rb"] }
+  files = %w[model lib scheduling prog serializers].freeze.flat_map { Dir["#{it}/**/*.rb"] }
   files << "clover.rb"
   files << "clover_admin.rb"
 
   Sequel::DATABASES.each(&:disconnect)
   all_pass = true
   files.each do |file|
+    next if file.start_with?("model/") && provider_dirs.include?(File.basename(File.dirname(file)))
     pid = fork do
       require_relative file
       exit(0)
@@ -167,6 +182,7 @@ if force_autoload
   end
 
   Clover.models_loaded
+  UbiCli.models_loaded
 end
 
 case Config.mail_driver
@@ -225,6 +241,7 @@ def clover_freeze
   [
     Authorization,
     Authorization::Unauthorized,
+    DnsChecker::Checker,
     HealthMonitorMethods,
     Hosting,
     Minio,
@@ -235,13 +252,15 @@ def clover_freeze
     Prog,
     Prog::Ai,
     Prog::Aws,
+    Prog::Base::ChildRunError,
     Prog::Base::Exit,
-    Prog::Base::FlowControl,
     Prog::Base::Hop,
     Prog::Base::Nap,
     Prog::DnsZone,
     Prog::Github,
+    Prog::Hetzner,
     Prog::Kubernetes,
+    Prog::Leaseweb,
     Prog::MachineImage,
     Prog::Minio,
     Prog::Postgres,
@@ -249,9 +268,11 @@ def clover_freeze
     Prog::VictoriaMetrics,
     Prog::Vm,
     Prog::Vm::Aws,
+    Prog::Vm::Gcp,
     Prog::Vm::Metal,
     Prog::Vnet,
     Prog::Vnet::Aws,
+    Prog::Vnet::Gcp,
     Prog::Vnet::Metal,
     Prog::Vnet::RekeyNicTunnel::Xfrm,
     ResourceMethods,

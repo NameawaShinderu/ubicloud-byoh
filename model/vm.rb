@@ -14,14 +14,18 @@ class Vm < Sequel::Model
   one_to_one :assigned_vm_address, key: :dst_vm_id
   one_to_many :vm_storage_volumes, order: Sequel.desc(:boot), remover: nil, clearer: nil
   one_to_many :active_billing_records, class: :BillingRecord, key: :resource_id, read_only: true, &:active
+  one_to_one :pinning_machine_image_version_metal, class: :MachineImageVersionMetal, key: :pinned_source_vm_id, read_only: true
   one_to_many :pci_devices, read_only: true
+  one_to_many :run_commands, order: Sequel.desc(:created_at), read_only: true
   one_to_one :gpu_partition, read_only: true
   one_through_one :load_balancer, read_only: true
   one_to_one :load_balancer_vm, read_only: true
   many_to_many :load_balancer_vm_ports, join_table: :load_balancers_vms, right_key: :id, right_primary_key: :load_balancer_vm_id, read_only: true
   many_to_one :vm_host_slice, read_only: true
   many_to_one :location
+  many_to_one :hypervisor, read_only: true
   one_to_one :aws_instance, key: :id, read_only: true
+  one_to_one :vm_gcp_resource, key: :id, read_only: true
   one_to_one :init_script, class: :VmInitScript, key: :id, read_only: true
   one_to_one :github_runner, read_only: true
 
@@ -31,16 +35,23 @@ class Vm < Sequel::Model
       [:firewalls_private_subnets, :private_subnet_id, :firewall_id],
     ],
     class: :Firewall
-  many_to_many :vm_firewalls, class: :Firewall, right_key: :firewall_id, remover: nil, clearer: nil
+  many_to_many :vm_firewalls, class: :Firewall, right_key: :firewall_id, remover: nil, clearer: nil,
+    before_add: :validate_firewall_cap,
+    after_add: :fire_firewall_rules_update_for_vm_firewall
 
   plugin :association_dependencies, sshable: :destroy, assigned_vm_address: :destroy, vm_storage_volumes: :destroy, load_balancer_vm: :destroy, init_script: :destroy
 
   dataset_module Pagination
+  dataset_module do
+    def unattached_to_load_balancer(project)
+      exclude(Sequel[:vm][:id] => LoadBalancerVm.where(vm_id: project.vms_dataset.select(:id)).select(:vm_id))
+    end
+  end
 
   plugin ResourceMethods, redacted_columns: :public_key
   plugin ProviderDispatcher, __FILE__
   plugin SemaphoreMethods, :destroy, :start_after_host_reboot, :prevent_destroy, :update_firewall_rules,
-    :checkup, :update_spdk_dependency, :waiting_for_capacity, :lb_expiry_started, :restart, :start, :stop, :migrate_to_separate_progs, :admin_stop, :stopping
+    :checkup, :update_spdk_dependency, :waiting_for_capacity, :lb_expiry_started, :restart, :start, :stop, :migrate_to_separate_progs, :admin_stop, :stopping, :prepare_to_move, :clean_prep
   include HealthMonitorMethods
 
   include ObjectTag::Cleanup
@@ -71,6 +82,10 @@ class Vm < Sequel::Model
     "/location/#{display_location}/vm/#{name}"
   end
 
+  def admin_ssh_user
+    sshable.unix_user
+  end
+
   def ip4
     ephemeral_net4&.nth(0)
   end
@@ -83,13 +98,18 @@ class Vm < Sequel::Model
     ip6&.to_s
   end
 
-  def nic
-    nics.first
+  def user_nic
+    nics.find { !it.is_management }
+  end
+
+  def management_nic
+    nics.find { it.is_management }
   end
 
   def private_ipv4
-    ipv4 = nic.private_ipv4
-    (ipv4.netmask.prefix_len == 32) ? ipv4.network : ipv4.nth(1)
+    if (ipv4 = user_nic&.private_ipv4)
+      (ipv4.netmask.prefix_len == 32) ? ipv4.network : ipv4.nth(1)
+    end
   end
 
   def private_ipv4_string
@@ -97,7 +117,7 @@ class Vm < Sequel::Model
   end
 
   def private_ipv6
-    nic.private_ipv6.nth(2)
+    user_nic&.private_ipv6&.nth(2)
   end
 
   def private_ipv6_string
@@ -114,6 +134,10 @@ class Vm < Sequel::Model
 
   def runtime_token
     JWT.encode({sub: ubid, iat: Time.now.to_i}, Config.clover_runtime_token_secret, "HS256")
+  end
+
+  def most_recent_serial_log
+    run_commands_dataset.first(command: "fetch_serial_log")
   end
 
   def display_state
@@ -139,11 +163,11 @@ class Vm < Sequel::Model
   end
 
   def can_stop?
-    %w[running starting restarting unavailable rebooting].include?(display_state)
+    %w[running starting restarting unavailable rebooting].freeze.include?(display_state)
   end
 
   def can_start?
-    %w[unavailable stopped].include?(display_state)
+    %w[unavailable stopped].freeze.include?(display_state)
   end
 
   # Reverse look-up the vm_size instance that was used to create this VM
@@ -158,6 +182,14 @@ class Vm < Sequel::Model
         (cpu_percent_limit.nil? || it.cpu_percent_limit == cpu_percent_limit)
     }
     vm_size&.name || "#{family}-#{vcpus}c-#{memory_gib}g"
+  end
+
+  def display_boot_image
+    Option::BootImages.find { |bi| bi.name == boot_image }&.display_name || boot_image
+  end
+
+  def display_hypervisor
+    hypervisor&.admin_label
   end
 
   # Various names in linux, like interface names, are obliged to be
@@ -187,7 +219,7 @@ class Vm < Sequel::Model
     end
     pulse = aggregate_readings(previous_pulse:, reading:)
 
-    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !reload.checkup_set?
+    if pulse[:reading] == "down" && pulse[:reading_rpt] > 5 && Time.now - pulse[:reading_chg] > 30 && !checkup_set?(cached: false)
       incr_checkup
     end
 
@@ -205,6 +237,24 @@ class Vm < Sequel::Model
     raise
   end
 
+  def in_maintenance_window?
+    return true if maintenance_window_start_at.nil?
+    offset = Time.now.utc.hour - maintenance_window_start_at
+    (offset % 24) < MAINTENANCE_DURATION_IN_HOURS
+  end
+
+  def validate
+    super
+    validates_includes(0..23, :maintenance_window_start_at, allow_nil: true, message: "must be between 0 and 23")
+  end
+
+  MAINTENANCE_DURATION_IN_HOURS = 2
+  def self.maintenance_hour_options
+    Array.new(24) do
+      [it, "#{"%02d" % it}:00 - #{"%02d" % ((it + MAINTENANCE_DURATION_IN_HOURS) % 24)}:00 (UTC)"]
+    end
+  end
+
   include Validation::PublicKeyValidation
 
   private
@@ -212,58 +262,88 @@ class Vm < Sequel::Model
   def ephemeral_net4
     assigned_vm_address&.ip
   end
+
+  # Fires semaphores when a firewall is attached to this VM directly
+  # (firewalls_vms). For GCP, the VPC must re-sync tag keys/values and
+  # policy rules to cover the new firewall, and this VM must re-bind its
+  # tags. Non-GCP VMs fire only their own semaphore; callers typically
+  # also fire it themselves, but firing twice is idempotent.
+  #
+  # Detach does not flow through here because vm_firewalls is declared
+  # with remover: nil and detach paths (VM destroy) bypass Sequel via
+  # ON DELETE CASCADE; VPC cleanup is covered by VpcUpdateFirewallRules's
+  # orphan sweep.
+  def fire_firewall_rules_update_for_vm_firewall(_firewall)
+    incr_update_firewall_rules
+    return unless location.gcp?
+    # A GCP VM always has a nic with a private_subnet by the time any
+    # caller can reach this hook (Prog::Vm::Nexus creates the nic before
+    # provisioning); gcp_vpc may be nil only if private_subnet's VPC row
+    # hasn't been linked yet.
+    vpc = user_nic.private_subnet.gcp_vpc
+    vpc&.incr_update_firewall_rules
+  end
 end
 
 # Table: vm
 # Columns:
-#  id                      | uuid                     | PRIMARY KEY
-#  ephemeral_net6          | cidr                     |
-#  vm_host_id              | uuid                     |
-#  unix_user               | text                     | NOT NULL
-#  public_key              | text                     | NOT NULL
-#  display_state           | vm_display_state         | NOT NULL DEFAULT 'creating'::vm_display_state
-#  name                    | text                     | NOT NULL
-#  boot_image              | text                     | NOT NULL
-#  local_vetho_ip          | cidr                     |
-#  ip4_enabled             | boolean                  | NOT NULL DEFAULT false
-#  family                  | text                     | NOT NULL
-#  cores                   | integer                  | NOT NULL
-#  pool_id                 | uuid                     |
-#  created_at              | timestamp with time zone | NOT NULL DEFAULT now()
-#  arch                    | arch                     | NOT NULL DEFAULT 'x64'::arch
-#  allocated_at            | timestamp with time zone |
-#  provisioned_at          | timestamp with time zone |
-#  vcpus                   | integer                  | NOT NULL
-#  memory_gib              | integer                  | NOT NULL
-#  vm_host_slice_id        | uuid                     |
-#  project_id              | uuid                     | NOT NULL
-#  cpu_percent_limit       | integer                  |
-#  cpu_burst_percent_limit | integer                  |
-#  location_id             | uuid                     | NOT NULL
+#  id                          | uuid                     | PRIMARY KEY
+#  ephemeral_net6              | cidr                     |
+#  vm_host_id                  | uuid                     |
+#  unix_user                   | text                     | NOT NULL
+#  public_key                  | text                     | NOT NULL
+#  display_state               | vm_display_state         | NOT NULL DEFAULT 'creating'::vm_display_state
+#  name                        | text                     | NOT NULL
+#  boot_image                  | text                     | NOT NULL
+#  local_vetho_ip              | cidr                     |
+#  ip4_enabled                 | boolean                  | NOT NULL DEFAULT false
+#  family                      | text                     | NOT NULL
+#  cores                       | integer                  | NOT NULL
+#  pool_id                     | uuid                     |
+#  created_at                  | timestamp with time zone | NOT NULL DEFAULT now()
+#  arch                        | arch                     | NOT NULL DEFAULT 'x64'::arch
+#  allocated_at                | timestamp with time zone |
+#  provisioned_at              | timestamp with time zone |
+#  vcpus                       | integer                  | NOT NULL
+#  memory_gib                  | integer                  | NOT NULL
+#  vm_host_slice_id            | uuid                     |
+#  project_id                  | uuid                     | NOT NULL
+#  cpu_percent_limit           | integer                  |
+#  cpu_burst_percent_limit     | integer                  |
+#  location_id                 | uuid                     | NOT NULL
+#  hypervisor_id               | uuid                     |
+#  maintenance_window_start_at | integer                  |
 # Indexes:
 #  vm_pkey                             | PRIMARY KEY btree (id)
 #  vm_ephemeral_net6_key               | UNIQUE btree (ephemeral_net6)
 #  vm_project_id_location_id_name_uidx | UNIQUE btree (project_id, location_id, name)
 #  vm_pool_id_index                    | btree (pool_id) WHERE pool_id IS NOT NULL
+# Check constraints:
+#  valid_maintenance_windows_start_at | (maintenance_window_start_at >= 0 AND maintenance_window_start_at <= 23)
 # Foreign key constraints:
+#  vm_hypervisor_id_fkey    | (hypervisor_id) REFERENCES hypervisor(id)
 #  vm_location_id_fkey      | (location_id) REFERENCES location(id)
 #  vm_pool_id_fkey          | (pool_id) REFERENCES vm_pool(id)
 #  vm_project_id_fkey       | (project_id) REFERENCES project(id)
 #  vm_vm_host_id_fkey       | (vm_host_id) REFERENCES vm_host(id)
 #  vm_vm_host_slice_id_fkey | (vm_host_slice_id) REFERENCES vm_host_slice(id)
 # Referenced By:
-#  assigned_vm_address        | assigned_vm_address_dst_vm_id_fkey    | (dst_vm_id) REFERENCES vm(id)
-#  dns_servers_vms            | dns_servers_vms_vm_id_fkey            | (vm_id) REFERENCES vm(id)
-#  firewalls_vms              | firewalls_vms_vm_id_fkey              | (vm_id) REFERENCES vm(id) ON DELETE CASCADE
-#  gpu_partition              | gpu_partition_vm_id_fkey              | (vm_id) REFERENCES vm(id)
-#  inference_endpoint_replica | inference_endpoint_replica_vm_id_fkey | (vm_id) REFERENCES vm(id)
-#  inference_router_replica   | inference_router_replica_vm_id_fkey   | (vm_id) REFERENCES vm(id)
-#  kubernetes_node            | kubernetes_node_vm_id_fkey            | (vm_id) REFERENCES vm(id)
-#  load_balancers_vms         | load_balancers_vms_vm_id_fkey         | (vm_id) REFERENCES vm(id)
-#  minio_server               | minio_server_vm_id_fkey               | (vm_id) REFERENCES vm(id)
-#  nic                        | nic_vm_id_fkey                        | (vm_id) REFERENCES vm(id)
-#  pci_device                 | pci_device_vm_id_fkey                 | (vm_id) REFERENCES vm(id)
-#  postgres_server            | postgres_server_vm_id_fkey            | (vm_id) REFERENCES vm(id)
-#  victoria_metrics_server    | victoria_metrics_server_vm_id_fkey    | (vm_id) REFERENCES vm(id)
-#  vm_init_script             | vm_init_script_id_fkey                | (id) REFERENCES vm(id)
-#  vm_storage_volume          | vm_storage_volume_vm_id_fkey          | (vm_id) REFERENCES vm(id)
+#  assigned_vm_address         | assigned_vm_address_dst_vm_id_fkey                   | (dst_vm_id) REFERENCES vm(id)
+#  dns_servers_vms             | dns_servers_vms_vm_id_fkey                           | (vm_id) REFERENCES vm(id)
+#  firewalls_vms               | firewalls_vms_vm_id_fkey                             | (vm_id) REFERENCES vm(id) ON DELETE CASCADE
+#  gpu_partition               | gpu_partition_vm_id_fkey                             | (vm_id) REFERENCES vm(id)
+#  inference_endpoint_replica  | inference_endpoint_replica_vm_id_fkey                | (vm_id) REFERENCES vm(id)
+#  inference_router_replica    | inference_router_replica_vm_id_fkey                  | (vm_id) REFERENCES vm(id)
+#  kubernetes_node             | kubernetes_node_vm_id_fkey                           | (vm_id) REFERENCES vm(id)
+#  load_balancers_vms          | load_balancers_vms_vm_id_fkey                        | (vm_id) REFERENCES vm(id)
+#  machine_image_version_metal | machine_image_version_metal_pinned_source_vm_id_fkey | (pinned_source_vm_id) REFERENCES vm(id)
+#  minio_server                | minio_server_vm_id_fkey                              | (vm_id) REFERENCES vm(id)
+#  nic                         | nic_vm_id_fkey                                       | (vm_id) REFERENCES vm(id)
+#  parseable_server            | parseable_server_vm_id_fkey                          | (vm_id) REFERENCES vm(id)
+#  pci_device                  | pci_device_vm_id_fkey                                | (vm_id) REFERENCES vm(id)
+#  postgres_server             | postgres_server_vm_id_fkey                           | (vm_id) REFERENCES vm(id)
+#  run_command                 | run_command_vm_id_fkey                               | (vm_id) REFERENCES vm(id) ON DELETE CASCADE
+#  victoria_metrics_server     | victoria_metrics_server_vm_id_fkey                   | (vm_id) REFERENCES vm(id)
+#  vm_gcp_resource             | vm_gcp_resource_id_fkey                              | (id) REFERENCES vm(id) ON DELETE CASCADE
+#  vm_init_script              | vm_init_script_id_fkey                               | (id) REFERENCES vm(id)
+#  vm_storage_volume           | vm_storage_volume_vm_id_fkey                         | (vm_id) REFERENCES vm(id)

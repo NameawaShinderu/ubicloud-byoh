@@ -12,4 +12,12 @@ module HealthMonitorMethods
   def needs_event_loop_for_pulse_check?
     false
   end
+
+  def page_on_sshable_failure?
+    true
+  end
+
+  def open_session_failure_page_threshold
+    MonitorableResource::OPEN_SESSION_FAILURE_PAGE_THRESHOLD
+  end
 end

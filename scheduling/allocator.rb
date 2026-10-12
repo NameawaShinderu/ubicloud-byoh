@@ -27,19 +27,24 @@ module Scheduling::Allocator
     available_storage_gib_non_negative
   ].freeze
 
-  def self.allocate(vm, storage_volumes, distinct_storage_devices: false, gpu_count: 0, gpu_device: nil, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], location_filter: [], location_preference: [], family_filter: [], os_filter: nil, data_center_exclusion_filter: [])
+  def self.allocate(vm, storage_volumes, distinct_storage_devices: false, gpu_count: 0, gpu_device: nil, allocation_state_filter: ["accepting"], host_filter: [], host_exclusion_filter: [], location_filter: [], location_preference: [], family_filter: [], data_center_exclusion_filter: [], os_filter: nil)
     requires_track_written = storage_volumes.any? { it["track_written"] }
     uses_machine_image = storage_volumes.any? { it["machine_image_version_id"] }
-    if requires_track_written || uses_machine_image
-      minimum_vhost_block_backend_version = VhostBlockBackend::MIN_ARCHIVE_SUPPORT_VERSION
+    uses_remote_storage_server = storage_volumes.any? { it["remote_storage_server_id"] }
+
+    minimum_vhost_block_backend_version = if uses_remote_storage_server
+      VhostBlockBackend::MIN_REMOTE_STORAGE_SERVER_VERSION
+    elsif requires_track_written || uses_machine_image
+      VhostBlockBackend::MIN_ARCHIVE_SUPPORT_VERSION
     end
+
     request = Request.new(
       vm.id,
       vm.vcpus,
       vm.memory_gib,
       storage_volumes.map { it["size_gib"] }.sum,
       storage_volumes.size.times.zip(storage_volumes).to_h.sort_by { |k, v| v["size_gib"] * -1 },
-      uses_machine_image ? nil : vm.boot_image,
+      (uses_machine_image || uses_remote_storage_server) ? nil : vm.boot_image,
       distinct_storage_devices,
       gpu_count,
       gpu_device,
@@ -58,8 +63,8 @@ module Scheduling::Allocator
       Option::VmFamilies.find { it.name == vm.family }&.require_shared_slice || false,
       vm.project.get_ff_allocator_diagnostics || false,
       family_filter,
-      os_filter,
       minimum_vhost_block_backend_version,
+      os_filter,
     )
     allocation = Allocation.best_allocation(request)
     fail NoSpaceLeft, "#{vm} no space left on any eligible host" unless allocation
@@ -93,8 +98,8 @@ module Scheduling::Allocator
     :require_shared_slice,
     :diagnostics,
     :family_filter,
-    :os_filter,
     :minimum_vhost_block_backend_version,
+    :os_filter,
   ) do
     def initialize(*args)
       super
@@ -110,8 +115,6 @@ module Scheduling::Allocator
     def memory_gib_for_vcpus(vcpus)
       memory_to_cpu_ratio = if arch_filter == "arm64"
         3.2
-      elsif family == "standard-gpu"
-        5.34
       else
         4
       end
@@ -132,17 +135,26 @@ module Scheduling::Allocator
       adjusted_vcpus = (vcpus.odd? && threads_per_core == 1) ? vcpus + 1 : vcpus
       (Float(adjusted_vcpus) / threads_per_core).ceil
     end
+
+    def single_ubicloud_location?
+      return false unless location_filter.one?
+      Location[location_filter.first].provider == "ubicloud"
+    end
+
+    def needs_large_storage_device?
+      storage_volumes.any? { |_, v| v["size_gib"] >= Config.allocator_large_storage_device_gib }
+    end
   end
 
   class Allocation
     attr_reader :score
 
-    # :nocov:
+    # simplecov:disable
     def self.freeze
       random_score
       super
     end
-    # :nocov:
+    # simplecov:enable
 
     def self.random_score
       @max_random_score ||= Config.allocator_max_random_score
@@ -156,159 +168,218 @@ module Scheduling::Allocator
     end
 
     def self.candidate_hosts(request)
-      ds = DB[:vm_host]
-        .join(:storage_devices, vm_host_id: Sequel[:vm_host][:id])
-        .left_join(:available_ipv4, routed_to_host_id: Sequel[:vm_host][:id])
-        .left_join(:gpus, vm_host_id: Sequel[:vm_host][:id])
-        .left_join(:gpu_partitions, vm_host_id: Sequel[:vm_host][:id])
-        .left_join(:vm_provisioning, vm_host_id: Sequel[:vm_host][:id])
-        .select(
-          Sequel[:vm_host][:id].as(:vm_host_id),
-          :total_cpus,
-          :total_cores,
-          :used_cores,
-          :total_hugepages_1g,
-          :used_hugepages_1g,
-          :location_id,
-          :num_storage_devices,
-          :available_storage_gib,
-          :total_storage_gib,
-          :storage_devices,
-          Sequel.function(:coalesce, :ipv4_available, false).as(:ipv4_available),
-          Sequel.function(:coalesce, :num_gpus, 0).as(:num_gpus),
-          Sequel.function(:coalesce, :available_gpus, 0).as(:available_gpus),
-          Sequel.function(:coalesce, :use_gpu_partition, false).as(:use_gpu_partition),
-          :available_iommu_groups,
-          Sequel.function(:coalesce, :vm_provisioning_count, 0).as(:vm_provisioning_count),
-          :accepts_slices,
-          :family,
-        )
-        .where(arch: request.arch_filter)
-        .with(:available_ipv4, DB[:ipv4_address]
-          .left_join(:assigned_vm_address, ip: :ip)
-          .join(:address, [:cidr])
-          .where { assigned_vm_address[:ip] =~ nil }
-          .select_group(:routed_to_host_id)
-          .select_append { (count.function.* > 0).as(:ipv4_available) })
-        .with(:storage_devices, DB[:storage_device]
-          .select_group(:vm_host_id)
-          .select_append { count.function.*.as(num_storage_devices) }
-          .select_append { sum(available_storage_gib).as(available_storage_gib) }
-          .select_append { sum(total_storage_gib).as(total_storage_gib) }
-          .select_append { json_agg(json_build_object(Sequel.lit("'id'"), Sequel[:storage_device][:id], Sequel.lit("'total_storage_gib'"), total_storage_gib, Sequel.lit("'available_storage_gib'"), available_storage_gib)).order(available_storage_gib).as(storage_devices) }
-          .where(enabled: true)
-          .having { sum(available_storage_gib) >= request.storage_gib }
-          .having { count.function.* >= (request.distinct_storage_devices ? request.storage_volumes.count : 1) })
-        .with(:gpus, DB[:pci_device]
-          .select_group(:vm_host_id)
-          .select_append { count.function.*.as(num_gpus) }
-          .select_append { sum(Sequel.case({{vm_id: nil} => 1}, 0)).as(available_gpus) }
-          .select_append do
-            gpu = Sequel.function(:jsonb_build_object, Sequel.lit("'iommu_group'"), :iommu_group, Sequel.lit("'numa_node'"), :numa_node)
-            Sequel.function(:array_agg, gpu).filter(vm_id: nil).as(:available_iommu_groups)
-                     end
-          .where(device_class: ["0300", "0302"])
-          .where { (device =~ request.gpu_device) | request.gpu_device.nil? })
-        .with(:gpu_partitions, DB[:gpu_partition]
-          .select_group(:vm_host_id)
-          .select_append { Sequel.function(:bool_or, enabled).as(:use_gpu_partition) })
-        .with(:vm_provisioning, DB[:vm]
-          .select_group(:vm_host_id)
-          .select_append { count.function.*.as(vm_provisioning_count) }
-          .where(display_state: "creating"))
+      CandidateHosts.new(request).hosts
+    end
 
-      ds = if request.use_slices && request.require_shared_slice
-        # We are looking for hosts that have at least once slice already allocated but with enough room
-        # for our new VM. This means it has to be a sharable slice, with cpu and memory available
-        # We then combine it with search for a host, as usual, with just open space on the host where
-        # we could allocate a new slice
-        # Later in VmHostSliceAllocator the selected hosts will be scored depending if a slice is reused or
-        # new one is created
-        # Shared slices only book the memory of the VMs placed in them and grow when reused, so a slice
-        # that is short on memory still qualifies if the host has free hugepages for the difference.
-        slice = Sequel[:vm_host_slice]
-        slice_host = Sequel[:slice_host]
-        host_free_hugepages = slice_host[:total_hugepages_1g] - slice_host[:used_hugepages_1g]
-        ds.with(:slice_utilization, DB[:vm_host_slice]
-            .join(Sequel[:vm_host].as(:slice_host), id: :vm_host_id)
-            .select_group(slice[:vm_host_id])
-            .select_append { (sum(slice[:total_cpu_percent]) - sum(slice[:used_cpu_percent])).as(slice_cpu_available) }
-            .select_append { max(slice[:total_memory_gib] - slice[:used_memory_gib] + host_free_hugepages).as(slice_memory_available) }
-            .where(slice[:enabled] => true)
-            .where(slice[:is_shared] => true)
-            .where(slice[:used_cpu_percent] + request.cpu_percent_limit <= slice[:total_cpu_percent])
-            .where(slice[:used_memory_gib] + request.memory_gib <= slice[:total_memory_gib] + host_free_hugepages))
-          # end of 'with'
-          .left_join(:slice_utilization, vm_host_id: Sequel[:vm_host][:id])
-          .select_append(Sequel.function(:coalesce, :slice_cpu_available, 0).as(:slice_cpu_available))
-          .select_append(Sequel.function(:coalesce, :slice_memory_available, 0).as(:slice_memory_available))
-          .where {
-            ((total_hugepages_1g - used_hugepages_1g >= request.memory_gib) & (total_cores - used_cores >= Sequel.function(:greatest, 1, request.vcpus * total_cores / total_cpus))) |
-              ((slice_cpu_available > 0) & (slice_memory_available > 0))
-          }
-      else
-        # If we allocate a dedicated VM, it does not matter if it is in a slice or not, we just need to find space for
-        # it directly on the host, as we used to. So no slice space computation is involved. A new slice will ALWAYS be
-        # allocated for a new VM.
+    class CandidateHosts
+      def initialize(request)
+        @request = request
+        @datasets = []
+      end
+
+      private def apply_filter(name)
+        ds = yield
+        @datasets << [name, ds]
         ds
-          .where { (total_hugepages_1g - used_hugepages_1g >= request.memory_gib) }
-          .where { (total_cores - used_cores >= Sequel.function(:greatest, 1, request.vcpus * total_cores / total_cpus)) }
       end
 
-      if request.boot_image
-        ds = ds.join(:boot_image, Sequel[:vm_host][:id] => Sequel[:boot_image][:vm_host_id])
-          .where(Sequel[:boot_image][:name] => request.boot_image)
-          .exclude(Sequel[:boot_image][:activated_at] => nil)
+      def hosts
+        request = @request
+
+        ds = apply_filter(:base) do
+          DB[:vm_host]
+            .join(:storage_devices, vm_host_id: Sequel[:vm_host][:id])
+            .left_join(:available_ipv4, routed_to_host_id: Sequel[:vm_host][:id])
+            .left_join(:gpus, vm_host_id: Sequel[:vm_host][:id])
+            .left_join(:gpu_partitions, vm_host_id: Sequel[:vm_host][:id])
+            .left_join(:vm_provisioning, vm_host_id: Sequel[:vm_host][:id])
+            .select(
+              Sequel[:vm_host][:id].as(:vm_host_id),
+              :total_cpus,
+              :total_cores,
+              :used_cores,
+              :total_hugepages_1g,
+              :used_hugepages_1g,
+              :location_id,
+              :num_storage_devices,
+              :available_storage_gib,
+              :total_storage_gib,
+              :storage_devices,
+              Sequel.function(:coalesce, :ipv4_available, false).as(:ipv4_available),
+              Sequel.function(:coalesce, :num_gpus, 0).as(:num_gpus),
+              Sequel.function(:coalesce, :available_gpus, 0).as(:available_gpus),
+              Sequel.function(:coalesce, :use_gpu_partition, false).as(:use_gpu_partition),
+              :available_iommu_groups,
+              Sequel.function(:coalesce, :vm_provisioning_count, 0).as(:vm_provisioning_count),
+              :accepts_slices,
+              :family,
+              :score_offset,
+            )
+            .where(arch: request.arch_filter)
+            .with(:available_ipv4, DB[:ipv4_address]
+              .left_join(:assigned_vm_address, ip: :ip)
+              .join(:address, [:cidr])
+              .where { assigned_vm_address[:ip] =~ nil }
+              .select_group(:routed_to_host_id)
+              .select_append { (count.function.* > 0).as(:ipv4_available) })
+            .with(:storage_devices, DB[:storage_device]
+              .select_group(:vm_host_id)
+              .select_append { count.function.*.as(num_storage_devices) }
+              .select_append { sum(available_storage_gib).as(available_storage_gib) }
+              .select_append { sum(total_storage_gib).as(total_storage_gib) }
+              .select_append { json_agg(json_build_object(Sequel.lit("'id'"), Sequel[:storage_device][:id], Sequel.lit("'total_storage_gib'"), total_storage_gib, Sequel.lit("'available_storage_gib'"), available_storage_gib)).order(available_storage_gib).as(storage_devices) }
+              .where(enabled: true)
+              .having { sum(available_storage_gib) >= request.storage_gib }
+              .having { count.function.* >= (request.distinct_storage_devices ? request.storage_volumes.count : 1) })
+            .with(:gpus, DB[:pci_device]
+              .select_group(:vm_host_id)
+              .select_append { count.function.*.as(num_gpus) }
+              .select_append { sum(Sequel.case({{vm_id: nil} => 1}, 0)).as(available_gpus) }
+              .select_append do
+                           gpu = Sequel.function(:jsonb_build_object, Sequel.lit("'iommu_group'"), :iommu_group, Sequel.lit("'numa_node'"), :numa_node)
+                           Sequel.function(:array_agg, gpu).filter(vm_id: nil).as(:available_iommu_groups)
+                         end
+              .where(device_class: ["0300", "0302"])
+              .where { (device =~ request.gpu_device) | request.gpu_device.nil? })
+            .with(:gpu_partitions, DB[:gpu_partition]
+              .select_group(:vm_host_id)
+              .select_append { Sequel.function(:bool_or, enabled).as(:use_gpu_partition) })
+            .with(:vm_provisioning, DB[:vm]
+              .select_group(:vm_host_id)
+              .select_append { count.function.*.as(vm_provisioning_count) }
+              .where(display_state: "creating"))
+        end
+
+        ds = if request.use_slices && request.require_shared_slice
+          apply_filter(:slice) do
+            # We are looking for hosts that have at least once slice already allocated but with enough room
+            # for our new VM. This means it has to be a sharable slice, with cpu and memory available
+            # We then combine it with search for a host, as usual, with just open space on the host where
+            # we could allocate a new slice
+            # Later in VmHostSliceAllocator the selected hosts will be scored depending if a slice is reused or
+            # new one is created
+            # Shared slices only book the memory of the VMs placed in them and grow when reused, so a slice
+            # that is short on memory still qualifies if the host has free hugepages for the difference.
+            slice = Sequel[:vm_host_slice]
+            slice_host = Sequel[:slice_host]
+            host_free_hugepages = slice_host[:total_hugepages_1g] - slice_host[:used_hugepages_1g]
+            ds.with(:slice_utilization, DB[:vm_host_slice]
+                .join(Sequel[:vm_host].as(:slice_host), id: :vm_host_id)
+                .select_group(slice[:vm_host_id])
+                .select_append { (sum(slice[:total_cpu_percent]) - sum(slice[:used_cpu_percent])).as(slice_cpu_available) }
+                .select_append { max(slice[:total_memory_gib] - slice[:used_memory_gib] + host_free_hugepages).as(slice_memory_available) }
+                .where(slice[:enabled] => true)
+                .where(slice[:is_shared] => true)
+                .where(slice[:used_cpu_percent] + request.cpu_percent_limit <= slice[:total_cpu_percent])
+                .where(slice[:used_memory_gib] + request.memory_gib <= slice[:total_memory_gib] + host_free_hugepages))
+              # end of 'with'
+              .left_join(:slice_utilization, vm_host_id: Sequel[:vm_host][:id])
+              .select_append(Sequel.function(:coalesce, :slice_cpu_available, 0).as(:slice_cpu_available))
+              .select_append(Sequel.function(:coalesce, :slice_memory_available, 0).as(:slice_memory_available))
+              .where {
+                ((total_hugepages_1g - used_hugepages_1g >= request.memory_gib) & (total_cores - used_cores >= Sequel.function(:greatest, 1, request.vcpus * total_cores / total_cpus))) |
+                  ((slice_cpu_available > 0) & (slice_memory_available > 0))
+              }
+          end
+        else
+          apply_filter(:space) do
+            # If we allocate a dedicated VM, it does not matter if it is in a slice or not, we just need to find space for
+            # it directly on the host, as we used to. So no slice space computation is involved. A new slice will ALWAYS be
+            # allocated for a new VM.
+            ds
+              .where { total_hugepages_1g - used_hugepages_1g >= request.memory_gib }
+              .where { total_cores - used_cores >= Sequel.function(:greatest, 1, request.vcpus * total_cores / total_cpus) }
+          end
+        end
+
+        apply_filter(:boot_image) do
+          if request.boot_image
+            ds = ds.join(:boot_image, Sequel[:vm_host][:id] => Sequel[:boot_image][:vm_host_id])
+              .where(Sequel[:boot_image][:name] => request.boot_image)
+              .exclude(Sequel[:boot_image][:activated_at] => nil)
+          end
+
+          request.storage_volumes.select { it[1]["read_only"] && it[1]["image"] }.map { [it[0], it[1]["image"]] }.each do |idx, img|
+            table_alias = :"boot_image_#{idx}"
+            ds = ds.join(Sequel[:boot_image].as(table_alias), Sequel[:vm_host][:id] => Sequel[table_alias][:vm_host_id])
+              .where(Sequel[table_alias][:name] => img)
+              .exclude(Sequel[table_alias][:activated_at] => nil)
+          end
+
+          ds
+        end
+
+        if request.ip4_enabled
+          apply_filter(:ipv4) { ds = ds.where(:ipv4_available) }
+        end
+        if request.gpu_count > 0
+          apply_filter(:gpu_count) { ds = ds.where { available_gpus >= request.gpu_count } }
+        end
+        unless request.host_filter.empty?
+          apply_filter(:host) { ds = ds.where(Sequel[:vm_host][:id] => request.host_filter) }
+        end
+        unless request.host_exclusion_filter.empty?
+          apply_filter(:exclude_host) { ds = ds.exclude(Sequel[:vm_host][:id] => request.host_exclusion_filter) }
+        end
+        unless request.data_center_exclusion_filter.empty?
+          apply_filter(:exclude_data_center) { ds = ds.exclude(Sequel[:vm_host][:data_center] => request.data_center_exclusion_filter) }
+        end
+        unless request.location_filter.empty?
+          apply_filter(:location) { ds = ds.where(location_id: request.location_filter) }
+        end
+        unless request.allocation_state_filter.empty?
+          apply_filter(:allocation_state) { ds = ds.where(allocation_state: request.allocation_state_filter) }
+        end
+        unless request.family_filter.empty?
+          apply_filter(:family) { ds = ds.where(Sequel[:vm_host][:family] => request.family_filter) }
+        end
+        if request.os_filter
+          apply_filter(:os) { ds = ds.where(Sequel[:vm_host][:os_version] => request.os_filter) }
+        end
+        unless request.gpu_count > 0 || request.host_filter.any? || request.single_ubicloud_location?
+          apply_filter(:non_gpu) { ds = ds.exclude { Sequel.function(:coalesce, num_gpus, 0) > 0 } }
+        end
+
+        if request.minimum_vhost_block_backend_version
+          apply_filter(:vhost_block_backend_version) do
+            ds = ds.where(
+              DB[:vhost_block_backend]
+                .where(vm_host_id: Sequel[:vm_host][:id])
+                .exclude(allocation_weight: 0)
+                .where { version_code >= request.minimum_vhost_block_backend_version }
+                .select(1)
+                .exists,
+            )
+          end
+        end
+
+        # If we dont want to use slices, place those only on hosts that do not accept them
+        # If we require a shared slice (for burstable vm), allocate those only on hosts that accept slices
+        # In all other cases, the host's acceptance of slices will determine if the VM is created in a slice or not
+        if !request.use_slices
+          apply_filter(:no_slices) { ds = ds.where(accepts_slices: false) }
+        elsif request.require_shared_slice
+          apply_filter(:shared_slice) { ds = ds.where(accepts_slices: true) }
+        end
+
+        records = ds.all
+
+        # Emit the allocation query if the project is flagged for diagnostics or there were
+        # no candidate hosts found.
+        if request.diagnostics || (records.empty? && !request.boot_image&.include?("github"))
+          counts = []
+          @datasets.each do |name, ds|
+            count = ds.count
+            counts << [name, count]
+            break if count == 0
+          end
+          Clog.emit("Allocator query for vm", {allocator_query: {vm_id: request.vm_id,
+                                                                 sql: ds.no_auto_parameterize.sql,
+                                                                 counts:}})
+        end
+
+        records
       end
-
-      request.storage_volumes.select { it[1]["read_only"] && it[1]["image"] }.map { [it[0], it[1]["image"]] }.each do |idx, img|
-        table_alias = :"boot_image_#{idx}"
-        ds = ds.join(Sequel[:boot_image].as(table_alias), Sequel[:vm_host][:id] => Sequel[table_alias][:vm_host_id])
-          .where(Sequel[table_alias][:name] => img)
-          .exclude(Sequel[table_alias][:activated_at] => nil)
-      end
-
-      ds = ds.where(:ipv4_available) if request.ip4_enabled
-      ds = ds.where { available_gpus >= request.gpu_count } if request.gpu_count > 0
-      ds = ds.where(Sequel[:vm_host][:id] => request.host_filter) unless request.host_filter.empty?
-      ds = ds.exclude(Sequel[:vm_host][:id] => request.host_exclusion_filter) unless request.host_exclusion_filter.empty?
-      ds = ds.exclude(Sequel[:vm_host][:data_center] => request.data_center_exclusion_filter) unless request.data_center_exclusion_filter.empty?
-      ds = ds.where(location_id: request.location_filter) unless request.location_filter.empty?
-      ds = ds.where(allocation_state: request.allocation_state_filter) unless request.allocation_state_filter.empty?
-      ds = ds.where(Sequel[:vm_host][:family] => request.family_filter) unless request.family_filter.empty?
-      ds = ds.exclude { Sequel.function(:coalesce, num_gpus, 0) > 0 } unless request.gpu_count > 0 || request.host_filter.any?
-
-      # Temporary while testing CloudHypervisor 46 rollout
-      ds = ds.where(Sequel[:vm_host][:os_version] => request.os_filter) if request.os_filter
-
-      if request.minimum_vhost_block_backend_version
-        ds = ds.where(
-          DB[:vhost_block_backend]
-            .where(vm_host_id: Sequel[:vm_host][:id])
-            .exclude(allocation_weight: 0)
-            .where { version_code >= request.minimum_vhost_block_backend_version }
-            .select(1)
-            .exists,
-        )
-      end
-
-      # If we dont's want to use slices, place those only on hosts that do not accept them
-      # If we require a shared slice (for burstable vm), allocate those only on hosts that accept slices
-      # In all other cases, the host's acceptance of slices will determine if the VM is created in a slice or not
-      if !request.use_slices
-        ds = ds.where(accepts_slices: false)
-      elsif request.require_shared_slice
-        ds = ds.where(accepts_slices: true)
-      end
-
-      # Emit the allocation query if the project is flagged for
-      # diagnostics.
-      if request.diagnostics
-        Clog.emit("Allocator query for vm", {allocator_query: {vm_id: request.vm_id,
-                                                               sql: ds.no_auto_parameterize.sql}})
-      end
-
-      ds.all
     end
 
     def self.update_vm(vm_host, vm)
@@ -401,10 +472,26 @@ module Scheduling::Allocator
       # penalty of 5 if host has a GPU but VM doesn't require a GPU
       score += 5 unless @request.gpu_count > 0 || @candidate_host[:num_gpus] == 0
 
+      # penalty of 5 for breaking up protected large storage devices
+      score += 5 if breaks_up_protected_large_storage_device?
+
       # penalty of 10 if location preference is not honored
       score += 10 unless @request.location_preference.empty? || @request.location_preference.include?(@candidate_host[:location_id])
 
+      # per-host manual offset, negative to prioritize
+      score += @candidate_host[:score_offset]
+
       score
+    end
+
+    def breaks_up_protected_large_storage_device?
+      large = Config.allocator_large_storage_device_gib
+      storage_allocation = @device_allocations.first
+
+      Config.allocator_protected_large_storage_location_ids.include?(@candidate_host[:location_id]) &&
+        @candidate_host[:storage_devices].any? { it["available_storage_gib"] >= large } &&
+        !@request.needs_large_storage_device? &&
+        storage_allocation.reduces_large_device_multiples?
     end
   end
 
@@ -579,18 +666,20 @@ module Scheduling::Allocator
     def select_cpuset(vm_host_id, n)
       # select the cpuset for the new slice
       cpus = VmHostCpu
-        .where(vm_host_id:, spdk: false, vm_host_slice_id: nil)
+        .where(vm_host_id:, io: false, vm_host_slice_id: nil)
         .order_by(:cpu_number)
-        .limit(n)
-        .map(&:cpu_number)
+        .to_hash_groups(:numa_node)
+        .values
 
-      if cpus.size != n
+      chosen = cpus.select { |arr| arr.size >= n }.min_by(&:size) || cpus.flatten
+
+      if chosen.size < n
         vm_host_ubid = UBID.to_ubid(vm_host_id)
-        Clog.emit("allocator counter drift", {allocator_counter_drift: {vm_host_id: vm_host_ubid, free_cpus: cpus.size, requested_cpus: n}})
-        raise CounterDrift.new("failed to allocate cpus on #{vm_host_ubid}: counters admit the slice but only #{cpus.size} of #{n} CPUs are free", vm_host_id)
+        Clog.emit("allocator counter drift", {allocator_counter_drift: {vm_host_id: vm_host_ubid, free_cpus: chosen.size, requested_cpus: n}})
+        raise CounterDrift.new("failed to allocate cpus on #{vm_host_ubid}: counters admit the slice but only #{chosen.size} of #{n} CPUs are free", vm_host_id)
       end
 
-      cpus
+      chosen.first(n).map!(&:cpu_number)
     end
 
     def select_existing_slice
@@ -701,6 +790,10 @@ module Scheduling::Allocator
   end
 
   class StorageAllocation
+    # Space kept free on every storage device, so that a device always has
+    # room for a new boot image or for an emergency.
+    RESERVED_STORAGE_GIB = 100
+
     attr_reader :is_valid, :total, :used, :requested, :volume_to_device_map
     def initialize(candidate_host, request)
       @candidate_host = candidate_host
@@ -710,11 +803,23 @@ module Scheduling::Allocator
 
     def update(vm, vm_host)
       @storage_device_allocations.each { it.update }
-      create_storage_volumes(vm, vm_host)
+      allocate_storage_volume_associations(vm, vm_host)
     end
 
     def utilization
       1 - (@candidate_host[:available_storage_gib] - @request.storage_gib).fdiv(@candidate_host[:total_storage_gib])
+    end
+
+    def reduces_large_device_multiples?
+      return false unless @storage_device_allocations
+
+      large = Config.allocator_large_storage_device_gib
+
+      @storage_device_allocations.any? do |dev|
+        available_before = dev.available_storage_gib + dev.allocated_storage_gib
+        next false if available_before < large
+        (dev.available_storage_gib / large).floor < (available_before / large).floor
+      end
     end
 
     def self.allocate_spdk_installation(spdk_installations)
@@ -765,20 +870,35 @@ module Scheduling::Allocator
 
       @volume_to_device_map = {}
       @request.storage_volumes.each do |vol_id, vol|
-        dev = @storage_device_allocations.detect { |dev| dev.available_storage_gib >= vol["size_gib"] && !(@request.distinct_storage_devices && dev.allocated_storage_gib > 0) }
+        size_gib = vol["size_gib"]
+
+        # Devices are ordered by available space, so the smallest device that
+        # fits wins. Prefer the smallest device that also keeps the reserve
+        # free, and fall back to the smallest device that fits only when no
+        # device can keep the reserve.
+        smallest_fit = nil
+        dev = @storage_device_allocations.detect { |dev|
+          next if @request.distinct_storage_devices && dev.allocated_storage_gib > 0
+          next if dev.available_storage_gib < size_gib
+
+          smallest_fit ||= dev
+          dev.available_storage_gib - size_gib >= RESERVED_STORAGE_GIB
+        } || smallest_fit
         return false if dev.nil?
 
         @volume_to_device_map[vol_id] = dev.id
-        dev.allocate(vol["size_gib"])
+        dev.allocate(size_gib)
       end
       true
     end
 
-    def create_storage_volumes(vm, vm_host)
-      @request.storage_volumes.each do |disk_index, volume|
+    def allocate_storage_volume_associations(vm, vm_host)
+      params_by_disk_index = @request.storage_volumes.to_h
+      vm.vm_storage_volumes.each do |volume|
+        params = params_by_disk_index[volume.disk_index]
         if vm_host.vhost_block_backends_dataset.exclude(allocation_weight: 0).empty?
           spdk_installation_id = StorageAllocation.allocate_spdk_installation(vm_host.spdk_installations)
-          use_bdev_ubi = SpdkInstallation[spdk_installation_id].supports_bdev_ubi? && volume["boot"]
+          use_bdev_ubi = SpdkInstallation[spdk_installation_id].supports_bdev_ubi? && volume.boot
         else
           vhost_block_backend_id = StorageAllocation.allocate_vhost_block_backend(
             vm_host.vhost_block_backends,
@@ -787,34 +907,21 @@ module Scheduling::Allocator
           use_bdev_ubi = false
         end
 
-        key_encryption_key = if volume["encrypted"]
-          StorageKeyEncryptionKey.create_random(auth_data: "#{vm.inhost_name}_#{disk_index}")
-        end
-
-        image_id = if volume["machine_image_version_id"]
+        boot_image_id = if volume.machine_image_version_id || volume.remote_storage_server_id
           nil
-        elsif volume["boot"]
+        elsif volume.boot
           allocate_boot_image(vm_host, vm.boot_image)
-        elsif volume["read_only"]
-          allocate_boot_image(vm_host, volume["image"])
+        elsif params["read_only"]
+          allocate_boot_image(vm_host, params["image"])
         end
 
-        VmStorageVolume.create(
-          vm_id: vm.id,
-          boot: volume["boot"],
-          size_gib: volume["size_gib"],
+        volume.update(
           use_bdev_ubi:,
-          boot_image_id: image_id,
-          disk_index:,
-          key_encryption_key_1_id: key_encryption_key&.id,
+          boot_image_id:,
           spdk_installation_id:,
           vhost_block_backend_id:,
-          storage_device_id: @volume_to_device_map[disk_index],
-          max_read_mbytes_per_sec: volume["max_read_mbytes_per_sec"],
-          max_write_mbytes_per_sec: volume["max_write_mbytes_per_sec"],
-          vring_workers: vhost_block_backend_id ? volume["vring_workers"] : nil,
-          track_written: volume.fetch("track_written", false),
-          machine_image_version_id: volume["machine_image_version_id"],
+          storage_device_id: @volume_to_device_map[volume.disk_index],
+          vring_workers: vhost_block_backend_id ? params["vring_workers"] : nil,
         )
       end
     end

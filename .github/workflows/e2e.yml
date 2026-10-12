@@ -10,36 +10,100 @@ on:
       test_cases:
         description: 'Comma-separated list of test cases (vm)'
         required: true
-        default: 'vm,github_runner_ubuntu_2404,github_runner_ubuntu_2204,postgres_standard,postgres_ha,postgres_upgrade,kubernetes'
+        default: 'vm,github_runner_ubuntu_2604,github_runner_ubuntu_2404,github_runner_ubuntu_2204,postgres_standard,postgres_ubuntu_2604,postgres_ha,postgres_upgrade,postgres_upgrade16,postgres_firewall,kubernetes,kubernetes_upgrade,machine_image_vm_capture,move_vm'
         type: string
       providers:
-        description: 'Comma-separated list of providers (metal,aws)'
+        description: 'Comma-separated list of providers (metal,aws,gcp)'
         required: true
-        default: 'metal,aws'
+        default: 'metal,aws,gcp'
         type: string
 
   schedule:
     - cron:  '0 */2 * * *'
 
+env:
+  INPUT_PROVIDERS: ${{ inputs.providers }}
+  INPUT_TEST_CASES: ${{ inputs.test_cases }}
+
 jobs:
   setup:
     if: vars.RUN_E2E == 'true'
     runs-on: ubuntu-slim
+    permissions:
+      actions: write # Required to cancel in-progress/queued E2E runs.
     outputs:
       providers: ${{ steps.set-providers.outputs.providers }}
+      has_github_runner: ${{ steps.set-providers.outputs.has_github_runner }}
+      skip: ${{ steps.skip_check.outputs.skip }}
     steps:
+      - name: Cancel in-progress scheduled E2E runs
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'e2e.yml',
+              event: 'schedule',
+              status: 'in_progress',
+            });
+            for (const run of runs.data.workflow_runs) {
+              console.log(`Cancelling scheduled E2E run ${run.id} (${run.html_url})`);
+              await github.rest.actions.cancelWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+              });
+            }
+
+      - name: Skip scheduled run if another E2E run is already queued behind a running one
+        if: github.event_name == 'schedule'
+        id: skip_check
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const listOthers = async (status) => {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'e2e.yml',
+                status,
+              });
+              return runs.data.workflow_runs.filter(r => r.id !== context.runId);
+            };
+            const inProgress = await listOthers('in_progress');
+            const queued = await listOthers('queued');
+            if (inProgress.length > 0 && queued.length > 0) {
+              const urls = [...inProgress, ...queued].map(r => r.html_url).join(', ');
+              console.log(`Found ${inProgress.length} in_progress and ${queued.length} queued E2E run(s): ${urls}`);
+              console.log('Skipping this scheduled run to avoid displacing the waiting job');
+              core.setOutput('skip', 'true');
+              await github.rest.actions.cancelWorkflowRun({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: context.runId,
+              });
+            }
+
       - name: Set provider matrix
         id: set-providers
         run: |
-          providers="metal,aws"
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.providers }}" ]]; then
-            providers="${{ inputs.providers }}"
+          providers="metal,aws,gcp"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "$INPUT_PROVIDERS" ]]; then
+            providers="$INPUT_PROVIDERS"
           fi
           # Convert comma-separated list to JSON array
+          has_github_runner=false
+          if [[ "${{ github.event_name }}" != "workflow_dispatch" || "$INPUT_TEST_CASES" == *"github_runner"* ]]; then
+            has_github_runner=true
+          fi
           echo "providers=$(echo "$providers" | jq -Rc 'split(",")')" >> $GITHUB_OUTPUT
+          echo "has_github_runner=$has_github_runner" >> $GITHUB_OUTPUT
 
   e2e:
     needs: setup
+    if: needs.setup.outputs.skip != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -47,22 +111,35 @@ jobs:
     name: E2E - ${{ matrix.provider }}
     runs-on: ubicloud-standard-4
     environment: E2E-${{ matrix.provider }}
-    timeout-minutes: 93
-    concurrency: E2E-${{ matrix.provider }}
+    timeout-minutes: 85
+    concurrency: ${{ (matrix.provider == 'metal' && 'E2E-metal') || (matrix.provider == 'gcp' && format('E2E-gcp-{0}', github.run_id)) || (needs.setup.outputs.has_github_runner == 'true' && 'E2E-aws') || format('E2E-aws-{0}', github.run_id) }}
+    env:
+      # Set repo variable E2E_PAUSE_METAL=true to halt metal e2e runs while
+      # debugging the shared metal host. The metal job then fails fast without
+      # touching the host (no checkout, no reimage) and skips the Slack page.
+      METAL_PAUSED: ${{ matrix.provider == 'metal' && vars.E2E_PAUSE_METAL == 'true' }}
 
     steps:
+    - name: Fail fast if metal is paused for debugging
+      if: env.METAL_PAUSED == 'true'
+      run: |
+        echo "⚠️ METAL E2E PAUSED (vars.E2E_PAUSE_METAL=true) — failing without touching the host." >> "$GITHUB_STEP_SUMMARY"
+        echo "Unset the variable to resume: gh variable delete E2E_PAUSE_METAL" >> "$GITHUB_STEP_SUMMARY"
+        exit 1
+
     - name: Check out code
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
 
     - name: Setup SSH access
-      uses: ubicloud/ssh-runner@v1
+      uses: ubicloud/ssh-runner@b6ccad69f047c476b84a54a990f89b1ea5f2a828 # v2.0
       with:
-        public-ssh-key: |
-          ${{ secrets.OPERATOR_SSH_PUBLIC_KEYS }}
+        public-ssh-key: ${{ secrets.OPERATOR_SSH_PUBLIC_KEYS }}
         wait-minutes: 0
 
     - name: Set up Clover
-      uses: ./.github/actions/setup-clover
+      uses: $/.github/actions/setup-clover
       with:
         setup-node: true
 
@@ -70,9 +147,11 @@ jobs:
       run: npm run prod
 
     - name: Install cloudflared
+      if: needs.setup.outputs.has_github_runner == 'true'
       run: curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb && sudo dpkg -i cloudflared.deb
 
     - name: Set cloudflared token
+      if: needs.setup.outputs.has_github_runner == 'true'
       run: sudo cloudflared service install ${{ secrets.CLOUDFLARED_TOKEN }}
 
     - name: Install mailpit
@@ -84,21 +163,20 @@ jobs:
           --setenv="MP_SMTP_AUTH=${{ secrets.MAIL_USER }}:${{ secrets.MAIL_PASSWORD }}" --setenv="MP_SMTP_AUTH_ALLOW_INSECURE=true" \
           --unit mailpit -- mailpit
 
-    - name: Install foreman
-      run: gem install foreman
-
     - name: Modify Procfile to add retry logic
       run: |
         sed -i "s/^\([^:]*\): \(.*\)/\1: bash -c 'for i in {1..4}; do \2 \&\& break || echo \"Attempt \$i failed, retrying...\"; sleep 1; done'/" Procfile
 
     - name: Add e2e script to Procfile
+      env:
+        PROVIDER: ${{ matrix.provider }}
       run: |
         test_cases="$(yq -r '[.[].name] | join(",")' config/e2e_test_cases.yml)"
-        if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.test_cases }}" ]]; then
-          test_cases="${{ inputs.test_cases }}"
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "$INPUT_TEST_CASES" ]]; then
+          test_cases="$INPUT_TEST_CASES"
         fi
-        echo "Running e2e ${{ matrix.provider }} test cases:$test_cases"
-        echo "e2e: bin/e2e --provider=${{ matrix.provider }} --test-cases=$test_cases" >> Procfile
+        echo "Running e2e $PROVIDER test cases:$test_cases"
+        echo "e2e: bin/e2e --provider=$PROVIDER --test-cases=$test_cases" >> Procfile
 
     - name: Persist env vars to .env.rb
       run: |
@@ -112,6 +190,8 @@ jobs:
         ENV["KUBERNETES_SERVICE_PROJECT_ID"] = "4e762e09-2a22-82d2-93c2-cfbefbda8c69"
         ENV["MINIO_SERVICE_PROJECT_ID"] = "37ad2a8d-0220-4e8b-a67f-38db95d6c657"
         ENV["VM_POOL_PROJECT_ID"] = "e4b93fb7-5125-8ad2-9d29-730ff4506bc3"
+        ENV["DNS_SERVICE_PROJECT_ID"] = "527dddb6-351f-8ad2-9b11-688f155a28dc"
+        ENV["LOAD_BALANCER_SERVICE_PROJECT_ID"] = "58e3bc1c-8cad-86d2-a8f1-c2331f74dc71"
         EOF
 
     - name: Run tests
@@ -119,11 +199,17 @@ jobs:
         BASE_URL: https://${{ secrets.CLOUDFLARED_ADDRESS }}
         ALLOW_UNSPREAD_SERVERS: "true"
         DISPATCHER_MAX_THREADS: 16
+        DB_POOL_RESPIRATE: 19
+        WEB_CONCURRENCY: 2
+        PROVIDER_RESOURCE_TAG_VALUE: ${{ github.run_id }}
         E2E_HETZNER_SERVER_ID: ${{ secrets.E2E_HETZNER_SERVER_ID }}
         E2E_GITHUB_INSTALLATION_ID: ${{ secrets.E2E_GH_INSTALLATION_ID }}
         E2E_AWS_ACCESS_KEY: ${{ secrets.E2E_AWS_ACCESS_KEY }}
         E2E_AWS_SECRET_KEY: ${{ secrets.E2E_AWS_SECRET_KEY }}
+        E2E_GCP_CREDENTIALS_BASE64_JSON: ${{ secrets.E2E_GCP_CREDENTIALS_BASE64_JSON }}
         E2E_CACHE_PROXY_DOWNLOAD_URL: ${{ secrets.E2E_CACHE_PROXY_DOWNLOAD_URL }}
+        E2E_CLOUDFLARE_API_TOKEN: ${{ secrets.E2E_CLOUDFLARE_API_TOKEN }}
+        E2E_CLOUDFLARE_PARENT_ZONE_NAME: ${{ secrets.E2E_CLOUDFLARE_PARENT_ZONE_NAME }}
         HETZNER_SSH_PUBLIC_KEY: ${{ secrets.HETZNER_SSH_PUBLIC_KEY }}
         HETZNER_SSH_PRIVATE_KEY: ${{ secrets.HETZNER_SSH_PRIVATE_KEY }}
         HETZNER_USER: ${{ secrets.HETZNER_USER }}
@@ -136,6 +222,12 @@ jobs:
         UBICLOUD_IMAGES_R2_ENDPOINT: ${{ secrets.UBICLOUD_IMAGES_R2_ENDPOINT }}
         UBICLOUD_IMAGES_R2_ACCESS_KEY: ${{ secrets.UBICLOUD_IMAGES_R2_ACCESS_KEY }}
         UBICLOUD_IMAGES_R2_SECRET_KEY: ${{ secrets.UBICLOUD_IMAGES_R2_SECRET_KEY }}
+        E2E_MACHINE_IMAGES_ENDPOINT: ${{ secrets.E2E_MACHINE_IMAGES_ENDPOINT }}
+        E2E_MACHINE_IMAGES_BUCKET: ${{ secrets.E2E_MACHINE_IMAGES_BUCKET }}
+        E2E_MACHINE_IMAGES_ACCESS_KEY: ${{ secrets.E2E_MACHINE_IMAGES_ACCESS_KEY }}
+        E2E_MACHINE_IMAGES_SECRET_KEY: ${{ secrets.E2E_MACHINE_IMAGES_SECRET_KEY }}
+        MACHINE_IMAGES_SERVICE_PROJECT_ID: "00400002-8a64-42d2-ab80-000001a2a0ec" # pj010000mach1ne000001mages
+        GITHUB_ACTIONS_CH_53_PERCENT: 100
         GITHUB_APP_NAME: ${{ secrets.GH_APP_NAME }}
         GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
         GITHUB_APP_CLIENT_ID: ${{ secrets.GH_APP_CLIENT_ID }}
@@ -148,6 +240,8 @@ jobs:
         GITHUB_CACHE_BLOB_STORAGE_SECRET_KEY: ${{ secrets.GH_CACHE_BLOB_STORAGE_SECRET_KEY }}
         GITHUB_CACHE_BLOB_STORAGE_ACCOUNT_ID: ${{ secrets.GH_CACHE_BLOB_STORAGE_ACCOUNT_ID }}
         GITHUB_CACHE_BLOB_STORAGE_API_KEY: ${{ secrets.GH_CACHE_BLOB_STORAGE_API_KEY }}
+        KUBERNETES_SERVICE_HOSTNAME: ${{ secrets.KUBERNETES_SERVICE_HOSTNAME }}
+        LOAD_BALANCER_SERVICE_HOSTNAME: ${{ secrets.LOAD_BALANCER_SERVICE_HOSTNAME }}
         MAIL_FROM: test@example.com
         SMTP_USER: ${{ secrets.MAIL_USER }}
         SMTP_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
@@ -156,18 +250,18 @@ jobs:
         SMTP_TLS: false
         STRIPE_PUBLIC_KEY: ${{ secrets.STRIPE_PUBLIC_KEY }}
         STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
-        VHOST_BLOCK_BACKEND_VERSION: v0.4.0
+        VHOST_BLOCK_BACKEND_VERSION: v0.5.1
         OPERATOR_SSH_PUBLIC_KEYS: ${{ secrets.OPERATOR_SSH_PUBLIC_KEYS }}
       run: |
         set -o pipefail
-        timeout 83m foreman start -m all=1,respirate=2 | tee foreman.log | grep --line-buffered -F "e2e.1"
+        timeout 70m bundle exec foreman start -m all=1,respirate=2 | tee foreman.log | grep --line-buffered -F "e2e.1"
 
     - name: Print logs
-      if: always()
+      if: always() && env.METAL_PAUSED != 'true'
       run: grep -h -v -E "sleep_duration_sec|monitor.1" foreman.log
 
     - name: Extract GitHub workflow run
-      if: always()
+      if: always() && env.METAL_PAUSED != 'true'
       continue-on-error: true
       run: |
         html_url="$(grep 'github_workflow_run' foreman.log | cut -d'|' -f2 | jq -r '.github_workflow_run.html_url' | head -1)"
@@ -176,15 +270,15 @@ jobs:
         fi
 
     - name: Extract image download time
-      if: always() && matrix.provider == 'metal'
+      if: always() && matrix.provider == 'metal' && env.METAL_PAUSED != 'true'
       id: extract_download
       run: |
-        download_time="$(grep "VmHost.wait_download_boot_images" foreman.log | cut -d'|' -f2 | tail -1)"
-        echo "### Image downloaded in $download_time" >> $GITHUB_STEP_SUMMARY
-        echo "DOWNLOAD_TIME=$download_time" >> $GITHUB_OUTPUT
+        download_time="$(grep "Boot image download completed" foreman.log | cut -d'|' -f2 | jq -r '.boot_image_download.duration' | sort -nr | head -1)"
+        echo "### Slowest boot image downloaded in ${download_time}s" >> $GITHUB_STEP_SUMMARY
+        echo "DOWNLOAD_TIME=${download_time}s" >> $GITHUB_OUTPUT
 
     - name: Extract last line
-      if: always()
+      if: always() && env.METAL_PAUSED != 'true'
       id: extract_last
       run: |
         last_line="$(grep "e2e.1" foreman.log | tail -2 | head -1 | cut -d'|' -f2,4,5)"
@@ -192,7 +286,7 @@ jobs:
         echo "LAST_LINE=$last_line" >> $GITHUB_OUTPUT
 
     - name: Extract vm provision times
-      if: always()
+      if: always() && env.METAL_PAUSED != 'true'
       continue-on-error: true
       run: |
         echo "## VM Provisioning Times" >> $GITHUB_STEP_SUMMARY
@@ -201,7 +295,7 @@ jobs:
         grep "vm provisioned" foreman.log | cut -d'|' -f2 | jq -r '[.thread, .vm.name, .vm.boot_image, .provision.duration] | "| " + join(" | ") + " |"' >> $GITHUB_STEP_SUMMARY
 
     - name: Extract runner queue times
-      if: always()
+      if: always() && env.METAL_PAUSED != 'true'
       continue-on-error: true
       run: |
         echo "## Runner Queue Times" >> $GITHUB_STEP_SUMMARY
@@ -210,7 +304,7 @@ jobs:
         grep "runner_started" foreman.log | cut -d'|' -f2 | jq -r '[.runner_started.ubid, .runner_started.label, .runner_started.vm_ubid, .runner_started.duration] | "| " + join(" | ") + " |"' >> $GITHUB_STEP_SUMMARY
 
     - name: Extract exception
-      if: always()
+      if: always() && env.METAL_PAUSED != 'true'
       continue-on-error: true
       run: |
         echo "## Exceptions" >> $GITHUB_STEP_SUMMARY
@@ -219,17 +313,17 @@ jobs:
         grep 'respirate.*"exception"' foreman.log | cut -d'|' -f2 | jq -r '[.time, .thread, .prog_label, .exception.class, (.exception.message | gsub("\n"; " ")), (.exception.backtrace[0] // "" | gsub("\n"; " "))] | "| " + join(" | ") + " |"' >> $GITHUB_STEP_SUMMARY
 
     - name: Upload logs
-      if: always()
-      uses: actions/upload-artifact@v7
+      if: always() && env.METAL_PAUSED != 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: e2e-${{ matrix.provider }}-${{ github.run_id }}-logs
         path: foreman.log
 
     - name: Dump PostgreSQL database
-      if: always()
+      if: always() && env.METAL_PAUSED != 'true'
       run: |
         pg_dump "postgres:///clover_test?user=clover" \
-          --table='archived_record*' \
+          --table='deleted_record*' \
           --table=vm \
           --table=vm_host \
           --table=load_balancer \
@@ -264,15 +358,15 @@ jobs:
           > clover_test_dump.sql
 
     - name: Upload database dump
-      if: always()
-      uses: actions/upload-artifact@v7
+      if: always() && env.METAL_PAUSED != 'true'
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: e2e-${{ matrix.provider }}-${{ github.run_id }}-db-dump
         path: clover_test_dump.sql
 
     - name: Send notification if failed
-      if: ${{ failure() && github.ref_name == 'main' }}
-      uses: slackapi/slack-github-action@v3.0.1
+      if: ${{ failure() && github.ref_name == 'main' && env.METAL_PAUSED != 'true' }}
+      uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
       with:
         webhook: ${{ secrets.SLACK_WEBHOOK_PAGER_URL }}
         webhook-type: incoming-webhook
@@ -295,80 +389,82 @@ jobs:
                   value: "${{ steps.extract_download.outputs.DOWNLOAD_TIME }}"
                 - title: "Last Line"
                   short: false
-                  value: "${{ steps.extract_last.outputs.LAST_LINE }}"
+                  value: ${{ toJSON(steps.extract_last.outputs.LAST_LINE) }}
 
     - name: Sleep 10 minutes after failed notification
-      if: ${{ failure() && github.ref_name == 'main' }}
+      if: ${{ failure() && github.ref_name == 'main' && env.METAL_PAUSED != 'true' }}
       run: sleep 600
 
+    - name: Stop cloudflared
+      if: always() && env.METAL_PAUSED != 'true'
+      run: sudo systemctl stop cloudflared || true
+
+  cleanup-aws:
+    needs: [setup, e2e]
+    if: always() && contains(needs.setup.outputs.providers, 'aws')
+    runs-on: ubicloud-standard-2
+    environment: E2E-aws
+    timeout-minutes: 20
+    permissions:
+      contents: read # actions/checkout
+      actions: read # read a stale run's status before sweeping its resources
+    steps:
     - name: Cleanup AWS resources
-      if: always() && matrix.provider == 'aws'
+      uses: $/.github/actions/aws-cleanup-e2e
+      with:
+        access-key-id: ${{ secrets.E2E_AWS_ACCESS_KEY }}
+        secret-access-key: ${{ secrets.E2E_AWS_SECRET_KEY }}
+        run-id: ${{ github.run_id }}
+        github-token: ${{ github.token }}
+
+  cleanup-gcp:
+    needs: [setup, e2e]
+    if: always() && contains(needs.setup.outputs.providers, 'gcp')
+    runs-on: ubicloud-standard-4
+    environment: E2E-gcp
+    timeout-minutes: 20
+    steps:
+    - name: Download e2e logs
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: e2e-gcp-${{ github.run_id }}-logs
+
+    - name: Cleanup GCP resources
+      uses: $/.github/actions/gcp-cleanup-e2e
+      with:
+        credentials-base64: ${{ secrets.E2E_GCP_CREDENTIALS_BASE64_JSON }}
+
+  cleanup-github-cache:
+    needs: [setup, e2e]
+    if: always() && needs.setup.outputs.has_github_runner == 'true'
+    runs-on: ubicloud-standard-2
+    environment: E2E-metal
+    timeout-minutes: 10
+    steps:
+    - name: Cleanup GitHub cache resources
+      uses: $/.github/actions/github-cache-cleanup-e2e
+      with:
+        endpoint: ${{ secrets.GH_CACHE_BLOB_STORAGE_ENDPOINT }}
+        region: ${{ secrets.GH_CACHE_BLOB_STORAGE_REGION }}
+        access-key-id: ${{ secrets.GH_CACHE_BLOB_STORAGE_ACCESS_KEY }}
+        secret-access-key: ${{ secrets.GH_CACHE_BLOB_STORAGE_SECRET_KEY }}
+        api-key: ${{ secrets.GH_CACHE_BLOB_STORAGE_API_KEY }}
+
+  cleanup-machine-images:
+    needs: [setup, e2e]
+    if: always() && contains(needs.setup.outputs.providers, 'metal') && vars.E2E_PAUSE_METAL != 'true'
+    runs-on: ubicloud-standard-2
+    environment: E2E-metal
+    timeout-minutes: 20
+    steps:
+    - name: Empty e2e machine-image bucket
+      if: env.E2E_MACHINE_IMAGES_BUCKET != ''
       env:
-        AWS_ACCESS_KEY_ID: ${{ secrets.E2E_AWS_ACCESS_KEY }}
-        AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_AWS_SECRET_KEY }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.E2E_MACHINE_IMAGES_ACCESS_KEY }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.E2E_MACHINE_IMAGES_SECRET_KEY }}
+        AWS_DEFAULT_REGION: auto
+        E2E_MACHINE_IMAGES_ENDPOINT: ${{ secrets.E2E_MACHINE_IMAGES_ENDPOINT }}
+        E2E_MACHINE_IMAGES_BUCKET: ${{ secrets.E2E_MACHINE_IMAGES_BUCKET }}
       run: |
-        log_instance_ids=$(grep -oh '"instance_id":"[^"]*"' foreman.log 2>/dev/null | cut -d'"' -f4 | sort -u | tr ',' '\n' | paste -sd, -)
-        if [ -z "$log_instance_ids" ]; then
-          echo "No instance IDs found in logs"
-          exit 0
-        fi
-        echo "Found instances in logs: $log_instance_ids"
-
-        for region in eu-central-1 us-west-2; do
-          echo "Cleaning up resources in $region"
-
-          # Find instances that exist in this region (filter doesn't error for non-existent IDs)
-          instance_ids=$(aws ec2 describe-instances --region $region \
-            --filters "Name=instance-id,Values=$log_instance_ids" \
-            --query "Reservations[].Instances[].InstanceId" --output text | tr '\t' ' ' || true)
-          if [ -z "$(echo "$instance_ids" | tr -d ' ')" ]; then
-            echo "No instances found in $region"
-            continue
-          fi
-          echo "Found instances in $region: $instance_ids"
-
-          # Fetch associated resources before terminating instances
-          eni_ids=$(aws ec2 describe-instances --instance-ids $instance_ids --region $region \
-            --query "Reservations[].Instances[].NetworkInterfaces[].NetworkInterfaceId" --output text | sort -u || true)
-          eip_ids=$(aws ec2 describe-addresses --region $region \
-            --filters "Name=instance-id,Values=$(echo $instance_ids | tr ' ' ',')" \
-            --query "Addresses[].AllocationId" --output text | sort -u || true)
-          vpc_ids=$(aws ec2 describe-instances --instance-ids $instance_ids --region $region \
-            --query "Reservations[].Instances[].VpcId" --output text | sort -u || true)
-          echo "Found ENIs: $eni_ids"
-          echo "Found EIPs: $eip_ids"
-          echo "Found VPCs: $vpc_ids"
-
-          echo "Terminating instances: $instance_ids"
-          aws ec2 terminate-instances --instance-ids $instance_ids --region $region || true
-          aws ec2 wait instance-terminated --instance-ids $instance_ids --region $region || true
-
-          for eni_id in $eni_ids; do
-            echo "Deleting Network Interface: $eni_id"
-            aws ec2 delete-network-interface --network-interface-id $eni_id --region $region || true
-          done
-
-          for eip_id in $eip_ids; do
-            echo "Releasing Elastic IP: $eip_id"
-            aws ec2 release-address --allocation-id $eip_id --region $region || true
-          done
-
-          for vpc_id in $vpc_ids; do
-            echo "Deleting VPC: $vpc_id"
-            for igw_id in $(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$vpc_id" --query 'InternetGateways[].InternetGatewayId' --output text --region $region); do
-              aws ec2 detach-internet-gateway --internet-gateway-id $igw_id --vpc-id $vpc_id --region $region || true
-              aws ec2 delete-internet-gateway --internet-gateway-id $igw_id --region $region || true
-            done &
-            for subnet_id in $(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc_id" --query 'Subnets[].SubnetId' --output text --region $region); do
-              aws ec2 delete-subnet --subnet-id $subnet_id --region $region || true
-            done &
-            for sg_id in $(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$vpc_id" --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text --region $region); do
-              aws ec2 delete-security-group --group-id $sg_id --region $region || true
-            done &
-            for rt_id in $(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc_id" --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text --region $region); do
-              aws ec2 delete-route-table --route-table-id $rt_id --region $region || true
-            done &
-            wait
-            aws ec2 delete-vpc --vpc-id $vpc_id --region $region || true
-          done
-        done
+        aws --endpoint-url "$E2E_MACHINE_IMAGES_ENDPOINT" \
+            s3 rm "s3://$E2E_MACHINE_IMAGES_BUCKET/" --recursive

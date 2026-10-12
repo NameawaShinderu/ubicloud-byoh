@@ -15,6 +15,7 @@ Commands:
     help       Get command help
     kc         Manage Kubernetes clusters
     lb         Manage load balancers
+    mi         Manage machine images
     pg         Manage PostgreSQL databases
     ps         Manage private subnets
     sk         Manage SSH public keys
@@ -168,6 +169,7 @@ Usage:
 Options:
     -s, --start-port=port            starting (or only) port to allow (default: 0)
     -e, --end-port=port              ending port to allow (default: 65535)
+    -p, --protocol=protocol          protocol to allow (tcp or udp, default: tcp)
     -d, --description=desc           description of rule
 
 
@@ -216,6 +218,7 @@ Options:
     -c, --cidr=ip-range              IPv4 or IPv6 range to allow
     -s, --start-port=port            starting (or only) port to allow (default: 0)
     -e, --end-port=port              ending port to allow (default: 65535)
+    -p, --protocol=protocol          protocol to allow (tcp or udp)
     -d, --description=desc           description of rule
 
 
@@ -240,7 +243,7 @@ Allowed Option Values:
     Fields: id name location description firewall-rules private-subnets
     Nic Fields: id name private-ipv4 private-ipv6 vm-name
     Private Subnet Fields: id name state location net4 net6 nics
-    Firewall Rule Fields: id cidr port-range
+    Firewall Rule Fields: id cidr port-range protocol
 
 
 Update the description for a firewall
@@ -333,15 +336,20 @@ Usage:
     ubi kc (location/kc-name | kc-id) post-command [...]
 
 Commands:
-    list               List Kubernetes clusters
+    list                List Kubernetes clusters
 
 Post Commands:
-    create             Create a Kubernetes cluster
-    destroy            Destroy a Kubernetes cluster
-    kubeconfig         Print kubeconfig.yaml for a Kubernetes cluster
-    rename             Rename a Kubernetes cluster
-    resize-nodepool    Resize a Kubernetes cluster nodepool
-    show               Show details for a Kubernetes cluster
+    create              Create a Kubernetes cluster
+    create-nodepool     Create a nodepool on a Kubernetes cluster
+    destroy             Destroy a Kubernetes cluster
+    destroy-nodepool    Destroy a nodepool of a Kubernetes cluster
+    kubeconfig          Print kubeconfig.yaml for a Kubernetes cluster
+    rename              Rename a Kubernetes cluster
+    resize-nodepool     Resize a Kubernetes cluster nodepool
+    retire-node         Retire a worker node from a Kubernetes cluster
+    show                Show details for a Kubernetes cluster
+    upgrade             Upgrade a Kubernetes cluster to the next supported version
+    upgrade-nodepool    Upgrade a nodepool of a Kubernetes cluster to the cluster's version
 
 
 List Kubernetes clusters
@@ -358,6 +366,12 @@ Allowed Option Values:
     Fields: location name id display_state version cp_node_count
 
 
+Create a nodepool on a Kubernetes cluster
+
+Usage:
+    ubi kc (location/kc-name | kc-id) create-nodepool np-name node-size node-count
+
+
 Create a Kubernetes cluster
 
 Usage:
@@ -370,8 +384,17 @@ Options:
     -z, --worker-size=size           Worker size
 
 Allowed Option Values:
-    Version: v1.34 v1.33
+    Version: v1.37 v1.36
     Control Plane Node Count: 1 3
+
+
+Destroy a nodepool of a Kubernetes cluster
+
+Usage:
+    ubi kc (location/kc-name | kc-id) destroy-nodepool [options] (np-name | np-id)
+
+Options:
+    -f, --force                      do not require confirmation
 
 
 Destroy a Kubernetes cluster
@@ -401,6 +424,12 @@ Usage:
     ubi kc (location/kc-name | kc-id) resize-nodepool (np-name | np-id) node-count
 
 
+Retire a worker node from a Kubernetes cluster
+
+Usage:
+    ubi kc (location/kc-name | kc-id) retire-node node-name
+
+
 Show details for a Kubernetes cluster
 
 Usage:
@@ -414,9 +443,21 @@ Options:
 Allowed Option Values:
     Fields: id name location display-state cp-node-count node-size version
             nodepools cp-vms
-    Nodepool Fields: id name node-count node-size vms
+    Nodepool Fields: id name node-count node-size version vms
     Virtual Machine Fields: id name state location size unix-user
                             storage-size-gib ip6 ip4-enabled ip4
+
+
+Upgrade a nodepool of a Kubernetes cluster to the cluster's version
+
+Usage:
+    ubi kc (location/kc-name | kc-id) upgrade-nodepool (np-name | np-id)
+
+
+Upgrade a Kubernetes cluster to the next supported version
+
+Usage:
+    ubi kc (location/kc-name | kc-id) upgrade
 
 
 Manage load balancers
@@ -531,6 +572,115 @@ Usage:
     ubi lb (location/lb-name | lb-id) update algorithm src-port dst-port health-check-endpoint cert-enabled [(vm-name | vm-id) [...]]
 
 
+Manage machine images
+
+Usage:
+    ubi mi command [...]
+    ubi mi (location/mi-name | mi-id) post-command [...]
+
+Commands:
+    list               List machine images
+
+Post Commands:
+    create             Create a machine image from a stopped VM
+    create-version     Create a new version of a machine image from a stopped VM
+    destroy            Destroy a machine image
+    destroy-version    Destroy a non-latest version of a machine image
+    list-versions      List versions of a machine image
+    rename             Rename a machine image
+    set-latest         Set the latest version of a machine image
+    show               Show details for a machine image
+
+
+List machine images
+
+Usage:
+    ubi mi list [options]
+
+Options:
+    -f, --fields=fields              show specific fields (comma separated)
+    -l, --location=location          only show machine images in given location
+    -N, --no-headers                 do not show headers
+
+Allowed Option Values:
+    Fields: location name id arch latest-version created-at
+
+
+Create a new version of a machine image from a stopped VM
+
+Usage:
+    ubi mi (location/mi-name | mi-id) create-version [options] (vm-name | vm-id)
+
+Options:
+    -V, --version=version            version label (default: timestamp)
+    -d, --destroy-source             destroy the source VM after capture
+
+
+Create a machine image from a stopped VM
+
+Usage:
+    ubi mi location/mi-name create [options] (vm-name | vm-id)
+
+Options:
+    -V, --version=version            version label (default: timestamp)
+    -d, --destroy-source             destroy the source VM after capture
+
+
+Destroy a non-latest version of a machine image
+
+Usage:
+    ubi mi (location/mi-name | mi-id) destroy-version [options] version
+
+Options:
+    -f, --force                      do not require confirmation
+
+
+Destroy a machine image
+
+Usage:
+    ubi mi (location/mi-name | mi-id) destroy [options]
+
+Options:
+    -f, --force                      do not require confirmation
+
+
+List versions of a machine image
+
+Usage:
+    ubi mi (location/mi-name | mi-id) list-versions [options]
+
+Options:
+    -f, --fields=fields              show specific fields (comma separated)
+    -N, --no-headers                 do not show headers
+
+Allowed Option Values:
+    Fields: version id state actual-size-mib archive-size-mib created-at latest
+
+
+Rename a machine image
+
+Usage:
+    ubi mi (location/mi-name | mi-id) rename new-name
+
+
+Set the latest version of a machine image
+
+Usage:
+    ubi mi (location/mi-name | mi-id) set-latest version
+
+
+Show details for a machine image
+
+Usage:
+    ubi mi (location/mi-name | mi-id) show [options]
+
+Options:
+    -f, --fields=fields              show specific fields (comma separated)
+
+Allowed Option Values:
+    Fields: id name location arch latest-version created-at
+
+
 Manage PostgreSQL databases
 
 Usage:
@@ -541,18 +691,24 @@ Commands:
     list                               List PostgreSQL databases
 
 Post Commands:
+    add-bearer-metric-destination      Add a PostgreSQL metric destination using bearer token authentication
     add-cert-auth-user                 Add user to list of users authenticating with client certificate authentication
     add-config-entries                 Add configuration entries to a PostgreSQL database
     add-firewall-rule                  Add a PostgreSQL firewall rule
     add-metric-destination             Add a PostgreSQL metric destination
+    add-otlp-log-destination           Add an OTLP HTTP log destination to a PostgreSQL database
     add-pgbouncer-config-entries       Add pgbouncer configuration entries to a PostgreSQL database
-    ca-certificates                    Print CA certificates for a PostgreSQL database
+    add-syslog-log-destination         Add a syslog (RFC 5424 over TLS) log destination to a PostgreSQL database
+    ca-certificates                    Print CA certificates for a PostgreSQL database (if available)
     create                             Create a PostgreSQL database
+    create-backup-credentials          Create temporary, read-only credentials for downloading PostgreSQL backups
     create-client-cert-keypair         Create client certificate keypair with given common name, expiring after a duration of seconds
     create-read-replica                Create a read replica for a PostgreSQL database
     delete-firewall-rule               Delete a PostgreSQL firewall rule
+    delete-log-destination             Delete a PostgreSQL log destination
     delete-metric-destination          Delete a PostgreSQL metric destination
     destroy                            Destroy a PostgreSQL database
+    get-logs                           Fetch logs for a PostgreSQL database in CSV format
     list-backups                       List backups for a PostgreSQL database
     list-servers                       List servers for a PostgreSQL database
     modify                             Modify a PostgreSQL database cluster
@@ -596,6 +752,12 @@ Allowed Option Values:
     Fields: location name id version flavor
 
 
+Add a PostgreSQL metric destination using bearer token authentication
+
+Usage:
+    ubi pg (location/pg-name | pg-id) add-bearer-metric-destination url token [header_name=value [...]]
+
+
 Add user to list of users authenticating with client certificate authentication
 
 Usage:
@@ -623,16 +785,37 @@ Usage:
     ubi pg (location/pg-name | pg-id) add-metric-destination username password url
 
 
+Add an OTLP HTTP log destination to a PostgreSQL database
+
+Usage:
+    ubi pg (location/pg-name | pg-id) add-otlp-log-destination name url [header_name=value [...]]
+
+
 Add pgbouncer configuration entries to a PostgreSQL database
 
 Usage:
     ubi pg (location/pg-name | pg-id) add-pgbouncer-config-entries key=value [...]
 
 
-Print CA certificates for a PostgreSQL database
+Add a syslog (RFC 5424 over TLS) log destination to a PostgreSQL database
+
+Usage:
+    ubi pg (location/pg-name | pg-id) add-syslog-log-destination name host [port] [sd-id/key=value [...]]
+
+
+Print CA certificates for a PostgreSQL database (if available)
 
 Usage:
     ubi pg (location/pg-name | pg-id) ca-certificates
+
+
+Create temporary, read-only credentials for downloading PostgreSQL backups
+
+Usage:
+    ubi pg (location/pg-name | pg-id) create-backup-credentials [options]
+
+Options:
+        --format=format              output format: table (default), env, or json
 
 
 Create client certificate keypair with given common name, expiring after a duration of seconds
@@ -658,7 +841,7 @@ Usage:
     ubi pg location/pg-name create [options]
 
 Options:
-    -f, --flavor=type                flavor
+    -f, --flavor=type                flavor (deprecated, standard is the only flavor)
     -h, --ha-type=type               replication type
     -s, --size=size                  server size
     -S, --storage-size=size          storage size GB
@@ -670,26 +853,57 @@ Options:
     -P, --private-subnet-name=name   override name of created private subnet
 
 Allowed Option Values:
-    Flavor: standard paradedb lantern
     Replication Type: none async sync
     Size: standard-2 standard-4 standard-8 standard-16 standard-30 standard-60
           hobby-1 hobby-2 c6gd.large c6gd.xlarge c6gd.2xlarge c6gd.4xlarge
-          c6gd.8xlarge c6gd.16xlarge m6id.large m6id.xlarge m6id.2xlarge
-          m6id.4xlarge m6id.8xlarge m6id.16xlarge m6gd.large m6gd.xlarge
-          m6gd.2xlarge m6gd.4xlarge m6gd.8xlarge m6gd.16xlarge m8gd.large
-          m8gd.xlarge m8gd.2xlarge m8gd.4xlarge m8gd.8xlarge m8gd.16xlarge
-          i8g.large i8g.xlarge i8g.2xlarge i8g.4xlarge i8g.8xlarge i8g.16xlarge
-          i8g.24xlarge i8ge.large i8ge.xlarge i8ge.2xlarge i8ge.3xlarge
-          i8ge.6xlarge i8ge.12xlarge i8ge.18xlarge i8ge.24xlarge i7i.large
-          i7i.xlarge i7i.2xlarge i7i.4xlarge i7i.8xlarge i7i.12xlarge
-          i7i.16xlarge i7i.24xlarge i7ie.large i7ie.xlarge i7ie.2xlarge
+          c6gd.8xlarge c6gd.12xlarge c6gd.16xlarge c6id.large c6id.xlarge
+          c6id.2xlarge c6id.4xlarge c6id.8xlarge c6id.12xlarge c6id.16xlarge
+          c7gd.large c7gd.xlarge c7gd.2xlarge c7gd.4xlarge c7gd.8xlarge
+          c7gd.12xlarge c7gd.16xlarge c8gd.large c8gd.xlarge c8gd.2xlarge
+          c8gd.4xlarge c8gd.8xlarge c8gd.12xlarge c8gd.16xlarge c8id.large
+          c8id.xlarge c8id.2xlarge c8id.4xlarge c8id.8xlarge c8id.12xlarge
+          c8id.16xlarge m6id.large m6id.xlarge m6id.2xlarge m6id.4xlarge
+          m6id.8xlarge m6id.12xlarge m6id.16xlarge m6gd.large m6gd.xlarge
+          m6gd.2xlarge m6gd.4xlarge m6gd.8xlarge m6gd.12xlarge m6gd.16xlarge
+          m7gd.large m7gd.xlarge m7gd.2xlarge m7gd.4xlarge m7gd.8xlarge
+          m7gd.12xlarge m7gd.16xlarge m8gd.large m8gd.xlarge m8gd.2xlarge
+          m8gd.4xlarge m8gd.8xlarge m8gd.12xlarge m8gd.16xlarge m8id.large
+          m8id.xlarge m8id.2xlarge m8id.4xlarge m8id.8xlarge m8id.12xlarge
+          m8id.16xlarge i8g.large i8g.xlarge i8g.2xlarge i8g.4xlarge i8g.8xlarge
+          i8g.12xlarge i8g.16xlarge i8g.24xlarge i8g.48xlarge i8ge.large
+          i8ge.xlarge i8ge.2xlarge i8ge.3xlarge i8ge.6xlarge i8ge.12xlarge
+          i8ge.18xlarge i8ge.24xlarge i8ge.48xlarge i7i.large i7i.xlarge
+          i7i.2xlarge i7i.4xlarge i7i.8xlarge i7i.12xlarge i7i.16xlarge
+          i7i.24xlarge i7i.48xlarge i7ie.large i7ie.xlarge i7ie.2xlarge
           i7ie.3xlarge i7ie.6xlarge i7ie.12xlarge i7ie.18xlarge i7ie.24xlarge
-          r8gd.medium r8gd.large r8gd.xlarge r8gd.2xlarge r8gd.4xlarge
-          r8gd.8xlarge r8gd.12xlarge r8gd.16xlarge r8gd.24xlarge r8gd.48xlarge
-          r6gd.medium r6gd.large r6gd.xlarge r6gd.2xlarge r6gd.4xlarge
-          r6gd.8xlarge r6gd.12xlarge r6gd.16xlarge r6id.large r6id.xlarge
-          r6id.2xlarge r6id.4xlarge r6id.8xlarge r6id.12xlarge r6id.16xlarge
-          r6id.24xlarge r6id.32xlarge
+          i7ie.48xlarge r6gd.medium r6gd.large r6gd.xlarge r6gd.2xlarge
+          r6gd.4xlarge r6gd.8xlarge r6gd.12xlarge r6gd.16xlarge r6id.large
+          r6id.xlarge r6id.2xlarge r6id.4xlarge r6id.8xlarge r6id.12xlarge
+          r6id.16xlarge r7gd.medium r7gd.large r7gd.xlarge r7gd.2xlarge
+          r7gd.4xlarge r7gd.8xlarge r7gd.12xlarge r7gd.16xlarge r8gd.medium
+          r8gd.large r8gd.xlarge r8gd.2xlarge r8gd.4xlarge r8gd.8xlarge
+          r8gd.12xlarge r8gd.16xlarge r8id.large r8id.xlarge r8id.2xlarge
+          r8id.4xlarge r8id.8xlarge r8id.12xlarge r8id.16xlarge c4a-standard-4
+          c4a-standard-8 c4a-standard-16 c4a-standard-32 c4a-standard-48
+          c4a-standard-64 c4a-standard-72 c4a-highmem-4 c4a-highmem-8
+          c4a-highmem-16 c4a-highmem-32 c4a-highmem-48 c4a-highmem-64
+          c4a-highmem-72 c4-standard-4 c4-standard-8 c4-standard-16
+          c4-standard-24 c4-standard-32 c4-standard-48 c4-standard-96
+          c4-standard-144 c4-standard-192 c4-standard-288 c4-highmem-4
+          c4-highmem-8 c4-highmem-16 c4-highmem-24 c4-highmem-32 c4-highmem-48
+          c4-highmem-96 c4-highmem-144 c4-highmem-192 c4-highmem-288
+          c4d-standard-8 c4d-standard-16 c4d-standard-32 c4d-standard-48
+          c4d-standard-64 c4d-standard-96 c4d-standard-192 c4d-standard-384
+          c4d-highmem-8 c4d-highmem-16 c4d-highmem-32 c4d-highmem-48
+          c4d-highmem-64 c4d-highmem-96 c4d-highmem-192 c4d-highmem-384
+          c3-standard-4 c3-standard-8 c3-standard-22 c3-standard-44
+          c3-standard-88 c3-standard-176 c3d-standard-8 c3d-standard-16
+          c3d-standard-30 c3d-standard-60 c3d-standard-90 c3d-standard-180
+          c3d-standard-360 c3d-highmem-8 c3d-highmem-16 c3d-highmem-30
+          c3d-highmem-60 c3d-highmem-90 c3d-highmem-180 c3d-highmem-360
+          z3-standardlssd-14 z3-standardlssd-22 z3-standardlssd-44
+          z3-standardlssd-88 z3-standardlssd-176 z3-highlssd-8 z3-highlssd-16
+          z3-highlssd-22 z3-highlssd-32 z3-highlssd-44 z3-highlssd-88
     Storage Size: 16 32 64 128 256 512 1024 2048 4096
     Version: 18 17 16
 
@@ -698,6 +912,12 @@ Delete a PostgreSQL firewall rule
 
 Usage:
     ubi pg (location/pg-name | pg-id) delete-firewall-rule rule-id
+
+
+Delete a PostgreSQL log destination
+
+Usage:
+    ubi pg (location/pg-name | pg-id) delete-log-destination ld-id
 
 
 Delete a PostgreSQL metric destination
@@ -713,6 +933,28 @@ Usage:
 
 Options:
     -f, --force                      do not require confirmation
+
+
+Fetch logs for a PostgreSQL database in CSV format
+
+Usage:
+    ubi pg (location/pg-name | pg-id) get-logs [options]
+
+Options:
+    -s, --start=time                 start time (RFC3339, default: 30 minutes ago)
+    -e, --end=time                   end time (RFC3339, default: now)
+        --stream-name=stream         filter by log stream
+        --server-role=role           filter by server role
+        --severity-level=level       filter by log severity level
+        --query-pattern=pattern      pattern for substring match against log message
+    -l, --max-log-lines=n            number of log lines to return (default: 50, max: 500)
+        --pagination-key=key         continue a previous search
+    -N, --no-headers                 do not show headers
+
+Allowed Option Values:
+    Stream: postgres pgbouncer upgrade
+    Server Role: primary standby
+    Level: DEBUG INFO WARN ERROR FATAL
 
 
 List backups for a PostgreSQL database
@@ -758,22 +1000,54 @@ Allowed Option Values:
     Replication Type: none async sync
     Size: standard-2 standard-4 standard-8 standard-16 standard-30 standard-60
           hobby-1 hobby-2 c6gd.large c6gd.xlarge c6gd.2xlarge c6gd.4xlarge
-          c6gd.8xlarge c6gd.16xlarge m6id.large m6id.xlarge m6id.2xlarge
-          m6id.4xlarge m6id.8xlarge m6id.16xlarge m6gd.large m6gd.xlarge
-          m6gd.2xlarge m6gd.4xlarge m6gd.8xlarge m6gd.16xlarge m8gd.large
-          m8gd.xlarge m8gd.2xlarge m8gd.4xlarge m8gd.8xlarge m8gd.16xlarge
-          i8g.large i8g.xlarge i8g.2xlarge i8g.4xlarge i8g.8xlarge i8g.16xlarge
-          i8g.24xlarge i8ge.large i8ge.xlarge i8ge.2xlarge i8ge.3xlarge
-          i8ge.6xlarge i8ge.12xlarge i8ge.18xlarge i8ge.24xlarge i7i.large
-          i7i.xlarge i7i.2xlarge i7i.4xlarge i7i.8xlarge i7i.12xlarge
-          i7i.16xlarge i7i.24xlarge i7ie.large i7ie.xlarge i7ie.2xlarge
+          c6gd.8xlarge c6gd.12xlarge c6gd.16xlarge c6id.large c6id.xlarge
+          c6id.2xlarge c6id.4xlarge c6id.8xlarge c6id.12xlarge c6id.16xlarge
+          c7gd.large c7gd.xlarge c7gd.2xlarge c7gd.4xlarge c7gd.8xlarge
+          c7gd.12xlarge c7gd.16xlarge c8gd.large c8gd.xlarge c8gd.2xlarge
+          c8gd.4xlarge c8gd.8xlarge c8gd.12xlarge c8gd.16xlarge c8id.large
+          c8id.xlarge c8id.2xlarge c8id.4xlarge c8id.8xlarge c8id.12xlarge
+          c8id.16xlarge m6id.large m6id.xlarge m6id.2xlarge m6id.4xlarge
+          m6id.8xlarge m6id.12xlarge m6id.16xlarge m6gd.large m6gd.xlarge
+          m6gd.2xlarge m6gd.4xlarge m6gd.8xlarge m6gd.12xlarge m6gd.16xlarge
+          m7gd.large m7gd.xlarge m7gd.2xlarge m7gd.4xlarge m7gd.8xlarge
+          m7gd.12xlarge m7gd.16xlarge m8gd.large m8gd.xlarge m8gd.2xlarge
+          m8gd.4xlarge m8gd.8xlarge m8gd.12xlarge m8gd.16xlarge m8id.large
+          m8id.xlarge m8id.2xlarge m8id.4xlarge m8id.8xlarge m8id.12xlarge
+          m8id.16xlarge i8g.large i8g.xlarge i8g.2xlarge i8g.4xlarge i8g.8xlarge
+          i8g.12xlarge i8g.16xlarge i8g.24xlarge i8g.48xlarge i8ge.large
+          i8ge.xlarge i8ge.2xlarge i8ge.3xlarge i8ge.6xlarge i8ge.12xlarge
+          i8ge.18xlarge i8ge.24xlarge i8ge.48xlarge i7i.large i7i.xlarge
+          i7i.2xlarge i7i.4xlarge i7i.8xlarge i7i.12xlarge i7i.16xlarge
+          i7i.24xlarge i7i.48xlarge i7ie.large i7ie.xlarge i7ie.2xlarge
           i7ie.3xlarge i7ie.6xlarge i7ie.12xlarge i7ie.18xlarge i7ie.24xlarge
-          r8gd.medium r8gd.large r8gd.xlarge r8gd.2xlarge r8gd.4xlarge
-          r8gd.8xlarge r8gd.12xlarge r8gd.16xlarge r8gd.24xlarge r8gd.48xlarge
-          r6gd.medium r6gd.large r6gd.xlarge r6gd.2xlarge r6gd.4xlarge
-          r6gd.8xlarge r6gd.12xlarge r6gd.16xlarge r6id.large r6id.xlarge
-          r6id.2xlarge r6id.4xlarge r6id.8xlarge r6id.12xlarge r6id.16xlarge
-          r6id.24xlarge r6id.32xlarge
+          i7ie.48xlarge r6gd.medium r6gd.large r6gd.xlarge r6gd.2xlarge
+          r6gd.4xlarge r6gd.8xlarge r6gd.12xlarge r6gd.16xlarge r6id.large
+          r6id.xlarge r6id.2xlarge r6id.4xlarge r6id.8xlarge r6id.12xlarge
+          r6id.16xlarge r7gd.medium r7gd.large r7gd.xlarge r7gd.2xlarge
+          r7gd.4xlarge r7gd.8xlarge r7gd.12xlarge r7gd.16xlarge r8gd.medium
+          r8gd.large r8gd.xlarge r8gd.2xlarge r8gd.4xlarge r8gd.8xlarge
+          r8gd.12xlarge r8gd.16xlarge r8id.large r8id.xlarge r8id.2xlarge
+          r8id.4xlarge r8id.8xlarge r8id.12xlarge r8id.16xlarge c4a-standard-4
+          c4a-standard-8 c4a-standard-16 c4a-standard-32 c4a-standard-48
+          c4a-standard-64 c4a-standard-72 c4a-highmem-4 c4a-highmem-8
+          c4a-highmem-16 c4a-highmem-32 c4a-highmem-48 c4a-highmem-64
+          c4a-highmem-72 c4-standard-4 c4-standard-8 c4-standard-16
+          c4-standard-24 c4-standard-32 c4-standard-48 c4-standard-96
+          c4-standard-144 c4-standard-192 c4-standard-288 c4-highmem-4
+          c4-highmem-8 c4-highmem-16 c4-highmem-24 c4-highmem-32 c4-highmem-48
+          c4-highmem-96 c4-highmem-144 c4-highmem-192 c4-highmem-288
+          c4d-standard-8 c4d-standard-16 c4d-standard-32 c4d-standard-48
+          c4d-standard-64 c4d-standard-96 c4d-standard-192 c4d-standard-384
+          c4d-highmem-8 c4d-highmem-16 c4d-highmem-32 c4d-highmem-48
+          c4d-highmem-64 c4d-highmem-96 c4d-highmem-192 c4d-highmem-384
+          c3-standard-4 c3-standard-8 c3-standard-22 c3-standard-44
+          c3-standard-88 c3-standard-176 c3d-standard-8 c3d-standard-16
+          c3d-standard-30 c3d-standard-60 c3d-standard-90 c3d-standard-180
+          c3d-standard-360 c3d-highmem-8 c3d-highmem-16 c3d-highmem-30
+          c3d-highmem-60 c3d-highmem-90 c3d-highmem-180 c3d-highmem-360
+          z3-standardlssd-14 z3-standardlssd-22 z3-standardlssd-44
+          z3-standardlssd-88 z3-standardlssd-176 z3-highlssd-8 z3-highlssd-16
+          z3-highlssd-22 z3-highlssd-32 z3-highlssd-44 z3-highlssd-88
     Storage Size: 16 32 64 128 256 512 1024 2048 4096
 
 
@@ -857,12 +1131,17 @@ Options:
 Set the maintenance window for a PostgreSQL database
 
 Usage:
-    ubi pg (location/pg-name | pg-id) set-maintenance-window start-hour
+    ubi pg (location/pg-name | pg-id) set-maintenance-window [options] start-hour
 
 Examples:
     ubi pg pg-id set-maintenance-window 3   #  3 am
     ubi pg pg-id set-maintenance-window 23  # 11 pm
     ubi pg pg-id set-maintenance-window ""  # unset
+    ubi pg pg-id set-maintenance-window -d mon,wed 3  # 3 am, Mon & Wed
+    ubi pg pg-id set-maintenance-window -d "" 3  # 3 am, clear days (every day)
+
+Options:
+    -d, --days=days                  days of week the window applies (e.g. mon,wed,fri); default every day
 
 
 Show configuration for a PostgreSQL database
@@ -900,9 +1179,10 @@ Options:
 Allowed Option Values:
     Fields: id name state location vm-size target-vm-size storage-size-gib
             target-storage-size-gib version target-version ha-type flavor
-            connection-string primary earliest-restore-time
-            maintenance-window-start-at read-replica parent tags firewall-rules
-            metric-destinations read-replicas ca-certificates
+            connection-string private-connection-string primary
+            earliest-restore-time maintenance-window-start-at read-replica
+            parent tags firewall-rules metric-destinations log-destinations
+            read-replicas ca-certificates
 
 
 Schedule a major version upgrade of the PostgreSQL database
@@ -993,7 +1273,7 @@ Options:
 Allowed Option Values:
     Fields: id name state location net4 net6 firewalls nics
     Nic Fields: id name private-ipv4 private-ipv6 vm-name
-    Firewall Rule Fields: id cidr port-range
+    Firewall Rule Fields: id cidr port-range protocol
     Firewall Fields: id name description location path firewall-rules
 
 
@@ -1076,19 +1356,21 @@ Usage:
     ubi vm (location/vm-name | vm-id) [post-options] post-command [...]
 
 Commands:
-    list       List virtual machines
+    list                      List virtual machines
 
 Post Commands:
-    create     Create a virtual machine
-    destroy    Destroy a virtual machine
-    rename     Rename a virtual machine
-    restart    Restart a virtual machine
-    scp        Copy files to or from virtual machine using `scp`
-    sftp       Copy files to or from virtual machine using `sftp`
-    show       Show details for a virtual machine
-    ssh        Connect to a virtual machine using `ssh`
-    start      Start a virtual machine
-    stop       Stop a virtual machine
+    create                    Create a virtual machine
+    destroy                   Destroy a virtual machine
+    rename                    Rename a virtual machine
+    restart                   Restart a virtual machine
+    scp                       Copy files to or from virtual machine using `scp`
+    serial-log                Show a virtual machine's serial console log, fetching it if needed
+    set-maintenance-window    Set the maintenance window for a virtual machine
+    sftp                      Copy files to or from virtual machine using `sftp`
+    show                      Show details for a virtual machine
+    ssh                       Connect to a virtual machine using `ssh`
+    start                     Start a virtual machine
+    stop                      Stop a virtual machine
 
 Post Options:
     -4, --ip4                        use IPv4 address
@@ -1131,7 +1413,9 @@ Options:
     -u, --unix-user=username         username (default: ubi)
 
 Allowed Option Values:
-    Boot Image: gpu-ubuntu-noble ubuntu-noble ubuntu-jammy debian-12 almalinux-9
+    Boot Image: gpu-ubuntu-noble ubuntu-resolute ubuntu-noble ubuntu-jammy
+                debian-13 debian-12 almalinux-10 almalinux-9
+                machine-image-name@version machine-image-name@latest
     Size: standard-2 standard-4 standard-8 standard-16 standard-30 standard-60
           burstable-1 burstable-2
     Storage Size: 10 20 40 80 160 320 600 640 1200 2400
@@ -1164,6 +1448,26 @@ Usage:
     ubi vm (location/vm-name | vm-id) [options] scp [scp-options] (local-path :remote-path | :remote-path local-path)
 
 
+Show a virtual machine's serial console log, fetching it if needed
+
+Usage:
+    ubi vm (location/vm-name | vm-id) serial-log [options]
+
+Options:
+    -r, --refresh                    request a new fetch even if a recent result exists
+
+
+Set the maintenance window for a virtual machine
+
+Usage:
+    ubi vm (location/vm-name | vm-id) set-maintenance-window start-hour
+
+Examples:
+    ubi vm vm-id set-maintenance-window 3   #  3 am
+    ubi vm vm-id set-maintenance-window 23  # 11 pm
+    ubi vm vm-id set-maintenance-window ""  # unset
+
+
 Copy files to or from virtual machine using `sftp`
 
 Usage:
@@ -1181,9 +1485,10 @@ Options:
     -w, --firewall-fields=fields     show specific firewall fields (comma separated)
 
 Allowed Option Values:
-    Fields: id name state location size unix-user storage-size-gib ip6
-            ip4-enabled ip4 private-ipv4 private-ipv6 subnet firewalls
-    Firewall Rule Fields: id cidr port-range
+    Fields: id name state location size unix-user storage-size-gib boot-image
+            ip6 ip4-enabled ip4 private-ipv4 private-ipv6 subnet
+            maintenance-window-start-at firewalls
+    Firewall Rule Fields: id cidr port-range protocol
     Firewall Fields: id name description location path firewall-rules
 
 

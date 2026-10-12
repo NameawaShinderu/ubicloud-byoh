@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # Only used by the monitor smoke test
-# :nocov:
+# simplecov:disable
 class MonitorResourceStub
   OBJECTS = []
 
@@ -49,6 +49,14 @@ class MonitorResourceStub
     @need_event_loop
   end
 
+  def page_on_sshable_failure?
+    true
+  end
+
+  def open_session_failure_page_threshold
+    MonitorableResource::OPEN_SESSION_FAILURE_PAGE_THRESHOLD
+  end
+
   def check_pulse(session:, previous_pulse:)
     @pulse_count += 1
     sleep(0.1 + rand)
@@ -73,4 +81,4 @@ class MonitorResourceStub
     {}
   end
 end
-# :nocov:
+# simplecov:enable

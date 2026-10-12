@@ -6,7 +6,7 @@ module Ubicloud
 
     set_fragment "vm"
 
-    set_columns :id, :name, :state, :location, :size, :unix_user, :storage_size_gib, :ip6, :ip4_enabled, :ip4, :firewalls, :private_ipv4, :private_ipv6, :subnet
+    set_columns :id, :name, :state, :location, :size, :unix_user, :storage_size_gib, :ip6, :ip4_enabled, :ip4, :firewalls, :private_ipv4, :private_ipv6, :subnet, :maintenance_window_start_at
 
     set_associations do
       {
@@ -34,6 +34,21 @@ module Ubicloud
     # To avoid billing charges, destroy the virtual machine.
     def stop
       merge_into_values(adapter.post(_path("/stop")))
+    end
+
+    # Return the status/output of the virtual machine's serial console log,
+    # as a hash, fetching it first if it has never been fetched. Pass
+    # refresh: true to request a newer fetch than the last one (ignored if
+    # the last fetch was too recent, and done automatically regardless once
+    # the last result is old enough).
+    def serial_log(refresh: false)
+      adapter.get(_path("/serial-log"), refresh ? {refresh: true} : nil)
+    end
+
+    # Set the maintenance window. maintenance_window_start_at should be in
+    # 0-23, or nil to unset the window.
+    def set_maintenance_window(maintenance_window_start_at)
+      merge_into_values(adapter.post(_path("/set-maintenance-window"), maintenance_window_start_at:))
     end
   end
 end

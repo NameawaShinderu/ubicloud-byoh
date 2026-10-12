@@ -24,11 +24,14 @@ class Clover
     end
 
     r.get web?, "create" do
-      handle_validation_failure("github/index")
-      unless @project.has_valid_payment_method?
-        raise_web_error("Project doesn't have valid billing information")
+      session["github_installation_project_id"] = @project.id
+
+      unless session["github_actions_setup"]
+        handle_validation_failure("github/index")
+        unless @project.has_valid_payment_method?
+          raise_web_error("Project doesn't have valid billing information")
+        end
       end
-      session[:github_installation_project_id] = @project.id
 
       r.redirect "https://github.com/apps/#{Config.github_app_name}/installations/new", 302
     end
@@ -139,6 +142,30 @@ class Clover
         view "github/cache"
       end
 
+      r.delete web?, "cache" do
+        ubids = typecast_params.array(:ubid_uuid, "ubids") || []
+        flash["notice"] = DB.transaction do
+          entries = @installation.cache_entries_dataset.where(Sequel[:github_cache_entry][:id] => ubids).for_update.all
+
+          if entries.empty?
+            no_audit_log
+            "No cache entries selected for deletion"
+          else
+            num_entries = entries.size
+            DB.ignore_duplicate_queries do
+              entries.group_by(&:repository_id).each do |repository_id, entries|
+                Prog::Github::DeleteCacheEntries.assemble(repository_id, cache_entry_ids: entries.map(&:id))
+              end
+            end
+            entry = entries.shift
+            audit_log(entry, "destroy", entries)
+            "#{num_entries} cache entr#{(num_entries == 1) ? "y" : "ies"} scheduled for deletion"
+          end
+        end
+
+        r.redirect @installation, "/cache"
+      end
+
       r.on "repository" do
         r.get api? do
           paginated_result(installation.repositories_dataset.order(:name), Serializers::GithubRepository, installation:)
@@ -181,26 +208,24 @@ class Clover
               end
             end
 
-            r.on :ubid_uuid do |id|
+            r.is api?, :ubid_uuid do |id|
               entry = repository.cache_entries_dataset.with_pk(id)
               check_found_object(entry)
 
-              r.get api? do
+              r.get do
                 Serializers::GithubCacheEntry.serialize(entry, installation:, repository:)
               end
 
-              r.delete true do
+              r.delete do
                 DB.transaction do
                   entry.destroy
+                rescue Aws::S3::Errors::InternalError
+                  raise CloverError.new(500, "InternalError", "Internal error when destroying cache entry")
+                else
                   audit_log(entry, "destroy")
                 end
 
-                if web?
-                  flash["notice"] = "Cache '#{entry.key}' deleted."
-                  r.redirect @project, "/github/#{@installation.ubid}/cache"
-                else
-                  204
-                end
+                204
               end
             end
           end

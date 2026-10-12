@@ -1,0 +1,121 @@
+name: CSI Build
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      push_image:
+        description: 'Push the image to Docker Hub'
+        default: false
+        type: boolean
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'kubernetes/csi/**'
+      - '.github/workflows/csi-build.yml'
+  pull_request:
+    paths:
+      - 'kubernetes/csi/**'
+      - '.github/workflows/csi-build.yml'
+
+env:
+  IMAGE_NAME: ubicloud/ubicsi
+  PUSH_IMAGE: ${{ inputs.push_image || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+
+jobs:
+  version-check:
+    name: Verify CSI version bump
+    if: github.event_name == 'pull_request'
+    runs-on: ubicloud-standard-2
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify gemspec version was bumped if image contents changed
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          changed=$(git diff --name-only "$base" HEAD -- \
+            'kubernetes/csi/lib/**' \
+            'kubernetes/csi/bin/**' \
+            'kubernetes/csi/Gemfile' \
+            'kubernetes/csi/Gemfile.lock' \
+            'kubernetes/csi/Dockerfile')
+          if [ -z "$changed" ]; then
+            echo "No CSI image contents changed; version bump not required."
+            exit 0
+          fi
+          echo "CSI files that affect the image changed:"
+          echo "$changed"
+          if git diff "$base" HEAD -- kubernetes/csi/ubi-csi.gemspec | grep -qE '^[-+][[:space:]]*spec\.version[[:space:]]*='; then
+            echo "spec.version in ubi-csi.gemspec was modified."
+            exit 0
+          fi
+          echo "ERROR: kubernetes/csi/ contents changed but spec.version in ubi-csi.gemspec was not bumped."
+          echo "Bump spec.version (and Csi::VERSION in lib/ubi_csi.rb) so the new image gets a fresh tag."
+          exit 1
+
+  docker:
+    name: Docker
+    runs-on: ubicloud-standard-8
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@bec3f19a76460dbe12f60def7d1a77585f07516c # v1.322.0
+        with:
+          ruby-version: mise.toml
+
+      - name: Extract CSI version
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(ruby -e 'puts Gem::Specification.load("kubernetes/csi/ubi-csi.gemspec").version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=v${{ steps.version.outputs.version }},enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Log in to Docker Hub
+        if: ${{ env.PUSH_IMAGE == 'true' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: kubernetes/csi
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=ubicsi
+          cache-to: type=gha,mode=max,scope=ubicsi
+          push: ${{ env.PUSH_IMAGE }}
+
+      - name: Inspect image
+        if: ${{ env.PUSH_IMAGE == 'true' }}
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE_NAME:$VERSION"
