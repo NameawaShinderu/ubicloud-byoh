@@ -1,0 +1,33 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Manages the Location of a BYOH site: its network profile, billing rates,
+# visibility and project grants. The logic lives in lib/byoh_location_cli.rb;
+# run with --help for the commands.
+#
+# Example:
+#
+#   bundle exec bin/byoh-location create --name byoh-aws-aps1 \
+#     --ui-name "AWS Mumbai (BYOH)" --underlay 10.98.0.0/16 \
+#     --overlay 172.20.0.0/14 --cp-reach onhost --cp-source 10.98.1.10/32 \
+#     --rates-from hetzner-fsn1
+#
+# Uses RACK_ENV from the environment (defaults to "development").
+
+unless ENV["RACK_ENV"]
+  ENV["RACK_ENV"] = "development"
+end
+
+ENV["SKIP_LIT_REQUIRE_FROZEN"] = "1"
+require "bundler"
+if ENV["RACK_ENV"] == "production"
+  Bundler.setup(:default)
+else
+  Bundler.setup(:default, :development)
+end
+
+require "logger"
+require_relative "../db"
+require_relative "../loader"
+
+exit ByohLocationCli.new.run(ARGV)

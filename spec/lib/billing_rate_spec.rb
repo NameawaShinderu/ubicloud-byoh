@@ -1,6 +1,31 @@
 # frozen_string_literal: true
 
+require "tmpdir"
+
 RSpec.describe BillingRate do
+  describe ".rate_globs" do
+    it "is only the shipped rates when BILLING_RATES_EXTRA_DIR is unset" do
+      expect(described_class.rate_globs).to eq ["config/billing_rates/*.yml"]
+    end
+
+    it "adds the overlay directory when BILLING_RATES_EXTRA_DIR is set" do
+      expect(Config).to receive(:billing_rates_extra_dir).and_return("/etc/ubicloud/billing_rates.d").at_least(:once)
+      expect(described_class.rate_globs).to eq ["config/billing_rates/*.yml", "/etc/ubicloud/billing_rates.d/*.yml"]
+    end
+  end
+
+  describe ".load_rates" do
+    it "reads the files of every glob afresh, skipping empty files" do
+      Dir.mktmpdir do |dir|
+        File.write(File.join(dir, "a.yml"), "")
+        File.write(File.join(dir, "b.yml"), [{"id" => "x", "active_from" => Time.utc(2026, 1, 1)}].to_yaml)
+        rates = described_class.load_rates(["config/billing_rates/*.yml", File.join(dir, "*.yml")])
+        expect(rates.size).to eq described_class.rates.size + 1
+        expect(rates.last).to eq({"id" => "x", "active_from" => Time.utc(2026, 1, 1)})
+      end
+    end
+  end
+
   it "each rate has a unique ID" do
     expect(described_class.rates.map { it["id"] }.size).to eq(described_class.rates.map { it["id"] }.uniq.size)
   end

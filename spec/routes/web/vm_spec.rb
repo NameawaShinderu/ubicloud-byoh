@@ -120,6 +120,24 @@ RSpec.describe Clover, "vm" do
         expect(page.status_code).to eq 404
       end
 
+      it "shows the IPv4 option without a price in a location that has no IPv4 rate" do
+        Location.create(name: "byoh-1", display_name: "byoh-1", ui_name: "BYOH One", visible: false, provider: "generic", byoh_network: {})
+        project.set_ff_visible_locations(["byoh-1"])
+        # Every rate of byoh-1 exists except the IPv4 one.
+        allow(BillingRate).to receive(:from_resource_properties).and_wrap_original do |original, resource_type, resource_family, location, *rest|
+          if location != "byoh-1"
+            original.call(resource_type, resource_family, location, *rest)
+          elsif resource_type != "IPAddress"
+            original.call(resource_type, resource_family, "hetzner-fsn1", *rest)
+          end
+        end
+
+        visit "#{project.path}/vm/create"
+        expect(page.status_code).to eq 200
+        expect(page.all("label", exact_text: "Enable Public IPv4", visible: :all).size).to eq 1
+        expect(page.all("label", text: /\AEnable Public IPv4 \(\$/, visible: :all)).not_to be_empty
+      end
+
       it "shows vm create page with burstable and location_latitude_fra" do
         project.set_ff_visible_locations ["latitude-fra"]
         visit "#{project.path}/vm/create"

@@ -16,6 +16,8 @@ module ContentGenerator
 
     def self.enable_ip4(location, value)
       unit_price = BillingRate.unit_price_from_resource_properties("IPAddress", "IPv4", location.name)
+      # A BYOH location may lack an IPv4 rate until its operator adds one.
+      return "Enable Public IPv4" unless unit_price
 
       "Enable Public IPv4 ($#{"%.2f" % (unit_price * 60 * 672)}/mo)"
     end

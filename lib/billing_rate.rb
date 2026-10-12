@@ -11,7 +11,19 @@ class BillingRate
   # simplecov:enable
 
   def self.rates
-    @rates ||= Dir["config/billing_rates/*.yml"].flat_map { YAML.load_file(it, permitted_classes: [Time]) }
+    @rates ||= load_rates(rate_globs)
+  end
+
+  # The shipped rates, plus the operator's overlay directory (rates for
+  # BYOH locations) when BILLING_RATES_EXTRA_DIR is set.
+  def self.rate_globs
+    ["config/billing_rates/*.yml", *(File.join(Config.billing_rates_extra_dir, "*.yml") if Config.billing_rates_extra_dir)]
+  end
+
+  # Reads the rates without memoising them, so that a check can see a file
+  # written after this process loaded #rates.
+  def self.load_rates(globs)
+    globs.flat_map { Dir[it] }.flat_map { YAML.load_file(it, permitted_classes: [Time]) || [] }
   end
 
   def self.from_resource_properties(resource_type, resource_family, location, byoc = false, active_at = Time.now)
