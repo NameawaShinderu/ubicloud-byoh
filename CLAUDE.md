@@ -97,23 +97,21 @@ Product direction from the user:
 
 | Path | Status | Role |
 |---|---|---|
-| `lib/hosting/apis.rb` | M | Adds `DELEGATING_PROVIDERS = [hetzner, generic]`; leaseweb or a nil provider still raises "unknown provider". Also adds `require_relative "base"`. |
-| `lib/hosting/base.rb` | A | `Hosting::Base` and `Hosting::CapabilityMissing`, plus an `IpInfo` Struct `(ip_address, source_host_ip, is_failover)`. HetznerApis does **not** inherit from it. |
+| `lib/hosting/apis.rb` | M | Adds `DELEGATING_PROVIDERS = [hetzner, generic]`; leaseweb or a nil provider still raises "unknown provider". |
+| `lib/hosting/capability_missing.rb` | A | `Hosting::CapabilityMissing`. (`Hosting::Base` was deleted on 2026-10-12; `GenericApis` is standalone with its own `IpInfo` Struct `(ip_address, source_host_ip, is_failover)`, like HetznerApis.) |
 | `lib/hosting/generic_apis.rb` | A | Driven by config; never calls a remote API (see the methods below). |
-| `lib/hosting/redfish_client.rb` | A | Excon client: GET Systems, then the Reset target, then POST ResetType. Sets no timeouts. `set_next_boot_pxe` is unused. |
+| `lib/hosting/redfish_client.rb` | A | Excon client: GET Systems, then the Reset target, then POST ResetType. Timeouts: connect 10s, read/write 60s. |
 | `lib/byoh_registration.rb` | A | Validation, `provider_config` builder, keypair handling, and the call to `HostNexus.assemble`. |
 | `bin/register-byoh-host` | A | OptionParser CLI with no extension. Defaults RACK_ENV to development. |
 | `prog/vm/host_nexus.rb` | M | `assemble` gains `provider_config:` and `ssh_private_key:` kwargs plus a generic branch; `setup_ssh_keys` gets a Hetzner guard. |
 | `model/host_provider.rb` | M | Adds `GENERIC_PROVIDER_NAME = "generic"`. The schema annotation was **not** updated for `config`. |
 | `migrate/20260412000000_add_generic_provider.rb` | A | Inserts `provider('generic')` and adds `host_provider.config jsonb NULL`. Note the 14-digit name. |
-| `config.rb` | M | `generic_connection_string`, `generic_user`, `generic_password` set to `""`. They exist only to satisfy `HostProvider::PROVIDER_METHODS`. |
 | `cache/schema.cache` | M | Regenerated binary. |
 | `package-lock.json` | M | Accidental churn from `npm install`; package.json is unchanged. Drop it on rebase. |
 | `.gitignore` | M | `/backups/` |
-| `spec/lib/hosting/{generic_apis,redfish_client}_spec.rb`, `spec/lib/byoh_registration_spec.rb`, `spec/integration/byoh_end_to_end_spec.rb` | A | 71 `it` blocks: generic_apis 28, registration 25, redfish 11, e2e 7. |
+| `spec/lib/hosting/{generic_apis,redfish_client}_spec.rb`, `spec/lib/byoh_registration_spec.rb`, `spec/lib/byoh_registration_end_to_end_spec.rb` | A | BYOH specs; every BYOH file is at 100% line and branch coverage. |
 | `spec/prog/vm/host_nexus_spec.rb` | M | Adds a "generic (BYOH) provider" block (+10 `it` blocks, 81 in total). |
 | `scripts/byoh/bootstrap-ctrl-plane.sh`, `bootstrap-data-plane.sh`, `providers/aws-routed-network-setup.sh`, `README.md` | A | Ops tooling. |
-| `scripts/byoh-ops/reconfigure-routed-networks.rb` | A | Swaps a host's IP pool. It destroys the host's VMs. |
 | `terraform/aws-byoh/*` | A | VPC 10.98.0.0/16; t3.medium control plane; m5d.metal data plane with `source_dest_check=false`; 3 secondary IPs + EIPs. |
 | `docs/byoh/{QUICKSTART,SETUP,SETUP_PROXMOX}.md`, `docs/providers/generic.md` | A | Docs. Many errors; see §10. |
 
@@ -279,11 +277,9 @@ RACK_ENV=development bundle exec bin/register-byoh-host \
 
 ### Change the IP pool later
 
-`bundle exec ruby scripts/byoh-ops/reconfigure-routed-networks.rb --vm-host-ubid vh… --cidrs a/32,b/32 [--v6 X/64] [--dry-run] [--yes]`
-
-- It **destroys the host's VMs**.
-- It does **not** update `vm_host.net6`.
-- Omitting `--v6` drops the v6 entry from the config. The `--help` text wrongly says the existing value is kept.
+There is no tool for this until `bin/byoh-pool` lands (NETWORKING.md §10, M2).
+The old `scripts/byoh-ops/reconfigure-routed-networks.rb` was deleted on 2026-10-12: it destroyed every VM on the host and had no spec.
+It is still in git history (`git show 0a24426cc:scripts/byoh-ops/reconfigure-routed-networks.rb`) for an emergency.
 
 ### Re-registering the same IP
 
@@ -335,30 +331,26 @@ RACK_ENV=development bundle exec bin/register-byoh-host \
 docker start ubi-pg-test    # only our container
 docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test ubi-bundler sh -c 'bundle exec bin/rake-task-runner migrate "" 0'
 docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test -e FORCE_AUTOLOAD=1 ubi-bundler sh -c 'bundle exec bin/rake-task-runner refresh_sequel_caches'
-docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test ubi-bundler sh -c 'apk add --quiet bash openssh-client && bundle exec rspec spec/lib/hosting spec/lib/byoh_registration_spec.rb spec/integration spec/prog/vm/host_nexus_spec.rb'
+docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test ubi-bundler sh -c 'apk add --quiet bash openssh-client && bundle exec rspec spec/lib/hosting spec/lib/byoh_registration_spec.rb spec/lib/byoh_registration_end_to_end_spec.rb spec/prog/vm/host_nexus_spec.rb'
 ```
 
 - The containers run as root, so `var/` ends up root-owned.
 - The earlier session's results: BYOH specs, 80 examples, 0 failures; a 1911-example subset, 0 failures.
-- **The full `rake` (coverage + frozen_spec) has never been run.**
-- **Full-suite recipe that works here:**
+- **Full-suite recipe (upstream's real gate; all green since 2026-10-12):**
+  - Upstream gates on the **parallel** run (`rake coverage_pspec`, turbo_tests, results merged). A serial `coverage_sspec` always reports `config.rb` as uncovered, because `spec/config_spec.rb` re-`load`s it and Ruby resets that file's counters. That is not a real gap.
   - Use a clean worktree, so the gitignored `backups/*.rb` are not counted.
-  - Use a database name ending in `test`, with the `citext` and `btree_gist` extensions.
-  - Pass random `CLOVER_*` secrets as `-e` variables.
-  - Run `bundle exec rake coverage_sspec`, then `CLOVER_FREEZE=true bundle exec rspec spec`.
-  - Pattern: `docker run --rm --network ubi-test-net -v <wt>:/app -w /app -e RACK_ENV=test -e CLOVER_DATABASE_URL=postgres://clover@ubi-pg-test:5432/clover_m0full_test ... ubi-bundler`.
-  - After M0 (2026-10-12): 5491 and 5471 examples, 0 failures. Line coverage 98.73%, branch 99.82%.
-  - The remaining gaps are pre-existing: `config.rb`, `clover.rb` and CLI files (load-order noise), the reconfigure script, and small BYOH gaps in `lib/hosting/base.rb`, `byoh_registration.rb` and `generic_apis.rb`.
-- Upstream's gate is **100% line and 100% branch coverage per file** (`spec/coverage_helper.rb`). Likely failures (UNVERIFIED):
-  - the overridden bodies in `lib/hosting/base.rb`
-  - several branches in `generic_apis.rb`
-  - `scripts/byoh-ops/reconfigure-routed-networks.rb`, which has no spec
-  - Use `# :nocov:` or add specs.
+  - In the worktree, write a test-only `.env.rb` (gitignored) with random `CLOVER_*` secrets and `CLOVER_DATABASE_URL = postgres://clover@ubi-pg-test:5432/clover_cov_test#{ENV["TEST_ENV_NUMBER"]}`.
+  - turbo_tests numbers processes **1..N** (not "", 2..N). Create `clover_cov_test1`..`clover_cov_test6` in `ubi-pg-test` with `citext` and `btree_gist`, and migrate each with `TEST_ENV_NUMBER=n`.
+  - Run with `docker run --cpuset-cpus=0-5 ...` so `Etc.nprocessors` gives 6 processes on this shared machine: `bundle exec rake coverage_pspec`, then `bundle exec rake frozen_pspec`, then `bundle exec rubocop`.
+  - Specs cannot mock core classes like `File` (frozen mode raises "does not implement").
+  - If a run is interrupted, `coverage/` stays root-owned; clean it up from inside a container.
+  - 2026-10-12 (`cov-100`): 100.0% line (20425/20425), 100.0% branch (6126/6126), 5485 examples; frozen 5465 examples; rubocop clean; all 0 failures.
+- Upstream's gate is **100% line and 100% branch coverage per file** (`spec/coverage_helper.rb`). Every new file needs full specs; prefer deleting dead code over `# :nocov:`.
 - **Spec conventions:**
   - Mock `Sshable#_cmd`, never `#cmd`. `RACK_ENV=test` raises `NetSsh::MissingMock` on real SSH.
   - Use the `hop`/`nap`/`exit` matchers.
   - Run `rake test_up` or refresh caches after a migration.
-- **Lint:** rubocop + standard. Multiline literals need trailing commas (`diff_comma`). Our `DELEGATING_PROVIDERS` and `creates_host_provider` arrays likely violate this.
+- **Lint:** rubocop + standard. Multiline literals need trailing commas (`diff_comma`). The whole repo is rubocop-clean since 2026-10-12; keep it that way.
 - **Never run `RACK_ENV=test` on a real control plane.** It disables SSH.
 - **Never run `rake setup_database[test]` on a control plane.** It drops `clover_test`, which is the deployment DB.
 
@@ -367,7 +359,7 @@ docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test u
 Dry merge: `git merge-tree --write-tree --name-only origin/main byoh-driver` reports 7 conflicts:
 - `.gitignore`
 - `cache/schema.cache` (regenerate it)
-- `config.rb` (drop our `generic_*`)
+- `config.rb` (our `generic_*` entries were already removed on 2026-10-12)
 - **`lib/hosting/apis.rb` (modify/delete)**: upstream replaced it with `Hosting::ProviderApis.for(provider)` in ad6bba614
 - `package-lock.json` (take theirs)
 - `prog/vm/host_nexus.rb`
@@ -415,8 +407,8 @@ Code:
    - No IPv4 size/overlap check (more than /24 fails late in `Address#validate`).
    - Host-bit CIDRs are probably silently normalized by NetAddr (UNVERIFIED).
    - Only the first v6 is used.
-9. Dead code: `declared_net6`, `capabilities`, `get_main_ip4`, `set_next_boot_pxe`, the `generic_*` Config entries.
-10. The `host_provider` annotation is missing `config`; the migration name is 14 digits; RedfishClient has no timeouts.
+9. ~~Dead code~~: removed on 2026-10-12.
+10. The `host_provider` annotation is missing `config`; the migration name is 14 digits. (RedfishClient timeouts were added on 2026-10-12.)
 
 Scripts:
 - The bootstrap DB is named `clover_test` while running in development.
