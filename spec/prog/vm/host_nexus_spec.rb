@@ -159,6 +159,15 @@ RSpec.describe Prog::Vm::HostNexus do
         expect(slice.netmask.prefix_len).to eq(79)
       end
 
+      it "leaves net6 unset when no IPv6 network is declared" do
+        cfg = provider_config.merge("routed_networks" => [{"source_host_ip" => "203.0.113.42"}, {"cidr" => "10.99.0.0/29"}])
+        st = described_class.assemble("203.0.113.42",
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config: cfg)
+
+        expect(st.subject.net6).to be_nil
+      end
+
       it "uses an operator-supplied server_identifier when one is passed" do
         st = described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
