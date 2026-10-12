@@ -201,6 +201,7 @@ RSpec.describe ByohPool do
 
     it "keeps legacy stored pools working when adding to a registered host" do
       host.provider.update(config: Sequel.pg_jsonb(host.provider.config.to_h.merge("routed_networks" => ["10.98.9.1", *config_networks])))
+      Address.create(cidr: "10.98.9.1/32", routed_to_host_id: host.id).populate_ipv4_addresses
       expect(pool.add([ByohPoolDeclaration.parse("10.98.4.0/30,exposure=internal")])).to eq []
       expect(Strand.where(prog: "SetupNftables").count).to eq 0
     end
@@ -208,9 +209,46 @@ RSpec.describe ByohPool do
     it "refuses empty, IPv6, already declared and invalid pools" do
       expect { pool.add([]) }.to raise_error(described_class::Error, "no pools given")
       expect { pool.add([ByohPoolDeclaration.parse("fd00:1:2:3::/64")]) }.to raise_error(described_class::Error, /change the IPv6 network with ipv6 set/)
-      expect { pool.add([ByohPoolDeclaration.parse("5.9.10.0/29")]) }.to raise_error(described_class::Error, "5.9.10.0/29 is already declared; change it with annotate")
+      expect { pool.add([ByohPoolDeclaration.parse("5.9.10.0/29")]) }.to raise_error(described_class::Error, "5.9.10.0/29 is already registered; change it with annotate")
+      expect { pool.add([ByohPoolDeclaration.parse("10.98.1.10/32,exposure=internal")]) }.to raise_error(described_class::Error, "10.98.1.10/32 is already registered; change it with annotate")
       expect { pool.add([ByohPoolDeclaration.parse("10.98.2.0/31,exposure=internal")]) }.to raise_error(described_class::Error, /10.98.2.0\/31 overlaps 10.98.2.0\/30/)
       expect(pool_actions).to eq []
+    end
+  end
+
+  describe "#add of a declared pool without address rows" do
+    before do
+      networks = config_networks + ["10.98.9.0/30", {"cidr" => "10.98.8.0/30", "exposure" => "internal"}]
+      host.provider.update(config: Sequel.pg_jsonb(host.provider.config.to_h.merge("routed_networks" => networks)))
+    end
+
+    it "refuses to register such pools unchecked as a side effect" do
+      expect { pool.add([ByohPoolDeclaration.parse("10.98.4.0/30")]) }
+        .to raise_error(described_class::Error, "10.98.9.0/30, 10.98.8.0/30 declared but not registered; add them in this command too, or remove them first")
+      expect(DB[:address].where(cidr: ["10.98.4.0/30", "10.98.9.0/30", "10.98.8.0/30"]).count).to eq 0
+    end
+
+    it "follows verify's advice: add validates and registers them, replacing their declarations" do
+      expect(pool.verify.first(2)).to eq [
+        [:fail, "10.98.9.0/30 is declared but not registered; register it with add, or drop it with remove"],
+        [:fail, "10.98.8.0/30 is declared but not registered; register it with add, or drop it with remove"],
+      ]
+      expect { pool.add([ByohPoolDeclaration.parse("10.98.9.0/29,exposure=internal"), ByohPoolDeclaration.parse("10.98.8.0/30,exposure=internal")]) }
+        .to raise_error(described_class::Error, /10.98.9.0\/30 declared but not registered/)
+      pool.add([ByohPoolDeclaration.parse("10.98.9.0/30,exposure=internal,reserve=10.98.9.3"), ByohPoolDeclaration.parse("10.98.8.0/30,exposure=internal")])
+      expect(config_networks.last(2)).to eq [
+        {"cidr" => "10.98.9.0/30", "delivery" => "routed", "exposure" => "internal", "reserve" => ["10.98.9.3"]},
+        {"cidr" => "10.98.8.0/30", "delivery" => "routed", "exposure" => "internal"},
+      ]
+      expect(config_networks.count { (it.is_a?(Hash) ? it["cidr"] : it).start_with?("10.98.9.0") }).to eq 1
+      expect(ipv4_row("10.98.9.3")[:reserved]).to be true
+      expect(pool.verify).to eq [[:unverified, "/etc/nftables.d/1-byoh-egress.conf is not checked from the database; on the host, run: sudo nft list table inet byoh_egress"]]
+    end
+
+    it "follows verify's other advice: remove drops them" do
+      pool.remove("10.98.9.0/30")
+      pool.remove("10.98.8.0/30")
+      expect(pool.verify.map(&:first)).to eq [:unverified]
     end
   end
 
@@ -451,7 +489,7 @@ RSpec.describe ByohPool do
       host.update(ipv6_mode: "gua")
 
       expect(pool.verify).to eq [
-        [:fail, "10.98.9.0/30 is declared but not registered; register it with add"],
+        [:fail, "10.98.9.0/30 is declared but not registered; register it with add, or drop it with remove"],
         [:fail, "5.9.10.0/29 has reserved addresses  but declares 5.9.10.7"],
         [:fail, "10.98.1.128: the VM's external IP 8.8.4.4 differs from the pool's 8.8.8.10"],
         [:fail, "10.98.1.129/32 maps external IPs {} but declares {\"10.98.1.129\" => \"8.8.8.11\"}"],

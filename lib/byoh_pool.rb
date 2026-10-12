@@ -174,19 +174,28 @@ class ByohPool
   end
 
   # Declares and registers new IPv4 pools. No VM is touched; the host's
-  # firewall sets are rebuilt.
+  # firewall sets are rebuilt. A pool that is declared but not registered
+  # is added again under the current rules, replacing its declaration;
+  # create_addresses would otherwise register it unchecked.
   def add(entries)
     raise Error, "no pools given" if entries.empty?
     raise Error, "add takes IPv4 pools; change the IPv6 network with ipv6 set" if entries.any?(&:ipv6?)
 
     change("add", {pools: entries.map(&:to_config)}) do |locked, current|
-      cidrs = current.map { it.last.cidr.to_s }
-      if (existing = entries.find { cidrs.include?(it.cidr.to_s) })
-        raise Error, "#{existing.cidr} is already declared; change it with annotate"
+      registered = locked.assigned_subnets_dataset.select_map(:cidr).map(&:to_s)
+      if (existing = entries.find { registered.include?(it.cidr.to_s) })
+        raise Error, "#{existing.cidr} is already registered; change it with annotate"
       end
 
-      notes = validate(entries, current.map(&:last))
-      write_config(locked, current.map(&:first) + entries.map(&:to_config))
+      cidrs = entries.map { it.cidr.to_s }
+      unregistered = unregistered_cidrs(current, registered) - cidrs
+      unless unregistered.empty?
+        raise Error, "#{unregistered.join(", ")} declared but not registered; add them in this command too, or remove them first"
+      end
+
+      kept = current.reject { cidrs.include?(it.last.cidr.to_s) }
+      notes = validate(entries, kept.map(&:last))
+      write_config(locked, kept.map(&:first) + entries.map(&:to_config))
       locked.create_addresses
       notes
     end
@@ -340,9 +349,8 @@ class ByohPool
     all_rows = rows
     rows_by_cidr = all_rows.group_by { it[:cidr].to_s }
 
-    by_cidr.each_key do |cidr|
-      next if cidr == "#{host.sshable.host}/32" || addresses.any? { it.cidr.to_s == cidr }
-      results << [:fail, "#{cidr} is declared but not registered; register it with add"]
+    unregistered_cidrs(declared, host.assigned_subnets_dataset.select_map(:cidr).map(&:to_s)).each do |cidr|
+      results << [:fail, "#{cidr} is declared but not registered; register it with add, or drop it with remove"]
     end
 
     addresses.each do |address|
@@ -426,6 +434,11 @@ class ByohPool
 
   def rebuild_firewall(locked)
     Strand.create(prog: "SetupNftables", label: "start", stack: [{subject_id: locked.id}]) unless locked.allocation_state == "unprepared"
+  end
+
+  # The declared IPv4 pools that have no address row.
+  def unregistered_cidrs(current, registered)
+    current.map(&:last).select(&:ipv4?).map { it.cidr.to_s } - registered
   end
 
   def pool_vms(address_ids)
