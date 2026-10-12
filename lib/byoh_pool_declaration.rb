@@ -406,7 +406,11 @@ class ByohPoolDeclaration
     external_ips = entries.flat_map { it.external.values }
     return [] if external_ips.empty?
 
-    errors = external_ips.tally.select { |_, count| count > 1 }.keys.map { "external IP #{it} is used more than once" }
+    # Stored entries count too, so a new pool cannot take an external IP
+    # an existing pool of the host already maps.
+    errors = all.flat_map { it.external.values }.tally
+      .select { |ip, count| count > 1 && external_ips.include?(ip) }.keys
+      .map { "external IP #{it} is used more than once" }
 
     external_ips.uniq.each do |ip|
       net = NetAddr::IPv4Net.parse("#{ip}/32")
@@ -419,8 +423,11 @@ class ByohPoolDeclaration
     pools = DB[:ipv4_address].where(external_ip: external_ips)
     vms = DB[:assigned_vm_address].where(external_ip: external_ips)
     if host
-      pools = pools.exclude(cidr: host.assigned_subnets_dataset.select(:cidr))
-      vms = vms.exclude(address_id: host.assigned_subnets_dataset.select(:id))
+      # Only the rows of a pool being re-declared are replaced; the host's
+      # other pools keep their mappings.
+      redeclared = host.assigned_subnets_dataset.where(cidr: entries.map { it.cidr.to_s })
+      pools = pools.exclude(cidr: redeclared.select(:cidr))
+      vms = vms.exclude(address_id: redeclared.select(:id))
     end
     (pools.select_map(:external_ip) + vms.select_map(:external_ip)).map(&:to_s).uniq.sort.each do
       errors << "external IP #{it} is already mapped to another address"

@@ -326,13 +326,37 @@ RSpec.describe ByohPoolDeclaration do
         ].join("\n")
       end
 
-      it "may already be mapped by the host's own rows" do
+      it "may already be mapped by the rows of the pool being re-declared" do
         host = create_vm_host
-        Address.create(cidr: "10.1.0.0/31", routed_to_host_id: host.id).populate_ipv4_addresses(external_ips: {"10.1.0.0" => "8.8.8.1"})
-        address = Address.create(cidr: "10.1.1.0/31", routed_to_host_id: host.id)
-        AssignedVmAddress.create(dst_vm_id: create_vm.id, ip: "10.1.1.1", address_id: address.id, external_ip: "8.8.8.2")
+        address = Address.create(cidr: "10.1.0.0/31", routed_to_host_id: host.id)
+        address.populate_ipv4_addresses(external_ips: {"10.1.0.0" => "8.8.8.1"})
+        AssignedVmAddress.create(dst_vm_id: create_vm.id, ip: "10.1.0.1", address_id: address.id, external_ip: "8.8.8.2")
         entries = [parse("10.1.0.0/31,exposure=nat,external=10.1.0.0:8.8.8.1,external=10.1.0.1:8.8.8.2")]
         expect(described_class.validate_set!(entries, main_ip: "1.1.1.1", location:, host:)).to eq []
+      end
+
+      it "must not be mapped by the host's other pools" do
+        host = create_vm_host
+        stored = parse({"cidr" => "10.1.0.0/31", "exposure" => "nat", "external" => {"10.1.0.0" => "8.8.8.1", "10.1.0.1" => "8.8.8.3"}}, legacy: true)
+        Address.create(cidr: "10.1.0.0/31", routed_to_host_id: host.id).populate_ipv4_addresses(external_ips: stored.external)
+        address = Address.create(cidr: "10.1.1.0/31", routed_to_host_id: host.id)
+        AssignedVmAddress.create(dst_vm_id: create_vm.id, ip: "10.1.1.1", address_id: address.id, external_ip: "8.8.8.2")
+        entries = [parse("10.2.0.0/31,exposure=nat,external=10.2.0.0:8.8.8.1,external=10.2.0.1:8.8.8.2")]
+        expect { described_class.validate_set!(entries, main_ip: "1.1.1.1", location:, host:, stored: [stored]) }
+          .to raise_error(described_class::ValidationError, [
+            "external IP 8.8.8.1 is used more than once",
+            "external IP 8.8.8.1 is already mapped to another address",
+            "external IP 8.8.8.2 is already mapped to another address",
+          ].join("\n"))
+      end
+
+      it "ignores duplicates among stored pools that no new pool uses" do
+        stored = [
+          parse({"cidr" => "10.1.0.0/32", "exposure" => "nat", "external" => {"10.1.0.0" => "8.8.8.1"}}, legacy: true),
+          parse({"cidr" => "10.1.1.0/32", "exposure" => "nat", "external" => {"10.1.1.0" => "8.8.8.1"}}, legacy: true),
+        ]
+        entries = [parse("10.2.0.0/32,exposure=nat,external=10.2.0.0:8.8.8.2")]
+        expect(described_class.validate_set!(entries, main_ip: "1.1.1.1", location:, stored:)).to eq []
       end
     end
 
