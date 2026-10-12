@@ -127,14 +127,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
         gpu_device:,
         family_filter:,
       )
-    rescue Scheduling::Allocator::NoSpaceLeft => ex
-      # A host whose counters drifted would be picked again on every
-      # retry, so leave it out of the next attempts.
-      if ex.is_a?(Scheduling::Allocator::CounterDrift)
-        host_exclusion_filter |= [ex.vm_host_id]
-        update_stack({"exclude_host_ids" => host_exclusion_filter})
-      end
-
+    rescue Scheduling::Allocator::NoSpaceLeft
       incr_waiting_for_capacity unless vm.waiting_for_capacity_set?
 
       Clog.emit("No capacity left", {lack_of_capacity: {location: Location[vm.location_id].name, arch:, family:, queue_size: queued_vms.count}})

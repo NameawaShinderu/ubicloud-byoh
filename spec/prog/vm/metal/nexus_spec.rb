@@ -391,7 +391,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect(Page.from_tag_parts("NoCapacity", Location[vm.location_id].display_name, "x64", "standard")).not_to be_nil
     end
 
-    it "excludes a host whose counters drifted from the next attempts" do
+    it "keeps a host whose counters drifted eligible for later attempts" do
       drifted = create_vm_host
       excluded = create_vm_host
       st.stack = [{"storage_volumes" => storage_volumes, "exclude_host_ids" => [excluded.id]}]
@@ -400,11 +400,11 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         .and_raise(Scheduling::Allocator::CounterDrift.new("failed to allocate cpus on #{drifted.ubid}", drifted.id))
 
       vm.created_at = Time.now - 11 * 60
+      expect(nx).not_to receive(:update_stack)
       expect { nx.start }.to nap(5)
 
-      expect(st.reload.stack.first["exclude_host_ids"]).to eq([excluded.id, drifted.id])
       expect(vm.reload.waiting_for_capacity_set?).to be(true)
-      expect(Page.first.details["hosts"].map { it["host"] }).to eq([vm_host.ubid])
+      expect(Page.first.details["hosts"].map { it["host"] }).to contain_exactly(vm_host.ubid, drifted.ubid)
     end
 
     it "does not create a page if VM has been waiting less than 10 minutes" do
