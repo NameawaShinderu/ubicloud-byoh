@@ -58,7 +58,7 @@ RSpec.describe ByohPoolDeclaration do
       expect { parse("fd00::1", legacy: true) }.to raise_error(described_class::ValidationError, "\"fd00::1\" is not a CIDR (address/prefix, no host bits)")
     end
 
-        it "accepts the legacy keys older registrations stored" do
+    it "accepts the legacy keys older registrations stored" do
       expect(parse({"cidr" => "8.8.8.0/29", "source_host_ip" => "1.1.1.1", "is_failover" => false}).cidr.to_s).to eq "8.8.8.0/29"
     end
 
