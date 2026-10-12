@@ -340,6 +340,9 @@ docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test u
   - turbo_tests numbers processes **1..N** (not "", 2..N). Create `clover_cov_test1`..`clover_cov_test6` in `ubi-pg-test` with `citext` and `btree_gist`, and migrate each with `TEST_ENV_NUMBER=n`.
   - Run with `docker run --cpuset-cpus=0-5 ...` so `Etc.nprocessors` gives 6 processes on this shared machine: `bundle exec rake coverage_pspec`, then `bundle exec rake frozen_pspec`, then `bundle exec rubocop`.
   - Specs cannot mock core classes like `File` (frozen mode raises "does not implement").
+  - Since M1, use the image `ubi-bundler-m1` (Ruby 4.0.7) and databases `clover_m1_test1..6`. Rhizome specs need an Ubuntu `/etc/os-release`, so add `-v /etc/os-release:/etc/os-release:ro` for `rake rhizome_spec`.
+  - Inherited, environment-only failures that also fail on pure `origin/main` here: `spec/db_spec.rb:189,193` (superuser test DB), `spec/routes/web/admin/model/resource_discount_spec.rb:13` (upstream bug), and `rhizome/postgres/spec/disk_full_check_spec.rb` (29 examples, Alpine).
+  - M1 result (2026-10-12): 9151 examples with only those 3 failing; excluding the two affected files, 9102 examples, 0 failures, and the only coverage gaps are lines exercised by the excluded `db_spec`. Frozen: 9127 examples, same 3. Rubocop clean.
   - If a run is interrupted, `coverage/` stays root-owned; clean it up from inside a container.
   - 2026-10-12 (`cov-100`): 100.0% line (20425/20425), 100.0% branch (6126/6126), 5485 examples; frozen 5465 examples; rubocop clean; all 0 failures.
 - Upstream's gate is **100% line and 100% branch coverage per file** (`spec/coverage_helper.rb`). Every new file needs full specs; prefer deleting dead code over `# :nocov:`.
