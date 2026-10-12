@@ -346,6 +346,21 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(vm_host.used_cores).to eq 1
     end
 
+    it "reserves no IO cpus on generic hosts without SPDK" do
+      HostProvider.create do |hp|
+        hp.id = vm_host.id
+        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+        hp.server_identifier = "byoh-1"
+      end
+      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "x64", "total_sockets" => 1, "total_dies" => 1, "total_cores" => 4, "total_cpus" => 8})
+
+      expect { nx.wait_prep }.to hop("setup_hugepages")
+
+      vm_host.reload
+      expect(VmHostCpu.where(vm_host_id: vm_host.id, spdk: true).count).to eq 0
+      expect(vm_host.used_cores).to eq 0
+    end
+
     it "crashes if an expected field is not set for LearnMemory" do
       Strand.create(parent_id: st.id, prog: "LearnMemory", label: "start", exitval: {})
       expect { nx.wait_prep }.to raise_error KeyError, "key not found: \"mem_gib\""
