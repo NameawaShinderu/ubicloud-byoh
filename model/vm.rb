@@ -90,6 +90,8 @@ class Vm < Sequel::Model
     ephemeral_net4&.nth(0)
   end
 
+  def byoh_host? = !!vm_host&.byoh?
+
   def ip4_string
     ip4&.to_s
   end
@@ -313,6 +315,7 @@ end
 #  location_id                 | uuid                     | NOT NULL
 #  hypervisor_id               | uuid                     |
 #  maintenance_window_start_at | integer                  |
+#  ip4_exposure                | text                     | NOT NULL DEFAULT 'internet'::text
 # Indexes:
 #  vm_pkey                             | PRIMARY KEY btree (id)
 #  vm_ephemeral_net6_key               | UNIQUE btree (ephemeral_net6)
@@ -320,6 +323,7 @@ end
 #  vm_pool_id_index                    | btree (pool_id) WHERE pool_id IS NOT NULL
 # Check constraints:
 #  valid_maintenance_windows_start_at | (maintenance_window_start_at >= 0 AND maintenance_window_start_at <= 23)
+#  vm_ip4_exposure_check              | (ip4_exposure = ANY (ARRAY['internet'::text, 'internal'::text]))
 # Foreign key constraints:
 #  vm_hypervisor_id_fkey    | (hypervisor_id) REFERENCES hypervisor(id)
 #  vm_location_id_fkey      | (location_id) REFERENCES location(id)

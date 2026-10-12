@@ -20,9 +20,9 @@ end
 # Table: host_provider
 # Primary Key: (server_identifier, provider_name)
 # Columns:
-#  id                | uuid |
-#  server_identifier | text |
-#  provider_name     | text |
+#  id                | uuid  |
+#  server_identifier | text  |
+#  provider_name     | text  |
 #  config            | jsonb |
 # Indexes:
 #  host_provider_pkey | PRIMARY KEY btree (provider_name, server_identifier)

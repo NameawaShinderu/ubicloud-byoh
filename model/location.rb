@@ -69,6 +69,24 @@ class Location < Sequel::Model
     !aws? && !gcp?
   end
 
+  # A BYOH site: bring-your-own hosts with the network profile in
+  # byoh_network (docs/byoh/NETWORKING.md section 5.3).
+  def byoh?
+    !byoh_network.nil?
+  end
+
+  def byoh_profile
+    ByohNetworkProfile.new(byoh_network) if byoh?
+  end
+
+  def validate
+    super
+    return unless byoh?
+
+    errors.add(:byoh_network, "is only allowed on metal locations") unless metal?
+    ByohNetworkProfile.new(byoh_network).errors.each { errors.add(:byoh_network, it) }
+  end
+
   def provider_dispatcher_group_name
     case provider
     when "aws", "gcp"
@@ -96,6 +114,7 @@ end
 #  project_id   | uuid    |
 #  dns_suffix   | text    |
 #  byoc         | boolean | NOT NULL DEFAULT false
+#  byoh_network | jsonb   |
 # Indexes:
 #  location_pkey                         | PRIMARY KEY btree (id)
 #  location_project_id_display_name_uidx | UNIQUE btree (project_id, display_name)

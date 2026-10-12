@@ -50,9 +50,14 @@ end
 #  cidr              | cidr    | NOT NULL
 #  is_failover_ip    | boolean | NOT NULL DEFAULT false
 #  routed_to_host_id | uuid    | NOT NULL
+#  delivery          | text    | NOT NULL DEFAULT 'routed'::text
+#  exposure          | text    | NOT NULL DEFAULT 'public'::text
 # Indexes:
 #  address_pkey     | PRIMARY KEY btree (id)
 #  address_cidr_key | UNIQUE btree (cidr)
+# Check constraints:
+#  address_delivery_check | (delivery = ANY (ARRAY['routed'::text, 'onlink'::text, 'fabric'::text]))
+#  address_exposure_check | (exposure = ANY (ARRAY['public'::text, 'nat'::text, 'internal'::text]))
 # Foreign key constraints:
 #  address_routed_to_host_id_fkey | (routed_to_host_id) REFERENCES vm_host(id)
 # Referenced By:

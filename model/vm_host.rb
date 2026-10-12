@@ -44,6 +44,11 @@ class VmHost < Sequel::Model
 
   def leaseweb? = HostProvider::LEASEWEB_PROVIDER_NAMES.include?(provider_name)
 
+  # BYOH network behaviour applies only to generic hosts in a BYOH
+  # location. A generic host still in a non-BYOH location keeps the
+  # behaviour it had before locations carried a network profile.
+  def byoh? = provider_name == HostProvider::GENERIC_PROVIDER_NAME && location.byoh?
+
   def sshable_host
     sshable.host
   end
@@ -553,6 +558,8 @@ end
 #  location_id        | uuid                     | NOT NULL
 #  family             | text                     | NOT NULL
 #  score_offset       | double precision         | NOT NULL DEFAULT 0
+#  ipv6_mode          | text                     | NOT NULL DEFAULT 'gua'::text
+#  network_check      | jsonb                    |
 # Indexes:
 #  vm_host_pkey     | PRIMARY KEY btree (id)
 #  vm_host_ip6_key  | UNIQUE btree (ip6)
@@ -562,6 +569,7 @@ end
 #  hugepages_allocation_limit  | (used_hugepages_1g <= total_hugepages_1g)
 #  used_cores_above_zero       | (used_cores >= 0)
 #  used_hugepages_non_negative | (used_hugepages_1g >= 0)
+#  vm_host_ipv6_mode_check     | (ipv6_mode = ANY (ARRAY['gua'::text, 'ula'::text]))
 # Foreign key constraints:
 #  vm_host_id_fkey          | (id) REFERENCES sshable(id)
 #  vm_host_location_id_fkey | (location_id) REFERENCES location(id)

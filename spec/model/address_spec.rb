@@ -17,6 +17,35 @@ RSpec.describe Address do
     expect(address.valid?).to be true
   end
 
+  describe "network contract columns" do
+    let(:vm_host) { create_vm_host }
+
+    it "default to a routed public block whose addresses are neither reserved nor mapped" do
+      address = described_class.create(cidr: "10.0.0.0/30", vm_host:)
+      address.populate_ipv4_addresses
+      expect(address.reload.values.slice(:delivery, :exposure)).to eq(delivery: "routed", exposure: "public")
+      expect(DB[:ipv4_address].select_map([:reserved, :external_ip]).uniq).to eq [[false, nil]]
+    end
+
+    it "accept every delivery and exposure" do
+      %w[routed onlink fabric].product(%w[public nat internal]).each_with_index do |(delivery, exposure), i|
+        expect(described_class.create(cidr: "10.0.#{i}.0/30", vm_host:, delivery:, exposure:).delivery).to eq delivery
+      end
+    end
+
+    it "refuse an unknown delivery or exposure" do
+      expect { described_class.create(cidr: "10.0.0.0/30", vm_host:, delivery: "tunnel") }.to raise_error(Sequel::ValidationFailed, "delivery is invalid")
+      expect { described_class.create(cidr: "10.0.0.0/30", vm_host:, exposure: "private") }.to raise_error(Sequel::ValidationFailed, "exposure is invalid")
+    end
+
+    it "refuse an IPv6 or duplicate external IP for a pool address" do
+      described_class.create(cidr: "10.0.0.0/30", vm_host:)
+      DB[:ipv4_address].insert(ip: "10.0.0.1", cidr: "10.0.0.0/30", external_ip: "203.0.113.1")
+      expect { DB.transaction { DB[:ipv4_address].insert(ip: "10.0.0.2", cidr: "10.0.0.0/30", external_ip: "203.0.113.1") } }.to raise_error(Sequel::UniqueConstraintViolation)
+      expect { DB.transaction { DB[:ipv4_address].insert(ip: "10.0.0.2", cidr: "10.0.0.0/30", external_ip: "2001:db8::1") } }.to raise_error(Sequel::CheckConstraintViolation, /ipv4_address_external_ip_v4_check/)
+    end
+  end
+
   it "populates ipv4_address table with addresses in cidr" do
     vm_host = Prog::Vm::HostNexus.assemble("1.2.3.4").subject
     address = described_class.create(cidr: "0.0.0.0/30", vm_host:)

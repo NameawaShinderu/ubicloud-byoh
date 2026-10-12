@@ -39,6 +39,38 @@ RSpec.describe Location do
     expect(described_class[name: "latitude-ai"].visible_or_for_project?(p1_id, ["latitude-ai"])).to be true
   end
 
+  describe "BYOH profile" do
+    def byoh_location(**)
+      described_class.new(name: "byoh-1", display_name: "byoh-1", ui_name: "byoh-1", visible: false, provider: HostProvider::GENERIC_PROVIDER_NAME, **)
+    end
+
+    it "is absent for other locations" do
+      loc = described_class[Location::HETZNER_FSN1_ID]
+      expect(loc.byoh?).to be false
+      expect(loc.byoh_profile).to be_nil
+      expect(loc.valid?).to be true
+    end
+
+    it "is present when byoh_network is set" do
+      loc = byoh_location(byoh_network: {"cp_reach" => "public"}).save_changes
+      loc = described_class[loc.id]
+      expect(loc.byoh?).to be true
+      expect(loc.byoh_profile.cp_reach).to eq "public"
+    end
+
+    it "reports profile errors" do
+      loc = byoh_location(byoh_network: {"guest_mtu" => 1, "tier" => "x"})
+      expect(loc.valid?).to be false
+      expect(loc.errors[:byoh_network]).to eq ["unknown key tier", "guest_mtu must be an integer between 1280 and 9000"]
+    end
+
+    it "is refused on cloud locations" do
+      loc = byoh_location(provider: "aws", byoh_network: {})
+      expect(loc.valid?).to be false
+      expect(loc.errors[:byoh_network]).to eq ["is only allowed on metal locations"]
+    end
+  end
+
   it "#provider_dispatcher_group_name returns the provider dispatch name" do
     expect(p2_loc.provider_dispatcher_group_name).to eq("aws")
     p2_loc.update(provider: "hetzner")

@@ -255,6 +255,42 @@ RSpec.describe VmHost do
     end
   end
 
+  describe "#byoh?" do
+    let(:byoh_location) {
+      Location.create(name: "byoh-test", display_name: "byoh-test", ui_name: "byoh-test", visible: false, provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {})
+    }
+
+    def make_provider(name)
+      HostProvider.create do
+        it.id = vm_host.id
+        it.server_identifier = "123"
+        it.provider_name = name
+      end
+    end
+
+    it "is false without a provider" do
+      vm_host.update(location_id: byoh_location.id)
+      expect(vm_host.byoh?).to be false
+    end
+
+    it "is false for a generic host outside a BYOH location" do
+      make_provider(HostProvider::GENERIC_PROVIDER_NAME)
+      expect(vm_host.byoh?).to be false
+    end
+
+    it "is false for a hetzner host in a BYOH location" do
+      make_provider(HostProvider::HETZNER_PROVIDER_NAME)
+      vm_host.update(location_id: byoh_location.id)
+      expect(vm_host.byoh?).to be false
+    end
+
+    it "is true for a generic host in a BYOH location" do
+      make_provider(HostProvider::GENERIC_PROVIDER_NAME)
+      vm_host.update(location_id: byoh_location.id)
+      expect(vm_host.byoh?).to be true
+    end
+  end
+
   describe "#power_on" do
     it "powers on the server" do
       expect(provider_api).to receive(:power_on).with(no_args)

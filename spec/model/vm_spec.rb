@@ -210,6 +210,20 @@ RSpec.describe Vm do
     end
   end
 
+  describe "#byoh_host?" do
+    it "is false without a host" do
+      expect(vm.byoh_host?).to be false
+    end
+
+    it "follows the host's byoh?" do
+      vm_host = create_vm_host
+      vm = create_vm(vm_host_id: vm_host.id)
+      expect(vm.byoh_host?).to be false
+      expect(vm.vm_host).to receive(:byoh?).and_return(true)
+      expect(vm.byoh_host?).to be true
+    end
+  end
+
   describe "#utility functions" do
     let(:project) { Project.create(name: "test-util") }
 
