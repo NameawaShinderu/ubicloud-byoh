@@ -201,14 +201,20 @@ module Scheduling::Allocator
         # we could allocate a new slice
         # Later in VmHostSliceAllocator the selected hosts will be scored depending if a slice is reused or
         # new one is created
+        # Shared slices only book the memory of the VMs placed in them and grow when reused, so a slice
+        # that is short on memory still qualifies if the host has free hugepages for the difference.
+        slice = Sequel[:vm_host_slice]
+        slice_host = Sequel[:slice_host]
+        host_free_hugepages = slice_host[:total_hugepages_1g] - slice_host[:used_hugepages_1g]
         ds.with(:slice_utilization, DB[:vm_host_slice]
-            .select_group(:vm_host_id)
-            .select_append { (sum(Sequel[:total_cpu_percent]) - sum(Sequel[:used_cpu_percent])).as(slice_cpu_available) }
-            .select_append { (sum(Sequel[:total_memory_gib]) - sum(Sequel[:used_memory_gib])).as(slice_memory_available) }
-            .where(enabled: true)
-            .where(is_shared: true)
-            .where(Sequel[:used_cpu_percent] + request.cpu_percent_limit <= Sequel[:total_cpu_percent])
-            .where(Sequel[:used_memory_gib] + request.memory_gib <= Sequel[:total_memory_gib]))
+            .join(Sequel[:vm_host].as(:slice_host), id: :vm_host_id)
+            .select_group(slice[:vm_host_id])
+            .select_append { (sum(slice[:total_cpu_percent]) - sum(slice[:used_cpu_percent])).as(slice_cpu_available) }
+            .select_append { max(slice[:total_memory_gib] - slice[:used_memory_gib] + host_free_hugepages).as(slice_memory_available) }
+            .where(slice[:enabled] => true)
+            .where(slice[:is_shared] => true)
+            .where(slice[:used_cpu_percent] + request.cpu_percent_limit <= slice[:total_cpu_percent])
+            .where(slice[:used_memory_gib] + request.memory_gib <= slice[:total_memory_gib] + host_free_hugepages))
           # end of 'with'
           .left_join(:slice_utilization, vm_host_id: Sequel[:vm_host][:id])
           .select_append(Sequel.function(:coalesce, :slice_cpu_available, 0).as(:slice_cpu_available))
@@ -439,7 +445,9 @@ module Scheduling::Allocator
 
     def is_valid
       if @existing_slice
-        true
+        # Reusing a slice that is short on memory grows it, which takes
+        # the difference from the host's free hugepages.
+        slice_memory_growth(@existing_slice) <= @candidate_host[:total_hugepages_1g] - @candidate_host[:used_hugepages_1g]
       else
         @vm_host_allocations.all?(&:is_valid)
       end
@@ -463,19 +471,32 @@ module Scheduling::Allocator
           # update the VM
           vm.update(vm_host_slice_id: @existing_slice.id)
 
-          # update the allocation on the VM
+          # Lock the slice so the growth below is computed from the
+          # current usage, not from the one seen while scoring.
           #
-          # if we cannot update the slice, likely because it was
+          # if we cannot find the slice, likely because it was
           # marked to be destroyed in parallel, we need to fail
           # and start the allocation process again
-          updated = VmHostSlice.dataset
-            .where(id: @existing_slice.id, enabled: true)
-            .update(
-              used_cpu_percent: Sequel[:used_cpu_percent] + vm.cpu_percent_limit,
-              used_memory_gib: Sequel[:used_memory_gib] + vm.memory_gib,
-            )
+          slice = VmHostSlice.where(id: @existing_slice.id, enabled: true).for_update.first
+          fail "failed to update slice" unless slice
 
-          fail "failed to update slice" unless updated == 1
+          # Grow the slice if it is short on memory, and take the
+          # difference from the host. Slices only grow; destroying the
+          # slice returns its whole total_memory_gib to the host. The
+          # CHECK constraints on vm_host and vm_host_slice catch a
+          # concurrent allocation that used the capacity first.
+          growth = slice_memory_growth(slice)
+          if growth > 0
+            VmHost.dataset.where(id: vm_host.id).update(
+              used_hugepages_1g: Sequel[:used_hugepages_1g] + growth,
+            )
+          end
+
+          VmHostSlice.dataset.where(id: slice.id).update(
+            used_cpu_percent: Sequel[:used_cpu_percent] + vm.cpu_percent_limit,
+            used_memory_gib: Sequel[:used_memory_gib] + vm.memory_gib,
+            total_memory_gib: Sequel[:total_memory_gib] + growth,
+          )
         else
           # We compute the number of cores that we need to give to the
           # slice, from the number of requested vCPUs. Then we convert
@@ -492,7 +513,9 @@ module Scheduling::Allocator
             vm_host,
             family: vm.family,
             allowed_cpus: cpus,
-            memory_gib: @request.memory_gib_for_vcpus(cpus.count),
+            # A shared slice books only the memory of the VM placed in
+            # it and grows when more VMs join (see the reuse branch).
+            memory_gib: @request.require_shared_slice ? @request.memory_gib : @request.memory_gib_for_vcpus(cpus.count),
             is_shared: @request.require_shared_slice,
           )
 
@@ -535,16 +558,22 @@ module Scheduling::Allocator
     def select_existing_slice
       vm_host = VmHost[@candidate_host[:vm_host_id]]
 
-      # Try to find an existing slice with some room
+      # Try to find an existing slice with some CPU room. A slice that
+      # is short on memory can grow (checked against the host in
+      # is_valid), but prefer the ones that need the least growth.
       vm_host.slices
         .select {
           (it.used_cpu_percent + @request.cpu_percent_limit <= it.total_cpu_percent) &&
-            (it.used_memory_gib + @request.memory_gib <= it.total_memory_gib) &&
             (it.cores == @request.cores_for_vcpus(vm_host.total_cpus / vm_host.total_cores)) &&
             (it.family == @request.family) &&
             it.enabled
         }
-        .min_by { it.used_cpu_percent }
+        .min_by { [slice_memory_growth(it), it.used_cpu_percent] }
+    end
+
+    # The memory a slice has to grow by to host the requested VM.
+    def slice_memory_growth(slice)
+      [slice.used_memory_gib + @request.memory_gib - slice.total_memory_gib, 0].max
     end
   end
 

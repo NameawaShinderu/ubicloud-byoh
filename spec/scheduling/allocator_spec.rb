@@ -1383,7 +1383,7 @@ RSpec.describe Al do
       expect(slice.cores).to eq(1)
       expect(slice.total_cpu_percent).to eq(200)
       expect(slice.used_cpu_percent).to eq(50)
-      expect(slice.total_memory_gib).to eq(8)
+      expect(slice.total_memory_gib).to eq(2)
       expect(slice.used_memory_gib).to eq(2)
       expect(vh.slices.size).to eq(2)
       expect(vh.used_cores).to eq(used_cores + slice.cores)
@@ -1576,7 +1576,7 @@ RSpec.describe Al do
       slice_b.update(enabled: true) # we don't have a proc to do that
       expect(slice_b).not_to be_nil
       expect(slice_b.cores).to eq(2)
-      expect(slice_b.total_memory_gib).to eq(6)
+      expect(slice_b.total_memory_gib).to eq(1)
       expect(slice_b.total_cpu_percent).to eq(200)
       expect(slice_b.used_cpu_percent).to eq(50)
       expect(slice_b.used_memory_gib).to eq(1)
@@ -1599,10 +1599,165 @@ RSpec.describe Al do
       expect(vm_b2.vm_host_slice.id).to eq(slice_b.id)
       expect(slice_b.used_cpu_percent).to eq(150)
       expect(slice_b.used_memory_gib).to eq(4)
+      expect(slice_b.total_memory_gib).to eq(4)
 
-      # No change at the host level
+      # No new cores; the slice grew by 3 GiB of hugepages
       expect(vmh.used_cores).to eq(used_cores + slice.cores + slice_b.cores)
-      expect(vmh.used_hugepages_1g).to eq(used_memory + slice.total_memory_gib + slice_b.total_memory_gib)
+      expect(vmh.used_hugepages_1g).to eq(used_memory + slice.total_memory_gib + 4)
+    end
+
+    describe "burstable slice memory" do
+      let(:vh) { VmHost.first }
+
+      before do
+        vh.update(total_cores: 4, total_cpus: 8, used_cores: 1, total_hugepages_1g: 27, used_hugepages_1g: 2)
+      end
+
+      def burstable_vm
+        create_vm(family: "burstable", vcpus: 1, memory_gib: 2, cpu_percent_limit: 50, cpu_burst_percent_limit: 50)
+      end
+
+      def burstable_req(vm)
+        create_req(vm, vol, use_slices: true, require_shared_slice: true)
+      end
+
+      # A shared slice holding one 2 GiB burstable VM, as a new slice is now created
+      def full_memory_slice
+        slice = Prog::Vm::VmHostSliceNexus.assemble_with_host("sl1", vh, family: "burstable", allowed_cpus: (2..3), memory_gib: 2, is_shared: true).subject
+        slice.update(used_cpu_percent: 50, used_memory_gib: 2, enabled: true)
+        vh.update(used_cores: 2, used_hugepages_1g: 4)
+        slice
+      end
+
+      it "books only the VM's memory for a new 2 GiB burstable slice" do
+        vm = burstable_vm
+        al = Al::Allocation.best_allocation(burstable_req(vm))
+        al.update(vm)
+
+        slice = vm.reload.vm_host_slice
+        expect(slice.total_memory_gib).to eq(2)
+        expect(slice.used_memory_gib).to eq(2)
+        expect(vh.reload.used_hugepages_1g).to eq(4)
+        expect(vh.used_cores).to eq(2)
+      end
+
+      it "keeps booking memory by vCPU count for dedicated slices" do
+        vm = create_vm(memory_gib: 6)
+        al = Al::Allocation.best_allocation(create_req(vm, vol, use_slices: true))
+        al.update(vm)
+
+        expect(vm.reload.vm_host_slice.total_memory_gib).to eq(8)
+      end
+
+      it "prefilter admits a slice short on memory when the host has hugepages for the growth" do
+        full_memory_slice
+        # No room for a new slice: every core is used
+        vh.update(used_cores: 4)
+
+        candidates = Al::Allocation.candidate_hosts(burstable_req(burstable_vm))
+        expect(candidates.size).to eq(1)
+        expect(candidates[0][:slice_cpu_available]).to eq(150)
+        expect(candidates[0][:slice_memory_available]).to eq(23)
+      end
+
+      it "prefilter rejects a slice short on memory when the host lacks hugepages for the growth" do
+        full_memory_slice
+        vh.update(used_cores: 4, used_hugepages_1g: 26)
+
+        expect(Al::Allocation.candidate_hosts(burstable_req(burstable_vm))).to be_empty
+      end
+
+      it "grows a reused slice and the host hugepages by the difference" do
+        slice = full_memory_slice
+        vm = burstable_vm
+        req = burstable_req(vm)
+        candidates = Al::Allocation.candidate_hosts(req)
+        expect(candidates.size).to eq(1)
+        al = Al::Allocation.new(candidates[0], req)
+        expect(al.is_valid).to be(true)
+
+        al.update(vm)
+
+        expect(vm.reload.vm_host_slice_id).to eq(slice.id)
+        slice.reload
+        expect(slice.total_memory_gib).to eq(4)
+        expect(slice.used_memory_gib).to eq(4)
+        expect(slice.used_cpu_percent).to eq(100)
+        vh.reload
+        expect(vh.used_hugepages_1g).to eq(6)
+        expect(vh.used_cores).to eq(2)
+      end
+
+      it "reuses a slice with room without growing it" do
+        slice = full_memory_slice
+        slice.update(total_memory_gib: 4)
+        vh.update(used_hugepages_1g: 6)
+        vm = burstable_vm
+        Al::Allocation.best_allocation(burstable_req(vm)).update(vm)
+
+        expect(vm.reload.vm_host_slice_id).to eq(slice.id)
+        expect(slice.reload.total_memory_gib).to eq(4)
+        expect(slice.used_memory_gib).to eq(4)
+        expect(vh.reload.used_hugepages_1g).to eq(6)
+      end
+
+      it "prefers the reusable slice that needs the least growth" do
+        full_memory_slice
+        roomy = Prog::Vm::VmHostSliceNexus.assemble_with_host("sl2", vh, family: "burstable", allowed_cpus: (4..5), memory_gib: 4, is_shared: true).subject
+        roomy.update(used_cpu_percent: 150, used_memory_gib: 2, enabled: true)
+        vh.update(used_cores: 3, used_hugepages_1g: 8)
+
+        vm = burstable_vm
+        Al::Allocation.best_allocation(burstable_req(vm)).update(vm)
+        expect(vm.reload.vm_host_slice_id).to eq(roomy.id)
+      end
+
+      it "is_valid rejects a reused slice when the host lacks hugepages for the growth" do
+        full_memory_slice
+        req = burstable_req(burstable_vm)
+        candidate = Al::Allocation.candidate_hosts(req).first
+        candidate[:used_hugepages_1g] = 26
+
+        expect(Al::Allocation.new(candidate, req).is_valid).to be(false)
+      end
+
+      it "raises NoSpaceLeft when a concurrent allocation takes the hugepages needed to grow" do
+        slice = full_memory_slice
+        vm = burstable_vm
+        al = Al::Allocation.best_allocation(burstable_req(vm))
+        expect(al).not_to be_nil
+
+        # A concurrent allocation takes the remaining hugepages
+        vh.update(used_hugepages_1g: 27)
+
+        expect { al.update(vm) }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /hugepages_allocation_limit/)
+        expect(vm.reload.vm_host_slice_id).to be_nil
+        expect(vm.vm_host_id).to be_nil
+        slice.reload
+        expect(slice.total_memory_gib).to eq(2)
+        expect(slice.used_memory_gib).to eq(2)
+        expect(vh.reload.used_hugepages_1g).to eq(27)
+      end
+
+      it "returns the grown total to the host when the empty slice is destroyed" do
+        slice = full_memory_slice
+        vm = burstable_vm
+        Al::Allocation.best_allocation(burstable_req(vm)).update(vm)
+        expect(slice.reload.total_memory_gib).to eq(4)
+        expect(vh.reload.used_hugepages_1g).to eq(6)
+
+        # Both VMs released, as Prog::Vm::Metal::Nexus#destroy does
+        slice.update(used_cpu_percent: 0, used_memory_gib: 0, enabled: false)
+        Vm.where(vm_host_slice_id: slice.id).update(vm_host_slice_id: nil)
+
+        nx = Prog::Vm::VmHostSliceNexus.new(slice.strand)
+        expect(nx.host.sshable).to receive(:_cmd).with("sudo host/bin/setup-slice delete sl1.slice")
+        expect { nx.destroy }.to exit({"msg" => "vm_host_slice destroyed"})
+
+        vh.reload
+        expect(vh.used_hugepages_1g).to eq(2)
+        expect(vh.used_cores).to eq(1)
+      end
     end
 
     it "memory_gib_for_vcpus handles standard family" do
