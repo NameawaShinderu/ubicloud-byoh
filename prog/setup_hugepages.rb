@@ -61,6 +61,14 @@ class Prog::SetupHugepages < Prog::Base
       hugepage_cnt = available_limit
     end
 
+    # verify_hugepages fails a slice host below this after the reboot; fail
+    # now, before changing the boot parameters and rebooting for nothing.
+    usable_hugepages = hugepage_cnt - vm_host.spdk_installations.sum(&:hugepages)
+    min_slice_hugepages = vm_host.min_slice_hugepages
+    if vm_host.accepts_slices && usable_hugepages < min_slice_hugepages
+      fail "Only #{usable_hugepages} usable 1G hugepages; a host that runs dedicated slices needs at least #{min_slice_hugepages}"
+    end
+
     sshable.cmd(STRIP_GRUB_TOKENS)
     sshable.cmd("sudo mkdir -p /etc/default/grub.d")
     sshable.write_file(GRUB_DROP_IN, <<~CFG)

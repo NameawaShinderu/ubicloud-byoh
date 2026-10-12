@@ -112,6 +112,23 @@ RSpec.describe Prog::SetupHugepages do
       expect { sh.start }.to raise_error RuntimeError, "/etc/default/grub or update-grub is missing; the host must boot with GRUB"
     end
 
+    it "fails before changing GRUB when a slice host would get too few hugepages" do
+      vm_host.update(total_mem_gib: 16, accepts_slices: true)
+      SpdkInstallation.create(vm_host_id: vm_host.id, version: "v1", allocation_weight: 100, hugepages: 4)
+      expect_prerequisites
+      expect(sh.sshable).to receive(:_cmd).with("cat /proc/meminfo").and_return("MemAvailable: 16252928 kB\n")
+      expect(sh.sshable).not_to receive(:_cmd).with(described_class::STRIP_GRUB_TOKENS)
+      expect { sh.start }.to raise_error RuntimeError, "Only 6 usable 1G hugepages; a host that runs dedicated slices needs at least 8"
+    end
+
+    it "accepts a slice host with enough hugepages for the smallest slice" do
+      vm_host.update(total_mem_gib: 14, accepts_slices: true)
+      expect_prerequisites
+      expect(sh.sshable).to receive(:_cmd).with("cat /proc/meminfo").and_return("MemAvailable: 14155776 kB\n")
+      expect_grub_update(8)
+      expect { sh.start }.to exit({"msg" => "hugepages installed"})
+    end
+
     it "fails if available memory couldn't be extracted" do
       vm_host.update(total_mem_gib: 128)
       expect_prerequisites
