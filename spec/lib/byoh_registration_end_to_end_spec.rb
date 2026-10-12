@@ -166,4 +166,11 @@ RSpec.describe ByohRegistration, "end_to_end" do
         .to raise_error(Hosting::CapabilityMissing, /does not support automated reimage/)
     end
   end
+
+  describe "a bare IPv4 routed network" do
+    it "registers it as a /32 pool" do
+      strand = described_class.new(main_ip: "203.0.113.88", routed_networks: ["198.51.100.5"]).register!
+      expect(VmHost[strand.id].assigned_subnets.map { it.cidr.to_s }.sort).to eq(["198.51.100.5/32", "203.0.113.88/32"])
+    end
+  end
 end

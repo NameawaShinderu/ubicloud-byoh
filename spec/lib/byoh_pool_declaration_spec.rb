@@ -51,7 +51,14 @@ RSpec.describe ByohPoolDeclaration do
       expect(parse("10.1.0.0/29,exposure=nat,external=10.1.0.1:8.8.4.4")).to have_attributes(exposure: "nat", exposure_defaulted: false)
     end
 
-    it "accepts the legacy keys older registrations stored" do
+    it "reads a bare IPv4 address as a /32 only in a stored entry" do
+      expect(parse({"cidr" => "203.0.113.5"}, legacy: true)).to have_attributes(exposure: "public")
+      expect(parse("203.0.113.5", legacy: true).cidr.to_s).to eq "203.0.113.5/32"
+      expect(parse_error("203.0.113.5")).to eq "\"203.0.113.5\" is not a CIDR (address/prefix, no host bits)"
+      expect { parse("fd00::1", legacy: true) }.to raise_error(described_class::ValidationError, "\"fd00::1\" is not a CIDR (address/prefix, no host bits)")
+    end
+
+        it "accepts the legacy keys older registrations stored" do
       expect(parse({"cidr" => "8.8.8.0/29", "source_host_ip" => "1.1.1.1", "is_failover" => false}).cidr.to_s).to eq "8.8.8.0/29"
     end
 

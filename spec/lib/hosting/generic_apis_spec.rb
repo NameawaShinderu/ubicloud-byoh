@@ -92,6 +92,11 @@ RSpec.describe Hosting::GenericApis do
         reserved_ips: %w[10.98.1.0 10.98.1.1], external_ips: {"10.98.1.2" => "8.8.8.2", "10.98.1.3" => "8.8.8.3"})
     end
 
+    it "reads a stored bare IPv4 address as a /32, as registration accepted it" do
+      ips = with_config(routed_networks: [{"cidr" => "198.51.100.7"}, "198.51.100.9"]).pull_ips
+      expect(ips.map(&:ip_address)).to eq(["203.0.113.42/32", "198.51.100.7/32", "198.51.100.9/32"])
+    end
+
     it "returns only the management /32 without a config" do
       host_provider.update(config: nil)
       expect(described_class.new(host_provider.reload).pull_ips.map(&:ip_address)).to eq(["203.0.113.42/32"])

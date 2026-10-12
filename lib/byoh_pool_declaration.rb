@@ -218,7 +218,7 @@ class ByohPoolDeclaration
   end
 
   def self.build_entry(hash, legacy:)
-    cidr = parse_cidr(hash["cidr"]) or
+    cidr = parse_cidr(legacy ? legacy_cidr(hash["cidr"]) : hash["cidr"]) or
       raise ValidationError, "#{hash["cidr"].inspect} is not a CIDR (address/prefix, no host bits)"
     v4 = cidr.is_a?(NetAddr::IPv4Net)
 
@@ -349,6 +349,12 @@ class ByohPoolDeclaration
     ByohNetworkProfile.parse_cidr(value) if value.is_a?(String) && value.include?("/")
   end
 
+  # Registration has always stored a bare IPv4 address as given, and
+  # Postgres reads it as a /32, so a stored entry keeps that meaning.
+  def self.legacy_cidr(value)
+    parse_ipv4(value) ? "#{value}/32" : value
+  end
+
   def self.parse_ipv4(value)
     ip = ByohNetworkProfile.parse_ip(value) if value.is_a?(String)
     ip if ip.is_a?(NetAddr::IPv4)
@@ -427,6 +433,6 @@ class ByohPoolDeclaration
     errors
   end
 
-  private_class_method :parse_inline, :build_entry, :build_v4_entry, :build_v6_entry, :externals, :external_by_offset, :choice,
+  private_class_method :parse_inline, :build_entry, :legacy_cidr, :build_v4_entry, :build_v6_entry, :externals, :external_by_offset, :choice,
     :list_of_ips, :derive_ipv6_mode, :database_overlap_errors, :location_overlap_errors, :external_ip_errors
 end
