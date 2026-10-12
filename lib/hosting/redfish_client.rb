@@ -14,9 +14,7 @@ require "uri"
 #
 # Intentionally NOT implemented: session authentication (Basic is fine
 # for one-shot commands), BIOS attribute manipulation, virtual media
-# mounting, full boot-source override (see #set_next_boot_pxe for the
-# narrow case we do support — only for future automated reimage, which
-# Ubicloud does not currently drive for BYOH hosts).
+# mounting and boot-source override.
 class Hosting::RedfishClient
   class Error < StandardError; end
 
@@ -34,20 +32,6 @@ class Hosting::RedfishClient
     sys_id = @system_id || discover_system_id
     target = reset_action_target(sys_id)
     http_post(target, {"ResetType" => reset_type})
-    nil
-  end
-
-  # Not currently exercised by any caller — present so that when/if
-  # Ubicloud stands up PXE infrastructure for BYOH hosts, the hook is
-  # already there. Kept deliberately minimal.
-  def set_next_boot_pxe
-    sys_id = @system_id || discover_system_id
-    http_patch("/redfish/v1/Systems/#{sys_id}", {
-      "Boot" => {
-        "BootSourceOverrideEnabled" => "Once",
-        "BootSourceOverrideTarget" => "Pxe"
-      }
-    })
     nil
   end
 
@@ -76,20 +60,19 @@ class Hosting::RedfishClient
       user: @username,
       password: @password,
       ssl_verify_peer: @verify_ssl,
+      connect_timeout: 10,
+      read_timeout: 60,
+      write_timeout: 60,
       headers: {"Content-Type" => "application/json", "Accept" => "application/json"})
   end
 
   def http_get(path)
-    resp = connection.get(path: path, expects: 200)
+    resp = connection.get(path:, expects: 200)
     JSON.parse(resp.body)
   end
 
   def http_post(url_or_path, body)
     connection.post(path: extract_path(url_or_path), body: JSON.generate(body), expects: [200, 202, 204])
-  end
-
-  def http_patch(path, body)
-    connection.patch(path: path, body: JSON.generate(body), expects: [200, 202, 204])
   end
 
   # Redfish action targets are usually absolute-path but some BMCs return

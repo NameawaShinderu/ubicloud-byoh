@@ -1,12 +1,11 @@
 # frozen_string_literal: true
 
 require "excon"
-require_relative "base"
 
 class Hosting::Apis
   DELEGATING_PROVIDERS = [
     HostProvider::HETZNER_PROVIDER_NAME,
-    HostProvider::GENERIC_PROVIDER_NAME
+    HostProvider::GENERIC_PROVIDER_NAME,
   ].freeze
 
   def self.pull_ips(vm_host)

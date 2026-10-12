@@ -8,7 +8,7 @@ RSpec.describe Hosting::RedfishClient do
 
   let(:single_system_body) {
     {
-      "Members" => [{"@odata.id" => "/redfish/v1/Systems/1"}]
+      "Members" => [{"@odata.id" => "/redfish/v1/Systems/1"}],
     }.to_json
   }
 
@@ -18,9 +18,9 @@ RSpec.describe Hosting::RedfishClient do
       "Actions" => {
         "#ComputerSystem.Reset" => {
           "target" => "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
-          "ResetType@Redfish.AllowableValues" => ["On", "ForceOff", "ForceRestart", "PowerCycle"]
-        }
-      }
+          "ResetType@Redfish.AllowableValues" => ["On", "ForceOff", "ForceRestart", "PowerCycle"],
+        },
+      },
     }.to_json
   }
 
@@ -33,7 +33,7 @@ RSpec.describe Hosting::RedfishClient do
         ->(req) {
           expect(JSON.parse(req[:body])).to eq("ResetType" => "ForceRestart")
           {status: 204, body: ""}
-        }
+        },
       )
 
       expect(client.power_reset).to be_nil
@@ -47,7 +47,7 @@ RSpec.describe Hosting::RedfishClient do
         ->(req) {
           expect(JSON.parse(req[:body])).to eq("ResetType" => "PowerCycle")
           {status: 202, body: ""}
-        }
+        },
       )
 
       expect(client.power_reset(reset_type: "PowerCycle")).to be_nil
@@ -58,7 +58,7 @@ RSpec.describe Hosting::RedfishClient do
       Excon.stub({path: "/redfish/v1/Systems/1", method: :get}, {status: 200, body: system_detail_body})
       Excon.stub(
         {path: "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", method: :post},
-        {status: 204, body: ""}
+        {status: 204, body: ""},
       )
 
       expect(client_with_id.power_reset).to be_nil
@@ -68,15 +68,15 @@ RSpec.describe Hosting::RedfishClient do
       absolute_body = {
         "Actions" => {
           "#ComputerSystem.Reset" => {
-            "target" => "https://bmc.example/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
-          }
-        }
+            "target" => "https://bmc.example/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+          },
+        },
       }.to_json
       Excon.stub({path: "/redfish/v1/Systems", method: :get}, {status: 200, body: single_system_body})
       Excon.stub({path: "/redfish/v1/Systems/1", method: :get}, {status: 200, body: absolute_body})
       Excon.stub(
         {path: "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset", method: :post},
-        {status: 204, body: ""}
+        {status: 204, body: ""},
       )
 
       expect(client.power_reset).to be_nil
@@ -98,8 +98,8 @@ RSpec.describe Hosting::RedfishClient do
       multi_body = {
         "Members" => [
           {"@odata.id" => "/redfish/v1/Systems/1"},
-          {"@odata.id" => "/redfish/v1/Systems/2"}
-        ]
+          {"@odata.id" => "/redfish/v1/Systems/2"},
+        ],
       }.to_json
       Excon.stub({path: "/redfish/v1/Systems", method: :get}, {status: 200, body: multi_body})
       expect { client.discover_system_id }.to raise_error(described_class::Error, /multiple systems/)
@@ -114,22 +114,11 @@ RSpec.describe Hosting::RedfishClient do
     end
   end
 
-  describe "#set_next_boot_pxe" do
-    it "PATCHes /Systems/{id} with a one-shot PXE override" do
+  describe "connection" do
+    it "bounds every BMC request with timeouts so a dead BMC cannot hang a strand" do
+      expect(Excon).to receive(:new).with(endpoint, hash_including(connect_timeout: 10, read_timeout: 60, write_timeout: 60)).and_call_original
       Excon.stub({path: "/redfish/v1/Systems", method: :get}, {status: 200, body: single_system_body})
-      Excon.stub(
-        {path: "/redfish/v1/Systems/1", method: :patch},
-        ->(req) {
-          parsed = JSON.parse(req[:body])
-          expect(parsed["Boot"]).to eq(
-            "BootSourceOverrideEnabled" => "Once",
-            "BootSourceOverrideTarget" => "Pxe"
-          )
-          {status: 204, body: ""}
-        }
-      )
-
-      expect(client.set_next_boot_pxe).to be_nil
+      expect(client.discover_system_id).to eq("1")
     end
   end
 

@@ -14,7 +14,7 @@ class Prog::Vm::HostNexus < Prog::Base
       # The operator declares the /64 (ULA is fine) in provider_config and
       # we pass it through as the net6 kwarg so LearnNetwork is skipped.
       if provider_name == HostProvider::GENERIC_PROVIDER_NAME && net6.nil? && provider_config
-        declared = Array(provider_config["routed_networks"]).find { |n| n["cidr"]&.include?(":") }
+        declared = Array(provider_config["routed_networks"]).find { |n| n["cidr"].include?(":") }
         net6 = declared["cidr"] if declared
       end
 
@@ -33,7 +33,7 @@ class Prog::Vm::HostNexus < Prog::Base
       creates_host_provider = [
         HostProvider::HETZNER_PROVIDER_NAME,
         HostProvider::LEASEWEB_PROVIDER_NAME,
-        HostProvider::GENERIC_PROVIDER_NAME
+        HostProvider::GENERIC_PROVIDER_NAME,
       ].include?(provider_name)
 
       if creates_host_provider

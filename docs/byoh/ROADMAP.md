@@ -765,7 +765,7 @@ After M1, stay close: merge or rebase upstream at least once per milestone, befo
 |---|---|
 | `lib/hosting/apis.rb` (modify/delete) | Move `GenericApis` to `Hosting::ProviderApis.for`; `provider_name` without `-`; methods without `server_id`; `IpInfo` with `host_only?`, `host_connectivity?` |
 | `prog/vm/host_nexus.rb` + spec | Keep our kwargs and default; keep upstream `install_os` (false for generic); `[HETZNER, *LEASEWEB_PROVIDER_NAMES, GENERIC]`; watch `effective_server_identifier` defined inside our hunk |
-| `config.rb`, `.gitignore`, `package-lock.json`, `cache/schema.cache` | Drop our `generic_*` config; take theirs; regenerate the cache |
+| `config.rb`, `.gitignore`, `package-lock.json`, `cache/schema.cache` | Our `generic_*` config is already gone; take theirs; regenerate the cache |
 | Fork migration `20260412000000` | Rename to an 8-digit date (fix `schema_migrations` on existing DBs, including live) or set `validate_migration_dates=false` |
 | New `check_ip_reachability` label | Generic skip policy before any BYOH host is re-prepped (contract C5; retry-forever) |
 | `verify_hugepages` MemAvailable ≥ 2 GiB | Hurts low-tier Proxmox; profile-aware in M5 |

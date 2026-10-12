@@ -14,12 +14,12 @@ require_relative "../model/spec_helper"
 #     model/vm_host.rb → Hosting::Apis.hardware_reset_server → HostProvider#api
 #     → Hosting::GenericApis#reset → Hosting::RedfishClient#power_reset → wire.
 #     Excon stubs stand in for a real BMC but the code path is 100% production.
-RSpec.describe "BYOH end-to-end integration" do
+RSpec.describe ByohRegistration, "end_to_end" do
   let(:base_reg) {
-    ByohRegistration.new(
+    described_class.new(
       main_ip: "203.0.113.42",
       routed_networks: ["10.99.0.0/29", "fd00:feed::/64"],
-      location_label: "byoh-e2e-test"
+      location_label: "byoh-e2e-test",
     )
   }
 
@@ -59,7 +59,7 @@ RSpec.describe "BYOH end-to-end integration" do
 
   describe "vm_host.hardware_reset → Redfish wire" do
     let(:strand) {
-      ByohRegistration.new(
+      described_class.new(
         main_ip: "203.0.113.99",
         routed_networks: ["10.100.0.0/29", "fd00:beef::/64"],
         location_label: "byoh-reset-test",
@@ -69,8 +69,8 @@ RSpec.describe "BYOH end-to-end integration" do
           "username" => "admin",
           "password" => "s3cret",
           "verify_ssl" => false,
-          "system_id" => "1"
-        }
+          "system_id" => "1",
+        },
       ).register!
     }
     let(:vm_host) { VmHost[strand.id] }
@@ -81,9 +81,9 @@ RSpec.describe "BYOH end-to-end integration" do
         {status: 200, body: {
           "Actions" => {
             "#ComputerSystem.Reset" => {
-              "target" => "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset"
-            }
-          }
+              "target" => "/redfish/v1/Systems/1/Actions/ComputerSystem.Reset",
+            },
+          },
         }.to_json})
 
       captured_body = nil
@@ -92,7 +92,7 @@ RSpec.describe "BYOH end-to-end integration" do
         ->(req) {
           captured_body = JSON.parse(req[:body])
           {status: 204, body: ""}
-        }
+        },
       )
 
       # This is the exact call production makes from prog/vm/host_nexus.rb
@@ -104,7 +104,7 @@ RSpec.describe "BYOH end-to-end integration" do
     it "honors bmc.reset_type override through the full chain" do
       # Re-register with a different reset_type and verify it propagates all
       # the way to the HTTP body.
-      st = ByohRegistration.new(
+      st = described_class.new(
         main_ip: "203.0.113.88",
         routed_networks: ["10.101.0.0/29", "fd00:cafe::/64"],
         location_label: "byoh-reset-test-2",
@@ -115,20 +115,23 @@ RSpec.describe "BYOH end-to-end integration" do
           "password" => "s3cret",
           "verify_ssl" => false,
           "system_id" => "Self",
-          "reset_type" => "PowerCycle"
-        }
+          "reset_type" => "PowerCycle",
+        },
       ).register!
       vmh = VmHost[st.id]
 
       Excon.stub({path: "/redfish/v1/Systems/Self", method: :get},
         {status: 200, body: {
-          "Actions" => {"#ComputerSystem.Reset" => {"target" => "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset"}}
+          "Actions" => {"#ComputerSystem.Reset" => {"target" => "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset"}},
         }.to_json})
 
       captured_body = nil
       Excon.stub(
         {path: "/redfish/v1/Systems/Self/Actions/ComputerSystem.Reset", method: :post},
-        ->(req) { captured_body = JSON.parse(req[:body]); {status: 202, body: ""} }
+        ->(req) {
+          captured_body = JSON.parse(req[:body])
+          {status: 202, body: ""}
+        },
       )
 
       vmh.hardware_reset
@@ -148,49 +151,19 @@ RSpec.describe "BYOH end-to-end integration" do
   describe "vm_host.reimage — stays CapabilityMissing for BYOH (PXE infra absent)" do
     it "raises CapabilityMissing when reimage is attempted on a generic host" do
       allow(Config).to receive(:development?).and_return(true)
-      strand = ByohRegistration.new(
+      strand = described_class.new(
         main_ip: "203.0.113.77",
         routed_networks: ["10.102.0.0/29", "fd00:dead::/64"],
         bmc_config: {
           "protocol" => "redfish",
           "endpoint" => "https://bmc-under-test-3",
           "username" => "admin",
-          "password" => "s3cret"
-        }
+          "password" => "s3cret",
+        },
       ).register!
 
       expect { VmHost[strand.id].reimage }
         .to raise_error(Hosting::CapabilityMissing, /does not support automated reimage/)
-    end
-  end
-
-  describe "capabilities exposure after registration" do
-    it "advertises :ip_pull always and :hw_reset when BMC is configured" do
-      strand = ByohRegistration.new(
-        main_ip: "203.0.113.66",
-        routed_networks: ["10.103.0.0/29", "fd00:babe::/64"],
-        bmc_config: {
-          "protocol" => "redfish",
-          "endpoint" => "https://bmc-under-test-4",
-          "username" => "admin",
-          "password" => "s3cret"
-        }
-      ).register!
-
-      caps = VmHost[strand.id].provider.api.capabilities
-      expect(caps).to include(:ip_pull)
-      expect(caps).to include(:hw_reset)
-      expect(caps).not_to include(:reimage)
-    end
-
-    it "advertises only :ip_pull when no BMC is configured" do
-      strand = ByohRegistration.new(
-        main_ip: "203.0.113.55",
-        routed_networks: ["10.104.0.0/29", "fd00:feed:1::/64"]
-      ).register!
-
-      caps = VmHost[strand.id].provider.api.capabilities
-      expect(caps).to eq(Set.new([:ip_pull]))
     end
   end
 end

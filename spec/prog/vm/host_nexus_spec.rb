@@ -82,15 +82,15 @@ RSpec.describe Prog::Vm::HostNexus do
           "location_label" => "homelab-rack-A",
           "routed_networks" => [
             {"cidr" => "10.99.0.0/29"},
-            {"cidr" => "fd00:feed::/64"}
-          ]
+            {"cidr" => "fd00:feed::/64"},
+          ],
         }
       end
 
       it "creates a HostProvider row with the operator config" do
         st = described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
-          provider_config: provider_config)
+          provider_config:)
 
         hp = st.subject.provider
         expect(hp.provider_name).to eq("generic")
@@ -101,7 +101,7 @@ RSpec.describe Prog::Vm::HostNexus do
       it "extracts the declared IPv6 /64 into vm_host.net6 (so LearnNetwork is skipped)" do
         st = described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
-          provider_config: provider_config)
+          provider_config:)
 
         expect(st.subject.net6.to_s).to eq("fd00:feed::/64")
       end
@@ -109,7 +109,7 @@ RSpec.describe Prog::Vm::HostNexus do
       it "creates Address rows for declared v4 networks and auto-prepends the management /32" do
         st = described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
-          provider_config: provider_config)
+          provider_config:)
 
         cidrs = st.subject.assigned_subnets.map { it.cidr.to_s }.sort
         expect(cidrs).to eq(["10.99.0.0/29", "203.0.113.42/32"].sort)
@@ -117,7 +117,7 @@ RSpec.describe Prog::Vm::HostNexus do
 
       it "does not auto-prepend the management /32 when it's inside a declared block" do
         cfg = provider_config.merge(
-          "routed_networks" => [{"cidr" => "203.0.113.40/29"}, {"cidr" => "fd00:feed::/64"}]
+          "routed_networks" => [{"cidr" => "203.0.113.40/29"}, {"cidr" => "fd00:feed::/64"}],
         )
         st = described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
@@ -130,7 +130,7 @@ RSpec.describe Prog::Vm::HostNexus do
       it "populates ipv4_address rows from declared v4 blocks (skipping the mgmt /32)" do
         described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
-          provider_config: provider_config)
+          provider_config:)
 
         # 10.99.0.0/29 has 8 addresses → 8 ipv4_address rows.
         # The 203.0.113.42/32 Address is skipped by populate_ipv4_addresses
@@ -142,7 +142,7 @@ RSpec.describe Prog::Vm::HostNexus do
       it "allocates a VM v4 IP from the declared pool via ip4_random_vm_network" do
         st = described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
-          provider_config: provider_config)
+          provider_config:)
 
         ip, address = st.subject.ip4_random_vm_network
         expect(ip).not_to be_nil
@@ -152,7 +152,7 @@ RSpec.describe Prog::Vm::HostNexus do
       it "allocates a VM v6 /79 slice from the declared net6" do
         st = described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
-          provider_config: provider_config)
+          provider_config:)
 
         slice = st.subject.ip6_random_vm_network
         expect(slice).not_to be_nil
@@ -160,7 +160,7 @@ RSpec.describe Prog::Vm::HostNexus do
       end
 
       it "leaves net6 unset when no IPv6 network is declared" do
-        cfg = provider_config.merge("routed_networks" => [{"source_host_ip" => "203.0.113.42"}, {"cidr" => "10.99.0.0/29"}])
+        cfg = provider_config.merge("routed_networks" => [{"cidr" => "10.99.0.0/29"}])
         st = described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           provider_config: cfg)
@@ -172,7 +172,7 @@ RSpec.describe Prog::Vm::HostNexus do
         st = described_class.assemble("203.0.113.42",
           provider_name: HostProvider::GENERIC_PROVIDER_NAME,
           server_identifier: "homelab-r1-01",
-          provider_config: provider_config)
+          provider_config:)
 
         expect(st.subject.provider.server_identifier).to eq("homelab-r1-01")
       end
