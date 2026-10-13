@@ -61,6 +61,7 @@ Take all of these before L1, and again before any rollback:
 | `GATE_IPV6_MODE` | `gua` or `ula`, checked by G4; unset means not checked |
 | `GATE_EXPECT_MONITOR` | `1` to require `bin/monitor` in G1 (default `0`, §1.2) |
 | `GATE_VM_A_EXPOSURE` | `nat` (default) or `public`: the pool exposure G6 expects for VM-A |
+| `GATE_EXTERNAL_SSH_VIA` | `[user@]host` outside the site that G6 jumps through (`ssh -J`) to reach VM-A's external IP. Default: connect directly from the control plane. Set it when a router 1:1 NATs the external IP without NAT reflection and the control plane is inside the site. UNVERIFIED: never run. |
 | `GATE_HOST_KEY` | root SSH key for the data plane (default `~/.ssh/byoh_data`) |
 | `GATE_VM_KEY` | private key whose public half the gate VMs were created with |
 | `GATE_VM_A`, `GATE_VM_B`, `GATE_VM_C`, `GATE_VM_D` | the VMs of G6, G7, G8 and G10 |
@@ -143,7 +144,7 @@ The gate itself does not depend on the platform. Only G0, G11 and G17 use AWS: t
 | G0 | Create the machines and do the site network work by hand ([SETUP.md](SETUP.md), [SETUP_PROXMOX.md](SETUP_PROXMOX.md)) |
 | G1 | `GATE_EXPECT_MONITOR=0` unless PLATFORMS.md says the monitor suits the hosts' disks |
 | G4 | Set `GATE_IPV6_MODE` to the mode you registered, or leave it unset |
-| G6 | `GATE_VM_A_EXPOSURE=public` for `routed`/`public` pools. With `nat` behind a router doing 1:1 NAT, VM-A's external IP must be reachable from the control plane. |
+| G6 | `GATE_VM_A_EXPOSURE=public` for `routed`/`public` pools. With `nat` behind a router doing 1:1 NAT, the SSH to VM-A's external IP must start outside the site when NAT reflection is off: set `GATE_EXTERNAL_SSH_VIA` to an outside host, or expect that one line to FAIL. |
 | G9b | `GATE_CTRL_PRIV`, `GATE_UNDERLAY_PROBE` (another site host with SSH open) and `GATE_SMTP_PROBE` as on AWS |
 | G11 | Change the router's 1:1 NAT first, then `bin/byoh-pool remap` |
 | G17 | Remove the machines |

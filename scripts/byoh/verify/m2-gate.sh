@@ -33,6 +33,10 @@
 #   GATE_VM_KEY          SSH key of the gate VMs' "ubi" user
 #   GATE_VM_A            VM with an internet address (G6, G9; G11 needs a nat one)
 #   GATE_VM_A_EXPOSURE   exposure of VM-A's pool, nat or public (default nat)
+#   GATE_EXTERNAL_SSH_VIA  [user@]host outside the site to jump through for G6's
+#                        SSH to VM-A's external IP (default: connect directly).
+#                        Needed when a router 1:1 NATs the external IP without
+#                        NAT reflection and the control plane is inside the site.
 #   GATE_VM_B            VM without IPv4 (G7, G9, G9b, G12)
 #   GATE_VM_C            VM created with ip4_exposure internal (G8, G9)
 #   GATE_VM_D            the fourth internet VM, which must wait (G10)
@@ -214,10 +218,15 @@ g6() {
   gate_checks vm --vm "$GATE_VM_A" --expect "$GATE_VM_A_EXPOSURE"
   local public
   public=$(vm_field "$GATE_VM_A" public_ip4)
-  if ssh -n "${SSH_OPTS[@]}" -i "$GATE_VM_KEY" "ubi@$public" true; then
-    pass "SSH to $GATE_VM_A at its external IP $public"
+  local jump=() via=""
+  if [[ -n ${GATE_EXTERNAL_SSH_VIA:-} ]]; then
+    jump=(-J "$GATE_EXTERNAL_SSH_VIA")
+    via=" through $GATE_EXTERNAL_SSH_VIA"
+  fi
+  if ssh -n "${SSH_OPTS[@]}" "${jump[@]}" -i "$GATE_VM_KEY" "ubi@$public" true; then
+    pass "SSH to $GATE_VM_A at its external IP $public$via"
   else
-    fail "SSH to $GATE_VM_A at its external IP $public"
+    fail "SSH to $GATE_VM_A at its external IP $public$via"
   fi
   info "check that the UI overview and 'ubi vm show' also show $public"
 }
