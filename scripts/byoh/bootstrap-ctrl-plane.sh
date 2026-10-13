@@ -33,6 +33,11 @@
 #   UBI_BILLING_RATES_DIR default: $HOME/ubicloud-billing-rates.d (where
 #                       bin/byoh-location writes BYOH billing rates; set
 #                       as BILLING_RATES_EXTRA_DIR in .env.rb)
+#   UBI_BASE_URL        default: http://<first address of hostname -I>:3000
+#                       (written as BASE_URL into a new .env.rb; Rodauth
+#                       builds the links in account emails from it, and the
+#                       upstream default http://localhost:9292 is unusable
+#                       from a browser. Set it to the URL users open.)
 #
 set -euo pipefail
 
@@ -45,6 +50,7 @@ UBI_RACK_ENV="${UBI_RACK_ENV:-development}"
 UBI_START_SERVICES="${UBI_START_SERVICES:-1}"
 UBI_START_MONITOR="${UBI_START_MONITOR:-0}"
 UBI_BILLING_RATES_DIR="${UBI_BILLING_RATES_DIR:-$HOME/ubicloud-billing-rates.d}"
+UBI_BASE_URL="${UBI_BASE_URL:-http://$(hostname -I 2>/dev/null | awk '{print $1}'):3000}"
 
 MARKERS_DIR="$HOME/.ubi-bootstrap"
 mkdir -p "$MARKERS_DIR"
@@ -190,6 +196,10 @@ if [ -f .env.rb ]; then
     echo "  WARNING: .env.rb does not set BILLING_RATES_EXTRA_DIR, so BYOH locations have no billing rates."
     echo "  Add: ENV[\"BILLING_RATES_EXTRA_DIR\"] ||= \"$UBI_BILLING_RATES_DIR\""
   fi
+  if ! grep -q BASE_URL .env.rb; then
+    echo "  WARNING: .env.rb does not set BASE_URL, so account email links point at http://localhost:9292."
+    echo "  Add: ENV[\"BASE_URL\"] ||= \"$UBI_BASE_URL\""
+  fi
 else
   SESSION_SECRET=$(openssl rand -base64 64 | tr -d '\n')
   RUNTIME_SECRET=$(openssl rand -base64 64 | tr -d '\n')
@@ -206,6 +216,8 @@ ENV["CLOVER_RUNTIME_TOKEN_SECRET"] ||= "$RUNTIME_SECRET"
 # bin/byoh-location writes the billing rates of BYOH locations here; web,
 # respirate and monitor load them from it.
 ENV["BILLING_RATES_EXTRA_DIR"] ||= "$UBI_BILLING_RATES_DIR"
+# The URL users open; account email links are built from it.
+ENV["BASE_URL"] ||= "$UBI_BASE_URL"
 ENVRB
   chmod 600 .env.rb
   echo "  .env.rb created with random secrets (chmod 600)"

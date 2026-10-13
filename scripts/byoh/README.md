@@ -53,6 +53,7 @@ Environment variables you can override:
 - `UBI_START_SERVICES` — `1` to start puma + respirate in tmux after setup, `0` to skip (default: `1`)
 - `UBI_START_MONITOR` — `1` to also start `bin/monitor` in tmux (default: `0`; read `docs/byoh/PLATFORMS.md` first, as its health checks misjudge hosts without by-id disk links)
 - `UBI_BILLING_RATES_DIR` — where `bin/byoh-location` writes BYOH billing rates, written to `.env.rb` as `BILLING_RATES_EXTRA_DIR` (default: `$HOME/ubicloud-billing-rates.d`)
+- `UBI_BASE_URL` — the URL users open, written to a new `.env.rb` as `BASE_URL`; account email links use it (default: `http://<first address of hostname -I>:3000`)
 
 The script does not clone the repository: clone it first
 (`git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud`).
