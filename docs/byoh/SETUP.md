@@ -6,9 +6,9 @@ This is the full runbook for a BYOH deployment with the current (M2) code: a con
 |---|---|---|
 | AWS EC2 (nested virtualization or `.metal`) | Validated (ap-south-1, 2026-10-11 and 2026-10-13) | This page, §12 "AWS-specific (optional)" |
 | Proxmox VE (a VM as the data plane) | UNVERIFIED | [SETUP_PROXMOX.md](SETUP_PROXMOX.md) |
-| Rented bare metal, colo, homelab, GCP, Azure | UNVERIFIED | §13 "Other platforms" and NETWORKING §9 |
+| Rented bare metal, colo, homelab, GCP, Azure, other clouds | UNVERIFIED | §13 "Other platforms", [platforms/](platforms/README.md) and NETWORKING §9 |
 
-The shortest path is [QUICKSTART.md](QUICKSTART.md). The design is in [NETWORKING.md](NETWORKING.md); the platform matrix and host requirements are in [PLATFORMS.md](PLATFORMS.md).
+The shortest path is [QUICKSTART.md](QUICKSTART.md). Per-platform guides: [platforms/README.md](platforms/README.md). Problems: [TROUBLESHOOTING.md](TROUBLESHOOTING.md). The design is in [NETWORKING.md](NETWORKING.md); the platform matrix and host requirements are in [PLATFORMS.md](PLATFORMS.md).
 
 The previous version of this page was an AWS-console walkthrough written before M2. It passed `--provider generic` (which aborts) and created no location. It is in git history if you need it.
 
@@ -34,7 +34,7 @@ The control plane and the data plane can be on different platforms. The only cou
 | Ubuntu 24.04 LTS, x86_64 | `lsb_release -rs` | Only 24.04 accepts VM slices |
 | KVM | `ls /dev/kvm` | Bare metal: enable VT-x/AMD-V. Guest: nested virtualization plus a CPU model that passes `vmx`/`svm` |
 | 1G hugepages | `grep -c pdpe1gb /proc/cpuinfo` > 0 | Guest: pass the host CPU model |
-| Memory in whole GiB | `sudo dmidecode -t memory \| grep Size:` shows `GB` | LearnMemory fails "unexpected dmidecode unit" |
+| Memory in whole GiB | `sudo dmidecode -t memory \| grep Size:` shows `GB` | On the published `byoh-driver` (17d383a9c), LearnMemory fails "unexpected dmidecode unit". `m2-network` (a0259a997) accepts kB/MB/GB/TB ([platforms/README.md](platforms/README.md) §3) |
 | Not a hybrid (P+E core) CPU, SMT on | `lscpu` | Every VM fails with `BUG` (PLATFORMS.md HW-6, HW-7) |
 | Outbound internet | `curl -sI https://cloud-images.ubuntu.com` | PrepHost and boot image downloads fail |
 | One uplink address only | `ip -br -4 addr` shows only the main IP | Pool addresses on the NIC steal VM traffic (C5) |
@@ -189,7 +189,7 @@ bundle exec bin/register-byoh-host \
   --yes
 ```
 
-Other options: `--routed-network CIDR[,key=value...]` (inline pools, repeatable), `--ipv6-mode gua|ula`, `--server-identifier`, a second `--default-boot-image ubuntu-jammy` (the default image for VMs that name none), and the Redfish BMC flags (`--bmc-endpoint`, `--bmc-user`, `--bmc-pass-env`, …). There is no `--provider` flag.
+Other options: `--routed-network CIDR[,key=value...]` (inline pools, repeatable), `--ipv6-mode gua|ula`, `--server-identifier`, a second `--default-boot-image ubuntu-jammy` (only if customers will pick it; the default image for VMs that name none is `ubuntu-noble`), and the Redfish BMC flags (`--bmc-endpoint`, `--bmc-user`, `--bmc-pass-env`, …). There is no `--provider` flag.
 
 Bring-up takes 15-25 minutes on bare metal and about 4 minutes on a nested-virtualization cloud VM. It **reboots the host once**. Watch it:
 
@@ -254,7 +254,7 @@ The VM user is `ubi`.
 | Upgrade the control plane | CLAUDE.md §8 and VERIFY.md §3.2 L1. A host registered before M1 needs the vhost-block-backend upgrade, or every new VM fails with "No capacity left". |
 | Hardware reset | Only with a BMC. Without one, admin "Hardware Reset" wedges the host strand. |
 
-Troubleshooting for all platforms is in CLAUDE.md §6 and SETUP_PROXMOX.md §10; the most common causes:
+Troubleshooting for all platforms is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md); the most common causes:
 
 | Symptom | Cause |
 |---|---|
@@ -286,15 +286,19 @@ The terraform flow, step by step, is in [QUICKSTART.md](QUICKSTART.md).
 
 ## 13. Other platforms
 
+Each platform has a guide in [platforms/](platforms/README.md), which also has a chooser table and the common six-step flow. Problems on every platform: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
 | Platform | delivery + exposure | Guide | Status |
 |---|---|---|---|
-| Proxmox VE guest, no public block | `onlink` + `internal` | [SETUP_PROXMOX.md](SETUP_PROXMOX.md) §6.2 | UNVERIFIED |
+| Proxmox VE guest, no public block | `onlink` + `internal` | [platforms/proxmox.md](platforms/proxmox.md), [SETUP_PROXMOX.md](SETUP_PROXMOX.md) §6.2 | UNVERIFIED |
 | Proxmox behind pfSense with extra public IPs | `onlink` + `nat` | [SETUP_PROXMOX.md](SETUP_PROXMOX.md) §6.3 | UNVERIFIED |
 | Proxmox, ISP block routed by the router | `routed` + `public` | [SETUP_PROXMOX.md](SETUP_PROXMOX.md) §6.4, NETWORKING §9.2 variant C | UNVERIFIED |
-| Homelab behind a consumer router | `onlink` + `internal`, or `routed` via a static route | NETWORKING §9.3 | UNVERIFIED |
-| Single IP or CGNAT, internet ingress needed | `routed` (WireGuard) + `public` | NETWORKING §9.4 | PLANNED |
-| Hetzner, OVH, Leaseweb | `routed` + `public` (vSwitch: `onlink`) | NETWORKING §9.5 | UNVERIFIED with BYOH |
-| Colo with BGP or static routes | `routed` + `public` | NETWORKING §9.6 | UNVERIFIED |
-| GCP | `routed` (protocol forwarding) + `public`, or `fabric` + `internal` | NETWORKING §9.7 | UNVERIFIED |
-| Azure | `fabric` + `nat` | NETWORKING §9.8 | UNVERIFIED |
-| AWS | `fabric` + `nat` | §12, NETWORKING §9.1 | Validated |
+| Other hypervisors (libvirt, ESXi, Hyper-V, XCP-ng) | as Proxmox | [platforms/proxmox.md](platforms/proxmox.md) "Other hypervisors" | UNVERIFIED |
+| Homelab or office behind a router | `onlink` + `internal`, `routed` via a static route, `onlink` + `nat` (1:1 NAT) | [platforms/own-hardware.md](platforms/own-hardware.md), NETWORKING §9.3 | UNVERIFIED |
+| Single IP or CGNAT, internet ingress needed | `routed` (WireGuard) + `public` | [platforms/own-hardware.md](platforms/own-hardware.md) §3.5 T1, NETWORKING §9.4 | PLANNED |
+| Hetzner, OVH, Leaseweb | `routed` + `public` (vSwitch: `onlink`) | [platforms/bare-metal-dedicated.md](platforms/bare-metal-dedicated.md), NETWORKING §9.5 | UNVERIFIED with BYOH |
+| Colo with BGP or static routes | `routed` + `public` | [platforms/own-hardware.md](platforms/own-hardware.md) §3.5 C1-C3, NETWORKING §9.6 | UNVERIFIED |
+| GCP | `routed` (protocol forwarding) + `public`, or `fabric` + `internal` | [platforms/gcp-azure.md](platforms/gcp-azure.md), NETWORKING §9.7 | UNVERIFIED |
+| Azure | `fabric` + `nat` | [platforms/gcp-azure.md](platforms/gcp-azure.md), NETWORKING §9.8 | UNVERIFIED |
+| OCI, Scaleway, Vultr, OVHcloud Public Cloud, DigitalOcean; VPS without KVM | `fabric` + `nat`, `routed` + `public`, or none | [platforms/other-clouds-vps.md](platforms/other-clouds-vps.md) | UNVERIFIED |
+| AWS | `fabric` + `nat` | [platforms/aws.md](platforms/aws.md), §12, NETWORKING §9.1 | Validated |

@@ -27,6 +27,8 @@ Anything marked UNVERIFIED was never executed.
 | `docs/byoh/PLATFORMS.md` | Platform compatibility, 54 verified portability findings (F1–F10), host preflight PF1–PF21 |
 | `docs/byoh/VERIFY.md` | M2 canary gate G0–G17 (`scripts/byoh/verify/m2-gate.sh`), live window L0–L4, rollback R1–R3, backup checklist |
 | `docs/byoh/POOL_OPERATIONS.md` | pools.yaml v2, `bin/byoh-pool`, billing `resource_name` rule, location egress keys |
+| `docs/byoh/platforms/` | Operator guides per platform (AWS, rented bare metal, own hardware/colo, Proxmox and other hypervisors, GCP/Azure, other clouds/VPS); `README.md` has the chooser table, the common 6-step flow and which branch carries which fix. Only AWS is tested |
+| `docs/byoh/TROUBLESHOOTING.md` | One Symptom/Cause/Fix catalogue by phase (install, bring-up labels, allocation, VM networking, DNS, billing, upgrades, monitor/BMC), with platform pointers |
 
 Product direction from the user:
 - production-grade
@@ -192,7 +194,7 @@ The file and class names are load-bearing: `"generic"` must resolve to `Hosting:
   - **enabled `storage_devices` rows with enough `available_storage_gib`** (INNER JOIN)
   - `accepts_slices` matches
 - **The allocator LEFT JOINs `available_ipv4`** and filters on it only when the VM asks for IPv4 (`scheduling/allocator.rb`). A host with no pool takes IPv6-only VMs, whose IPv4 egress goes through the host NAT. An IPv4 VM needs a free address whose pool exposure matches its `ip4_exposure` (`internet` → `public`/`nat`, `internal` → `internal`).
-- `Config.default_boot_image_name` = **ubuntu-jammy**. Either download jammy too, or always pick ubuntu-noble explicitly.
+- `Config.default_boot_image_name` = **ubuntu-noble** (`config.rb`, since the M1 merge, upstream 697fb6d66). Download jammy only if customers will pick it.
 - `enable_ip4` defaults to false.
 - Failure message: `"no space left on any eligible host"`. The VM sets `waiting_for_capacity` and pages after 10 minutes.
 
@@ -258,7 +260,7 @@ RACK_ENV=development bundle exec bin/register-byoh-host \
 - `--ssh-key` must be an unencrypted OpenSSH Ed25519 key.
 - Run the CLI from the repo root with a working `.env.rb`; it loads `db.rb` and `loader.rb`.
 - `--location` is **required** and must name a BYOH location created with `bin/byoh-location create` (§8a). Pools are optional: `--pool-file` and `--routed-network` add to each other; with none, only IPv6-only VMs place.
-- Terraform: SSH ingress comes from `var.operator_ssh_cidr` (default 0.0.0.0/0), and ports 3000 and 443 are hard-coded open to the world.
+- Terraform: SSH ingress comes from `var.operator_ssh_cidr` (default 0.0.0.0/0), and ports 3000 and 443 from `var.web_ui_cidr` (default 0.0.0.0/0). Set both to your /32.
 - Boot images live only in the strand stack. To add one later, run `vm_host.download_boot_image("name")` in `bin/pry`.
 
 - There is **no `--provider` flag**; passing one aborts with InvalidOption. Several docs still pass it.
@@ -290,6 +292,8 @@ It is still in git history (`git show 0a24426cc:scripts/byoh-ops/reconfigure-rou
 
 ## 6. Debugging playbook
 
+The operator-facing catalogue is `docs/byoh/TROUBLESHOOTING.md`; keep it consistent with this section.
+
 - **Host state** (use the `vm_host` id = strand id):
   `SELECT prog,label,try,schedule,stack FROM strand WHERE id='<uuid>';`
   `SELECT allocation_state,os_version,total_cores,total_hugepages_1g,accepts_slices,net6 FROM vm_host;`
@@ -303,7 +307,7 @@ It is still in git history (`git show 0a24426cc:scripts/byoh-ops/reconfigure-rou
 |---|---|
 | Stuck at `bootstrap_rhizome` (BootstrapRhizome) | Root SSH is failing: the key isn't in root's authorized_keys, or there's no route from the control plane to the main IP |
 | PrepHost fails | No outbound internet (cloud-hypervisor and htcat downloads) |
-| LearnMemory "unexpected dmidecode unit" | Non-GB DIMM sizes (common in nested VMs) |
+| LearnMemory "unexpected dmidecode unit" | Non-GB DIMM sizes (common in nested VMs) on builds without a0259a997 (the published `byoh-driver`); on `m2-network` only an unknown unit |
 | `verify_hugepages` fails | Not enough RAM for 1G hugepages |
 | VM "no space left on any eligible host" | Wrong location (use the host's BYOH location; eu-central-h1 only for a legacy host not yet moved); no activated boot image of that name; no free `ipv4_address`; cores/hugepages; slices mismatch on low-core hosts (scope the fix: `DB[:vm_host].where(id: …).update(accepts_slices: false)`) |
 | VM stuck at `wait_sshable` | The control plane can't reach `<vm ip4>:22`. This is a missing operator L3 route, not a driver bug |

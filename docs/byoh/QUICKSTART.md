@@ -2,9 +2,11 @@
 
 The shortest path from two Ubuntu 24.04 machines to a running VM. It works the same on any platform. The details behind each step are in [SETUP.md](SETUP.md). The only platform-specific parts are how you create the machines and how pool addresses reach the host:
 
-- AWS with terraform: the "AWS-specific (optional)" section below. **Validated.**
-- Proxmox VE: [SETUP_PROXMOX.md](SETUP_PROXMOX.md). UNVERIFIED.
-- Anything else: SETUP.md §13 and NETWORKING §9. UNVERIFIED.
+- AWS with terraform: the "AWS-specific (optional)" section below, and [platforms/aws.md](platforms/aws.md). **Validated.**
+- Proxmox VE: [platforms/proxmox.md](platforms/proxmox.md) and [SETUP_PROXMOX.md](SETUP_PROXMOX.md). UNVERIFIED.
+- Anything else: pick your platform in [platforms/README.md](platforms/README.md). UNVERIFIED.
+
+When something goes wrong: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ---
 
@@ -12,7 +14,7 @@ The shortest path from two Ubuntu 24.04 machines to a running VM. It works the s
 
 - **Control plane:** Ubuntu 24.04, 2 vCPU, 4 GB RAM or more, and a sudo user.
 - **Data plane:** Ubuntu 24.04 with KVM and 1G pages. On a VM, that means nested virtualization and a host CPU model.
-  - Memory must be a whole number of GiB; 32 GiB is a good size.
+  - Memory must be a whole number of GiB on the published `byoh-driver`; 32 GiB is a good size.
   - It needs outbound internet.
   - It must be a dedicated machine; registration reboots it.
 - **SSH** from the control plane to the data plane's management IP.
@@ -131,6 +133,8 @@ This is the validated path. It uses `terraform/aws-byoh` to create the machines,
 
 ## Common problems
 
+The full catalogue is [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
 | Symptom | Fix |
 |---|---|
 | `bundle install` fails with "No such file or directory - mise" | Put `~/.local/bin` on PATH |
@@ -144,6 +148,8 @@ This is the validated path. It uses `terraform/aws-byoh` to create the machines,
 ## See also
 
 - [SETUP.md](SETUP.md): the full runbook.
+- [platforms/README.md](platforms/README.md): one guide per platform.
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md): symptoms, causes and fixes.
 - [SETUP_PROXMOX.md](SETUP_PROXMOX.md): Proxmox.
 - [POOL_OPERATIONS.md](POOL_OPERATIONS.md): changing pools.
 - [VERIFY.md](VERIFY.md): the gate and the live window.

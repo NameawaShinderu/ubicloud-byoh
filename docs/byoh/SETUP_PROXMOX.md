@@ -84,7 +84,7 @@ free -g; pvesm status                            # memory and storage headroom
 |---|---|---|
 | CPU type | `host` | Passes `vmx`/`svm` and `pdpe1gb` (1G pages) to the guest. Without it there is no `/dev/kvm` and no 1G hugepages. |
 | Cores | 8 recommended, 4 minimum (UNVERIFIED) | Rhizome reserves cores for the host. On AWS, 8 vCPU gave 4 usable cores and room for 2-3 `standard-2` VMs. |
-| Memory | A **multiple of 1024 MiB**, 32768 recommended, 16384 minimum (UNVERIFIED) | Other sizes crash LearnMemory with "unexpected dmidecode unit" (OPS-16). Most of the memory becomes 1G hugepages for VMs; `verify_hugepages` needs MemAvailable of at least 2 GiB after that. On AWS, 32 GiB gave 26 hugepages. |
+| Memory | A **multiple of 1024 MiB**, 32768 recommended, 16384 minimum (UNVERIFIED) | Other sizes crash LearnMemory with "unexpected dmidecode unit" (OPS-16) on builds without a0259a997, which includes the published `byoh-driver`; `m2-network` rounds them down ([platforms/README.md](platforms/README.md) §3). Most of the memory becomes 1G hugepages for VMs; `verify_hugepages` needs MemAvailable of at least 2 GiB after that. On AWS, 32 GiB gave 26 hugepages. |
 | Ballooning | Off (`balloon: 0`) | The guest's memory is pinned as 1G hugepages; a balloon would take it back. UNVERIFIED. |
 | Disk | One `scsi0` disk on a `virtio-scsi-single` controller, on the VM's own storage, 200 GB or more | VM disks and boot images live on the root filesystem under `/var/storage`. Virtio and SCSI disks have no by-id links; IO limits fall back to the path [FIXED], but `bin/monitor` health checks do not (§4.3). |
 | NIC | **One** NIC, `virtio`, on the LAN bridge, with **`firewall=0`** | Two NICs (vmbr0 DHCP plus a BYOH bridge, as the old docs had) give asymmetric egress, and G5 flags the second address. With the Proxmox firewall on, `ipfilter` or `macfilter` can drop proxy-ARP replies and VM-sourced packets (the default is UNVERIFIED). |
@@ -390,7 +390,7 @@ Create an account at `http://<control plane>:3000/create-account`. The verificat
 - A VM without IPv4 needs no pool at all. Its outbound IPv4 goes through the host NAT.
 - The CLI path uses the location's display name (`--display-name`, default `--name`).
 - The VM user is `ubi`. Internal VMs are reached from the LAN or VPN at their pool address: `ssh ubi@10.80.0.20x`.
-- Pick `ubuntu-noble` explicitly, or also download `ubuntu-jammy` (the default image) with `--default-boot-image ubuntu-jammy`.
+- `ubuntu-noble` is the default image. Download `ubuntu-jammy` too (`--default-boot-image ubuntu-jammy`) only if customers will pick it.
 
 ---
 
