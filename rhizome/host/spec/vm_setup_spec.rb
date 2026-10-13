@@ -669,6 +669,26 @@ RSpec.describe VmSetup do
     end
   end
 
+  describe "#check_ip4_not_local" do
+    it "passes when the host routes the address elsewhere" do
+      expect(vs).to receive(:_run_command).with("ip", "-j", "route", "get", "192.0.2.10")
+        .and_return('[{"dst":"192.0.2.10","gateway":"10.0.0.1","dev":"ens5","prefsrc":"10.0.0.5","flags":[],"uid":0,"cache":[]}]')
+      expect { vs.check_ip4_not_local("192.0.2.10/32") }.not_to raise_error
+    end
+
+    it "passes when the host has no route to the address" do
+      expect(vs).to receive(:_run_command).with("ip", "-j", "route", "get", "192.0.2.10")
+        .and_raise(CommandFail.new("", "", "RTNETLINK answers: Network is unreachable"))
+      expect { vs.check_ip4_not_local("192.0.2.10") }.not_to raise_error
+    end
+
+    it "fails when the address is local to the host" do
+      expect(vs).to receive(:_run_command).with("ip", "-j", "route", "get", "10.98.1.20")
+        .and_return('[{"type":"local","dst":"10.98.1.20","dev":"lo","prefsrc":"10.98.1.20","flags":[],"uid":0,"cache":["local"]}]')
+      expect { vs.check_ip4_not_local("10.98.1.20/32") }.to raise_error RuntimeError, /\A10\.98\.1\.20 is a local address of this host/
+    end
+  end
+
   describe "#setup_networking" do
     it "can setup networking" do
       vps = instance_spy(VmPath)
@@ -679,6 +699,7 @@ RSpec.describe VmSetup do
       clover_ephemeral = NetAddr.parse_net("fddf:53d2:4c89:2305:8000::/65")
       ip4 = "192.168.1.100"
 
+      expect(vs).to receive(:check_ip4_not_local).with("192.168.1.100")
       expect(vs).to receive(:unblock_ip4).with("192.168.1.100")
       expect(vs).to receive(:interfaces).with([], true)
       expect(vs).to receive(:setup_veths_6) {

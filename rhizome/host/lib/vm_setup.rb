@@ -102,6 +102,7 @@ class VmSetup
   def setup_networking(skip_persisted, gua, ip4, local_ip4, nics, ndp_needed, dns_ipv4, multiqueue:)
     ip4 = nil if ip4.empty?
     guest_ephemeral, clover_ephemeral = subdivide_network(NetAddr.parse_net(gua))
+    check_ip4_not_local(ip4) if ip4
 
     if !skip_persisted
       # Write out guest-delegated and clover infrastructure address
@@ -124,6 +125,28 @@ class VmSetup
     ByohEgressNat.ensure_installed(**@egress_nat4, keep_existing: skip_persisted) if host_nat?
     write_nftables_conf(ip4, local_ip4, gua, nics)
     forwarding
+  end
+
+  # The host must route the VM's IPv4 to the VM, not own it. A cloud agent
+  # that configures every address of the NIC on the host, such as
+  # cloud-init on EC2 with secondary IPs or the GCP guest agent with alias
+  # IP ranges, makes the host answer for the VM instead: its own sshd
+  # takes the VM's SSH connections. Fail the setup with the reason rather
+  # than start a VM nobody can reach.
+  def check_ip4_not_local(ip4)
+    address = NetAddr::IPv4Net.parse(ip4).network.to_s
+    routes = begin
+      JSON.parse(r("ip", "-j", "route", "get", address))
+    rescue CommandFail
+      # No route at all, as on a host without a default route: nothing
+      # claims the address.
+      return
+    end
+    return unless routes.any? { |route| route["type"] == "local" }
+
+    fail "#{address} is a local address of this host, so the host answers for the VM. " \
+      "Remove it from the host's interfaces (ip -br addr; ip route show table local) and stop the cloud agent " \
+      "from adding it back (docs/byoh/NETWORKING.md section 9)."
   end
 
   def unblock_ip4(ip4)
