@@ -16,14 +16,14 @@ class ByohGateChecks
     Commands:
       location  --location NAME [--rates-from LOCATION]
       host      --host UBID [--ipv6-mode gua|ula]
-      vm        --vm UBID --expect nat|none|internal|waiting [--external IP]
+      vm        --vm UBID --expect public|nat|none|internal|waiting [--external IP]
       info      --vm UBID
       snapshot  --host UBID
       compare   --host UBID --snapshot FILE
   USAGE
 
   COMMANDS = %w[location host vm info snapshot compare].freeze
-  EXPECTATIONS = %w[nat none internal waiting].freeze
+  EXPECTATIONS = %w[public nat none internal waiting].freeze
 
   # The rate types a VM is billed under; a snapshot counts the open
   # records of these whose VM no longer exists.
@@ -81,7 +81,7 @@ class ByohGateChecks
   end
 
   # G4, G5 and G10: the host is a BYOH host taking VMs, registered with an
-  # audit row, its pools pass byoh-pool verify, no VM has a link-local
+  # audit row (or moved into its location with one), its pools pass byoh-pool verify, no VM has a link-local
   # veth address cloud services use, and no internet VM holds an internal
   # address.
   def cmd_host(argv)
@@ -102,8 +102,13 @@ class ByohGateChecks
         ula48 = host.location.byoh_profile&.ula48
         r.check(!!ula48 && ByohNetworkProfile.covers?(ula48, host.net6), "net6 #{host.net6} is inside the location's ula48 #{ula48 || "(none)"}")
       end
-      registered = DB[:byoh_operator_action].where(command: "register-byoh-host", target_id: host.id, result: "ok").count
-      r.check(registered.positive?, "a register-byoh-host audit row exists for #{host.ubid}")
+      if audit_row?("register-byoh-host", host) || !audit_row?("move-location", host)
+        r.check(audit_row?("register-byoh-host", host), "a register-byoh-host audit row exists for #{host.ubid}")
+      else
+        # A host registered before the audit log existed has no
+        # registration row; the move into its BYOH location wrote one.
+        r.info("#{host.ubid} has no register-byoh-host audit row, but a move-location row: it was registered before M2 and moved")
+      end
 
       host.vms_dataset.order(:name).all.each do |vm|
         apipa = VmHost::APIPA_EXCLUDED.find { ByohNetworkProfile.covers?(it, vm.local_vetho_ip) }
@@ -131,9 +136,9 @@ class ByohGateChecks
   # dials and what is billed for one VM.
   def cmd_vm(argv)
     opts = {}
-    parse(argv, "vm --vm UBID --expect nat|none|internal|waiting [--external IP]") do |o|
+    parse(argv, "vm --vm UBID --expect public|nat|none|internal|waiting [--external IP]") do |o|
       vm_option(o, opts)
-      o.on("--expect KIND", EXPECTATIONS, "nat, none (no IPv4), internal, or waiting (not placed)") { opts[:expect] = it }
+      o.on("--expect KIND", EXPECTATIONS, "public, nat, none (no IPv4), internal, or waiting (not placed)") { opts[:expect] = it }
       o.on("--external IP", "The external IP a nat VM must have") { opts[:external] = it }
     end
     expect = opts[:expect] || raise(Error, "--expect is required")
@@ -160,15 +165,31 @@ class ByohGateChecks
     end
   end
 
+  # A VM on a public pool address, which the internet reaches directly
+  # (routed or onlink blocks on bare metal, colo, or a routed site).
+  def check_public(r, vm, api, ipv4_records, _opts)
+    address = vm.assigned_vm_address
+    return r.fail("#{vm.ubid} has no IPv4 address") unless address
+
+    ip4 = vm.ip4_string
+    exposure = address.address.exposure
+    r.check(exposure == "public" && !address.external_ip, "#{vm.ubid}'s address #{ip4} is in a public pool (exposure #{exposure}#{", external #{address.external_ip}" if address.external_ip})")
+    check_shown_and_billed(r, vm, api, ipv4_records, ip4)
+  end
+
   def check_nat(r, vm, api, ipv4_records, opts)
     external = vm.assigned_vm_address&.external_ip&.to_s
     return r.fail("#{vm.ubid} has no external IP") unless external
 
     r.check(external == opts[:external], "#{vm.ubid}'s external IP is #{opts[:external]} (#{external})") if opts[:external]
-    r.check(api[:ip4].to_s == external && api[:ip4_scope] == "public", "the API shows #{external} with scope public (#{api[:ip4]}, #{api[:ip4_scope]})")
+    check_shown_and_billed(r, vm, api, ipv4_records, external)
+  end
+
+  def check_shown_and_billed(r, vm, api, ipv4_records, public_ip)
+    r.check(api[:ip4].to_s == public_ip && api[:ip4_scope] == "public", "the API shows #{public_ip} with scope public (#{api[:ip4]}, #{api[:ip4_scope]})")
     if vm.project.billable
       names = ipv4_records.map(&:resource_name)
-      r.check(names == ["#{external}/32"], "the IPv4 billing record is named #{external}/32 (#{names.join(", ").then { it.empty? ? "none" : it }})")
+      r.check(names == ["#{public_ip}/32"], "the IPv4 billing record is named #{public_ip}/32 (#{names.join(", ").then { it.empty? ? "none" : it }})")
     else
       r.info("project #{vm.project.ubid} is not billable, so no billing record is written")
     end
@@ -187,7 +208,9 @@ class ByohGateChecks
     r.check(ipv4_records.empty?, "#{vm.ubid} has no IPv4 billing record")
   end
 
-  # The addresses the gate script connects to, as key=value lines.
+  # The addresses the gate script connects to, as key=value lines. The
+  # script reaches a VM at private_ip4 from inside its namespace on the
+  # host (ip netns exec <inhost>), which works whatever the host's IPv6.
   def cmd_info(argv)
     opts = {}
     parse(argv, "info --vm UBID") { vm_option(it, opts) }
@@ -200,6 +223,7 @@ class ByohGateChecks
       public_ip4: vm.public_ip4_string,
       ip6: vm.ip6_string,
       private_ip4: vm.private_ipv4_string,
+      inhost: vm.inhost_name,
     }.each { |key, value| @out.puts "#{key}=#{value}" }
     0
   end
@@ -254,6 +278,10 @@ class ByohGateChecks
       orphaned_vm_billing_records: BillingRecord.active.where(billing_rate_id: rate_ids).exclude(resource_id: DB[:vm].select(:id)).count,
       audit_rows: DB[:byoh_operator_action].count,
     }
+  end
+
+  def audit_row?(command, host)
+    !DB[:byoh_operator_action].where(command:, target_id: host.id, result: "ok").empty?
   end
 
   def ipv4_billing_records(vm)

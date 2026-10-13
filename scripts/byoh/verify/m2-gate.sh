@@ -11,7 +11,10 @@
 #
 # Database checks go through scripts/byoh/verify/m2-checks and change
 # nothing. Host checks SSH to the data plane as root. VM checks SSH to a
-# VM's IPv6 address through the data plane, which routes it. G3 runs a
+# VM's private IPv4 from inside its network namespace on the data plane
+# (ip netns exec <vm> nc), so they work on every platform and with either
+# IPv6 mode; a VM on a ULA host cannot route back to the host's IPv6, so
+# jumping to the VM's IPv6 fails there. G3 runs a
 # registration that must be refused, and G13 runs byoh-pool annotate with
 # the host's own export, which writes one audit row and no other change.
 #
@@ -19,10 +22,15 @@
 #   GATE_LOCATION        BYOH location name (G2, G3)
 #   GATE_RATES_FROM      location the rates were copied from (default hetzner-fsn1)
 #   GATE_HOST            VmHost ubid (G4 onwards)
+#   GATE_IPV6_MODE       expected host IPv6 mode for G4, gua or ula (default: not checked)
+#   GATE_EXPECT_MONITOR  1 to require bin/monitor in G1 (default 0: docs/byoh/PLATFORMS.md
+#                        says not to run it on hosts without by-id disk links, such as
+#                        AWS EBS and Proxmox virtio disks)
 #   GATE_MAIN_IP         data plane primary IP, as registered (--main-ip)
 #   GATE_HOST_KEY        root SSH key for the data plane (default ~/.ssh/byoh_data)
 #   GATE_VM_KEY          SSH key of the gate VMs' "ubi" user
-#   GATE_VM_A            VM with a nat address (G6, G9, G11)
+#   GATE_VM_A            VM with an internet address (G6, G9; G11 needs a nat one)
+#   GATE_VM_A_EXPOSURE   exposure of VM-A's pool, nat or public (default nat)
 #   GATE_VM_B            VM without IPv4 (G7, G9, G9b, G12)
 #   GATE_VM_C            VM created with ip4_exposure internal (G8, G9)
 #   GATE_VM_D            the fourth internet VM, which must wait (G10)
@@ -39,6 +47,8 @@ GATE_RATES_FROM=${GATE_RATES_FROM:-hetzner-fsn1}
 GATE_HOST_KEY=${GATE_HOST_KEY:-$HOME/.ssh/byoh_data}
 GATE_RESPIRATE_LOG=${GATE_RESPIRATE_LOG:-/tmp/respirate.log}
 GATE_STATE_DIR=${GATE_STATE_DIR:-var/m2-gate}
+GATE_EXPECT_MONITOR=${GATE_EXPECT_MONITOR:-0}
+GATE_VM_A_EXPOSURE=${GATE_VM_A_EXPOSURE:-nat}
 
 failures=0
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new)
@@ -66,26 +76,33 @@ gate_checks() {
   if checks "$@"; then pass "m2-checks $1"; else fail "m2-checks $1"; fi
 }
 
+# -n keeps ssh from reading the script's own standard input, which a
+# heredoc-driven run would otherwise lose to the first ssh.
 host_ssh() {
-  ssh "${SSH_OPTS[@]}" -i "$GATE_HOST_KEY" "root@$GATE_MAIN_IP" "$@"
+  ssh -n "${SSH_OPTS[@]}" -i "$GATE_HOST_KEY" "root@$GATE_MAIN_IP" "$@"
 }
 
 vm_field() {
   checks info --vm "$1" | sed -n "s/^$2=//p"
 }
 
-# Runs a command in a VM over its IPv6 address, jumping through the host.
+# Runs a command in a VM. The proxy enters the VM's namespace on the
+# host and connects to its private IPv4 there, which needs no route from
+# the control plane or the host to the VM. The known_hosts entry is keyed
+# by the VM, as private addresses are reused across VMs.
 vm_ssh() {
-  local vm=$1 ip6
+  local vm=$1 info private inhost
   shift
-  ip6=$(vm_field "$vm" ip6)
-  if [[ -z $ip6 ]]; then
-    echo "! $vm has no IPv6 address to reach it through the host" >&2
+  info=$(checks info --vm "$vm")
+  private=$(sed -n 's/^private_ip4=//p' <<<"$info")
+  inhost=$(sed -n 's/^inhost=//p' <<<"$info")
+  if [[ -z $private || -z $inhost ]]; then
+    echo "! $vm has no private IPv4 or namespace to reach it through the host" >&2
     return 255
   fi
-  ssh "${SSH_OPTS[@]}" -i "$GATE_VM_KEY" \
-    -o "ProxyCommand=ssh ${SSH_OPTS[*]} -i $GATE_HOST_KEY -W '[%h]:%p' root@$GATE_MAIN_IP" \
-    "ubi@$ip6" "$@"
+  ssh -n "${SSH_OPTS[@]}" -o "HostKeyAlias=$vm" -i "$GATE_VM_KEY" \
+    -o "ProxyCommand=ssh ${SSH_OPTS[*]} -i $GATE_HOST_KEY root@$GATE_MAIN_IP ip netns exec $inhost nc %h %p" \
+    "ubi@$private" "$@"
 }
 
 # The summed packet counts of the byoh_egress rules that contain $1.
@@ -104,9 +121,16 @@ SMTP_RULE="dport 25 "
 g1() {
   echo "== G1 control plane services and BILLING_RATES_EXTRA_DIR"
   local process
-  for process in puma bin/respirate bin/monitor; do
+  for process in puma bin/respirate; do
     if pgrep -f "$process" >/dev/null; then pass "$process is running"; else fail "$process is not running"; fi
   done
+  if [[ $GATE_EXPECT_MONITOR == 1 ]]; then
+    if pgrep -f bin/monitor >/dev/null; then pass "bin/monitor is running"; else fail "bin/monitor is not running"; fi
+  elif pgrep -f bin/monitor >/dev/null; then
+    info "bin/monitor is running; check docs/byoh/PLATFORMS.md that its health checks suit this host's disks"
+  else
+    info "bin/monitor is not running (GATE_EXPECT_MONITOR=1 requires it), so hosts are never marked unavailable"
+  fi
   if grep -q BILLING_RATES_EXTRA_DIR .env.rb 2>/dev/null; then
     pass ".env.rb sets BILLING_RATES_EXTRA_DIR"
   else
@@ -140,7 +164,7 @@ g3() {
 g4() {
   echo "== G4 registered host"
   need GATE_HOST
-  gate_checks host --host "$GATE_HOST" --ipv6-mode ula
+  gate_checks host --host "$GATE_HOST" ${GATE_IPV6_MODE:+--ipv6-mode "$GATE_IPV6_MODE"}
 }
 
 g5() {
@@ -183,12 +207,12 @@ egress() {
 }
 
 g6() {
-  echo "== G6 VM-A (nat)"
+  echo "== G6 VM-A ($GATE_VM_A_EXPOSURE)"
   need GATE_VM_A GATE_VM_KEY
-  gate_checks vm --vm "$GATE_VM_A" --expect nat
+  gate_checks vm --vm "$GATE_VM_A" --expect "$GATE_VM_A_EXPOSURE"
   local public
   public=$(vm_field "$GATE_VM_A" public_ip4)
-  if ssh "${SSH_OPTS[@]}" -i "$GATE_VM_KEY" "ubi@$public" true; then
+  if ssh -n "${SSH_OPTS[@]}" -i "$GATE_VM_KEY" "ubi@$public" true; then
     pass "SSH to $GATE_VM_A at its external IP $public"
   else
     fail "SSH to $GATE_VM_A at its external IP $public"
@@ -219,13 +243,15 @@ g8() {
 }
 
 g9() {
-  echo "== G9 instance metadata is unreachable"
+  echo "== G9 link-local addresses (cloud instance metadata) are unreachable"
   need GATE_VM_A GATE_VM_B GATE_VM_C GATE_VM_KEY GATE_MAIN_IP
   local vm before after
   for vm in "$GATE_VM_A" "$GATE_VM_B" "$GATE_VM_C"; do
     before=$(counter "$IMDS_RULE")
     if vm_ssh "$vm" curl -s -m 5 -o /dev/null http://169.254.169.254/; then
       fail "$vm reached 169.254.169.254"
+    elif (($? == 255)); then
+      fail "cannot SSH to $vm to probe 169.254.169.254"
     else
       pass "$vm cannot reach 169.254.169.254"
     fi
@@ -234,13 +260,16 @@ g9() {
   done
 }
 
-# Fails when the VM opens a TCP connection, and checks that the rule
+# Fails when the VM opens a TCP connection (exit 255 is ssh's own
+# failure, not a refused probe), and checks that the rule
 # matching $3 counted it.
 denied() {
   local vm=$1 target=$2 rule=$3 before after
   before=$(counter "$rule")
   if vm_ssh "$vm" nc -z -w 3 "$target"; then
     fail "$vm connected to $target"
+  elif (($? == 255)); then
+    fail "cannot SSH to $vm to probe $target"
   else
     pass "$vm cannot connect to $target"
   fi

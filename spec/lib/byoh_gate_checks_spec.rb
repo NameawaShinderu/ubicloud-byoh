@@ -158,6 +158,16 @@ RSpec.describe ByohGateChecks do
         "WARN verify: #{vm.ubid}: its veth address"
     end
 
+    it "reports a host moved into BYOH without a registration row as INFO" do
+      host.update(allocation_state: "accepting")
+      DB[:byoh_operator_action].delete
+      ByohOperatorLog.record(command: "move-location", target_id: host.id, args: {from: "hetzner-fsn1", to: "byoh-gate"}, result: "ok")
+      status, out, _ = cli("host", "--host", host.ubid)
+      expect(status).to eq 0
+      expect(out).to include "INFO #{host.ubid} has no register-byoh-host audit row, but a move-location row: it was registered before M2 and moved\n"
+      expect(out).not_to include "FAIL"
+    end
+
     it "fails a ULA outside the location's ula48 and passes on verify failures" do
       host
       DB[:location].where(id: location.id).update(byoh_network: Sequel.pg_jsonb({}))
@@ -249,6 +259,29 @@ RSpec.describe ByohGateChecks do
       OUT
     end
 
+    it "passes a public VM shown and billed at its own address" do
+      vm = place_vm("5.9.10.1")
+      Sshable.create_with_id(vm.id, host: "5.9.10.1")
+      ipv4_record(vm, "5.9.10.1/32")
+      status, out, _ = cli("vm", "--vm", vm.ubid, "--expect", "public")
+      expect(status).to eq 0
+      expect(out).to eq <<~OUT
+        PASS #{vm.ubid}'s address 5.9.10.1 is in a public pool (exposure public)
+        PASS the API shows 5.9.10.1 with scope public (5.9.10.1, public)
+        PASS the IPv4 billing record is named 5.9.10.1/32 (5.9.10.1/32)
+        PASS the control plane reaches #{vm.ubid} at 5.9.10.1 (5.9.10.1)
+        ok
+      OUT
+    end
+
+    it "fails a public expectation for a nat VM or a VM without IPv4" do
+      vm = place_vm("10.98.1.128")
+      expect(cli("vm", "--vm", vm.ubid, "--expect", "public")[1]).to include "FAIL #{vm.ubid}'s address 10.98.1.128 is in a public pool (exposure nat, external 8.8.8.10)\n",
+        "FAIL the API shows 10.98.1.128 with scope public (8.8.8.10, public)\n"
+      other = create_vm(vm_host_id: host.id, location_id: location.id, name: "no-ip4")
+      expect(cli("vm", "--vm", other.ubid, "--expect", "public")[1]).to start_with "FAIL #{other.ubid} has no IPv4 address\n"
+    end
+
     it "checks an internal VM" do
       vm = place_vm("10.98.1.129", ip4_exposure: "internal")
       Sshable.create_with_id(vm.id, host: "10.98.1.129")
@@ -280,6 +313,7 @@ RSpec.describe ByohGateChecks do
         public_ip4=8.8.8.10
         ip6=
         private_ip4=
+        inhost=#{vm.inhost_name}
       OUT
     end
 
