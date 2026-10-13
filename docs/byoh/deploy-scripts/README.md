@@ -1,4 +1,14 @@
-# Ubicloud BYOH — Proxmox Deployment Scripts
+# Ubicloud BYOH — Proxmox Deployment Scripts (UNSUPPORTED)
+
+> **Unsupported and broken.** These scripts predate M2. They create no
+> BYOH location (registration now requires `--location`), dual-home the
+> data plane, declare pools without `delivery`/`exposure`, set
+> `accepts_slices=false` on **every** host (OPS-1), cannot SSH from the
+> control plane to the data plane (OPS-11), and `reset.sh` destroys VMIDs
+> 400, 401 and 9000 by number only. Each script now exits at once unless
+> `BYOH_RUN_UNSUPPORTED_DEPLOY_SCRIPTS=1` is set. Follow
+> [SETUP_PROXMOX.md](../SETUP_PROXMOX.md) instead. They are kept only as a
+> reference until they are rewritten or deleted.
 
 Automated shell scripts to deploy Ubicloud BYOH on a Proxmox VE host.
 

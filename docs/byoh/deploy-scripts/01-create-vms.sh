@@ -1,4 +1,11 @@
 #!/bin/bash
+# UNSUPPORTED: these scripts predate M2 and are broken (no BYOH
+# location, dual-homed data plane, unscoped accepts_slices, VMID-based
+# deletes). Use docs/byoh/SETUP_PROXMOX.md instead.
+if [ "${BYOH_RUN_UNSUPPORTED_DEPLOY_SCRIPTS:-}" != "1" ]; then
+  echo "$0 is unsupported; follow docs/byoh/SETUP_PROXMOX.md" >&2
+  exit 1
+fi
 # Run on: Proxmox host
 # Purpose: Create VM template + ctrl plane + data plane
 # Log: /var/log/ubicloud-deploy-01.log

@@ -1,4 +1,11 @@
 #!/bin/bash
+# UNSUPPORTED: these scripts predate M2 and are broken (no BYOH
+# location, dual-homed data plane, unscoped accepts_slices, VMID-based
+# deletes). Use docs/byoh/SETUP_PROXMOX.md instead.
+if [ "${BYOH_RUN_UNSUPPORTED_DEPLOY_SCRIPTS:-}" != "1" ]; then
+  echo "$0 is unsupported; follow docs/byoh/SETUP_PROXMOX.md" >&2
+  exit 1
+fi
 # Run on: ctrl plane VM (or via SSH from Proxmox host)
 # Purpose: Live monitoring dashboard
 # Usage: bash 05-monitor.sh [once|loop]

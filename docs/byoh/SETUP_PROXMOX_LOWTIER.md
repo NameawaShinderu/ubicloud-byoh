@@ -1,4 +1,13 @@
-# Deploying Ubicloud BYOH on Low-Tier Proxmox Hardware
+# Deploying Ubicloud BYOH on Low-Tier Proxmox Hardware (SUPERSEDED)
+
+> **Superseded by [SETUP_PROXMOX.md](SETUP_PROXMOX.md).** This page
+> predates M2: it creates no BYOH location, registers without
+> `--location` and `--pool-file`, and says VMs land in eu-central-h1,
+> which is no longer true. Its hardware notes (low core counts, 16 GB
+> nodes, nested virtualization) may still help, but follow SETUP_PROXMOX.md
+> for every command. The claim below that everything was tested on an
+> i5-5200U is UNVERIFIED: no Proxmox run is recorded in this project
+> (VERIFY.md §5).
 
 A real-world guide to running Ubicloud's Bring-Your-Own-Hardware
 cloud platform on consumer-grade Proxmox hosts — the kind of
