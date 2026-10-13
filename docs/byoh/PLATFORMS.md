@@ -35,10 +35,10 @@ These are the rules a host must meet **today**. The right-hand column shows how 
 | Requirement | How to check | Why (code) | Changes later |
 |---|---|---|---|
 | Ubuntu 24.04, x86_64 or aarch64 | `lsb_release -rs`; `uname -m` | `wait_prep` sets `accepts_slices = (os == "ubuntu-24.04")`; LearnOs | none |
-| KVM present | `test -c /dev/kvm` and `vmx` or `svm` in `/proc/cpuinfo` | cloud-hypervisor needs it. **Nothing checks it today** (`rhizome/host/bin/prep_host.rb`), so a KVM-less host still reaches `accepting` | prep check [PLANNED F9] |
+| KVM present | `test -c /dev/kvm` and `vmx` or `svm` in `/proc/cpuinfo` | cloud-hypervisor needs it. `scripts/byoh/bootstrap-data-plane.sh` refuses the host before registration, and PrepHost aborts with the same reason after it (`rhizome/host/lib/kvm_check.rb`, [FIXED 05f1eefb2]). A VPS without nested virtualization fails here | none |
 | 1 GiB hugepage CPU flag (x86) | `grep -qw pdpe1gb /proc/cpuinfo` | dedicated VMs are backed by 1G hugepages (`prog/setup_hugepages.rb:16`) | not needed for a `flexible` profile host [PLANNED CMP-P1] |
 | RAM ≥ 14 GiB (16+ recommended) | sum of `dmidecode -t memory` sizes | hugepages = `total_mem_gib*42/43 - 5` (`prog/setup_hugepages.rb:14`); the smallest slice books 8 | `flexible` profile uses 0 hugepages, so smaller hosts become usable [PLANNED CMP-P1] |
-| Every DIMM reported in `GB` | `dmidecode -t memory \| grep -E '^\s+Size: [0-9]'` | `fail "BUG: unexpected dmidecode unit" unless $2 == "GB"` (`prog/learn_memory.rb:10`). Proxmox memory must be a multiple of 1024 MiB | accept MB/GB/TB [PLANNED F9] |
+| DIMM sizes readable | `dmidecode -t memory \| grep -E '^\s+Size: [0-9]'` | LearnMemory sums kB/MB/GB/TB sizes and rounds down to whole GiB; with no SMBIOS memory device it uses `MemTotal` rounded up. Only an unknown unit fails (`prog/learn_memory.rb`) [FIXED IN M2] | none |
 | ≥ 2 physical cores **beyond** CPUs 0-1 | `lscpu -e` | CPUs 0-1 are marked `spdk` on every host with ≤ 64 CPUs (`model/vm_host.rb:173-178`, `prog/vm/host_nexus.rb:154-160`), even though SPDK is never installed | generic hosts get 0 IO CPUs [PLANNED CMP-P0 step 3] |
 | Uniform threads per core, all CPUs online | `lscpu -Jy -e=CPU,SOCKET,CORE,ONLINE` | `fail "BUG" unless r.zero?` (`model/metal/vm.rb:29-30`); offline CPUs are counted (`prog/learn_cpu.rb:15-23`) | [PLANNED F4] |
 | cgroup v2 with `cpuset` | `stat -fc %T /sys/fs/cgroup`; `/sys/fs/cgroup/cgroup.controllers` | VM slices (`rhizome/host/lib/slice_setup.rb`) | none |
@@ -105,7 +105,7 @@ Duplicates are merged; the canonical ID comes first. Severity is for BYOH hosts.
 | 15 | major | OPS-5, OPS-6 | `scripts/byoh/providers/aws-routed-network-setup.sh:134-150`; `terraform/aws-byoh/user-data-data.sh:29,47` | AWS | pool IPs on the host NIC | F7 + NET L10 (retire the script) + PF17/PF18 | PARTLY FIXED (terraform path: 003f2800d) |
 | 16 | major | OPS-11 | `docs/byoh/deploy-scripts/04-register-host.sh:14-22` | Proxmox automated deploy | `Permission denied (publickey)` ctrl→data | F10 | OPEN |
 | 17 | major | OPS-14 (+ location) | `bin/register-byoh-host:125-155`; `lib/byoh_registration.rb:51-57`; `prog/vm/host_nexus.rb:6` | all | no host preflight; every host lands in `HETZNER_FSN1_ID` | preflight: F10 (section 6). Location: NET-P1 (`bin/byoh-location`) and CMP-P1 (registration) | PARTLY FIXED (location: m2-network ca8e608fe, 9ecea1072, `bin/byoh-location` and a required `--location`; preflight still F10) |
-| 18 | major/mod | HW-4, VR-6 | `rhizome/host/bin/prep_host.rb` | AWS without nested, GCP without nested, Proxmox `kvm64`, BIOS VT off | host reaches `accepting`; VMs never boot | F9 + PF3 | OPEN |
+| 18 | major/mod | HW-4, VR-6 | `rhizome/host/bin/prep_host.rb` | AWS without nested, GCP without nested, Proxmox `kvm64`, BIOS VT off | host reaches `accepting`; VMs never boot | F9 + PF3 | FIXED (05f1eefb2: PrepHost aborts; M2: `bootstrap-data-plane.sh` also checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` before registration) |
 | 19 | major (small) | HW-8, OPS-12 | `prog/setup_hugepages.rb:14` | hosts under 14 GiB | 0-7 hugepages, host still `accepting`, nothing fits | F3 → CMP-P0 step 5 (upstream MemAvailable clamp) + CMP-P1 (profile) | OPEN |
 | 20 | medium | OPS-9 | `docs/byoh/SETUP_PROXMOX.md:2132-2142` | Proxmox disk passthrough | mount hides `/var/storage/images`; capacity stale | F6 (docs) | OPEN |
 | 21 | medium | OPS-17 | `scripts/byoh/bootstrap-ctrl-plane.sh:217-242` | all | no `bin/monitor`, no restarter | F10; monitor only after F5 and with compute critic hole 5 resolved | OPEN |
@@ -166,7 +166,7 @@ Each `fail` prints a platform hint: Proxmox `qm set <id> --cpu host`; AWS a nest
 | PF3 | KVM | `test -c /dev/kvm`; `grep -Ewo 'vmx\|svm' /proc/cpuinfo \| head -1`; `cat /sys/module/kvm_{intel,amd}/parameters/nested 2>/dev/null` | char device present and a flag found | fail | — | HW-4 |
 | PF4 | 1G pages (x86) | `grep -qw pdpe1gb /proc/cpuinfo` | present | fail | warn only on a `flexible` profile host [CMP-P1] | `prog/vm/host_nexus.rb:272` |
 | PF5 | GRUB | `grep -Eq '^GRUB_CMDLINE_LINUX=".*"$' /etc/default/grub && command -v update-grub && test -d /boot/grub` | all true | fail | — | `prog/setup_hugepages.rb:16-17` |
-| PF6 | RAM units | `dmidecode -t memory \| grep -E '^\s+Size: [0-9]'` | every line ends in `GB` | fail | dropped after F9 | `prog/learn_memory.rb:10` |
+| PF6 | RAM units | `dmidecode -t memory \| grep -E '^\s+Size: [0-9]'` | every line ends in `kB`, `MB`, `GB` or `TB` | fail | — (MB units accepted in M2) | `prog/learn_memory.rb` |
 | PF7 | Hugepage yield | G = sum of GB from PF6; `G*42/43 - 5` (integer math) | ≥ 8 (fail below), ≥ 16 (warn below) | fail / warn | after CMP-P0 step 5 also check MemAvailable ≥ 2 GiB; after CMP-P1 only for `dedicated`/`mixed` profiles | `prog/setup_hugepages.rb:14`; `scheduling/allocator.rb:84-93` |
 | PF8 | CPU topology | `lscpu -Jy -e=CPU,SOCKET,CORE,ONLINE` | all online; uniform threads per core; cores beyond CPUs 0-1 ≥ 2 | fail | after CMP-P0 step 3 the "beyond CPUs 0-1" part drops on generic hosts without SPDK; after F4 offline CPUs become a warn | `model/metal/vm.rb:29-30`; `prog/learn_cpu.rb`; `model/vm_host.rb:173` |
 | PF9 | cgroup v2 cpuset | `stat -fc %T /sys/fs/cgroup` = `cgroup2fs`; `grep -w cpuset /sys/fs/cgroup/cgroup.controllers` | both | fail | — | `rhizome/host/lib/slice_setup.rb:50` |
@@ -192,7 +192,7 @@ lsb_release -rs; uname -m                                                    # P
 test -c /dev/kvm && echo kvm-ok; grep -Ewo 'vmx|svm' /proc/cpuinfo | head -1 # PF3
 grep -qw pdpe1gb /proc/cpuinfo && echo pdpe1gb-ok                            # PF4
 grep -E '^GRUB_CMDLINE_LINUX=".*"$' /etc/default/grub; command -v update-grub # PF5
-dmidecode -t memory | grep -E '^\s+Size: [0-9]'                              # PF6 (all must end in GB)
+dmidecode -t memory | grep -E '^\s+Size: [0-9]'                              # PF6 (kB/MB/GB/TB)
 G=$(dmidecode -t memory | awk '/^\s+Size: [0-9]+ GB/{s+=$2} END{print s}'); echo "hugepages=$(( G*42/43 - 5 ))"  # PF7 (need >= 8)
 lscpu -Jy -e=CPU,SOCKET,CORE,ONLINE                                          # PF8
 stat -fc %T /sys/fs/cgroup; cat /sys/fs/cgroup/cgroup.controllers            # PF9

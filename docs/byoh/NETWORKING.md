@@ -133,7 +133,7 @@ All of these run the same code path.
 |---|---|---|---|
 | **routed** | Hetzner, OVH routed, Leaseweb, colo/BGP, pfSense-routed ISP block, WireGuard tunnel | pfSense BINAT block → routed RFC1918 block | pfSense/home-router static route to RFC1918 |
 | **onlink** | Hetzner vSwitch public subnet; ISP block bridged to the LAN | **pfSense 1:1 onto vmbr1 IPs** | **Company Proxmox vmbr1 today**, homelab LAN |
-| **fabric** | n/a | **AWS secondary IP + EIP (live env)**, GCP alias + external, Azure ipconfig + Public IP | AWS secondary IPs without EIPs |
+| **fabric** | n/a | **AWS secondary IP + EIP (live env)**, GCP alias + external (UNVERIFIED: the GCP docs checked do not show an external IPv4 mapped to an alias IP; use protocol forwarding, §9.7), Azure ipconfig + Public IP | AWS secondary IPs without EIPs |
 
 ### 3.3 Not product modes
 
@@ -481,6 +481,8 @@ The veth APIPA picker (`model/vm_host.rb:162-167`) picks a random pair and, on c
 
 It also contains the location's `vm_egress_deny`. The ordering in §4.3 ensures replies to established connections are never dropped.
 
+**Shipped in M2** (`rhizome/host/lib/byoh_egress_nat.rb`, every VM on a BYOH host, whatever its exposure): connections a VM opens to 169.254.0.0/16, to 168.63.129.16 (Azure WireServer, which is not link-local), and to the IPv6 metadata services `fd00:ec2::254` (AWS) and `fd20:ce::254` (GCP, provider docs, UNVERIFIED here) are dropped in the host forward chain. GCP's `metadata.google.internal` resolves to 169.254.169.254, so it is covered. The rest of the list (the location's `vm_egress_deny` for public addresses of pool VMs) is still P2.
+
 Related hardening:
 - AWS hosts also set `metadata_options { http_tokens = "required", http_put_response_hop_limit = 1 }`. Absent from `main.tf` today.
 - Whether a VM can reach the host's IMDS today is UNVERIFIED.
@@ -722,9 +724,12 @@ Scripts: `scripts/byoh/providers/wireguard-tunnel/{vps.sh,host.sh}` [PLANNED P6;
 | Provider | Notes |
 |---|---|
 | Hetzner Robot | Additional subnets and IPs are routed to the main IP. Failover IPs are `routed`; switching them is operator-side. vSwitch public subnets are `onlink`. IPv6: server /64 is `gua`, `ndp: false` as upstream (whether Hetzner needs NDP is UNVERIFIED). Robot firewall off, or allow all to the pool. |
-| OVH | Additional IPs in **routed mode** only. vMAC/bridged mode does not fit rhizome, because guest MACs never reach the uplink. IPv6 is an on-link /64: `--ipv6 <cidr>,ndp` (needs P0 `SetupNdpProxy`). |
+| OVH | Additional IPs in **routed mode** only: no virtual MAC may be set on them in the OVHcloud Control Panel (provider docs, UNVERIFIED here). vMAC/bridged mode does not fit rhizome, because guest MACs never reach the uplink. IPv6 is an on-link /64: `--routed-network <v6>/64,ndp`. |
 | Leaseweb and others | Routed blocks. When the provider requires an address of the block on the NIC (as `origin/main:lib/hosting/leaseweb_netplan.rb` does), that address is reserved, never allocatable (C5). |
-| Everywhere | Never put allocatable pool IPs in netplan (C5). `cp_reach: public` when the CP is elsewhere, and add its egress IP to `control_plane_outbound_cidrs` (union, §6.6). |
+| Everywhere | Never put allocatable pool IPs in netplan (C5). Since M2, VM setup fails with "is a local address of this host" when a VM's IPv4 is local on the host, instead of letting the host's own sshd answer for the VM. `cp_reach: public` when the CP is elsewhere, and add its egress IP to `control_plane_outbound_cidrs` (union, §6.6). |
+| Virtual / separate MACs | **Not supported.** An IP that the provider delivers to a distinct MAC (OVH vMAC, Hetzner "separate MAC" on a single additional IP) needs a bridged guest whose MAC is on the wire; rhizome routes every VM behind the host's MAC. Remove the vMAC/separate MAC and use the IP routed to the main IP, or order a routed subnet. |
+| Pools on a second interface (Hetzner vSwitch VLAN, OVH vRack, `wg0`) | Ubicloud stores the pools file `uplink` but never acts on it: VM egress follows the host's main routing table. A public block that must leave through another interface needs operator policy routing that survives reboots, for example `ip rule add to <block> lookup main priority 999`, then `ip rule add from <block> lookup 100 priority 1000` with `default via <vswitch-gw> dev <vlan>` in table 100. The `to <block>` rule keeps traffic between VMs and to the VMs on the vetho routes. Hetzner documents the separate table for vSwitch public subnets and an MTU of 1400 on the VLAN (provider docs, UNVERIFIED here); guests already get 1400 from DHCP. UNVERIFIED end to end. |
+| Bonds and VLAN uplinks | Supported by the code: PrepHost's uplink MAC pin skips a default route on a bond, bridge or VLAN, a multipath default route, and (since M2) an ethernet that a VLAN, bond, bridge or VRF names, instead of failing on it. NDP proxying (`,ndp`) needs a single-device default route. UNVERIFIED on hardware. |
 
 ### 9.6 Colo with BGP: routed + public
 
@@ -737,13 +742,17 @@ Scripts: `scripts/byoh/providers/wireguard-tunnel/{vps.sh,host.sh}` [PLANNED P6;
 - N2/C3 with nested virtualization, `can_ip_forward=true`.
 - Per-VM public IPv4 via **protocol forwarding** (forwarding rule → target instance), which delivers dst unchanged: `routed` + `public`, with the externals as the pool.
 - Or alias ranges as `fabric` + `internal`.
-- The guest agent must not add local routes for forwarded or alias IPs (C5).
+- The guest agent must not add local routes for forwarded or alias IPs (C5). By default it adds alias ranges as local routes (`ip route show table local`); set `ip_aliases = false` (and `target_instance_ips = false` for protocol forwarding) under `[IpForwarding]` in `/etc/default/instance_configs.cfg` and restart the agent (provider docs, UNVERIFIED here). VM setup refuses a VM whose IPv4 is local on the host.
+- Nested virtualization: not on E2, memory-optimized or Arm machine types, and not on AMD series except N4D; the organization policy `constraints/compute.disableNestedVirtualization` must not block it (provider docs, UNVERIFIED here).
+- The default VPC MTU is 1460; guests get 1400 from DHCP, which fits.
 - VPC firewall: allow all with destination = pool. SSH-only for the host IP.
 - IPv6: dual-stack /96 as `gua` (after the P4 spike).
 
 ### 9.8 Azure (experimental, UNVERIFIED)
 
-- Dv3/Ev3 or newer with nested virtualization; NIC IP forwarding on.
+- Dv3/Ev3 or newer with nested virtualization; NIC IP forwarding on. Pick security type Standard: Microsoft Q&A answers say Trusted Launch blocks nested virtualization on sizes older than v5 (provider docs, UNVERIFIED here).
+- Outbound: in virtual networks created after 2025-09-30 subnets have no default outbound access, so the host needs a NAT gateway or a public IP for PrepHost's downloads (provider docs, UNVERIFIED here).
+- 168.63.129.16 (WireServer, Azure DNS) is not link-local; the M2 egress table drops VM connections to it (§6.5). Guests use their own DNS upstreams, not Azure DNS.
 - Secondary ipconfigs, each with a Public IP: `fabric` + `nat`. The agent and cloud-init must not configure them.
 - NSG: allow all to the pool private IPs.
 - IPv6: Azure NATs IPv6, so use `ula`.
