@@ -1288,17 +1288,16 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect { nx.wait_sshable }.to hop("wait")
     end
 
-    it "counts a failed probe and naps" do
-      refresh_frame(nx, new_values: {"netns_probe_tries" => 3})
+    it "naps after a failed probe" do
       expect(sshable).to receive(:_cmd).with(probe_command, log: false).and_raise(Sshable::SshError.new(probe_command, "", "", 1, nil))
       expect { nx.wait_sshable }.to nap(5)
-      expect(nx.netns_probe_tries).to eq 4
     end
 
-    it "gives up probing after the last try and lets the VM run" do
-      refresh_frame(nx, new_values: {"netns_probe_tries" => described_class::NETNS_PROBE_TRIES})
+    it "gives up probing before the wait deadline start registers" do
+      expect(described_class::NETNS_PROBE_SECONDS).to be < 10 * 60
+      vm.update(allocated_at: Time.now - described_class::NETNS_PROBE_SECONDS - 1)
       expect(sshable).not_to receive(:_cmd)
-      expect(Clog).to receive(:emit).with("byoh netns probe gave up", {byoh_netns_probe: {vm_ubid: vm.ubid, vm_host_ubid: vm_host.ubid, tries: described_class::NETNS_PROBE_TRIES}})
+      expect(Clog).to receive(:emit).with("byoh netns probe gave up", {byoh_netns_probe: {vm_ubid: vm.ubid, vm_host_ubid: vm_host.ubid, waited: described_class::NETNS_PROBE_SECONDS + 1}})
       expect(Clog).to receive(:emit).with("vm provisioned", instance_of(Array))
       expect { nx.wait_sshable }.to hop("wait")
     end

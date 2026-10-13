@@ -13,11 +13,13 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   subject_is :vm
   frame_reader :distinct_storage_devices, :exclude_host_ids, :exclude_data_centers, :gpu_count, :gpu_device,
     :force_host_id, :storage_volumes, :ch_version
-  frame_accessor :reason_determined, :netns_probe_tries
+  frame_accessor :reason_determined
 
-  # How often wait_sshable probes a VM the control plane cannot reach from
-  # the host's network namespace, 5 seconds apart, before giving up.
-  NETNS_PROBE_TRIES = 120
+  # How long after allocation wait_sshable keeps probing a VM the control
+  # plane cannot reach from the host's network namespace. It stays under
+  # the 10-minute deadline start registers for reaching wait, leaving
+  # room for the last probe and the hop.
+  NETNS_PROBE_SECONDS = 8 * 60
 
   def vm_name
     @vm_name ||= vm.inhost_name
@@ -281,13 +283,13 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     vm.byoh_host? && !boots_from_customer_machine_image? && !vm.private_ipv4.nil?
   end
 
-  # Naps until sshd answers inside the VM's network namespace. After
-  # NETNS_PROBE_TRIES failures it logs and lets the VM run, so a guest
-  # without sshd is not stuck.
+  # Naps until sshd answers inside the VM's network namespace. Once
+  # NETNS_PROBE_SECONDS have passed since allocation it logs and lets the
+  # VM run, so a guest without sshd is not stuck and does not page.
   def probe_from_netns
-    tries = netns_probe_tries.to_i
-    if tries >= NETNS_PROBE_TRIES
-      Clog.emit("byoh netns probe gave up", {byoh_netns_probe: {vm_ubid: vm.ubid, vm_host_ubid: host.ubid, tries:}})
+    waited = Time.now - vm.allocated_at
+    if waited >= NETNS_PROBE_SECONDS
+      Clog.emit("byoh netns probe gave up", {byoh_netns_probe: {vm_ubid: vm.ubid, vm_host_ubid: host.ubid, waited: waited.round}})
       return
     end
 
@@ -295,7 +297,6 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       host.sshable.cmd("sudo timeout 3 ip netns exec :vm_name bash -c :probe",
         vm_name:, probe: ":>/dev/tcp/#{vm.private_ipv4}/22", log: false)
     rescue Sshable::SshError
-      self.netns_probe_tries = tries + 1
       nap 5
     end
   end
