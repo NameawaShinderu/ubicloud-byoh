@@ -42,7 +42,7 @@ Product direction from the user:
 | `origin` | github.com/ubicloud/ubicloud | upstream |
 | `byoh-fork` | github.com/NameawaShinderu/ubicloud-byoh | our fork; push here |
 | local `main` | 43a2241e2 (2026-04-10) | old merge base; stale since the M1 merge |
-| local `byoh-driver` | tracks `byoh-fork/byoh-driver` | contains the M1 merge of origin/main fad16215c (§8) |
+| local `byoh-driver` | tracks `byoh-fork/byoh-driver` | contains the M1 merge of origin/main fad16215c (§8) and M2 (§8a); `m2-network` was merged into it at 17d383a9c, which runs live since 2026-10-13 |
 | `byoh-fork/dependabot/*` | fae63fb24, a20708ee0 | only Gemfile.lock bumps on top of 06f359de4 |
 | `origin/main` | fad16215c (committed 2026-10-09) | fetched 2026-10-11 |
 
@@ -111,9 +111,9 @@ Product direction from the user:
 | `.gitignore` | M | `/backups/` |
 | `spec/lib/hosting/{generic_apis,redfish_client}_spec.rb`, `spec/lib/byoh_registration_spec.rb`, `spec/lib/byoh_registration_end_to_end_spec.rb` | A | BYOH specs; every BYOH file is at 100% line and branch coverage. |
 | `spec/prog/vm/host_nexus_spec.rb` | M | Adds a "generic (BYOH) provider" block (+10 `it` blocks, 81 in total). |
-| `scripts/byoh/bootstrap-ctrl-plane.sh`, `bootstrap-data-plane.sh`, `providers/aws-routed-network-setup.sh`, `README.md` | A | Ops tooling. |
+| `scripts/byoh/bootstrap-ctrl-plane.sh`, `bootstrap-data-plane.sh`, `README.md` | A | Platform-neutral ops tooling. `providers/aws-routed-network-setup.sh` is retired and broken. |
 | `terraform/aws-byoh/*` | A | VPC 10.98.0.0/16; t3.medium control plane; m5d.metal data plane with `source_dest_check=false`; 3 secondary IPs + EIPs. |
-| `docs/byoh/{QUICKSTART,SETUP,SETUP_PROXMOX}.md`, `docs/providers/generic.md` | A | Docs. Many errors; see §10. |
+| `docs/byoh/{QUICKSTART,SETUP,SETUP_PROXMOX}.md`, `docs/providers/generic.md` | A | Docs, rewritten for M2 on 2026-10-13: SETUP is platform-neutral with an "AWS-specific (optional)" section; SETUP_PROXMOX is the Proxmox runbook (UNVERIFIED). `SETUP_PROXMOX_LOWTIER.md` is superseded, `deploy-scripts/` unsupported (they exit unless `BYOH_RUN_UNSUPPORTED_DEPLOY_SCRIPTS=1`). |
 
 **GenericApis methods** (`lib/hosting/generic_apis.rb`):
 
@@ -141,7 +141,7 @@ The file and class names are load-bearing: `"generic"` must resolve to `Hosting:
 2. Create the `VmHost`:
    - `location_id` = the BYOH location named by the required `--location` (create it first with `bin/byoh-location create`). Before M2 every generic host landed in `Location::HETZNER_FSN1_ID`; such legacy hosts keep M1 behaviour until `bin/byoh-host move-location`.
    - `family` = "standard"; `ndp_needed` = false.
-   - `net6` = the first IPv6 routed network. If none is given, `ByohRegistration` appends a **random ULA /64**.
+   - `net6` = the first IPv6 routed network. If none is given, `ByohRegistration` draws an unused /64 from the location's `ula48`.
    - Because `net6` is set, `LearnNetwork` is skipped (`host_nexus.rb:116`), and `ip6` stays NULL.
 3. Create the `HostProvider`:
    - `provider_name` = "generic"; `server_identifier` defaults to `byoh-<vm_host uuid>` (the help text wrongly says "random").
@@ -191,8 +191,7 @@ The file and class names are load-bearing: `"generic"` must resolve to `Hosting:
   - free hugepages and cores
   - **enabled `storage_devices` rows with enough `available_storage_gib`** (INNER JOIN)
   - `accepts_slices` matches
-- **The allocator INNER JOINs `available_ipv4`.** A host with no free `ipv4_address` row is never a candidate, **even for IPv6-only VMs**.
-  - So declare at least one real IPv4 block or `/32` besides the management IP.
+- **The allocator LEFT JOINs `available_ipv4`** and filters on it only when the VM asks for IPv4 (`scheduling/allocator.rb`). A host with no pool takes IPv6-only VMs, whose IPv4 egress goes through the host NAT. An IPv4 VM needs a free address whose pool exposure matches its `ip4_exposure` (`internet` → `public`/`nat`, `internal` → `internal`).
 - `Config.default_boot_image_name` = **ubuntu-jammy**. Either download jammy too, or always pick ubuntu-noble explicitly.
 - `enable_ip4` defaults to false.
 - Failure message: `"no space left on any eligible host"`. The VM sets `waiting_for_capacity` and pages after 10 minutes.
@@ -204,17 +203,15 @@ The file and class names are load-bearing: `"generic"` must resolve to `Hosting:
   - `ip route replace <vm-ip>/32 dev vetho<vm>` plus proxy_arp
   - netns DNAT public→private, and SNAT only toward non-RFC1918 destinations (`rhizome/host/lib/vm_setup.rb`)
   - the nftables allowed set
-- `wait_sshable` TCP-connects **from the control plane to `<vm ip4>:22`**, but only when the VM has IPv4. If it cannot connect, the VM stays at `wait_sshable` indefinitely and pages after 10 minutes.
+- `wait_sshable` TCP-connects from the control plane to `cp_reach_ip4:22`: the pool address with `cp_reach: onhost`, the public address with `public`. A VM with no address the control plane can reach (internal with `cp_reach: public`, or no IPv4) is probed from the host with `ip netns exec` instead. If nothing connects, the VM stays at `wait_sshable` and pages after 10 minutes.
 
 | Environment | Operator pre-work |
 |---|---|
-| Real bare-metal providers (Hetzner, OVH, Leaseweb…) | Order a routed block; the provider routes it |
-| AWS (shipped tooling) | ENI secondary private IPs, each registered as a `/32`; src/dst check off; 1:1 EIPs (`terraform/aws-byoh` **or** `aws-routed-network-setup.sh`, never both). `--main-ip` = the data plane's **private** IP |
-| AWS (alt, `docs/providers/generic.md`) | VPC `create-route <cidr> → ENI` plus src/dst check off. This works **only for a CIDR outside the VPC CIDR**. Commit d1f9ee2d8: 10.99.100.0/29 inside the VPC wasn't routable, so the setup switched to secondary IPs + EIPs |
-| Homelab router | Static route for the block → data-plane IP |
-| Proxmox as router | `ip route add <cidr> via <data-plane-VM-IP>` + ip_forward on the Proxmox host |
-| Same-L2 pool (fork deploy scripts) | Pool `/32`s on the bridge subnet; relies on host proxy_arp (UNVERIFIED) |
-| Single IP only | **Does not work today:** zero pool rows means the host is never a candidate |
+| Real bare-metal providers (Hetzner, OVH, Leaseweb…) | Order a routed block; `routed` + `public` |
+| AWS (`terraform/aws-byoh`) | ENI secondary private IPs as `/32`s with 1:1 EIPs, `fabric` + `nat`; the cloud-init C5 fix. `--main-ip` = the data plane's **private** IP. `aws-routed-network-setup.sh` and in-VPC route-table routes are retired |
+| Homelab or pfSense router | Static route for the block → the data-plane IP (on Proxmox, the data-plane **VM**), `routed` |
+| Proxmox / LAN (SETUP_PROXMOX.md) | Pool range on the LAN outside DHCP, `onlink` + `internal`, or `onlink` + `nat` via pfSense 1:1 NAT; proxy_arp answers (UNVERIFIED on any platform) |
+| Single IP only | IPv6-only VMs work, with IPv4 egress through the host NAT; IPv4 VMs need a pool |
 
 ## 5. Deployment flow (real commands)
 
@@ -225,14 +222,14 @@ Ubuntu 24.04, run as a non-root sudo user.
 1. `git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud`
    - **The bootstrap does not clone.** Step 5 exits 1 if the repo is missing.
 2. `bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh`
-   - Env overrides: `UBI_REPO_DIR`, `UBI_RUBY_VERSION` (4.0.2), `UBI_NODE_VERSION` (24.12.0), `UBI_DB_NAME` (**clover_test**), `UBI_RACK_ENV` (development), `UBI_START_SERVICES`.
+   - Env overrides: `UBI_REPO_DIR`, `UBI_RUBY_VERSION` (4.0.7), `UBI_NODE_VERSION` (24.12.0), `UBI_DB_NAME` (**clover_test**), `UBI_RACK_ENV` (development), `UBI_START_SERVICES`, `UBI_START_MONITOR` (0), `UBI_BILLING_RATES_DIR` (`~/ubicloud-billing-rates.d`).
    - It installs PG16 and creates roles `clover` (superuser) and `clover_password`.
    - It sets **pg_hba to trust** for local and loopback connections.
-   - It writes `.env.rb` (chmod 600; never overwritten if it exists) and runs `bin/rake-task-runner migrate "" 0`.
+   - It writes `.env.rb` (chmod 600; never overwritten if it exists), including `BILLING_RATES_EXTRA_DIR`, and runs `bin/rake-task-runner migrate "" 0`.
    - It starts tmux sessions **`puma`** and **`respirate`**. Logs go to `/tmp/{puma,respirate}.{log,err}`.
    - Markers live in `~/.ubi-bootstrap/`. The `migrations` and `caches-refreshed` markers are permanent, so **delete them after pulling new migrations**.
-   - **`bin/monitor` and `bin/restarter` are not started**, and nothing survives a reboot.
-3. Ruby is not on the interactive PATH. `export PATH=~/.local/share/mise/installs/ruby/4.0.2/bin:$PATH`
+   - `bin/monitor` starts only with `UBI_START_MONITOR=1` (leave it off for EBS/virtio hosts, PLATFORMS F5); `bin/restarter` is not used, and nothing survives a reboot.
+3. Ruby is not on the interactive PATH. `export PATH=~/.local/bin:~/.local/share/mise/installs/ruby/4.0.7/bin:$PATH`. `~/.local/bin` (mise) is needed by `bundle install`.
 4. Open the UI at `http://<ctrl>:3000/create-account`. **No admin account is seeded.**
    - The verification email goes to the logger, so look in `/tmp/puma.log`, not the tmux pane.
 
@@ -241,7 +238,7 @@ Ubuntu 24.04, run as a non-root sudo user.
 Ubuntu 24.04 with KVM, outbound internet, and root SSH from the control plane.
 
 - Run `scripts/byoh/bootstrap-data-plane.sh`, or use terraform's `user-data-data.sh`.
-  - It does openssh, `PermitRootLogin prohibit-password`, and a ruby-bundler pre-install.
+  - It does openssh, `PermitRootLogin prohibit-password`, and pre-installs ruby-bundler and netcat-openbsd (the gate's netns proxy).
 - Put the control plane's **public** key into `/root/.ssh/authorized_keys` **before** registering.
 - Do the L3 pre-work from §4.
 
@@ -260,7 +257,7 @@ RACK_ENV=development bundle exec bin/register-byoh-host \
 
 - `--ssh-key` must be an unencrypted OpenSSH Ed25519 key.
 - Run the CLI from the repo root with a working `.env.rb`; it loads `db.rb` and `loader.rb`.
-- On `m2-network` (M2), `--location` is **required** and must name a BYOH location created with `bin/byoh-location create` (§8a). Before M2 it was a label that defaulted to `byoh`.
+- `--location` is **required** and must name a BYOH location created with `bin/byoh-location create` (§8a). Pools are optional: `--pool-file` and `--routed-network` add to each other; with none, only IPv6-only VMs place.
 - Terraform: SSH ingress comes from `var.operator_ssh_cidr` (default 0.0.0.0/0), and ports 3000 and 443 are hard-coded open to the world.
 - Boot images live only in the strand stack. To add one later, run `vm_host.download_boot_image("name")` in `bin/pry`.
 
@@ -273,7 +270,8 @@ RACK_ENV=development bundle exec bin/register-byoh-host \
   - Each block must be ≤ /24 and network-aligned.
   - Keep the management IP **outside** declared blocks.
   - IPv6 must be /64.
-- Bring-up to `accepting` takes about 15–25 minutes, including one host reboot.
+- Bring-up to `accepting` takes about 15–25 minutes on bare metal (about 4 on a nested-virt VM), including one host reboot.
+- Runbooks: `docs/byoh/SETUP.md` (any platform), `SETUP_PROXMOX.md`, `QUICKSTART.md`.
 
 ### Change the IP pool later
 
@@ -401,12 +399,14 @@ How the 22 conflicts were resolved:
    - The `ipv4_address` count is unchanged.
    - `vm_host_cpu` has `io` and no `spdk`.
    - `host_provider.config` is intact.
+   - Put `~/.local/bin` (mise) on PATH first, or `bundle install` fails with "No such file or directory - mise" (live, 2026-10-13).
 6. Start the services, then run `VmHost.all.each(&:install_rhizome)` in pry. Existing hosts keep running VMs; recreate VMs only if they need the new rhizome behaviour.
+   - **Upgrade vhost-block-backend** on hosts registered before M1: they have v0.2.2, new VMs need `version_code >= 401`, and without it every VM create fails with "No capacity left" (live, 2026-10-13): `VmHost.all.each { Prog::Storage::SetupVhostBlockBackend.assemble(it.id, Config.vhost_block_backend_version, allocation_weight: 100) }`. Resolve the stale "No capacity left" page by hand afterwards.
 7. SSH host keys are now TOFU-pinned on first connect. Reinstalling a host's OS requires destroying and re-registering the VmHost.
 
 ## 8a. M2 network contract (branch `m2-network`)
 
-Plan: WP1–WP10. Runbooks: `docs/byoh/VERIFY.md`, `docs/byoh/POOL_OPERATIONS.md`.
+Plan: WP1–WP10. Runbooks: `docs/byoh/VERIFY.md`, `docs/byoh/POOL_OPERATIONS.md`. Live since 2026-10-13 (VERIFY.md §5).
 
 - **Migration** `migrate/20261013_byoh_network_contract.rb`. **Never rename an applied migration** (a rename is what forced §8 step 3). Its `down` refuses while M2 data exists.
   - **Run `bin/byoh-host export-audit --out backups/audit-<ts>.jsonl` before any `down`**; the guard trusts only the table comment that export writes.
@@ -415,7 +415,7 @@ Plan: WP1–WP10. Runbooks: `docs/byoh/VERIFY.md`, `docs/byoh/POOL_OPERATIONS.md
   - `bin/register-byoh-host` (`--location` required, `--pool-file`, `--ipv6-mode`),
   - `bin/byoh-host` (move-location, setup-egress-nat, export-audit),
   - `bin/byoh-pool` (list/export/add/remove/remap/annotate/ipv6 set/verify/trace),
-  - `scripts/byoh/verify/m2-checks` (read-only gate checks) and `m2-gate.sh`.
+  - `scripts/byoh/verify/m2-checks` (read-only gate checks) and `m2-gate.sh`. The gate reaches VMs with `ssh -n -o ProxyCommand="ssh root@<host> ip netns exec <inhost> nc %h %p" ubi@<private_ipv4>` (`m2-checks info` prints both), never over IPv6 (§10 #7). Platform knobs: `GATE_IPV6_MODE`, `GATE_EXPECT_MONITOR` (default 0), `GATE_VM_A_EXPOSURE` (nat/public). A moved host's missing register audit row is INFO.
 - **Billing overlay:** `BILLING_RATES_EXTRA_DIR` (no `CLOVER_` prefix) in `.env.rb`. **web, respirate and monitor all need it**; restart all three after `byoh-location create --rates-from` or `rates`. Back the directory up with the DB.
 - **Gating (C14):** `VmHost#byoh?` = generic provider **and** BYOH location. A generic host still in hetzner-fsn1 behaves exactly like M1.
 - **Egress NAT:** the flat prog `prog/setup_byoh_egress_nat.rb` (`Prog::SetupByohEgressNat`, no namespace module) installs `/etc/nftables.d/1-byoh-egress.conf` (table `inet byoh_egress`) on BYOH hosts, or removes it from a host that left BYOH. HostNexus `prep` buds it for BYOH hosts; `bin/byoh-host move-location` starts it for a host past prep (and, with `--rollback-to`, to remove it, after resetting the host's pools to `routed`/`public`); `bin/byoh-location set` starts it on every host past prep when the egress keys change; `bin/byoh-host setup-egress-nat` reinstalls it by hand. The table also has an input chain that drops VM connections to the host's own deny4 addresses.
@@ -438,7 +438,7 @@ Code:
 4. The BMC password can be stored in plaintext despite the comment in `byoh_registration.rb`.
 5. Hardware Reset without a BMC wedges the strand (`CapabilityMissing` retried forever), and admin "Power On" without a BMC returns a 500. Still open after M1.
 6. ~~The leaseweb `setup_ssh_keys` behaviour changed~~: fixed in M1 (only generic hosts skip the root-key bootstrap).
-7. Default ULA net6 plus the in-netns `2000::/3` route: private IPsec between VMs is likely broken. Inferred, UNVERIFIED.
+7. Default ULA net6 plus the in-netns `2000::/3` route. **Verified (live, 2026-10-13):** the host cannot reach a VM over IPv6 on a ULA host ("No route to host"), because the VM namespace routes only `2000::/3` back. Reach VMs with `ip netns exec <inhost> nc` instead (VERIFY.md §1.4). Private IPsec between VMs on ULA hosts is likely broken for the same reason (UNVERIFIED).
 8. Validation gaps:
    - No IPv4 size/overlap check (more than /24 fails late in `Address#validate`).
    - Host-bit CIDRs are probably silently normalized by NetAddr (UNVERIFIED).
@@ -450,9 +450,9 @@ Code:
 Scripts:
 - The bootstrap DB is named `clover_test` while running in development.
 - pg_hba is set to trust.
-- No monitor or restarter.
+- Monitor is opt-in (`UBI_START_MONITOR=1`); no restarter.
 - Migration markers are permanent.
-- `aws-routed-network-setup.sh`:
+- `aws-routed-network-setup.sh` (retired; nothing recommends it any more):
   - reads the region before installing aws-cli
   - doesn't install `unzip`
   - assumes a /24 subnet
@@ -462,23 +462,9 @@ Scripts:
   - doesn't update net6
   - prints the global pool
 
-Docs (SETUP.md and SETUP_PROXMOX.md are the least trustworthy; QUICKSTART is the most accurate):
-- They pass `--provider generic`.
-- They `curl|bash` without cloning first.
-- tmux names are `ctrl-plane-*`; the real ones are `puma`/`respirate`.
-- `rake db:migrate` (doesn't exist).
-- A manual `.env.rb` with a quoted heredoc and missing vars.
-- A "Created location" output that never happens.
-- The VM location given as the label; it is really eu-central-h1.
-- Invented labels, `ubi-spdk.service`, `/var/log/ubi-rhizome`, `/opt/rhizome-host`.
-- A broken strand-watch Ruby loop.
-- 10.99 vs 10.98 IPs.
-- A claim that terraform attaches SSM; it doesn't.
-- A dangerous "delete the location row" step.
-- A broken `TESTING.md` link.
-- Contradictory claims that SPDK/NVMe is required.
+Docs: SETUP.md, QUICKSTART.md, SETUP_PROXMOX.md and `docs/providers/generic.md` were rewritten for M2 on 2026-10-13 (the old errors: `--provider`, no location, invented labels and outputs, SPDK/NVMe claims, the route-via-Proxmox-node next hop). Still stale: `SETUP_PROXMOX_LOWTIER.md` (marked superseded) and NETWORKING §4 packet walks (AWS values, labelled). SETUP_PROXMOX.md has never been run on Proxmox (UNVERIFIED).
 
-Fork deploy-scripts (06f359de4):
+Fork deploy-scripts (06f359de4; unsupported, every script exits unless `BYOH_RUN_UNSUPPORTED_DEPLOY_SCRIPTS=1`):
 - `04` does ctrl→data `ssh ubuntu@` with no key and no `-A`, which blocks `99-deploy-all`.
 - `|tee` without pipefail.
 - AMD nested check broken.
@@ -490,6 +476,8 @@ Fork deploy-scripts (06f359de4):
 - `--cipassword ubuntu` and `PermitRootLogin yes`.
 
 ## 10a. Validated deployment: AWS with nested virtualization (2026-10-11)
+
+**Live environment now (2026-10-13):** the control plane runs `byoh-driver` 17d383a9c (M1 + M2, Ruby 4.0.7). The host is in BYOH location `byoh-aws-aps1` (`--ula48 fd1b:3821:6123::/48`), with `fabric`/`nat` pools carrying the EIPs. `BILLING_RATES_EXTRA_DIR=/home/ubuntu/ubicloud-billing-rates.d`. **The data-plane instance is stopped to save cost**; start it before any work. Window results are in VERIFY.md §5.
 
 The full flow was proven on non-metal EC2: register → `accepting` in about 4 minutes, VM create and destroy, host reboot recovery, Elastic IP ingress, egress, DNS, apt, and web login.
 
