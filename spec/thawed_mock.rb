@@ -46,7 +46,7 @@ module ThawedMock
   allow_mocking(Time, :now)
 
   # Database
-  allow_mocking(DB, :[], :get, :copy_table)
+  allow_mocking(DB, :[], :get, :copy_table, :run)
 
   # Models
   allow_mocking(Account, :[])
