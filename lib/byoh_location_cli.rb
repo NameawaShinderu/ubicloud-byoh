@@ -205,15 +205,21 @@ class ByohLocationCli
     changes = {}
     changes[:ui_name] = opts[:ui_name] if opts[:ui_name]
     changes[:byoh_network] = Sequel.pg_jsonb(new_profile) if new_profile != old_profile
-    DB.transaction do
+    # The egress table holds the location's deny lists, so a change must
+    # reach every host now: VM setup keeps a table that is already loaded.
+    # A host before prep gets the new settings from prep.
+    egress_changed = ByohNetworkProfile.new(old_profile).egress_nat4_params != ByohNetworkProfile.new(new_profile).egress_nat4_params
+    strands = DB.transaction do
       location.update(changes) unless changes.empty?
       audit("set", location, {ui_name: opts[:ui_name], byoh_network: new_profile}.compact)
+      next [] unless egress_changed
+
+      VmHost.where(location_id: location.id).order(:id).all.select { ByohHostCli.past_prep?(it) }.map do |host|
+        [host, Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}])]
+      end
     end
     @out.puts "Updated location #{location.name}."
-    if ByohNetworkProfile.new(old_profile).egress_nat4_params != ByohNetworkProfile.new(new_profile).egress_nat4_params &&
-        !VmHost.where(location_id: location.id).empty?
-      @out.puts "The host egress NAT settings changed; apply them to each host with: bin/byoh-host setup-egress-nat --host UBID"
-    end
+    strands.each { |host, strand| @out.puts "Started #{strand.ubid} to install the new egress NAT settings on host #{host.ubid}." }
     update_visibility(location, opts[:visible]) unless opts[:visible].nil?
     print_warnings
   end

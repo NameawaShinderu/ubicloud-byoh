@@ -249,13 +249,16 @@ RSpec.describe ByohLocationCli do
       expect(audit_rows.map { it[:command] }).to eq ["byoh-location set"]
     end
 
-    it "tells the operator to reapply changed egress NAT settings to the hosts" do
-      create_vm_host(location_id: location.id)
+    it "reapplies changed egress NAT settings to the hosts past prep" do
+      host = create_vm_host(location_id: location.id)
+      early = create_vm_host(location_id: location.id, allocation_state: "unprepared")
+      Strand.create_with_id(early, prog: "Vm::HostNexus", label: "bootstrap_rhizome")
       expect(cli("set", "--location", location.name, "--guest-mtu", "1500")[1]).to eq "Updated location byoh-1.\n"
-      expect(cli("set", "--location", location.name, "--egress-smtp")[1]).to eq <<~OUT
-        Updated location byoh-1.
-        The host egress NAT settings changed; apply them to each host with: bin/byoh-host setup-egress-nat --host UBID
-      OUT
+      expect(Strand.where(prog: "SetupByohEgressNat").count).to eq 0
+      output = cli("set", "--location", location.name, "--egress-smtp")[1]
+      strand = Strand.first(prog: "SetupByohEgressNat")
+      expect(output).to eq "Updated location byoh-1.\nStarted #{strand.ubid} to install the new egress NAT settings on host #{host.ubid}.\n"
+      expect([Strand.where(prog: "SetupByohEgressNat").count, strand.stack]).to eq [1, [{"subject_id" => host.id}]]
     end
 
     it "changes ula48 only while the location has no hosts" do
