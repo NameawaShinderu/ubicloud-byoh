@@ -338,12 +338,14 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       end
 
       # An internal address is not billed. A nat address is billed under
-      # its external IP, which is the one customers see.
+      # its external IP, which is the one customers see, written as a /32
+      # like the pool address other IPv4 records carry.
       if vm.ip4_enabled && vm.public_ip4_scope != "internal"
+        external_ip = vm.assigned_vm_address.external_ip
         BillingRecord.create(
           project_id: project.id,
           resource_id: vm.id,
-          resource_name: vm.assigned_vm_address.external_ip&.to_s || vm.assigned_vm_address.ip,
+          resource_name: external_ip ? "#{external_ip}/32" : vm.assigned_vm_address.ip,
           billing_rate_id: BillingRate.from_resource_properties("IPAddress", "IPv4", vm.location.name)["id"],
           amount: 1,
         )

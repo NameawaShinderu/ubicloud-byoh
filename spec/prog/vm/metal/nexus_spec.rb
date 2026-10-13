@@ -1361,7 +1361,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       assign("nat", external_ip: "8.8.8.10")
       expect { nx.create_billing_record }.to hop("prep")
       record = vm.active_billing_records.find { it.billing_rate["resource_type"] == "IPAddress" }
-      expect(record.resource_name).to eq "8.8.8.10"
+      expect(record.resource_name).to eq "8.8.8.10/32"
     end
   end
 
