@@ -11,6 +11,13 @@ require "fileutils"
 # metadata service, and keeps host-NAT traffic off the networks in deny4:
 # the site underlay, the control plane and the hosts' management networks.
 #
+# Only connections a VM opens are dropped: replies to a host-NAT VM's
+# vethi address, as from another VM on the host, must pass. The namespace
+# NAT leaves traffic to RFC 1918 networks with the VM's private source, so
+# the RFC 1918 part of deny4 is matched by interface, for every VM, as such
+# traffic cannot be answered off the host anyway; traffic between VMs on
+# the host is left alone.
+#
 # The table lives in its own file, included from /etc/nftables.conf like
 # the other /etc/nftables.d files, so it survives reboots and the
 # "systemctl reload nftables" that VM setup runs.
@@ -50,7 +57,8 @@ module ByohEgressNat
 
         chain forward {
           type filter hook forward priority filter - 1; policy accept;
-          iifname "vetho*" ip daddr 169.254.0.0/16 counter drop
+          iifname "vetho*" ip daddr 169.254.0.0/16 ct direction original counter drop
+          iifname "vetho*" oifname != "vetho*" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } ip daddr @deny4 ct direction original counter drop
           ip saddr 169.254.0.0/16 ip daddr @deny4 counter drop
       #{smtp_drop}    ip saddr 169.254.0.0/16 ct state new add @per_src { ip saddr ct count over #{MAX_CONNECTIONS} } counter drop
         }
