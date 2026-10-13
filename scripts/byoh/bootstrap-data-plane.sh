@@ -50,6 +50,32 @@ if ! grep -q 'VERSION_ID="24.04"' /etc/os-release 2>/dev/null; then
 fi
 echo "  $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
 
+# --- Step 1b: hardware virtualization ----------------------------------
+# The same checks prep runs after registration (rhizome/host/lib/kvm_check.rb
+# and Prog::SetupHugepages), made here so a host that can never run VMs,
+# such as a VPS without nested virtualization, is refused before it is
+# registered rather than looping in PrepHost.
+step "1b. hardware virtualization"
+virt_hint="Enable VT-x/AMD-V in the firmware on bare metal. On a cloud VM, use an instance type with nested virtualization enabled (AWS m8i/c8i/r8i with nested virtualization, GCP --enable-nested-virtualization, an Azure size that supports nested virtualization) or a bare-metal type. On Proxmox: qm set <vmid> --cpu host. A VPS without nested virtualization cannot be a data plane."
+if [ ! -c /dev/kvm ]; then
+  echo "ERROR: /dev/kvm is missing, so KVM is unavailable." >&2
+  echo "  $virt_hint" >&2
+  exit 1
+fi
+if [ "$(uname -m)" = "x86_64" ]; then
+  if ! grep -Eqw 'vmx|svm' /proc/cpuinfo; then
+    echo "ERROR: the CPU has neither the vmx nor the svm flag." >&2
+    echo "  $virt_hint" >&2
+    exit 1
+  fi
+  if ! grep -qw pdpe1gb /proc/cpuinfo; then
+    echo "ERROR: the CPU lacks the pdpe1gb flag, so it cannot use 1G hugepages (Prog::SetupHugepages)." >&2
+    echo "  On Proxmox use CPU type host; on a cloud VM pick a newer instance family." >&2
+    exit 1
+  fi
+fi
+echo "  /dev/kvm present$( [ "$(uname -m)" = "x86_64" ] && echo ", vmx/svm and pdpe1gb flags present")"
+
 # --- Step 2: openssh-server ------------------------------------------
 step "2. openssh-server"
 if is_done sshd-installed; then
