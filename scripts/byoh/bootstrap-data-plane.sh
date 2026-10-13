@@ -6,8 +6,9 @@
 # Prepares a fresh Ubuntu 24.04 LTS host to be registered as a BYOH
 # (generic provider) data plane by the Ubicloud control plane. This
 # script does the absolute minimum — Ubicloud's rhizome agent + the
-# prep_host.rb prog will install SPDK, cloud-hypervisor, nftables rules,
-# hugepages, firmware, boot images, etc. via SSH after registration.
+# prep_host.rb prog will install cloud-hypervisor, vhost-block-backend,
+# nftables rules, hugepages, firmware, boot images, etc. via SSH after
+# registration.
 #
 # What this script does:
 #   1. Verify Ubuntu 24.04 LTS
@@ -19,13 +20,14 @@
 #   5. Print instructions for installing the control plane's SSH pubkey
 #
 # What this script does NOT do:
-#   - Install SPDK, cloud-hypervisor, qemu, KVM — rhizome does that
-#   - Configure network interfaces — that's your provider pre-work
-#     (see docs/providers/generic.md → "Making declared routed_networks
-#     actually reachable per environment")
+#   - Install cloud-hypervisor or the storage backend — rhizome does that
+#   - Configure network interfaces — that's your site's pre-work (see
+#     docs/byoh/NETWORKING.md section 9). Never put pool IPs on the NIC.
 #   - Open firewall ports — SSH 22 from the control plane is all you need
 #
-# Tested against: Ubuntu 24.04.2 LTS (Noble) on AWS m5d.metal.
+# Platform-neutral: the same steps on bare metal, a cloud VM with nested
+# virtualization, or a Proxmox VM. Tested on AWS (m5d.metal and
+# m8i.2xlarge); other platforms are UNVERIFIED.
 #
 # Usage:
 #   ./scripts/byoh/bootstrap-data-plane.sh
@@ -96,7 +98,9 @@ if is_done bundler-preinstalled; then
 else
   export DEBIAN_FRONTEND=noninteractive
   sudo apt-get update
-  sudo apt-get install -y ruby-bundler
+  # netcat-openbsd: the gate (scripts/byoh/verify/m2-gate.sh) reaches
+  # VMs with "ip netns exec <vm> nc"; Ubuntu server images ship it.
+  sudo apt-get install -y ruby-bundler netcat-openbsd
   which bundle
   done_marker bundler-preinstalled
 fi
@@ -118,21 +122,22 @@ echo "  sudo bash -c 'echo \"<PUBKEY FROM CLI>\" >> /root/.ssh/authorized_keys'"
 echo ""
 echo "Then, on the control plane, run something like:"
 echo ""
+echo "  bundle exec bin/byoh-location create --name <site> ...   # once per site"
 echo "  bundle exec bin/register-byoh-host \\"
+echo "    --location <site> \\"
 echo "    --main-ip ${MY_IP:-<this-host-primary-ip>} \\"
-echo "    --routed-network <your-provider-routed-cidr> \\"
-echo "    --routed-network fd00:aa55::/64 \\"
-echo "    --location byoh-\$LOCATION \\"
+echo "    --pool-file pools.yaml \\"
 echo "    --ssh-key /path/to/ctrl-plane/privkey \\"
+echo "    --default-boot-image ubuntu-noble \\"
 echo "    --yes"
 echo ""
-echo "Provider-specific routing pre-work (what CIDR you declare above"
-echo "depends on your provider):"
-echo "  • Hetzner/OVH/Equinix/Leaseweb/Cherry/Latitude: order a routed"
-echo "    IP block via your provider panel, they handle the routing"
-echo "  • Proxmox/homelab: add a static route on your LAN router"
-echo "  • AWS: run scripts/byoh/providers/aws-routed-network-setup.sh"
-echo "  • Colocation: you already have BGP/static routing from upstream"
+echo "How the pool addresses reach this host depends on the site"
+echo "(docs/byoh/NETWORKING.md section 9):"
+echo "  • Rented bare metal (Hetzner/OVH/Leaseweb): a routed block, routed + public"
+echo "  • Proxmox or a LAN: pool IPs on the LAN segment, onlink + internal,"
+echo "    or onlink + nat behind 1:1 NAT (docs/byoh/SETUP_PROXMOX.md)"
+echo "  • AWS: ENI secondary IPs + EIPs from terraform/aws-byoh, fabric + nat"
+echo "  • Colocation: a static route or BGP, routed + public"
 echo ""
-echo "See docs/providers/generic.md → 'Making declared routed_networks"
-echo "actually reachable per environment' for the full matrix."
+echo "Setup guides: docs/byoh/SETUP.md (any platform) and"
+echo "docs/byoh/SETUP_PROXMOX.md."

@@ -9,14 +9,12 @@
 # re-running the script skips already-completed phases via marker files
 # under ~/.ubi-bootstrap/.
 #
-# This captures every manual command I ran on the AWS Mumbai test box
-# during Phase 1-7 validation. If you want a fresh ctrl plane on OVH, on
-# your Proxmox, or on another AWS region, run this script and it should
-# produce a byte-identical setup modulo secrets and DB state.
+# Nothing here depends on where the control plane runs: any Ubuntu 24.04
+# machine (cloud VM, Proxmox VM, bare metal) that can reach the data
+# plane hosts' management IPs over SSH works.
 #
-# Tested against: Ubuntu 24.04.2 LTS (Noble Numbat) on AWS t3.medium
-# and m5d.metal. Not tested on Debian/Rocky/Alma/Fedora — they'd likely
-# need apt vs dnf porting.
+# Tested on: Ubuntu 24.04 LTS on AWS (t3.medium, t3.large). Other
+# platforms are UNVERIFIED. Not for Debian/Rocky/Alma/Fedora.
 #
 # Usage:
 #   ./scripts/byoh/bootstrap-ctrl-plane.sh
@@ -28,6 +26,13 @@
 #   UBI_DB_NAME         default: clover_test
 #   UBI_RACK_ENV        default: development
 #   UBI_START_SERVICES  default: 1 (set to 0 to skip puma/respirate)
+#   UBI_START_MONITOR   default: 0 (set to 1 to also start bin/monitor;
+#                       see docs/byoh/PLATFORMS.md before you do: its
+#                       health checks misjudge hosts without by-id disk
+#                       links, such as AWS EBS and Proxmox virtio disks)
+#   UBI_BILLING_RATES_DIR default: $HOME/ubicloud-billing-rates.d (where
+#                       bin/byoh-location writes BYOH billing rates; set
+#                       as BILLING_RATES_EXTRA_DIR in .env.rb)
 #
 set -euo pipefail
 
@@ -38,6 +43,8 @@ UBI_NODE_VERSION="${UBI_NODE_VERSION:-24.12.0}"
 UBI_DB_NAME="${UBI_DB_NAME:-clover_test}"
 UBI_RACK_ENV="${UBI_RACK_ENV:-development}"
 UBI_START_SERVICES="${UBI_START_SERVICES:-1}"
+UBI_START_MONITOR="${UBI_START_MONITOR:-0}"
+UBI_BILLING_RATES_DIR="${UBI_BILLING_RATES_DIR:-$HOME/ubicloud-billing-rates.d}"
 
 MARKERS_DIR="$HOME/.ubi-bootstrap"
 mkdir -p "$MARKERS_DIR"
@@ -176,8 +183,13 @@ fi
 
 # --- Step 8: .env.rb (with random secrets) --------------------------
 step "8. .env.rb"
+mkdir -p "$UBI_BILLING_RATES_DIR"
 if [ -f .env.rb ]; then
   echo "  [skip] .env.rb already exists; not overwriting. Delete it manually if you want fresh secrets."
+  if ! grep -q BILLING_RATES_EXTRA_DIR .env.rb; then
+    echo "  WARNING: .env.rb does not set BILLING_RATES_EXTRA_DIR, so BYOH locations have no billing rates."
+    echo "  Add: ENV[\"BILLING_RATES_EXTRA_DIR\"] ||= \"$UBI_BILLING_RATES_DIR\""
+  fi
 else
   SESSION_SECRET=$(openssl rand -base64 64 | tr -d '\n')
   RUNTIME_SECRET=$(openssl rand -base64 64 | tr -d '\n')
@@ -191,6 +203,9 @@ ENV["CLOVER_SESSION_SECRET"] ||= "$SESSION_SECRET"
 ENV["CLOVER_DATABASE_URL"] ||= "postgres:///$UBI_DB_NAME?user=clover"
 ENV["CLOVER_COLUMN_ENCRYPTION_KEY"] ||= "$ENC_KEY"
 ENV["CLOVER_RUNTIME_TOKEN_SECRET"] ||= "$RUNTIME_SECRET"
+# bin/byoh-location writes the billing rates of BYOH locations here; web,
+# respirate and monitor load them from it.
+ENV["BILLING_RATES_EXTRA_DIR"] ||= "$UBI_BILLING_RATES_DIR"
 ENVRB
   chmod 600 .env.rb
   echo "  .env.rb created with random secrets (chmod 600)"
@@ -223,7 +238,7 @@ if [ "$UBI_START_SERVICES" = "1" ]; then
   if tmux has-session -t puma 2>/dev/null; then
     echo "  [skip] tmux session 'puma' already running (attach with: tmux attach -t puma)"
   else
-    tmux new-session -d -s puma "cd $UBI_REPO_DIR && export PATH=$RUBY_BIN:\$PATH && RACK_ENV=$UBI_RACK_ENV bundle exec puma -C puma_config.rb > /tmp/puma.log 2> /tmp/puma.err"
+    tmux new-session -d -s puma "cd $UBI_REPO_DIR && export PATH=$MISE_BIN:$RUBY_BIN:\$PATH && RACK_ENV=$UBI_RACK_ENV bundle exec puma -C puma_config.rb > /tmp/puma.log 2> /tmp/puma.err"
     echo "  tmux session 'puma' started → http://<host>:3000  (logs: /tmp/puma.log, /tmp/puma.err)"
   fi
 
@@ -231,8 +246,20 @@ if [ "$UBI_START_SERVICES" = "1" ]; then
   if tmux has-session -t respirate 2>/dev/null; then
     echo "  [skip] tmux session 'respirate' already running (attach with: tmux attach -t respirate)"
   else
-    tmux new-session -d -s respirate "cd $UBI_REPO_DIR && export PATH=$RUBY_BIN:\$PATH && RACK_ENV=$UBI_RACK_ENV bundle exec bin/respirate > /tmp/respirate.log 2> /tmp/respirate.err"
+    tmux new-session -d -s respirate "cd $UBI_REPO_DIR && export PATH=$MISE_BIN:$RUBY_BIN:\$PATH && RACK_ENV=$UBI_RACK_ENV bundle exec bin/respirate > /tmp/respirate.log 2> /tmp/respirate.err"
     echo "  tmux session 'respirate' started  (logs: /tmp/respirate.log, /tmp/respirate.err)"
+  fi
+
+  # Monitor (host and VM health checks); opt-in, see the header
+  if [ "$UBI_START_MONITOR" = "1" ]; then
+    if tmux has-session -t monitor 2>/dev/null; then
+      echo "  [skip] tmux session 'monitor' already running (attach with: tmux attach -t monitor)"
+    else
+      tmux new-session -d -s monitor "cd $UBI_REPO_DIR && export PATH=$MISE_BIN:$RUBY_BIN:\$PATH && RACK_ENV=$UBI_RACK_ENV bundle exec bin/monitor > /tmp/monitor.log 2> /tmp/monitor.err"
+      echo "  tmux session 'monitor' started  (logs: /tmp/monitor.log, /tmp/monitor.err)"
+    fi
+  else
+    echo "  bin/monitor not started (UBI_START_MONITOR=0): hosts are never marked unavailable"
   fi
 else
   step "11. services skipped (UBI_START_SERVICES=$UBI_START_SERVICES)"

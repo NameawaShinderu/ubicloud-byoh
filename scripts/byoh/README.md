@@ -1,11 +1,10 @@
 # BYOH bootstrap scripts
 
 Reproducible scripts for standing up the Ubicloud control plane and BYOH
-data plane on any Ubuntu 24.04 LTS host. Every manual step I performed
-on the AWS Mumbai test environment (mise, ruby, node, postgres, bundle
-install, npm build, migrations, cache refresh) is captured here so the
-same thing can be done on OVH, Proxmox, a laptop with libvirt, or a
-fresh AWS region — **zero manual steps**.
+data plane on any Ubuntu 24.04 LTS host. Nothing in them is specific to
+a platform. They were run on AWS only; on other platforms they are
+UNVERIFIED. The full runbooks are `docs/byoh/SETUP.md` (any platform)
+and `docs/byoh/SETUP_PROXMOX.md` (a Proxmox VM as the data plane).
 
 ## The two roles
 
@@ -14,7 +13,7 @@ A Ubicloud BYOH deployment needs two kinds of Linux hosts:
 | Role | What runs on it | Who runs this script | Script |
 |---|---|---|---|
 | **Control plane** | Postgres, clover (Roda/Puma), respirate dispatcher, `bin/register-byoh-host` CLI, web UI | You, once per deployment | `bootstrap-ctrl-plane.sh` |
-| **Data plane** | rhizome agent + SPDK + cloud-hypervisor + the VMs themselves | You, once per BYOH host you want to add | `bootstrap-data-plane.sh` |
+| **Data plane** | rhizome agent + vhost-block-backend + cloud-hypervisor + the VMs themselves | You, once per BYOH host you want to add | `bootstrap-data-plane.sh` |
 
 The control plane and data plane can be:
 - **Same host** (single-machine lab) — run both scripts on the same box
@@ -47,11 +46,16 @@ that are already done. Every step has a marker file under
 
 Environment variables you can override:
 - `UBI_REPO_DIR` — path to the ubicloud repo (default: `$HOME/ubicloud`)
-- `UBI_RUBY_VERSION` — Ruby version (default: `4.0.2`)
+- `UBI_RUBY_VERSION` — Ruby version (default: `4.0.7`)
 - `UBI_NODE_VERSION` — Node version (default: `24.12.0`)
 - `UBI_DB_NAME` — Postgres DB name (default: `clover_test`)
 - `UBI_RACK_ENV` — Rack env (default: `development`; use `test` only when running specs)
 - `UBI_START_SERVICES` — `1` to start puma + respirate in tmux after setup, `0` to skip (default: `1`)
+- `UBI_START_MONITOR` — `1` to also start `bin/monitor` in tmux (default: `0`; read `docs/byoh/PLATFORMS.md` first, as its health checks misjudge hosts without by-id disk links)
+- `UBI_BILLING_RATES_DIR` — where `bin/byoh-location` writes BYOH billing rates, written to `.env.rb` as `BILLING_RATES_EXTRA_DIR` (default: `$HOME/ubicloud-billing-rates.d`)
+
+The script does not clone the repository: clone it first
+(`git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud`).
 
 ## Usage — data plane
 
@@ -75,19 +79,22 @@ instructions for this step.
 The bootstrap scripts handle the UNIVERSAL parts. These environment-
 specific steps happen BEFORE you run `bin/register-byoh-host`:
 
-| Provider | Pre-work | How the operator does it |
-|---|---|---|
-| **Hetzner (dedicated)** | Order an additional `/29` via Robot UI → "route to server X" | Hetzner's core routers route automatically |
-| **OVH** | Order an IP block → "route to server X" | OVH handles routing; then `netplan apply` on the server |
-| **Equinix Metal / Latitude / Cherry / Leaseweb** | Same pattern via provider panel | Their core does routing |
-| **Proxmox + home router** | Add static route on router: `10.99.100.0/29 → <proxmox-ip>`; `sysctl net.ipv4.ip_forward=1` on Proxmox | Once — router config + sysctl |
-| **AWS** | Assign N secondary private IPs to the ENI + associate M EIPs (1-to-1 for public reachability); disable source/dest check | See `scripts/byoh/providers/aws-routed-network-setup.sh` |
-| **Colocation** | Your upstream routes the prefix to you | You already have this |
+Each pool is declared with a `delivery` (how packets reach the host) and
+an `exposure` (what the internet sees); see `docs/byoh/NETWORKING.md`
+sections 3 and 9. The driver code is the same everywhere.
 
-For AWS specifically, there's a helper script
-`scripts/byoh/providers/aws-routed-network-setup.sh` that takes AWS
-credentials + an ENI ID and does the EIP + secondary IP dance
-automatically.
+| Site | Pool shape | Operator pre-work |
+|---|---|---|
+| **Hetzner / OVH / Leaseweb** (rented bare metal) | `routed` + `public` | Order a block routed to the server's main IP |
+| **Colocation** | `routed` + `public` | Static route or BGP of the block to the host |
+| **Proxmox or another LAN, no public block** | `onlink` + `internal` | Keep the pool IPs out of the DHCP range; one NIC on the bridge; PVE firewall/ipfilter off on it (`docs/byoh/SETUP_PROXMOX.md`) |
+| **Proxmox behind pfSense with extra public IPs** | `onlink` + `nat` | pfSense 1:1 NAT external IP → pool IP, reflection off (`docs/byoh/SETUP_PROXMOX.md`) |
+| **Proxmox, block routed by the router** | `routed` + `public` | Router static route `<block> → <data-plane VM IP>` (the data-plane VM, not the Proxmox node) |
+| **AWS** | `fabric` + `nat` | `terraform/aws-byoh` (ENI secondary IPs + EIPs, cloud-init fix) |
+
+`scripts/byoh/providers/aws-routed-network-setup.sh` is **retired and
+broken** (cloud-init puts the pool IPs back on the NIC at the bootstrap
+reboot, and it can leak EIPs). Use `terraform/aws-byoh`.
 
 ## Restart playbook
 
