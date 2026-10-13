@@ -555,7 +555,7 @@ RSpec.describe ByohPool do
       vm = place_vm("10.98.2.0", vm_host: host)
       Sshable.create_with_id(vm.id, host: "10.98.2.0")
       expect(described_class.new(host).verify).to eq [
-        [:warn, "no free public or nat IPv4 address: no VM with IPv4 can be placed on this host"],
+        [:warn, "no free public or nat IPv4 address: no internet VM with IPv4 can be placed on this host; internal VMs and VMs without IPv4 can"],
         [:warn, "location hetzner-fsn1 is not a BYOH location, so the network contract does not apply to this host yet"],
       ]
     end

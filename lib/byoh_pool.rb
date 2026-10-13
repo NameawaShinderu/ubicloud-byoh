@@ -380,7 +380,7 @@ class ByohPool
     end
 
     if all_rows.none? { !it[:reserved] && !it[:vm_id] && INTERNET_EXPOSURES.include?(it[:exposure]) }
-      results << [:warn, "no free public or nat IPv4 address: no VM with IPv4 can be placed on this host"]
+      results << [:warn, "no free public or nat IPv4 address: no internet VM with IPv4 can be placed on this host; internal VMs and VMs without IPv4 can"]
     end
 
     v6 = stored.find(&:ipv6?)
