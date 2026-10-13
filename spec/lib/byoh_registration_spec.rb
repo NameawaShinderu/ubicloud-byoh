@@ -159,6 +159,30 @@ RSpec.describe ByohRegistration do
         expect(reg.provider_config["uplink"]).to eq "enp1s0"
       end
 
+      it "accepts the file terraform/aws-byoh writes with yamlencode" do
+        path = pool_file(<<~YAML)
+          "ipv6_mode": "ula"
+          "routed_networks":
+          - "cidr": "10.98.1.128/32"
+            "delivery": "fabric"
+            "exposure": "nat"
+            "external":
+              "10.98.1.128": "13.232.10.20"
+          - "cidr": "10.98.1.140/32"
+            "delivery": "fabric"
+            "exposure": "internal"
+          "version": 2
+        YAML
+        reg = described_class.new(**base_args, main_ip: "10.98.1.10", routed_networks: [], pool_file: path)
+        reg.validate!
+        expect(reg.notes).to eq []
+        expect(reg.ipv6_mode).to eq "ula"
+        expect(reg.provider_config["routed_networks"].first(2)).to eq [
+          {"cidr" => "10.98.1.128/32", "delivery" => "fabric", "exposure" => "nat", "external" => {"10.98.1.128" => "13.232.10.20"}},
+          {"cidr" => "10.98.1.140/32", "delivery" => "fabric", "exposure" => "internal"},
+        ]
+      end
+
       it "refuses an ipv6_mode that contradicts the file" do
         path = pool_file("version: 2\nipv6_mode: ula\nrouted_networks: []\n")
         expect {

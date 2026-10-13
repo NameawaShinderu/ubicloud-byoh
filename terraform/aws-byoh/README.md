@@ -11,7 +11,15 @@ Declarative Terraform module that provisions a complete Ubicloud
     - `source_dest_check = false` — kernel can forward packets to VMs
     - 3 secondary private IPs on the ENI — the BYOH routable IP pool
     - Pre-installed `ruby-bundler` and root SSH pubkey login via user-data
+    - optional `byoh_internal_private_ips`: more secondary private IPs with no EIP
 - 3 Elastic IPs, each 1:1 associated with a secondary private IP
+- `.generated/<workspace>/pools.yaml`, the pool file for `bin/register-byoh-host --pool-file`
+
+> **Do not apply in `company-mumbai` until M7 (P2).** The live security
+> group has drifted from `main.tf`, and the state does not match the live
+> EIPs. For live hosts, build the pool file from AWS instead of from
+> Terraform:
+> `bin/byoh-pool export --host <ubid> --set delivery=fabric,exposure=nat --external-map <(aws ec2 describe-addresses --output json)`.
 
 ## Why Terraform, not bash?
 
@@ -54,27 +62,54 @@ terraform apply
 
 `terraform apply` takes ~5-10 minutes — most of it is the `m5d.metal`'s Nitro BMC POST. It prints a big `handoff_instructions` block at the end with the public IPs, SSH commands, and EIP mapping.
 
+## Pools file
+
+`terraform apply` writes `.generated/<workspace>/pools.yaml` (output
+`pools_yaml_path`), a version 2 pool file:
+
+- every `byoh_secondary_private_ips` entry is a `/32` with
+  `delivery: fabric`, `exposure: nat` and `external` mapping it to its EIP;
+- every `byoh_internal_private_ips` entry is a `/32` with
+  `delivery: fabric`, `exposure: internal` and no EIP. VMs created with
+  `ip4_exposure=internal` land there: reachable only from inside the VPC,
+  with outbound traffic through the host NAT;
+- `ipv6_mode: ula`, because the VPC has no IPv6.
+
+With the default `byoh_internal_private_ips = []`, the AWS resources are
+the same as before; only the local `pools.yaml` file is added.
+
+`terraform output -raw byoh_location_create_command` prints the
+`bin/byoh-location create` command for this VPC: underlay = the VPC
+CIDR, `cp_source` = the control plane's private `/32`, `mgmt_allow` =
+that `/32` plus `operator_ssh_cidr`, and billing rates copied from
+`hetzner-fsn1` into `BILLING_RATES_EXTRA_DIR`. It warns when
+`operator_ssh_cidr` is `0.0.0.0/0`, and leaves that CIDR out of
+`--mgmt-allow`, because VMs behind the host NAT are denied the
+`mgmt_allow` networks.
+
 ## Outputs
 
 Running `terraform output` after apply:
 
 ```
 byoh_eip_to_private_ip = {
-  "13.xxx.xxx.xxx" = "10.99.1.128"
-  "13.yyy.yyy.yyy" = "10.99.1.129"
-  "35.zzz.zzz.zzz" = "10.99.1.130"
+  "13.xxx.xxx.xxx" = "10.98.1.128"
+  "13.yyy.yyy.yyy" = "10.98.1.129"
+  "35.zzz.zzz.zzz" = "10.98.1.130"
 }
-byoh_ip_pool         = ["10.99.1.128", "10.99.1.129", "10.99.1.130"]
-ctrl_public_ip       = "13.aaa.aaa.aaa"
-data_public_ip       = "52.bbb.bbb.bbb"
-data_private_ip      = "10.99.1.101"
-ssh_private_key_path = "./.generated/byoh_ssh_key"
-handoff_instructions = <long multi-line string with exact next steps>
+byoh_internal_ip_pool        = []
+byoh_ip_pool                 = ["10.98.1.128", "10.98.1.129", "10.98.1.130"]
+byoh_location_create_command = <commands for bin/byoh-location create>
+ctrl_public_ip               = "13.aaa.aaa.aaa"
+data_public_ip               = "52.bbb.bbb.bbb"
+data_private_ip              = "10.98.1.101"
+pools_yaml_path              = "./.generated/<workspace>/pools.yaml"
+ssh_private_key_path         = "./.generated/<workspace>/byoh_ssh_key"
+handoff_instructions         = <long multi-line string with exact next steps>
 ```
 
-The `byoh_eip_to_private_ip` map is critical: when Ubicloud allocates
-a VM one of the private IPs from the pool, SSH to the **matching EIP**
-from anywhere on the internet.
+Registered with `--pool-file`, a VM's IPv4 is shown to the customer as
+its EIP, and SSH, Postgres and load balancer DNS use the EIP.
 
 ## What happens next (after terraform apply)
 

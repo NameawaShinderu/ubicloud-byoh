@@ -6,16 +6,18 @@
 # Provisions a complete Ubicloud BYOH test environment in a single
 # AWS region:
 #
-#   - Dedicated VPC (10.99.0.0/16) isolated from any existing infra
+#   - Dedicated VPC (var.vpc_cidr, 10.98.0.0/16 by default) isolated from any existing infra
 #   - Public subnet with internet gateway + route table
 #   - Security group: SSH from operator's IP + web UI from anywhere
 #   - Generated Ed25519 keypair (saved to .generated/ locally)
 #   - Control plane instance (t3.medium, Ubuntu 24.04)
 #   - Data plane instance (m5d.metal bare-metal, Ubuntu 24.04)
 #       + N secondary private IPs on the ENI (the BYOH IP pool)
+#       + M more secondary private IPs without an EIP (internal pool)
 #       + source_dest_check disabled (so kernel can forward to VMs)
 #       + user-data: allow root SSH, pre-install ruby-bundler
 #   - N Elastic IPs, each 1:1 associated with a secondary private IP
+#   - .generated/<workspace>/pools.yaml for register-byoh-host
 #
 # This is the AWS-specific provider pre-work. On Hetzner/OVH/
 # Equinix/Leaseweb the equivalent is "order a routed block via the
@@ -292,7 +294,8 @@ resource "aws_instance" "data" {
   # run_nftables prog then adds per-VM routes (`ip route add <ip>
   # dev <vm-veth>`) so the kernel forwards each packet to the right
   # VM's netns.
-  secondary_private_ips = var.byoh_secondary_private_ips
+  # byoh_internal_private_ips are on the ENI too, but get no EIP.
+  secondary_private_ips = concat(var.byoh_secondary_private_ips, var.byoh_internal_private_ips)
 
   # Non-metal 8th-gen Intel types (m8i/c8i/r8i…) can expose VT-x to
   # the guest. Required when data_plane_instance_type is not .metal.
@@ -344,4 +347,45 @@ resource "aws_eip_association" "byoh" {
   network_interface_id = aws_instance.data.primary_network_interface_id
   private_ip_address   = var.byoh_secondary_private_ips[count.index]
   depends_on           = [aws_instance.data]
+}
+
+# --- pools.yaml for bin/register-byoh-host --pool-file --------------
+# Every pool IP is assigned to the ENI, so AWS delivers it to the host
+# (delivery fabric). An IP with an EIP is exposure nat, mapped to its
+# EIP; an IP without one is exposure internal. The VPC has no IPv6, so
+# the host's IPv6 prefix is a ULA drawn from the location's ula48.
+locals {
+  byoh_pools = {
+    version   = 2
+    ipv6_mode = "ula"
+    routed_networks = concat(
+      [for i, ip in var.byoh_secondary_private_ips : {
+        cidr     = "${ip}/32"
+        delivery = "fabric"
+        exposure = "nat"
+        external = { (ip) = aws_eip.byoh[i].public_ip }
+      }],
+      [for ip in var.byoh_internal_private_ips : {
+        cidr     = "${ip}/32"
+        delivery = "fabric"
+        exposure = "internal"
+      }]
+    )
+  }
+}
+
+resource "local_file" "pools_yaml" {
+  filename        = "${path.module}/.generated/${terraform.workspace}/pools.yaml"
+  content         = yamlencode(local.byoh_pools)
+  file_permission = "0644"
+
+  # Written once the EIPs point at their private IPs.
+  depends_on = [aws_eip_association.byoh]
+
+  lifecycle {
+    precondition {
+      condition     = length(setintersection(var.byoh_secondary_private_ips, var.byoh_internal_private_ips)) == 0
+      error_message = "An IP is in both byoh_secondary_private_ips and byoh_internal_private_ips; each pool IP is either nat (with an EIP) or internal."
+    }
+  }
 }

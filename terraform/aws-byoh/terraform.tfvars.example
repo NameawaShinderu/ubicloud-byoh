@@ -44,3 +44,7 @@ byoh_secondary_private_ips = [
   "10.98.1.129",
   "10.98.1.130",
 ]
+
+# Optional secondary private IPs with NO EIP. pools.yaml declares them
+# as exposure internal: VMs on them are reachable only inside the VPC.
+# byoh_internal_private_ips = ["10.98.1.140"]

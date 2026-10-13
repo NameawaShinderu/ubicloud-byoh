@@ -53,13 +53,30 @@ variable "data_root_size_gb" {
 }
 
 variable "byoh_secondary_private_ips" {
-  description = "Pool of secondary private IPs assigned to the data plane ENI. Each IP becomes a slot in Ubicloud's routed_network pool. One EIP is allocated + associated with each, so each slot can host a publicly-reachable VM. Pool size = max concurrent VMs publicly reachable from the internet."
+  description = "Pool of secondary private IPs assigned to the data plane ENI. One EIP is allocated + associated with each, and each is written to pools.yaml as a /32 with exposure nat. Pool size = max concurrent VMs publicly reachable from the internet."
   type        = list(string)
   default = [
     "10.98.1.128",
     "10.98.1.129",
     "10.98.1.130",
   ]
+}
+
+variable "byoh_internal_private_ips" {
+  description = "Extra secondary private IPs on the data plane ENI that get NO Elastic IP. They are written to pools.yaml with exposure internal: VMs on them are reachable only from inside the VPC and reach the internet through the host NAT."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for ip in var.byoh_internal_private_ips : can(regex("^[0-9.]+$", ip)) && can(cidrhost("${ip}/32", 0))])
+    error_message = "byoh_internal_private_ips must be plain IPv4 addresses, without a prefix length."
+  }
+}
+
+variable "byoh_location_name" {
+  description = "Name of the BYOH location printed in byoh_location_create_command (lowercase letters, digits and -). Empty means byoh-aws-<workspace>."
+  type        = string
+  default     = ""
 }
 
 variable "web_ui_cidr" {
