@@ -214,10 +214,19 @@ RSpec.describe ByohGateChecks do
       _, out, _ = cli("vm", "--vm", vm.ubid, "--expect", "nat", "--external", "8.8.4.4")
       expect(out).to include "FAIL #{vm.ubid}'s external IP is 8.8.4.4 (8.8.8.10)\n",
         "FAIL the IPv4 billing record is named 8.8.8.10/32 (none)\n",
-        "FAIL the control plane reaches #{vm.ubid} at 10.98.1.128 (no sshable)\n"
+        "INFO #{vm.ubid} has no sshable; wait_sshable dials 10.98.1.128:22\n"
 
       vm.project.update(billable: false)
       expect(cli("vm", "--vm", vm.ubid, "--expect", "nat")[1]).to include "INFO project #{vm.project.ubid} is not billable"
+    end
+
+    it "fails a VM whose sshable points at the wrong address" do
+      vm = place_vm("10.98.1.128")
+      Sshable.create_with_id(vm.id, host: "10.98.1.200")
+      ipv4_record(vm, "8.8.8.10/32")
+      status, out, _ = cli("vm", "--vm", vm.ubid, "--expect", "nat")
+      expect(status).to eq 1
+      expect(out).to end_with "FAIL the control plane reaches #{vm.ubid} at 10.98.1.128 (10.98.1.200)\n1 failed\n"
     end
 
     it "fails a nat VM without an external IP" do
@@ -230,13 +239,13 @@ RSpec.describe ByohGateChecks do
     it "passes a VM without IPv4 that leaves through the host NAT" do
       vm = create_vm(vm_host_id: host.id, location_id: location.id)
       status, out, _ = cli("vm", "--vm", vm.ubid, "--expect", "none")
-      expect(status).to eq 1
+      expect(status).to eq 0
       expect(out).to eq <<~OUT
         PASS #{vm.ubid} has no IPv4 address
         PASS #{vm.ubid}'s outbound IPv4 goes through the host NAT
         PASS #{vm.ubid} has no IPv4 billing record
-        FAIL the control plane reaches #{vm.ubid} at  (no sshable)
-        1 failed
+        INFO #{vm.ubid} has no sshable; wait_sshable does not dial it (no IPv4)
+        ok
       OUT
     end
 

@@ -150,8 +150,13 @@ class ByohGateChecks
       ipv4_records = ipv4_billing_records(vm)
       send(:"check_#{expect}", r, vm, api, ipv4_records, opts)
       expected_ssh = vm.cp_reach_ip4&.to_s || vm.ip6_string
-      ssh_host = vm.sshable&.host
-      r.check(!ssh_host.nil? && ssh_host == expected_ssh, "the control plane reaches #{vm.ubid} at #{expected_ssh} (#{ssh_host || "no sshable"})")
+      # Only VMs assembled with an Sshable have one; for the rest,
+      # wait_sshable dials cp_reach_ip4 directly, or nothing without IPv4.
+      if (ssh_host = vm.sshable&.host)
+        r.check(ssh_host == expected_ssh, "the control plane reaches #{vm.ubid} at #{expected_ssh} (#{ssh_host})")
+      else
+        r.info("#{vm.ubid} has no sshable; wait_sshable #{(cp = vm.cp_reach_ip4) ? "dials #{cp}:22" : "does not dial it (no IPv4)"}")
+      end
     end
   end
 
