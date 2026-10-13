@@ -139,7 +139,7 @@ The file and class names are load-bearing: `"generic"` must resolve to `Hosting:
 
 1. Create the `Sshable` with host = main IP and `raw_private_key_1` = the operator key, preloaded to avoid a race with `setup_ssh_keys`.
 2. Create the `VmHost`:
-   - `location_id` = **`Location::HETZNER_FSN1_ID`**. The CLI never passes `location_id`, even though `register!(location_id:)` supports it.
+   - `location_id` = the BYOH location named by the required `--location` (create it first with `bin/byoh-location create`). Before M2 every generic host landed in `Location::HETZNER_FSN1_ID`; such legacy hosts keep M1 behaviour until `bin/byoh-host move-location`.
    - `family` = "standard"; `ndp_needed` = false.
    - `net6` = the first IPv6 routed network. If none is given, `ByohRegistration` appends a **random ULA /64**.
    - Because `net6` is set, `LearnNetwork` is skipped (`host_nexus.rb:116`), and `ip6` stays NULL.
@@ -182,7 +182,7 @@ The file and class names are load-bearing: `"generic"` must resolve to `Hosting:
 
 ### Allocation requirements (`scheduling/allocator.rb`, `prog/vm/metal/nexus.rb`)
 
-- The VM must be created in location **`eu-central-h1` / "Germany"** (the hetzner-fsn1 row).
+- The VM must be created in the host's BYOH location (its `ui_name`; the project needs `bin/byoh-location grant` while the location is hidden). Before M2, and for legacy hosts still in hetzner-fsn1, that was `eu-central-h1` / "Germany".
 - Host requirements:
   - `allocation_state = 'accepting'`
   - family `standard`
@@ -307,7 +307,7 @@ It is still in git history (`git show 0a24426cc:scripts/byoh-ops/reconfigure-rou
 | PrepHost fails | No outbound internet (cloud-hypervisor and htcat downloads) |
 | LearnMemory "unexpected dmidecode unit" | Non-GB DIMM sizes (common in nested VMs) |
 | `verify_hugepages` fails | Not enough RAM for 1G hugepages |
-| VM "no space left on any eligible host" | Wrong location (use eu-central-h1); no activated boot image of that name; no free `ipv4_address`; cores/hugepages; slices mismatch on low-core hosts (scope the fix: `DB[:vm_host].where(id: …).update(accepts_slices: false)`) |
+| VM "no space left on any eligible host" | Wrong location (use the host's BYOH location; eu-central-h1 only for a legacy host not yet moved); no activated boot image of that name; no free `ipv4_address`; cores/hugepages; slices mismatch on low-core hosts (scope the fix: `DB[:vm_host].where(id: …).update(accepts_slices: false)`) |
 | VM stuck at `wait_sshable` | The control plane can't reach `<vm ip4>:22`. This is a missing operator L3 route, not a driver bug |
 | Strand stuck at `hardware_reset` | Admin "Hardware Reset" on a host with no BMC raises `CapabilityMissing` forever (or on a host with VMs that isn't draining); VMs show as "rebooting". **Don't click it** without a BMC |
 | Redfish reset fails with an auth error after a control-plane restart | The `--bmc-pass-env` variable is missing from respirate's environment, so the call goes out with a nil password |
@@ -418,7 +418,7 @@ Plan: WP1–WP10. Runbooks: `docs/byoh/VERIFY.md`, `docs/byoh/POOL_OPERATIONS.md
   - `scripts/byoh/verify/m2-checks` (read-only gate checks) and `m2-gate.sh`.
 - **Billing overlay:** `BILLING_RATES_EXTRA_DIR` (no `CLOVER_` prefix) in `.env.rb`. **web, respirate and monitor all need it**; restart all three after `byoh-location create --rates-from` or `rates`. Back the directory up with the DB.
 - **Gating (C14):** `VmHost#byoh?` = generic provider **and** BYOH location. A generic host still in hetzner-fsn1 behaves exactly like M1.
-- **Egress NAT:** the flat prog `prog/setup_byoh_egress_nat.rb` (`Prog::SetupByohEgressNat`, no namespace module) installs `/etc/nftables.d/1-byoh-egress.conf` (table `inet byoh_egress`) on BYOH hosts, or removes it from a host that left BYOH. HostNexus `prep` buds it for BYOH hosts; `bin/byoh-host setup-egress-nat` reinstalls it after a profile change.
+- **Egress NAT:** the flat prog `prog/setup_byoh_egress_nat.rb` (`Prog::SetupByohEgressNat`, no namespace module) installs `/etc/nftables.d/1-byoh-egress.conf` (table `inet byoh_egress`) on BYOH hosts, or removes it from a host that left BYOH. HostNexus `prep` buds it for BYOH hosts; `bin/byoh-host move-location` starts it for a host past prep (and, with `--rollback-to`, to remove it, after resetting the host's pools to `routed`/`public`); `bin/byoh-location set` starts it on every host past prep when the egress keys change; `bin/byoh-host setup-egress-nat` reinstalls it by hand. The table also has an input chain that drops VM connections to the host's own deny4 addresses.
 - **Never `terraform apply` in `company-mumbai` before M7.** The live SG has drifted from `main.tf` and state does not match the live EIPs; build the live pool file with `bin/byoh-pool export --external-map` from `aws ec2 describe-addresses`.
 
 ## 9. Secrets and sensitive local files (gitignored — never print or commit)
@@ -523,8 +523,9 @@ The full flow was proven on non-metal EC2: register → `accepting` in about 4 m
 - **Login is two-step:** POST `login`, then POST `login` + `password` with the new `_csrf`.
 - **Creating a VM from Ruby:**
   ```ruby
-  Prog::Vm::Nexus.assemble(pubkey, project.id, name:, size: "standard-2", location_id: Location::HETZNER_FSN1_ID, boot_image: "ubuntu-noble", enable_ip4: true)
+  Prog::Vm::Nexus.assemble(pubkey, project.id, name:, size: "standard-2", location_id: Location["<byoh location ubid>"].id, boot_image: "ubuntu-noble", enable_ip4: true)
   ```
+  (This validation ran before M2 with `Location::HETZNER_FSN1_ID`.)
   The VM user is `ubi`.
 - **`terraform/aws-byoh` changes:**
   - Provider `~> 6.0`.

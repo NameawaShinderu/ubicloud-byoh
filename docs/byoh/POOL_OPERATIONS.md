@@ -135,7 +135,7 @@ VMs without IPv4, and by default VMs on an `internal` pool, leave through the ho
 | `egress_smtp` | `--[no-]egress-smtp` | false | TCP 25 through the host NAT is dropped unless set |
 | `vm_egress_deny` | `--egress-deny CIDRS` | none | Added to the networks host-NAT traffic may not reach. The table always denies `underlay_cidrs`, `cp_source_cidrs` and `host_mgmt_allow` too, and drops every VM's original-direction traffic to RFC 1918 networks in that list. |
 
-The table on each host is built from the profile at install time. After changing these keys, reinstall it on every host of the location (`set` prints a reminder):
+The table on each host is built from the profile at install time. When `set` changes these keys it starts a strand that reinstalls the table on every host of the location that is past prep, and prints their ids; a host before prep gets the new settings from prep. `bin/byoh-host move-location` into a BYOH location starts the same strand. To reinstall it by hand:
 
 ```bash
 bundle exec bin/byoh-host setup-egress-nat --host vh...
@@ -151,6 +151,6 @@ Full steps are in [VERIFY.md](VERIFY.md) §4.
 
 | Level | After | Summary |
 |---|---|---|
-| R3 | host move, annotate or VM recreate | revoke, destroy the location's VMs, `annotate` back to `routed`/`public`, `move-location --rollback-to hetzner-fsn1 --empty-only` (removes the egress table) |
+| R3 | host move, annotate or VM recreate | revoke, destroy the location's VMs, `move-location --rollback-to hetzner-fsn1 --empty-only` (resets the pools to `routed`/`public` with no reserve or external IPs, and removes the egress table) |
 | R2 | location create | revoke, `bin/byoh-location delete` |
 | R1 | code deploy | `bin/byoh-host export-audit`, migration `down` to 20261012, check out `aws-mumbai-m2-pre`, `install_rhizome`, restart. Only when no BYOH billing record exists in the open invoice month. |
