@@ -121,7 +121,7 @@ RSpec.describe Clover, "vm" do
       end
 
       it "shows the IPv4 option without a price in a location that has no IPv4 rate" do
-        Location.create(name: "byoh-1", display_name: "byoh-1", ui_name: "BYOH One", visible: false, provider: "generic", byoh_network: {})
+        Location.create(name: "byoh-1", display_name: "byoh-1", ui_name: "BYOH One", visible: false, provider: "generic", byoh_network: {"vm_egress_nat4" => false})
         project.set_ff_visible_locations(["byoh-1"])
         # Every rate of byoh-1 exists except the IPv4 one.
         allow(BillingRate).to receive(:from_resource_properties).and_wrap_original do |original, resource_type, resource_family, location, *rest|
@@ -850,6 +850,143 @@ RSpec.describe Clover, "vm" do
         expect(page.title).to eq("Ubicloud - ResourceNotFound")
         expect(page.status_code).to eq(404)
         expect(page).to have_content("ResourceNotFound")
+      end
+    end
+
+    describe "in a BYOH location" do
+      let(:location) { create_byoh_location(name: "byoh-web", ui_name: "BYOH Web") }
+
+      before do
+        location
+        project.set_ff_visible_locations(["byoh-web"])
+        # The BYOH location charges what hetzner-fsn1 does.
+        allow(BillingRate).to receive(:from_resource_properties).and_wrap_original do |original, resource_type, resource_family, location_name, *rest|
+          original.call(resource_type, resource_family, (location_name == "byoh-web") ? "hetzner-fsn1" : location_name, *rest)
+        end
+      end
+
+      def add_pool(vm_host, cidr, exposure)
+        Address.create(cidr:, routed_to_host_id: vm_host.id, exposure:).populate_ipv4_addresses
+      end
+
+      def byoh_vm(**)
+        v = Prog::Vm::Nexus.assemble("dummy-public key", project.id, name: "byoh-vm", location_id: location.id, **).subject
+        v.update(ephemeral_net6: "fd10:1:2:3::/79")
+        v.reload
+      end
+
+      def overview_rows(vm)
+        visit "#{project.path}#{vm.path}"
+        page.all("dt").map(&:text).zip(page.all("dd").map(&:text)).to_h
+      end
+
+      it "offers the IPv4 exposures the location's pools have" do
+        vm_host = create_byoh_vm_host(location)
+        add_pool(vm_host, "10.98.1.128/31", "nat")
+        add_pool(vm_host, "10.98.2.0/31", "internal")
+        empty = create_byoh_location(name: "byoh-empty", ui_name: "BYOH Empty")
+        internal_only = create_byoh_location(name: "byoh-internal", ui_name: "BYOH Internal", vm_egress_nat4: false)
+        add_pool(create_byoh_vm_host(internal_only), "10.98.3.0/31", "internal")
+        project.set_ff_visible_locations(["byoh-web", "byoh-empty", "byoh-internal"])
+
+        visit "#{project.path}/vm/create"
+        expect(page.status_code).to eq 200
+        exposures = page.all("input[name=ip4_exposure]", visible: :all).map { [it.find(:xpath, "..", visible: :all)[:class], it.value] }
+        expect(exposures.map { |classes, value| [classes[/form_location_\S+/], value] }).to contain_exactly(
+          ["form_location_#{location.ubid}", "internet"],
+          ["form_location_#{location.ubid}", "internal"],
+          ["form_location_#{empty.ubid}", "internet"],
+          ["form_location_#{internal_only.ubid}", "internal"],
+        )
+        expect(page).to have_content "Reachable only from the BYOH Web network"
+        expect(page).to have_content "unless the location's option says outbound IPv4 goes through the site's shared NAT"
+        expect(page.all("label", text: /Without it, outbound IPv4 goes through the site's shared NAT/, visible: :all).size).to eq 2
+      end
+
+      it "creates a VM with an internal IPv4" do
+        add_pool(create_byoh_vm_host(location), "10.98.2.0/31", "internal")
+        visit "#{project.path}/vm/create"
+        fill_in "Name", with: "internal-vm"
+        fill_in "SSH Public Key", with: "a a"
+        choose option: location.ubid
+        check "enable_ip4"
+        choose option: "internal"
+        choose option: "ubuntu-jammy"
+        choose option: "standard-2"
+        click_button "Create"
+
+        expect(page).to have_flash_notice("'internal-vm' will be ready in a few minutes")
+        expect(Vm.first.values.slice(:ip4_enabled, :ip4_exposure)).to eq(ip4_enabled: true, ip4_exposure: "internal")
+      end
+
+      it "refuses an unknown IPv4 exposure" do
+        visit "#{project.path}/vm/create"
+        fill_in "Name", with: "bad-vm"
+        fill_in "SSH Public Key", with: "a a"
+        choose option: location.ubid
+        choose option: "ubuntu-jammy"
+        choose option: "standard-2"
+        page.driver.browser.dom.css("input[name=ip4_exposure][value=internet]").attr("value", "bogus")
+        choose option: "bogus"
+        click_button "Create"
+
+        expect(page).to have_flash_error("Validation failed for following fields: ip4_exposure")
+        expect(Vm.count).to eq 0
+      end
+
+      it "shows a nat VM's public and site addresses" do
+        vm = byoh_vm(enable_ip4: true)
+        add_byoh_ipv4_to_vm(vm, create_byoh_vm_host(location, ipv6_mode: "ula"), "10.98.1.129", exposure: "nat", external_ip: "203.0.113.9")
+        rows = overview_rows(vm)
+        expect(rows.slice("Public IPv4", "Site IPv4", "IPv6", "SSH Command")).to eq(
+          "Public IPv4" => "203.0.113.9", "Site IPv4" => "10.98.1.129", "IPv6" => "Not available",
+          "SSH Command" => "ssh -i <PRIVATE_KEY_PATH> ubi@203.0.113.9",
+        )
+        expect(rows).not_to have_key("IPv4")
+
+        visit "#{project.path}/vm"
+        expect(page).to have_content "203.0.113.9"
+      end
+
+      it "shows a public VM without a site address" do
+        vm = byoh_vm(enable_ip4: true)
+        add_byoh_ipv4_to_vm(vm, create_byoh_vm_host(location), "198.51.100.7")
+        rows = overview_rows(vm)
+        expect(rows["Public IPv4"]).to eq "198.51.100.7"
+        expect(rows).not_to have_key("Site IPv4")
+        expect(rows["IPv6"]).to eq vm.ip6_string
+      end
+
+      it "shows an internal VM's reach and outbound path" do
+        vm = byoh_vm(enable_ip4: true)
+        add_byoh_ipv4_to_vm(vm, create_byoh_vm_host(location), "10.98.2.1", exposure: "internal")
+        rows = overview_rows(vm)
+        expect(rows.slice("Internal IPv4", "IPv4 Reach")).to eq(
+          "Internal IPv4" => "10.98.2.1", "IPv4 Reach" => "Only from the BYOH Web network; outbound via shared NAT",
+        )
+
+        location.update(byoh_network: {"internal_egress" => "site"})
+        expect(overview_rows(vm)["IPv4 Reach"]).to eq "Only from the BYOH Web network"
+      end
+
+      it "shows a VM without IPv4 and how its outbound IPv4 leaves" do
+        vm = byoh_vm
+        vm.update(vm_host_id: create_byoh_vm_host(location, ipv6_mode: "ula").id)
+        rows = overview_rows(vm)
+        expect(rows.slice("IPv4", "IPv6", "SSH Command")).to eq(
+          "IPv4" => "Not enabled; outbound IPv4 via shared NAT", "IPv6" => "Not available",
+          "SSH Command" => "No address reachable from the internet",
+        )
+
+        visit "#{project.path}/vm"
+        expect(page).to have_content "No public address"
+
+        location.update(byoh_network: {"vm_egress_nat4" => false})
+        expect(overview_rows(vm)["IPv4"]).to eq "Not enabled"
+
+        vm.update(ephemeral_net6: nil)
+        visit "#{project.path}/vm"
+        expect(page).to have_content "Not assigned yet"
       end
     end
 

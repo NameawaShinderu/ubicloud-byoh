@@ -2436,6 +2436,12 @@ paths:
                 enable_ip4:
                   description: Enable IPv4
                   type: boolean
+                ip4_exposure:
+                  description: Who can reach the VM's IPv4 address. internal is available only in BYOH locations.
+                  type: string
+                  enum:
+                    - internet
+                    - internal
                 private_subnet_id:
                   description: ID of the private subnet
                   type: string
@@ -4217,6 +4223,13 @@ components:
         ip4_enabled:
           description: Whether IPv4 is enabled
           type: boolean
+        ip4_scope:
+          description: Who can reach the VM's IPv4 address. Present only for VMs on BYOH hosts, where an internal address is reachable only from the site's network.
+          type: string
+          enum:
+            - public
+            - internal
+          nullable: true
         ip6:
           description: IPv6 address
           type: string
@@ -5014,6 +5027,11 @@ components:
                     type: array
                     items:
                       $ref: '#/components/schemas/Firewall'
+                  ip4_internal:
+                    description: The site address behind a VM's public IPv4 when the two differ, as on a 1:1 NAT pool. Present only for VMs on BYOH hosts.
+                    type: string
+                    format: ipv4
+                    nullable: true
                   private_ipv4:
                     description: Private IPv4 address
                     type: string

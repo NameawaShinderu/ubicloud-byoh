@@ -92,6 +92,18 @@ class Vm < Sequel::Model
 
   def byoh_host? = !!vm_host&.byoh?
 
+  # byoh_host? for the customer pages and API, which list many VMs with
+  # their location already loaded. A VM is only placed on a host in its
+  # own location, so a non-BYOH location answers without querying the
+  # host and its provider.
+  def byoh_addressing? = location.byoh? && byoh_host?
+
+  # The addresses service DNS (load balancers, Postgres) publishes for
+  # the VM: its public ones on a BYOH host, and its own elsewhere.
+  def dns_ip4_string = byoh_host? ? public_ip4_string : ip4_string
+
+  def dns_ip6_string = byoh_host? ? public_ip6&.to_s : ip6_string
+
   # The address the internet reaches the VM's IPv4 at: the external IP a
   # nat pool address is 1:1 NATed to, otherwise the address itself.
   def public_ip4 = assigned_vm_address&.external_ip || ip4

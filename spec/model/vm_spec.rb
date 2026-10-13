@@ -224,6 +224,41 @@ RSpec.describe Vm do
     end
   end
 
+  describe "#byoh_addressing?" do
+    let(:location) { create_byoh_location }
+
+    it "is false in a non-BYOH location without asking the host" do
+      vm = create_vm(vm_host_id: create_byoh_vm_host(location).id)
+      expect(vm).not_to receive(:vm_host)
+      expect(vm.byoh_addressing?).to be false
+    end
+
+    it "follows the host in a BYOH location" do
+      vm = create_vm(location_id: location.id)
+      expect(vm.byoh_addressing?).to be false
+      vm.update(vm_host_id: create_byoh_vm_host(location).id)
+      expect(vm.reload.byoh_addressing?).to be true
+    end
+  end
+
+  describe "service DNS addresses" do
+    let(:location) { create_byoh_location }
+    let(:vm) { create_vm(location_id: location.id, ephemeral_net6: "fd10:1:2:3::/79") }
+
+    it "publishes a BYOH VM's public addresses" do
+      vm_host = create_byoh_vm_host(location, ipv6_mode: "ula")
+      add_byoh_ipv4_to_vm(vm, vm_host, "10.98.1.129", exposure: "nat", external_ip: "203.0.113.9")
+      expect([vm.dns_ip4_string, vm.dns_ip6_string]).to eq ["203.0.113.9", nil]
+      vm_host.update(ipv6_mode: "gua")
+      expect(vm.reload.dns_ip6_string).to eq vm.ip6_string
+    end
+
+    it "publishes the VM's own addresses off BYOH hosts" do
+      add_ipv4_to_vm(vm, "10.98.1.129")
+      expect([vm.dns_ip4_string, vm.dns_ip6_string]).to eq ["10.98.1.129", vm.ip6_string]
+    end
+  end
+
   describe "public and control-plane IPv4" do
     let(:location) {
       Location.create(name: "byoh-vm", display_name: "byoh-vm", ui_name: "byoh-vm", visible: false,

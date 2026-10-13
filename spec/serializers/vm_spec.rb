@@ -66,6 +66,40 @@ RSpec.describe Serializers::Vm do
       expect(prepare_for_comparison(described_class.serialize_internal(vm, {detailed: true}))).to eq(expected_result)
     end
 
+    describe "on a BYOH host" do
+      let(:location) { create_byoh_location }
+      let(:byoh_vm) {
+        vm = create_vm(name: "byoh-vm", location_id: location.id, ephemeral_net6: "fd10:1:2:3::/79")
+        add_byoh_ipv4_to_vm(vm, create_byoh_vm_host(location, ipv6_mode: "ula"), "10.98.1.129", exposure: "nat", external_ip: "203.0.113.9")
+      }
+
+      it "shows the addresses customers reach the VM at" do
+        serialized = described_class.serialize_internal(byoh_vm, {detailed: true})
+        expect(serialized.slice(:ip6, :ip4, :ip4_scope, :ip4_internal).transform_values(&:to_s)).to eq(
+          ip6: "", ip4: "203.0.113.9", ip4_scope: "public", ip4_internal: "10.98.1.129",
+        )
+        expect(serialized.keys.last).to eq :ip4_internal
+      end
+
+      it "shows an internal address with its scope and no internal address in the summary" do
+        byoh_vm.assigned_vm_address.update(external_ip: nil)
+        byoh_vm.assigned_vm_address.address.update(exposure: "internal")
+        byoh_vm.vm_host.update(ipv6_mode: "gua")
+        serialized = described_class.serialize_internal(byoh_vm.reload)
+        expect(serialized.slice(:ip4, :ip4_scope).transform_values(&:to_s)).to eq(ip4: "10.98.1.129", ip4_scope: "internal")
+        expect(serialized[:ip6].to_s).to eq byoh_vm.ip6_string
+        expect(serialized).not_to have_key(:ip4_internal)
+      end
+
+      it "keeps the VM's own addresses on a generic host outside a BYOH location" do
+        byoh_vm.vm_host.update(location_id: Location::HETZNER_FSN1_ID)
+        byoh_vm.update(location_id: Location::HETZNER_FSN1_ID)
+        serialized = described_class.serialize_internal(byoh_vm.reload, {detailed: true})
+        expect([serialized[:ip4].to_s, serialized[:ip6].to_s]).to eq ["10.98.1.129", byoh_vm.ip6_string]
+        expect(serialized.keys).not_to include(:ip4_scope, :ip4_internal)
+      end
+    end
+
     it "serializes a VM whose user_nic is gone (mid-destroy) without raising" do
       vm.user_nic.update(vm_id: nil)
       vm.reload

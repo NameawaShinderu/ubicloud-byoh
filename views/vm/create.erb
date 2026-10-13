@@ -26,9 +26,13 @@ current_usage = @project.current_resource_usage("VmVCpu")
     {name: "location", type: "radio_small_cards", label: "Location", required: "required"},
     {name: "private_subnet_id", type: "select", label: "Private Subnet", placeholder: "Default", description_html: ps_description, opening_tag: "<div class='sm:col-span-3'>"},
     {name: "new_private_subnet_name", type: "text", label: "Private Subnet Name", placeholder: "Private Subnet Name", opening_tag: "<div class='sm:col-span-3' id='new-private-subnet-name'>", value: typecast_body_params.str("new_private_subnet_name")},
-    {name: "enable_ip4", type: "checkbox", label: "Public IPv4 Support", description: "Needed for inbound and outbound public IPv4 connections. Websites that do not support IPv6 will be inaccessible without an IPv4 address."},
+    {name: "enable_ip4", type: "checkbox", label: "Public IPv4 Support", description: "Needed for inbound and outbound public IPv4 connections. Websites that do not support IPv6 will be inaccessible without an IPv4 address#{", unless the location's option says outbound IPv4 goes through the site's shared NAT" if @byoh_shared_nat4}."},
     {name: "family", type: "radio_small_cards", label: "Server family", required: "required"}
   ]
+
+  if @option_parents.key?("ip4_exposure")
+    form_elements.insert(-2, {name: "ip4_exposure", type: "radio_small_cards", label: "IPv4 Exposure", description_html: "<p class='mt-1 text-sm leading-6 text-gray-600'>Applies when IPv4 is enabled. An internal address is reachable only from the location's own network.</p>"})
+  end
 
   elements = [
     {name: "size", type: "radio_small_cards", label: "Server size", required: "required"},

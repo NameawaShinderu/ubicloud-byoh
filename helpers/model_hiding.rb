@@ -26,7 +26,7 @@ class Clover < Roda
         ::InferenceRouterModel => [:where],
         ::Invoice => [:blob_storage_client],
         ::LoadBalancer => [:stack_options],
-        ::Location => [:for_project, :postgres_locations, :visible_or_for_project],
+        ::Location => [:byoh_ip4_exposures, :for_project, :postgres_locations, :visible_or_for_project],
         ::LockedDomain => [:with_pk],
         ::ObjectTag => [:options_for_project],
         ::OidcProvider => [:[], :name_for_ubid, :identity_name_hash, :with_pk!],

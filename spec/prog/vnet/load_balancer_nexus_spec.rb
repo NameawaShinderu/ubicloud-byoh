@@ -394,6 +394,26 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
       expect(DnsRecord.where(dns_zone_id: dns_zone.id, tombstoned: false).all).to be_empty
     end
 
+    it "publishes the public addresses of a VM on a BYOH host" do
+      vm = add_lb_vm(stack: "dual", name: "byoh-vm", private_ipv4: "10.0.0.7/32", private_ipv6: "fd10:9b0b:6b4b:8fb2::/64", public_ipv6: "fd20:1:2:3::/64")
+      location = create_byoh_location
+      vm.update(location_id: location.id)
+      vm_host = create_byoh_vm_host(location, ipv6_mode: "ula")
+      add_byoh_ipv4_to_vm(vm, vm_host, "10.98.1.129", exposure: "nat", external_ip: "203.0.113.9")
+      nx.load_balancer.custom_hostname = nx.load_balancer.hostname
+
+      # The ULA IPv6 is not published, and does not count as pending.
+      expect { nx.rewrite_dns_records }.to hop("wait")
+      records = DnsRecord.where(dns_zone_id: dns_zone.id, tombstoned: false).all.map { [it.type, it.data] }
+      expect(records).to eq [["A", "203.0.113.9"]]
+
+      vm_host.update(ipv6_mode: "gua")
+      nx.load_balancer.reload
+      expect { nx.rewrite_dns_records }.to hop("wait")
+      records = DnsRecord.where(dns_zone_id: dns_zone.id, tombstoned: false).all.map { [it.type, it.data] }
+      expect(records).to include(["AAAA", "fd20:1:2:3::2"])
+    end
+
     it "rewriting repeatedly is relatively safe" do
       add_lb_vm(
         stack: "dual",

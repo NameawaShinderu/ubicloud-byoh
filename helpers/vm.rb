@@ -1,6 +1,10 @@
 # frozen_string_literal: true
 
 class Clover
+  # What a VM's IPv4 faces: the internet (public or nat pools) or only the
+  # site's network (internal pools, BYOH locations only).
+  VM_IP4_EXPOSURES = %w[internet internal].freeze
+
   def authorized_vm(perm: "Vm:view", location_id: nil)
     authorized_object(association: :vms, key: "vm_id", perm:, location_id:)
   end
@@ -66,11 +70,21 @@ class Clover
     end
 
     assemble_params = typecast_params.convert!(symbolize: true) do |tp|
-      tp.nonempty_str(["size", "unix_user", "boot_image", "private_subnet_id", "gpu", "init_script"])
+      tp.nonempty_str(["size", "unix_user", "boot_image", "private_subnet_id", "gpu", "init_script", "ip4_exposure"])
       tp.pos_int("storage_size")
       tp.bool("enable_ip4")
     end
     assemble_params.compact!
+
+    if (ip4_exposure = assemble_params[:ip4_exposure])
+      unless VM_IP4_EXPOSURES.include?(ip4_exposure)
+        fail Validation::ValidationFailed.new({ip4_exposure: "IPv4 exposure must be internet or internal"})
+      end
+      # Only BYOH locations have internal pools.
+      if ip4_exposure == "internal" && !@location.byoh?
+        fail Validation::ValidationFailed.new({ip4_exposure: "Internal IPv4 is only available in BYOH locations"})
+      end
+    end
 
     # Web-only: translate the MI sentinel into "<name>@latest". API/CLI
     # callers pass boot_image="name@version" directly; if they pass the
@@ -226,6 +240,18 @@ class Clover
     end
 
     options.add_option(name: "enable_ip4", values: ["1"], parent: "location")
+
+    # The IPv4 exposure choice exists only in BYOH locations, so other
+    # projects get the same form as before. A location offers the
+    # exposures its hosts have pool addresses for.
+    byoh_locations = Option.locations(feature_flags: @project.feature_flags).select(&:byoh?)
+    @byoh_shared_nat4 = byoh_locations.any? { it.byoh_profile.vm_egress_nat4 }
+    unless byoh_locations.empty?
+      exposures = Location.byoh_ip4_exposures(byoh_locations.map(&:id))
+      options.add_option(name: "ip4_exposure", values: VM_IP4_EXPOSURES, parent: "location") do |location, ip4_exposure|
+        exposures[location.id]&.include?(ip4_exposure)
+      end
+    end
 
     options.add_option(name: "family", values: Option.families.map(&:name), parent: "location") do |location, family|
       next false if location_family_check&.call(location, family)

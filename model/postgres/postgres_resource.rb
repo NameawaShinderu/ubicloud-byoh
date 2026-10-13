@@ -97,7 +97,7 @@ class PostgresResource < Sequel::Model
   def can_add_aaaa_record?
     !location.aws? &&
       dns_zone &&
-      representative_server.vm.ip6_string &&
+      representative_server.vm.dns_ip6_string &&
       dns_zone
         .records_dataset
         .where(type: "AAAA", name: hostname + ".")
@@ -110,7 +110,7 @@ class PostgresResource < Sequel::Model
 
       "#{name}.#{ubid}.#{hostname_suffix}"
     else
-      representative_server.vm.ip4_string
+      representative_server.vm.dns_ip4_string
     end
   end
 
@@ -336,10 +336,10 @@ class PostgresResource < Sequel::Model
       if location.aws?
         dns.check(:CNAME, record_name, vm.aws_instance.ipv4_dns_name + ".")
       else
-        dns.check(:A, record_name, vm.ip4_string)
+        dns.check(:A, record_name, vm.dns_ip4_string)
 
         unless dns_zone.records_dataset.where(type: "AAAA", name: record_name + ".").empty?
-          dns.check(:AAAA, record_name, vm.ip6_string)
+          dns.check(:AAAA, record_name, vm.dns_ip6_string)
         end
 
         record_name = private_hostname

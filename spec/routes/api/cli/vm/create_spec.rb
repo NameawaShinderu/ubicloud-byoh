@@ -25,6 +25,11 @@ RSpec.describe Clover, "cli vm create" do
     expect(body).to eq "VM created with id: #{vm.ubid}\n"
   end
 
+  it "creates vm with an IPv4 exposure" do
+    cli(%w[vm eu-central-h1/test-vm create -e internet] << "a a")
+    expect(Vm.first.ip4_exposure).to eq "internet"
+  end
+
   it "creates vm with registered SSH public key and init script" do
     expect(Vm.count).to eq 0
     expect(PrivateSubnet.count).to eq 0
@@ -112,6 +117,11 @@ RSpec.describe Clover, "cli vm create" do
 
   it "shows errors if trying to create a vm with an invalid number of arguments" do
     expect(Vm.count).to eq 0
+    expect(cli(%W[vm eu-north-h1/test-vm2 create -e internal] << "c c", status: 400)).to eq(<<~END)
+      ! Unexpected response status: 400
+      Details: Validation failed for following fields: ip4_exposure
+        ip4_exposure: Internal IPv4 is only available in BYOH locations
+    END
     expect(cli(%W[vm eu-north-h1/test-vm2 create], status: 400).b).to start_with("! Invalid number of arguments for vm create subcommand (requires: 1, given: 0)")
     expect(cli(%W[vm eu-north-h1/test-vm2 create c d], status: 400).b).to start_with("! Invalid number of arguments for vm create subcommand (requires: 1, given: 2)")
     expect(Vm.count).to eq 0

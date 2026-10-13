@@ -186,8 +186,8 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
       load_balancer.vms_to_dns.each do |vm|
         # Insert IPv4 record if stack is ipv4 or dual, and vm has IPv4
         if load_balancer.ipv4_enabled?
-          if vm.ip4_string
-            ip_info << [vm.ip4_string, "A", hostname, dns_zone]
+          if (ip4 = vm.dns_ip4_string)
+            ip_info << [ip4, "A", hostname, dns_zone]
           elsif vm.ip4_enabled
             # VM will have a public IPv4 address, but it is not assigned yet
             nap 5
@@ -196,12 +196,14 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
         end
 
         if load_balancer.ipv6_enabled?
-          if vm.ip6_string
-            ip_info << [vm.ip6_string, "AAAA", hostname, dns_zone]
-          else
+          if (ip6 = vm.dns_ip6_string)
+            ip_info << [ip6, "AAAA", hostname, dns_zone]
+          elsif !vm.ip6_string
             # VM public IPv6 address not assigned yet
             nap 5
           end
+          # A VM on a BYOH host with only ULA IPv6 has no public IPv6 to
+          # publish, so it gets no public AAAA record.
           ip_info << [vm.private_ipv6_string, "AAAA", private_hostname, private_dns_zone]
         end
       end

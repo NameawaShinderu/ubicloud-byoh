@@ -11,6 +11,7 @@ class UbiCli
     options("ubi vm location/vm-name create [options] public-key", key: :vm_create) do
       on("-6", "--ipv6-only", "do not enable IPv4")
       on("-b", "--boot-image=image_name", "boot image")
+      on("-e", "--ip4-exposure=exposure", %w[internet internal], "IPv4 exposure (internal is only in BYOH locations)")
       on("-i", "--init-script=script", "use given init script")
       on("-p", "--private-subnet-id=ps-id", "place VM into specific private subnet (also accepts ps-name)")
       on("-s", "--size=size", server_sizes, "server size")
@@ -18,6 +19,7 @@ class UbiCli
       on("-u", "--unix-user=username", "username (default: ubi)")
     end
     help_option_values("Boot Image:", Option::BootImages.map(&:name) + ["machine-image-name@version", "machine-image-name@latest"])
+    help_option_values("IPv4 Exposure:", %w[internet internal])
     help_option_values("Size:", server_sizes)
     help_option_values("Storage Size:", storage_sizes)
 

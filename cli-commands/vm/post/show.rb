@@ -4,7 +4,10 @@ class UbiCli
   on("vm").run_on("show") do
     desc "Show details for a virtual machine"
 
-    fields = %w[id name state location size unix-user storage-size-gib boot-image ip6 ip4-enabled ip4 private-ipv4 private-ipv6 subnet maintenance-window-start-at firewalls].freeze.each(&:freeze)
+    fields = %w[id name state location size unix-user storage-size-gib boot-image ip6 ip4-enabled ip4 ip4-scope ip4-internal private-ipv4 private-ipv6 subnet maintenance-window-start-at firewalls].freeze.each(&:freeze)
+    # Only VMs on BYOH hosts have these, so other VMs show what they did
+    # before unless the fields are asked for.
+    byoh_fields = %w[ip4-scope ip4-internal].freeze.each(&:freeze)
     firewall_fields = %w[id name description location path firewall-rules].freeze.each(&:freeze)
     firewall_rule_fields = %w[id cidr port-range protocol].freeze.each(&:freeze)
 
@@ -21,6 +24,7 @@ class UbiCli
       data = sdk_object.info
       opts = opts[:vm_show]
       keys = check_fields(opts[:fields], fields, "vm show -f option", cmd)
+      keys -= byoh_fields.reject { data.values.key?(it.tr("-", "_").to_sym) } unless opts[:fields]
       firewall_keys = check_fields(opts[:"firewall-fields"], firewall_fields, "vm show -w option", cmd)
       firewall_rule_keys = check_fields(opts[:"rule-fields"], firewall_rule_fields, "vm show -r option", cmd)
 

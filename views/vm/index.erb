@@ -24,7 +24,7 @@
           vm.display_size,
           (vm.storage_size_gib > 0) ? "#{vm.storage_size_gib} GB" : "-",
           ["vm_state_label", {component: { state: vm.display_state }}],
-          [vm.ip4 || vm.ip6 || "Not assigned yet", {copyable: true}]
+          [(vm.byoh_addressing? ? vm.public_ip4 || vm.public_ip6 || (vm.ip6 && "No public address") : vm.ip4 || vm.ip6) || "Not assigned yet", {copyable: true}]
         ],
         {id: "vm-#{vm.ubid}"}
       ]

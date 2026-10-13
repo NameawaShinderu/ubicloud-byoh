@@ -426,6 +426,30 @@ RSpec.configure do |config|
       "#{now} #{now - age}\n#{content}"
     end
 
+    def create_byoh_location(name: "byoh-test", ui_name: "BYOH Test", **profile)
+      Location.create(name:, display_name: name, ui_name:, visible: false,
+        provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: profile.transform_keys(&:to_s))
+    end
+
+    def create_byoh_vm_host(location, **)
+      vm_host = create_vm_host(location_id: location.id, **)
+      HostProvider.create do |hp|
+        hp.id = vm_host.id
+        hp.server_identifier = "byoh-#{vm_host.ubid}"
+        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+      end
+      vm_host
+    end
+
+    # Places the VM on the BYOH host with a /32 pool address of the given
+    # exposure, NATed to external_ip when one is given.
+    def add_byoh_ipv4_to_vm(vm, vm_host, ipv4, exposure: "public", external_ip: nil)
+      vm.update(vm_host_id: vm_host.id, ip4_enabled: true)
+      addr = Address.create(cidr: "#{ipv4}/32", routed_to_host_id: vm_host.id, exposure:)
+      AssignedVmAddress.create(ip: "#{ipv4}/32", address_id: addr.id, dst_vm_id: vm.id, external_ip:)
+      vm.reload
+    end
+
     def add_ipv4_to_vm(vm, ipv4)
       host = create_vm_host(total_cores: 10, used_cores: 3)
       cidr = IPAddr.new(ipv4)

@@ -6,7 +6,7 @@ module Ubicloud
 
     set_fragment "vm"
 
-    set_columns :id, :name, :state, :location, :size, :unix_user, :storage_size_gib, :ip6, :ip4_enabled, :ip4, :firewalls, :private_ipv4, :private_ipv6, :subnet, :maintenance_window_start_at
+    set_columns :id, :name, :state, :location, :size, :unix_user, :storage_size_gib, :ip6, :ip4_enabled, :ip4, :ip4_scope, :ip4_internal, :firewalls, :private_ipv4, :private_ipv6, :subnet, :maintenance_window_start_at
 
     set_associations do
       {

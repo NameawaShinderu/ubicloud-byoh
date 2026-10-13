@@ -79,6 +79,21 @@ class Location < Sequel::Model
     ByohNetworkProfile.new(byoh_network) if byoh?
   end
 
+  # The IPv4 exposures a VM can ask for in each of the given BYOH
+  # locations: those its hosts have unreserved pool addresses for, or
+  # internet when they have none. Keyed by location id.
+  def self.byoh_ip4_exposures(location_ids)
+    exposures = DB[:ipv4_address]
+      .join(:address, [:cidr])
+      .join(:vm_host, id: :routed_to_host_id)
+      .where(Sequel[:vm_host][:location_id] => location_ids, Sequel[:ipv4_address][:reserved] => false)
+      .distinct
+      .select_map([Sequel[:vm_host][:location_id], Sequel[:address][:exposure]])
+      .group_by(&:first)
+      .transform_values { |rows| rows.map { |_, exposure| VmHost::IP4_EXPOSURE_POOLS.find { it[1].include?(exposure) }[0] }.uniq }
+    location_ids.to_h { [it, exposures.fetch(it, ["internet"])] }
+  end
+
   def validate
     super
     return unless byoh?

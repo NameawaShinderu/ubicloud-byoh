@@ -84,6 +84,29 @@ RSpec.describe Clover, "vm" do
         expect(Vm.first.ip4_enabled).to be false
       end
 
+      it "accepts an internet IPv4 exposure" do
+        post "/project/#{project.ubid}/location/#{TEST_LOCATION}/vm/test-vm", {
+          public_key: "ssh key",
+          enable_ip4: true,
+          ip4_exposure: "internet",
+        }.to_json
+
+        expect(last_response.status).to eq(200)
+        expect(Vm.first.ip4_exposure).to eq "internet"
+        expect(JSON.parse(last_response.body).keys).not_to include("ip4_scope", "ip4_internal")
+      end
+
+      it "refuses an internal IPv4 exposure outside a BYOH location" do
+        post "/project/#{project.ubid}/location/#{TEST_LOCATION}/vm/test-vm", {
+          public_key: "ssh key",
+          enable_ip4: true,
+          ip4_exposure: "internal",
+        }.to_json
+
+        expect(last_response).to have_api_error(400, "Validation failed for following fields: ip4_exposure", {"ip4_exposure" => "Internal IPv4 is only available in BYOH locations"})
+        expect(Vm.count).to eq 0
+      end
+
       it "rejects the web-only machine_image field" do
         expect {
           post "/project/#{project.ubid}/location/#{TEST_LOCATION}/vm/test-vm", {

@@ -2,6 +2,9 @@
 
 class Serializers::Vm < Serializers::Base
   def self.serialize_internal(vm, options = {})
+    # A VM on a BYOH host shows the addresses customers reach it at
+    # (docs/byoh/NETWORKING.md section 5.5). Other VMs keep their own.
+    byoh = vm.byoh_addressing?
     base = {
       id: vm.ubid,
       name: vm.name,
@@ -11,11 +14,12 @@ class Serializers::Vm < Serializers::Base
       unix_user: vm.unix_user,
       storage_size_gib: vm.storage_size_gib,
       boot_image: vm.boot_image,
-      ip6: vm.ip6,
+      ip6: byoh ? vm.public_ip6 : vm.ip6,
       ip4_enabled: vm.ip4_enabled,
-      ip4: vm.ip4,
+      ip4: byoh ? vm.public_ip4 : vm.ip4,
       maintenance_window_start_at: vm.maintenance_window_start_at,
     }
+    base[:ip4_scope] = vm.public_ip4_scope if byoh
 
     if options[:detailed]
       base.merge!(
@@ -25,6 +29,7 @@ class Serializers::Vm < Serializers::Base
         subnet: vm.user_nic&.private_subnet&.name,
         gpu: vm.display_gpu,
       )
+      base[:ip4_internal] = vm.ip4_internal if byoh
     end
 
     base

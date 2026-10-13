@@ -17,9 +17,18 @@ module ContentGenerator
     def self.enable_ip4(location, value)
       unit_price = BillingRate.unit_price_from_resource_properties("IPAddress", "IPv4", location.name)
       # A BYOH location may lack an IPv4 rate until its operator adds one.
-      return "Enable Public IPv4" unless unit_price
+      label = unit_price ? "Enable Public IPv4 ($#{"%.2f" % (unit_price * 60 * 672)}/mo)" : "Enable Public IPv4"
+      return label unless location.byoh? && location.byoh_profile.vm_egress_nat4
 
-      "Enable Public IPv4 ($#{"%.2f" % (unit_price * 60 * 672)}/mo)"
+      "#{label}. Needed for inbound IPv4. Without it, outbound IPv4 goes through the site's shared NAT."
+    end
+
+    def self.ip4_exposure(location, value)
+      if value == "internal"
+        ["Internal IPv4", "Reachable only from the #{location.ui_name} network"]
+      else
+        ["Public IPv4", "Reachable from the internet"]
+      end
     end
 
     def self.family(location, family)

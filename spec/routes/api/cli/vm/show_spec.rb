@@ -44,6 +44,21 @@ RSpec.describe Clover, "cli vm show" do
     END
   end
 
+  it "shows the BYOH address fields only for a VM on a BYOH host, unless asked for" do
+    expect(cli(%W[vm #{@ref} show -f ip4,ip4-scope,ip4-internal])).to eq <<~END
+      ip4: 128.0.0.1
+      ip4-scope: 
+      ip4-internal: 
+    END
+
+    location = create_byoh_location
+    @project.set_ff_visible_locations([location.name])
+    vm = create_vm(project_id: @project.id, name: "byoh-vm", location_id: location.id)
+    Prog::Vnet::NicNexus.assemble(@project.default_private_subnet(location).id, name: "byoh-vm-nic").subject.update(vm_id: vm.id)
+    add_byoh_ipv4_to_vm(vm, create_byoh_vm_host(location), "10.98.1.129", exposure: "nat", external_ip: "203.0.113.9")
+    expect(cli(%W[vm #{location.display_name}/byoh-vm show])).to include("ip4: 203.0.113.9\nip4-scope: public\nip4-internal: 10.98.1.129\nprivate-ipv4: ")
+  end
+
   it "-f option controls which fields are shown for VM" do
     expect(cli(%W[vm #{@ref} show -f id,name])).to eq <<~END
       id: #{@vm.ubid}

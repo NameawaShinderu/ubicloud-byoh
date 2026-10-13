@@ -14,14 +14,33 @@
     data << ["GPU", gpu]
   end
   subnet = @vm.user_nic.private_subnet
-  data += [
+  ssh_command = lambda do |address|
+    ["SSH Command", "<span class='bg-slate-100 text-rose-500 font-mono px-2 py-1 rounded'>#{h("ssh -i <PRIVATE_KEY_PATH> #{@vm.unix_user}@#{address}")}</span>", { escape: false }]
+  end
+  if @vm.byoh_addressing?
+    # docs/byoh/NETWORKING.md section 5.5: show the addresses customers
+    # reach the VM at, and how its outbound IPv4 leaves the site.
+    shared_nat4 = @vm.byoh_egress_nat4?
+    if !@vm.ip4_enabled
+      data << ["IPv4", shared_nat4 ? "Not enabled; outbound IPv4 via shared NAT" : "Not enabled"]
+    elsif @vm.public_ip4_scope == "internal"
+      data << ["Internal IPv4", @vm.public_ip4, { copyable: true }]
+      data << ["IPv4 Reach", "Only from the #{@vm.location.ui_name} network#{"; outbound via shared NAT" if shared_nat4}"]
+    else
+      data << ["Public IPv4", @vm.public_ip4, { copyable: true }]
+      data << ["Site IPv4", @vm.ip4_internal, { copyable: true }] if @vm.ip4_internal
+    end
+    public_ip6 = @vm.public_ip6
+    data << ["IPv6", public_ip6 || "Not available", { copyable: !!public_ip6 }]
+    data << ((address = @vm.public_ip4 || public_ip6) ? ssh_command.call(address) : ["SSH Command", "No address reachable from the internet"])
+  else
+    data += [
       ["IPv4", @vm.ip4_enabled ? @vm.ip4 : "Not enabled", { copyable: @vm.ip4_enabled }],
       ["IPv6", @vm.ip6, { copyable: true }],
-      [
-        "SSH Command",
-        "<span class='bg-slate-100 text-rose-500 font-mono px-2 py-1 rounded'>#{h("ssh -i <PRIVATE_KEY_PATH> #{@vm.unix_user}@#{@vm.ip4 || @vm.ip6}")}</span>",
-        { escape: false }
-      ],
+      ssh_command.call(@vm.ip4 || @vm.ip6)
+    ]
+  end
+  data += [
       ["Private IPv4", @vm.private_ipv4, { copyable: true }],
       ["Private IPv6", @vm.private_ipv6, { copyable: true }],
       [
