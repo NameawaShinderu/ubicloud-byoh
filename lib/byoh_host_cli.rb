@@ -96,6 +96,11 @@ class ByohHostCli
     @out.puts "Moved host #{host.ubid} from location #{from.name} to #{target.name}."
     notes.each { @out.puts "  #{it}" }
     @out.puts "The host is #{host.allocation_state}; set it to accepting in the admin UI when it should take VMs." if host.allocation_state == "draining"
+    # Prep installs the egress NAT table only on hosts that were BYOH hosts
+    # at the time.
+    if !rollback && host.allocation_state != "unprepared"
+      @out.puts "Install the host's egress NAT table before it takes VMs: bin/byoh-host setup-egress-nat --host #{host.ubid}"
+    end
   end
 
   # The host's pools must pass the same location checks registration
@@ -120,7 +125,14 @@ class ByohHostCli
     parse(argv, "setup-egress-nat --host UBID") { host_option(it, opts) }
     host = find_host(opts)
     raise Error, "host #{host.ubid} is not a BYOH host (a generic host in a BYOH location)" unless host.byoh?
-    raise Error, "setup-egress-nat is not available yet: the host egress NAT is not part of this release"
+    raise Error, "host #{host.ubid} is still being prepared; its prep sets up the egress NAT" if host.allocation_state == "unprepared"
+
+    strand = DB.transaction do
+      st = Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}])
+      ByohOperatorLog.record(command: "setup-egress-nat", target_id: host.id, args: {location: host.location.name}, result: "started #{st.ubid}")
+      st
+    end
+    @out.puts "Started #{strand.ubid} to install the egress NAT table on host #{host.ubid} from location #{host.location.name}'s profile."
   end
 
   # Writes every byoh_operator_action row as JSON lines and records the

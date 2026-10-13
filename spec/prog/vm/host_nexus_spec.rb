@@ -491,6 +491,26 @@ RSpec.describe Prog::Vm::HostNexus do
       ])
     end
 
+    it "sets up the egress NAT on a BYOH host only" do
+      HostProvider.create { |hp|
+        hp.id = vm_host.id
+        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+        hp.server_identifier = "byoh-prep"
+      }
+      vm_host.update(net6: "2a01:4f9:2b:35a::/64")
+
+      # A generic host outside a BYOH location keeps the M1 prep.
+      expect { nx.prep }.to hop("wait_prep")
+      expect(Strand.where(parent_id: st.id).select_map(:prog)).not_to include("SetupByohEgressNat")
+
+      Strand.where(parent_id: st.id).destroy
+      location = Location.create(name: "byoh-prep", display_name: "byoh-prep", ui_name: "byoh-prep", visible: false,
+        provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {})
+      vm_host.update(location_id: location.id)
+      expect { described_class.new(st.reload).prep }.to hop("wait_prep")
+      expect(Strand.where(parent_id: st.id).select_map(:prog)).to include("SetupByohEgressNat")
+    end
+
     it "sets up the ndp proxy when the host needs ndp" do
       vm_host.update(net6: "2a01:4f9:2b:35a::/64", ndp_needed: true)
 

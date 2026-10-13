@@ -92,7 +92,7 @@ class Vm < Sequel::Model
 
       # we don't write secrets to params_json, because it
       # shouldn't be stored in the host for security reasons.
-      JSON.pretty_generate(
+      params = {
         vm_name: name,
         public_ipv6: project.get_ff_ipv6_disabled ? user_nic.private_subnet.random_private_ipv6.to_s : ephemeral_net6.to_s,
         public_ipv4: ip4.to_s,
@@ -120,7 +120,9 @@ class Vm < Sequel::Model
         init_script: init_script&.init_script || "",
         ipv6_disabled: project.get_ff_ipv6_disabled || false,
         append_serial_console: location_id == Location::GITHUB_RUNNERS_ID,
-      )
+      }
+      params[:egress_nat4] = vm_host.location.byoh_profile.egress_nat4_params if byoh_egress_nat4?
+      JSON.pretty_generate(params)
     end
 
     def storage_volumes

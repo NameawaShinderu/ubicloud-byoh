@@ -189,10 +189,13 @@ class VmHost < Sequel::Model
   # one of them shadows that service for the VM (NETWORKING.md 6.4).
   APIPA_EXCLUDED = %w[169.254.0.0/24 169.254.169.0/24 169.254.170.0/24 169.254.255.0/24].map { NetAddr::IPv4Net.parse(it) }.freeze
 
+  # BYOH hosts skip APIPA_EXCLUDED; other hosts keep drawing from the whole
+  # range as before.
   def veth_pair_random_ip4_addr
     ips_string = vms_dataset.select_map(:local_vetho_ip).map { it.network.to_s }
+    excluded = byoh? ? APIPA_EXCLUDED : []
     ip = APIPA_RANGE.nth(2 * SecureRandom.random_number(APIPA_LEN))
-    ip = ip.next.next while ips_string.include?(ip.to_s)
+    ip = ip.next.next while ips_string.include?(ip.to_s) || excluded.any? { it.contains(ip) }
     NetAddr::IPv4Net.new(ip, APIPA_MASK)
   end
 
@@ -481,7 +484,8 @@ class VmHost < Sequel::Model
     end
 
     pulse.merge!(dns_egress_pulse(session, previous_pulse, "4"))
-    pulse.merge!(dns_egress_pulse(session, previous_pulse, "6")) if net6
+    # A ULA-only BYOH host has no IPv6 path to the internet to probe.
+    pulse.merge!(dns_egress_pulse(session, previous_pulse, "6")) if net6 && ipv6_mode == "gua"
 
     pulse
   end

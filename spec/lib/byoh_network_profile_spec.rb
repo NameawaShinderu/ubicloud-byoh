@@ -65,6 +65,16 @@ RSpec.describe ByohNetworkProfile do
     end
   end
 
+  describe "#egress_nat4_params" do
+    it "denies the IPv4 networks of the deny list, underlay, control plane and management, once each" do
+      expect(profile(full).egress_nat4_params).to eq(deny4: ["10.98.0.0/16", "10.98.1.10/32", "10.98.1.0/24", "203.0.113.7/32"], smtp: true)
+    end
+
+    it "denies nothing and blocks SMTP by default" do
+      expect(profile({}).egress_nat4_params).to eq(deny4: [], smtp: false)
+    end
+  end
+
   describe "#errors" do
     it "refuses a value that is not an object" do
       expect(profile(["10.0.0.0/8"]).errors).to eq ["must be a JSON object"]

@@ -249,6 +249,15 @@ RSpec.describe ByohLocationCli do
       expect(audit_rows.map { it[:command] }).to eq ["byoh-location set"]
     end
 
+    it "tells the operator to reapply changed egress NAT settings to the hosts" do
+      create_vm_host(location_id: location.id)
+      expect(cli("set", "--location", location.name, "--guest-mtu", "1500")[1]).to eq "Updated location byoh-1.\n"
+      expect(cli("set", "--location", location.name, "--egress-smtp")[1]).to eq <<~OUT
+        Updated location byoh-1.
+        The host egress NAT settings changed; apply them to each host with: bin/byoh-host setup-egress-nat --host UBID
+      OUT
+    end
+
     it "changes ula48 only while the location has no hosts" do
       expect(cli("set", "--location", location.name, "--ula48", "fd00:1:3::/48")[0]).to eq 0
       create_vm_host(location_id: location.id)

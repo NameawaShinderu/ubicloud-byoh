@@ -82,6 +82,18 @@ class ByohNetworkProfile
     @raw.fetch("dns_servers", []).map { NetAddr.parse_ip(it) }
   end
 
+  # The host egress NAT settings (rhizome/host/lib/byoh_egress_nat.rb).
+  # Masqueraded VM traffic never reaches the site underlay, the control
+  # plane or the networks that manage the hosts, nor any network the
+  # location denies VMs.
+  def egress_nat4_params
+    deny4 = (vm_egress_deny + underlay_cidrs + cp_source_cidrs + host_mgmt_allow)
+      .select { it.is_a?(NetAddr::IPv4Net) }
+      .map(&:to_s)
+      .uniq
+    {deny4:, smtp: egress_smtp}
+  end
+
   def errors
     return ["must be a JSON object"] unless @raw.is_a?(Hash)
 

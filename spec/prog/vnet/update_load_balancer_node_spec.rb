@@ -528,6 +528,162 @@ LOAD_BALANCER
     end
   end
 
+  context "when the VM's host masquerades its egress (BYOH)" do
+    before do
+      location = Location.create(name: "byoh-lb", display_name: "byoh-lb", ui_name: "byoh-lb", visible: false,
+        provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {})
+      HostProvider.create { |hp|
+        hp.id = vmh.id
+        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+        hp.server_identifier = "byoh-lb"
+      }
+      vmh.update(location_id: location.id)
+      vm.update(local_vetho_ip: "169.254.0.10/32")
+      LoadBalancerVmPort.where(id: lb.vm_ports_dataset.map(&:id)).update(state: "up")
+    end
+
+    def give_vm_internal_ip4
+      vm.assigned_vm_address.destroy
+      address = Address.create(cidr: "10.98.5.0/30", routed_to_host_id: vmh.id, exposure: "internal")
+      AssignedVmAddress.create(dst_vm_id: vm.id, ip: "10.98.5.1/32", address_id: address.id)
+      vm.reload
+    end
+
+    it "balances a VM without IPv4 on its private address and SNATs its egress to vethi" do
+      vm.assigned_vm_address.destroy
+      vm.reload
+      expect(sshable).to receive(:_cmd).with("sudo ip netns exec #{vm.inhost_name} nft --file -", stdin: <<LOAD_BALANCER)
+table ip nat;
+delete table ip nat;
+table inet nat;
+delete table inet nat;
+table inet nat {
+  set neighbor_ips_v4 {
+    type ipv4_addr;
+
+  }
+
+  set neighbor_ips_v6 {
+    type ipv6_addr;
+
+  }
+
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+ip daddr 192.168.1.0 tcp dport 80 ct state established,related,new counter dnat to 192.168.1.0:8080
+
+ip6 daddr 2a02:a464:deb2:a000::2 tcp dport 80 meta mark set 0x00B1C100D
+ip6 daddr 2a02:a464:deb2:a000::2 tcp dport 80 ct state established,related,new counter dnat to numgen inc mod 1 map { 0 : 2a02:a464:deb2:a000::2 . 8080 }
+ip6 daddr fd10:9b0b:6b4b:8fbb::2 tcp dport 80 ct state established,related,new counter dnat to [2a02:a464:deb2:a000::2]:8080
+
+
+    # Basic NAT for public IPv4 to private IPv4
+
+  }
+
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+ip daddr @neighbor_ips_v4 tcp dport 80 ct state established,related,new counter snat to 192.168.1.0
+ip6 daddr @neighbor_ips_v6 tcp dport 80 ct state established,related,new counter snat to fd10:9b0b:6b4b:8fbb::2
+
+    # Basic NAT for private IPv4 to public IPv4
+    ip saddr 192.168.1.0 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to 169.254.0.11
+  }
+}
+LOAD_BALANCER
+      expect { nx.update_load_balancer }.to exit({"msg" => "load balancer is updated"})
+    end
+
+    it "keeps an internal VM's DNAT and hairpin but SNATs its internet egress to vethi" do
+      give_vm_internal_ip4
+      lb.update(stack: "ipv4")
+      expect(sshable).to receive(:_cmd).with("sudo ip netns exec #{vm.inhost_name} nft --file -", stdin: <<LOAD_BALANCER)
+table ip nat;
+delete table ip nat;
+table inet nat;
+delete table inet nat;
+table inet nat {
+  set neighbor_ips_v4 {
+    type ipv4_addr;
+
+  }
+
+  set neighbor_ips_v6 {
+    type ipv6_addr;
+
+  }
+
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+ip daddr 10.98.5.1 tcp dport 80 meta mark set 0x00B1C100D
+ip daddr 10.98.5.1 tcp dport 80 ct state established,related,new counter dnat to numgen inc mod 1 map { 0 : 192.168.1.0 . 8080 }
+ip daddr 192.168.1.0 tcp dport 80 ct state established,related,new counter dnat to 192.168.1.0:8080
+
+
+
+    # Basic NAT for public IPv4 to private IPv4
+    ip daddr 10.98.5.1 dnat to 192.168.1.0
+  }
+
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+ip daddr @neighbor_ips_v4 tcp dport 80 ct state established,related,new counter snat to 192.168.1.0
+
+
+    # Basic NAT for private IPv4 to public IPv4
+    ip saddr 192.168.1.0 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to 169.254.0.11
+    ip saddr 192.168.1.0 ip daddr 192.168.1.0 snat to 10.98.5.1
+  }
+}
+LOAD_BALANCER
+      expect { nx.update_load_balancer }.to exit({"msg" => "load balancer is updated"})
+    end
+
+    it "removes the balancer back to the host-NAT rules of a VM without IPv4" do
+      vm.assigned_vm_address.destroy
+      vm.reload
+      expect(sshable).to receive(:_cmd).with("sudo ip netns exec #{vm.inhost_name} nft --file -", stdin: <<REMOVE_LOAD_BALANCER)
+table ip nat;
+delete table ip nat;
+table inet nat;
+delete table inet nat;
+table ip nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr 192.168.1.0 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to 169.254.0.11
+  }
+}
+REMOVE_LOAD_BALANCER
+      expect { nx.remove_load_balancer }.to exit({"msg" => "load balancer is removed"})
+    end
+
+    it "removes the balancer back to the host-NAT rules of an internal VM" do
+      give_vm_internal_ip4
+      expect(sshable).to receive(:_cmd).with("sudo ip netns exec #{vm.inhost_name} nft --file -", stdin: <<REMOVE_LOAD_BALANCER)
+table ip nat;
+delete table ip nat;
+table inet nat;
+delete table inet nat;
+table ip nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    ip daddr 10.98.5.1 dnat to 192.168.1.0
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr 192.168.1.0 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to 169.254.0.11
+    ip saddr 192.168.1.0 ip daddr 192.168.1.0 snat to 10.98.5.1
+  }
+}
+REMOVE_LOAD_BALANCER
+      expect { nx.remove_load_balancer }.to exit({"msg" => "load balancer is removed"})
+    end
+  end
+
   describe "#remove_load_balancer" do
     it "creates basic nat rules" do
       expect(sshable).to receive(:_cmd).with("sudo ip netns exec #{vm.inhost_name} nft --file -", stdin: <<REMOVE_LOAD_BALANCER)

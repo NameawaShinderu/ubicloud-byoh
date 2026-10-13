@@ -210,6 +210,10 @@ class ByohLocationCli
       audit("set", location, {ui_name: opts[:ui_name], byoh_network: new_profile}.compact)
     end
     @out.puts "Updated location #{location.name}."
+    if ByohNetworkProfile.new(old_profile).egress_nat4_params != ByohNetworkProfile.new(new_profile).egress_nat4_params &&
+        !VmHost.where(location_id: location.id).empty?
+      @out.puts "The host egress NAT settings changed; apply them to each host with: bin/byoh-host setup-egress-nat --host UBID"
+    end
     update_visibility(location, opts[:visible]) unless opts[:visible].nil?
     print_warnings
   end

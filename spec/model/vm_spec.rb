@@ -364,6 +364,55 @@ RSpec.describe Vm do
       end
     end
 
+    describe "#params_json egress_nat4" do
+      def egress_nat4(exposure = nil)
+        host.update(total_cpus: 12, total_cores: 12, total_dies: 1, total_sockets: 1)
+        vm = Prog::Vm::Nexus.assemble("a a", Project.create(name: "egress").id).subject
+        vm.update(vm_host_id: host.id)
+        vm.vm_storage_volumes_dataset.destroy
+        if exposure
+          address = Address.create(cidr: "10.98.5.0/30", routed_to_host_id: host.id, exposure:)
+          AssignedVmAddress.create(ip: "10.98.5.1", address_id: address.id, dst_vm_id: vm.id)
+        end
+        params = JSON.parse(vm.reload.params_json)
+        expect(params["public_ipv4"]).to eq(exposure ? "10.98.5.1" : "")
+        params.fetch("egress_nat4", :absent)
+      end
+
+      let(:host_nat) { {"deny4" => ["10.98.0.0/16"], "smtp" => false} }
+
+      before do
+        location.update(byoh_network: {"cp_reach" => "public", "underlay_cidrs" => ["10.98.0.0/16"]})
+      end
+
+      it "asks the host to masquerade a VM without IPv4" do
+        expect(egress_nat4).to eq host_nat
+      end
+
+      it "asks the host to masquerade an internal VM with host_nat internal egress" do
+        expect(egress_nat4("internal")).to eq host_nat
+      end
+
+      it "leaves an internal VM to the site with site internal egress" do
+        location.update(byoh_network: {"cp_reach" => "public", "internal_egress" => "site"})
+        expect(egress_nat4("internal")).to eq :absent
+      end
+
+      it "leaves out a VM with a public pool address" do
+        expect(egress_nat4("public")).to eq :absent
+      end
+
+      it "leaves out every VM when the location turns host NAT off" do
+        location.update(byoh_network: {"cp_reach" => "public", "vm_egress_nat4" => false})
+        expect(egress_nat4).to eq :absent
+      end
+
+      it "leaves out a generic host outside a BYOH location" do
+        host.update(location_id: Location::HETZNER_FSN1_ID)
+        expect(egress_nat4).to eq :absent
+      end
+    end
+
     describe ".from_ips" do
       it "finds a VM by its pool address or its external IP" do
         vm = vm_on("nat", external_ip: "8.8.8.10")

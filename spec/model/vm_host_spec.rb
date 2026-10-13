@@ -500,6 +500,24 @@ RSpec.describe VmHost do
       vm.update(local_vetho_ip: "169.254.0.10", vm_host_id: vm_host.id)
       expect(vm_host.veth_pair_random_ip4_addr.network.to_s).to eq("169.254.0.12")
     end
+
+    it "skips the link-local ranges cloud services use only on a BYOH host" do
+      HostProvider.create do
+        it.id = vm_host.id
+        it.server_identifier = "byoh-apipa"
+        it.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+      end
+      location = Location.create(name: "byoh-apipa", display_name: "byoh-apipa", ui_name: "byoh-apipa", visible: false,
+        provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {})
+      # 2 * 21632 is 169.254.169.0, the start of an excluded /24.
+      expect(SecureRandom).to receive(:random_number).with(32767 - 1024).and_return(21632, 21632, 2)
+      # A generic host outside a BYOH location draws as before.
+      expect(vm_host.veth_pair_random_ip4_addr.network.to_s).to eq("169.254.169.0")
+
+      vm_host.update(location_id: location.id)
+      expect(vm_host.veth_pair_random_ip4_addr.network.to_s).to eq("169.254.171.0")
+      expect(vm_host.veth_pair_random_ip4_addr.network.to_s).to eq("169.254.1.0")
+    end
   end
 
   describe "#init_health_monitor_session" do
@@ -755,6 +773,14 @@ RSpec.describe VmHost do
 
     it "skips the IPv6 probe when the host has no IPv6" do
       vm_host.update(net6: nil)
+      stub_health_checks_pass
+      pulse = vm_host.check_pulse(session:, previous_pulse: {})
+      expect(pulse[:dns_egress4]).to eq("up")
+      expect(pulse).not_to have_key(:dns_egress6)
+    end
+
+    it "skips the IPv6 probe when the host has only ULA IPv6" do
+      vm_host.update(ipv6_mode: "ula")
       stub_health_checks_pass
       pulse = vm_host.check_pulse(session:, previous_pulse: {})
       expect(pulse[:dns_egress4]).to eq("up")
