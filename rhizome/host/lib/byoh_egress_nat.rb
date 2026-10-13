@@ -10,6 +10,9 @@ require "fileutils"
 # host away from the platform's link-local services, such as an instance
 # metadata service, and keeps host-NAT traffic off the networks in deny4:
 # the site underlay, the control plane and the hosts' management networks.
+# Connections a VM opens to this host's own addresses in deny4, such as
+# its management IP, are dropped in the input chain, which the forward
+# chain never sees.
 #
 # Only connections a VM opens are dropped: replies to a host-NAT VM's
 # vethi address, as from another VM on the host, must pass. The namespace
@@ -61,6 +64,11 @@ module ByohEgressNat
           iifname "vetho*" oifname != "vetho*" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } ip daddr @deny4 ct direction original counter drop
           ip saddr 169.254.0.0/16 ip daddr @deny4 counter drop
       #{smtp_drop}    ip saddr 169.254.0.0/16 ct state new add @per_src { ip saddr ct count over #{MAX_CONNECTIONS} } counter drop
+        }
+
+        chain input {
+          type filter hook input priority filter - 1; policy accept;
+          iifname "vetho*" ip daddr @deny4 ct direction original counter drop
         }
 
         chain postrouting {

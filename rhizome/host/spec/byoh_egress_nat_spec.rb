@@ -38,6 +38,11 @@ RSpec.describe ByohEgressNat do
           ip saddr 169.254.0.0/16 ct state new add @per_src { ip saddr ct count over 4096 } counter drop
         }
 
+        chain input {
+          type filter hook input priority filter - 1; policy accept;
+          iifname "vetho*" ip daddr @deny4 ct direction original counter drop
+        }
+
         chain postrouting {
           type nat hook postrouting priority srcnat; policy accept;
           ip saddr 169.254.0.0/16 ip daddr != 169.254.0.0/16 oifname != "vetho*" ct state new update @log_src { ip saddr limit rate 5/second } log prefix "byoh-egress " level info
