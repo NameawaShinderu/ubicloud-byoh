@@ -96,6 +96,12 @@ class Vm < Sequel::Model
   # nat pool address is 1:1 NATed to, otherwise the address itself.
   def public_ip4 = assigned_vm_address&.external_ip || ip4
 
+  def public_ip4_string = public_ip4&.to_s
+
+  # The pool address of a nat VM, which only the site's network reaches.
+  # Nil when the VM's address is itself its public one.
+  def ip4_internal = (ip4 if assigned_vm_address&.external_ip)
+
   # Whether the VM's IPv4 faces the internet. Only a BYOH host has
   # internal pools.
   def public_ip4_scope
@@ -113,6 +119,26 @@ class Vm < Sequel::Model
     return ip4 if vm_host.location.byoh_profile.cp_reach == "onhost"
 
     public_ip4 unless public_ip4_scope == "internal"
+  end
+
+  # The IPv6 customers reach the VM at. A BYOH host without a global
+  # prefix hands out a ULA, which is reachable only inside the site.
+  def public_ip6
+    return ip6 unless byoh_host?
+
+    ip6 if vm_host.ipv6_mode == "gua"
+  end
+
+  # Whether outbound IPv4 leaves through the BYOH host's shared NAT: for
+  # a VM without IPv4, and for one with an internal address when the
+  # location sends internal traffic through the host.
+  def byoh_egress_nat4?
+    return false unless byoh_host?
+
+    profile = vm_host.location.byoh_profile
+    return false unless profile.vm_egress_nat4
+
+    ip4.nil? || (public_ip4_scope == "internal" && profile.internal_egress == "host_nat")
   end
 
   def ip4_string
@@ -225,8 +251,12 @@ class Vm < Sequel::Model
     id.to_s[0..7]
   end
 
+  # The VMs holding any of the given "a.b.c.d/32" addresses, as a pool
+  # address or as the external IP a nat pool address is NATed to.
   def self.from_ips(ips)
-    eager_graph(:assigned_vm_address, :project).where(Sequel[:assigned_vm_address][:ip] => ips).all
+    eager_graph(:assigned_vm_address, :project)
+      .where(Sequel.|({Sequel[:assigned_vm_address][:ip] => ips}, {Sequel[:assigned_vm_address][:external_ip] => ips.map { it.delete_suffix("/32") }}))
+      .all
   end
 
   def storage_size_gib

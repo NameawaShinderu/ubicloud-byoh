@@ -56,9 +56,33 @@ summary_data = summary
       "Total" => counts.values.sum,
     }
   end
-  .sort_by { [it["Total"], it["Customer"].value] } %>
+  .sort_by { [it["Total"], it["Customer"].value] }
+
+pool_data = if obj.byoh?
+  pool_rows = ByohPool.new(obj).rows
+  pool_vms = Vm.where(id: pool_rows.filter_map { it[:vm_id] }).to_hash(:id)
+  pool_rows.map do |row|
+    state = if (vm = pool_vms[row[:vm_id]])
+      table_link(vm.name, "/model/Vm/#{vm.ubid}")
+    else
+      row[:reserved] ? "reserved" : "free"
+    end
+    {
+      "Address" => row[:ip].to_s,
+      "Pool" => row[:cidr].to_s,
+      "Delivery" => row[:delivery],
+      "Exposure" => row[:exposure],
+      "External IP" => row[:external_ip]&.to_s,
+      "State" => state,
+    }
+  end
+end %>
 
 <%== part("components/collapsible_table", title: inventory_title, table_class: "vm-host-inventory-table", data: inventory_data) %>
+
+<% if pool_data %>
+  <%== part("components/collapsible_table", title: "BYOH Pools", table_class: "vm-host-pools-table", data: pool_data, use_admin_label: false) %>
+<% end %>
 
 <% if resource_data.empty? %>
   <p>No customer resources are hosted on this host.</p>

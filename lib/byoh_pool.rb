@@ -98,7 +98,7 @@ class ByohPool
       .left_join(:assigned_vm_address, {ip: Sequel[:ipv4_address][:ip]})
       .where(Sequel[:address][:routed_to_host_id] => host.id)
       .order(Sequel[:ipv4_address][:ip])
-      .select(Sequel[:ipv4_address][:ip], Sequel[:ipv4_address][:cidr], :exposure, :reserved, Sequel[:ipv4_address][:external_ip],
+      .select(Sequel[:ipv4_address][:ip], Sequel[:ipv4_address][:cidr], :delivery, :exposure, :reserved, Sequel[:ipv4_address][:external_ip],
         Sequel[:assigned_vm_address][:dst_vm_id].as(:vm_id), Sequel[:assigned_vm_address][:external_ip].as(:vm_external_ip))
       .all
   end

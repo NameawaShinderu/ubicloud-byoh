@@ -18,6 +18,8 @@ class DeletedRecord < Sequel::Model
       .first
   end
 
+  # Deleted VMs that held any of the given "a.b.c.d/32" addresses, as a
+  # pool address or as the external IP of a nat pool address.
   def self.vms_by_ips(ips, days: 5)
     ip_values = Sequel.pg_jsonb_op(Sequel[:ip][:model_values])
     vm_values = Sequel.pg_jsonb_op(Sequel[:vm][:model_values])
@@ -26,11 +28,12 @@ class DeletedRecord < Sequel::Model
       .join(Sequel[:deleted_record].as(:vm), Sequel.cast(ip_values.get_text("dst_vm_id"), :uuid) => Sequel[:vm][:record_id])
       .where(Sequel[:ip][:model_name] => "AssignedVmAddress")
       .where(Sequel[:vm][:model_name] => "Vm")
-      .where(ip_values.get_text("ip") => ips)
+      .where(Sequel.|({ip_values.get_text("ip") => ips}, {ip_values.get_text("external_ip") => ips.map { it.delete_suffix("/32") }}))
       .where(Sequel[:ip][:deleted_at] > last_n_days)
       .where(Sequel[:vm][:deleted_at] > last_n_days)
       .select(
         ip_values.get_text("ip").as(:ip),
+        ip_values.get_text("external_ip").as(:external_ip),
         Sequel[:ip][:deleted_at],
         Sequel.cast(vm_values.get_text("created_at"), :timestamptz).as(:created_at),
         ip_values.get_text("dst_vm_id").as(:vm_id),

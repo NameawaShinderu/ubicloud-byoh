@@ -3401,6 +3401,70 @@ RSpec.describe CloverAdmin do
     expect(page.find_field("days").value).to eq "10"
   end
 
+  it "finds active and archived VMs by the external IP of a nat address" do
+    host = create_vm_host
+    active_vm = create_vm(name: "active-nat-vm")
+    address = Address.create(cidr: "10.98.5.0/30", routed_to_host_id: host.id, exposure: "nat")
+    AssignedVmAddress.create(ip: "10.98.5.1", address_id: address.id, dst_vm_id: active_vm.id, external_ip: "8.8.8.10")
+    archived_vm = create_vm(name: "archived-nat-vm")
+    AssignedVmAddress.create(ip: "10.98.5.2", address_id: address.id, dst_vm_id: archived_vm.id, external_ip: "8.8.8.11").destroy
+    archived_vm.destroy
+
+    visit "/vm-by-ipv4"
+    fill_in "ips", with: "8.8.8.10, 8.8.8.11"
+    click_button "Show Virtual Machines"
+
+    expect(page.all(".vm-by-ipv4-table thead th").map(&:text).first(2)).to eq ["ip", "external_ip"]
+    expect(page.all(".vm-by-ipv4-table tbody tr").map { it.all("td").map(&:text).values_at(0, 1, 5) }).to eq [
+      ["10.98.5.1/32", "8.8.8.10", "active-nat-vm"],
+      ["10.98.5.2/32", "8.8.8.11", "archived-nat-vm"],
+    ]
+  end
+
+  it "leaves the external IP column out when no VM has one" do
+    host = create_vm_host
+    vm = create_vm(name: "plain-vm")
+    address = Address.create(cidr: "172.16.0.0/24", routed_to_host_id: host.id)
+    AssignedVmAddress.create(ip: "172.16.0.1/32", address_id: address.id, dst_vm_id: vm.id)
+
+    visit "/vm-by-ipv4"
+    fill_in "ips", with: "172.16.0.1"
+    click_button "Show Virtual Machines"
+
+    expect(page).to have_content("plain-vm")
+    expect(page.all(".vm-by-ipv4-table thead th").map(&:text)).not_to include "external_ip"
+  end
+
+  it "lists the pools of a BYOH host" do
+    location = Location.create(name: "byoh-admin", display_name: "byoh-admin", ui_name: "byoh-admin", visible: false,
+      provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {})
+    vm_host = create_vm_host(location_id: location.id)
+    HostProvider.create do |hp|
+      hp.id = vm_host.id
+      hp.server_identifier = "byoh-admin"
+      hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+    end
+    address = Address.create(cidr: "10.98.1.128/30", routed_to_host_id: vm_host.id, delivery: "fabric", exposure: "nat")
+    address.populate_ipv4_addresses(reserved_ips: ["10.98.1.131"], external_ips: {"10.98.1.128" => "8.8.8.10"})
+    vm = create_vm(vm_host_id: vm_host.id, name: "pool-vm")
+    AssignedVmAddress.create(ip: "10.98.1.128", address_id: address.id, dst_vm_id: vm.id, external_ip: "8.8.8.10")
+
+    visit "/model/VmHost/#{vm_host.ubid}"
+    page.all("summary").each(&:click)
+    expect(page.all(".vm-host-pools-table thead th").map(&:text)).to eq ["Address", "Pool", "Delivery", "Exposure", "External IP", "State"]
+    expect(page.all(".vm-host-pools-table tbody tr").map { it.all("td").map(&:text) }).to eq [
+      ["10.98.1.128", "10.98.1.128/30", "fabric", "nat", "8.8.8.10", "pool-vm"],
+      ["10.98.1.129", "10.98.1.128/30", "fabric", "nat", "", "free"],
+      ["10.98.1.130", "10.98.1.128/30", "fabric", "nat", "", "free"],
+      ["10.98.1.131", "10.98.1.128/30", "fabric", "nat", "", "reserved"],
+    ]
+    expect(page).to have_link("pool-vm", href: "/model/Vm/#{vm.ubid}")
+
+    vm_host.update(location_id: Location::HETZNER_FSN1_ID)
+    visit "/model/VmHost/#{vm_host.ubid}"
+    expect(page).to have_no_css(".vm-host-pools-table")
+  end
+
   it "shows a message when no data available" do
     visit "/vm-by-ipv4"
     fill_in "ips", with: "172.16.0.1, 172.16.1.1,,invalid-ip"

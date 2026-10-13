@@ -1709,6 +1709,7 @@ class CloverAdmin < Roda
         active_vms = Vm.from_ips(ips).map {
           {
             ip: it.assigned_vm_address.ip.to_s,
+            external_ip: it.assigned_vm_address.external_ip&.to_s,
             created_at: it.created_at,
             archived_at: nil,
             vm_id: it.ubid,
@@ -1720,6 +1721,7 @@ class CloverAdmin < Roda
         deleted_vms = DeletedRecord.vms_by_ips(ips, days: @days).map {
           {
             ip: it[:ip],
+            external_ip: it[:external_ip],
             created_at: it[:created_at],
             archived_at: it[:deleted_at],
             vm_id: UBID.to_ubid(it[:vm_id]),
@@ -1729,6 +1731,9 @@ class CloverAdmin < Roda
           }
         }
         @vms = (active_vms + deleted_vms).sort_by { [it[:ip], -it[:created_at].to_i] }
+        # Only nat pool addresses have an external IP; keep the column out
+        # of results that have none.
+        @vms.each { it.delete(:external_ip) } if @vms.none? { it[:external_ip] }
       end
 
       view("vm_by_ipv4")

@@ -14,7 +14,7 @@ class Prog::Vm::Nexus < Prog::Base
     exclude_availability_zones: [], availability_zone: nil, availability_zone_required: false, alternative_families: [],
     allow_private_subnet_in_other_project: false, init_script: nil, exclude_data_centers: [],
     use_separate_management_nic: false, use_eip: true, management_nic_use_eip: true, remote_storage_server_id: nil,
-    waiting_strand_id: nil, allocated_waiting_strand_id: nil)
+    waiting_strand_id: nil, allocated_waiting_strand_id: nil, ip4_exposure: "internet")
 
     unless (project = Project[project_id])
       fail "No existing project"
@@ -25,6 +25,15 @@ class Prog::Vm::Nexus < Prog::Base
 
     unless (location = (allow_private_subnet_in_other_project ? Location : Location.for_project(project_id)).with_pk(location_id))
       fail "No existing location in project"
+    end
+
+    unless VmHost::IP4_EXPOSURE_POOLS.key?(ip4_exposure)
+      fail "Unknown IPv4 exposure #{ip4_exposure}"
+    end
+    # Only BYOH locations have internal pools; elsewhere an internal VM
+    # would wait for capacity forever.
+    if ip4_exposure == "internal" && !location.byoh?
+      fail "Internal IPv4 is only available in BYOH locations"
     end
 
     vm_size = Validation.validate_vm_size(size, arch)
@@ -129,6 +138,7 @@ class Prog::Vm::Nexus < Prog::Base
         location_id: location.id,
         boot_image:,
         ip4_enabled: enable_ip4,
+        ip4_exposure:,
         pool_id:,
         arch:,
         project_id:,

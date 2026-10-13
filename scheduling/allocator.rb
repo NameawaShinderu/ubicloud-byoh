@@ -65,6 +65,7 @@ module Scheduling::Allocator
       family_filter,
       minimum_vhost_block_backend_version,
       os_filter,
+      vm.ip4_exposure,
     )
     allocation = Allocation.best_allocation(request)
     fail NoSpaceLeft, "#{vm} no space left on any eligible host" unless allocation
@@ -100,11 +101,13 @@ module Scheduling::Allocator
     :family_filter,
     :minimum_vhost_block_backend_version,
     :os_filter,
+    :ip4_exposure,
   ) do
     def initialize(*args)
       super
       self.require_shared_slice ||= false
       self.diagnostics ||= false
+      self.ip4_exposure ||= "internet"
     end
 
     # Computes the amount of memory needed for a slice
@@ -220,7 +223,7 @@ module Scheduling::Allocator
               .left_join(:assigned_vm_address, ip: :ip)
               .join(:address, [:cidr])
               .where { assigned_vm_address[:ip] =~ nil }
-              .where(Sequel[:ipv4_address][:reserved] => false)
+              .where(Sequel[:ipv4_address][:reserved] => false, Sequel[:address][:exposure] => VmHost::IP4_EXPOSURE_POOLS.fetch(request.ip4_exposure))
               .select_group(:routed_to_host_id)
               .select_append { (count.function.* > 0).as(:ipv4_available) })
             .with(:storage_devices, DB[:storage_device]
@@ -384,7 +387,7 @@ module Scheduling::Allocator
     end
 
     def self.update_vm(vm_host, vm)
-      ip4, address = vm_host.ip4_random_vm_network if vm.ip4_enabled
+      ip4, address, external_ip = vm_host.ip4_random_vm_network(exposure: vm.ip4_exposure) if vm.ip4_enabled
       fail NoSpaceLeft, "no ip4 addresses left" if vm.ip4_enabled && !ip4
 
       update_args = {
@@ -396,8 +399,8 @@ module Scheduling::Allocator
       update_args[:family] = vm_host.family if vm.family != "burstable"
       vm.set(**update_args)
       vm.save_with_ephemeral_net6_error_retrying(vm_host)
-      AssignedVmAddress.create(dst_vm_id: vm.id, ip: ip4.to_s, address_id: address.id) if ip4
-      vm.sshable&.update(host: vm.ip4_string || vm.ip6_string)
+      AssignedVmAddress.create(dst_vm_id: vm.id, ip: ip4.to_s, address_id: address.id, external_ip: external_ip&.to_s) if ip4
+      vm.sshable&.update(host: vm.cp_reach_ip4&.to_s || vm.ip6_string)
     end
 
     def initialize(candidate_host, request)

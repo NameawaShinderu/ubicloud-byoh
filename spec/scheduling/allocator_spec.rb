@@ -93,6 +93,22 @@ RSpec.describe Scheduling::Allocator do
       expect(vm.vm_storage_volumes.count).to eq(2)
     end
 
+    it "passes the VM's IPv4 exposure as the request's last member" do
+      vm.update(ip4_exposure: "internal")
+      expect(Al::Allocation).to receive(:best_allocation) do |request|
+        expect(request.to_a.last).to eq "internal"
+        expect(request.ip4_exposure).to eq "internal"
+        expect(request.os_filter).to be_nil
+        nil
+      end
+      expect { described_class.allocate(vm, storage_volumes) }.to raise_error Scheduling::Allocator::NoSpaceLeft
+      expect(Al::Request.members.last(2)).to eq [:os_filter, :ip4_exposure]
+    end
+
+    it "defaults a request's IPv4 exposure to internet" do
+      expect(Al::Request.new.ip4_exposure).to eq "internet"
+    end
+
     it "handles non-existing family" do
       vm.family = "non-existing-family"
       expect { described_class.allocate(vm, storage_volumes) }.to raise_error Scheduling::Allocator::NoSpaceLeft, /no space left on any eligible host/
@@ -453,6 +469,22 @@ RSpec.describe Scheduling::Allocator do
 
       expect(Al::Allocation.candidate_hosts(req)).to be_empty
       DB[:ipv4_address].update(reserved: false)
+      expect(Al::Allocation.candidate_hosts(req).map { it[:vm_host_id] }).to eq [vmh.id]
+    end
+
+    it "counts only ipv4 addresses of the requested exposure as available" do
+      vmh = create_vm_host(total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+      StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+      BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+      address = Address.create(cidr: "10.1.1.0/30", routed_to_host_id: vmh.id, exposure: "internal").tap(&:populate_ipv4_addresses)
+
+      expect(Al::Allocation.candidate_hosts(req)).to be_empty
+      req.ip4_exposure = "internal"
+      expect(Al::Allocation.candidate_hosts(req).map { it[:vm_host_id] }).to eq [vmh.id]
+
+      address.update(exposure: "nat")
+      expect(Al::Allocation.candidate_hosts(req)).to be_empty
+      req.ip4_exposure = "internet"
       expect(Al::Allocation.candidate_hosts(req).map { it[:vm_host_id] }).to eq [vmh.id]
     end
 
@@ -1281,6 +1313,53 @@ RSpec.describe Scheduling::Allocator do
 
       expect(vm.reload.assigned_vm_address).not_to be_nil
       expect(vm.sshable.host).to eq(vm.ip4_string)
+    end
+
+    describe "on a BYOH host" do
+      let(:location) {
+        Location.create(name: "byoh-alloc", display_name: "byoh-alloc", ui_name: "byoh-alloc", visible: false,
+          provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"cp_reach" => "public"})
+      }
+      let(:vmh) {
+        host = create_vm_host(location_id: location.id, net6: "fd10:9b0b:6b4b:8fbc::/64")
+        HostProvider.create do |hp|
+          hp.id = host.id
+          hp.server_identifier = "byoh-alloc"
+          hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+        end
+        host
+      }
+
+      def allocate(exposure, **vm_args)
+        vm = create_vm(ip4_enabled: true, ip4_exposure: exposure, location_id: location.id, **vm_args)
+        Sshable.create_with_id(vm)
+        Al::Allocation.update_vm(vmh, vm)
+        vm.reload
+      end
+
+      it "copies the external IP of a nat address and reaches the VM at it" do
+        Address.create(cidr: "10.98.1.128/32", routed_to_host_id: vmh.id, exposure: "nat")
+          .populate_ipv4_addresses(external_ips: {"10.98.1.128" => "8.8.8.10"})
+        vm = allocate("internet")
+        expect(vm.assigned_vm_address.external_ip.to_s).to eq "8.8.8.10"
+        expect(vm.ip4_string).to eq "10.98.1.128"
+        expect(vm.sshable.host).to eq "8.8.8.10"
+      end
+
+      it "gives an internal VM an internal address and reaches it over IPv6" do
+        Address.create(cidr: "10.98.2.0/32", routed_to_host_id: vmh.id, exposure: "internal").populate_ipv4_addresses
+        Address.create(cidr: "10.98.1.128/32", routed_to_host_id: vmh.id, exposure: "nat")
+          .populate_ipv4_addresses(external_ips: {"10.98.1.128" => "8.8.8.10"})
+        vm = allocate("internal")
+        expect(vm.ip4_string).to eq "10.98.2.0"
+        expect(vm.assigned_vm_address.external_ip).to be_nil
+        expect(vm.sshable.host).to eq vm.ip6_string
+      end
+
+      it "never gives an internet VM an internal address" do
+        Address.create(cidr: "10.98.2.0/32", routed_to_host_id: vmh.id, exposure: "internal").populate_ipv4_addresses
+        expect { allocate("internet") }.to raise_error(Scheduling::Allocator::NoSpaceLeft, /no ip4 addresses left/)
+      end
     end
 
     it "fails if there is no ip address available but the vm is ip4 enabled" do

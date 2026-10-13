@@ -86,6 +86,25 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       }.to raise_error RuntimeError, "No existing location in project"
     end
 
+    it "fails for an unknown IPv4 exposure" do
+      expect {
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, ip4_exposure: "outer-space")
+      }.to raise_error RuntimeError, "Unknown IPv4 exposure outer-space"
+    end
+
+    it "fails for internal IPv4 outside a BYOH location" do
+      expect {
+        Prog::Vm::Nexus.assemble("some_ssh key", project.id, enable_ip4: true, ip4_exposure: "internal")
+      }.to raise_error RuntimeError, "Internal IPv4 is only available in BYOH locations"
+    end
+
+    it "records the requested IPv4 exposure" do
+      expect(Prog::Vm::Nexus.assemble("some_ssh key", project.id).subject.ip4_exposure).to eq "internet"
+      Location[Location::HETZNER_FSN1_ID].update(byoh_network: {})
+      st = Prog::Vm::Nexus.assemble("some_ssh key", project.id, name: "internal-vm", enable_ip4: true, ip4_exposure: "internal")
+      expect(st.subject.ip4_exposure).to eq "internal"
+    end
+
     it "creates Subnet and Nic if not passed" do
       expect {
         Prog::Vm::Nexus.assemble("some_ssh key", project.id)
@@ -1221,6 +1240,116 @@ RSpec.describe Prog::Vm::Metal::Nexus do
     end
   end
 
+  describe "on a BYOH host" do
+    let(:byoh_location) {
+      Location.create(name: "byoh-nexus", display_name: "byoh-nexus", ui_name: "byoh-nexus", visible: false,
+        provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"cp_reach" => "public"})
+    }
+    let(:vm_host) {
+      host = create_vm_host(location_id: byoh_location.id, used_cores: 2, total_hugepages_1g: 375, used_hugepages_1g: 16)
+      HostProvider.create do |hp|
+        hp.id = host.id
+        hp.server_identifier = "byoh-nexus"
+        hp.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+      end
+      host
+    }
+    let(:probe_command) {
+      "sudo timeout 3 ip netns exec #{vm.inhost_name} bash -c #{Shellwords.escape(":>/dev/tcp/10.0.0.1/22")}"
+    }
+
+    def assign(exposure, external_ip: nil)
+      adr = Address.create(cidr: "10.98.5.0/30", routed_to_host_id: vm_host.id, exposure:)
+      AssignedVmAddress.create(ip: "10.98.5.1", address_id: adr.id, dst_vm_id: vm.id, external_ip:)
+      vm.update(ip4_enabled: true)
+    end
+
+    before do
+      vm.update(allocated_at: Time.now - 100)
+      vm.incr_update_firewall_rules
+      nic.update(vm_id: vm.id)
+    end
+
+    it "connects to the external IP of a nat VM" do
+      assign("nat", external_ip: "8.8.8.10")
+      expect(Socket).to receive(:tcp).with("8.8.8.10", 22, connect_timeout: 1)
+      expect { nx.wait_sshable }.to hop("wait")
+    end
+
+    it "probes an internal VM from its network namespace" do
+      assign("internal")
+      expect(sshable).to receive(:_cmd).with(probe_command, log: false).and_return("")
+      expect { nx.wait_sshable }.to hop("wait")
+      expect(vm.reload.display_state).to eq("running")
+    end
+
+    it "probes a VM without IPv4 from its network namespace" do
+      expect(sshable).to receive(:_cmd).with(probe_command, log: false).and_return("")
+      expect { nx.wait_sshable }.to hop("wait")
+    end
+
+    it "counts a failed probe and naps" do
+      refresh_frame(nx, new_values: {"netns_probe_tries" => 3})
+      expect(sshable).to receive(:_cmd).with(probe_command, log: false).and_raise(Sshable::SshError.new(probe_command, "", "", 1, nil))
+      expect { nx.wait_sshable }.to nap(5)
+      expect(nx.netns_probe_tries).to eq 4
+    end
+
+    it "gives up probing after the last try and lets the VM run" do
+      refresh_frame(nx, new_values: {"netns_probe_tries" => described_class::NETNS_PROBE_TRIES})
+      expect(sshable).not_to receive(:_cmd)
+      expect(Clog).to receive(:emit).with("byoh netns probe gave up", {byoh_netns_probe: {vm_ubid: vm.ubid, vm_host_ubid: vm_host.ubid, tries: described_class::NETNS_PROBE_TRIES}})
+      expect(Clog).to receive(:emit).with("vm provisioned", instance_of(Array))
+      expect { nx.wait_sshable }.to hop("wait")
+    end
+
+    it "does not probe a VM booting from a customer machine image" do
+      expect(nx).to receive(:boots_from_customer_machine_image?).and_return(true)
+      expect(sshable).not_to receive(:_cmd)
+      expect { nx.wait_sshable }.to hop("wait")
+    end
+
+    it "does not probe a VM without a private IPv4" do
+      nic.update(vm_id: nil)
+      expect(sshable).not_to receive(:_cmd)
+      expect { nx.wait_sshable }.to hop("wait")
+    end
+
+    it "does not probe on a generic host outside a BYOH location, as upstream" do
+      vm_host.update(location_id: Location::HETZNER_FSN1_ID)
+      expect(sshable).not_to receive(:_cmd)
+      expect { nx.wait_sshable }.to hop("wait")
+    end
+
+    it "connects to the pool address on a generic host outside a BYOH location, as upstream" do
+      vm_host.update(location_id: Location::HETZNER_FSN1_ID)
+      assign("internal")
+      expect(Socket).to receive(:tcp).with("10.98.5.1", 22, connect_timeout: 1)
+      expect { nx.wait_sshable }.to hop("wait")
+    end
+
+    it "bills the pool address on a generic host outside a BYOH location, as upstream" do
+      vm_host.update(location_id: Location::HETZNER_FSN1_ID)
+      assign("internal")
+      expect { nx.create_billing_record }.to hop("prep")
+      record = vm.active_billing_records.find { it.billing_rate["resource_type"] == "IPAddress" }
+      expect(record.resource_name).to eq "10.98.5.1/32"
+    end
+
+    it "does not bill an internal address" do
+      assign("internal")
+      expect { nx.create_billing_record }.to hop("prep")
+      expect(vm.active_billing_records.map { it.billing_rate["resource_type"] }).to eq ["VmVCpu"]
+    end
+
+    it "bills a nat address under its external IP" do
+      assign("nat", external_ip: "8.8.8.10")
+      expect { nx.create_billing_record }.to hop("prep")
+      record = vm.active_billing_records.find { it.billing_rate["resource_type"] == "IPAddress" }
+      expect(record.resource_name).to eq "8.8.8.10"
+    end
+  end
+
   describe "#wait_storage_catchup" do
     before do
       sd = StorageDevice.create(vm_host_id: vm_host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100)
@@ -1292,6 +1421,7 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       expect { nx.create_billing_record }.to hop("prep")
         .and change(BillingRecord, :count).from(0).to(2)
       expect(vm.active_billing_records.map { it.billing_rate["resource_type"] }.sort).to eq(["IPAddress", "VmVCpu"])
+      expect(vm.active_billing_records.find { it.billing_rate["resource_type"] == "IPAddress" }.resource_name).to eq "192.168.1.1/32"
     end
 
     it "creates billing records when gpu is present" do

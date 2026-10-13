@@ -54,6 +54,17 @@ RSpec.describe DeletedRecord do
       expect(described_class.vms_by_ips(["5.6.7.8/32"])).to be_empty
       expect(described_class.vms_by_ips(["1.2.3.4/32"], days: 0)).to be_empty
     end
+
+    it "finds a deleted VM by the external IP of its address" do
+      vm = create_vm(name: "deleted-nat-vm")
+      address = Address.create(cidr: "10.98.5.0/30", routed_to_host_id: create_vm_host.id, exposure: "nat")
+      AssignedVmAddress.create(ip: "10.98.5.1", address_id: address.id, dst_vm_id: vm.id, external_ip: "8.8.8.10").destroy
+      vm.destroy
+
+      rows = described_class.vms_by_ips(["8.8.8.10/32"])
+      expect(rows.map { [it[:vm_name], it[:ip], it[:external_ip]] }).to eq [["deleted-nat-vm", "10.98.5.1/32", "8.8.8.10"]]
+      expect(described_class.vms_by_ips(["10.98.5.1/32"]).length).to eq 1
+    end
   end
 
   describe "partition maintenance" do

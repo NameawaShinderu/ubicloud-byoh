@@ -13,7 +13,11 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   subject_is :vm
   frame_reader :distinct_storage_devices, :exclude_host_ids, :exclude_data_centers, :gpu_count, :gpu_device,
     :force_host_id, :storage_volumes, :ch_version
-  frame_accessor :reason_determined
+  frame_accessor :reason_determined, :netns_probe_tries
+
+  # How often wait_sshable probes a VM the control plane cannot reach from
+  # the host's network namespace, 5 seconds apart, before giving up.
+  NETNS_PROBE_TRIES = 120
 
   def vm_name
     @vm_name ||= vm.inhost_name
@@ -253,18 +257,47 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       nap 3
     end
 
-    if (addr = vm.ip4_string)
+    if (addr = vm.cp_reach_ip4&.to_s)
       begin
-        Socket.tcp(addr.to_s, 22, connect_timeout: 1) {}
+        Socket.tcp(addr, 22, connect_timeout: 1) {}
       rescue SystemCallError
         nap 1
       end
+    elsif netns_probe?
+      probe_from_netns
     end
 
     vm.update(display_state: "running", provisioned_at: Time.now)
     Clog.emit("vm provisioned", [vm, {provision: {vm_ubid: vm.ubid, vm_host_ubid: host.ubid, duration: (Time.now - vm.allocated_at).round(3)}}])
 
     hop_wait_and_wakeup_waiting_strand
+  end
+
+  # A VM on a BYOH host whose IPv4 the control plane cannot reach (an
+  # internal address it does not sit next to, or no IPv4 at all) is probed
+  # from the host instead, at its private address. Customer images need
+  # not run sshd, so they are not probed, as they are not elsewhere.
+  def netns_probe?
+    vm.byoh_host? && !boots_from_customer_machine_image? && !vm.private_ipv4.nil?
+  end
+
+  # Naps until sshd answers inside the VM's network namespace. After
+  # NETNS_PROBE_TRIES failures it logs and lets the VM run, so a guest
+  # without sshd is not stuck.
+  def probe_from_netns
+    tries = netns_probe_tries.to_i
+    if tries >= NETNS_PROBE_TRIES
+      Clog.emit("byoh netns probe gave up", {byoh_netns_probe: {vm_ubid: vm.ubid, vm_host_ubid: host.ubid, tries:}})
+      return
+    end
+
+    begin
+      host.sshable.cmd("sudo timeout 3 ip netns exec :vm_name bash -c :probe",
+        vm_name:, probe: ":>/dev/tcp/#{vm.private_ipv4}/22", log: false)
+    rescue Sshable::SshError
+      self.netns_probe_tries = tries + 1
+      nap 5
+    end
   end
 
   label def wait_storage_catchup
@@ -302,11 +335,13 @@ class Prog::Vm::Metal::Nexus < Prog::Base
         )
       end
 
-      if vm.ip4_enabled
+      # An internal address is not billed. A nat address is billed under
+      # its external IP, which is the one customers see.
+      if vm.ip4_enabled && vm.public_ip4_scope != "internal"
         BillingRecord.create(
           project_id: project.id,
           resource_id: vm.id,
-          resource_name: vm.assigned_vm_address.ip,
+          resource_name: vm.assigned_vm_address.external_ip&.to_s || vm.assigned_vm_address.ip,
           billing_rate_id: BillingRate.from_resource_properties("IPAddress", "IPv4", vm.location.name)["id"],
           amount: 1,
         )

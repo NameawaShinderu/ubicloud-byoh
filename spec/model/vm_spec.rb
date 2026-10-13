@@ -268,6 +268,75 @@ RSpec.describe Vm do
       vm = vm_on("internal")
       expect([vm.public_ip4.to_s, vm.public_ip4_scope, vm.cp_reach_ip4.to_s]).to eq ["10.98.5.1", "public", "10.98.5.1"]
     end
+
+    it "shows a nat VM's pool address as its internal one" do
+      vm = vm_on("nat", external_ip: "8.8.8.10")
+      expect(vm.public_ip4_string).to eq "8.8.8.10"
+      expect(vm.ip4_internal).to be_a NetAddr::IPv4
+      expect(vm.ip4_internal.to_s).to eq "10.98.5.1"
+    end
+
+    it "has no internal IPv4 when the pool address is public" do
+      vm = vm_on("public")
+      expect([vm.public_ip4_string, vm.ip4_internal]).to eq ["10.98.5.1", nil]
+      no_ip4 = create_vm(vm_host_id: host.id)
+      expect([no_ip4.public_ip4_string, no_ip4.ip4_internal]).to eq [nil, nil]
+    end
+
+    describe "#public_ip6" do
+      let(:vm) { create_vm(vm_host_id: host.id, location_id: location.id, ephemeral_net6: "fd00:feed::/80") }
+
+      it "is the IPv6 of a host with global IPv6" do
+        expect(vm.public_ip6.to_s).to eq vm.ip6_string
+      end
+
+      it "is nil on a host with only ULA IPv6" do
+        host.update(ipv6_mode: "ula")
+        expect(vm.ip6).not_to be_nil
+        expect(vm.public_ip6).to be_nil
+      end
+
+      it "is the IPv6 outside a BYOH host, whatever the mode" do
+        host.update(ipv6_mode: "ula", location_id: Location::HETZNER_FSN1_ID)
+        expect(vm.public_ip6.to_s).to eq vm.ip6_string
+      end
+    end
+
+    describe "#byoh_egress_nat4?" do
+      it "sends a VM without IPv4 through the host's NAT" do
+        expect(create_vm(vm_host_id: host.id).byoh_egress_nat4?).to be true
+      end
+
+      it "sends an internal VM through the host's NAT only with host_nat internal egress" do
+        vm = vm_on("internal")
+        expect(vm.byoh_egress_nat4?).to be true
+        location.update(byoh_network: {"cp_reach" => "public", "internal_egress" => "site"})
+        expect(vm.reload.byoh_egress_nat4?).to be false
+      end
+
+      it "does not send a VM with a public or nat address through the host's NAT" do
+        expect(vm_on("nat", external_ip: "8.8.8.10").byoh_egress_nat4?).to be false
+      end
+
+      it "is false when the location turns host NAT off" do
+        location.update(byoh_network: {"cp_reach" => "public", "vm_egress_nat4" => false})
+        expect(create_vm(vm_host_id: host.id).byoh_egress_nat4?).to be false
+      end
+
+      it "is false outside a BYOH host" do
+        host.update(location_id: Location::HETZNER_FSN1_ID)
+        expect(create_vm(vm_host_id: host.id).byoh_egress_nat4?).to be false
+      end
+    end
+
+    describe ".from_ips" do
+      it "finds a VM by its pool address or its external IP" do
+        vm = vm_on("nat", external_ip: "8.8.8.10")
+        expect(described_class.from_ips(["10.98.5.1/32"]).map(&:id)).to eq [vm.id]
+        expect(described_class.from_ips(["8.8.8.10/32"]).map(&:id)).to eq [vm.id]
+        expect(described_class.from_ips(["8.8.8.11/32"])).to be_empty
+      end
+    end
   end
 
   describe "#utility functions" do
