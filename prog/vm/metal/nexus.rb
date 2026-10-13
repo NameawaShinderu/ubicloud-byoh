@@ -284,7 +284,8 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     vm.byoh_host? && !boots_from_customer_machine_image? && !vm.private_ipv4.nil?
   end
 
-  # Naps until sshd answers inside the VM's network namespace. Once
+  # Naps until sshd answers inside the VM's network namespace, then logs
+  # the success so the M2 gate can tell the probe ran. Once
   # NETNS_PROBE_SECONDS have passed since allocation it logs and lets the
   # VM run, so a guest without sshd is not stuck and does not page.
   def probe_from_netns
@@ -300,6 +301,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     rescue Sshable::SshError
       nap 5
     end
+    Clog.emit("byoh netns probe ok", {byoh_netns_probe: {vm_ubid: vm.ubid, vm_host_ubid: host.ubid, waited: waited.round}})
   end
 
   label def wait_storage_catchup

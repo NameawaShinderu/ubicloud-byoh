@@ -1301,6 +1301,8 @@ RSpec.describe Prog::Vm::Metal::Nexus do
 
     it "probes a VM without IPv4 from its network namespace" do
       expect(sshable).to receive(:_cmd).with(probe_command, log: false).and_return("")
+      expect(Clog).to receive(:emit).with("byoh netns probe ok", {byoh_netns_probe: {vm_ubid: vm.ubid, vm_host_ubid: vm_host.ubid, waited: 100}})
+      expect(Clog).to receive(:emit).with("vm provisioned", instance_of(Array))
       expect { nx.wait_sshable }.to hop("wait")
     end
 

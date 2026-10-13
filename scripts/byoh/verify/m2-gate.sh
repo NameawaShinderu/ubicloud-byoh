@@ -95,8 +95,9 @@ counter() {
 }
 
 IMDS_RULE="ip daddr 169.254.0.0/16 ct direction original"
-# Two rules drop deny4 targets: one for RFC 1918 addresses and one for
-# the rest, so the deny probes count both.
+# Three rules drop deny4 targets: in the forward chain one for RFC 1918
+# addresses and one for the rest, and in the input chain one for the
+# host's own addresses, so the deny probes count all of them.
 DENY4_RULE="ip daddr @deny4"
 SMTP_RULE="dport 25 "
 
@@ -201,10 +202,10 @@ g7() {
   gate_checks vm --vm "$GATE_VM_B" --expect none
   if grep -F "byoh netns probe gave up" "$GATE_RESPIRATE_LOG" 2>/dev/null | grep -qF "$GATE_VM_B"; then
     fail "the netns probe gave up on $GATE_VM_B ($GATE_RESPIRATE_LOG)"
-  elif grep -F "vm provisioned" "$GATE_RESPIRATE_LOG" 2>/dev/null | grep -qF "$GATE_VM_B"; then
+  elif grep -F "byoh netns probe ok" "$GATE_RESPIRATE_LOG" 2>/dev/null | grep -qF "$GATE_VM_B"; then
     pass "$GATE_VM_B was provisioned through the netns probe"
   else
-    info "no provisioning line for $GATE_VM_B in $GATE_RESPIRATE_LOG"
+    fail "no 'byoh netns probe ok' line for $GATE_VM_B in $GATE_RESPIRATE_LOG"
   fi
   egress "$GATE_VM_B"
   info "check that the UI overview says outbound IPv4 goes through the shared NAT"
