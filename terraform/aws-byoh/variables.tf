@@ -77,6 +77,12 @@ variable "byoh_location_name" {
   description = "Name of the BYOH location printed in byoh_location_create_command (lowercase letters, digits and -). Empty means byoh-aws-<workspace>."
   type        = string
   default     = ""
+
+  # Same rule as ByohLocationCli::NAME_FORMAT.
+  validation {
+    condition     = var.byoh_location_name == "" || can(regex("^[a-z][a-z0-9-]{0,61}[a-z0-9]$", var.byoh_location_name))
+    error_message = "byoh_location_name must be 2-63 lowercase letters, digits and -, start with a letter and not end with -."
+  }
 }
 
 variable "web_ui_cidr" {

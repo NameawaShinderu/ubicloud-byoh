@@ -58,7 +58,10 @@ output "pools_yaml_path" {
 }
 
 locals {
-  byoh_location_name = var.byoh_location_name != "" ? var.byoh_location_name : "byoh-aws-${terraform.workspace}"
+  # Workspace names may hold uppercase, _ or ., which byoh-location
+  # rejects, so the fallback maps them onto its alphabet.
+  byoh_location_name       = var.byoh_location_name != "" ? var.byoh_location_name : "byoh-aws-${lower(replace(terraform.workspace, "/[^A-Za-z0-9-]/", "-"))}"
+  byoh_location_name_valid = can(regex("^[a-z][a-z0-9-]{0,61}[a-z0-9]$", local.byoh_location_name))
   # Private subnets of the location must stay out of the VPC underlay.
   byoh_overlay_ipv4_cidr = "172.20.0.0/14"
   # The masquerade denies host_mgmt_allow to VMs, so a world-open
@@ -73,7 +76,13 @@ locals {
 
 output "byoh_location_create_command" {
   description = "Commands to run on the control plane, from the repo root, to create the BYOH location for this VPC."
-  value       = <<-EOT
+
+  precondition {
+    condition     = local.byoh_location_name_valid
+    error_message = "The BYOH location name \"${local.byoh_location_name}\" is not valid for bin/byoh-location (2-63 lowercase letters, digits and -, ending in a letter or digit). Set byoh_location_name."
+  }
+
+  value = <<-EOT
     %{if local.operator_ssh_open~}
     # WARNING: operator_ssh_cidr is 0.0.0.0/0, so SSH to both instances is
     # open to the world and the operator is left out of --mgmt-allow. Set it
