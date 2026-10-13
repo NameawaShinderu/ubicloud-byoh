@@ -8,6 +8,8 @@
 #   steps: g1 g2 g3 g4 g5 g6 g7 g8 g9 g9b g10 g11 g12 g13 g14
 #          g15-before g15-after
 #          all  (g1 g2 g4 g5 g6 g7 g8 g9 g9b g10: the state after setup)
+#   A site without internet pools (onlink + internal) skips g6, g10 and
+#   g11: g1 g2 g3 g4 g5 g7 g8 g9 g9b g12 g13 g14.
 #
 # Database checks go through scripts/byoh/verify/m2-checks and change
 # nothing. Host checks SSH to the data plane as root. VM checks SSH to a
@@ -244,9 +246,18 @@ g8() {
 
 g9() {
   echo "== G9 link-local addresses (cloud instance metadata) are unreachable"
-  need GATE_VM_A GATE_VM_B GATE_VM_C GATE_VM_KEY GATE_MAIN_IP
-  local vm before after
-  for vm in "$GATE_VM_A" "$GATE_VM_B" "$GATE_VM_C"; do
+  need GATE_VM_KEY GATE_MAIN_IP
+  # A site without internet pools (onlink + internal) has no VM-A, so
+  # G9 probes from whichever gate VMs exist.
+  local vm before after vms=()
+  for vm in "${GATE_VM_A:-}" "${GATE_VM_B:-}" "${GATE_VM_C:-}"; do
+    if [[ -n $vm ]]; then vms+=("$vm"); fi
+  done
+  if ((${#vms[@]} == 0)); then
+    echo "! set at least one of GATE_VM_A, GATE_VM_B and GATE_VM_C" >&2
+    exit 2
+  fi
+  for vm in "${vms[@]}"; do
     before=$(counter "$IMDS_RULE")
     if vm_ssh "$vm" curl -s -m 5 -o /dev/null http://169.254.169.254/; then
       fail "$vm reached 169.254.169.254"
