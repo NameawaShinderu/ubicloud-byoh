@@ -1,0 +1,201 @@
+# BYOH troubleshooting
+
+One Symptom | Cause | Fix catalogue for every platform, in the order things happen: control-plane install, host bring-up, allocation, VM networking, DNS, billing, upgrades, and the monitor. Each row points to the platform guide that has more detail where a platform differs.
+
+It consolidates [NETWORKING.md](NETWORKING.md) §11, the debugging playbook in the repository's `CLAUDE.md` §6, [PLATFORMS.md](PLATFORMS.md) §4 and §7, [VERIFY.md](VERIFY.md) §5 and the "Problems and solutions" tables of the [platform guides](platforms/README.md). Those pages stay the source for design detail.
+
+**Status.** Rows marked "verified live" happened on the AWS deployment (ap-south-1). Everything else is derived from the code and is UNVERIFIED on a real host. Branch differences: the guides describe `m2-network`; the published `byoh-driver` is at 17d383a9c ([platforms/README.md](platforms/README.md) §3). Rows that depend on a later commit name it.
+
+Platform guides: [AWS](platforms/aws.md) · [rented bare metal](platforms/bare-metal-dedicated.md) · [own hardware](platforms/own-hardware.md) · [Proxmox and other hypervisors](platforms/proxmox.md) · [GCP and Azure](platforms/gcp-azure.md) · [other clouds and VPS](platforms/other-clouds-vps.md).
+
+---
+
+## 0. First look
+
+Run these on the control plane, from the repository root, with mise and Ruby on PATH ([SETUP.md](SETUP.md) §4).
+
+| What | Command |
+|---|---|
+| Host strand (the VmHost id is the strand id) | `psql -U clover -d clover_test -c "SELECT prog,label,try,schedule FROM strand WHERE id='<uuid>'"` |
+| Its children (PrepHost, LearnMemory, ...) | `psql -U clover -d clover_test -c "SELECT prog,label,try FROM strand WHERE parent_id='<uuid>'"` |
+| Host state | `psql -U clover -d clover_test -c "SELECT allocation_state,os_version,total_cores,total_hugepages_1g,accepts_slices,net6 FROM vm_host"` |
+| Errors | `/tmp/respirate.log` and `/tmp/respirate.err`: look for "exception terminates strand run". Expired deadlines create `page` rows ("has an expired deadline!") |
+| Pools and addresses | `bundle exec bin/byoh-pool list --host vh...`, `verify --host vh...`, `trace <ip>` |
+| One VM | `bundle exec scripts/byoh/verify/m2-checks info --vm vm...` (prints `private_ip4=` and `inhost=`) |
+| Reach a VM from the host | `ssh -o "ProxyCommand=ssh -i ~/.ssh/byoh_data root@<main IP> ip netns exec <inhost> nc %h %p" ubi@<private_ip4>` ([VERIFY.md](VERIFY.md) §1.4) |
+| REPL | `RACK_ENV=development bundle exec bin/pry`, then `VmHost["vh..."]`, `Vm["vm..."]` |
+| On the host | `ip -br -4 addr` (only the main IP, contract C5), `nft list table inet byoh_egress`, `pgrep -af cloud-hypervisor` (not `pgrep -a`: the name is longer than 15 characters) |
+
+---
+
+## 1. Control-plane install
+
+| Symptom | Cause | Fix | Platform notes |
+|---|---|---|---|
+| `bootstrap-ctrl-plane.sh`: "… does not contain a ubicloud checkout" | The script does not clone | `git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud` first | |
+| `bundle install` fails: "No such file or directory - mise" | `~/.local/bin` (mise) not on PATH (verified live, 2026-10-13) | `export PATH=$HOME/.local/bin:$HOME/.local/share/mise/installs/ruby/4.0.7/bin:$PATH` | |
+| `bundle` or `ruby -v` uses the system Ruby | mise's Ruby is not on PATH | As above. After a Ruby upgrade, change the version in the path too | |
+| `register-byoh-host` aborts with `InvalidOption` on `--provider` | There is no such flag | Use `--location` | Older docs pass it |
+| `register-byoh-host`: "--location is required", "no location X", "is not a BYOH location" | No BYOH location yet | `bin/byoh-location create` ([SETUP.md](SETUP.md) §6) | |
+| Strands fail with `NetSsh::MissingMock` | `RACK_ENV=test` on a control plane, which disables SSH | Use `RACK_ENV=development`. Never `test` on a control plane, and never `rake setup_database[test]` there: it drops `clover_test`, the deployment database | |
+| Boot images never download with `RACK_ENV=production` | In production every image comes from R2/MinIO, which BYOH does not have | Keep `RACK_ENV=development` | |
+| No verification email | Mail goes to the logger | Look in `/tmp/puma.log`, not the tmux pane | |
+| Email link starts with `http://localhost:9292` or a private IP | `.env.rb` has no `BASE_URL`, or the bootstrap took the first address of `hostname -I` | Set `ENV["BASE_URL"] ||= "http://<address you browse to>:3000"` in `.env.rb` and restart `puma`. On a new control plane, `export UBI_BASE_URL=...` before the bootstrap, which writes `BASE_URL` only into a new `.env.rb` | AWS: the private IP ([aws.md](platforms/aws.md) §3.4). 17d383a9c does not write `BASE_URL` at all |
+| `byoh-location show` warns "BASE_URL is …; set it to the URL customers use" | `BASE_URL` unset or a localhost address. A private address does not warn | As above | |
+| `byoh-location show` warns "CONTROL_PLANE_OUTBOUND_CIDRS includes 0.0.0.0/0, ::/0, so Postgres and Kubernetes firewalls allow SSH from anywhere" | The `config.rb` default `0.0.0.0/0,::/0` | Security setting: `ENV["CONTROL_PLANE_OUTBOUND_CIDRS"] ||= "<the --cp-source CIDRs>"` in `.env.rb`, then restart the services (NETWORKING §6.6) | LAN sites: the control plane's LAN IP; off-site: its egress IP ([own-hardware.md](platforms/own-hardware.md) §3.3) |
+| Warns "location X: cp_source_cidrs … is not in CONTROL_PLANE_OUTBOUND_CIDRS" | You narrowed the variable and left a `--cp-source` CIDR out | Add that CIDR | |
+| UI on port 3000 unreachable | Firewall in front of the control plane | Open 3000 from your address only | AWS: `web_ui_cidr` ([aws.md](platforms/aws.md) §3.10) |
+| `puma` and `respirate` gone after the control plane rebooted | They run in tmux; nothing restarts them (no systemd units yet, PLATFORMS PF21) | `bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh` again: it restarts them and skips finished steps | |
+
+---
+
+## 2. Host bring-up
+
+`bin/register-byoh-host` creates the host strand. The labels run in this order (generic hosts skip `check_ip_reachability`): `start → setup_ssh_keys → bootstrap_rhizome → prep → wait_prep → setup_hugepages → setup_storage_backend → download_boot_images → wait_download_boot_images → prep_reboot → reboot → [verify_spdk] → verify_hugepages → start_slices → start_vms → configure_metrics → wait`. The host is ready when `allocation_state` is `accepting` (set in `start_vms`). Watch the label in `strand` and the state in `vm_host` (§0); the log does not print `allocation_state`.
+
+### 2.1 Before registration
+
+| Symptom | Cause | Fix | Platform notes |
+|---|---|---|---|
+| `bootstrap-data-plane.sh`: "/dev/kvm is missing, so KVM is unavailable." or "the CPU has neither the vmx nor the svm flag." | Bare metal: VT-x/AMD-V off in the firmware. VM: no nested virtualization, or a CPU model that hides `vmx`/`svm` | Enable it; power off and on | AWS: m8i/c8i/r8i with `data_plane_nested_virtualization = true`, or `.metal`. Proxmox: `qm set <vmid> --cpu host`. GCP: `--enable-nested-virtualization` on N2/C3. Azure: security type Standard. VPS without KVM: not possible ([other-clouds-vps.md](platforms/other-clouds-vps.md) §1.3) |
+| "the CPU lacks the pdpe1gb flag" | Old CPU, or a virtual CPU model that hides 1G pages | Another machine, `--cpu host`, libvirt `host-passthrough`, a newer EVC baseline. A `flexible` profile without hugepages is PLANNED ([COMPUTE.md](COMPUTE.md)) | [proxmox.md](platforms/proxmox.md) "Other hypervisors" |
+| "This script requires Ubuntu 24.04 LTS (Noble)." | Another OS or release | Reinstall with 24.04. Only 24.04 accepts VM slices | |
+| `register-byoh-host`: "contains main_ip …" | A declared IPv4 block contains `--main-ip` | Declare only the extra block(s); `<main-ip>/32` alone is allowed | Bare metal: never declare the main IP's own subnet |
+| "is not globally routable, so it cannot be public" | An RFC 1918 or documentation range declared `public` | `exposure=internal`, or `exposure=nat` with a real external IP. Documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) are refused as public or external | |
+| "is nat but has no external IP for …" | A `nat` pool address without an `external` entry | Map it, or `reserve` it | |
+| "an IPv4 pool may be at most a /24", "is not a CIDR (address/prefix, no host bits)" | Block too large or with host bits | Split it; write the network address | |
+| "an IPv6 pool must be a /64", "at most one IPv6 /64 may be declared" | Registration takes exactly one /64 | Declare one /64 of a /56 or /48. A provider /96 or /128 cannot be declared: register without IPv6 and the host gets a ULA /64 | GCP /96, Kimsufi /128 |
+| "overlaps the location's overlay network …", "overlaps the private subnet …" | Pool inside `--overlay` or an existing private subnet | Another range. Overlap with `--underlay` is not checked, but avoid it | |
+| "an onlink pool needs segment=<LAN CIDR> and gateway=<LAN gateway>" | `onlink` without `segment`/`gateway` | Add both | |
+| Registration fails on a unique index (`sshable.host`, `address.cidr`, `vm_host.net6`) | The same machine or block is registered already | Destroy the old VmHost first (delete its VMs, then `VmHost["vh..."].incr_destroy`). Never delete `location` rows | A reinstalled OS needs this too: host keys are pinned on first connect |
+| "WARNING: env var X is not set; BMC reset will fail at runtime" | `--bmc-pass-env` names a variable this shell lacks | Put it in `.env.rb` and restart `puma` and `respirate` **before** registering (§8) | |
+
+### 2.2 During bring-up
+
+| Label | Symptom | Cause | Fix | Platform notes |
+|---|---|---|---|---|
+| `setup_ssh_keys`, `bootstrap_rhizome` | Stuck; pages after the 10-minute deadline to `download_boot_images` | Root SSH from the control plane fails: the key is not in `/root/.ssh/authorized_keys`, `PermitRootLogin` forbids keys, a firewall blocks TCP 22, or there is no route to the main IP (C0) | `ssh -i ~/.ssh/byoh_data -o BatchMode=yes root@<main IP> true` from the control plane must print nothing and exit 0. Install the key, open 22 from `--cp-source` | Rented servers: append the key from the workstation that has root ([bare-metal-dedicated.md](platforms/bare-metal-dedicated.md) §3.4). Ubuntu Server: `sudo` needs a terminal ([own-hardware.md](platforms/own-hardware.md) §3.2). GCP: an admin login and the `byoh-host-ssh` rule ([gcp-azure.md](platforms/gcp-azure.md) §3.1). AWS: user-data installs the key |
+| `prep` (PrepHost) | Fails downloading | No outbound internet. PrepHost runs `apt-get` (Ubuntu mirrors over HTTP 80 and HTTPS) and downloads cloud-hypervisor and firmware from github.com, which redirects to `*.githubusercontent.com` | Allow outbound HTTP and HTTPS; `curl -sfI https://github.com` on the host | Azure VNets after 2025-09-30, private OCI subnets and GCP without an external IP or Cloud NAT have no default egress ([gcp-azure.md](platforms/gcp-azure.md) Z3) |
+| `prep` (PrepHost) | "/dev/kvm is not a character device, so KVM is unavailable." | No KVM (§2.1) | As §2.1. Registering does not help | |
+| `prep` (PrepHost) | "no default route to identify the uplink interface" | No default route when PrepHost pins the uplink by MAC | Fix netplan: a single or multipath default route | |
+| `prep` (PrepHost) | `netplan generate` fails after the uplink MAC pin | A VLAN `link:`, bond `interfaces:`, bridge or VRF names the uplink (builds without c73f96ddc, including 17d383a9c) | Tag VLANs on the hypervisor or switch, not on the host; `m2-network` skips the pin | Azure Accelerated Networking: [gcp-azure.md](platforms/gcp-azure.md) Z8 |
+| `prep` (LearnMemory) | "BUG: unexpected dmidecode unit …" | 17d383a9c: a DIMM size not in whole GB (common in VMs). `m2-network` (a0259a997): only a unit other than kB/MB/GB/TB | Give the machine a multiple of 1024 MiB and power it off and on; respirate retries, do not re-register. Or run `m2-network` control-plane code and restart `respirate` (LearnMemory is a control-plane prog; no `install_rhizome` needed) | Proxmox: `qm set <vmid> --memory 32768`, then `qm shutdown` and `qm start` |
+| `wait_prep` | Host never takes slice VMs | `accepts_slices` is set only on Ubuntu 24.04 | Reinstall with 24.04 | |
+| `setup_hugepages`, `verify_hugepages` | "Insufficient memory left for the host OS", "Only N usable 1G hugepages …", "Not enough hugepages for VMs", "Couldn't set hugepage size to 1G" | Too little RAM (hugepages = `GiB*42/43 - 5`, and 2 GiB `MemAvailable` must remain); memory ballooning; no `pdpe1gb`; a GRUB without a `GRUB_CMDLINE_LINUX="..."` line | 16+ GiB, ballooning off, the standard GRUB line (PLATFORMS PF5, PF7) | Proxmox: `--balloon 0`. Hyper-V: no Dynamic Memory. ESXi: full memory reservation |
+| `setup_storage_backend` | vhost-block-backend install fails | No egress to github.com | As PrepHost | |
+| `download_boot_images`, `wait_download_boot_images` | Waits; pages after the 4-hour deadline to `prep_reboot` | cloud-images.ubuntu.com blocked, or `RACK_ENV=production` (R2) | Allow HTTPS to cloud-images.ubuntu.com; `RACK_ENV=development` | |
+| `prep_reboot`, `reboot` | Host does not come back; pages after the 15-minute deadline to `wait` | The host **really reboots**, and netplan, fstab, GRUB, policy routing or `wg0` did not survive it | Rescue or console, fix, power on. The strand resumes once SSH works | Rented servers: rescue system ([bare-metal-dedicated.md](platforms/bare-metal-dedicated.md) row 15). T1/vSwitch: persist `ip rule` ([own-hardware.md](platforms/own-hardware.md) §3.5) |
+| after `reboot` | Pool IPs back on the NIC | A cloud agent or cloud-init re-adds them on boot (C5) | `ip -br -4 addr` must show only the main IP; fix the agent (§4) | AWS user-data fix; GCP `instance_configs.cfg`; Azure cloud-init drop-in ([gcp-azure.md](platforms/gcp-azure.md) §3.2) |
+| `start_vms` | Host is `accepting` but every VM waits | No boot image, or the wrong one | §3 | |
+| `wait` | Host goes `unavailable` and pages | `bin/monitor` health checks on disks without `wwn-`/`nvme-eui` links or SMART | §8 | |
+
+---
+
+## 3. Allocation: "no space left" and "No capacity left"
+
+The allocator fails with "no space left on any eligible host". The VM sets `waiting_for_capacity`, and after 10 minutes a page says "No capacity left at <location> for <family> family of <arch>". The message does not say which resource ran out; check in this order.
+
+| Symptom | Cause | Fix | Platform notes |
+|---|---|---|---|
+| **Every** VM create fails with "No capacity left" on a host registered before M1 | The host has vhost-block-backend v0.2.2; new VMs need `version_code >= 401` (`VhostBlockBackend::MIN_ARCHIVE_SUPPORT_VERSION`) (verified live, 2026-10-13) | In `bin/pry`: `VmHost.all.each { Prog::Storage::SetupVhostBlockBackend.assemble(it.id, Config.vhost_block_backend_version, allocation_weight: 100) }`, wait for the strands, then resolve the stale page (§7) | Any host registered before the M1 merge |
+| VM never places | Created in the wrong location: the host's BYOH location is the one to use (its UI name); a legacy host not yet moved is still in eu-central-h1 / hetzner-fsn1 | Recreate the VM in the host's location. A hidden location needs `bin/byoh-location grant --location <name> --project pj...` | |
+| Internet VM waits | No free `public` or `nat` address | `bin/byoh-pool list --host vh...`; add one (`bin/byoh-pool add`), or create the VM with `-6` or `-e internal` | Single-IP hosts, GCP variant B, Proxmox variant A have none |
+| Internal VM waits | No free `internal` address | Add an internal pool | AWS: `byoh_internal_private_ips` |
+| VM without IPv4 waits | Not the address: the allocator left-joins free IPv4 and filters on it only for IPv4 VMs. Look at the other rows | | |
+| Fresh host takes nothing | No activated boot image of the requested name. The default image is `ubuntu-noble` (`Config.default_boot_image_name`) | `VmHost["vh..."].download_boot_image("ubuntu-jammy")` in `bin/pry` for another image | |
+| VM stuck in `creating`; respirate log "failed to allocate cpus" | IO-CPU over-count on small hosts (PLATFORMS #2) | Fewer or smaller VMs; see PLATFORMS §7 | |
+| `Sequel::CheckConstraintViolation hugepages_allocation_limit` | Burstable hugepage accounting (PLATFORMS #3) | PLATFORMS §7 | |
+| Host never a candidate | `allocation_state` not `accepting` (draining, unavailable) | Fix the cause, then set it back (§8) | |
+| Host never a candidate for normal VMs | An NVIDIA GPU in an IOMMU group (VR-4) | Remove the GPU or turn the IOMMU off, then re-register | [own-hardware.md](platforms/own-hardware.md) §2.2 |
+| Slice VMs never place on a small host | `accepts_slices` does not match | Scoped fix only: `DB[:vm_host].where(id: <uuid>).update(accepts_slices: false)`; never unscoped | |
+| Storage | `available_storage_gib` too low on every enabled `storage_device` | PLATFORMS §7 queries; extra disks only count when mounted at `/var/storage/devices/<name>` before registration | |
+| Every VM fails with `RuntimeError "BUG"` in `write_params_json` | Hybrid P+E-core CPU, SMT off, or offline CPUs (PLATFORMS HW-6, HW-7) | A non-hybrid CPU, SMT on, all CPUs online; then re-register | Homelab desktops, some rental lines |
+| VM prep fails with `Errno::ENOENT` | `/var/storage` on btrfs or ZFS (STOR-5) | ext4 or xfs | |
+| VM create fails resolving a billing rate | §6 | | |
+
+---
+
+## 4. VM networking
+
+| Symptom | Cause | Fix | Platform notes |
+|---|---|---|---|
+| VM create fails: "<ip> is a local address of this host, so the host answers for the VM" (`m2-network`, a092f1b8b) | A pool IP is configured on the host (netplan, cloud-init, a cloud agent, by hand) (C5) | Remove it from netplan and the interface (`ip -br addr`, `ip route show table local`), stop the agent from re-adding it, recreate the VM | AWS: cloud-init fix ([aws.md](platforms/aws.md) §3.3). GCP: guest agent, `proto 66` local routes. Azure: cloud-init secondary ipconfigs. Proxmox: `ipconfig0` |
+| SSH to a VM gives "Permission denied (publickey)", or `wait_sshable` passed but customers cannot log in | Same cause on 17d383a9c, or on a VM created before the check; or the wrong user | As above, then recreate the VM. The VM user is `ubi`, not `ubuntu` | Verified live on AWS (2026-10) |
+| VM stuck at `wait_sshable`; page after 10 minutes | The control plane cannot reach the address `wait_sshable` dials (C0): with `cp_reach: onhost` the pool IP, with `public` the public or external IP; an internal VM is not dialled | `nc -vz <ip> 22` from the control plane. Use `bin/byoh-location set --location <name> --cp-reach public` when the control plane is off-site, or add the route | O1 with reflection off: use `onhost`. GCP variant A: the control plane needs egress to the forwarding-rule IP ([gcp-azure.md](platforms/gcp-azure.md) G3) |
+| VM without IPv4 marked running only after a long wait; log "byoh netns probe gave up" | The netns probe from the host could not reach the VM's SSH within 8 minutes | Check the VM's serial log; reach it through its namespace (§0) | |
+| Inbound to a VM's public or external IP times out; its egress works | A filter in front of the host (cloud security group, NSG, provider firewall, router WAN rule), a missing 1:1 mapping, or the address is not routed to the main IP (on-link, or tied to a virtual MAC) | Allow everything to the pool addresses at the edge; restrict only the host's main IP. `bin/byoh-pool trace <ip>` shows the VM and netns commands | AWS: `data_plane_open_ingress = false` by design until `host_guard` ([aws.md](platforms/aws.md) §3.10). Hetzner Robot firewall, OVH vMAC ([bare-metal-dedicated.md](platforms/bare-metal-dedicated.md) rows 5-6). Azure NSG matches the private IP |
+| Customer allow-from-CIDR rules never match; VM egress shows the router's IP | Source not preserved (C2): the router masquerades the block, NAT reflection, a port forward | "Do not NAT" rule for the block on the router | [own-hardware.md](platforms/own-hardware.md) O2/C1 |
+| VM cannot reach the external IP of another VM at the same site | NAT reflection off; the same-site hairpin is PLANNED (NETWORKING §4.6) | Test from outside the site; split DNS | Router 1:1 NAT sites; AWS EIP from inside the VPC (UNVERIFIED) |
+| VM cannot reach the LAN, VPC, NAS or control plane | By design: `deny4` = `--egress-deny` + `--underlay` + `--cp-source` + `--mgmt-allow`. Every VM is dropped toward the host's own `deny4` addresses and the RFC 1918 parts of `deny4`; host-NAT VMs toward all of it (gate G9b) | Expected. `--egress-allow` (`vm_egress_allow`) is stored but nothing reads it yet (PLANNED). The only lever is to leave a range out of those options | |
+| VM cannot reach 169.254.169.254, 168.63.129.16, `fd00:ec2::254` or `fd20:ce::254` | By design: platform metadata and services are dropped for every VM on a BYOH host (gate G9; the last three need 9d85a6e3c) | Expected | Azure: keep the DHCP resolver, not Azure DNS ([gcp-azure.md](platforms/gcp-azure.md) Z6) |
+| Outbound TCP 25 fails | `egress_smtp` is off by default | `bin/byoh-location set --location <name> --egress-smtp` if you accept the abuse risk | |
+| VM without IPv4 or internal VM has no IPv4 egress | Host NAT table missing | `nft list table inet byoh_egress` on the host; `bundle exec bin/byoh-host setup-egress-nat --host vh...` | |
+| VM-to-VM private traffic fails | ULA `net6` without cross-host routing (NH-2, OPEN) | `ip -n <inhost> -6 route`; `ip xfrm state` (NETWORKING §7.3) | Every host without a routed global /64 |
+| Large transfers hang | Path MTU. Guests always get MTU 1400 from DHCP; `--guest-mtu` is stored but not applied | Check that the guest image did not override it (`ip link` in the VM); keep tunnels (`wg0`) at 1420 or lower | GCP VPC 1460; Hetzner vSwitch VLAN 1400 |
+| VM IPv6 dead on an on-link /64 | Declared without `ndp`, or a multipath default route (NDP proxying needs a single-device route) | `bin/byoh-pool ipv6 set --host vh... --cidr <v6>/64,ndp` (empty host only) | OVH ([bare-metal-dedicated.md](platforms/bare-metal-dedicated.md) row 11); BGP hosts: use a routed /64 |
+| Internal VMs unreachable from the LAN | Pool inside the router's DHCP range or used by another device (`arping` shows two MACs); a route or VPN covers the pool; stale ARP; a hypervisor IP filter (Proxmox `ipfilter`, libvirt `clean-traffic`) | Shrink DHCP, remove the overlap, clear the router's ARP cache, `firewall=0` on the data plane's NIC | [proxmox.md](platforms/proxmox.md) §4, [own-hardware.md](platforms/own-hardware.md) H1/H2 |
+| Docker, ufw, Tailscale or the hypervisor's firewall stop working on the host | `flush ruleset` on every VM create and destroy (NH-6) | Dedicate the host. Never register a Proxmox node or a libvirt host | |
+
+---
+
+## 5. DNS
+
+Each VM's dnsmasq hands out its own address as the resolver and forwards to `8.8.8.8` and `2606:4700:4700::1111` (VMs without any IPv4 path: `2001:4860:4860::8888` and `2606:4700:4700::1111`) (`rhizome/host/lib/vm_setup.rb`).
+
+| Symptom | Cause | Fix | Platform notes |
+|---|---|---|---|
+| Guest DNS fails on a host without IPv6 egress | VM created before the 971a3d608 backport | Recreate the VM; existing VMs converge only on recreate | AWS, homelab, Proxmox |
+| Guest DNS broke after the VM was added to or removed from a load balancer | The load-balancer update rebuilds the netns NAT without the port-53 rules (NETWORKING §4.7, PLANNED fix) | `nft list ruleset` in the netns, look for the `dport 53` SNAT rules; recreate the VM | |
+| VMs resolve no names on an office network | The firewall blocks UDP/TCP 53 except to its own resolver | Allow DNS from the host and the pool to the resolvers above. The location's `dns_servers` is stored but not applied | [own-hardware.md](platforms/own-hardware.md) O1/O2 |
+| A guest set by hand to the platform resolver (Azure 168.63.129.16, a metadata resolver) gets no answers | Platform services are dropped for VMs (§4) | Keep the DHCP-provided resolver | Azure |
+| `getent hosts` works but `apt-get update` fails | Egress, not DNS | §4 | |
+
+---
+
+## 6. Billing and rates
+
+BYOH locations are billed from an overlay directory of rate files (`BILLING_RATES_EXTRA_DIR`, [VERIFY.md](VERIFY.md) §1.1).
+
+| Symptom | Cause | Fix | Platform notes |
+|---|---|---|---|
+| `byoh-location show` warns "BILLING_RATES_EXTRA_DIR is unset, so web, respirate and monitor do not load the billing rates of BYOH locations" | `.env.rb` lacks the variable (17d383a9c's bootstrap never writes it) | `ENV["BILLING_RATES_EXTRA_DIR"] ||= "/home/<user>/ubicloud-billing-rates.d"` in `.env.rb` (an absolute path: Ruby does not expand `~`); restart web, respirate and monitor | |
+| VM create fails resolving a billing rate, or invoices cannot be built | A process started without the variable, or before the last `create --rates-from`/`rates`: rates are read once at start | Restart web, respirate and monitor after every `create --rates-from` or `rates` | |
+| `show` warns "location X: no billing rate for …"; or reports missing coverage | The rates were written to another directory than the services read | Use the `.env.rb` directory (`show` prints the `Rate file`), rerun `bin/byoh-location rates --location <name> --rates-from hetzner-fsn1`, restart | AWS: terraform prints `/etc/ubicloud/billing_rates.d`; skip it on a bootstrapped control plane ([aws.md](platforms/aws.md) §3.5) |
+| An `internal` VM has no IPv4 billing record | By design: internal addresses are not billed | Expected | |
+| A `nat` VM's IPv4 record is named after the external IP | By design: a `nat` address is billed as `<external IP>/32`, also after `remap` | Expected | |
+| Rate ids cannot be resolved after a code rollback | M1 code cannot resolve overlay rate ids | Stay on M2 code while any BYOH billing record exists in the current invoice month ([VERIFY.md](VERIFY.md) §4) | |
+| Rates lost after a restore | The overlay directory was not backed up | Back it up with the database ([VERIFY.md](VERIFY.md) §1.3); each `rates` audit row also keeps a copy of the YAML | |
+
+---
+
+## 7. Upgrades and migrations
+
+The full procedure is in `CLAUDE.md` §8 (M1) and [VERIFY.md](VERIFY.md) §3.2 L1 (M2). These are the steps that failed or nearly failed.
+
+| Symptom | Cause | Fix | Platform notes |
+|---|---|---|---|
+| `bundle install` fails "No such file or directory - mise" during the upgrade | mise's `~/.local/bin` not on PATH (verified live, 2026-10-13) | Put `~/.local/bin` and the new Ruby's `bin` on PATH **before** `bundle install` | |
+| Sequel aborts: an applied migration file no longer exists | The generic-provider migration was renamed in M1 | Once, before migrating: `UPDATE schema_migrations SET filename='20260412_add_generic_provider.rb' WHERE filename='20260412000000_add_generic_provider.rb';`. Never rename an applied migration | Control planes registered before M1 |
+| The 20260601 billing migrations abort while closing billing records | A database that kept running pre-merge code past upstream's rate cutoff has open records that start after it, and closing them at the cutoff builds an empty span. Caught in the rehearsal on a dump of the live database | Pull 17d383a9c or later **before** migrating: it rebinds records opened after the cutoff to the new rate. Rehearse every upgrade on a restored `pg_dump` first | Any long-running fork database |
+| New migrations are not applied after a pull | `~/.ubi-bootstrap/{migrations,caches-refreshed}` markers are permanent | Delete them, run `bin/rake-task-runner migrate "" 0`, then `FORCE_AUTOLOAD=1 bin/rake-task-runner refresh_sequel_caches` | |
+| Every VM create fails with "No capacity left" after the upgrade | vhost-block-backend too old (§3) | `SetupVhostBlockBackend.assemble` per host | Hosts registered before M1 |
+| A "No capacity left" page stays open after the fix | Pages are not resolved by the fix | Admin page "Resolve", or `Page.active.where(Sequel.like(:summary, "No capacity left%")).each(&:incr_resolve)` in `bin/pry` | |
+| New rhizome behaviour missing on existing hosts | Rhizome code is pushed only on demand | `VmHost.all.each(&:install_rhizome)` in `bin/pry`; recreate VMs that need new VM-setup behaviour | |
+| Host egress table missing after `move-location` | The strand that installs it did not finish | `bundle exec bin/byoh-host setup-egress-nat --host vh...` | |
+| Migration `down` refuses | M2 data exists (reserved rows, external IPs, non-default delivery or exposure, a profile, an internal VM, or audit rows newer than the export) | `bin/byoh-host export-audit --out backups/audit-<ts>.jsonl` first; follow [VERIFY.md](VERIFY.md) §4 | |
+| SSH to a reinstalled host fails with a host-key mismatch | Host keys are pinned on first connect | Destroy and re-register the VmHost | |
+
+---
+
+## 8. Monitor, reboots and BMC
+
+| Symptom | Cause | Fix | Platform notes |
+|---|---|---|---|
+| Host flaps to `unavailable`; pages about SMART or the clocksource | `bin/monitor` health checks need `wwn-`/`nvme-eui` disk links, SMART and the `tsc` clocksource (PLATFORMS F5, OPEN) | Stop the monitor (`tmux kill-session -t monitor`). It is one global process with no per-host switch. Then `VmHost["vh..."].update(allocation_state: "accepting")` in `bin/pry` | AWS EBS, GCP PD, Azure managed disks, virtio, hardware RAID, LVM roots. Start it only if PF12 and PF14 pass and `/var/storage` is not on `/dev/mapper/*` ([own-hardware.md](platforms/own-hardware.md) §3.10) |
+| `unavailable` never triggers; VMs stay stopped after a power outage | `bin/monitor` is not running (the bootstrap starts it only with `UBI_START_MONITOR=1`), so the out-of-band reboot is not noticed | Admin **Reboot** of the host: it reboots once more and `start_vms` restarts every VM | Own hardware: "Restore on AC power loss" ([own-hardware.md](platforms/own-hardware.md) §3.10) |
+| Host strand stuck at `hardware_reset`; VMs show "rebooting" | Admin "Hardware Reset" on a host without a Redfish BMC raises `CapabilityMissing` and retries forever; or the host had VMs and was not draining ("Host has VMs and is not in draining state") | Never click it without a BMC. A provider-panel or cloud-console reset does not unstick the strand, and no command adds a BMC to a registered host. Recovery (UNVERIFIED): in `bin/pry`, `Strand[VmHost["vh..."].id].update(label: "prep_reboot", try: 0)`. The semaphore was already cleared in `prep_hardware_reset`, so the host reboots over SSH and `start_vms` restarts the VMs. Otherwise destroy and re-register with `--bmc-*` | Cloud hosts never have a BMC |
+| Admin "Power On" returns an error | No BMC configured (OPEN) | Power on through the provider panel or by hand | |
+| Redfish reset or Power Status fails with an auth error after a control-plane restart | The `--bmc-pass-env` variable is not in the environment of respirate (Hardware Reset) or puma (Power On, Power Status), so the call goes out with a nil password | `ENV["VAR"] ||= "..."` in `.env.rb` (mode 600); restart both | |
+| BMC discovery: "returned multiple systems; set bmc.system_id explicitly" | The BMC lists several systems | Register with `--bmc-system-id` | |
+| A BMC cannot be registered | IPMI only; only Redfish is implemented | Manage power by hand (`ipmitool`, provider panel) | Many rented servers give customers no BMC |
+| A reimage is needed | Not supported for generic hosts | Reinstall by hand, then destroy and re-register the VmHost | |
