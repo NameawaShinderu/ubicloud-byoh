@@ -32,6 +32,8 @@ RSpec.describe ByohEgressNat do
         chain forward {
           type filter hook forward priority filter - 1; policy accept;
           iifname "vetho*" ip daddr 169.254.0.0/16 ct direction original counter drop
+          iifname "vetho*" ip daddr 168.63.129.16 ct direction original counter drop
+          iifname "vetho*" ip6 daddr { fd00:ec2::254, fd20:ce::254 } ct direction original counter drop
           iifname "vetho*" oifname != "vetho*" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } ip daddr @deny4 ct direction original counter drop
           ip saddr 169.254.0.0/16 ip daddr @deny4 counter drop
           ip saddr 169.254.0.0/16 tcp dport 25 counter drop

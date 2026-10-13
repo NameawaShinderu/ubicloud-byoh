@@ -8,7 +8,9 @@ require "fileutils"
 # the vethi link address (VmSetup#generate_host_nat4_rules), and this table
 # masquerades that traffic out of the host. It also keeps every VM on the
 # host away from the platform's link-local services, such as an instance
-# metadata service, and keeps host-NAT traffic off the networks in deny4:
+# metadata service, and from the platform services listed in
+# PLATFORM_SERVICES4 and PLATFORM_SERVICES6. It keeps host-NAT traffic
+# off the networks in deny4:
 # the site underlay, the control plane and the hosts' management networks.
 # Connections a VM opens to this host's own addresses in deny4, such as
 # its management IP, are dropped in the input chain, which the forward
@@ -28,6 +30,14 @@ module ByohEgressNat
   PATH = "/etc/nftables.d/1-byoh-egress.conf"
   NFTABLES_CONF = "/etc/nftables.conf"
   INCLUDE_LINE = "include \"/etc/nftables.d/*.conf\""
+
+  # Platform services outside 169.254.0.0/16 that answer the host's own
+  # addresses: the Azure WireServer, which hands out the host VM's goal
+  # state and certificates and is not link-local, and the IPv6 instance
+  # metadata services of AWS and GCP. Host-NAT traffic would reach them
+  # as the host itself.
+  PLATFORM_SERVICES4 = "168.63.129.16"
+  PLATFORM_SERVICES6 = "{ fd00:ec2::254, fd20:ce::254 }"
 
   # Connections a single VM may have open through the host NAT.
   MAX_CONNECTIONS = 4096
@@ -61,6 +71,8 @@ module ByohEgressNat
         chain forward {
           type filter hook forward priority filter - 1; policy accept;
           iifname "vetho*" ip daddr 169.254.0.0/16 ct direction original counter drop
+          iifname "vetho*" ip daddr #{PLATFORM_SERVICES4} ct direction original counter drop
+          iifname "vetho*" ip6 daddr #{PLATFORM_SERVICES6} ct direction original counter drop
           iifname "vetho*" oifname != "vetho*" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } ip daddr @deny4 ct direction original counter drop
           ip saddr 169.254.0.0/16 ip daddr @deny4 counter drop
       #{smtp_drop}    ip saddr 169.254.0.0/16 ct state new add @per_src { ip saddr ct count over #{MAX_CONNECTIONS} } counter drop
