@@ -6,10 +6,18 @@ require "json"
 require "yaml"
 
 class UplinkMacPin
+  # Netplan definitions that name other interfaces by their netplan id.
+  REFERENCING_TYPES = %w[bonds bridges vrfs].freeze
+
   def run
     ifname = uplink_interface
+    return "the default route is multipath, nothing to pin" if ifname == :multipath
+
     path, id = name_keyed_entry(ifname)
     return "netplan does not select #{ifname} by name, nothing to pin" unless path
+    # Re-keying the entry would leave a VLAN, bond, bridge or VRF that names
+    # it pointing at an id that no longer exists, which netplan refuses.
+    return "netplan definitions refer to #{ifname} by name, nothing to pin" if referenced?(id)
 
     fail "netplan already has an ethernet named uplink" if ethernet_ids.include?("uplink")
 
@@ -23,10 +31,22 @@ class UplinkMacPin
 
   private
 
+  # A multipath default route, as on a host with two BGP uplinks, names
+  # its devices under nexthops and has no single uplink.
   def uplink_interface
-    dev = JSON.parse(r("ip", "-j", "route", "show", "default")).filter_map { |route| route["dev"] }.first
-    fail "no default route to identify the uplink interface" unless dev
-    dev
+    routes = JSON.parse(r("ip", "-j", "route", "show", "default"))
+    fail "no default route to identify the uplink interface" if routes.empty?
+    routes.filter_map { |route| route["dev"] }.first || :multipath
+  end
+
+  def referenced?(id)
+    netplan_paths.any? do |path|
+      network = load_netplan(path).to_h["network"].to_h
+      network["vlans"].to_h.each_value.any? { |conf| conf.is_a?(Hash) && conf["link"] == id } ||
+        REFERENCING_TYPES.any? { |type|
+          network[type].to_h.each_value.any? { |conf| conf.is_a?(Hash) && Array(conf["interfaces"]).include?(id) }
+        }
+    end
   end
 
   def permanent_mac(ifname)

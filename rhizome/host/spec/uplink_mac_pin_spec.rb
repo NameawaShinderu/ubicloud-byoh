@@ -146,6 +146,58 @@ RSpec.describe UplinkMacPin do
       expect { pin.run }.to raise_error RuntimeError, "no default route to identify the uplink interface"
     end
 
+    it "leaves the default route alone when it is multipath" do
+      allow(pin).to receive(:_run_command).with("ip", "-j", "route", "show", "default")
+        .and_return(JSON.generate([{dst: "default", nexthops: [{gateway: "192.0.2.1", dev: "enp1s0"}, {gateway: "198.51.100.1", dev: "enp2s0"}]}]))
+
+      expect(pin.run).to eq "the default route is multipath, nothing to pin"
+    end
+
+    it "leaves an entry that a vlan links to alone" do
+      File.write(File.join(netplan_dir, "02-vswitch.yaml"), <<~YAML)
+        network:
+          version: 2
+          vlans:
+            other:
+            vlan4000:
+              id: 4000
+              link: enp2s0
+      YAML
+      stub_uplink
+
+      expect(pin.run).to eq "netplan definitions refer to enp2s0 by name, nothing to pin"
+      expect(File).not_to exist(path + ".ubicloud-orig")
+    end
+
+    it "leaves an entry that a bond, bridge or vrf lists alone" do
+      %w[bonds bridges vrfs].each do |type|
+        File.write(File.join(netplan_dir, "02-#{type}.yaml"), "network:\n  version: 2\n  #{type}:\n    x0:\n      interfaces: [enp2s0]\n")
+        stub_uplink
+
+        expect(pin.run).to eq "netplan definitions refer to enp2s0 by name, nothing to pin"
+        File.delete(File.join(netplan_dir, "02-#{type}.yaml"))
+      end
+    end
+
+    it "pins an entry that other definitions do not name" do
+      File.write(File.join(netplan_dir, "02-other.yaml"), <<~YAML)
+        network:
+          version: 2
+          vlans:
+            vlan10:
+              id: 10
+              link: enp3s0
+          bonds:
+            bond0:
+              interfaces: [enp4s0, enp5s0]
+            bond1:
+      YAML
+      stub_uplink
+      stub_netplan_generate
+
+      expect(pin.run).to eq "pinned enp2s0 to 98:b7:85:00:99:9a in #{path}"
+    end
+
     it "fails when netplan already has an ethernet named uplink" do
       File.write(File.join(netplan_dir, "02-extra.yaml"), "network:\n  version: 2\n  ethernets:\n    uplink:\n      dhcp4: false\n")
       stub_uplink
