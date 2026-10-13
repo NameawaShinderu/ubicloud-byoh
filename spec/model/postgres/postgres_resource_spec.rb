@@ -1304,6 +1304,17 @@ RSpec.describe PostgresResource do
           expect(postgres_resource.check_all_dns_records).to eq []
         end
 
+        it "does not check a public A record for a BYOH VM's internal address" do
+          vm = postgres_resource.representative_server.vm
+          vm.assigned_vm_address.destroy
+          location = create_byoh_location
+          add_byoh_ipv4_to_vm(vm, create_byoh_vm_host(location), "10.98.1.129", exposure: "internal")
+          postgres_resource.update(created_at: Time.utc(2025))
+          expect(checker).to receive(:check).with(:A, postgres_resource.private_hostname, vm.private_ipv4_string)
+          expect(checker).to receive(:check).with(:AAAA, postgres_resource.private_hostname, vm.private_ipv6_string)
+          expect(postgres_resource.check_all_dns_records).to eq []
+        end
+
         it "does not attempt to resolve AAAA public record for old metal databases lacking one" do
           postgres_resource.update(created_at: Time.utc(2025))
           expect(checker).to receive(:check).with(:A, postgres_resource.hostname, "10.1.2.3")

@@ -188,8 +188,9 @@ class Prog::Vnet::LoadBalancerNexus < Prog::Base
         if load_balancer.ipv4_enabled?
           if (ip4 = vm.dns_ip4_string)
             ip_info << [ip4, "A", hostname, dns_zone]
-          elsif vm.ip4_enabled
-            # VM will have a public IPv4 address, but it is not assigned yet
+          elsif vm.ip4_enabled && !vm.internal_ip4?
+            # VM will have a public IPv4 address, but it is not assigned yet.
+            # A BYOH VM's internal address gets only the private record.
             nap 5
           end
           ip_info << [vm.private_ipv4_string, "A", private_hostname, private_dns_zone]

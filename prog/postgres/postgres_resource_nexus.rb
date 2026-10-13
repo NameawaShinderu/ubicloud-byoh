@@ -294,7 +294,8 @@ class Prog::Postgres::PostgresResourceNexus < Prog::Base
       if aws
         dns_zone.insert_record(record_name:, type: "CNAME", ttl: 10, data: vm.aws_instance.ipv4_dns_name + ".")
       else
-        dns_zone.insert_record(record_name:, type: "A", ttl: 10, data: vm.dns_ip4_string)
+        # A BYOH VM's internal address gets only the private record.
+        dns_zone.insert_record(record_name:, type: "A", ttl: 10, data: vm.dns_ip4_string) unless vm.internal_ip4?
         unless dns_zone.records_dataset.where(type: "AAAA", name: record_name + ".").empty?
           dns_zone.insert_record(record_name:, type: "AAAA", ttl: 10, data: vm.dns_ip6_string)
         end

@@ -414,6 +414,17 @@ RSpec.describe Prog::Vnet::LoadBalancerNexus do
       expect(records).to include(["AAAA", "fd20:1:2:3::2"])
     end
 
+    it "publishes only the private record of a BYOH VM's internal address" do
+      vm = add_lb_vm(stack: "ipv4", name: "byoh-vm", private_ipv4: "10.0.0.7/32", private_ipv6: "fd10:9b0b:6b4b:8fb2::/64", public_ipv6: "fd20:1:2:3::/64")
+      location = create_byoh_location
+      vm.update(location_id: location.id)
+      add_byoh_ipv4_to_vm(vm, create_byoh_vm_host(location, ipv6_mode: "ula"), "10.98.1.129", exposure: "internal")
+      nx.load_balancer.custom_hostname = nx.load_balancer.hostname
+
+      expect { nx.rewrite_dns_records }.to hop("wait")
+      expect(DnsRecord.where(dns_zone_id: dns_zone.id, tombstoned: false).all).to be_empty
+    end
+
     it "rewriting repeatedly is relatively safe" do
       add_lb_vm(
         stack: "dual",

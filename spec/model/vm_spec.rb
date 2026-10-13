@@ -253,6 +253,12 @@ RSpec.describe Vm do
       expect(vm.reload.dns_ip6_string).to eq vm.ip6_string
     end
 
+    it "publishes no public IPv4 for a BYOH VM's internal address" do
+      vm_host = create_byoh_vm_host(location, ipv6_mode: "ula")
+      add_byoh_ipv4_to_vm(vm, vm_host, "10.98.1.129", exposure: "internal")
+      expect([vm.internal_ip4?, vm.dns_ip4_string, vm.public_ip4_string]).to eq [true, nil, "10.98.1.129"]
+    end
+
     it "publishes the VM's own addresses off BYOH hosts" do
       add_ipv4_to_vm(vm, "10.98.1.129")
       expect([vm.dns_ip4_string, vm.dns_ip6_string]).to eq ["10.98.1.129", vm.ip6_string]

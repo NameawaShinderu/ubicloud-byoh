@@ -607,6 +607,20 @@ RSpec.describe Prog::Postgres::PostgresResourceNexus do
         ]
       end
 
+      it "publishes only the private records of a BYOH VM's internal address" do
+        vm = postgres_server.vm
+        location = create_byoh_location
+        vm.assigned_vm_address&.destroy
+        add_byoh_ipv4_to_vm(vm, create_byoh_vm_host(location), "10.98.1.129", exposure: "internal")
+        dns_zone = DnsZone.create(project_id: postgres_project.id, name: "pg.example.com")
+        nx.incr_initial_provisioning
+        expect { nx.refresh_dns_record }.to hop("initialize_certificates")
+        expect(DnsRecord.where(dns_zone_id: dns_zone.id).select_order_map([:type, :name])).to eq [
+          ["A", private_hostname],
+          ["AAAA", private_hostname],
+        ]
+      end
+
       it "creates CNAME DNS records for AWS instances" do
         postgres_server
         ipv4_dns_name = "ec2-44-224-119-46.us-west-2.compute.amazonaws.com"

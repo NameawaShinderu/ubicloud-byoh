@@ -99,8 +99,10 @@ class Vm < Sequel::Model
   def byoh_addressing? = location.byoh? && byoh_host?
 
   # The addresses service DNS (load balancers, Postgres) publishes for
-  # the VM: its public ones on a BYOH host, and its own elsewhere.
-  def dns_ip4_string = byoh_host? ? public_ip4_string : ip4_string
+  # the VM: its public ones on a BYOH host, and its own elsewhere. An
+  # internal address is reachable only from the site, so it gets no
+  # public record.
+  def dns_ip4_string = byoh_host? ? (public_ip4_string unless internal_ip4?) : ip4_string
 
   def dns_ip6_string = byoh_host? ? public_ip6&.to_s : ip6_string
 
@@ -123,6 +125,8 @@ class Vm < Sequel::Model
     (assigned_vm_address.address.exposure == "internal") ? "internal" : "public"
   end
 
+  def internal_ip4? = public_ip4_scope == "internal"
+
   # The IPv4 the control plane connects to: the pool address when the
   # control plane sits on the host's network (cp_reach onhost), the public
   # address otherwise, and none for an internal address it cannot reach.
@@ -130,7 +134,7 @@ class Vm < Sequel::Model
     return ip4 unless byoh_host?
     return ip4 if vm_host.location.byoh_profile.cp_reach == "onhost"
 
-    public_ip4 unless public_ip4_scope == "internal"
+    public_ip4 unless internal_ip4?
   end
 
   # The IPv6 customers reach the VM at. A BYOH host without a global
