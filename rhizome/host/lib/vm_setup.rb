@@ -14,18 +14,24 @@ require "shellwords"
 require_relative "vm_path"
 require_relative "cloud_hypervisor"
 require_relative "storage_volume"
+require_relative "byoh_egress_nat"
 
 class VmSetup
   Nic = Struct.new(:net6, :net4, :tap, :mac, :private_ipv4_gateway)
 
-  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false)
+  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false, egress_nat4: nil)
     @vm_name = vm_name
     @hugepages = hugepages
     @hypervisor = hypervisor
     @ch_version = CloudHypervisor::Version[ch_version] || no_valid_ch_version
     @firmware_version = CloudHypervisor::Firmware[firmware_version] || no_valid_firmware_version
     @append_serial_console = append_serial_console
+    @egress_nat4 = egress_nat4&.transform_keys(&:to_sym)
   end
+
+  # Whether the host masquerades the VM's IPv4 egress (ByohEgressNat). Only
+  # BYOH hosts ask for it, for VMs without an internet-facing IPv4.
+  def host_nat? = !!@egress_nat4
 
   private def no_valid_ch_version
     raise("no valid cloud hypervisor version")
@@ -115,6 +121,7 @@ class VmSetup
     setup_veths_6(guest_ephemeral, clover_ephemeral, gua, ndp_needed)
     setup_taps_6(gua, nics, dns_ipv4)
     routes4(ip4, local_ip4, nics)
+    ByohEgressNat.ensure_installed(**@egress_nat4) if host_nat?
     write_nftables_conf(ip4, local_ip4, gua, nics)
     forwarding
   end
@@ -346,6 +353,9 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
 
     r "ip", "addr", "replace", "#{vetho}/32", "dev", "vetho#{@vm_name}"
     r "ip", "route", "replace", vm, "dev", "vetho#{@vm_name}" if ip4
+    # Host-NAT egress leaves the namespace from vethi; the host needs a route
+    # back to it.
+    r "ip", "route", "replace", "#{vethi}/32", "dev", "vetho#{@vm_name}" if host_nat?
     r "echo 1 > :path", path: "/proc/sys/net/ipv4/conf/vetho#{@vm_name}/proxy_arp"
 
     r "ip", "-n", @vm_name, "addr", "replace", "#{vethi}/32", "dev", "vethi#{@vm_name}"
@@ -395,6 +405,7 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
   end
 
   def generate_nat4_rules(ip4, private_ip, local_ip4)
+    return generate_host_nat4_rules(ip4, private_ip, local_ip4) if host_nat?
     return unless ip4
 
     public_ipv4 = NetAddr::IPv4Net.parse(ip4).network.to_s
@@ -417,6 +428,42 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
         ip saddr #{private_ipv4} ip daddr #{private_ipv4} snat to #{public_ipv4}
         ip saddr #{vethi_ipv4} udp dport 53 snat to #{public_ipv4}
         ip saddr #{vethi_ipv4} tcp dport 53 snat to #{public_ipv4}
+      }
+    }
+    NAT4_RULES
+  end
+
+  # The namespace NAT of a VM whose IPv4 egress the host masquerades: its
+  # internet-bound traffic leaves from the vethi link address instead of
+  # an IPv4 of its own, and so do dnsmasq's upstream queries, unchanged.
+  # A VM with an internal IPv4 keeps its DNAT and hairpin.
+  def generate_host_nat4_rules(ip4, private_ip, local_ip4)
+    private_ipv4_addr = NetAddr::IPv4Net.parse(private_ip)
+    private_ipv4 = (private_ipv4_addr.netmask.prefix_len == 32) ? private_ipv4_addr.network.to_s : private_ipv4_addr.nth(1).to_s
+    vethi_ipv4 = NetAddr::IPv4Net.parse(local_ip4).next_sib.network.to_s
+    unless ip4
+      return <<~NAT4_RULES
+      table ip nat {
+        chain postrouting {
+          type nat hook postrouting priority srcnat; policy accept;
+          ip saddr #{private_ipv4} ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to #{vethi_ipv4}
+        }
+      }
+      NAT4_RULES
+    end
+
+    ip4_addr = NetAddr::IPv4Net.parse(ip4).network.to_s
+    <<~NAT4_RULES
+    table ip nat {
+      chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip daddr #{ip4_addr} dnat to #{private_ipv4}
+      }
+
+      chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr #{private_ipv4} ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to #{vethi_ipv4}
+        ip saddr #{private_ipv4} ip daddr #{private_ipv4} snat to #{ip4_addr}
       }
     }
     NAT4_RULES
@@ -528,8 +575,9 @@ dhcp-option=6,8.8.8.8
       # the first answer, so resolution survives the loss of either IP
       # family or either provider.  The IPv4 upstream is reachable only
       # through the port-53 SNAT to the VM's public IPv4 (see
-      # generate_nat4_rules), so IPv4-less VMs list two IPv6 upstreams.
-      dns_servers = if ip4.nil? || ip4.empty?
+      # generate_nat4_rules) or through the host NAT, so other IPv4-less
+      # VMs list two IPv6 upstreams.
+      dns_servers = if (ip4.nil? || ip4.empty?) && !host_nat?
         ["2001:4860:4860::8888", "2606:4700:4700::1111"]
       else
         ["8.8.8.8", "2606:4700:4700::1111"]

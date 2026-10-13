@@ -28,6 +28,19 @@ RSpec.describe VmSetup do
     end.new("test")
   }
 
+  # A VM whose IPv4 egress a BYOH host masquerades.
+  let(:host_nat_vs) {
+    Class.new(described_class) do
+      def no_valid_ch_version
+        nil
+      end
+
+      def no_valid_firmware_version
+        nil
+      end
+    end.new("test", egress_nat4: {"deny4" => ["10.97.0.0/16"], "smtp" => false})
+  }
+
   it "can halve an IPv6 network" do
     lower, upper = vs.subdivide_network(NetAddr.parse_net("2a01:4f9:2b:35b:7e40::/79"))
     expect(lower.to_s).to eq("2a01:4f9:2b:35b:7e40::/80")
@@ -313,6 +326,20 @@ RSpec.describe VmSetup do
       dnsmasq_conf = vps.writes["dnsmasq.conf"]
       expect(dnsmasq_conf).to include("all-servers\nserver=2001:4860:4860::8888\nserver=2606:4700:4700::1111")
       expect(dnsmasq_conf).not_to include("server=8.8.8.8")
+    end
+  end
+
+  describe "#cloudinit for a host-NAT VM" do
+    it "queries one upstream per family without an IPv4 of its own" do
+      vps = mock_vm_path.new("test")
+      nics = [VmSetup::Nic.new("fd48:666c:a296:ce4b:2cc6::/79", "192.168.5.50/32", "nctest", "3e:bd:a5:96:f7:b9", "10.0.0.254/32")]
+      allow(host_nat_vs).to receive_messages(vp: vps, write_user_data: nil, rm_if_exists: nil)
+      allow(FileUtils).to receive(:chown)
+      expect(host_nat_vs).to receive(:_run_command).with("mkdosfs", "-n", "CIDATA", "-C", "/vm/test/cloudinit.img", "128")
+      expect(host_nat_vs).to receive(:_run_command).with("mcopy", "-oi", "/vm/test/cloudinit.img", "-s", any_args).exactly(3).times
+
+      host_nat_vs.cloudinit("user", ["key"], "fddf:53d2:4c89:2305:46a0::/79", nics, nil, "ubuntu-noble", "10.0.0.2", ipv6_disabled: false, ip4: "")
+      expect(vps.writes["dnsmasq.conf"]).to include("all-servers\nserver=8.8.8.8\nserver=2606:4700:4700::1111")
     end
   end
 
@@ -717,6 +744,21 @@ RSpec.describe VmSetup do
       vs.setup_networking(false, gua, "", "local_ip4", [], false, "10.0.0.2", multiqueue: false)
     end
 
+    it "installs the host egress NAT before the namespace rules for a host-NAT VM" do
+      gua = "fddf:53d2:4c89:2305:46a0::"
+      calls = []
+      expect(host_nat_vs).to receive(:interfaces).with([], false)
+      expect(host_nat_vs).to receive(:setup_veths_6)
+      expect(host_nat_vs).to receive(:setup_taps_6).with(gua, [], "10.0.0.2")
+      expect(host_nat_vs).to receive(:routes4).with(nil, "local_ip4", []) { calls << :routes4 }
+      expect(ByohEgressNat).to receive(:ensure_installed).with(deny4: ["10.97.0.0/16"], smtp: false) { calls << :egress }
+      expect(host_nat_vs).to receive(:write_nftables_conf) { calls << :nftables }
+      expect(host_nat_vs).to receive(:forwarding)
+
+      host_nat_vs.setup_networking(true, gua, "", "local_ip4", [], false, "10.0.0.2", multiqueue: false)
+      expect(calls).to eq [:routes4, :egress, :nftables]
+    end
+
     it "can generate nftables config" do
       vps = instance_spy(VmPath)
       expect(vs).to receive(:vp).and_return(vps).at_least(:once)
@@ -1038,8 +1080,50 @@ NFTABLES_CONF
     end
   end
 
+  describe "#generate_nat4_rules under host NAT" do
+    it "SNATs a host-NAT VM without IPv4 to vethi, without DNAT or a port-53 SNAT" do
+      expect(host_nat_vs.generate_nat4_rules(nil, "192.168.5.50/32", "169.254.0.10/32")).to eq <<~NAT
+        table ip nat {
+          chain postrouting {
+            type nat hook postrouting priority srcnat; policy accept;
+            ip saddr 192.168.5.50 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to 169.254.0.11
+          }
+        }
+      NAT
+    end
+
+    it "keeps a host-NAT VM's internal IPv4 DNAT and hairpin but sends internet egress from vethi" do
+      expect(host_nat_vs.generate_nat4_rules("10.97.5.7/32", "192.168.5.0/26", "169.254.0.10/32")).to eq <<~NAT
+        table ip nat {
+          chain prerouting {
+            type nat hook prerouting priority dstnat; policy accept;
+            ip daddr 10.97.5.7 dnat to 192.168.5.1
+          }
+
+          chain postrouting {
+            type nat hook postrouting priority srcnat; policy accept;
+            ip saddr 192.168.5.1 ip daddr != { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } snat to 169.254.0.11
+            ip saddr 192.168.5.1 ip daddr 192.168.5.1 snat to 10.97.5.7
+          }
+        }
+      NAT
+    end
+  end
+
   describe "#routes4" do
     let(:nics) { [VmSetup::Nic.new(nil, nil, "nctest", nil, nil)] }
+
+    it "routes vethi back into the namespace for a host-NAT VM" do
+      expect(host_nat_vs).to receive(:_run_command).with("ip", "addr", "replace", "10.0.0.0/32", "dev", "vethotest")
+      expect(host_nat_vs).to receive(:_run_command).with("ip", "route", "replace", "10.0.0.1/32", "dev", "vethotest")
+      expect(host_nat_vs).to receive(:_run_command).with("echo 1 > /proc/sys/net/ipv4/conf/vethotest/proxy_arp")
+      expect(host_nat_vs).to receive(:_run_command).with("ip", "-n", "test", "addr", "replace", "10.0.0.1/32", "dev", "vethitest")
+      expect(host_nat_vs).to receive(:_run_command).with("ip", "-n", "test", "route", "replace", "10.0.0.0", "dev", "vethitest")
+      expect(host_nat_vs).to receive(:_run_command).with("ip", "-n", "test", "route", "replace", "default", "via", "10.0.0.0", "dev", "vethitest")
+      expect(host_nat_vs).to receive(:_run_command).with("ip netns exec test bash -c echo\\ 1\\ \\>\\ /proc/sys/net/ipv4/conf/vethitest/proxy_arp")
+      expect(host_nat_vs).to receive(:_run_command).with("ip netns exec test bash -c echo\\ 1\\ \\>\\ /proc/sys/net/ipv4/conf/nctest/proxy_arp")
+      host_nat_vs.routes4(nil, "10.0.0.0/32", nics)
+    end
 
     it "sets up routes with ip4" do
       # With ip4="10.0.0.2/32" and ip4_local="10.0.0.0/31":

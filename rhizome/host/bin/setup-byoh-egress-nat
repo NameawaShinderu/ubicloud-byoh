@@ -1,0 +1,9 @@
+#!/bin/env ruby
+# frozen_string_literal: true
+
+require "json"
+require_relative "../lib/byoh_egress_nat"
+
+# Reads {"deny4": [...], "smtp": bool} from stdin.
+params = JSON.parse($stdin.read, symbolize_names: true)
+ByohEgressNat.ensure_installed(**params)
