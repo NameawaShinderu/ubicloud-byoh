@@ -37,7 +37,34 @@ routed_networks:
     ndp: true                      # on-link /64: the host answers NDP for the VMs
 ```
 
-`terraform/aws-byoh` writes this file to `.generated/<workspace>/pools.yaml`: one `fabric`/`nat` entry per EIP-backed secondary IP, and one `fabric`/`internal` entry per `byoh_internal_private_ips` address.
+The file is plain YAML and does not depend on any platform. Write it by hand, or let a tool produce it. `terraform/aws-byoh` writes one to `.generated/<workspace>/pools.yaml`: one `fabric`/`nat` entry per EIP-backed secondary IP, and one `fabric`/`internal` entry per `byoh_internal_private_ips` address.
+
+A hand-written file for a LAN site, such as a Proxmox VM data plane behind pfSense ([SETUP_PROXMOX.md](SETUP_PROXMOX.md), NETWORKING §9.2). The LAN is 10.80.0.0/24 with the gateway at 10.80.0.1, and the pool addresses are outside the DHCP range:
+
+```yaml
+version: 2
+uplink: ens18
+routed_networks:
+  # Variant A: reachable from the site only
+  - cidr: 10.80.0.200/29
+    delivery: onlink
+    exposure: internal
+    segment: 10.80.0.0/24
+    gateway: 10.80.0.1
+  # Variant B: pfSense 1:1 NATs each address to one of your public IPs
+  - cidr: 10.80.0.208/30
+    delivery: onlink
+    exposure: nat
+    segment: 10.80.0.0/24
+    gateway: 10.80.0.1
+    external:
+      10.80.0.208: <public IP 1>   # replace; documentation ranges such as 203.0.113.0/24 are refused
+      10.80.0.209: <public IP 2>
+      10.80.0.210: <public IP 3>
+      10.80.0.211: <public IP 4>
+```
+
+A routed block on rented bare metal or in a colo is a single entry: `cidr: <block>`, `delivery: routed`, `exposure: public`.
 
 ### 1.2 Inline form
 
@@ -80,9 +107,24 @@ These are checked for every newly declared entry, by registration and by `add`, 
 | `verify --host H` | Database-only checks. Exits 1 on any failure. |
 | `trace IP` | Finds a pool IP or external IP: pool, host, VM, or reserved/free. For a VM it prints the netns `nft` and `conntrack` commands to run on the host. |
 
-### 2.1 export, and the AWS form of `--external-map`
+### 2.1 export and `--external-map`
 
-`--external-map FILE` takes either a YAML map `{pool IP: external IP}` or the raw JSON of `aws ec2 describe-addresses`. The JSON is recognised by its `Addresses` key; each address maps `PrivateIpAddress` to `PublicIp`, and addresses without a private IP are skipped.
+`--external-map FILE` takes either a YAML map `{pool IP: external IP}` or the raw JSON of `aws ec2 describe-addresses`. The YAML map is the platform-neutral form; write it from your 1:1 NAT table (pfSense, a cloud console, or a provider panel):
+
+```yaml
+# map.yaml
+10.80.0.208: <public IP 1>
+10.80.0.209: <public IP 2>
+```
+
+```bash
+bundle exec bin/byoh-pool export --host vh... --set exposure=nat --external-map map.yaml > pools-nat.yaml
+bundle exec bin/byoh-pool annotate --host vh... --pool-file pools-nat.yaml
+```
+
+`--set` applies to every pool of the host. When only some pools change, edit the exported file before `annotate`.
+
+**AWS only (optional).** The JSON is recognised by its `Addresses` key; each address maps `PrivateIpAddress` to `PublicIp`, and addresses without a private IP are skipped.
 
 ```bash
 aws ec2 describe-addresses --output json > eips.json        # on the operator workstation

@@ -146,7 +146,7 @@ These remain available as operator lab-access helpers only. They are not support
 | Jumping through the control plane | Lab access only. |
 | Per-host `cloudflared` on the data-plane host (portability F8 Tier 1) | **Replaced by the Ubicloud access tunnel (§12.4).** Also, the host cannot reach a VM's private IP without entering the VM netns (§12.1). |
 
-The Proxmox setup docs (`docs/byoh/SETUP_PROXMOX*.md`) describe several of these as setup options. They move to a "lab access" appendix in P6.
+The old Proxmox docs (`SETUP_PROXMOX_LOWTIER.md`, `deploy-scripts/`, now marked superseded and unsupported) described several of these as setup options. The current [SETUP_PROXMOX.md](SETUP_PROXMOX.md) uses only the product modes.
 
 Sites with no public block choose one of:
 - `internal` pools;
@@ -619,7 +619,7 @@ Operator-run:
 
 ## 9. Platform runbooks
 
-Each platform gets a page under `docs/byoh/platforms/`. The Ubicloud side is identical everywhere [PLANNED P1]:
+The Ubicloud side is identical everywhere. Setup runbooks: [SETUP.md](SETUP.md) (any platform, with an AWS-only section) and [SETUP_PROXMOX.md](SETUP_PROXMOX.md). The per-platform pages under `docs/byoh/platforms/` do not exist yet [PLANNED]; until then this section is the reference.
 
 ```
 bin/byoh-location create --name <site> --display-name <site> --ui-name "<Name>" --underlay <cidrs> --overlay 172.20.0.0/14 \
@@ -648,7 +648,7 @@ bin/byoh-pool verify --host <ubid>
 | IPv6 | `ula` today. [P4 spike] VPC `assign_generated_ipv6_cidr_block`, subnet /64, `::/0` via the IGW, `ipv6_prefix_count=1` on the ENI, register `--ipv6 <the /80>`. SG adds `::/0`. |
 | Limits | EIP quota defaults to 5 per region [EXT]. About $0.005/h per public IPv4 [EXT]. m8i.2xlarge per-ENI IP limit UNVERIFIED; terraform must validate the count. |
 | Customer view | IPv4 = EIP. SSH, PG and LB DNS use the EIP. Firewall rules fully effective. |
-| Retired | `scripts/byoh/providers/aws-routed-network-setup.sh` (EIP leak at `:164-172`, /24 assumption, fixed ULA). The VPC route-table method for CIDRs inside the VPC (`docs/providers/generic.md:81-123`). |
+| Retired | `scripts/byoh/providers/aws-routed-network-setup.sh` (EIP leak at `:164-172`, /24 assumption, fixed ULA). The VPC route-table method for CIDRs inside the VPC (formerly in `docs/providers/generic.md`, removed 2026-10-13). |
 
 ### 9.2 Company Proxmox behind pfSense (vmbr1 10.80.0.0/24, pfSense 10.80.0.1)
 
@@ -715,7 +715,7 @@ Best option when the ISP agrees to route.
 5. The `wg0` routes must not overlap the host's LAN segment (§3.4, proxy_arp).
 6. MTU: WireGuard leaves about 1420, so guest MTU 1400 fits.
 
-Scripts: `scripts/byoh/providers/wireguard-tunnel/{vps.sh,host.sh}`.
+Scripts: `scripts/byoh/providers/wireguard-tunnel/{vps.sh,host.sh}` [PLANNED P6; they do not exist yet].
 
 ### 9.5 Bare metal: routed + public
 
@@ -730,7 +730,7 @@ Scripts: `scripts/byoh/providers/wireguard-tunnel/{vps.sh,host.sh}`.
 
 - Static route, or ToR BGP, of a per-host block to each host's main IP.
 - IPv6: a routed /64 per host from your /48.
-- Running FRR on the host is out of scope for the driver. Operator-owned recipe in `docs/byoh/platforms/colo-bgp.md`.
+- Running FRR on the host is out of scope for the driver. An operator-owned recipe in `docs/byoh/platforms/colo-bgp.md` is PLANNED; it does not exist yet.
 
 ### 9.7 GCP (experimental, UNVERIFIED)
 
