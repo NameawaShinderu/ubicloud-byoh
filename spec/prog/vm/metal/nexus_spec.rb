@@ -630,6 +630,22 @@ RSpec.describe Prog::Vm::Metal::Nexus do
       ])
     end
 
+    it "counts only free IPv4 addresses of the VM's exposure in the page" do
+      expect(Scheduling::Allocator).to receive(:allocate).and_raise(Scheduling::Allocator::NoSpaceLeft.new("no space left on any eligible host")).twice
+      Address.create(cidr: "10.98.6.0/30", routed_to_host_id: vm_host.id, exposure: "internal").populate_ipv4_addresses
+      Address.create(cidr: "10.98.7.0/31", routed_to_host_id: vm_host.id, exposure: "nat").populate_ipv4_addresses
+      vm.created_at = Time.now - 11 * 60
+
+      expect { nx.start }.to nap(5)
+      expect(Page.first.details["hosts"].first["free_ipv4"]).to eq 2
+
+      Page.first.destroy
+      vm.update(ip4_exposure: "internal")
+      vm.created_at = Time.now - 11 * 60
+      expect { nx.start }.to nap(5)
+      expect(Page.first.details["hosts"].first["free_ipv4"]).to eq 4
+    end
+
     it "orders hosts with the same free cores by free hugepages in the page" do
       expect(Scheduling::Allocator).to receive(:allocate).and_raise(Scheduling::Allocator::NoSpaceLeft.new("no space left on any eligible host"))
       roomy = create_vm_host(used_hugepages_1g: 0)

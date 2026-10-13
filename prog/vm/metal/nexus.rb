@@ -47,9 +47,10 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   # Free capacity of the hosts the allocator considered, in every
   # dimension it checks, so a NoCapacity page shows which one ran out.
   # Uses the allocator's host filters and lists the hosts with the most
-  # free cores and hugepages first. Limited to a few hosts to keep the
-  # query cheap.
-  def host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:, data_center_exclusion_filter:, os_filter:)
+  # free cores and hugepages first. Free IPv4 counts only addresses of the
+  # exposure the VM asked for, as the allocator does. Limited to a few
+  # hosts to keep the query cheap.
+  def host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:, data_center_exclusion_filter:, os_filter:, ip4_exposure:)
     vm_host_id = Sequel[:vm_host][:id]
     free_storage_gib = DB[:storage_device]
       .where(vm_host_id:, enabled: true)
@@ -57,7 +58,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     free_ipv4 = DB[:ipv4_address]
       .left_join(:assigned_vm_address, ip: :ip)
       .join(:address, [:cidr])
-      .where(:routed_to_host_id => vm_host_id, Sequel[:assigned_vm_address][:ip] => nil, Sequel[:ipv4_address][:reserved] => false)
+      .where(:routed_to_host_id => vm_host_id, Sequel[:assigned_vm_address][:ip] => nil, Sequel[:ipv4_address][:reserved] => false, Sequel[:address][:exposure] => VmHost::IP4_EXPOSURE_POOLS.fetch(ip4_exposure))
       .select { count.function.* }
 
     ds = VmHost.where(arch:)
@@ -167,7 +168,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       end
       if waiting_seconds >= page_after_minutes * 60
         utilization = VmHost.where(allocation_state: "accepting", arch:).select_map { sum(:used_cores) * 100.0 / sum(:total_cores) }.first.to_f
-        hosts = host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:, data_center_exclusion_filter:, os_filter:)
+        hosts = host_capacity_summary(arch:, allocation_state_filter:, location_filter:, host_filter:, host_exclusion_filter:, family_filter:, data_center_exclusion_filter:, os_filter:, ip4_exposure: vm.ip4_exposure)
         Prog::PageNexus.assemble("No capacity left at #{Location[vm.location_id].display_name} for #{family} family of #{arch}", ["NoCapacity", Location[vm.location_id].display_name, arch, family], queued_vms.limit(25).select_map(Sequel[:vm][:id]).map { UBID.to_ubid(it) }, resource_id: nil, extra_data: {queue_size: queued_vms.count, utilization:, hosts:})
       end
 
