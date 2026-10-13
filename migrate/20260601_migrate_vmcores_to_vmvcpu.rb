@@ -33,13 +33,22 @@ Sequel.migration do
                tstzrange('#{cutoff.iso8601}'::timestamptz, NULL),
                amount * 2, '#{new_id}'::uuid, resource_tags
         FROM billing_record
-        WHERE billing_rate_id = '#{old_id}'::uuid AND upper(span) IS NULL
+        WHERE billing_rate_id = '#{old_id}'::uuid AND upper(span) IS NULL AND lower(span) < '#{cutoff.iso8601}'::timestamptz
       SQL
 
       run <<~SQL
         UPDATE billing_record
         SET span = tstzrange(lower(span), '#{cutoff.iso8601}'::timestamptz)
-        WHERE billing_rate_id = '#{old_id}'::uuid AND upper(span) IS NULL
+        WHERE billing_rate_id = '#{old_id}'::uuid AND upper(span) IS NULL AND lower(span) < '#{cutoff.iso8601}'::timestamptz
+      SQL
+
+      # Records opened at an old rate after the cutoff (a database that ran
+      # old code past the cutoff, such as a BYOH fork) would get an empty
+      # range above. They should have used the new rate all along.
+      run <<~SQL
+        UPDATE billing_record
+        SET billing_rate_id = '#{new_id}'::uuid, amount = amount * 2
+        WHERE billing_rate_id = '#{old_id}'::uuid AND upper(span) IS NULL AND lower(span) >= '#{cutoff.iso8601}'::timestamptz
       SQL
     end
   end
