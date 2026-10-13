@@ -84,18 +84,20 @@ vm_ssh() {
     return 255
   fi
   ssh "${SSH_OPTS[@]}" -i "$GATE_VM_KEY" \
-    -o "ProxyCommand=ssh ${SSH_OPTS[*]} -i $GATE_HOST_KEY -W %h:%p root@$GATE_MAIN_IP" \
+    -o "ProxyCommand=ssh ${SSH_OPTS[*]} -i $GATE_HOST_KEY -W '[%h]:%p' root@$GATE_MAIN_IP" \
     "ubi@$ip6" "$@"
 }
 
-# The packet count of the first byoh_egress rule that contains $1.
+# The summed packet counts of the byoh_egress rules that contain $1.
 counter() {
   { host_ssh nft list table inet byoh_egress | grep -F -- "$1" |
-    sed -n 's/.*counter packets \([0-9]*\).*/\1/p' | head -n 1; } || true
+    sed -n 's/.*counter packets \([0-9]*\).*/\1/p' | awk '{ n += $1 } END { if (NR) print n }'; } || true
 }
 
 IMDS_RULE="ip daddr 169.254.0.0/16 ct direction original"
-DENY4_RULE="ip daddr @deny4 ct direction original"
+# Two rules drop deny4 targets: one for RFC 1918 addresses and one for
+# the rest, so the deny probes count both.
+DENY4_RULE="ip daddr @deny4"
 SMTP_RULE="dport 25 "
 
 g1() {
