@@ -25,7 +25,7 @@ Related pages:
    - Addresses the provider **1:1 NATs** onto a private address of the host work (`nat`).
    - Addresses tied to a separate virtual MAC do **not** work.
 
-   An address the provider tells you to configure on the NIC still has to stay off the host. Declare it as a pool and leave it unconfigured (contract C5). Since M2, VM setup fails with "is a local address of this host" when you forget (`VmSetup#check_ip4_not_local`).
+   An address the provider tells you to configure on the NIC still has to stay off the host. Declare it as a pool and leave it unconfigured (contract C5). Since M2, VM setup on a BYOH host fails with "is a local address of this host" when you forget (`VmSetup#check_ip4_not_local`).
 
 ### 1.2 Verdict table
 

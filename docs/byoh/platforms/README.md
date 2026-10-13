@@ -62,7 +62,7 @@ The guides describe branch `m2-network`. It is **not pushed yet**: the published
 | Commit | What it adds | On 17d383a9c instead |
 |---|---|---|
 | a0259a997 | LearnMemory accepts kB/MB/GB/TB sizes and falls back to `MemTotal` | Any DIMM size that is not whole GB fails "unexpected dmidecode unit". Give guests a multiple of 1024 MiB |
-| a092f1b8b | VM setup refuses a pool IP that is local on the host ("is a local address of this host") | No error: the host answers for the VM and customers get "Permission denied (publickey)". Check that `ip -br -4 addr` shows only the main IP |
+| a092f1b8b | VM setup on a BYOH host refuses a pool IP that is local on the host ("is a local address of this host") | No error: the host answers for the VM and customers get "Permission denied (publickey)". Check that `ip -br -4 addr` shows only the main IP |
 | c73f96ddc | The uplink MAC pin skips NICs named by a VLAN, bond, bridge or VRF | PrepHost can break such a netplan. Keep VLANs and bonds off the data-plane host's uplink (tag on the hypervisor or switch) |
 | 9d85a6e3c | VMs cannot reach `168.63.129.16`, `fd00:ec2::254` and `fd20:ce::254` | Only `169.254.0.0/16` is dropped |
 | 105b6439b | `bootstrap-data-plane.sh` checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` | Run those checks by hand (PLATFORMS PF3, PF4); PrepHost still aborts without KVM |

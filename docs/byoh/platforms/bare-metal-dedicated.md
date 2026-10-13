@@ -49,7 +49,7 @@ Use a rented dedicated server when you want public IPv4 per VM with no NAT and n
 
 | Requirement | Notes |
 |---|---|
-| Main IPv4 configured by the installer, and nothing else | `ip -br -4 addr` shows only the main IP. **Never put pool IPs on the NIC (C5)**, even when the provider's own docs tell you to add an additional or failover IP to the network config. Since M2, VM setup fails with "… is a local address of this host" when you do |
+| Main IPv4 configured by the installer, and nothing else | `ip -br -4 addr` shows only the main IP. **Never put pool IPs on the NIC (C5)**, even when the provider's own docs tell you to add an additional or failover IP to the network config. Since M2, VM setup on a BYOH host fails with "… is a local address of this host" when you do |
 | Pool addresses routed to the main IP | Provider-side. The driver never changes upstream routing |
 | Outbound HTTPS | PrepHost downloads cloud-hypervisor and htcat; boot images come from cloud-images.ubuntu.com |
 | Provider firewall open for the pools | Hetzner Robot firewall: off, or allow everything to the pool addresses (NETWORKING §9.5). Any other provider-side firewall in front of the server: the same (UNVERIFIED) |

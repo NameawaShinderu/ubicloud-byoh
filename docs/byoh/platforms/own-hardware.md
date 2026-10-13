@@ -77,7 +77,7 @@ Menu names differ by vendor; these are the usual ones. UNVERIFIED on any specifi
 | Need | Detail |
 |---|---|
 | A management IPv4 for the host (`--main-ip`) | The address the control plane SSHes to. Never inside a pool. |
-| Pool addresses | Delivered to the host by your router or provider (routed), or on the host's LAN segment (onlink). **Never configured on the host** (C5). Since M2, VM setup fails with "X is a local address of this host" if one is. |
+| Pool addresses | Delivered to the host by your router or provider (routed), or on the host's LAN segment (onlink). **Never configured on the host** (C5). Since M2, VM setup on a BYOH host fails with "X is a local address of this host" if one is. |
 | IPv4 block size | Each pool is /24 or smaller, network-aligned |
 | IPv6 (optional) | Exactly one /64 per host. From a /56 or /48, declare one /64. Routed /64: plain entry. On-link /64: add `,ndp` (needs a single-device default route, §3.5 C3). Without one, the host gets a ULA /64 from the location's `ula48`. |
 | Control-plane reachability (C0) | TCP 22 from the control plane to the main IP. With `--cp-reach onhost`, also from the control plane to the pool addresses. With `--cp-reach public`, TCP 22 from the control plane to each internet VM's public or external IP (`Vm#cp_reach_ip4`; an internal VM is not dialled): on O1 with the control plane inside the site and NAT reflection off, that address is unreachable, so use `onhost` there. An off-site control plane needs a routed path (site VPN); Ubicloud does not build it (NETWORKING §4.5). |

@@ -371,7 +371,7 @@ RSpec.describe Vm do
     end
 
     describe "#params_json egress_nat4" do
-      def egress_nat4(exposure = nil)
+      def egress_nat4(exposure = nil, key: "egress_nat4")
         host.update(total_cpus: 12, total_cores: 12, total_dies: 1, total_sockets: 1)
         vm = Prog::Vm::Nexus.assemble("a a", Project.create(name: "egress").id).subject
         vm.update(vm_host_id: host.id)
@@ -382,7 +382,7 @@ RSpec.describe Vm do
         end
         params = JSON.parse(vm.reload.params_json)
         expect(params["public_ipv4"]).to eq(exposure ? "10.98.5.1" : "")
-        params.fetch("egress_nat4", :absent)
+        params.fetch(key, :absent)
       end
 
       let(:host_nat) { {"deny4" => ["10.98.0.0/16"], "smtp" => false} }
@@ -416,6 +416,15 @@ RSpec.describe Vm do
       it "leaves out a generic host outside a BYOH location" do
         host.update(location_id: Location::HETZNER_FSN1_ID)
         expect(egress_nat4).to eq :absent
+      end
+
+      it "marks a VM on a BYOH host" do
+        expect(egress_nat4("public", key: "byoh_host")).to be true
+      end
+
+      it "does not mark a VM on a host outside a BYOH location" do
+        host.update(location_id: Location::HETZNER_FSN1_ID)
+        expect(egress_nat4("public", key: "byoh_host")).to eq :absent
       end
     end
 
@@ -825,6 +834,11 @@ RSpec.describe Vm do
 
       json = JSON.parse(vm.params_json(hypervisor: "ch"))
       expect(json["hypervisor"]).to eq("ch")
+    end
+
+    it "leaves out the BYOH-only keys on a non-BYOH host" do
+      json = JSON.parse(vm.params_json)
+      expect(json.keys).not_to include("byoh_host", "egress_nat4")
     end
 
     it "includes the gpu partition id" do

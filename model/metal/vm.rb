@@ -121,6 +121,7 @@ class Vm < Sequel::Model
         ipv6_disabled: project.get_ff_ipv6_disabled || false,
         append_serial_console: location_id == Location::GITHUB_RUNNERS_ID,
       }
+      params[:byoh_host] = true if byoh_host?
       params[:egress_nat4] = vm_host.location.byoh_profile.egress_nat4_params if byoh_egress_nat4?
       JSON.pretty_generate(params)
     end

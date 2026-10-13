@@ -19,7 +19,7 @@ require_relative "byoh_egress_nat"
 class VmSetup
   Nic = Struct.new(:net6, :net4, :tap, :mac, :private_ipv4_gateway)
 
-  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false, egress_nat4: nil)
+  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false)
     @vm_name = vm_name
     @hugepages = hugepages
     @hypervisor = hypervisor
@@ -27,6 +27,7 @@ class VmSetup
     @firmware_version = CloudHypervisor::Firmware[firmware_version] || no_valid_firmware_version
     @append_serial_console = append_serial_console
     @egress_nat4 = egress_nat4&.transform_keys(&:to_sym)
+    @byoh_host = byoh_host
   end
 
   # Whether the host masquerades the VM's IPv4 egress (ByohEgressNat). Only
@@ -102,7 +103,7 @@ class VmSetup
   def setup_networking(skip_persisted, gua, ip4, local_ip4, nics, ndp_needed, dns_ipv4, multiqueue:)
     ip4 = nil if ip4.empty?
     guest_ephemeral, clover_ephemeral = subdivide_network(NetAddr.parse_net(gua))
-    check_ip4_not_local(ip4) if ip4
+    check_ip4_not_local(ip4) if ip4 && @byoh_host
 
     if !skip_persisted
       # Write out guest-delegated and clover infrastructure address
@@ -132,7 +133,9 @@ class VmSetup
   # cloud-init on EC2 with secondary IPs or the GCP guest agent with alias
   # IP ranges, makes the host answer for the VM instead: its own sshd
   # takes the VM's SSH connections. Fail the setup with the reason rather
-  # than start a VM nobody can reach.
+  # than start a VM nobody can reach. Only BYOH hosts run the check: on
+  # other hosts the VM's IPv4 can be local by design (CheckIpReachability
+  # puts pool addresses on lo), and their setup must stay unchanged.
   def check_ip4_not_local(ip4)
     address = NetAddr::IPv4Net.parse(ip4).network.to_s
     routes = begin

@@ -190,7 +190,7 @@ The EC2 datasource of cloud-init writes **every** ENI secondary IP into `/etc/ne
 
 **Verified:** after deploy and after a host reboot, `ip -br -4 addr` shows only the primary IP (2026-10-11).
 
-Second line of defence, since a092f1b8b: if a pool address is ever local on the host again, VM setup fails with `<ip> is a local address of this host, so the host answers for the VM. ...` instead of passing falsely. This is covered by unit specs only, UNVERIFIED on a real host.
+Second line of defence, since a092f1b8b: if a pool address is ever local on the host again, VM setup on a BYOH host fails with `<ip> is a local address of this host, so the host answers for the VM. ...` instead of passing falsely. This is covered by unit specs only, UNVERIFIED on a real host.
 
 `scripts/byoh/providers/aws-routed-network-setup.sh` (the non-terraform path) does **not** apply this fix. It is broken and retired (PLATFORMS.md, finding 15). Do not use it.
 

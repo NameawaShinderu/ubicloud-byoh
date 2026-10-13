@@ -41,6 +41,19 @@ RSpec.describe VmSetup do
     end.new("test", egress_nat4: {"deny4" => ["10.97.0.0/16"], "smtp" => false})
   }
 
+  # A VM on a BYOH host.
+  let(:byoh_vs) {
+    Class.new(described_class) do
+      def no_valid_ch_version
+        nil
+      end
+
+      def no_valid_firmware_version
+        nil
+      end
+    end.new("test", byoh_host: true)
+  }
+
   it "can halve an IPv6 network" do
     lower, upper = vs.subdivide_network(NetAddr.parse_net("2a01:4f9:2b:35b:7e40::/79"))
     expect(lower.to_s).to eq("2a01:4f9:2b:35b:7e40::/80")
@@ -699,7 +712,7 @@ RSpec.describe VmSetup do
       clover_ephemeral = NetAddr.parse_net("fddf:53d2:4c89:2305:8000::/65")
       ip4 = "192.168.1.100"
 
-      expect(vs).to receive(:check_ip4_not_local).with("192.168.1.100")
+      expect(vs).not_to receive(:check_ip4_not_local)
       expect(vs).to receive(:unblock_ip4).with("192.168.1.100")
       expect(vs).to receive(:interfaces).with([], true)
       expect(vs).to receive(:setup_veths_6) {
@@ -717,6 +730,46 @@ RSpec.describe VmSetup do
       expect(vps).to receive(:write_clover_ephemeral).with(clover_ephemeral.to_s)
 
       vs.setup_networking(false, gua, ip4, "local_ip4", [], false, "10.0.0.2", multiqueue: true)
+    end
+
+    it "refuses an IPv4 that is local on a BYOH host before it sets anything up" do
+      gua = "fddf:53d2:4c89:2305:46a0::"
+      expect(byoh_vs).to receive(:_run_command).with("ip", "-j", "route", "get", "192.168.1.100")
+        .and_return('[{"type":"local","dst":"192.168.1.100","dev":"lo","prefsrc":"192.168.1.100","flags":[],"uid":0,"cache":["local"]}]')
+      expect(byoh_vs).not_to receive(:vp)
+      expect(byoh_vs).not_to receive(:interfaces)
+
+      expect {
+        byoh_vs.setup_networking(false, gua, "192.168.1.100", "local_ip4", [], false, "10.0.0.2", multiqueue: true)
+      }.to raise_error RuntimeError, /\A192\.168\.1\.100 is a local address of this host/
+    end
+
+    it "checks a BYOH VM's IPv4 and then sets up networking" do
+      gua = "fddf:53d2:4c89:2305:46a0::"
+      expect(byoh_vs).to receive(:check_ip4_not_local).with("192.168.1.100").ordered
+      expect(byoh_vs).to receive(:vp).and_return(instance_spy(VmPath)).at_least(:once).ordered
+      expect(byoh_vs).to receive(:unblock_ip4).with("192.168.1.100")
+      expect(byoh_vs).to receive(:interfaces).with([], true)
+      expect(byoh_vs).to receive(:setup_veths_6)
+      expect(byoh_vs).to receive(:setup_taps_6).with(gua, [], "10.0.0.2")
+      expect(byoh_vs).to receive(:routes4).with("192.168.1.100", "local_ip4", [])
+      expect(byoh_vs).to receive(:write_nftables_conf)
+      expect(byoh_vs).to receive(:forwarding)
+
+      byoh_vs.setup_networking(false, gua, "192.168.1.100", "local_ip4", [], false, "10.0.0.2", multiqueue: true)
+    end
+
+    it "does not check an empty IPv4 on a BYOH host" do
+      gua = "fddf:53d2:4c89:2305:46a0::"
+      expect(byoh_vs).not_to receive(:check_ip4_not_local)
+      expect(byoh_vs).to receive(:interfaces).with([], false)
+      expect(byoh_vs).to receive(:setup_veths_6)
+      expect(byoh_vs).to receive(:setup_taps_6).with(gua, [], "10.0.0.2")
+      expect(byoh_vs).to receive(:routes4).with(nil, "local_ip4", [])
+      expect(byoh_vs).to receive(:write_nftables_conf)
+      expect(byoh_vs).to receive(:forwarding)
+
+      byoh_vs.setup_networking(true, gua, "", "local_ip4", [], false, "10.0.0.2", multiqueue: false)
     end
 
     it "can setup networking for empty ip4" do

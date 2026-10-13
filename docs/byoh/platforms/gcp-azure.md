@@ -143,7 +143,7 @@ ip -br -4 addr                 # only the main IP on the uplink
 ip route show table local      # no pool address, no alias range, no forwarding-rule IP
 ```
 
-Since a092f1b8b, VM setup also refuses a VM whose IPv4 is local on the host ("… is a local address of this host, so the host answers for the VM"). So a regression shows up as a failed VM create, not as silent misrouting.
+Since a092f1b8b, VM setup on a BYOH host also refuses a VM whose IPv4 is local on the host ("… is a local address of this host, so the host answers for the VM"). So a regression shows up as a failed VM create, not as silent misrouting.
 
 ### 3.3 Data-plane bootstrap
 
