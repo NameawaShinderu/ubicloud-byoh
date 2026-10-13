@@ -25,6 +25,8 @@ Anything marked UNVERIFIED was never executed.
 | `docs/byoh/NETWORKING.md` | One host network contract for all platforms (`delivery` routed/onlink/fabric × `exposure` public/nat/internal), `host_guard`, `public_ip4`, real locations |
 | `docs/byoh/COMPUTE.md` | Dedicated vs Flexible tiers, custom shapes, overcommit and balloon gates, usage-based placement |
 | `docs/byoh/PLATFORMS.md` | Platform compatibility, 54 verified portability findings (F1–F10), host preflight PF1–PF21 |
+| `docs/byoh/VERIFY.md` | M2 canary gate G0–G17 (`scripts/byoh/verify/m2-gate.sh`), live window L0–L4, rollback R1–R3, backup checklist |
+| `docs/byoh/POOL_OPERATIONS.md` | pools.yaml v2, `bin/byoh-pool`, billing `resource_name` rule, location egress keys |
 
 Product direction from the user:
 - production-grade
@@ -247,22 +249,23 @@ Ubuntu 24.04 with KVM, outbound internet, and root SSH from the control plane.
 
 ```
 RACK_ENV=development bundle exec bin/register-byoh-host \
-  --main-ip <v4> --routed-network <v4cidr-or-/32> [--routed-network ...] \
-  [--routed-network <v6>/64] --ssh-key ~/.ssh/byoh_data \
+  --location <byoh location> --main-ip <v4> \
+  (--pool-file pools.yaml | --routed-network <cidr>[,key=value...] ...) [--ipv6-mode gua|ula] \
+  --ssh-key ~/.ssh/byoh_data \
   --default-boot-image ubuntu-noble [--default-boot-image ubuntu-jammy] \
-  [--location <label>] [--server-identifier ID] \
+  [--server-identifier ID] \
   [--bmc-endpoint URL --bmc-user U --bmc-pass-env VAR [--bmc-system-id ID] [--bmc-reset-type ForceRestart] [--bmc-verify-ssl]] \
   --yes
 ```
 
 - `--ssh-key` must be an unencrypted OpenSSH Ed25519 key.
 - Run the CLI from the repo root with a working `.env.rb`; it loads `db.rb` and `loader.rb`.
-- `--location` defaults to `byoh`.
+- On `m2-network` (M2), `--location` is **required** and must name a BYOH location created with `bin/byoh-location create` (§8a). Before M2 it was a label that defaulted to `byoh`.
 - Terraform: SSH ingress comes from `var.operator_ssh_cidr` (default 0.0.0.0/0), and ports 3000 and 443 are hard-coded open to the world.
 - Boot images live only in the strand stack. To add one later, run `vm_host.download_boot_image("name")` in `bin/pry`.
 
 - There is **no `--provider` flag**; passing one aborts with InvalidOption. Several docs still pass it.
-- `--location` is only a label in the config. The host still lands in eu-central-h1.
+- Before M2, `--location` was only a label and the host landed in eu-central-h1. From M2 the host lands in the named location.
 - Without `--ssh-key`, the CLI generates a key and prints the public key to install.
 - If any BMC flag is given, `verify_ssl` is forced to false unless `--bmc-verify-ssl` is passed.
 - Prefer `--bmc-pass-env`. `--bmc-password` is stored in plaintext in jsonb.
@@ -274,7 +277,7 @@ RACK_ENV=development bundle exec bin/register-byoh-host \
 
 ### Change the IP pool later
 
-There is no tool for this until `bin/byoh-pool` lands (NETWORKING.md §10, M2).
+From M2, use `bin/byoh-pool` (list, export, add, remove [--drain], remap, annotate, ipv6 set, verify, trace); see `docs/byoh/POOL_OPERATIONS.md`.
 The old `scripts/byoh-ops/reconfigure-routed-networks.rb` was deleted on 2026-10-12: it destroyed every VM on the host and had no spec.
 It is still in git history (`git show 0a24426cc:scripts/byoh-ops/reconfigure-routed-networks.rb`) for an emergency.
 
@@ -401,6 +404,23 @@ How the 22 conflicts were resolved:
 6. Start the services, then run `VmHost.all.each(&:install_rhizome)` in pry. Existing hosts keep running VMs; recreate VMs only if they need the new rhizome behaviour.
 7. SSH host keys are now TOFU-pinned on first connect. Reinstalling a host's OS requires destroying and re-registering the VmHost.
 
+## 8a. M2 network contract (branch `m2-network`)
+
+Plan: WP1–WP10. Runbooks: `docs/byoh/VERIFY.md`, `docs/byoh/POOL_OPERATIONS.md`.
+
+- **Migration** `migrate/20261013_byoh_network_contract.rb`. **Never rename an applied migration** (a rename is what forced §8 step 3). Its `down` refuses while M2 data exists.
+  - **Run `bin/byoh-host export-audit --out backups/audit-<ts>.jsonl` before any `down`**; the guard trusts only the table comment that export writes.
+- **Operator CLIs** (each mutation writes a `byoh_operator_action` row):
+  - `bin/byoh-location` (create/list/show/set/rates/grant/revoke/delete),
+  - `bin/register-byoh-host` (`--location` required, `--pool-file`, `--ipv6-mode`),
+  - `bin/byoh-host` (move-location, setup-egress-nat, export-audit),
+  - `bin/byoh-pool` (list/export/add/remove/remap/annotate/ipv6 set/verify/trace),
+  - `scripts/byoh/verify/m2-checks` (read-only gate checks) and `m2-gate.sh`.
+- **Billing overlay:** `BILLING_RATES_EXTRA_DIR` (no `CLOVER_` prefix) in `.env.rb`. **web, respirate and monitor all need it**; restart all three after `byoh-location create --rates-from` or `rates`. Back the directory up with the DB.
+- **Gating (C14):** `VmHost#byoh?` = generic provider **and** BYOH location. A generic host still in hetzner-fsn1 behaves exactly like M1.
+- **Egress NAT:** the flat prog `prog/setup_byoh_egress_nat.rb` (`Prog::SetupByohEgressNat`, no namespace module) installs `/etc/nftables.d/1-byoh-egress.conf` (table `inet byoh_egress`) on BYOH hosts, or removes it from a host that left BYOH. HostNexus `prep` buds it for BYOH hosts; `bin/byoh-host setup-egress-nat` reinstalls it after a profile change.
+- **Never `terraform apply` in `company-mumbai` before M7.** The live SG has drifted from `main.tf` and state does not match the live EIPs; build the live pool file with `bin/byoh-pool export --external-map` from `aws ec2 describe-addresses`.
+
 ## 9. Secrets and sensitive local files (gitignored — never print or commit)
 
 - `.env.rb` (mode 664 here)
@@ -413,8 +433,8 @@ How the 22 conflicts were resolved:
 
 Code:
 1. ~~A management IP inside a declared v4 block enters the VM pool~~: registration rejects such blocks since M1 (configs registered earlier are not re-checked).
-2. Network and broadcast addresses of declared blocks are allocatable.
-3. Every BYOH host lands in hetzner-fsn1 and `data_center` is NULL. The `'generic'` provider row is unused. Fix: add a CLI `--location-id` plus a BYOH Location row with billing rates.
+2. ~~Network and broadcast addresses of declared blocks are allocatable~~: by design for `routed`/`fabric` (each VM IP is a /32 route); `onlink` pools reserve the segment's network, broadcast and gateway (M2).
+3. Every BYOH host lands in hetzner-fsn1 and `data_center` is NULL. M2 fixes the location (`bin/byoh-location`, required `--location`, `bin/byoh-host move-location`); `data_center` is still NULL.
 4. The BMC password can be stored in plaintext despite the comment in `byoh_registration.rb`.
 5. Hardware Reset without a BMC wedges the strand (`CapabilityMissing` retried forever), and admin "Power On" without a BMC returns a 500. Still open after M1.
 6. ~~The leaseweb `setup_ssh_keys` behaviour changed~~: fixed in M1 (only generic hosts skip the root-key bootstrap).
@@ -425,6 +445,7 @@ Code:
    - Only the first v6 is used.
 9. ~~Dead code~~: removed on 2026-10-12.
 10. The `host_provider` annotation is missing `config`; the migration name is 14 digits. (RedfishClient timeouts were added on 2026-10-12.)
+11. Upstream gap, not ours to fix (U1 forbids changing non-BYOH output): an IPv6-only load balancer accepts a VM without IPv4 on non-BYOH hosts. Report it upstream.
 
 Scripts:
 - The bootstrap DB is named `clover_test` while running in development.

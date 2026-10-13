@@ -17,6 +17,17 @@ and wants to see the BYOH driver work end-to-end on real hardware.
 - A real VM running Ubuntu 24.04 on the BYOH host, SSH-able from
   anywhere on the internet via its EIP
 
+> **M2 (branch `m2-network`) changes registration.** `bin/register-byoh-host`
+> now requires `--location` naming a **BYOH location**, which you create
+> first with `bin/byoh-location create` (the `byoh_location_create_command`
+> terraform output prints the command), and terraform writes
+> `.generated/<workspace>/pools.yaml` for `--pool-file`. The commands in
+> Step 4 below predate M2: on M2 code, run Step 3b first and register with
+> `--location <name> --pool-file pools.yaml` instead of the
+> `--routed-network` lines. VMs are then created in that location, not in
+> eu-central-h1. See [VERIFY.md](VERIFY.md) §2 and
+> [POOL_OPERATIONS.md](POOL_OPERATIONS.md).
+
 ---
 
 ## Prerequisites (on your workstation)
@@ -133,6 +144,22 @@ under `~/.ubi-bootstrap/` and skips if already done.
 curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/login
 # → HTTP 200
 ```
+
+---
+
+## Step 3b (M2 code only): Create the BYOH location
+
+```bash
+# On the control plane, from the repo root. Paste the terraform output
+# byoh_location_create_command: it creates the rates directory, tells you
+# to add BILLING_RATES_EXTRA_DIR to .env.rb, and runs
+# bin/byoh-location create ... --rates-from hetzner-fsn1.
+# Then restart puma and respirate (and bin/monitor if you run it), and
+# let your project see the hidden location:
+bundle exec bin/byoh-location grant --location <name> --project <project ubid>
+```
+
+The project exists only after Step 6; run `grant` then.
 
 ---
 
@@ -260,7 +287,8 @@ Open `http://<ctrl_public_ip>:3000/create-account` in your browser.
 
 - Sidebar → **Virtual Machines** → **Create Virtual Machine**
 - Name: anything
-- Location: **eu-central-h1 (Germany)** (our BYOH host is registered
+- Location (M2 code): the BYOH location's UI name from Step 3b.
+- Location (before M2): **eu-central-h1 (Germany)** (our BYOH host is registered
   at Hetzner's default location label because `bin/register-byoh-host`
   doesn't override `location_id`. This is harmless — Ubicloud just
   treats the location as an opaque label.)

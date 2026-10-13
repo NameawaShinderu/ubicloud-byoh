@@ -288,6 +288,8 @@ IPv6 follows the same pattern:
 | `location.byoh_network` | jsonb NULL | site profile (§5.3) |
 | `vm_host.ipv6_mode` | text `'gua'`, CHECK in (gua, ula) | §7 |
 | `vm_host.network_check` | jsonb NULL | last preflight and continuous-check result |
+| `vm.ip4_exposure` | text `'internet'`, CHECK in (internet, internal) | the exposure the VM asked for, kept for allocator retries (M2) |
+| `byoh_operator_action` | table | audit row per operator command (`bin/byoh-location`, `bin/register-byoh-host`, `bin/byoh-host`, `bin/byoh-pool`); export it with `bin/byoh-host export-audit` before any migration `down` (M2) |
 
 The defaults reproduce today's rows (routed, public, not reserved), so the migration is a no-op for upstream and Hetzner.
 
@@ -307,18 +309,24 @@ Each BYOH site is a real `Location` with its own name, display name and billing 
   "ula48":              "fdXX:XXXX:XXXX::/48",
   "ula_underlay":       "none | operator | mesh",
   "guest_mtu":          1400,
-  "dns_servers":        []
+  "dns_servers":        [],
+  "vm_egress_nat4":     true,
+  "internal_egress":    "host_nat | site",
+  "egress_smtp":        false
 }
 ```
 
 | Field | Notes |
 |---|---|
 | `overlay_ipv4_cidrs` | Customer private subnets are drawn only from here. Upstream draws random ranges from 10/8, 172.16/12 and 192.168/16 (`model/private_subnet.rb:17-19`), and `172.20.0.0/14` sits inside 172.16/12. Validation must cover **existing** project subnets too, not only new ones (§10). |
-| `vm_egress_deny` | Metadata addresses are always added (§6.5). Default: `underlay_cidrs` minus the pools. |
+| `vm_egress_deny` | Metadata addresses are always added (§6.5). Default: `underlay_cidrs` minus the pools. In M2 the host-NAT table drops traffic to the IPv4 part of `vm_egress_deny` + `underlay_cidrs` + `cp_source_cidrs` + `host_mgmt_allow`, and only for traffic that goes through the host masquerade, plus original-direction RFC 1918 traffic of any VM; the full chain for pool VMs is P2. |
 | `cp_source_cidrs` | The CP's source address as this site sees it. Feeds `host_mgmt_allow` checks and the union for `control_plane_outbound_cidrs` (§6.6). New field from the review. |
 | `ula48` | Generated with SecureRandom when the location is created. |
 | `ula_underlay` | §7.3. |
 | `guest_mtu` | Lowered only for `mesh` over a 1500-byte underlay (§7.3). |
+| `vm_egress_nat4` | Default true. VMs without IPv4 leave through the host NAT (`/etc/nftables.d/1-byoh-egress.conf`, §14.7). False leaves them without IPv4 egress. Added in M2. |
+| `internal_egress` | Default `host_nat`: VMs on an `internal` pool also leave through the host NAT, because their pool address usually has no edge NAT (AWS secondary IP without an EIP). `site`: they SNAT to their pool address and the site's own NAT carries them. Added in M2. |
+| `egress_smtp` | Default false: host-NAT traffic to TCP 25 is dropped. Added in M2. |
 | `dns_servers` | Optional site resolvers for guests. Today the guest resolvers are hard-coded: dnsmasq forwards to `8.8.8.8` plus public IPv6 resolvers (`vm_setup.rb:519-523`), or hands out `8.8.8.8` directly when `ipv6_disabled` (`:509-511`), so `internal` sites that require company DNS have no hook. New field from the review [PLANNED P2]. |
 
 **Location visibility** (UNVERIFIED, to resolve in P1):
@@ -344,7 +352,7 @@ routed_networks:
     ndp: false
 ```
 
-Bare strings and `{cidr}` keep their current meaning (`routed`/`public`).
+Bare strings and `{cidr}` keep their current meaning (`routed`/`public`) **for entries already stored**: stored entries are never re-validated against the `public` and `nat` rules. A **newly declared** entry with no explicit `exposure` defaults to `public` when it is globally routable and to `internal` otherwise, and registration prints a note (M2, C15). `bin/byoh-pool verify` warns about a stored `public` pool on special-use space; fix it with `annotate` before relying on exposure.
 
 ### 5.5 Customer surfaces [PLANNED P1]
 
@@ -358,7 +366,7 @@ Bare strings and `{cidr}` keep their current meaning (`routed`/`public`).
 | LB DNS (`prog/vnet/load_balancer_nexus.rb:157-198`) | Members' `public_ip4`/`public_ip6`. |
 | LB certificates for `internal` | **Technically possible.** DNS-01 writes the challenge into Ubicloud's own `dns_zone` (`prog/vnet/cert_nexus.rb:44-45`) and does not depend on the VM addresses being public. Whether to offer them is a product choice. **OPEN** |
 | MinIO / VictoriaMetrics / k8s SANs and DNS | `public_ip4`. Intra-cluster hosts stay on role A or private IPs. |
-| Billing (`prog/vm/metal/nexus.rb:226-231`) | `resource_name` = `public_ip4`. No IPv4 record for `internal`. Rates come from `config/billing_rates.yml` (`lib/billing_rate.rb:14`), each row with a fixed UUID. `BillingRate.from_resource_properties(...)["id"]` raises NoMethodError when the location has no row, so **every** resource type and family (VmVCpu per family, VmStorage, IPAddress, and so on) needs a row per BYOH location before the first VM. |
+| Billing (`prog/vm/metal/nexus.rb:226-231`) | `resource_name` = `public_ip4`. No IPv4 record for `internal`. Rates come from the shipped `config/billing_rates/*.yml` plus the overlay directory `BILLING_RATES_EXTRA_DIR` (`lib/billing_rate.rb`), where `bin/byoh-location rates` writes `<location>.yml` with fixed UUIDv5 ids. There is no `config/billing_rates.yml` (M2, C7). `BillingRate.from_resource_properties(...)["id"]` raises NoMethodError when the location has no row, so **every** resource type and family (VmVCpu per family, VmStorage, IPAddress, and so on) needs a row per BYOH location before the first VM. |
 | Abuse lookup (`Vm.from_ips`, `clover_admin.rb:975`) | matches `ip` OR `external_ip` |
 | Admin VmHost page | pools with delivery, exposure, external, reserved, allocated VM, last check |
 
@@ -413,7 +421,7 @@ Notes:
 - Forwarded VM traffic, including ESP to clover addresses, never hits `input`, so the guard cannot break VMs.
 - Node exporter listens only on 127.0.0.1 (`rhizome/host/bin/setup-node-exporter:38`), so it is unaffected.
 - The console and access tunnel (§12) use host TCP 22 from the control plane, which `host_mgmt_allow` already permits. No new host port is opened.
-- P6 egress-only VMs add a host `masquerade` rule for 169.254.0.0/16 to this same file. [ROADMAP.md](ROADMAP.md) M2 ships that rule earlier as its own gated `/etc/nftables.d/` file and folds it in here at P2 (OPEN, ROADMAP D-8).
+- P6 egress-only VMs need a host `masquerade` rule for 169.254.0.0/16. [ROADMAP.md](ROADMAP.md) M2 ships it as its own gated file, `/etc/nftables.d/1-byoh-egress.conf` (table `inet byoh_egress`, BYOH hosts only), and P2 folds it in here (decided, ROADMAP D-8, C9).
 - P2 also owns NH-6: Ubuntu's `/etc/nftables.conf` starts with `flush ruleset`, so every reload wipes Docker, ufw, Tailscale, k3s or libvirt rules on the host ([PLATFORMS.md](PLATFORMS.md) #11). The fix is not designed yet.
 
 **Persistence.**
@@ -459,7 +467,7 @@ Optional hardened posture for shared AWS accounts (split-ENI), documented, not t
 The veth APIPA picker (`model/vm_host.rb:162-167`) picks a random pair and, on collision, walks forward with `ip = ip.next.next` (`:165`).
 - It must never return an address in 169.254.0.0/24, 169.254.169.0/24, 169.254.170.0/24 or 169.254.255.0/24, so a veth /32 can never shadow a cloud link-local service.
 - The exclusion check must sit **inside** the collision loop, because the walk can step into an excluded /24.
-- This change applies to all hosts (not gated). It only removes candidate addresses, so it is behaviour-safe (P6).
+- M2 applies the exclusion on BYOH hosts only (`VmHost#veth_pair_random_ip4_addr`), so upstream hosts keep upstream's picker (C11). Existing VMs keep their address until recreated; `bin/byoh-pool verify` lists the ones inside an excluded /24.
 
 ### 6.5 VM egress deny list [PLANNED P2, BYOH hosts only]
 
@@ -614,13 +622,13 @@ Operator-run:
 Each platform gets a page under `docs/byoh/platforms/`. The Ubicloud side is identical everywhere [PLANNED P1]:
 
 ```
-bin/byoh-location create --name <site> --display "<Name>" --underlay <cidrs> --overlay 172.20.0.0/14 \
-    --cp-reach onhost|public --cp-source <cidr> --mgmt-allow <cidrs> [--ula-underlay none|operator|mesh]
-bin/register-byoh-host --location <site> --main-ip <host ip> --uplink <if> --pool-file pools.yaml [--ipv6 <cidr>[,ndp]|none]
-bin/byoh-pool verify --host <ubid> [--from-outside]
+bin/byoh-location create --name <site> --display-name <site> --ui-name "<Name>" --underlay <cidrs> --overlay 172.20.0.0/14 \
+    --cp-reach onhost|public --cp-source <cidr> --mgmt-allow <cidrs> [--ula-underlay none|operator|mesh] --rates-from <location>
+bin/register-byoh-host --location <site> --main-ip <host ip> --pool-file pools.yaml [--ipv6-mode gua|ula] --ssh-key <key> --yes
+bin/byoh-pool verify --host <ubid>
 ```
 
-[TODAY] `bin/register-byoh-host` has `--main-ip`, `--routed-network`, a label-only `--location`, BMC flags, `--ssh-key`, `--server-identifier`, `--default-boot-image` and `--yes` (`bin/register-byoh-host:60-103`). There is no `--provider` flag; docs that pass one are wrong.
+[M2] `bin/register-byoh-host` requires `--location` (a BYOH location from `bin/byoh-location create`) and takes `--pool-file`, `--ipv6-mode`, `--routed-network CIDR[,key=value...]` (an IPv6 /64 may carry `,ndp`), BMC flags, `--ssh-key`, `--server-identifier`, `--default-boot-image` and `--yes`. The uplink comes from the pool file's `uplink` key; there is no `--uplink` or `--ipv6` flag yet, and `--from-outside` is P3. There is no `--provider` flag; docs that pass one are wrong. Pool operations: [POOL_OPERATIONS.md](POOL_OPERATIONS.md).
 
 ### 9.1 AWS EC2 (matches `terraform/aws-byoh`): fabric + nat
 
@@ -776,9 +784,9 @@ Every command writes an audit log row.
 
 | Check | Rule |
 |---|---|
-| Syntax | CIDRs parse and are aligned. IPv4 blocks no larger than /22. |
+| Syntax | CIDRs parse and are aligned, with an explicit prefix. IPv4 blocks are /24 or longer, because `Address#validate` caps a block at 256 addresses (M2, C1). IPv6 is exactly /64. |
 | Uniqueness | No overlap within the host or anywhere in the database. |
-| Management IP | Never in a pool; auto-reserved with a warning. |
+| Management IP | Never in a pool: a block that contains it is refused. Only `<main-ip>/32` itself is accepted, as the host-only address (M2, C2). |
 | `public` | Refuses RFC1918, 100.64/10 and special-use addresses. |
 | `nat` | Needs a globally routable, database-unique E for every usable IP. |
 | IPv6 | A ULA is refused as `gua`. |
@@ -945,10 +953,10 @@ The console is no longer part of the compute phases (COMPUTE.md points here and 
 
 **[TODAY]:**
 - The UI shows the on-host 10.98.1.x instead of the EIP.
-- All BYOH hosts are in hetzner-fsn1 / eu-central-h1 (`prog/vm/host_nexus.rb:6`).
+- All BYOH hosts are in hetzner-fsn1 / eu-central-h1 (`prog/vm/host_nexus.rb:6`). (M2: registration requires a BYOH location; a generic host still in hetzner-fsn1 keeps M1 behaviour until `bin/byoh-host move-location`, C14.)
 - The allocator INNER JOINs free IPv4 (`scheduling/allocator.rb:135`), so a host without a v4 pool hosts nothing.
 - A management IP inside a declared block is allocatable, and the block containing it is dropped at prerouting (`prog/setup_nftables.rb:7`).
-- Network and broadcast addresses are allocatable.
+- Network and broadcast addresses are allocatable. (By design for `routed` and `fabric`, where each VM address is a /32 route; `onlink` pools reserve the segment's network, broadcast and gateway since M2, C3.)
 - A random ULA is shown as IPv6.
 - No host input firewall; the live AWS SG is kept closed to VM ingress until `host_guard` exists.
 - RFC1918 SNAT exemption.
@@ -1002,12 +1010,12 @@ Every phase ships independently. All Ruby changes keep 100% spec coverage. Every
 
 | Area | Files |
 |---|---|
-| Migration | `migrate/<8-digit date>_byoh_network_contract.rb`, sorting after upstream's newest (CLAUDE.md §8). §5.2 columns. |
+| Migration | `migrate/20261013_byoh_network_contract.rb`. Never rename it once applied. §5.2 columns. |
 | Models | `model/address.rb` (delivery/exposure, §3.4 `usable` rules, reserved rows, `external_ip`), `model/assigned_vm_address.rb`, `model/location.rb` (`byoh_network`, `byoh?`), `model/vm.rb` (`public_ip4`, `public_ip4_scope`, `cp_reach_ip4`, `public_ip6`; `from_ips` matches `external_ip`) |
 | Registration | `lib/byoh_registration.rb` (v2 schema, §10 validations, location required, ULA from `ula48`, `ipv6_mode`), `bin/register-byoh-host` (new flags; `--routed-network` stays as alias), new `bin/byoh-location`, `bin/byoh-pool` |
 | Location | `prog/vm/host_nexus.rb:6` default removed for generic; reuse the `generic` provider row; resolve `visible`/`project_id` and Postgres availability (§5.3) |
 | Allocation | `scheduling/allocator.rb` (exclude `reserved`, filter by `ip4_exposure`, copy `external_ip`, `sshable.host = cp_reach_ip4`), `prog/vm/nexus.rb` (`ip4_exposure`), `prog/vm/metal/nexus.rb` (`wait_sshable` via `cp_reach_ip4` or host-side probe; billing via `public_ip4`) |
-| Billing | `config/billing_rates.yml`: rows for **every** resource type and family per BYOH location (§5.5) |
+| Billing | Overlay directory `BILLING_RATES_EXTRA_DIR` (`bin/byoh-location rates --rates-from`): rows for **every** resource type and family per BYOH location (§5.5). Web, respirate and monitor all need the variable. |
 | Customer surfaces | `serializers/vm.rb`, `views/vm/overview.erb`, `views/vm/index.erb`, `views/kubernetes-cluster/nodes.erb`, Postgres resource model and prog, `prog/vnet/load_balancer_nexus.rb`, MinIO, VictoriaMetrics, Kubernetes progs, `clover_admin.rb` |
 | Unchanged in P1 | `model/metal/vm.rb:98` (role A). `update_load_balancer_node.rb` keeps role A but changes in P2. |
 | Config | Preflight warning for `control_plane_outbound_cidrs` (§6.6); `base_url` warning |
@@ -1052,7 +1060,7 @@ Every phase ships independently. All Ruby changes keep 100% spec coverage. Every
 
 ### 14.7 Phase 6: sites without a public block, and operator tooling
 
-- Egress-only VMs (no pool IPv4) on BYOH hosts (pulled forward into milestone M2 with P1, ROADMAP §3.3): netns SNAT to the vethi address; host `masquerade` of 169.254.0.0/16 out the uplink in the `host_guard` file; gated; UI text "No inbound IPv4 (outbound via shared NAT)"; conntrack log. Enables T2 (§12.3).
+- Egress-only VMs (no pool IPv4) on BYOH hosts (pulled forward into milestone M2 with P1, ROADMAP §3.3): netns SNAT to the vethi address; host `masquerade` of 169.254.0.0/16 out the uplink, in its own file `/etc/nftables.d/1-byoh-egress.conf` until P2 folds it into `host_guard` (D-8); gated; UI text "No inbound IPv4 (outbound via shared NAT)"; conntrack log. Enables T2 (§12.3).
 - `scripts/byoh/providers/wireguard-tunnel/{vps.sh,host.sh}`; per-pool uplink and policy routing in preflight.
 - Proxmox `docs/byoh/deploy-scripts/*`: single vmbr1 uplink; emit `pools.yaml`; fix the /29 vs 3×/32 mismatch.
 - Experimental `terraform/gcp-byoh`, `terraform/azure-byoh`.
@@ -1070,9 +1078,9 @@ Order: protect first, open last. Do not touch the live env outside these steps.
 |---|---|---|---|
 | L0 | **done** | `data_plane_open_ingress` default `false` (`variables.tf:77-81`) and `false` in `company-mumbai.tfvars`; `operator_ssh_cidr` narrowed there; stale `*.tfplan` files deleted. Any apply now keeps the SG closed. | n/a |
 | L1 | after P0 + P1 deploy | Run migrations; defaults leave rows `routed`/`public`. | none needed |
-| L2 | P1 | `bin/byoh-location create --name byoh-aws-aps1 --display "AWS Mumbai (BYOH)" --underlay 10.98.0.0/16 --overlay 172.20.0.0/14 --cp-reach onhost --cp-source <ctrl private>/32 --mgmt-allow <ctrl private>/32,<operator>/32`. Check that no existing private subnet uses 172.20/14. Add billing rows for the location. | delete the empty location |
+| L2 | P1 | `bin/byoh-location create --name byoh-aws-aps1 --display-name byoh-aws-aps1 --ui-name "AWS Mumbai (BYOH)" --underlay 10.98.0.0/16 --overlay 172.20.0.0/14 --cp-reach onhost --cp-source <ctrl private>/32 --mgmt-allow <ctrl private>/32,<operator>/32`. Check that no existing private subnet uses 172.20/14. Add billing rows for the location (`--rates-from hetzner-fsn1`), restart web, respirate and monitor, `grant`. | `revoke`, then `bin/byoh-location delete` |
 | L3 | P1 | Move the host: confirm the 3 VMs are test-only (`Vm.where(vm_host_id:)`), destroy them, drain the host (admin "Move to Draining"), `bin/byoh-host move-location --empty-only` (it refuses an accepting host and pools that overlap the new location's overlay or private subnets), move it back to accepting, recreate. | reverse move while empty (drained) |
-| L4 | P1 | `terraform apply` for the `pools.yaml` output (safe: the open-ingress flag is false; review the plan for any SG change), then `bin/byoh-pool annotate --host <ubid> --pool-file .generated/<ws>/pools.yaml`. UI shows 43.204.120.21. | clear `external_ip` |
+| L4 | P1 | **No terraform command** (the live SG has drifted from `main.tf`, and state does not match the live EIPs). `aws ec2 describe-addresses --output json > eips.json`, then `bin/byoh-pool export --host <ubid> --set delivery=fabric,exposure=nat --external-map eips.json > live-pools.yaml`, review it, and `bin/byoh-pool annotate --host <ubid> --pool-file live-pools.yaml`. UI shows 43.204.120.21. Runbook: [VERIFY.md](VERIFY.md) §3. | `annotate` with `exposure: internal` and no external |
 | L5 | P2 | `install_rhizome` (CLAUDE.md §10a), bud `SetupHostGuard`; confirm a fresh CP SSH, `nft list table inet host_guard`, and the file in `/etc/nftables.d/`. | 90 s auto-rollback, or delete the table and file |
 | L6 | P2, after L5 | Set `data_plane_open_ingress = true`, add `metadata_options`, apply. Optionally re-enable src/dst check (§9.1) in the same window, after testing on a disposable host. | `data_plane_open_ingress=false` |
 | L7 | P2 | Recreate VMs so they get the new netns rules. | recreate on the old rhizome |
