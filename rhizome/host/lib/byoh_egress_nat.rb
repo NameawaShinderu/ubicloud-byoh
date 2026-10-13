@@ -95,6 +95,13 @@ module ByohEgressNat
     true
   end
 
+  # Removes the table and its file, as when the host leaves BYOH. Declaring
+  # the table before deleting it makes this succeed when it is absent.
+  def self.remove(path: PATH)
+    FileUtils.rm_f(path)
+    r "nft", "-f", "-", stdin: "table inet byoh_egress\ndelete table inet byoh_egress\n"
+  end
+
   def self.ensure_include(nftables_conf)
     File.open(nftables_conf, File::APPEND | File::RDWR | File::CREAT) do |f|
       f.flock(File::LOCK_EX)

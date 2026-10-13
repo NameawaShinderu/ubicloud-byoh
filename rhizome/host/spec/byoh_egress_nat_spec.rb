@@ -127,4 +127,19 @@ RSpec.describe ByohEgressNat do
       expect(File.read(conf)).to eq "include \"/etc/nftables.d/*.conf\"\n"
     end
   end
+
+  describe ".remove" do
+    let(:dir) { Dir.mktmpdir }
+    let(:path) { File.join(dir, "1-byoh-egress.conf") }
+
+    after { FileUtils.rm_rf(dir) }
+
+    it "deletes the file and the table, present or not" do
+      File.write(path, "table")
+      expect(described_class).to receive(:_run_command).with("nft", "-f", "-", stdin: "table inet byoh_egress\ndelete table inet byoh_egress\n").twice.and_return("")
+      described_class.remove(path: path)
+      expect(File.exist?(path)).to be false
+      described_class.remove(path: path)
+    end
+  end
 end

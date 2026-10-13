@@ -23,10 +23,10 @@ RSpec.describe Prog::SetupByohEgressNat do
       expect { sn.start }.to exit({"msg" => "byoh egress nat was setup"})
     end
 
-    it "does nothing on a host that is not a BYOH host" do
+    it "removes the table from a host that is not a BYOH host" do
       host.update(location_id: Location::HETZNER_FSN1_ID)
-      expect(sn.sshable).not_to receive(:_cmd)
-      expect { sn.start }.to exit({"msg" => "not a BYOH host"})
+      expect(sn.sshable).to receive(:_cmd).with("sudo host/bin/setup-byoh-egress-nat remove")
+      expect { sn.start }.to exit({"msg" => "byoh egress nat was removed"})
     end
   end
 end

@@ -4,6 +4,11 @@
 require "json"
 require_relative "../lib/byoh_egress_nat"
 
-# Reads {"deny4": [...], "smtp": bool} from stdin.
-params = JSON.parse($stdin.read, symbolize_names: true)
-ByohEgressNat.ensure_installed(**params)
+# Reads {"deny4": [...], "smtp": bool} from stdin, or with "remove" as
+# argument removes the table.
+if ARGV == ["remove"]
+  ByohEgressNat.remove
+else
+  params = JSON.parse($stdin.read, symbolize_names: true)
+  ByohEgressNat.ensure_installed(**params)
+end

@@ -73,7 +73,7 @@ class ByohHostCli
 
     from = host.location
     notes = []
-    DB.transaction do
+    removal = DB.transaction do
       # The row lock makes the move wait for an allocation that already
       # wrote a VM to the host, so that VM is counted here. It does not
       # stop an allocation that chose the host before the lock but writes
@@ -92,8 +92,13 @@ class ByohHostCli
       host.provider.update(config: Sequel.pg_jsonb(host.provider.config.to_h.merge("location_label" => target.name)))
       ByohOperatorLog.record(command: rollback ? "move-location-rollback" : "move-location", target_id: host.id,
         args: {from: from.name, to: target.name}, result: "ok")
+      # A host leaving BYOH must not keep the BYOH egress NAT table, which
+      # outlives reboots. Prog::SetupByohEgressNat removes it from a host
+      # that is no longer a BYOH host.
+      Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}]) if rollback
     end
     @out.puts "Moved host #{host.ubid} from location #{from.name} to #{target.name}."
+    @out.puts "Started #{removal.ubid} to remove the egress NAT table from host #{host.ubid}." if removal
     notes.each { @out.puts "  #{it}" }
     @out.puts "The host is #{host.allocation_state}; set it to accepting in the admin UI when it should take VMs." if host.allocation_state == "draining"
     # Prep installs the egress NAT table only on hosts that were BYOH hosts

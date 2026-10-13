@@ -77,8 +77,11 @@ RSpec.describe ByohHostCli do
     it "rolls a host back out of a BYOH location" do
       host = generic_host(byoh_1)
       status, out, _ = cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-fsn1", "--empty-only")
+      strand = Strand.first(prog: "SetupByohEgressNat")
       expect(status).to eq 0
-      expect(out).to eq "Moved host #{host.ubid} from location byoh-1 to hetzner-fsn1.\n"
+      expect(out).to eq "Moved host #{host.ubid} from location byoh-1 to hetzner-fsn1.\n" \
+        "Started #{strand.ubid} to remove the egress NAT table from host #{host.ubid}.\n"
+      expect([strand.label, strand.stack]).to eq ["start", [{"subject_id" => host.id}]]
       expect(host.reload.location_id).to eq Location::HETZNER_FSN1_ID
       expect(host.byoh?).to be false
       expect(host.provider.config["location_label"]).to eq "hetzner-fsn1"
@@ -139,6 +142,7 @@ RSpec.describe ByohHostCli do
       expect(host.reload.allocation_state).to eq "draining"
       expect(cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-fsn1", "--empty-only")[1])
         .to eq "Moved host #{host.ubid} from location byoh-1 to hetzner-fsn1.\n" \
+          "Started #{Strand.first(prog: "SetupByohEgressNat").ubid} to remove the egress NAT table from host #{host.ubid}.\n" \
           "The host is draining; set it to accepting in the admin UI when it should take VMs.\n"
     end
 
