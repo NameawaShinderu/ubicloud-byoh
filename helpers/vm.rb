@@ -241,15 +241,18 @@ class Clover
 
     options.add_option(name: "enable_ip4", values: ["1"], parent: "location")
 
-    # The IPv4 exposure choice exists only in BYOH locations, so other
-    # projects get the same form as before. A location offers the
-    # exposures its hosts have pool addresses for.
+    # The IPv4 exposure choice exists only in projects that see a BYOH
+    # location, so other projects get the same form as before. A BYOH
+    # location offers the exposures its hosts have pool addresses for;
+    # every other location offers internet only, as the form's script
+    # needs at least one choice per location to redraw the options
+    # that follow.
     byoh_locations = Option.locations(feature_flags: @project.feature_flags).select(&:byoh?)
     @byoh_shared_nat4 = byoh_locations.any? { it.byoh_profile.vm_egress_nat4 }
     unless byoh_locations.empty?
       exposures = Location.byoh_ip4_exposures(byoh_locations.map(&:id))
       options.add_option(name: "ip4_exposure", values: VM_IP4_EXPOSURES, parent: "location") do |location, ip4_exposure|
-        exposures[location.id]&.include?(ip4_exposure)
+        exposures.fetch(location.id, ["internet"]).include?(ip4_exposure)
       end
     end
 

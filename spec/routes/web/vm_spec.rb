@@ -891,12 +891,17 @@ RSpec.describe Clover, "vm" do
 
         visit "#{project.path}/vm/create"
         expect(page.status_code).to eq 200
+        # The project also sees upstream locations. Each location needs an
+        # exposure choice, or the form's script cannot redraw the options
+        # that follow when the location changes.
+        expect(page.all("input[name=location]", visible: :all).map(&:value)).to include(Location[name: "hetzner-fsn1"].ubid)
         exposures = page.all("input[name=ip4_exposure]", visible: :all).map { [it.find(:xpath, "..", visible: :all)[:class], it.value] }
         expect(exposures.map { |classes, value| [classes[/form_location_\S+/], value] }).to contain_exactly(
           ["form_location_#{location.ubid}", "internet"],
           ["form_location_#{location.ubid}", "internal"],
           ["form_location_#{empty.ubid}", "internet"],
           ["form_location_#{internal_only.ubid}", "internal"],
+          *(page.all("input[name=location]", visible: :all).map(&:value) - [location, empty, internal_only].map(&:ubid)).map { ["form_location_#{it}", "internet"] },
         )
         expect(page).to have_content "Reachable only from the BYOH Web network"
         expect(page).to have_content "unless the location's option says outbound IPv4 goes through the site's shared NAT"
