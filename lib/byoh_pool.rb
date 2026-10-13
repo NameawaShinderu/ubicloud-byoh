@@ -464,14 +464,15 @@ class ByohPool
   end
 
   # The VM's control-plane address and IPv4 billing name follow its
-  # external IP. The load balancer and Postgres DNS records are rewritten
-  # too, but their writers still publish the pool address until service
-  # DNS moves to Vm#public_ip4 (M2 WP7).
+  # external IP; the billing name is "<external IP>/32", as VM creation
+  # writes it. The load balancer and Postgres DNS records are rewritten
+  # too, and publish Vm#dns_ip4_string, which is the external IP on BYOH
+  # hosts.
   def refresh_vms(vms)
     vms.each do |vm|
       vm.sshable&.update(host: vm.cp_reach_ip4&.to_s || vm.ip6_string)
       vm_address = vm.assigned_vm_address
-      resource_name = vm_address.external_ip&.to_s || vm_address.ip.to_s
+      resource_name = (external_ip = vm_address.external_ip) ? "#{external_ip}/32" : vm_address.ip.to_s
       vm.active_billing_records.each do |record|
         rate = record.billing_rate or
           raise Error, "billing rate #{record.billing_rate_id} of #{vm.ubid} is not loaded; run with BILLING_RATES_EXTRA_DIR set, as web and respirate are"

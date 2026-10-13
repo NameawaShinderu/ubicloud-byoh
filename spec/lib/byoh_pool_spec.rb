@@ -359,7 +359,7 @@ RSpec.describe ByohPool do
       expect(ipv4_row("10.98.1.128")[:external_ip].to_s).to eq "8.8.4.4"
       expect(vm.reload.assigned_vm_address.external_ip.to_s).to eq "8.8.4.4"
       expect(Sshable[vm.id].host).to eq "8.8.4.4"
-      expect(ip_record.reload.resource_name).to eq "8.8.4.4"
+      expect(ip_record.reload.resource_name).to eq "8.8.4.4/32"
       expect(cpu_record.reload.resource_name).to eq vm.name
       expect(Semaphore.where(strand_id: lb.id, name: "rewrite_dns_records").count).to eq 1
       expect(Semaphore.where(strand_id: pg.id, name: "refresh_dns_record").count).to eq 1
