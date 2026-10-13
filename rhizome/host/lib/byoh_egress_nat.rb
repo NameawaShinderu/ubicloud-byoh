@@ -67,10 +67,15 @@ module ByohEgressNat
   # Writes and loads the table when its content changed. The new content is
   # loaded from the temporary file before it replaces the old one, so the
   # file on disk is always one that loaded. Returns whether it changed.
-  def self.ensure_installed(deny4:, smtp:, path: PATH, nftables_conf: NFTABLES_CONF)
+  #
+  # With keep_existing, an installed table is left as it is. VM setup
+  # passes it when it recreates a VM after a host reboot: the VM's
+  # parameters date from its creation, and the table may since have been
+  # installed from a newer profile (bin/byoh-host setup-egress-nat).
+  def self.ensure_installed(deny4:, smtp:, path: PATH, nftables_conf: NFTABLES_CONF, keep_existing: false)
     content = render(deny4: deny4, smtp: smtp)
     ensure_include(nftables_conf)
-    return false if File.exist?(path) && File.read(path) == content
+    return false if File.exist?(path) && (keep_existing || File.read(path) == content)
 
     FileUtils.mkdir_p(File.dirname(path))
     temp_path = "#{path}.tmp"

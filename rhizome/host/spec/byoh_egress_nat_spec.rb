@@ -91,6 +91,19 @@ RSpec.describe ByohEgressNat do
       expect(File.read(path)).not_to include("dport 25")
     end
 
+    it "keeps an installed table with keep_existing" do
+      expect(described_class).to receive(:_run_command).with("nft", "-f", "#{path}.tmp").and_return("")
+      install
+      expect(described_class.ensure_installed(deny4: [], smtp: true, path: path, nftables_conf: conf, keep_existing: true)).to be false
+      expect(File.read(path)).to eq table
+    end
+
+    it "installs a missing table with keep_existing" do
+      expect(described_class).to receive(:_run_command).with("nft", "-f", "#{path}.tmp").and_return("")
+      expect(described_class.ensure_installed(deny4: ["10.97.0.0/16", "203.0.113.0/24"], smtp: false, path: path, nftables_conf: conf, keep_existing: true)).to be true
+      expect(File.read(path)).to eq table
+    end
+
     it "keeps the old table when the new one does not load" do
       expect(described_class).to receive(:_run_command).with("nft", "-f", "#{path}.tmp").and_return("")
       install

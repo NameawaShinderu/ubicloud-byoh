@@ -747,16 +747,30 @@ RSpec.describe VmSetup do
     it "installs the host egress NAT before the namespace rules for a host-NAT VM" do
       gua = "fddf:53d2:4c89:2305:46a0::"
       calls = []
+      expect(host_nat_vs).to receive(:vp).and_return(instance_spy(VmPath)).at_least(:once)
       expect(host_nat_vs).to receive(:interfaces).with([], false)
       expect(host_nat_vs).to receive(:setup_veths_6)
       expect(host_nat_vs).to receive(:setup_taps_6).with(gua, [], "10.0.0.2")
       expect(host_nat_vs).to receive(:routes4).with(nil, "local_ip4", []) { calls << :routes4 }
-      expect(ByohEgressNat).to receive(:ensure_installed).with(deny4: ["10.97.0.0/16"], smtp: false) { calls << :egress }
+      expect(ByohEgressNat).to receive(:ensure_installed).with(deny4: ["10.97.0.0/16"], smtp: false, keep_existing: false) { calls << :egress }
       expect(host_nat_vs).to receive(:write_nftables_conf) { calls << :nftables }
       expect(host_nat_vs).to receive(:forwarding)
 
-      host_nat_vs.setup_networking(true, gua, "", "local_ip4", [], false, "10.0.0.2", multiqueue: false)
+      host_nat_vs.setup_networking(false, gua, "", "local_ip4", [], false, "10.0.0.2", multiqueue: false)
       expect(calls).to eq [:routes4, :egress, :nftables]
+    end
+
+    it "keeps the installed host egress NAT when it recreates a host-NAT VM" do
+      gua = "fddf:53d2:4c89:2305:46a0::"
+      expect(host_nat_vs).to receive(:interfaces).with([], false)
+      expect(host_nat_vs).to receive(:setup_veths_6)
+      expect(host_nat_vs).to receive(:setup_taps_6).with(gua, [], "10.0.0.2")
+      expect(host_nat_vs).to receive(:routes4).with(nil, "local_ip4", [])
+      expect(ByohEgressNat).to receive(:ensure_installed).with(deny4: ["10.97.0.0/16"], smtp: false, keep_existing: true)
+      expect(host_nat_vs).to receive(:write_nftables_conf)
+      expect(host_nat_vs).to receive(:forwarding)
+
+      host_nat_vs.setup_networking(true, gua, "", "local_ip4", [], false, "10.0.0.2", multiqueue: false)
     end
 
     it "can generate nftables config" do

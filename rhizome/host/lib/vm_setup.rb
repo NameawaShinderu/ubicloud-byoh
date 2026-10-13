@@ -121,7 +121,7 @@ class VmSetup
     setup_veths_6(guest_ephemeral, clover_ephemeral, gua, ndp_needed)
     setup_taps_6(gua, nics, dns_ipv4)
     routes4(ip4, local_ip4, nics)
-    ByohEgressNat.ensure_installed(**@egress_nat4) if host_nat?
+    ByohEgressNat.ensure_installed(**@egress_nat4, keep_existing: skip_persisted) if host_nat?
     write_nftables_conf(ip4, local_ip4, gua, nics)
     forwarding
   end
