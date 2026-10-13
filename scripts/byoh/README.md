@@ -98,3 +98,13 @@ tmux sessions, verify DB is up, etc.).
 Full disaster recovery (fresh machine): start from
 `backups/aws-mumbai-pre-eip/clover_test.dump` per the restore
 instructions in `backups/README.md`.
+
+## Verification (`verify/`)
+
+- `verify/m2-gate.sh STEP...` runs the M2 canary gate checks (G1-G15)
+  on the control plane, from the repo root. Its settings are listed in
+  its header and in `docs/byoh/VERIFY.md` §1.4. It never runs terraform
+  or aws; G0, G16 and G17 are manual.
+- `verify/m2-checks` is the read-only database half of the gate
+  (`lib/byoh_gate_checks.rb`), usable on its own:
+  `bundle exec scripts/byoh/verify/m2-checks host --host vh...`.

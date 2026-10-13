@@ -1,0 +1,31 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# The database checks of the M2 canary gate (m2-gate.sh next to this file,
+# docs/byoh/VERIFY.md). The logic lives in lib/byoh_gate_checks.rb; run
+# with --help for the commands. Read-only: nothing here changes the
+# database.
+#
+# Run from the repository root on the control plane:
+#
+#   bundle exec scripts/byoh/verify/m2-checks host --host vh... --ipv6-mode ula
+#
+# Uses RACK_ENV from the environment (defaults to "development").
+
+unless ENV["RACK_ENV"]
+  ENV["RACK_ENV"] = "development"
+end
+
+ENV["SKIP_LIT_REQUIRE_FROZEN"] = "1"
+require "bundler"
+if ENV["RACK_ENV"] == "production"
+  Bundler.setup(:default)
+else
+  Bundler.setup(:default, :development)
+end
+
+require "logger"
+require_relative "../../../db"
+require_relative "../../../loader"
+
+exit ByohGateChecks.new.run(ARGV)
