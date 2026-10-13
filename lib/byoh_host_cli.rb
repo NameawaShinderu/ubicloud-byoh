@@ -43,6 +43,16 @@ class ByohHostCli
     1
   end
 
+  # Labels at which Prog::Vm::HostNexus has not yet budded its prep
+  # children, so prep will install the egress NAT table itself.
+  PRE_PREP_LABELS = %w[start install_host_os setup_ssh_keys bootstrap_rhizome check_ip_reachability prep].freeze
+
+  # Whether the host's prep has started installing its egress NAT table,
+  # so a later change must be installed by a SetupByohEgressNat strand.
+  def self.past_prep?(host)
+    !(host.allocation_state == "unprepared" && PRE_PREP_LABELS.include?(host.strand.label))
+  end
+
   private
 
   # Moves an empty generic host into a BYOH location, or, with
@@ -73,7 +83,8 @@ class ByohHostCli
 
     from = host.location
     notes = []
-    removal = DB.transaction do
+    pools = 0
+    strand = DB.transaction do
       # The row lock makes the move wait for an allocation that already
       # wrote a VM to the host, so that VM is counted here. It does not
       # stop an allocation that chose the host before the lock but writes
@@ -87,25 +98,29 @@ class ByohHostCli
       vms = host.vms_dataset.count
       raise Error, "host #{host.ubid} has #{vms} VMs; destroy them first" unless vms.zero?
 
-      notes = check_pools_for_location(host, target) unless rollback
+      if rollback
+        pools = ByohPool.new(host).reset_to_legacy(host)
+      else
+        notes = check_pools_for_location(host, target)
+      end
       host.update(location_id: target.id)
       host.provider.update(config: Sequel.pg_jsonb(host.provider.config.to_h.merge("location_label" => target.name)))
       ByohOperatorLog.record(command: rollback ? "move-location-rollback" : "move-location", target_id: host.id,
         args: {from: from.name, to: target.name}, result: "ok")
       # A host leaving BYOH must not keep the BYOH egress NAT table, which
       # outlives reboots. Prog::SetupByohEgressNat removes it from a host
-      # that is no longer a BYOH host.
-      Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}]) if rollback
+      # that is no longer a BYOH host. A host entering BYOH needs the
+      # table before it takes VMs, as it is all that keeps them off the
+      # metadata service and the underlay; prep installs it only on hosts
+      # that are BYOH hosts when prep runs, so a host past prep gets it
+      # here.
+      Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}]) if rollback || self.class.past_prep?(host)
     end
     @out.puts "Moved host #{host.ubid} from location #{from.name} to #{target.name}."
-    @out.puts "Started #{removal.ubid} to remove the egress NAT table from host #{host.ubid}." if removal
+    @out.puts "Reset #{pools} IPv4 pools to routed and public, with nothing reserved and no external IPs." if pools.positive?
+    @out.puts "Started #{strand.ubid} to #{rollback ? "remove" : "install"} the egress NAT table #{rollback ? "from" : "on"} host #{host.ubid}." if strand
     notes.each { @out.puts "  #{it}" }
     @out.puts "The host is #{host.allocation_state}; set it to accepting in the admin UI when it should take VMs." if host.allocation_state == "draining"
-    # Prep installs the egress NAT table only on hosts that were BYOH hosts
-    # at the time.
-    if !rollback && host.allocation_state != "unprepared"
-      @out.puts "Install the host's egress NAT table before it takes VMs: bin/byoh-host setup-egress-nat --host #{host.ubid}"
-    end
   end
 
   # The host's pools must pass the same location checks registration

@@ -469,6 +469,18 @@ RSpec.describe ByohPool do
     end
   end
 
+  describe "#reset_to_legacy" do
+    it "returns every pool to routed and public with nothing reserved and no external IPs" do
+      DB[:ipv4_address].where(ip: "10.98.2.1").update(reserved: true)
+      expect(pool.reset_to_legacy(host)).to eq 4
+      expect(Address.where(routed_to_host_id: host.id).exclude(delivery: "routed", exposure: "public").count).to eq 0
+      expect(DB[:ipv4_address].where(reserved: true).count).to eq 0
+      expect(DB[:ipv4_address].exclude(external_ip: nil).count).to eq 0
+      expect(config_networks.map { it["cidr"] }).to eq ["5.9.10.0/29", "10.98.1.128/32", "10.98.1.129/32", "10.98.2.0/30", host.net6.to_s]
+      expect(config_networks.map(&:keys).uniq).to eq [["cidr"]]
+    end
+  end
+
   describe "#ipv6_set" do
     it "changes the IPv6 network of an empty host" do
       host.update(allocation_state: "accepting")

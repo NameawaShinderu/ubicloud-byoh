@@ -408,6 +408,22 @@ class ByohPool
     end
   end
 
+  # Returns the pools of an empty host to the shape they had before the
+  # network contract: routed, public, nothing reserved, no external IPs,
+  # and bare CIDRs in the config. move-location --rollback-to runs it in
+  # its transaction, holding the host row lock, so the host leaves BYOH
+  # with nothing M1 code or the contract migration's down guard cannot
+  # represent. annotate cannot do this: it refuses public exposure on a
+  # pool that is not globally routable. Returns the number of IPv4 pools.
+  def reset_to_legacy(locked)
+    address_ids = pool_addresses(locked).map(&:id)
+    addresses = Address.where(id: address_ids)
+    addresses.update(delivery: "routed", exposure: "public")
+    DB[:ipv4_address].where(cidr: addresses.select(:cidr)).update(reserved: false, external_ip: nil)
+    write_config(locked, declared(locked).map { |_, entry| {"cidr" => entry.cidr.to_s} })
+    address_ids.size
+  end
+
   private
 
   # Runs the block in a transaction holding the vm_host row lock, with the

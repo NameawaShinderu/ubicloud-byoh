@@ -88,6 +88,17 @@ RSpec.describe ByohHostCli do
       expect(audit_rows.map { it.values_at(:command, :result) }).to eq [["move-location-rollback", "ok"]]
     end
 
+    it "resets the host's IPv4 pools when rolling it back" do
+      host = Prog::Vm::HostNexus.assemble("203.0.113.42", location_id: byoh_1.id, provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+        provider_config: {"main_ip4" => "203.0.113.42", "location_label" => "byoh-1",
+                          "routed_networks" => [{"cidr" => "10.98.2.0/30", "delivery" => "fabric", "exposure" => "internal"}]}).subject
+      Address.where(cidr: "10.98.2.0/30").update(delivery: "fabric", exposure: "internal")
+      status, out, _ = cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-fsn1", "--empty-only")
+      expect([status, out.lines[1]]).to eq [0, "Reset 1 IPv4 pools to routed and public, with nothing reserved and no external IPs.\n"]
+      expect(Address.first(cidr: "10.98.2.0/30").values.values_at(:delivery, :exposure)).to eq ["routed", "public"]
+      expect(host.provider.reload.config.values_at("routed_networks", "location_label")).to eq [[{"cidr" => "10.98.2.0/30"}], "hetzner-fsn1"]
+    end
+
     it "requires --empty-only and exactly one target" do
       host = legacy_host
       expect(cli("move-location", "--host", host.ubid, "--location", "byoh-1")).to eq [1, "", "! --empty-only is required: only hosts without VMs can be moved\n"]
@@ -135,15 +146,36 @@ RSpec.describe ByohHostCli do
       host = legacy_host
       host.update(allocation_state: "draining")
       byoh_1
-      expect(cli("move-location", "--host", host.ubid, "--location", "byoh-1", "--empty-only")).to eq [0,
+      status, out, err = cli("move-location", "--host", host.ubid, "--location", "byoh-1", "--empty-only")
+      install = Strand.first(prog: "SetupByohEgressNat")
+      expect([status, out, err]).to eq [0,
         "Moved host #{host.ubid} from location hetzner-fsn1 to byoh-1.\n" \
-        "The host is draining; set it to accepting in the admin UI when it should take VMs.\n" \
-        "Install the host's egress NAT table before it takes VMs: bin/byoh-host setup-egress-nat --host #{host.ubid}\n", ""]
+        "Started #{install.ubid} to install the egress NAT table on host #{host.ubid}.\n" \
+        "The host is draining; set it to accepting in the admin UI when it should take VMs.\n", ""]
+      expect([install.label, install.stack]).to eq ["start", [{"subject_id" => host.id}]]
       expect(host.reload.allocation_state).to eq "draining"
       expect(cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-fsn1", "--empty-only")[1])
         .to eq "Moved host #{host.ubid} from location byoh-1 to hetzner-fsn1.\n" \
-          "Started #{Strand.first(prog: "SetupByohEgressNat").ubid} to remove the egress NAT table from host #{host.ubid}.\n" \
+          "Started #{Strand.exclude(id: install.id).first(prog: "SetupByohEgressNat").ubid} to remove the egress NAT table from host #{host.ubid}.\n" \
           "The host is draining; set it to accepting in the admin UI when it should take VMs.\n"
+    end
+
+    it "installs the egress NAT table on an unprepared host that is past prep" do
+      host = legacy_host
+      byoh_1
+      host.strand.update(label: "wait_prep")
+      status, out, _ = cli("move-location", "--host", host.ubid, "--location", "byoh-1", "--empty-only")
+      strand = Strand.first(prog: "SetupByohEgressNat")
+      expect([status, out]).to eq [0,
+        "Moved host #{host.ubid} from location hetzner-fsn1 to byoh-1.\n" \
+        "Started #{strand.ubid} to install the egress NAT table on host #{host.ubid}.\n"]
+    end
+
+    it "leaves the egress NAT table to prep on a host that has not reached it" do
+      host = legacy_host
+      byoh_1
+      expect(cli("move-location", "--host", host.ubid, "--location", "byoh-1", "--empty-only")[1]).to eq "Moved host #{host.ubid} from location hetzner-fsn1 to byoh-1.\n"
+      expect(Strand.where(prog: "SetupByohEgressNat").count).to eq 0
     end
 
     it "refuses pools that overlap the target's overlay network or private subnets" do
