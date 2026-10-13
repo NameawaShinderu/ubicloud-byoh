@@ -86,15 +86,18 @@ free -g; pvesm status                            # memory and storage headroom
 | Cores | 8 recommended, 4 minimum (UNVERIFIED) | Rhizome reserves cores for the host. On AWS, 8 vCPU gave 4 usable cores and room for 2-3 `standard-2` VMs. |
 | Memory | A **multiple of 1024 MiB**, 32768 recommended, 16384 minimum (UNVERIFIED) | Other sizes crash LearnMemory with "unexpected dmidecode unit" (OPS-16). Most of the memory becomes 1G hugepages for VMs; `verify_hugepages` needs MemAvailable of at least 2 GiB after that. On AWS, 32 GiB gave 26 hugepages. |
 | Ballooning | Off (`balloon: 0`) | The guest's memory is pinned as 1G hugepages; a balloon would take it back. UNVERIFIED. |
-| Disk | One virtio disk on the VM's own storage, 200 GB or more | VM disks and boot images live on the root filesystem under `/var/storage`. Virtio and SCSI disks have no by-id links; IO limits fall back to the path [FIXED], but `bin/monitor` health checks do not (§4.3). |
+| Disk | One `scsi0` disk on a `virtio-scsi-single` controller, on the VM's own storage, 200 GB or more | VM disks and boot images live on the root filesystem under `/var/storage`. Virtio and SCSI disks have no by-id links; IO limits fall back to the path [FIXED], but `bin/monitor` health checks do not (§4.3). |
 | NIC | **One** NIC, `virtio`, on the LAN bridge, with **`firewall=0`** | Two NICs (vmbr0 DHCP plus a BYOH bridge, as the old docs had) give asymmetric egress, and G5 flags the second address. With the Proxmox firewall on, `ipfilter` or `macfilter` can drop proxy-ARP replies and VM-sourced packets (the default is UNVERIFIED). |
-| Machine / BIOS | Defaults (i440fx or q35, SeaBIOS or OVMF) | Nothing in rhizome depends on them. UNVERIFIED for OVMF. |
+| Machine / BIOS | Defaults (i440fx or q35, SeaBIOS or OVMF) | Nothing in rhizome depends on them. UNVERIFIED for OVMF. The NIC is `ens18` on i440fx and `enp6s18` on q35; this page writes `ens18`. |
 | OS | Ubuntu 24.04 LTS server or cloud image | Upstream accepts only 24.04 for slices (`accepts_slices`). |
 | Network config | Static IP `10.80.0.20/24`, gateway `10.80.0.1`, set by cloud-init `ipconfig0` or the installer | Never put pool addresses on the NIC or in netplan (contract C5). |
 
 ### 3.2 Example commands
 
 Run these on the Proxmox node as root. `9100` is a free VMID; `local-lvm` is your storage. They create only this VM.
+
+- `import-from` needs Proxmox VE 7.2 or later. It works on every storage type (LVM-thin, ZFS, directory, NFS, Ceph), unlike a fixed volume name such as `$STORAGE:vm-$VMID-disk-0`, which exists only on block storage.
+- `--sshkeys` installs the key you will log in with as `ubuntu`. If the control plane already has a key, you may put its public key here as well; §5 needs one of them.
 
 ```bash
 VMID=9100; STORAGE=local-lvm; BRIDGE=vmbr1
@@ -105,8 +108,8 @@ qm create $VMID --name ubi-byoh-data --ostype l26 \
   --cpu host --cores 8 --sockets 1 --memory 32768 --balloon 0 \
   --net0 virtio,bridge=$BRIDGE,firewall=0 \
   --scsihw virtio-scsi-single --serial0 socket --vga serial0 --agent enabled=1
-qm importdisk $VMID /var/lib/vz/template/iso/noble-server-cloudimg-amd64.img $STORAGE
-qm set $VMID --scsi0 $STORAGE:vm-$VMID-disk-0 --boot order=scsi0 --ide2 $STORAGE:cloudinit
+qm set $VMID --scsi0 $STORAGE:0,import-from=/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img \
+  --boot order=scsi0 --ide2 $STORAGE:cloudinit
 qm resize $VMID scsi0 200G
 qm set $VMID --ipconfig0 ip=10.80.0.20/24,gw=10.80.0.1 --nameserver 10.80.0.1 \
   --ciuser ubuntu --sshkeys ~/your_admin_key.pub
@@ -122,7 +125,7 @@ ssh ubuntu@10.80.0.20
 ls -l /dev/kvm                                  # must exist
 grep -c pdpe1gb /proc/cpuinfo                   # > 0
 sudo dmidecode -t memory | grep -E '^\s+Size:'   # sizes in GB; MB means the memory is not a GiB multiple
-ip -br -4 addr                                  # only lo and 10.80.0.20/24 on ens18
+ip -br -4 addr                                  # only lo and 10.80.0.20/24 on the NIC (ens18 or enp6s18)
 curl -sI https://cloud-images.ubuntu.com >/dev/null && echo egress ok
 ```
 
@@ -156,7 +159,7 @@ bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh
 export PATH=$HOME/.local/bin:$HOME/.local/share/mise/installs/ruby/4.0.7/bin:$PATH
 ```
 
-- The script writes `.env.rb` with `BILLING_RATES_EXTRA_DIR` pointing at `~/ubicloud-billing-rates.d`. An older `.env.rb` is kept; add the line by hand if the script warns.
+- The script writes `.env.rb` with `BILLING_RATES_EXTRA_DIR` pointing at `~/ubicloud-billing-rates.d`, and `BASE_URL` set to `http://<first address of hostname -I>:3000`. Account emails link to `BASE_URL`; the upstream default `http://localhost:9292` is unusable from a browser. If users open another URL (a DNS name, a reverse proxy), run the script with `UBI_BASE_URL=<that URL>`, or edit `.env.rb` afterwards. An older `.env.rb` is kept; add the lines by hand if the script warns.
 - `~/.local/bin` (mise) must be on PATH for `bundle install`, or bundler fails with "No such file or directory - mise" (seen in the live AWS window).
 - It starts `puma` and `respirate` in tmux. Logs go to `/tmp/{puma,respirate}.{log,err}`.
 
@@ -177,11 +180,21 @@ bash ~/ubicloud/scripts/byoh/bootstrap-data-plane.sh
 
 It enables root public-key login (`PermitRootLogin prohibit-password`), and installs `ruby-bundler` and `netcat-openbsd`. It changes no network settings.
 
-On the control plane, create the key the control plane will use, and install its public half as root on the data plane:
+On the control plane, create the key the control plane will use:
 
 ```bash
 ssh-keygen -t ed25519 -N '' -f ~/.ssh/byoh_data
-ssh ubuntu@10.80.0.20 "sudo tee -a /root/.ssh/authorized_keys" < ~/.ssh/byoh_data.pub
+```
+
+Install its public half as root on the data plane. The `ubuntu` login needs the private key that matches `--sshkeys` in §3.2, which is usually on your workstation, not on the control plane. So run this **on your workstation**, after copying `byoh_data.pub` there from the control plane:
+
+```bash
+ssh ubuntu@10.80.0.20 "sudo tee -a /root/.ssh/authorized_keys" < byoh_data.pub
+```
+
+If you put a control-plane key in `--sshkeys`, you can run the same command on the control plane instead. Then check from the control plane:
+
+```bash
 ssh -i ~/.ssh/byoh_data root@10.80.0.20 true && echo root ssh ok
 ```
 
@@ -192,6 +205,8 @@ Proxmox does not distribute this key for you (OPS-11). `--ssh-key` must be an un
 ## 6. Site network: pick a variant
 
 These are NETWORKING §9.2 variants A and B. Both use `delivery: onlink`: the pool addresses sit on the LAN, and the data plane answers ARP for them through `proxy_arp`, which prep sets.
+
+`uplink` in `pools.yaml` is the data plane's NIC name: `ens18` on i440fx, `enp6s18` on q35 (check with `ip -br link`). It is informational: it is stored and shown, and nothing configures the NIC from it.
 
 > The `onlink` data path has not been run on any platform yet (UNVERIFIED). Code-wise it is the same path as `routed` and `fabric` (NETWORKING §3.1).
 
@@ -262,7 +277,7 @@ Each usable address of a `nat` pool needs a unique, globally routable external I
 |---|---|---|
 | Variant C: `routed` + `public` | The ISP routes a block to pfSense's WAN. pfSense routes it to `10.80.0.20` (the data-plane VM, **not** the Proxmox node), with a "Do not NAT" outbound rule for the block. | `cidr: <block>`, `delivery: routed`, `exposure: public` |
 | Variant D | One WAN IP, but internet ingress is needed | The tunnel recipe, NETWORKING §9.4 (PLANNED) |
-| IPv6 | pfSense gets a prefix by DHCPv6-PD | Route a /64 to `10.80.0.20` and add `cidr: <the /64>` (`gua`); otherwise IPv6 is `ula` and needs nothing |
+| IPv6 | pfSense gets a prefix by DHCPv6-PD | An IPv6 route needs an IPv6 next hop. Give the data-plane VM a static IPv6 on the LAN (`qm set $VMID --ipconfig0 ip=10.80.0.20/24,gw=10.80.0.1,ip6=<LAN /64>::20/64,gw6=<pfSense LAN IPv6>`), route a **second** /64 from the delegated prefix to that address, and add `cidr: <the second /64>` (`gua`). For a /64 that is on-link on the LAN instead, add it with `ndp: true`. UNVERIFIED on Proxmox. Without either, IPv6 is `ula` and needs nothing. |
 
 Port forwarding on a shared WAN IP, Tailscale on the host, and `cloudflared` on the host are lab helpers, not product modes (NETWORKING §3.3).
 
@@ -291,16 +306,23 @@ bundle exec bin/byoh-location create --name byoh-pve-office \
 - `--ula48` is generated at random. Pass one only to fit an existing host's `net6`.
 - `--rates-from hetzner-fsn1` copies upstream prices into `$BILLING_RATES_EXTRA_DIR`; use `--multiplier` to change them.
 
-Then restart `puma` and `respirate` so they load the rates, and check:
+The command (and gate step G2) may print two **warnings**. Neither is a failure, and neither stops anything:
+
+- `cp_source_cidrs <ip>/32 is not in CONTROL_PLANE_OUTBOUND_CIDRS`. To silence it, add `ENV["CONTROL_PLANE_OUTBOUND_CIDRS"] ||= "<control plane IP>/32"` to `.env.rb` (comma-separated for several).
+- `BASE_URL is http://localhost:9292`. This appears only with an `.env.rb` from an older bootstrap; set `BASE_URL` as in §4.2.
+
+Then restart `puma` and `respirate` so they load the rates. They are tmux sessions; the bootstrap restarts them and skips every finished step:
 
 ```bash
+tmux kill-session -t puma; tmux kill-session -t respirate
+bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh
 bundle exec bin/byoh-location show --location byoh-pve-office
 ```
 
-The location is hidden. After you create your account (§8), give your project access:
+The location is hidden. After you create your account (§8), give your project access. The project ubid (`pj…`) is in the UI's address bar on any project page (`/project/pj…`):
 
 ```bash
-bundle exec bin/byoh-location grant --location byoh-pve-office --project <project ubid>
+bundle exec bin/byoh-location grant --location byoh-pve-office --project pj...
 ```
 
 ### 7.2 Register the host
@@ -322,7 +344,9 @@ bundle exec bin/register-byoh-host \
 - Pool entries can also be given inline, with `--routed-network 10.80.0.200/29,delivery=onlink,exposure=internal,segment=10.80.0.0/24,gateway=10.80.0.1`.
 - Keep `RACK_ENV=development` (the default). With `production`, boot images come from R2/MinIO, which BYOH does not have.
 
-Bring-up takes about 15-25 minutes and **reboots the data-plane VM once**. Watch it:
+The command prints `VmHost UBID:  vh…`. Keep it: §7.3, §9 and the pool and host CLIs take it as `--host`.
+
+Bring-up took about 4 minutes on an AWS nested-virtualization VM. It is UNVERIFIED on Proxmox; allow 15-25 minutes. It **reboots the data-plane VM once**. Watch it:
 
 ```bash
 tail -f /tmp/respirate.log
@@ -335,10 +359,12 @@ The host is ready when `allocation_state` is `accepting`.
 
 ```bash
 bundle exec bin/byoh-pool list   --host vh...
-bundle exec bin/byoh-pool verify --host vh...       # exit 0, no FAIL lines
+bundle exec bin/byoh-pool verify --host vh...       # exit 0, no FAIL lines (see below)
 ssh -i ~/.ssh/byoh_data root@10.80.0.20 nft list table inet byoh_egress   # the host NAT table is loaded
 ssh -i ~/.ssh/byoh_data root@10.80.0.20 ip -br -4 addr                    # still only 10.80.0.20 (C5)
 ```
+
+On a variant A host, `verify` always prints `warn: no free public or nat IPv4 address: no internet VM with IPv4 can be placed on this host; internal VMs and VMs without IPv4 can`. That is expected: the host has no internet pool.
 
 If the egress table is missing, install it with `bundle exec bin/byoh-host setup-egress-nat --host vh...`.
 
@@ -346,7 +372,13 @@ If the egress table is missing, install it with `bundle exec bin/byoh-host setup
 
 ## 8. Create VMs
 
-Create an account at `http://<control plane>:3000/create-account`; the verification email goes to `/tmp/puma.log`. Then grant the project (§7.1) and add an SSH key.
+Create an account at `http://<control plane>:3000/create-account`. The verification email goes to `/tmp/puma.log`; its link uses `BASE_URL` (§4.2). If the link starts with `http://localhost:9292`, replace that part with `http://<control plane>:3000`. Then grant the project (§7.1) and add an SSH key.
+
+**CLI setup.** The `ubi` CLI (and `bin/ubi` in the repo) needs a token, and by default it talks to Ubicloud's hosted service, not to your control plane. The API also answers only on a host name that starts with `api.` (the host routing in `clover.rb`). UNVERIFIED: the CLI path has not been run against a BYOH control plane.
+
+1. In the UI, open the project's **Personal Access Tokens** page (`/project/pj…/token`) and create a token.
+2. On the machine where you run `ubi`, give the control plane an `api.` name, for example `echo "<control plane IP> api.byoh.internal" | sudo tee -a /etc/hosts`.
+3. `export UBI_TOKEN=pat-... UBI_URL=http://api.byoh.internal:3000/cli`
 
 | Variant | VM | UI | CLI |
 |---|---|---|---|
@@ -377,9 +409,12 @@ export GATE_SMTP_PROBE=<an internet host that accepts TCP 25>
 
 # Variant A (no internet pools):
 scripts/byoh/verify/m2-gate.sh g1 g2 g3 g4 g5 g7 g8 g9 g9b
-# Variant B adds the nat VM:
-GATE_VM_A=vm... scripts/byoh/verify/m2-gate.sh g6
+# Variant B adds the nat VM. Its SSH to the external IP E must start outside
+# the site, because NAT reflection is off (§6.3):
+GATE_VM_A=vm... GATE_EXTERNAL_SSH_VIA=<user@host outside the site> scripts/byoh/verify/m2-gate.sh g6
 ```
+
+Without `GATE_EXTERNAL_SSH_VIA`, G6 dials E from the control plane. With the control plane on the LAN and reflection off, that one line FAILs by design; test `ssh ubi@<E>` from an outside machine by hand instead. `GATE_EXTERNAL_SSH_VIA` makes G6 jump through the outside host with `ssh -J`, so that host needs only SSH access and TCP forwarding (UNVERIFIED: never run).
 
 To reach a VM by hand the same way:
 
@@ -398,7 +433,7 @@ Do not jump to the VM's IPv6 through the host. On a `ula` host it fails with "No
 |---|---|
 | Strand stuck at `bootstrap_rhizome` | Root SSH from the control plane fails: key not in `/root/.ssh/authorized_keys`, or no route to `10.80.0.20` (C0). Test with `ssh -i ~/.ssh/byoh_data root@10.80.0.20 true`. |
 | PrepHost fails | No outbound internet from the data plane (cloud-hypervisor and other downloads). |
-| LearnMemory "unexpected dmidecode unit" | Memory is not a multiple of 1024 MiB. Fix it with `qm set <id> --memory 32768`, reboot the VM, and re-register. |
+| LearnMemory "unexpected dmidecode unit" | Memory is not a multiple of 1024 MiB. Fix it with `qm set <id> --memory 32768` and restart the VM from Proxmox (`qm shutdown` then `qm start`; a guest reboot does not apply the change). Do not re-register: respirate retries the failed step on its own. To re-register anyway, destroy the old VmHost first (§11). |
 | `verify_hugepages` fails | Not enough memory for 1G hugepages, or `cpu` is not `host` (no `pdpe1gb`). |
 | No `/dev/kvm` in the data plane | Nested virtualization is off on the node, or the CPU type is not `host`. |
 | VM waits for capacity ("No capacity left") | An internet VM on a host with only `internal` pools (use `-e internal`); no free address of the right exposure (`bin/byoh-pool list`); boot image not downloaded; too few cores or hugepages. On a low-core host, the slices setting may not match. Scope the fix to the one host: `DB[:vm_host].where(id: …).update(accepts_slices: false)`. Never run it unscoped, as `deploy-scripts/04` did. |

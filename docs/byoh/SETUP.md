@@ -88,13 +88,13 @@ cd ~/ubicloud
 ```
 
 - The script does not clone; clone first.
-- It installs Postgres 16, Ruby 4.0.7 and Node 24 via mise, runs `bundle install`, builds assets, writes `.env.rb` with random secrets and `BILLING_RATES_EXTRA_DIR=~/ubicloud-billing-rates.d`, migrates, and starts `puma` and `respirate` in tmux. Logs go to `/tmp/{puma,respirate}.{log,err}`.
+- It installs Postgres 16, Ruby 4.0.7 and Node 24 via mise, runs `bundle install`, builds assets, writes `.env.rb` with random secrets, `BILLING_RATES_EXTRA_DIR=~/ubicloud-billing-rates.d` and `BASE_URL=http://<first address of hostname -I>:3000` (override with `UBI_BASE_URL`), migrates, and starts `puma` and `respirate` in tmux. Logs go to `/tmp/{puma,respirate}.{log,err}`.
 - `~/.local/bin` (mise) must be on PATH for any later `bundle install`. Without it bundler fails with "No such file or directory - mise" (live AWS window, 2026-10-13).
 - Set `UBI_START_MONITOR=1` only when PLATFORMS.md says the monitor suits your hosts' disks.
 - Keep `RACK_ENV=development`. In `production`, boot images come from R2/MinIO, which BYOH does not have. **Never run `RACK_ENV=test` on a control plane**: it disables SSH.
 - Known shortcuts in the script: Postgres `pg_hba` is set to `trust` locally, the database is named `clover_test`, and nothing restarts after a reboot.
 
-The UI is at `http://<control plane>:3000/create-account`. The verification email goes to `/tmp/puma.log`.
+The UI is at `http://<control plane>:3000/create-account`. The verification email goes to `/tmp/puma.log`. Its link starts with `BASE_URL`; with an older `.env.rb` that lacks it, the link says `http://localhost:9292`, so replace that part with the control plane's URL.
 
 ---
 
@@ -214,7 +214,11 @@ ssh -i ~/.ssh/byoh_data root@<main IP> ip -br -4 addr                         # 
 2. Add an SSH public key.
 3. Create a VM in the BYOH location (its UI name). With IPv4 enabled, pick **IPv4 Exposure**: `internet` (a `public` or `nat` address) or `internal`.
 
-CLI equivalents, where the path uses the location's display name:
+CLI equivalents, where the path uses the location's display name. By default `ubi` talks to Ubicloud's hosted service, and the API answers only on a host name that starts with `api.`. So first (UNVERIFIED against a BYOH control plane):
+
+1. Create a token on the project's **Personal Access Tokens** page (`/project/pj…/token`).
+2. Map an `api.` name to the control plane where you run `ubi`, for example `echo "<control plane IP> api.byoh.internal" | sudo tee -a /etc/hosts`.
+3. `export UBI_TOKEN=pat-... UBI_URL=http://api.byoh.internal:3000/cli`
 
 ```bash
 ubi vm <site>/vm1 create -b ubuntu-noble "$(cat ~/.ssh/id_ed25519.pub)"                # internet IPv4
@@ -233,7 +237,7 @@ The VM user is `ubi`.
 - VMs are reached through their namespace on the host (`ip netns exec <inhost> nc <private ipv4> 22`), which works with ULA hosts.
 - The IPv6 mode is checked only when `GATE_IPV6_MODE` is set.
 - `bin/monitor` is required only with `GATE_EXPECT_MONITOR=1`.
-- VM-A may be `nat` or `public` (`GATE_VM_A_EXPOSURE`).
+- VM-A may be `nat` or `public` (`GATE_VM_A_EXPOSURE`). Behind a router doing 1:1 NAT without NAT reflection, set `GATE_EXTERNAL_SSH_VIA` to a host outside the site, or G6's SSH to the external IP fails by design.
 - A site without internet pools runs `g1 g2 g3 g4 g5 g7 g8 g9 g9b`.
 
 ---

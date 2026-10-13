@@ -665,7 +665,7 @@ bin/byoh-pool verify --host <ubid>
 | `cp_reach` | `onhost` (requires C0) |
 | `vm_egress_deny` | = underlay. VMs cannot open connections to the company LAN unless `vm_egress_allow` permits it. Office clients can still use services on `internal` VMs (§4.3 order). |
 | `host_mgmt_allow` | `[10.80.0.0/24 or the CP /32, admin VPN]` |
-| `dns_servers` | company resolvers, if guests must use them |
+| `dns_servers` | company resolvers, if guests must use them. [PLANNED] Stored and validated only: guest dnsmasq still forwards to 8.8.8.8 and 2606:4700:4700::1111 (`rhizome/host/lib/vm_setup.rb`), so the site must allow outbound DNS from the data plane. |
 
 **Variant A: no public block (today). onlink + internal.**
 1. Shrink the pfSense DHCP range so 10.80.0.200-10.80.0.239 is free.
@@ -679,7 +679,7 @@ This is a valid internal-cloud product, not a degraded public one.
 1. pfSense: Firewall → Virtual IPs. Add each public IP (type IP Alias or Proxy ARP).
 2. Firewall → NAT → 1:1: WAN, external `E_i` → internal `10.80.0.20x`.
 3. WAN rule: pass any protocol to each internal target (C3).
-4. NAT reflection **off** for these entries (C2). VM-to-E at the site works through the Ubicloud hairpin DNAT (§4.6). Office clients need split-horizon DNS.
+4. NAT reflection **off** for these entries (C2). VM-to-E at the site fails until the Ubicloud hairpin DNAT (§4.6, PLANNED P2) lands. Office clients need split-horizon DNS.
 5. Declare `exposure: nat` with an `external:` map.
 
 Same shape as AWS.
@@ -694,7 +694,7 @@ Best option when the ISP agrees to route.
 
 **Variant D: one WAN IP but internet ingress needed.** Tunnel recipe (§9.4).
 
-**IPv6:** if the ISP delegates a prefix (DHCPv6-PD) to pfSense, route a /64 to 10.80.0.20 and use `gua` (or `ndp` when on-link). Otherwise `ula`.
+**IPv6:** if the ISP delegates a prefix (DHCPv6-PD) to pfSense, give the data-plane VM an IPv6 address on the LAN, route a second /64 to that address (an IPv6 route needs an IPv6 next hop, not 10.80.0.20), and use `gua`. For an on-link /64, use `ndp: true`. Otherwise `ula`. UNVERIFIED.
 
 ### 9.3 Homelab behind a consumer router
 

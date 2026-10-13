@@ -82,10 +82,10 @@ bundle exec bin/byoh-pool verify --host vh...
 
 ## 5. First VM
 
-1. Sign up at `http://<control plane>:3000/create-account`. The verification email is in `/tmp/puma.log`.
+1. Sign up at `http://<control plane>:3000/create-account`. The verification email is in `/tmp/puma.log`; if its link starts with `http://localhost:9292` (an `.env.rb` without `BASE_URL`), replace that part with `http://<control plane>:3000`.
 2. Grant the project access to the location:
    ```bash
-   bundle exec bin/byoh-location grant --location byoh-site1 --project <project ubid>
+   bundle exec bin/byoh-location grant --location byoh-site1 --project pj...    # the project ubid, from the UI's /project/pj… address
    ```
 3. Add an SSH key.
 4. Create a VM in "Site 1 (BYOH)" with `ubuntu-noble`:

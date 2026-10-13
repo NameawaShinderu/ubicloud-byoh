@@ -14,7 +14,7 @@ Automated shell scripts to deploy Ubicloud BYOH on a Proxmox VE host.
 
 ## Target deployment
 
-- **Server**: Proxmox VE 8+ on bare metal (tested on OVH 64 GB, and homelab 16 GB)
+- **Server**: Proxmox VE 8+ on bare metal (UNVERIFIED: no Proxmox run is recorded in this project, [VERIFY.md](../VERIFY.md) §5)
 - **Output**: Ctrl plane VM + data plane VM + ready-to-use Ubicloud web UI
 - **Time**: ~30-40 minutes end-to-end (Ruby compile dominates)
 
