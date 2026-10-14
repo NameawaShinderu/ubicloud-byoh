@@ -2,7 +2,10 @@
 
 # simplecov:disable
 environment ENV["RACK_ENV"] || "development"
-bind "tcp://#{ENV["BIND"] || "0.0.0.0"}:#{ENV["PORT"] || "3000"}"
+# BIND takes an IPv4 address, a hostname or an IPv6 address, bracketed or not.
+bind_host = ENV["BIND"] || "0.0.0.0"
+bind_host = "[#{bind_host}]" if bind_host.include?(":") && !bind_host.start_with?("[")
+bind "tcp://#{bind_host}:#{ENV["PORT"] || "3000"}"
 threads 15, 15
 enable_keep_alives false
 silence_fork_callback_warning
