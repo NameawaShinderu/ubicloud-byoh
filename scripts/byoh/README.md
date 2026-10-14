@@ -59,12 +59,12 @@ to `/usr/local/bin`. Run it as root:
 |---|---|
 | `ubicloud-admin status` | units, web, env file, pg_hba trust rules, backup recipient and age, `bin/byoh-config-check`; exits 1 on any fail |
 | `ubicloud-admin backup now\|list\|prune --keep N` | `pg_dump` plus the age-encrypted `/etc/ubicloud` under `BACKUP_TARGET`; the daily `ubicloud-backup.timer` runs `backup now` |
-| `ubicloud-admin restore TS --key-file F [--env-only\|--db-only] [--force]` | checks the backup, restores into `ubicloud_restore`, then swaps it in (the old database stays as `ubicloud_prev_*`), migrates and starts; a failed migration swaps back |
-| `ubicloud-admin env set\|unset\|get --reveal\|keys` | edits `/etc/ubicloud/env` (values on stdin, never printed) and restarts the services |
+| `ubicloud-admin restore TS --key-file F [--env-only\|--db-only] [--force]` | checks the backup, restores into `ubicloud_restore` as the non-superuser role `ubicloud_restorer`, then swaps it in (the old database stays as `ubicloud_prev_*`), migrates and starts; any failure after the swap puts back the database, `/etc/ubicloud` and the billing rates. A replaced env file is kept as `env.before-restore-*`. Backups are trusted: keep them where only root can write |
+| `ubicloud-admin env set\|unset\|get --reveal\|keys` | edits `/etc/ubicloud/env` (values on stdin, never printed) and restarts the services, putting the old file back if web does not answer; refuses the secrets, install.sh's flag keys and code-loading keys |
 | `ubicloud-admin logs [web\|respirate\|monitor\|backup\|caddy\|cloudflared] [-f]` | journalctl |
 | `ubicloud-admin account create\|list` | `bin/byoh-account` |
 | `ubicloud-admin run TOOL ...` | `byoh-location`, `byoh-pool`, `byoh-host`, `register-byoh-host`, `byoh-config-check`, `production_check`, `create_prod_admin_account` |
-| `ubicloud-admin console [-e CODE]` | `bin/pry`, unaudited (one system log line) |
+| `ubicloud-admin console [-e CODE\|-e -]` | `bin/pry`; audited when the env file sets `PRY_AUDIT_BUCKET` or `OTEL_EXPORTER_OTLP_ENDPOINT`, otherwise unaudited (one system log line). `-e -` reads the code from stdin, so it stays out of sudo's log |
 
 `ubicloud-admin --help` has the details.
 

@@ -132,4 +132,11 @@ if PRY_LOGGER
   Pry.prepend(PryLogger)
 end
 
+# ubicloud-admin console -e: one piece of code, run as one pry input
+# (so through the audit sink above, when there is one), then exit.
+if (console_code = ENV.delete("UBICLOUD_CONSOLE_CODE"))
+  Pry.new.evaluate_ruby(console_code)
+  exit
+end
+
 Pry::CLI.start(opts)

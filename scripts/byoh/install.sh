@@ -872,7 +872,10 @@ step_database() {
   systemctl enable --now -q "$PG_UNIT" 2>/dev/null || systemctl start "$PG_UNIT"
   wait_postgres
   local r
-  for r in ubicloud ubicloud_password; do
+  # ubicloud_restorer is the role ubicloud-admin restore runs pg_restore
+  # as, so the SQL of a backup never runs as a superuser. It can log in
+  # only from ubicloud-migrate, and only to database ubicloud_restore.
+  for r in ubicloud ubicloud_password ubicloud_restorer; do
     if [[ -z $(psql_value -c "SELECT 1 FROM pg_roles WHERE rolname = '$r'") ]]; then
       psql_admin -c "CREATE ROLE $r LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE"
       db_changes+=("role $r")
@@ -880,6 +883,12 @@ step_database() {
     [[ $(psql_value -c "SELECT rolsuper OR rolcreatedb OR rolcreaterole OR NOT rolcanlogin FROM pg_roles WHERE rolname = '$r'") == f ]] ||
       die "database role $r exists with superuser, createdb or createrole, or without login; fix it by hand"
   done
+  # It creates objects for both roles and hands them over, so it is a
+  # member of both and inherits their rights.
+  if [[ $(psql_value -c "SELECT count(*) FROM pg_auth_members a JOIN pg_roles g ON g.oid = a.roleid JOIN pg_roles m ON m.oid = a.member WHERE m.rolname = 'ubicloud_restorer' AND g.rolname IN ('ubicloud', 'ubicloud_password') AND a.inherit_option") != 2 ]]; then
+    psql_admin -c "GRANT ubicloud, ubicloud_password TO ubicloud_restorer WITH INHERIT TRUE"
+    db_changes+=("ubicloud_restorer membership")
+  fi
   if [[ -z $(psql_value -c "SELECT 1 FROM pg_database WHERE datname = 'ubicloud'") ]]; then
     runuser -u postgres -- createdb -O ubicloud ubicloud
     db_changes+=("database ubicloud")
@@ -900,24 +909,29 @@ step_database() {
   ident=$(mktemp "$WORK/ident.XXXXXX")
   hba=$(mktemp "$WORK/hba.XXXXXX")
   # OS user ubicloud is role ubicloud; ubicloud-migrate may also be the
-  # password-hash role, for migrations and restores only.
+  # password-hash role, for migrations and restores only, and the
+  # restore role.
   cat >"$ident" <<'EOF'
 # BEGIN ubicloud
 ubicloud ubicloud ubicloud
 ubicloud ubicloud-migrate ubicloud
 ubicloud ubicloud-migrate ubicloud_password
+ubicloud ubicloud-migrate ubicloud_restorer
 ubicloud postgres postgres
 # END ubicloud
 EOF
   # First match wins, so the block goes before every other rule: database
-  # ubicloud takes peer logins only, whatever trust lines follow.
+  # ubicloud takes peer logins only, whatever trust lines follow, and
+  # ubicloud_restore (a restore in progress) only postgres and the
+  # restore role.
   cat >"$hba" <<'EOF'
 # BEGIN ubicloud
-local ubicloud postgres peer
+local ubicloud,ubicloud_restore postgres peer
 local ubicloud ubicloud,ubicloud_password peer map=ubicloud
-local ubicloud all reject
-host ubicloud all 127.0.0.1/32 reject
-host ubicloud all ::1/128 reject
+local ubicloud_restore ubicloud_restorer peer map=ubicloud
+local ubicloud,ubicloud_restore all reject
+host ubicloud,ubicloud_restore all 127.0.0.1/32 reject
+host ubicloud,ubicloud_restore all ::1/128 reject
 # END ubicloud
 EOF
   BLOCK_CHANGED=0
