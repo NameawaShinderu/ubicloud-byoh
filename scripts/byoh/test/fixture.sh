@@ -9,6 +9,11 @@
 #   fixture.sh as-service CMD…  run CMD in the release as ubicloud, with the
 #                               service environment (parsed by systemd)
 #   fixture.sh as-migrate CMD…  the same as ubicloud-migrate
+#   fixture.sh argv-watch       while /root/argv-watch.run exists, scan
+#                               every command line for the column key:
+#                               argv-watch.leak holds the ps output of a
+#                               hit, argv-watch.saw marks that a migrate
+#                               ran (the positive control)
 #
 # FIXTURE_CWD replaces the release as the working directory, and
 # FIXTURE_SETENV=KEY=value adds one variable.
@@ -44,8 +49,24 @@ service_env_run() {
     "$TOOLS/bin/ruby" "$@"
 }
 
+# The key is read from a file with grep -f, so no command line of the
+# watcher itself ever carries it.
+argv_watch() {
+  local w=/root/argv-watch
+  sed -n "s/^CLOVER_COLUMN_ENCRYPTION_KEY='\(.*\)'$/\1/p" /etc/ubicloud/env >"$w.key"
+  test -s "$w.key"
+  rm -f "$w.leak" "$w.saw"
+  touch "$w.run"
+  while [[ -e $w.run ]]; do
+    ps -eo args >"$w.ps"
+    grep -qF -f "$w.key" "$w.ps" && cp "$w.ps" "$w.leak"
+    grep -q 'rake-task-runner migrate' "$w.ps" && touch "$w.saw"
+  done
+}
+
 case ${1:-} in
   units) stage_units ;;
+  argv-watch) argv_watch ;;
   account)
     service_env_run ubicloud bin/byoh-account create --email "${2:?email}" --password-stdin
     ;;
@@ -58,7 +79,7 @@ case ${1:-} in
     service_env_run ubicloud-migrate "$@"
     ;;
   *)
-    echo "usage: fixture.sh units|account EMAIL|as-service ARGS…|as-migrate ARGS…" >&2
+    echo "usage: fixture.sh units|account EMAIL|as-service ARGS…|as-migrate ARGS…|argv-watch" >&2
     exit 2
     ;;
 esac

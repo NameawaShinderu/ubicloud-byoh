@@ -417,7 +417,15 @@ sc_rerun() {
   release_rev_to_art rerun
   sums=$(settings_sums rerun)
   pids=$(service_pids rerun)
+  # No secret value on a command line while install.sh runs: a watcher
+  # scans ps for the column key through the whole run, migrate included.
+  docker exec -d ubi-m3-rerun bash /art/fixture.sh argv-watch
+  wait_for 10 dx rerun test -e /root/argv-watch.run >/dev/null || fail "rerun: the argv watcher did not start"
   install_cp rerun >"$LOGS/rerun-same.log" 2>&1 || fail "rerun: install.sh failed, see $LOGS/rerun-same.log"
+  dx rerun rm -f /root/argv-watch.run
+  dx rerun test -e /root/argv-watch.saw || fail "rerun: the argv watcher never saw the migrate run"
+  dx rerun test ! -e /root/argv-watch.leak || fail "rerun: the column key was on a command line during install.sh"
+  say "rerun: no secret on any command line during the run (migrate seen by the watcher)"
   grep -q '^changed ' "$LOGS/rerun-same.log" && fail "rerun: identical arguments changed: $(grep '^changed ' "$LOGS/rerun-same.log")"
   [[ $(settings_sums rerun) == "$sums" ]] || fail "rerun: identical arguments changed a managed file"
   [[ $(service_pids rerun) == "$pids" ]] || fail "rerun: identical arguments restarted a service"

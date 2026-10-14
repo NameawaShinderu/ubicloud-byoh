@@ -229,25 +229,31 @@ kv_read() {
 
 valid_value() { [[ $1 != *"'"* && $1 != *\\* && $1 != *$'\n'* && $1 != *$'\r'* ]]; }
 
-# kv_env_args FILE...: prints KEY=value lines, NUL-separated, for env -i.
-kv_env_args() {
-  local f k
-  for f in "$@"; do
-    kv_read "$f"
-    for k in "${KV_KEYS[@]}"; do printf '%s=%s\0' "$k" "${KV[$k]}"; done
-  done
-}
-
 # as_service USER CMD...: runs CMD in the current release as USER with
 # exactly the env file, the release env, PATH and HOME, umask 0007.
+# The values travel in the environment, never in argv: /proc/PID/cmdline
+# is readable by every local user, /proc/PID/environ only by its owner.
+# export is a builtin, and setpriv execs CMD without a PAM session, so no
+# process ever carries a value on its command line.
 as_service() {
-  local user=$1 envs=()
+  local user=$1 group
   shift
-  mapfile -d '' envs < <(kv_env_args "$ENV_FILE" "$CURRENT/.release-env")
+  group=$(id -gn "$user")
+  # The caller tests the status, so set -e is off in here: every step
+  # that can fail exits by itself.
   (
-    cd "$CURRENT" &&
-      runuser -u "$user" -- env -i "${envs[@]}" PATH="$SERVICE_PATH" HOME="$STATE" \
-      sh -c 'umask 0007 && exec "$@"' sh "$@"
+    cd "$CURRENT" || exit 1
+    local k f
+    while IFS= read -r k; do unset "$k" 2>/dev/null || exit 1; done < <(compgen -e)
+    for f in "$ENV_FILE" "$CURRENT/.release-env"; do
+      kv_read "$f"
+      for k in "${KV_KEYS[@]}"; do
+        export "$k=${KV[$k]}" 2>/dev/null || die "$f sets $k, which bash cannot export"
+      done
+    done
+    export PATH=$SERVICE_PATH HOME=$STATE
+    umask 0007
+    exec setpriv --reuid="$user" --regid="$group" --init-groups -- "$@"
   )
 }
 
@@ -278,10 +284,11 @@ step_checks() {
 
 WORK=""
 SRC_DIR=""
+SMTP_DIR=""
 
 fetch_source() {
   WORK=$(mktemp -d /tmp/ubicloud-install.XXXXXX)
-  trap 'rm -rf "$WORK" ${BUILD_HOME:+"$BUILD_HOME"}' EXIT
+  trap 'rm -rf "$WORK" ${BUILD_HOME:+"$BUILD_HOME"} ${SMTP_DIR:+"$SMTP_DIR"}' EXIT
   if [[ -n $SRC_GIT ]]; then
     # git refuses repositories owned by another user, so it runs as the
     # repository's owner. root only writes the archive it prints.
@@ -553,13 +560,25 @@ recipients_wanted() {
 
 # Turns --smtp-file into SMTP_* lines with the source's bin/byoh-smtp-url,
 # which needs no database. The URL never reaches argv or the output.
+# M3-n: root never runs source code, so the parser runs as nobody from a
+# copy of its two files that user nobody can read.
 read_smtp() {
   SMTP_LINES=""
   [[ -n $SMTP_FILE ]] || return 0
-  local url
+  local url dir
   if [[ $SMTP_FILE == - ]]; then url=$(cat); else url=$(cat "$SMTP_FILE"); fi
-  SMTP_LINES=$(printf '%s' "$url" | env -i PATH="$SERVICE_PATH" "$TOOLS/bin/ruby" "$SRC_DIR/bin/byoh-smtp-url") ||
+  dir=$(mktemp -d /tmp/ubicloud-smtp.XXXXXX)
+  SMTP_DIR=$dir
+  install -d -m 0755 "$dir/bin" "$dir/lib"
+  install -m 0644 "$SRC_DIR/bin/byoh-smtp-url" "$dir/bin/byoh-smtp-url"
+  install -m 0644 "$SRC_DIR/lib/byoh_smtp_url.rb" "$dir/lib/byoh_smtp_url.rb"
+  chmod 0755 "$dir"
+  SMTP_LINES=$(cd "$dir" && printf '%s' "$url" |
+    setpriv --reuid=nobody --regid=nogroup --clear-groups -- \
+      env -i PATH="$SERVICE_PATH" "$TOOLS/bin/ruby" "$dir/bin/byoh-smtp-url") ||
     usage_die "--smtp-file: the URL is not usable (see the message above)"
+  rm -rf "$dir"
+  SMTP_DIR=""
   SMTP_LINES=${SMTP_LINES%$'\n'}
 }
 
