@@ -362,6 +362,11 @@ step_checks() {
   # shellcheck disable=SC1091
   version=$(. /etc/os-release && echo "${VERSION_ID:-}")
   [[ $id == ubuntu && $version == 24.04 ]] || die "install.sh needs Ubuntu 24.04 (found ${id:-?} ${version:-?})"
+  # The mise and cloudflared binaries are pinned by their amd64 sha256;
+  # elsewhere step 3 would fail after the packages were installed.
+  local arch
+  arch=$(dpkg --print-architecture)
+  [[ $arch == amd64 ]] || usage_die "the pinned mise and cloudflared binaries are amd64 only (this machine is $arch)"
   local mem
   mem=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
   if ((mem < MIN_MEM_KB)); then
@@ -373,7 +378,7 @@ step_checks() {
       die "the clock is not NTP-synchronized (timedatectl); TLS, tokens and backups depend on it. --skip-check clock overrides"
     report skip "checks: clock not NTP-synchronized (--skip-check clock)"
   fi
-  report ok "checks: Ubuntu 24.04, root, ${mem} kB memory"
+  report ok "checks: Ubuntu 24.04, amd64, root, ${mem} kB memory"
 }
 
 # --- source ---------------------------------------------------------------------
@@ -639,7 +644,9 @@ check_settings() {
         # which clients could then choose.
         printf "install.sh: key IP_FROM_HEADER differs; it follows --tls (X-Real-IP for acme and provided, CF-Connecting-IP for tunnel, unset for none), so change it only with the front: pass --update-env IP_FROM_HEADER with --tls\n" >&2
         ;;
-      *) printf "install.sh: key %s differs; edit with 'ubicloud-admin env set %s' or pass --update-env %s\n" "$k" "$k" "$k" >&2 ;;
+      # A flag owns the key: ubicloud-admin env set refuses it, or it is
+      # not in the env file at all (BACKUP_*).
+      *) printf "install.sh: key %s differs; pass the same flags as before, or add --update-env %s to change it\n" "$k" "$k" >&2 ;;
     esac
   done
   exit 2
@@ -865,7 +872,7 @@ stage_release() {
   report ok "stage release done; current is still $(readlink "$CURRENT")"
   echo
   echo "Release $VERSION (rev $SRC_REV) is staged. To switch to it (docs/byoh/OPERATIONS.md, release switch):"
-  echo "  sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate"
+  echo "  sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate ubicloud-monitor"
   echo "  sudo ubicloud-admin backup now"
   echo "  sudo ubicloud-admin release migrate $VERSION"
   echo "  sudo ubicloud-admin release use $VERSION"
@@ -1262,10 +1269,6 @@ check_front() {
       ((NO_START)) && return 0
       has_existing_cloudflared && return 0
       if [[ $(dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null || true) != installed ]]; then
-        local arch
-        arch=$(dpkg --print-architecture)
-        [[ $arch == amd64 ]] ||
-          usage_die "install.sh pins cloudflared for amd64 only (this machine is $arch); install cloudflared yourself and run it as cloudflared.service"
         CF_DEB=$WORK/cloudflared.deb
         curl -fsSL --retry 3 -o "$CF_DEB" \
           "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64.deb" ||

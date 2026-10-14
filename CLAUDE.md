@@ -226,7 +226,7 @@ The file and class names are load-bearing: `"generic"` must resolve to `Hosting:
 
 ### Control plane, packaged (M3, `m3-packaging`; UNVERIFIED outside the container harness)
 
-`sudo bash ~/ubicloud/scripts/byoh/install.sh --version V --source-git ~/ubicloud --ref <rev> --url https://HOST --tls acme|provided|tunnel|none --admin-email E --backup-recipient age1...` (`docs/byoh/INSTALL.md`).
+`sudo bash ~/ubicloud/scripts/byoh/install.sh --version V --source-git ~/ubicloud --ref <rev> --url https://HOST --tls <acme|provided|tunnel|none> --admin-email E --backup-recipient age1...` (`docs/byoh/INSTALL.md`).
 - Idempotent, no markers; a flag that would change an existing setting exits 2 unless `--update-env KEY`. Exit 0/1/2.
 - Default `--rack-env production` with `BOOT_IMAGE_SOURCE=public`, `MAIL_DRIVER=logger`, `DELETED_RECORD_DROP_UNARCHIVED=true`, `ALLOW_UNSPREAD_SERVERS=true`, `BIND=127.0.0.1`. The **E1 canary** (a production-mode VM boot) has not run.
 - Operate with `sudo ubicloud-admin status|smoke|backup|restore|env|logs|account|run <tool>|console|release` (`docs/byoh/OPERATIONS.md`). Tools run as `ubicloud-admin run byoh-location ...`; DB access `sudo -u postgres psql -d ubicloud`.

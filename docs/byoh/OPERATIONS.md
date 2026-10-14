@@ -32,16 +32,19 @@ containers); nothing here has run on a real machine yet (UNVERIFIED).
 |---|---|---|---|
 | `ubicloud.target` | Wants web, respirate and the backup timer | — | Enabled at boot. `systemctl start\|stop\|restart ubicloud.target` acts on everything `PartOf` it |
 | `ubicloud-web` | `bundle exec puma -C puma_config.rb` on `BIND:PORT` (127.0.0.1:3000) | always, 2 s | 15 threads |
-| `ubicloud-respirate` | `ruby bin/restarter bin/respirate` | always, 1 s | `bin/restarter` respawns respirate within `RESTART_MAX_SLEEP=2` s and exits 0 after an hour, which systemd restarts. `KillMode=mixed`, `TimeoutStopSec=100` |
+| `ubicloud-respirate` | `ruby bin/restarter bin/respirate` | always, 1 s | When respirate exits (an apoptosis or a crash), `bin/restarter` respawns it within `RESTART_MAX_SLEEP=2` s; at the first such exit after an hour it exits 0 instead, and systemd restarts it. A respirate that keeps running keeps the same restarter. `KillMode=mixed`, `TimeoutStopSec=100` |
 | `ubicloud-monitor` | `ruby bin/monitor` | always, 2 s | **Installed, not enabled** until M9 (§9) |
 | `ubicloud-backup.timer` | Daily at 03:15 (+ up to 15 min random), `Persistent=true` | — | `PartOf` the target: stopping the target pauses scheduled backups |
 | `ubicloud-backup.service` | `ubicloud-admin backup now`, as root | oneshot | Not `PartOf` the target, so a stop or restart of the target never kills a running backup |
 | `caddy` or `cloudflared` / `ubicloud-cloudflared` | The TLS front | stock / on-failure | Not part of the target ([INSTALL.md](INSTALL.md) §3) |
 | `postgresql@16-main` | Postgres | stock | The units `Want` it but do not stop with it |
 
-All services run with `ProtectSystem=strict`, `ProtectHome=yes`,
-`ReadWritePaths=/var/lib/ubicloud`, no capabilities and `UMask=0007`;
-`systemd-analyze security` rates web and respirate 3.5. They read
+Web, respirate and monitor run with `ProtectSystem=strict`,
+`ProtectHome=yes`, `ReadWritePaths=/var/lib/ubicloud`, no capabilities
+and `UMask=0007`; `systemd-analyze security` rates web and respirate
+3.5. `ubicloud-backup.service` is not confined this way: it runs as
+root with only `UMask=0077` and `PrivateTmp`, because it reads
+`/etc/ubicloud` and dumps as postgres. They read
 `/etc/ubicloud/env` and the release's `.release-env` (`GIT_REV`).
 
 **Logs** go to journald only: `sudo ubicloud-admin logs [web|respirate|monitor|backup|caddy|cloudflared]... [-f] [--since T] [-n N]`
@@ -84,7 +87,7 @@ timer never races a restore, an install or a release switch.
 | `status` | Units, enabled target, monitor state, release and migrations, web answer, env file mode and keys, `pg_hba` trust rules and login superusers, leftover restore databases, backup recipient and age, then `bin/byoh-config-check` (settings, role isolation, partition runway). Exits 1 on any fail |
 | `smoke` | install.sh step 12 ([INSTALL.md](INSTALL.md) §6) |
 | `backup now\|list\|prune --keep N` | §6 |
-| `restore TS --key-file F [--env-only\|--db-only] [--force]` | §6.3 |
+| `restore TS --key-file F [--env-only\|--db-only] [--force] [--no-start]` | §6.3, §6.4 |
 | `env set KEY [--no-restart]`, `env unset KEY`, `env get KEY --reveal`, `env keys` | §4 |
 | `logs ...` | §1 |
 | `account create --email E [--name N] [--project P] [--password-stdin\|--password-file F]`, `account list` | §5 |
@@ -318,27 +321,48 @@ A restore you never tried is a hope. Once a month (and once before
 backup on a **disposable** machine. Never drill on the live control
 plane: `restore` replaces the live database.
 
+The restored database holds the live strands, and the restored env file
+holds the BMC passwords (§4.2). A respirate that ran them on the drill
+machine would act on the real fleet: SSH to the hosts, and Redfish resets
+through their BMCs, which have other addresses than the hosts. So the
+drill keeps respirate from ever running, and cuts the machine off as
+well.
+
 1. A fresh Ubuntu 24.04 VM. Install with the live machine's version and
    rev and `--tls none --url http://localhost:3000`.
-2. Before the restore, block the drill machine's outbound traffic to the
-   data-plane hosts and to SMTP (for example with an nftables output
-   rule). The restored respirate would otherwise act on the real hosts.
-3. Copy `<TS>/` and `secrets/<TS>.age` into `/var/backups/ubicloud`, then
-   `sudo ubicloud-admin restore TS --key-file F --force` with an identity
-   you keep off the live machine.
-4. Check, without touching the hosts:
+2. Before the restore, make outbound traffic default-deny: allow only
+   loopback and DNS, and drop everything else (an nftables `output`
+   chain with `policy drop`, or the VM's security group). Do not build
+   an allow-list of the data-plane hosts and SMTP: the BMC and Redfish
+   endpoints, the pool addresses and every other address in the
+   database must be unreachable too. Check with `curl -m 5` to one host
+   and one BMC endpoint.
+3. Stop the services and keep them from coming back at boot:
 
    ```bash
-   sudo systemctl stop ubicloud-respirate
+   sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate ubicloud-monitor
+   sudo systemctl disable ubicloud.target
+   ```
+
+4. Copy `<TS>/` and `secrets/<TS>.age` into `/var/backups/ubicloud`, then
+   `sudo ubicloud-admin restore TS --key-file F --force --no-start` with
+   an identity you keep off the live machine. `--no-start` leaves every
+   service stopped after the restore; without it the restore starts
+   respirate.
+5. Check, without starting any service:
+
+   ```bash
    echo 'Sshable.each { it.raw_private_key_1 }; puts "decrypted #{Sshable.count} host keys"' | sudo ubicloud-admin console -e -
    echo 'puts Account.count, VmHost.count, Vm.count' | sudo ubicloud-admin console -e -
    ```
 
    A wrong column key raises on the first Sshable.
-5. Destroy the drill machine (it holds every secret).
+6. Destroy the drill machine (it holds every secret). Never start
+   `ubicloud.target` or `ubicloud-respirate` on it.
 
-This drill is UNVERIFIED end to end (the harness restores on the same
-container).
+This drill is UNVERIFIED end to end: the harness restores on the same
+container, and checks only that `restore --no-start` leaves web,
+respirate, monitor and the target stopped.
 
 ---
 
@@ -402,14 +426,15 @@ before it succeeded.
 3. **Stop the services.**
 
    ```
-   sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate
+   sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate ubicloud-monitor
    ```
 
-   This stops web, respirate and the backup timer. Respirate stops
-   gracefully, which takes up to `TimeoutStopSec=100` while a strand
-   finishes. Name the two services as well as the target: `systemctl
-   stop ubicloud.target` alone can return while respirate is still
-   stopping, and a backup taken then is older than its stop. `release
+   This stops web, respirate, monitor (if you enabled it) and the backup
+   timer. Respirate stops gracefully, which takes up to
+   `TimeoutStopSec=100` while a strand finishes. Name the services as
+   well as the target: `systemctl stop ubicloud.target` alone can return
+   while respirate or monitor is still stopping, and a backup taken then
+   is older than its stop. `release
    migrate` and `use` count a unit that is still stopping as running.
 
 4. **Back up.**
@@ -418,9 +443,8 @@ before it succeeded.
    sudo ubicloud-admin backup now
    ```
 
-   The backup comes after the stop, so it holds the database as v1 left
-   it. The plan put the backup before the stop, which would miss every
-   strand that ran in between. `release migrate` refuses a backup that is
+   Back up after the stop, not before: a backup taken while respirate
+   runs misses the strands that ran afterwards. `release migrate` refuses a backup that is
    older than the last time web, respirate or monitor ran: the latest
    stop of one of them, from systemd or the journal, or the boot when
    none ran since. It also refuses a backup that holds other migrations
@@ -493,7 +517,7 @@ that was made before it ran.
   `matches` for the old one):
 
   ```
-  sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate
+  sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate ubicloud-monitor
   sudo ubicloud-admin release use v1
   sudo systemctl start ubicloud.target
   ```
@@ -506,7 +530,7 @@ that was made before it ran.
   backup from step 4 (`ubicloud-admin backup list`):
 
   ```
-  sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate
+  sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate ubicloud-monitor
   sudo ubicloud-admin release use v1 --for-restore <TS>
   sudo ubicloud-admin restore <TS> --db-only
   ```

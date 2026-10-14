@@ -577,7 +577,7 @@ sc_rerun() {
   rc=0
   install_cp rerun --mail-from other@example.test >"$LOGS/rerun-mailfrom.log" 2>&1 || rc=$?
   [[ $rc == 2 ]] || fail "rerun: a different --mail-from exited $rc, not 2"
-  grep -q "key MAIL_FROM differs; edit with 'ubicloud-admin env set MAIL_FROM' or pass --update-env MAIL_FROM" "$LOGS/rerun-mailfrom.log" ||
+  grep -qx "install.sh: key MAIL_FROM differs; pass the same flags as before, or add --update-env MAIL_FROM to change it" "$LOGS/rerun-mailfrom.log" ||
     fail "rerun: a different --mail-from: $(cat "$LOGS/rerun-mailfrom.log")"
   grep -q 'ops@example.test' "$LOGS/rerun-mailfrom.log" && fail "rerun: install.sh printed a value"
   [[ $(settings_sums rerun) == "$sums" ]] || fail "rerun: a refused run changed a managed file"
@@ -791,6 +791,22 @@ sc_flags() {
   [[ $rc == 2 ]] || fail "flags: no source exited $rc, not 2"
   dx flags test ! -e /etc/ubicloud || fail "flags: a refused run created /etc/ubicloud"
   say "flags: usage errors exit 2 and change nothing"
+
+  # An arm64 machine, faked with a dpkg that reports arm64: step 1
+  # refuses it before any package is installed.
+  # shellcheck disable=SC2016 # the shim's $1 and $@ expand in the container
+  dx flags bash -c 'mkdir -p /root/fakearch && printf "%s\n" "#!/bin/sh" \
+    "[ \"\$1\" = --print-architecture ] && { echo arm64; exit 0; }" "exec /usr/bin/dpkg \"\$@\"" \
+    >/root/fakearch/dpkg && chmod 0755 /root/fakearch/dpkg'
+  rc=0
+  dx flags env PATH=/root/fakearch:/usr/sbin:/usr/bin:/sbin:/bin bash /art/install.sh "${INSTALL_ARGS[@]}" \
+    --source-tarball /art/src.tgz --source-rev "$(cat "$ART/src.rev")" >"$LOGS/flags-arm64.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -qx 'install.sh: the pinned mise and cloudflared binaries are amd64 only (this machine is arm64)' "$LOGS/flags-arm64.log"; then
+    fail "flags: arm64 exited $rc: $(cat "$LOGS/flags-arm64.log")"
+  fi
+  dx flags test ! -e /etc/ubicloud || fail "flags: the arm64 refusal created /etc/ubicloud"
+  dx flags rm -r /root/fakearch
+  say "flags: an arm64 machine exits 2 in step 1 and changes nothing"
 
   # A git checkout owned by another user, as on the live control plane.
   dx flags bash -c 'useradd -m dev && install -d -o dev -g dev /home/dev/repo &&
@@ -1884,6 +1900,20 @@ sc_backup() {
   [[ $(login backup) == "302 http://localhost:3000/after-login" ]] || fail "backup: login after the restore"
   say "backup: a restore over the live database ran; the old one is $(db_names backup | cut -d' ' -f2); status ok"
 
+  # The restore drill: --no-start leaves every service stopped, so the
+  # restored respirate never runs the backup's strands.
+  [[ $(adm_rc backup restore "$ts" --key-file /root/backup-key --env-only --no-start) == 2 ]] ||
+    fail "backup: --no-start with --env-only was not refused with exit 2"
+  [[ $(adm_rc backup restore "$ts" --key-file /root/backup-key --no-start) == 0 ]] || fail "backup: restore --no-start failed: $(adm_last)"
+  adm_last | grep -q '^notice  restore: the services stay stopped (--no-start)' || fail "backup: restore --no-start: $(adm_last)"
+  for u in ubicloud.target ubicloud-web ubicloud-respirate ubicloud-monitor; do
+    [[ $(dx backup systemctl is-active "$u" || true) == inactive ]] || fail "backup: $u runs after restore --no-start"
+  done
+  grep -q after@example.test <<<"$(adm backup account list)" && fail "backup: restore --no-start kept an account made after the backup"
+  dx backup systemctl start ubicloud.target
+  wait_for 120 web_up backup >/dev/null || fail "backup: web down after restore --no-start and a start"
+  say "backup: restore --no-start restored the database and left every service stopped; --env-only refuses it"
+
   # The disaster: no database, no env file.
   dx backup systemctl stop ubicloud.target
   dx backup runuser -u postgres -- dropdb ubicloud
@@ -2904,7 +2934,7 @@ current_of() { dx "$1" readlink /opt/ubicloud/current; }
 # stop_cp NAME: stops the control plane and waits for web and respirate
 # too; systemctl stop ubicloud.target alone can return while respirate
 # still finishes its strands.
-stop_cp() { dx "$1" systemctl stop ubicloud.target ubicloud-web ubicloud-respirate; }
+stop_cp() { dx "$1" systemctl stop ubicloud.target ubicloud-web ubicloud-respirate ubicloud-monitor; }
 previous_of() { dx "$1" readlink /opt/ubicloud/previous 2>/dev/null || true; }
 
 sc_upgrade_manual() {

@@ -5,7 +5,7 @@
 #   ubicloud-admin status
 #   ubicloud-admin smoke
 #   ubicloud-admin backup now|list|prune --keep N
-#   ubicloud-admin restore TS --key-file F [--env-only|--db-only] [--force]
+#   ubicloud-admin restore TS --key-file F [--env-only|--db-only] [--force] [--no-start]
 #   ubicloud-admin env set KEY [--no-restart]   (the value on stdin, or typed)
 #   ubicloud-admin env unset KEY [--no-restart]
 #   ubicloud-admin env get KEY --reveal
@@ -51,7 +51,10 @@
 #          ubicloud_prev_<time> (kept; drop it yourself) and
 #          ubicloud_restore becomes ubicloud. It migrates, then installs
 #          the TLS files, tunnel token, backup settings and billing rates
-#          of the backup, starts the services and prints status. If
+#          of the backup, starts the services and prints status.
+#          --no-start leaves the services stopped, so the restored
+#          respirate never runs the backup's strands (the restore drill
+#          on a disposable machine); it does not apply to --env-only. If
 #          anything fails after the swap, the old database, /etc/ubicloud
 #          and the billing rates are put back. The env file is replaced
 #          only when it is missing or with --force (the old one is kept as
@@ -95,7 +98,8 @@
 #          installs its units and ubicloud-admin and points current at it
 #          (the old one becomes previous). Both refuse while web,
 #          respirate or monitor run (systemctl stop ubicloud.target
-#          first), and refuse a release that runs other tools than
+#          ubicloud-web ubicloud-respirate ubicloud-monitor first), and
+#          refuse a release that runs other tools than
 #          /opt/ubicloud/tools or that is not root's alone. migrate refuses
 #          unless a backup made after the services last ran (backup now
 #          after the stop) holds the database, or holds it as it was
@@ -779,7 +783,7 @@ backup_prune() {
 # --- restore --------------------------------------------------------------------------
 
 cmd_restore() {
-  local ts="" key_file="" mode=all force=0
+  local ts="" key_file="" mode=all force=0 no_start=0
   while [[ $# -gt 0 ]]; do
     case $1 in
       --key-file)
@@ -790,6 +794,7 @@ cmd_restore() {
       --env-only) [[ $mode == all ]] || usage_die "give --env-only or --db-only, not both"; mode="env" ;;
       --db-only) [[ $mode == all ]] || usage_die "give --env-only or --db-only, not both"; mode="db" ;;
       --force) force=1 ;;
+      --no-start) no_start=1 ;;
       -*) usage_die "unknown restore option $1" ;;
       *)
         [[ -z $ts ]] || usage_die "restore takes one timestamp"
@@ -799,6 +804,7 @@ cmd_restore() {
     shift
   done
   [[ $ts =~ $TS_RE ]] || usage_die "restore needs a backup timestamp such as 20261014T031500Z (ubicloud-admin backup list)"
+  [[ $mode != env || $no_start == 0 ]] || usage_die "--no-start applies to a database restore, not to --env-only"
   [[ $mode == db || -n $key_file ]] || usage_die "restore needs --key-file F, the age identity of a backup recipient (or --db-only)"
   [[ -z $key_file || -f $key_file ]] || usage_die "--key-file $key_file is not a file"
   need_root
@@ -884,12 +890,16 @@ cmd_restore() {
   # current and the restored database agree now (restore_check_migrations
   # and the migrations above).
   hold_clear
-  start_services "$RB_WAS ubicloud.target"
+  ((no_start)) || start_services "$RB_WAS ubicloud.target"
   RB_ARMED=0
   trap cleanup_work EXIT
   [[ -z $ENV_SAVED ]] || report notice "restore: the env file before the restore is $ENV_SAVED (root 0600)"
   ((RB_HAD_LIVE == 0)) || report notice "restore: the database before the restore is $RB_PREV; drop it once the restore is checked (runuser -u postgres -- dropdb $RB_PREV)"
   report ok "restore: $ts restored"
+  if ((no_start)); then
+    report notice "restore: the services stay stopped (--no-start); systemctl start ubicloud.target starts them"
+    return 0
+  fi
   wait_web 120 || report warn "restore: web does not answer after 120 s (ubicloud-admin logs web)"
   echo
   local rc=0
@@ -1669,7 +1679,7 @@ need_stopped() {
   local running
   running=$(running_services)
   [[ -z $running ]] ||
-    usage_die "$running run; stop them first (systemctl stop ubicloud.target ubicloud-web ubicloud-respirate, which waits for them), so no process runs one release on the other's schema"
+    usage_die "$running run; stop them first (systemctl stop ubicloud.target ubicloud-web ubicloud-respirate ubicloud-monitor, which waits for them), so no process runs one release on the other's schema"
 }
 
 cmd_release() {

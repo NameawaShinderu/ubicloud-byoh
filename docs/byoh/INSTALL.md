@@ -32,7 +32,7 @@ until it is merged into `byoh-driver` and pushed; until then a
 
 | Need | Detail |
 |---|---|
-| OS | Ubuntu 24.04, x86_64 (the pinned mise and cloudflared binaries are amd64 only) |
+| OS | Ubuntu 24.04, x86_64 (the pinned mise and cloudflared binaries are amd64 only; step 1 refuses another architecture with exit 2) |
 | Memory | About 4 GiB (`MemTotal` at least 3.5 GiB; `--skip-check mem` overrides). Sizing beyond that is UNVERIFIED; the live control plane is a t3.large |
 | Clock | NTP-synchronized (`timedatectl`; `--skip-check clock` overrides). TLS, tokens and backup timestamps depend on it |
 | Access | root (`sudo`) |
@@ -80,7 +80,7 @@ smoke` (§6), then the URL and the next commands.
 
 | # | Step | Changes |
 |---|---|---|
-| 1 | Checks | Ubuntu 24.04, memory, NTP; nothing changes |
+| 1 | Checks | Ubuntu 24.04, amd64, memory, NTP; nothing changes |
 | — | Source | Extracts the rev into a temp dir; reads Ruby and Node versions from its `mise.toml` |
 | — | Release and tools checks | Exit 2 before any change when the version exists with another rev, when `--version` is not the current release (use the release switch, OPERATIONS.md §7), or when the source wants other Ruby/Node versions than the current release |
 | 2 | Packages | `postgresql-16`, `age`, build dependencies, `git curl jq iproute2 openssl` (apt, only the missing ones) |
@@ -134,8 +134,14 @@ password on the command line; use `--smtp-file`), `--import-env-rb`
 
 ## 3. TLS fronts
 
-puma always listens on `127.0.0.1:3000` (`BIND`, `PORT`). The front is
-the only thing users reach.
+By default puma listens on `127.0.0.1:3000` (`BIND`, `PORT`), so the
+front is the only thing users reach. `BIND` and `PORT` are yours to
+change (`ubicloud-admin env set`), but the front's `IP_FROM_HEADER` is
+only trustworthy while nothing but the front reaches puma: a client that
+reaches puma directly sets that header itself and with it its own
+audit-log IP. So with `IP_FROM_HEADER` set and `BIND` not a loopback
+address, `bin/byoh-config-check` fails `ubicloud-admin status` in
+production and warns in development.
 
 | `--tls` | Front | Certificate | `IP_FROM_HEADER` | Ports | Status |
 |---|---|---|---|---|---|
@@ -397,7 +403,8 @@ Not run, or only approximated in containers:
 - A VM boot in production mode (the E1 canary, §7).
 - `--tls none` from a browser over `ssh -L`; the admin UI.
 - Sending to a real SMTP server, a real `PRY_AUDIT_BUCKET`.
-- An arm64 machine (refused: the pinned binaries are amd64).
+- An arm64 machine. Step 1 refuses it with exit 2 (the pinned mise and
+  cloudflared binaries are amd64); the harness fakes the architecture.
 - Memory and disk sizing beyond the 3.5 GiB check.
 - A restore onto a second machine (OPERATIONS.md §6.3).
 - Everything on the live control plane ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)).

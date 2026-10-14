@@ -88,13 +88,13 @@ Choose one layout. Both need a fresh Ubuntu 24.04 machine.
 git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
 sudo bash ~/ubicloud/scripts/byoh/install.sh --version v0.1.0 \
   --source-git ~/ubicloud --ref HEAD \
-  --url https://cloud.example.com --tls acme|provided|tunnel|none \
+  --url https://cloud.example.com --tls acme \
   --admin-email ops@example.com --backup-recipient age1...
 sudo ubicloud-admin account create --email ops@example.com
 sudo ubicloud-admin status
 ```
 
-`install.sh` reaches `byoh-driver` when M3 is merged; until then it is on the unpushed branch `m3-packaging`. Flags, TLS fronts, settings and the production-mode differences are in [INSTALL.md](INSTALL.md). `--rack-env production` is the default and sets `BOOT_IMAGE_SOURCE=public`; no VM has booted in production mode yet (the E1 canary, [INSTALL.md](INSTALL.md) §7), so `--rack-env development` is the cautious choice for a first site. Onboard users with `ubicloud-admin account create`: with the default logger mail driver, verification mail lands in the journal.
+`--tls acme` is one of four fronts: use `provided` with your own certificate, `tunnel` with a Cloudflare tunnel, or `none` for `ssh -L` only ([INSTALL.md](INSTALL.md) §3). `install.sh` reaches `byoh-driver` when M3 is merged; until then it is on the unpushed branch `m3-packaging`. Flags, TLS fronts, settings and the production-mode differences are in [INSTALL.md](INSTALL.md). `--rack-env production` is the default and sets `BOOT_IMAGE_SOURCE=public`; no VM has booted in production mode yet (the E1 canary, [INSTALL.md](INSTALL.md) §7), so `--rack-env development` is the cautious choice for a first site. Onboard users with `ubicloud-admin account create`: with the default logger mail driver, verification mail lands in the journal.
 
 ### 4.2 Development (`bootstrap-dev-ctrl-plane.sh`, labs only)
 

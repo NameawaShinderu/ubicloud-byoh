@@ -196,7 +196,7 @@ Second line of defence, since a092f1b8b: if a pool address is ever local on the 
 
 ### 3.4 Control plane
 
-Follow [SETUP.md §4](../SETUP.md). The commands below use the development bootstrap, which the live environment runs. For the packaged layout, run `scripts/byoh/install.sh` instead ([INSTALL.md](../INSTALL.md)): `--tls tunnel` with a Cloudflare tunnel, or `--tls acme` with ports 80 and 443 open in the security group (`web_ui_cidr` covers 443 only, so add 80 for ACME; UNVERIFIED). On AWS:
+Follow [SETUP.md §4](../SETUP.md). The commands below use the development bootstrap, which the live environment runs. For the packaged layout, run `scripts/byoh/install.sh` instead ([INSTALL.md](../INSTALL.md)): `--tls tunnel` with a Cloudflare tunnel, or `--tls acme`. ACME needs port 80 open to `0.0.0.0/0`, because Let's Encrypt validates from addresses it does not publish, and 443 open to everyone who should reach the UI. `web_ui_cidr` (meant to be your /32) limits 3000 and 443 and opens no port 80, so widen 443 and add a port 80 rule outside `web_ui_cidr` (UNVERIFIED). On AWS:
 
 ```bash
 scp -i .generated/<ws>/byoh_ssh_key .generated/<ws>/pools.yaml .generated/<ws>/byoh_ssh_key ubuntu@<ctrl_public_ip>:
