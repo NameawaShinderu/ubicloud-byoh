@@ -24,9 +24,12 @@ class ByohAccountCli
   # The accounts.valid_email check constraint.
   EMAIL_FORMAT = /\A[^,;@ \r\n]+@[^,@; \r\n]+\.[^,@; \r\n]+\z/
 
-  # Rodauth's password_minimum_length and password_maximum_bytes in
-  # clover.rb.
-  PASSWORD_BYTES = 8..72
+  # The floor in every environment: clover.rb's password_minimum_length
+  # (characters) and password_maximum_bytes. Outside development signup
+  # also wants a lowercase letter, an uppercase letter, a digit and no
+  # common password; password_problem asks Clover's Rodauth for those.
+  PASSWORD_MIN_CHARS = 8
+  PASSWORD_MAX_BYTES = 72
 
   # Rodauth's production argon2 cost, so a CLI-made hash is as strong as
   # one made by signing up.
@@ -94,8 +97,8 @@ class ByohAccountCli
     end
 
     password, generated = read_password(opts)
-    unless PASSWORD_BYTES.cover?(password.bytesize)
-      raise Error, "the password must be #{PASSWORD_BYTES.min} to #{PASSWORD_BYTES.max} bytes long"
+    if (problem = password_problem(password))
+      raise Error, "the password does not meet the signup requirements: #{problem}"
     end
 
     hash = Argon2::Password.new(**HASH_COST, secret: Config.clover_session_secret).create(password)
@@ -147,8 +150,21 @@ class ByohAccountCli
       end
       [first_line(line, file), false]
     else
-      [@random.urlsafe_base64(18), true]
+      # A random password can lack a digit or a case.
+      password = nil
+      password = @random.urlsafe_base64(18) while password.nil? || password_problem(password)
+      [password, true]
     end
+  end
+
+  # Returns why signup would refuse password, or nil.
+  def password_problem(password)
+    if password.length < PASSWORD_MIN_CHARS || password.bytesize > PASSWORD_MAX_BYTES
+      return "it must have at least #{PASSWORD_MIN_CHARS} characters and at most #{PASSWORD_MAX_BYTES} bytes"
+    end
+    rodauth = Clover.rodauth.new(Clover.allocate)
+    return if rodauth.password_meets_requirements?(password)
+    rodauth.send(:password_requirement_message) || rodauth.send(:password_does_not_meet_requirements_message)
   end
 
   def first_line(line, source)

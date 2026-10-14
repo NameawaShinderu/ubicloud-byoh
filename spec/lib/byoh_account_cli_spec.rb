@@ -4,7 +4,7 @@ require "stringio"
 require "tmpdir"
 
 RSpec.describe ByohAccountCli do
-  let(:random) { class_double(SecureRandom, urlsafe_base64: "generated-password-1") }
+  let(:random) { class_double(SecureRandom, urlsafe_base64: "Generated-password-1") }
 
   # Runs one command; returns its exit status, stdout and stderr.
   def cli(*argv, stdin: "")
@@ -50,9 +50,9 @@ RSpec.describe ByohAccountCli do
       expect(project.name).to eq "Default"
       expect(account.projects.map(&:id)).to eq [project.id]
       expect(DB[:access_control_entry].where(project_id: project.id).count).to eq 2
-      expect(verify(account, "generated-password-1")).to be true
+      expect(verify(account, "Generated-password-1")).to be true
       expect(password_hash(account)).to start_with "$argon2id$v=19$m=65536,t=2,p=1$"
-      expect(out).to eq "Created account #{account.ubid} (ops.team@example.com) with project #{project.ubid} (Default).\nPassword: generated-password-1\n"
+      expect(out).to eq "Created account #{account.ubid} (ops.team@example.com) with project #{project.ubid} (Default).\nPassword: Generated-password-1\n"
 
       row = DB[:byoh_operator_action].first(target_id: account.id)
       expect(row[:command]).to eq "byoh-account create"
@@ -60,24 +60,24 @@ RSpec.describe ByohAccountCli do
     end
 
     it "reads the password from stdin and takes a name and project" do
-      status, out, = cli("create", "--email", "a@example.com", "--name", "Alice Ops", "--project", "team-a", "--password-stdin", stdin: "correct horse\nignored\n")
+      status, out, = cli("create", "--email", "a@example.com", "--name", "Alice Ops", "--project", "team-a", "--password-stdin", stdin: "Correct horse 1\nignored\n")
       expect(status).to eq 0
       expect(out).not_to include "Password"
 
       account = Account.first(email: "a@example.com")
       expect(account.name).to eq "Alice Ops"
       expect(account.default_project.name).to eq "team-a"
-      expect(verify(account, "correct horse")).to be true
-      expect(verify(account, "correct horse\n")).to be false
+      expect(verify(account, "Correct horse 1")).to be true
+      expect(verify(account, "Correct horse 1\n")).to be false
     end
 
     it "reads the password from the first line of a file" do
       Dir.mktmpdir do |dir|
         file = File.join(dir, "pw")
-        File.write(file, "file-password\n")
+        File.write(file, "File-password-1\n")
         expect(cli("create", "--email", "b@example.com", "--password-file", file)[0]).to eq 0
         account = Account.first(email: "b@example.com")
-        expect(verify(account, "file-password")).to be true
+        expect(verify(account, "File-password-1")).to be true
         expect(account.name).to eq "Ubicloud User"
 
         expect(cli("create", "--email", "c@example.com", "--password-file", File.join(dir, "missing"))).to eq [1, "", "! cannot read --password-file: No such file or directory @ rb_sysopen - #{dir}/missing\n"]
@@ -103,13 +103,42 @@ RSpec.describe ByohAccountCli do
       expect(cli("create", "--email", "not-an-email")).to eq [1, "", "! --email not-an-email is not a valid email address\n"]
       expect(cli("create", "--email", "d@example.com", "--password-stdin", "--password-file", "f")).to eq [1, "", "! give only one of --password-stdin and --password-file\n"]
       expect(cli("create", "--email", "d@example.com", "--name", "1")).to eq [1, "", "! --name \"1\" must start with a letter and have 2 to 63 letters, digits, spaces or hyphens\n"]
-      expect(cli("create", "--email", "d@example.com", "--password-stdin", stdin: "short\n")).to eq [1, "", "! the password must be 8 to 72 bytes long\n"]
-      expect(cli("create", "--email", "d@example.com", "--password-stdin", stdin: "x" * 73)).to eq [1, "", "! the password must be 8 to 72 bytes long\n"]
+      length = "! the password does not meet the signup requirements: it must have at least 8 characters and at most 72 bytes\n"
+      expect(cli("create", "--email", "d@example.com", "--password-stdin", stdin: "Short1\n")).to eq [1, "", length]
+      expect(cli("create", "--email", "d@example.com", "--password-stdin", stdin: "Xy1" * 25)).to eq [1, "", length]
+      # Three characters but nine bytes.
+      expect(cli("create", "--email", "d@example.com", "--password-stdin", stdin: "\u20ac" * 3)).to eq [1, "", length]
       status, _, err = cli("create", "--email", "d@example.com", "--project", "bad name!")
       expect(status).to eq 1
       expect(err).to start_with "! --project bad name!: name must be less than 64 characters"
       expect(Account.where(email: "d@example.com").count).to eq 0
       expect(DB[:byoh_operator_action].count).to eq 0
+    end
+  end
+
+  describe "password requirements" do
+    # The test environment, like production, runs clover.rb's full
+    # password policy.
+    it "refuses what signup refuses: a common password, or one without a lowercase or uppercase letter or a digit" do
+      expect(cli("create", "--email", "e@example.com", "--password-stdin", stdin: "Password1\n")).to eq [1, "", "! the password does not meet the signup requirements: is one of the most common passwords\n"]
+      policy = "! the password does not meet the signup requirements: Password must have 8 characters minimum and contain at least one lowercase letter, one uppercase letter, and one digit. Password cannot be the same as your current password.\n"
+      %w[aaaaaaaa1x AAAAAAAA1X aaaaAAAAxx \u00c4b\u00c7d\u00e9fg1].each do |weak|
+        expect(cli("create", "--email", "e@example.com", "--password-stdin", stdin: "#{weak}\n")).to eq [1, "", policy]
+      end
+      expect(Account.where(email: "e@example.com").count).to eq 0
+    end
+
+    it "accepts a multibyte password of 8 characters" do
+      expect(cli("create", "--email", "e@example.com", "--password-stdin", stdin: "\u00e9Abcdef1\n")[0]).to eq 0
+      expect(verify(Account.first(email: "e@example.com"), "\u00e9Abcdef1")).to be true
+    end
+
+    it "generates passwords until one meets the requirements" do
+      allow(random).to receive(:urlsafe_base64).and_return("short", "no-digits-or-upper-case", "Generated-password-1")
+      status, out, = cli("create", "--email", "e@example.com")
+      expect(status).to eq 0
+      expect(out).to end_with "Password: Generated-password-1\n"
+      expect(random).to have_received(:urlsafe_base64).with(18).exactly(3).times
     end
   end
 
