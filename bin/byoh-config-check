@@ -1,0 +1,30 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Prints ok/warn/fail lines for the control-plane settings and database
+# state a BYOH deployment needs, and exits 1 if any check fails. The
+# logic lives in lib/byoh_config_check.rb.
+#
+# Example:
+#
+#   bundle exec bin/byoh-config-check [--simulate-production]
+#
+# Uses RACK_ENV from the environment (defaults to "development").
+
+unless ENV["RACK_ENV"]
+  ENV["RACK_ENV"] = "development"
+end
+
+ENV["SKIP_LIT_REQUIRE_FROZEN"] = "1"
+require "bundler"
+if ENV["RACK_ENV"] == "production"
+  Bundler.setup(:default)
+else
+  Bundler.setup(:default, :development)
+end
+
+require "logger"
+require_relative "../db"
+require_relative "../loader"
+
+exit ByohConfigCheck.new.run(ARGV)

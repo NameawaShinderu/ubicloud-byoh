@@ -1,0 +1,32 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Creates verified customer accounts without email, and lists accounts.
+# The logic lives in lib/byoh_account_cli.rb; run with --help for the
+# commands. Admin accounts come from
+# `bin/rake-task-runner create_prod_admin_account LOGIN` instead.
+#
+# Example:
+#
+#   bundle exec bin/byoh-account create --email ops@example.com \
+#     --password-file pw.txt
+#
+# Uses RACK_ENV from the environment (defaults to "development").
+
+unless ENV["RACK_ENV"]
+  ENV["RACK_ENV"] = "development"
+end
+
+ENV["SKIP_LIT_REQUIRE_FROZEN"] = "1"
+require "bundler"
+if ENV["RACK_ENV"] == "production"
+  Bundler.setup(:default)
+else
+  Bundler.setup(:default, :development)
+end
+
+require "logger"
+require_relative "../db"
+require_relative "../loader"
+
+exit ByohAccountCli.new.run(ARGV)
