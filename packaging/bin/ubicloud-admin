@@ -3,6 +3,7 @@
 # as root (sudo); install.sh puts it in /usr/local/bin.
 #
 #   ubicloud-admin status
+#   ubicloud-admin smoke
 #   ubicloud-admin backup now|list|prune --keep N
 #   ubicloud-admin restore TS --key-file F [--env-only|--db-only] [--force]
 #   ubicloud-admin env set KEY [--no-restart]   (the value on stdin, or typed)
@@ -17,6 +18,15 @@
 #
 # status   Units, settings (bin/byoh-config-check), pg_hba trust rules,
 #          backup recipient and age, release. Exits 1 on any fail.
+# smoke    What install.sh runs last (step 12): puma answers on its
+#          address, and through the front in /etc/ubicloud/front.conf
+#          (caddy on 127.0.0.1:443 under the BASE_URL host for acme and
+#          provided, BASE_URL itself for tunnel); web and respirate are
+#          active; bin/byoh-config-check has no fail; and with
+#          RACK_ENV=production, bin/production_check passes (it needs
+#          port 8081). No answer yet from an acme certificate or a tunnel
+#          is a warning, since both come up in the background. Exits 1
+#          on any fail.
 # backup   now: <target>/<UTC timestamp>/ with db.dump (pg_dump -Fc),
 #          globals.sql, billing-rates.tar and manifest.json, and
 #          <target>/secrets/<timestamp>.age, a tar of /etc/ubicloud
@@ -87,6 +97,9 @@ readonly ETC=/etc/ubicloud
 readonly ENV_FILE=$ETC/env
 readonly BACKUP_CONF=$ETC/backup.conf
 readonly BACKUP_RECIPIENTS=$ETC/backup-recipients
+readonly FRONT_CONF=$ETC/front.conf
+# bin/production_check's puma.
+readonly CHECK_PORT=8081
 readonly LOCK=/run/ubicloud-admin.lock
 readonly PG_UNIT=postgresql@16-main
 readonly SERVICE_PATH=$TOOLS/bin:/usr/bin:/bin
@@ -394,6 +407,127 @@ status_backups() {
   else
     report ok "backup: none yet in $target (the timer runs daily at 03:15; ubicloud-admin backup now)"
   fi
+}
+
+# --- smoke (install.sh step 12) ---------------------------------------------------
+
+# probe SECONDS URL [CURL_OPTION...]: GETs URL until it answers 2xx or
+# 3xx or SECONDS pass. Sets PROBE_CODE (000 without an HTTP answer) and
+# PROBE_RC (curl's exit status).
+probe() {
+  local end=$((SECONDS + $1)) url=$2
+  shift 2
+  while :; do
+    PROBE_RC=0
+    PROBE_CODE=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$@" "$url" 2>/dev/null) || PROBE_RC=$?
+    PROBE_CODE=${PROBE_CODE:-000}
+    [[ $PROBE_CODE =~ ^[23][0-9][0-9]$ ]] && return 0
+    # 6: the host name does not resolve, which waiting does not change.
+    ((PROBE_RC == 6 || SECONDS >= end)) && return 1
+    sleep 1
+  done
+}
+
+# The front through which the smoke GET goes: TLS_FRONT in front.conf,
+# which install.sh writes once the front runs (none before that).
+smoke_front() {
+  local front base host
+  kv_read "$FRONT_CONF"
+  front=${KV[TLS_FRONT]:-none}
+  base=$(env_value BASE_URL)
+  base=${base%/}
+  case $front in
+    none) ;;
+    acme | provided)
+      if [[ ! $base =~ ^https://([A-Za-z0-9.-]+)$ ]]; then
+        fail_line "smoke: front --tls $front, but BASE_URL is not https://HOST"
+        return
+      fi
+      host=${BASH_REMATCH[1]}
+      # The certificate is not what is tested here (install.sh checks a
+      # provided one), so -k; --resolve sends the request to this
+      # machine's caddy under the name it serves.
+      if probe 30 "https://$host/login" -k --resolve "$host:443:127.0.0.1"; then
+        report ok "smoke: caddy serves https://$host (HTTP $PROBE_CODE)"
+      elif [[ $front == acme && $PROBE_CODE == 000 ]]; then
+        warn_line "smoke: caddy gives no HTTPS answer for $host yet (curl exit $PROBE_RC); it gets the certificate from Let's Encrypt in the background, which needs public DNS and ports 80 and 443 (ubicloud-admin logs caddy)"
+      else
+        fail_line "smoke: https://$host through caddy answers HTTP $PROBE_CODE (curl exit $PROBE_RC; ubicloud-admin logs caddy web)"
+      fi
+      ;;
+    tunnel)
+      if probe 30 "$base/login"; then
+        report ok "smoke: $base answers through the tunnel (HTTP $PROBE_CODE)"
+      elif [[ $PROBE_CODE == 000 ]]; then
+        # cloudflared connects in the background, and the public name
+        # may not resolve from this machine.
+        warn_line "smoke: no answer from $base (curl exit $PROBE_RC); the tunnel connects in the background, and its public hostname must route to http://$(web_addr) (ubicloud-admin logs cloudflared)"
+      else
+        fail_line "smoke: $base answers HTTP $PROBE_CODE through the tunnel; check that its public hostname routes to http://$(web_addr) (ubicloud-admin logs cloudflared web)"
+      fi
+      ;;
+    *) fail_line "smoke: $FRONT_CONF names an unknown front $front" ;;
+  esac
+}
+
+# bin/production_check boots a second puma with RACK_ENV=production on
+# port 8081 and expects a 401 for a JSON login POST to localhost:8081.
+# BIND=127.0.0.1 keeps that puma on loopback whatever BIND the env file
+# sets. Where localhost resolves to ::1 first (as in docker's
+# /etc/hosts), Ruby's Net::HTTP falls back to 127.0.0.1 (scripts/byoh/
+# test, fresh), so bin/production_check stays as upstream wrote it.
+smoke_production_check() {
+  if [[ $(env_value RACK_ENV) != production ]]; then
+    report skip "smoke: bin/production_check (RACK_ENV is $(env_value RACK_ENV development), not production)"
+    return
+  fi
+  if [[ -n $(ss -Htln "sport = :$CHECK_PORT") ]]; then
+    fail_line "smoke: port $CHECK_PORT is taken, so bin/production_check cannot start its puma (ss -tlnp 'sport = :$CHECK_PORT')"
+    return
+  fi
+  make_work
+  SERVICE_EXTRA=(BIND=127.0.0.1)
+  if ruby_as ubicloud bin/production_check >"$WORK/production_check.log" 2>&1; then
+    report ok "smoke: bin/production_check (a production puma boots and answers a login with 401)"
+  else
+    tail -20 "$WORK/production_check.log" | sed 's/^/  /'
+    fail_line "smoke: bin/production_check failed (above)"
+  fi
+  SERVICE_EXTRA=()
+}
+
+cmd_smoke() {
+  [[ $# -eq 0 ]] || usage_die "smoke takes no arguments"
+  need_root
+  need_release
+  audit smoke
+  FAILS=0 WARNS=0
+  # puma itself, which a restart may have just started.
+  if probe 120 "http://$(web_addr)/login"; then
+    report ok "smoke: puma answers on $(web_addr) (HTTP $PROBE_CODE)"
+  else
+    fail_line "smoke: puma does not answer on $(web_addr) (HTTP $PROBE_CODE)"
+  fi
+  smoke_front
+  local u i
+  for u in ubicloud-web ubicloud-respirate; do
+    for i in $(seq 10); do
+      [[ $(unit_state "$u") != active ]] || break
+      sleep 1
+    done
+    if [[ $(unit_state "$u") == active ]]; then report ok "smoke: $u active"; else fail_line "smoke: $u is $(unit_state "$u")"; fi
+  done
+  local out rc=0
+  out=$(ruby_as ubicloud bin/byoh-config-check 2>&1) || rc=$?
+  printf '%s\n' "$out" | sed 's/^/  /'
+  WARNS=$((WARNS + $(grep -c '^warn' <<<"$out" || true)))
+  if ((rc)); then fail_line "smoke: bin/byoh-config-check reports failures (above)"; else report ok "smoke: bin/byoh-config-check has no fail"; fi
+  smoke_production_check
+  if ((FAILS)); then
+    echo "smoke: $FAILS fail, $WARNS warn; see ubicloud-admin logs web respirate"
+    return 1
+  fi
+  echo "smoke: ok ($WARNS warn)"
 }
 
 # --- backup -------------------------------------------------------------------------
@@ -1321,6 +1455,7 @@ main() {
   fi
   case $command in
     status) cmd_status "$@" ;;
+    smoke) cmd_smoke "$@" ;;
     backup) cmd_backup "$@" ;;
     restore) cmd_restore "$@" ;;
     env) cmd_env "$@" ;;

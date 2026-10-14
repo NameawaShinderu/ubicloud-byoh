@@ -52,6 +52,12 @@
 # from the flags), or would start the units while another process holds
 # the port or a development control plane lives on the machine.
 #
+# The last step runs ubicloud-admin smoke (skipped with --no-start): it
+# GETs the login page from puma and through the front, checks that web
+# and respirate run, runs bin/byoh-config-check and, with
+# RACK_ENV=production, bin/production_check (port 8081). A fail exits 1
+# with everything installed; a rerun repeats only what changed.
+#
 # Docs: docs/byoh/INSTALL.md (flags, settings), docs/byoh/OPERATIONS.md.
 set -euo pipefail
 umask 077
@@ -1504,6 +1510,27 @@ Restore: ubicloud-admin restore <timestamp> --key-file <age identity>
 EOF
 }
 
+# --- step 12: install smoke ---------------------------------------------------------------------
+
+# ubicloud-admin smoke: puma and the front answer, web and respirate
+# run, bin/byoh-config-check has no fail, and in production
+# bin/production_check passes. It changes nothing and takes no lock, so
+# it runs under this script's lock.
+step_smoke() {
+  if ((NO_START)); then
+    report skip "smoke: not run (--no-start); run ubicloud-admin smoke once the services run"
+    return 0
+  fi
+  # step_admin installed the current release's ubicloud-admin, which may
+  # predate this script (a release built before step 12 existed).
+  if ! grep -q '^cmd_smoke()' "$ADMIN_BIN"; then
+    report warn "smoke: not run; the current release's ubicloud-admin has no smoke command"
+    return 0
+  fi
+  "$ADMIN_BIN" smoke ||
+    die "the install smoke test failed (above); see ubicloud-admin logs web respirate, fix the cause, then run install.sh again or ubicloud-admin smoke"
+}
+
 # --- main ------------------------------------------------------------------------------------------
 
 main() {
@@ -1554,6 +1581,7 @@ main() {
     step_units
   fi
   step_backup
+  step_smoke
 
   echo
   echo "Ubicloud $VERSION (rev $SRC_REV) is installed."

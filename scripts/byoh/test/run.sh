@@ -323,7 +323,7 @@ psql_as() {
 # already there): a release of the working tree, the database, the env
 # file, migrations and the units, started.
 sc_fresh() {
-  local out since t
+  local out since t rc
   stage_art
   src_tarball
   start_sys fresh ubi-m3-tools
@@ -431,6 +431,47 @@ sc_fresh() {
   say "fresh: account created with ubicloud-admin from /, login ok ($out)"
   adm fresh status >"$LOGS/fresh-status.txt" 2>&1 || fail "fresh: ubicloud-admin status: $(grep '^fail' "$LOGS/fresh-status.txt")"
   say "fresh: ubicloud-admin status passes ($(tail -1 "$LOGS/fresh-status.txt"))"
+
+  # Step 12 (WP7): the install ended with ubicloud-admin smoke, and in
+  # production that ran bin/production_check.
+  local re
+  for re in '^ok      smoke: puma answers on 127\.0\.0\.1:3000 \(HTTP 200\)$' '^ok      smoke: ubicloud-web active$' \
+    '^ok      smoke: ubicloud-respirate active$' '^ok      smoke: bin/byoh-config-check has no fail$' \
+    '^ok      smoke: bin/production_check ' '^smoke: ok '; do
+    grep -qE "$re" "$LOGS/fresh-install.log" || fail "fresh: step 12 printed no line matching $re"
+  done
+  say "fresh: step 12 passed: puma, web, respirate, byoh-config-check and production_check"
+  # A MAIL_FROM removed by hand: byoh-config-check fails in production,
+  # so smoke exits 1. (install.sh itself appends a missing key before
+  # step 12, so only ubicloud-admin smoke can see the file this way.)
+  dx fresh cp -p /etc/ubicloud/env /root/env.orig
+  dx fresh sed -i '/^MAIL_FROM=/d' /etc/ubicloud/env
+  rc=0
+  adm fresh smoke >"$LOGS/fresh-smoke-mailfrom.log" 2>&1 || rc=$?
+  [[ $rc == 1 ]] || fail "fresh: smoke without MAIL_FROM exited $rc, not 1"
+  if ! { grep -qE '^ +fail +MAIL_FROM is unset' "$LOGS/fresh-smoke-mailfrom.log" &&
+    grep -q '^fail    smoke: bin/byoh-config-check reports failures' "$LOGS/fresh-smoke-mailfrom.log" &&
+    grep -q '^smoke: 1 fail, .*see ubicloud-admin logs web respirate$' "$LOGS/fresh-smoke-mailfrom.log"; }; then
+    fail "fresh: smoke without MAIL_FROM: $(cat "$LOGS/fresh-smoke-mailfrom.log")"
+  fi
+  dx fresh cp -p /root/env.orig /etc/ubicloud/env
+  say "fresh: smoke fails (exit 1) on a MAIL_FROM removed from the env file in production"
+  # A failing step 12 fails install.sh with the logs hint: port 8081,
+  # which production_check needs, is taken.
+  docker exec -d ubi-m3-fresh /opt/ubicloud/tools/bin/ruby -rsocket -e 'TCPServer.new("127.0.0.1", 8081); sleep'
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  wait_for 20 dx fresh bash -c '[[ -n $(ss -Htln "sport = :8081") ]]' >/dev/null || fail "fresh: the stand-in listener did not start"
+  rc=0
+  install_cp fresh >"$LOGS/fresh-smoke-port.log" 2>&1 || rc=$?
+  [[ $rc == 1 ]] || fail "fresh: install.sh with port 8081 taken exited $rc, not 1"
+  if ! { grep -q "^fail    smoke: port 8081 is taken" "$LOGS/fresh-smoke-port.log" &&
+    grep -q '^install.sh: the install smoke test failed (above); see ubicloud-admin logs web respirate' "$LOGS/fresh-smoke-port.log"; }; then
+    fail "fresh: install.sh with port 8081 taken: $(cat "$LOGS/fresh-smoke-port.log")"
+  fi
+  grep -q '^changed ' "$LOGS/fresh-smoke-port.log" && fail "fresh: the rerun changed: $(grep '^changed ' "$LOGS/fresh-smoke-port.log")"
+  dx fresh pkill -f TCPServer
+  adm fresh smoke >"$LOGS/fresh-smoke-again.log" 2>&1 || fail "fresh: smoke after the fixes: $(grep '^fail' "$LOGS/fresh-smoke-again.log")"
+  say "fresh: install.sh exits 1 with the logs hint when step 12 fails (port 8081 taken), and passes again once it is free"
   poke_strand fresh
   wait_for 60 strand_ran fresh >/dev/null || fail "fresh: respirate ran no strand"
   journal_clean fresh "$since"
@@ -740,6 +781,7 @@ sc_flags() {
     fail "flags: no warning about the trust lines"
   grep -qE '^warn +database: role\(s\) clover are superusers' "$LOGS/flags-install.log" ||
     fail "flags: no warning about the superuser"
+  grep -q '^skip    smoke: not run (--no-start)' "$LOGS/flags-install.log" || fail "flags: --no-start ran step 12"
   [[ $(dx flags systemctl is-enabled ubicloud.target || true) != enabled ]] || fail "flags: --no-start enabled the target"
   [[ $(dx flags systemctl is-active ubicloud-web || true) != active ]] || fail "flags: --no-start started web"
   say "flags: git source as its owner, relative paths, SMTP from a 0600 file (no password in the output), rates copied, listen fixed, trust and superuser warned, --no-start"
@@ -774,6 +816,10 @@ sc_flags() {
   dx flags bash /art/install.sh "${args[@]}" >"$LOGS/flags-start.log" 2>&1 ||
     fail "flags: install.sh start failed, see $LOGS/flags-start.log"
   grep -q '^changed units: started ubicloud.target$' "$LOGS/flags-start.log" || fail "flags: install.sh did not start the target"
+  if ! { grep -q '^skip    smoke: bin/production_check (RACK_ENV is development, not production)$' "$LOGS/flags-start.log" &&
+    grep -q '^smoke: ok ' "$LOGS/flags-start.log"; }; then
+    fail "flags: step 12 in development: $(grep smoke "$LOGS/flags-start.log")"
+  fi
   wait_for 180 web_up flags >/dev/null || fail "flags: web did not answer in development mode"
   dx flags bash /art/install.sh --stage tools --source-git /home/dev/repo --ref HEAD --skip-check clock >"$LOGS/flags-tools.log" 2>&1 ||
     fail "flags: --stage tools rerun failed"
@@ -858,7 +904,9 @@ sc_smoke() {
   [[ $(dx smoke stat -c %U "$cab") == ubicloud ]] || fail "smoke: $cab not written by the services"
   src_tarball
   release_rev_to_art smoke
-  install_cp smoke >"$LOGS/smoke-rerun.log" 2>&1 ||
+  # --no-start skips step 12, whose byoh-config-check and
+  # production_check run as ubicloud and would rewrite the files first.
+  install_cp smoke --no-start >"$LOGS/smoke-rerun.log" 2>&1 ||
     fail "smoke: install.sh rerun failed, see $LOGS/smoke-rerun.log"
   sums2=$(dx smoke sha256sum /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/pg_ident.conf)
   [[ $sums == "$sums2" ]] || fail "smoke: the rerun changed pg_hba.conf or pg_ident.conf"
@@ -1124,6 +1172,10 @@ sc_tls_provided() {
   install_cp tlsp "${tls[@]}" >"$LOGS/tlsp-install.log" 2>&1 || fail "tls-provided: install.sh failed, see $LOGS/tlsp-install.log"
   grep -E '^(ok|changed|skip|warn|notice) ' "$LOGS/tlsp-install.log" | tee -a "$LOGS/harness.log" >/dev/null
   grep -q '^changed front: installed caddy' "$LOGS/tlsp-install.log" || fail "tls-provided: caddy was not installed"
+  if ! { grep -qE '^ok      smoke: caddy serves https://cp\.test \(HTTP 200\)$' "$LOGS/tlsp-install.log" &&
+    grep -q '^ok      smoke: bin/production_check ' "$LOGS/tlsp-install.log" && grep -q '^smoke: ok ' "$LOGS/tlsp-install.log"; }; then
+    fail "tls-provided: step 12: $(grep smoke "$LOGS/tlsp-install.log")"
+  fi
   wait_for 180 web_up tlsp >/dev/null || fail "tls-provided: web did not answer"
   assert_active tlsp
   [[ $(dx tlsp systemctl is-active caddy) == active && $(dx tlsp systemctl is-enabled caddy) == enabled ]] ||
@@ -1286,6 +1338,12 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
     fail "tunnel: install.sh failed, see $LOGS/tunnel-existing.log"
   grep -E '^(ok|changed|skip|warn|notice) ' "$LOGS/tunnel-existing.log" | tee -a "$LOGS/harness.log" >/dev/null
   grep -q 'dummy-live-token' "$LOGS/tunnel-existing.log" && fail "tunnel: install.sh printed the token"
+  # Step 12: the public name does not resolve here, which is a warning;
+  # puma itself answers.
+  if ! { grep -q '^warn    smoke: no answer from https://cp.example.test (curl exit 6)' "$LOGS/tunnel-existing.log" &&
+    grep -q '^smoke: ok ' "$LOGS/tunnel-existing.log"; }; then
+    fail "tunnel: step 12: $(grep smoke "$LOGS/tunnel-existing.log")"
+  fi
   grep -q '^ok      front: cloudflared.service exists; install.sh leaves it as it is$' "$LOGS/tunnel-existing.log" ||
     fail "tunnel: no report on the existing unit"
   grep -q '^warn    front: cloudflared.service passes the tunnel token on its command line' "$LOGS/tunnel-existing.log" ||
