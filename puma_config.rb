@@ -2,7 +2,7 @@
 
 # simplecov:disable
 environment ENV["RACK_ENV"] || "development"
-bind "tcp://0.0.0.0:#{ENV["PORT"] || "3000"}"
+bind "tcp://#{ENV["BIND"] || "0.0.0.0"}:#{ENV["PORT"] || "3000"}"
 threads 15, 15
 enable_keep_alives false
 silence_fork_callback_warning

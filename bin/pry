@@ -5,7 +5,7 @@ REPL = true
 
 require_relative "../loader"
 
-if Config.production? && !Config.is_e2e && Config.pry_audit_bucket.nil? && Config.otel_exporter_otlp_endpoint.nil?
+if Config.production? && !Config.is_e2e && Config.pry_audit_bucket.nil? && Config.otel_exporter_otlp_endpoint.nil? && !Config.pry_allow_unaudited
   puts "PRY_AUDIT_BUCKET or OTEL_EXPORTER_OTLP_ENDPOINT is not set in production environment. This is not allowed for auditing purposes."
   exit(1)
 end

@@ -1,0 +1,15 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Reads one smtp://user:pass@host[:port][?tls=on|off] URL on stdin and
+# prints the matching SMTP_* lines in the /etc/ubicloud/env format. The
+# logic lives in lib/byoh_smtp_url.rb. It needs no database or config,
+# so the installer can run it before the env file exists.
+#
+# Example:
+#
+#   bin/byoh-smtp-url < smtp-url-file >> env.new
+
+require_relative "../lib/byoh_smtp_url"
+
+exit ByohSmtpUrl.run($stdin, $stdout, $stderr)

@@ -362,6 +362,26 @@ RSpec.describe Prog::DeletedRecordArchiver do
       expect { prog.wait }.to nap(60 * 60)
       expect(DeletedRecord.partition_days).to include(expired)
     end
+
+    context "when running in production" do
+      before do
+        allow(Config).to receive_messages(development?: false, production?: true, deleted_record_archive_bucket: nil)
+        DeletedRecord.create_partition(expired)
+      end
+
+      it "naps without dropping unless the operator opts in" do
+        expect(Config.deleted_record_drop_unarchived).to be false
+        expect { prog.wait }.to nap(60 * 60)
+        expect(DeletedRecord.partition_days).to include(expired)
+      end
+
+      it "drops expired partitions when DELETED_RECORD_DROP_UNARCHIVED is set" do
+        allow(Config).to receive(:deleted_record_drop_unarchived).and_return(true)
+        expect { prog.wait }.to hop("drop_unarchived")
+        expect { prog.drop_unarchived }.to hop("wait")
+        expect(DeletedRecord.partition_days).not_to include(expired)
+      end
+    end
   end
 
   describe "#drop_oldest_partition" do

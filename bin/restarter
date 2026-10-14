@@ -2,6 +2,9 @@
 # frozen_string_literal: true
 
 minimum_time_alive = Integer(ENV.fetch("RESTART_MINIMUM_TIME_ALIVE", "3600"), 10)
+# Upper bound of the pause before a respawn. A systemd unit that restarts
+# respirate promptly sets it lower than the default.
+max_sleep = Integer(ENV.fetch("RESTART_MAX_SLEEP", "10"), 10).clamp(1..)
 require "json"
 
 command = ARGV.dup.freeze
@@ -20,7 +23,11 @@ puts JSON.generate(restarter: {
 loop do
   pid = Process.spawn(*command)
   Signal.trap("TERM") do
-    Process.kill(:TERM, pid)
+    begin
+      Process.kill(:TERM, pid)
+    rescue Errno::ESRCH
+      # The child already exited; the loop sees shutting_down next.
+    end
     shutting_down = true
   end
   Process.wait(pid)
@@ -41,9 +48,14 @@ loop do
       success: status.success?,
     },
   })
-  exit status.exitstatus if shutting_down
+  # A child killed by a signal has no exit status.
+  exit(status.exitstatus || 128 + status.termsig) if shutting_down
 
-  sleep(rand(1..10))
+  sleep(rand(1..max_sleep))
+
+  # TERM arrived during the sleep: stop instead of spawning a child that
+  # nothing will signal again.
+  exit if shutting_down
 
   if Time.now - start_time > minimum_time_alive
     puts JSON.generate(restarter: {start_time: iso_start,

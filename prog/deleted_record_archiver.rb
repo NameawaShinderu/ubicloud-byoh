@@ -77,7 +77,7 @@ class Prog::DeletedRecordArchiver < Prog::Base
   end
 
   def drop_unarchived?
-    Config.deleted_record_archive_bucket.nil? && Config.development? && !expired_day.nil?
+    Config.deleted_record_archive_bucket.nil? && (Config.development? || Config.deleted_record_drop_unarchived) && !expired_day.nil?
   end
 
   def expired_day

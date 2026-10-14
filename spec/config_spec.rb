@@ -61,6 +61,24 @@ RSpec.describe Config do
     end
   end
 
+  describe "boot_image_source" do
+    let(:line) { File.read(File.expand_path("../config.rb", __dir__)).lines.find { it.include?("override :boot_image_source") }.sub(":boot_image_source", ":test_boot_image_source") }
+
+    after { ENV.delete("TEST_BOOT_IMAGE_SOURCE") }
+
+    it "defaults to auto and accepts public" do
+      expect(described_class.boot_image_source).to eq "auto"
+      ENV["TEST_BOOT_IMAGE_SOURCE"] = "public"
+      described_class.class_eval(line)
+      expect(described_class.test_boot_image_source).to eq "public"
+    end
+
+    it "rejects any other value" do
+      ENV["TEST_BOOT_IMAGE_SOURCE"] = "r2"
+      expect { described_class.class_eval(line) }.to raise_error(RuntimeError, /invalid value "r2", must match/)
+    end
+  end
+
   it "ignores LoadError when .env.rb is not present" do
     main = TOPLEVEL_BINDING.eval("self")
     expect(main).to receive(:require_relative).with("lib/casting_config_helpers")

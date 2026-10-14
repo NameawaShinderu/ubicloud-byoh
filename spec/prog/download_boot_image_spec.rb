@@ -176,6 +176,59 @@ RSpec.describe Prog::DownloadBootImage do
     end
   end
 
+  describe "boot image source in production" do
+    before do
+      allow(Config).to receive(:production?).and_return(true)
+    end
+
+    it "keeps R2 for public images with the default source" do
+      expect(Config.boot_image_source).to eq "auto"
+      allow(Config).to receive(:ubicloud_images_r2_bucket_name).and_return("images-bucket")
+      version = described_class::BOOT_IMAGE_SHA256.dig("ubuntu-noble", "x64").keys.max
+      url_presigner = instance_double(Aws::S3::Presigner)
+      s3_client = instance_double(Aws::S3::Client)
+      expect(Aws::S3::Client).to receive(:new).and_return(s3_client)
+      expect(Aws::S3::Presigner).to receive(:new).with(client: s3_client).and_return(url_presigner)
+      expect(url_presigner).to receive(:presigned_url).with(:get_object, hash_including(bucket: "images-bucket", key: "ubuntu-noble-x64-#{version}.img")).and_return("https://r2.example.com/noble.img")
+      refresh_frame(dbi, new_values: {"image_name" => "ubuntu-noble", "version" => nil, "custom_url" => nil})
+
+      expect(dbi.download_from_blob_storage?).to be true
+      expect(dbi.download_from_r2?).to be true
+      expect(dbi.url).to eq "https://r2.example.com/noble.img"
+    end
+
+    it "still uses blob storage for images without a public mirror when the source is public" do
+      allow(Config).to receive(:boot_image_source).and_return("public")
+      refresh_frame(dbi, new_values: {"image_name" => "github-ubuntu-2204", "version" => nil, "custom_url" => nil})
+      expect(dbi.download_from_blob_storage?).to be true
+      expect(dbi.download_from_r2?).to be false
+    end
+
+    %w[ubuntu-noble ubuntu-jammy].product(%w[x64 arm64]).each do |image_name, arch|
+      it "downloads #{image_name} on #{arch} from the public mirror, with a checksum, when the source is public" do
+        allow(Config).to receive(:boot_image_source).and_return("public")
+        expect(Aws::S3::Client).not_to receive(:new)
+        expect(Minio::Client).not_to receive(:new)
+        expect(Config).not_to receive(:ubicloud_images_blob_storage_certs)
+        vm_host.update(arch:)
+        refresh_frame(dbi, new_values: {"image_name" => image_name, "version" => nil, "custom_url" => nil})
+        version = described_class::BOOT_IMAGE_SHA256.dig(image_name, arch).keys.max
+        sha256sum = dbi.sha256sum
+
+        expect(dbi.version).to eq version
+        expect(sha256sum).to match(/\A\h{64}\z/)
+        expect(dbi.url).to eq described_class.upstream_url(image_name, version, arch)
+        expect(dbi.url).to start_with "https://cloud-images.ubuntu.com/"
+
+        daemon_name = "download_#{image_name}_#{version}"
+        params_json = {image_name:, url: dbi.url, version:, sha256sum:, certs: nil, use_htcat: false}.to_json
+        expect(sshable).to receive(:_cmd).with("common/bin/daemonizer --check #{daemon_name}").and_return("NotStarted")
+        expect(sshable).to receive(:_cmd).with("common/bin/daemonizer 'host/bin/download-boot-image' #{daemon_name}", stdin: params_json)
+        expect { dbi.download }.to nap(15)
+      end
+    end
+  end
+
   describe "#download" do
     it "starts to download image if it's not started yet" do
       params_json = {

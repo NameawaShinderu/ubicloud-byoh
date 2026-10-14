@@ -227,6 +227,9 @@ module Config
   optional :pry_audit_access_key, string, clear: true
   optional :pry_audit_secret_key, string, clear: true
   override :pry_audit_retention_years, 6, int
+  # Lets bin/pry start in production without an audit sink. Meant to be set
+  # only in the environment of a single operator console session.
+  override :pry_allow_unaudited, false, bool
 
   # Ubicloud Images (Minio)
   override :ubicloud_images_bucket_name, "ubicloud-images", string
@@ -241,12 +244,19 @@ module Config
   optional :deleted_record_archive_access_key, string, clear: true
   optional :deleted_record_archive_secret_key, string, clear: true
   override :deleted_record_archive_window_seconds, 60 * 60, int
+  # Drop expired deleted_record partitions when no archive bucket is set.
+  # Development always does this; production must opt in, because the
+  # rows are then gone for good.
+  override :deleted_record_drop_unarchived, false, bool
 
   # Ubicloud Images (R2)
   optional :ubicloud_images_r2_bucket_name, string
   optional :ubicloud_images_r2_endpoint, string
   optional :ubicloud_images_r2_access_key, string, clear: true
   optional :ubicloud_images_r2_secret_key, string, clear: true
+  # "auto" fetches every image from the blob storage above in production.
+  # "public" uses the public upstream mirror for images that have one.
+  override :boot_image_source, "auto", match?(/\A(auto|public)\z/)
 
   override :github_ubuntu_2204_x64_aws_ami_version, "ami-0f1fbe99fe0b007bd", string
   override :github_ubuntu_2404_x64_aws_ami_version, "ami-038c8beee8816e610", string
