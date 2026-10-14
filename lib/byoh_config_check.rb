@@ -117,8 +117,14 @@ class ByohConfigCheck
 
   def base_url
     return unless @production
-    uri = URI(Config.base_url)
-    if uri.scheme == "http" && !%w[localhost 127.0.0.1 ::1].include?(uri.hostname)
+    uri = begin
+      URI(Config.base_url)
+    rescue URI::InvalidURIError
+      return failure("BASE_URL #{Config.base_url.inspect} is not a valid URL")
+    end
+    if !%w[http https].include?(uri.scheme) || uri.hostname.to_s.empty?
+      failure("BASE_URL #{Config.base_url.inspect} is not an http or https URL with a host, such as https://cloud.example.com")
+    elsif uri.scheme == "http" && !%w[localhost 127.0.0.1 ::1].include?(uri.hostname)
       failure("BASE_URL #{Config.base_url} is http, but production cookies are Secure, so browsers drop them and login fails; use https")
     else
       ok("BASE_URL #{Config.base_url}")

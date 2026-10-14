@@ -115,6 +115,18 @@ RSpec.describe ByohConfigCheck do
       end
     end
 
+    it "fails on a BASE_URL that is not an http or https URL, and still runs every other check" do
+      allow(Config).to receive(:base_url).and_return("https://cloud example.com")
+      out = StringIO.new
+      expect(new_checker(out:).run(["--simulate-production"])).to eq 1
+      expect(out.string).to include "fail BASE_URL \"https://cloud example.com\" is not a valid URL\n", "ok   DB_POOL_WEB is 16\n"
+
+      ["cloud.example.com", "ftp://cloud.example.com", "https:///path"].each do |url|
+        allow(Config).to receive(:base_url).and_return(url)
+        expect(messages(checker.check(production: true), "fail")).to eq ["BASE_URL #{url.inspect} is not an http or https URL with a host, such as https://cloud.example.com"]
+      end
+    end
+
     describe "mail" do
       it "only reports the driver outside production" do
         allow(Config).to receive_messages(mail_driver: :logger, mail_from: nil)
