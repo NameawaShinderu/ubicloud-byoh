@@ -180,7 +180,8 @@ The WP3 fixture hit these first; `scripts/byoh/install.sh` handles each:
   migrations with `UMask=0007`, and give the services `UMask=0007` too,
   not `0077`, so either side can rewrite the other's files through the
   shared `ubicloud` group. `smoke` tests both directions. A restore
-  (WP6) is not tested yet. `/var/lib/ubicloud` is 0750 and holds no
+  (WP6) is not tested yet. `/var/lib/ubicloud` is root:ubicloud 0750
+  (only `var/` and `billing_rates.d/` belong to `ubicloud`) and holds no
   secrets.
 - Replace the managed `# BEGIN ubicloud` .. `# END ubicloud` blocks in
   `pg_hba.conf` (first) and `pg_ident.conf`, and reload only when a file

@@ -284,6 +284,30 @@ validate_args() {
   [[ -z $BACKUP_RECIPIENT_FILE || -f $BACKUP_RECIPIENT_FILE ]] ||
     usage_die "--backup-recipient-file $BACKUP_RECIPIENT_FILE is not a file"
   [[ -z $BACKUP_RECIPIENT_FILE ]] || BACKUP_RECIPIENT_FILE=$(absolute "$BACKUP_RECIPIENT_FILE")
+  # The format here; the checksum in check_recipients, once age is
+  # installed. Both before anything changes.
+  if [[ -n $BACKUP_RECIPIENT_FILE ]]; then
+    local line n=0 i=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      i=$((i + 1))
+      [[ $line =~ ^# || $line =~ ^[[:space:]]*$ ]] && continue
+      [[ $line =~ ^age1[02-9ac-hj-np-z]{58}$ ]] ||
+        usage_die "--backup-recipient-file $BACKUP_RECIPIENT_FILE: line $i is not an age public key (age1...)"
+      n=$((n + 1))
+    done <"$BACKUP_RECIPIENT_FILE"
+    ((n > 0)) || usage_die "--backup-recipient-file $BACKUP_RECIPIENT_FILE holds no age public key (age1...)"
+  fi
+}
+
+# check_recipients: exits 2 when age does not accept the recipients
+# (a bad checksum), before anything but the packages changed.
+check_recipients() {
+  local want
+  want=$(recipients_wanted)
+  [[ -n $want ]] || return 0
+  printf '%s\n' "$want" >"$WORK/recipients.check"
+  age -R "$WORK/recipients.check" -o /dev/null </dev/null 2>"$WORK/age.err" ||
+    usage_die "the backup recipient is not a valid age recipient: $(head -1 "$WORK/age.err")"
 }
 
 # absolute PATH: PATH made absolute, so that it means the same after a
@@ -767,13 +791,33 @@ ensure_users() {
     useradd --system --user-group -G ubicloud -d /nonexistent -M -s /usr/sbin/nologin ubicloud-migrate
     changed=1
   fi
+  if ! id ubicloud-build >/dev/null 2>&1; then
+    useradd --system --user-group -d /nonexistent -M -s /usr/sbin/nologin ubicloud-build
+    changed=1
+  fi
   # M3-n: the only writable state. var/ is setgid 2770 so that
   # ubicloud-migrate and the services rewrite each other's ca_bundles.
+  # $STATE itself is root's, so a service cannot swap var/ or
+  # billing_rates.d/ for a symlink that root would then follow.
   [[ -d $STATE/var && -d $STATE/billing_rates.d ]] || changed=1
-  install -d -m 0750 -o ubicloud -g ubicloud "$STATE"
+  [[ $(stat -c %U "$STATE" 2>/dev/null) == ubicloud ]] && changed=1
+  secure_state
   install -d -m 2770 -o ubicloud -g ubicloud "$STATE/var"
   install -d -m 0750 -o ubicloud -g ubicloud "$STATE/billing_rates.d"
   if ((changed)); then report changed "users: ubicloud, ubicloud-migrate, $STATE"; else report ok "users: ubicloud, ubicloud-migrate"; fi
+}
+
+# secure_state: makes $STATE root:ubicloud 0750 (layouts before this
+# had it owned by ubicloud) and refuses a var/ or billing_rates.d/ that
+# is not a real directory, which root must never follow.
+secure_state() {
+  [[ ! -L $STATE ]] || die "$STATE is a symlink; it must be a directory"
+  install -d -m 0750 -o root -g ubicloud "$STATE"
+  local d
+  for d in "$STATE/var" "$STATE/billing_rates.d"; do
+    [[ ! -L $d && (! -e $d || -d $d) ]] ||
+      die "$d is a symlink or not a directory; a process of user ubicloud may have replaced it. Inspect it, move it away and rerun"
+  done
 }
 
 release_rev() { sed -n 's/^rev=//p' "$RELEASES/$1/.ubicloud-release" 2>/dev/null; }
@@ -798,10 +842,12 @@ check_release() {
   fi
 }
 
-# as_build CMD...: runs CMD as ubicloud in the release being built, with
-# a throwaway HOME so no bundler or npm cache lands in the state dir.
+# as_build CMD...: runs CMD as ubicloud-build in the release being
+# built, with a throwaway HOME so no bundler or npm cache lands in the
+# state dir. No service runs as that user, so a compromised web or
+# respirate cannot change the code root installs and runs afterwards.
 as_build() {
-  runuser -u ubicloud -- env -i PATH="$SERVICE_PATH" HOME="$BUILD_HOME" "$@"
+  runuser -u ubicloud-build -- env -i PATH="$SERVICE_PATH" HOME="$BUILD_HOME" "$@"
 }
 
 RELEASE_CHANGED=0
@@ -824,13 +870,16 @@ build_release() {
   local tmp=$RELEASES/$VERSION.tmp
   install -d -m 0755 "$OPT" "$RELEASES"
   rm -rf "$tmp"
-  install -d -m 0755 -o ubicloud -g ubicloud "$tmp"
+  id ubicloud-build >/dev/null 2>&1 ||
+    useradd --system --user-group -d /nonexistent -M -s /usr/sbin/nologin ubicloud-build
+  install -d -m 0755 -o ubicloud-build -g ubicloud-build "$tmp"
   cp -a "$SRC_DIR/." "$tmp/"
-  chown -R ubicloud:ubicloud "$tmp"
+  chown -R -h ubicloud-build:ubicloud-build "$tmp"
+  chmod -R go-w "$tmp"
   [[ -f $tmp/cache/schema.cache ]] || die "the source has no cache/*.cache; install.sh uses the committed Sequel caches"
   # Not under $WORK, which only root can enter.
   BUILD_HOME=$(mktemp -d /tmp/ubicloud-build-home.XXXXXX)
-  chown ubicloud:ubicloud "$BUILD_HOME"
+  chown ubicloud-build:ubicloud-build "$BUILD_HOME"
   # Chained with &&: a subshell on the left of || runs without set -e.
   (
     cd "$tmp" &&
@@ -845,19 +894,35 @@ build_release() {
     tail -40 "$WORK/build.log" >&2
     die "building release $VERSION failed"
   }
+  # Nothing of the build user may outlive the build and write on.
+  kill_user_procs ubicloud-build
   rm -rf "$BUILD_HOME"
+  # M3-n: root owns the code, and the services can only read it. The
+  # files root writes come after the chown, so none can be a symlink
+  # the build planted.
+  chown -R -h root:root "$tmp"
+  chmod -R a+rX,go-w "$tmp"
   [[ -s $tmp/assets/css/app.css ]] || die "npm run prod did not write assets/css/app.css"
-  rm -rf "${tmp:?}/var"
+  rm -rf "${tmp:?}/var" "$tmp/.ubicloud-release" "$tmp/.release-env"
   ln -s "$STATE/var" "$tmp/var"
   printf 'version=%s\nrev=%s\nbuilt=%s\n' "$VERSION" "$SRC_REV" "$(date -u +%FT%TZ)" >"$tmp/.ubicloud-release"
   printf "GIT_REV='%s'\n" "$SRC_REV" >"$tmp/.release-env"
-  # M3-n: root owns the code, and the services can only read it.
-  chown -R -h root:root "$tmp"
-  chmod -R a+rX,go-w "$tmp"
+  chmod 0644 "$tmp/.ubicloud-release" "$tmp/.release-env"
   assert_release "$tmp"
   mv -T "$tmp" "$RELEASES/$VERSION"
   RELEASE_CHANGED=1
   report changed "release: built $VERSION at rev $SRC_REV"
+}
+
+# kill_user_procs USER: SIGKILLs every process USER runs (no procps in
+# a minimal image, so through /proc).
+kill_user_procs() {
+  local p uid
+  uid=$(id -u "$1")
+  for p in /proc/[0-9]*; do
+    [[ $(stat -c %u "$p" 2>/dev/null) == "$uid" ]] && { kill -KILL "${p#/proc/}" 2>/dev/null || true; }
+  done
+  return 0
 }
 
 # --stage release: builds the release next to the current one. The
@@ -1614,6 +1679,7 @@ main() {
   # These need postgres and the tools (the SMTP parser) from the steps
   # above, which are the same as the current release's by now.
   read_smtp
+  check_recipients
   check_settings
   check_start
   check_front

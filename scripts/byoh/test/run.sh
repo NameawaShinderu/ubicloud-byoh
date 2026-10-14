@@ -652,6 +652,26 @@ sc_rerun() {
   dx rerun mv /root/env.saved /etc/ubicloud/env
   say "rerun: a missing env file with a migrated database is refused"
 
+  # M3-n: the state dir is root's, so a service cannot swap var/ for a
+  # symlink; one that is there anyway (planted under an older layout)
+  # is refused before root follows it, and an older ubicloud-owned
+  # state dir is made root's.
+  [[ $(dx rerun stat -c '%U:%G %a' /var/lib/ubicloud) == "root:ubicloud 750" ]] ||
+    fail "rerun: /var/lib/ubicloud is $(dx rerun stat -c '%U:%G %a' /var/lib/ubicloud)"
+  dx rerun runuser -u ubicloud -- ln -s /etc /var/lib/ubicloud/x 2>/dev/null && fail "rerun: ubicloud can add entries to /var/lib/ubicloud"
+  dx rerun bash -c 'install -d -m 0755 /victim && mv /var/lib/ubicloud/var /var/lib/ubicloud/var.x && ln -s /victim /var/lib/ubicloud/var'
+  rc=0
+  install_cp rerun --mail-from other@example.test >"$LOGS/rerun-symlink.log" 2>&1 || rc=$?
+  dx rerun bash -c 'rm /var/lib/ubicloud/var && mv /var/lib/ubicloud/var.x /var/lib/ubicloud/var'
+  { [[ $rc == 1 ]] && grep -q 'var is a symlink or not a directory' "$LOGS/rerun-symlink.log"; } ||
+    fail "rerun: a symlinked var/: exit $rc, $(tail -3 "$LOGS/rerun-symlink.log")"
+  [[ $(dx rerun stat -c '%U:%G %a' /victim) == "root:root 755" ]] || fail "rerun: install.sh changed the target of a symlinked var/"
+  dx rerun rmdir /victim
+  dx rerun chown ubicloud:ubicloud /var/lib/ubicloud
+  install_cp rerun --mail-from other@example.test >"$LOGS/rerun-state.log" 2>&1 || fail "rerun: an ubicloud-owned state dir failed the run"
+  [[ $(dx rerun stat -c '%U:%G %a' /var/lib/ubicloud) == "root:ubicloud 750" ]] || fail "rerun: the ubicloud-owned state dir stayed"
+  say "rerun: /var/lib/ubicloud is root:ubicloud 750; a symlinked var/ exits 1 untouched, an ubicloud-owned state dir is made root's"
+
   # The same version from another rev is refused before anything changes.
   local rev
   rev=$(cat "$ART/src.rev")
@@ -741,6 +761,24 @@ sc_rerun_backup() {
     fail "rerun: --update-env BACKUP_RECIPIENTS: $(cat "$LOGS/rerun-brecip-update.log")"
   dx rerun cmp -s /root/backup-recipient2 /etc/ubicloud/backup-recipients || fail "rerun: the recipients were not replaced"
   say "rerun: another backup recipient exits 2, --update-env BACKUP_RECIPIENTS replaces it"
+
+  # A bad recipient file exits 2 before anything changes: a key with a
+  # broken checksum (found by age) and a file of comments only.
+  local sums pids f
+  sums=$(settings_sums rerun)
+  pids=$(service_pids rerun)
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  dx rerun bash -c 'k=$(cat /root/backup-recipient); last=${k: -1}; [[ $last == q ]] && n=p || n=q; printf "%s\n" "${k%?}$n" >/root/recip-badsum; printf "# only a comment\n\n" >/root/recip-empty'
+  for f in recip-badsum recip-empty; do
+    rc=0
+    install_cp rerun --mail-from other@example.test --backup-recipient-file "/root/$f" --update-env BACKUP_RECIPIENTS \
+      >"$LOGS/rerun-$f.log" 2>&1 || rc=$?
+    [[ $rc == 2 ]] || fail "rerun: --backup-recipient-file $f exited $rc, not 2"
+    grep -qE 'not a valid age recipient|holds no age public key' "$LOGS/rerun-$f.log" || fail "rerun: $f: $(tail -2 "$LOGS/rerun-$f.log")"
+    grep -q '^changed ' "$LOGS/rerun-$f.log" && fail "rerun: $f changed: $(grep '^changed ' "$LOGS/rerun-$f.log")"
+  done
+  [[ $(settings_sums rerun) == "$sums" && $(service_pids rerun) == "$pids" ]] || fail "rerun: a refused recipient file changed a file or a service"
+  say "rerun: a recipient with a bad checksum and a file of comments only exit 2 and change nothing"
 }
 
 # A lost env file while postgres is stopped: install.sh starts postgres
@@ -1750,8 +1788,11 @@ sc_backup() {
   dx backup bash -c 'printf "# harness v1\n[]\n" >/var/lib/ubicloud/billing_rates.d/harness.yml && chown ubicloud:ubicloud /var/lib/ubicloud/billing_rates.d/harness.yml && chmod 0640 /var/lib/ubicloud/billing_rates.d/harness.yml'
   say "backup: Sshable#cmd ok, account created, login ok"
 
-  # backup now
-  out=$(adm backup backup now 2>&1) || fail "backup: backup now: $out"
+  # backup now; a symlink in the billing rates goes into the archive,
+  # and a restore must not copy what it points to.
+  dx backup ln -s /etc/shadow /var/lib/ubicloud/billing_rates.d/evil.yml
+  out=$(adm backup backup now 2>&1) || { dx backup rm -f /var/lib/ubicloud/billing_rates.d/evil.yml; fail "backup: backup now: $out"; }
+  dx backup rm -f /var/lib/ubicloud/billing_rates.d/evil.yml
   ts=$(grep -oE '[0-9]{8}T[0-9]{6}Z' <<<"$out" | head -1)
   dir=/var/backups/ubicloud/$ts
   [[ $(dx backup stat -c '%U %a' "$dir") == "root 700" ]] || fail "backup: $dir is not root 0700"
@@ -1884,6 +1925,8 @@ sc_backup() {
   dx backup grep -q '# harness: changed' /etc/ubicloud/backup-recipients && fail "backup: restore --force kept the changed backup-recipients"
   dx backup grep -q '# harness v2' /var/lib/ubicloud/billing_rates.d/harness.yml && fail "backup: restore --force kept the changed billing rates"
   [[ $(dx backup stat -c '%U:%G %a' /var/lib/ubicloud/billing_rates.d/harness.yml) == "ubicloud:ubicloud 640" ]] || fail "backup: the restored billing rates' mode"
+  dx backup test ! -e /var/lib/ubicloud/billing_rates.d/evil.yml || fail "backup: restore --force copied a symlink's target into the billing rates"
+  grep -q 'skipped evil.yml in the backup' "$LOGS/adm.log" || fail "backup: no warning for the symlink in the billing rates"
   dx backup rm -f "$saved"
   [[ $(db_names backup) =~ ^ubicloud\ ubicloud_prev_[0-9]{14}$ ]] || fail "backup: databases after restore --force: $(db_names backup)"
   dx backup runuser -u postgres -- dropdb "$(db_names backup | cut -d' ' -f2)"
@@ -1905,7 +1948,7 @@ sc_backup() {
   [[ $(adm_rc backup restore "$ts" --key-file /root/backup-key --env-only --no-start) == 2 ]] ||
     fail "backup: --no-start with --env-only was not refused with exit 2"
   [[ $(adm_rc backup restore "$ts" --key-file /root/backup-key --no-start) == 0 ]] || fail "backup: restore --no-start failed: $(adm_last)"
-  adm_last | grep -q '^notice  restore: the services stay stopped (--no-start)' || fail "backup: restore --no-start: $(adm_last)"
+  grep -q '^notice  restore: the services stay stopped (--no-start)' <<<"$(adm_last)" || fail "backup: restore --no-start: $(adm_last)"
   for u in ubicloud.target ubicloud-web ubicloud-respirate ubicloud-monitor; do
     [[ $(dx backup systemctl is-active "$u" || true) == inactive ]] || fail "backup: $u runs after restore --no-start"
   done
@@ -2760,6 +2803,15 @@ sc_migrate() {
   as_ubuntu "$name" "sed -i '/HARNESS_BAD/d' ~/ubicloud/.env.rb"
   say "$name: a .env.rb that does not load is reported as NameError at its line, without the token"
 
+  # MAIL_FROM with a display name: install.sh would refuse it after the
+  # env file is written, so preflight is fatal and names --mail-from.
+  as_ubuntu "$name" "echo 'ENV[\"MAIL_FROM\"] = \"Ubicloud <ops@example.test>\"' >>~/ubicloud/.env.rb"
+  rc=$(mig "$name" "$name-preflight-mailfrom.log" preflight "${MIG_FLAGS[@]}")
+  { [[ $rc == 1 ]] && grep -qE '^fatal   env: MAIL_FROM \(from .env.rb\) is not a bare email address.*pass --mail-from' "$LOGS/$name-preflight-mailfrom.log"; } ||
+    fail "$name: preflight with MAIL_FROM 'Name <addr>' gave $rc, see $LOGS/$name-preflight-mailfrom.log"
+  as_ubuntu "$name" "sed -i '/MAIL_FROM/d' ~/ubicloud/.env.rb"
+  say "$name: a .env.rb MAIL_FROM with a display name is fatal at preflight"
+
   # The BMC password only in the running respirate's environment: a
   # preflight warn, and a rollback warning naming it.
   as_ubuntu "$name" "sed -i '/BYOH_BMC_PASS_TEST/d' ~/ubicloud/.env.rb && tmux send-keys -t respirate C-c" || fail "$name: no tmux session respirate"
@@ -3105,9 +3157,12 @@ EOS
   # 6. The way back: t2 with the backup made before t3's migration.
   # Until the restore, nothing starts t2 on t3's schema, not even a
   # reboot with ubicloud.target enabled.
+  # A symlink planted under an older layout is not written through.
+  dx "$n" ln -s /root/hold-victim /var/lib/ubicloud/release-hold.new
   [[ $(adm_rc "$n" release use t2 --for-restore "$ts_pre") == 0 ]] || fail "$n: release use t2 --for-restore $ts_pre"
   [[ $(current_of "$n") == releases/t2 && $(previous_of "$n") == releases/t3 ]] || fail "$n: after use t2 --for-restore"
   dx "$n" test -f /var/lib/ubicloud/release-hold || fail "$n: --for-restore set no hold"
+  dx "$n" test ! -e /root/hold-victim || fail "$n: release use --for-restore wrote through a planted release-hold.new"
   ! dx "$n" systemctl start ubicloud-web 2>/dev/null || fail "$n: web started while held"
   dx "$n" systemctl start ubicloud.target || true
   [[ $(dx "$n" systemctl is-active ubicloud-web) != active && $(dx "$n" systemctl is-active ubicloud-respirate) != active ]] ||

@@ -86,7 +86,7 @@ smoke` (§6), then the URL and the next commands.
 | 2 | Packages | `postgresql-16`, `age`, build dependencies, `git curl jq iproute2 openssl` (apt, only the missing ones) |
 | 3 | Tools | Pinned mise (sha256-checked) builds Ruby and Node into `/opt/ubicloud/tools`; plain symlinks in `/opt/ubicloud/tools/bin`. No mise at runtime |
 | — | Settings checks | Exit 2 before any change when a flag would change an existing setting without `--update-env` (§4), when the env file sets `PRY_ALLOW_UNAUDITED` or `PORT=8081`, when the database has a schema but the env file is missing, when the front cannot be set up, or when something else holds the web port or a development control plane lives here |
-| 4 | Users and release | OS users `ubicloud` and `ubicloud-migrate`; `/var/lib/ubicloud/{var,billing_rates.d}`; builds `releases/<version>` (bundle in deployment mode, `npm ci`, `npm run prod`), then makes it root-owned and read-only and points `current` at it |
+| 4 | Users and release | OS users `ubicloud`, `ubicloud-migrate` and `ubicloud-build` (builds releases only); `/var/lib/ubicloud/{var,billing_rates.d}`; builds `releases/<version>` (bundle in deployment mode, `npm ci`, `npm run prod`), then makes it root-owned and read-only and points `current` at it |
 | 5 | Database | Roles `ubicloud`, `ubicloud_password`, `ubicloud_restorer` (LOGIN, no superuser, createdb or createrole); database `ubicloud`, `citext`, `btree_gist`; the managed `# BEGIN ubicloud` blocks at the top of `pg_hba.conf` and in `pg_ident.conf`; `listen_addresses = 'localhost'`. Warns about `trust` lines and login superusers elsewhere |
 | 6 | Env file | `/etc/ubicloud/env` (root 0600): missing keys added, secrets generated once (§4) |
 | 7 | Migrations | `bin/rake-task-runner migrate` as `ubicloud-migrate` |
@@ -380,13 +380,19 @@ a working account.
 | `/etc/ubicloud/env` | root 0600 | Settings and secrets (§4) |
 | `/etc/ubicloud/{backup.conf,backup-recipients,front.conf}` | root | Backup target, age recipients, the front |
 | `/etc/ubicloud/tls/`, `cloudflared.token` | root:caddy 0750 / root 0600 | Provided certificate and key; tunnel token |
-| `/var/lib/ubicloud` | ubicloud 0750 | `var/` (2770: CA bundles, shared with `ubicloud-migrate`), `billing_rates.d/` |
+| `/var/lib/ubicloud` | root:ubicloud 0750 | `var/` (ubicloud 2770: CA bundles, shared with `ubicloud-migrate`), `billing_rates.d/` (ubicloud 0750), `release-hold` (root, during `release use --for-restore`) |
 | `/var/backups/ubicloud` | root 0700 | Backups (OPERATIONS.md §6) |
 | `/usr/local/bin/ubicloud-admin` | root 0755 | From the current release |
 | `/etc/systemd/system/ubicloud*` | root 0644 | From `packaging/systemd` |
 
-All the services can write is `/var/lib/ubicloud`; a compromised web
-process cannot change code that root later runs.
+All the services can write is `/var/lib/ubicloud/var` and
+`billing_rates.d`; a compromised web process cannot change code that
+root later runs. `/var/lib/ubicloud` itself is root's, so the services
+cannot swap those two directories for symlinks: `install.sh` and
+`ubicloud-admin` refuse one that is a symlink and make an older
+`ubicloud`-owned `/var/lib/ubicloud` root's. Releases are built as the
+system user `ubicloud-build`, which no service runs as, and made root's
+before root writes or runs anything in them.
 
 ---
 

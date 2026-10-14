@@ -510,6 +510,10 @@ plan_import() {
     fatal "env: --tls none needs the URL http://localhost:PORT; pass --url"
   fi
   MAIL_FROM=${ARG[mail-from]:-${IMP[MAIL_FROM]:-${ARG[admin-email]}}}
+  # install.sh takes a bare address only; refusing here keeps the install
+  # phase from writing the env file and then failing on --mail-from.
+  [[ $MAIL_FROM =~ ^[^@[:space:]\'\\]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] ||
+    fatal "env: MAIL_FROM ($( [[ -n ${ARG[mail-from]:-} ]] && echo --mail-from || echo "from .env.rb")) is not a bare email address, which install.sh needs (a display name such as 'Name <ops@example.com>' is refused); pass --mail-from ops@example.com"
   for k in "${IMP_KEYS[@]}"; do
     v=${IMP[$k]}
     if [[ ! $k =~ $KEY_RE || $k =~ $DENIED_KEY_RE ]]; then

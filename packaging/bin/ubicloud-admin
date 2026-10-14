@@ -255,6 +255,20 @@ backup_target() {
   printf '%s' "${t%/}"
 }
 
+# secure_state: makes $STATE root:ubicloud 0750, as install.sh does
+# (older layouts had it owned by ubicloud, which could then swap its
+# entries for symlinks root follows), and refuses a var/ or
+# billing_rates.d/ that is not a real directory.
+secure_state() {
+  [[ ! -L $STATE ]] || die "$STATE is a symlink; it must be a directory"
+  install -d -m 0750 -o root -g ubicloud "$STATE"
+  local d
+  for d in "$STATE/var" "$STATE/billing_rates.d"; do
+    [[ ! -L $d && (! -e $d || -d $d) ]] ||
+      die "$d is a symlink or not a directory; a process of user ubicloud may have replaced it. Inspect it and move it away"
+  done
+}
+
 # --- running code of the release ----------------------------------------------
 
 # Extra NAME=value pairs for the next as_service, after the env file.
@@ -913,6 +927,8 @@ RB_ARMED=0 RB_SWAPPED=0 RB_HAD_LIVE=0 RB_PREV="" RB_WAS="" RB_TS="" RB_FAILED=""
 
 # Copies /etc/ubicloud and the billing rates before the swap.
 restore_snapshot() {
+  # Also keeps restore_rollback's copy back out of a symlink.
+  secure_state
   cp -a "$ETC" "$WORK/etc.before"
   if [[ -d $STATE/billing_rates.d ]]; then
     cp -a "$STATE/billing_rates.d" "$WORK/rates.before"
@@ -1101,9 +1117,15 @@ restore_billing_rates() {
   mkdir "$WORK/rates"
   tar -C "$WORK/rates" -xf "$dir/billing-rates.tar"
   local f n=0
+  secure_state
   install -d -m 0750 -o ubicloud -g ubicloud "$STATE/billing_rates.d"
   shopt -s nullglob
   for f in "$WORK/rates/billing_rates.d"/*; do
+    # A symlink in the archive would make root copy what it points to.
+    if [[ -L $f || ! -f $f ]]; then
+      report warn "restore: skipped ${f##*/} in the backup's billing rates: not a regular file"
+      continue
+    fi
     if [[ ! -e $STATE/billing_rates.d/${f##*/} || $force == 1 ]] && ! cmp -s "$f" "$STATE/billing_rates.d/${f##*/}"; then
       install -m 0640 -o ubicloud -g ubicloud "$f" "$STATE/billing_rates.d/${f##*/}"
       n=$((n + 1))
@@ -1903,7 +1925,14 @@ release_install_file() {
 # fails visibly; also at boot), and make the backup timer's runs skip.
 hold_set() {
   local u d
-  printf 'version=%s\nrestore=%s\n' "$1" "$2" >"$HOLD.new"
+  secure_state
+  # $STATE is root's now, but an older layout let ubicloud plant a
+  # symlink here; noclobber creates the file with O_EXCL.
+  rm -f "$HOLD.new"
+  (
+    set -C
+    printf 'version=%s\nrestore=%s\n' "$1" "$2" >"$HOLD.new"
+  ) || die "cannot create $HOLD.new"
   chmod 0644 "$HOLD.new"
   mv -f "$HOLD.new" "$HOLD"
   for u in "${SERVICES[@]}" ubicloud-backup; do
