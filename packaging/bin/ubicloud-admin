@@ -97,17 +97,20 @@
 #          respirate or monitor run (systemctl stop ubicloud.target
 #          first), and refuse a release that runs other tools than
 #          /opt/ubicloud/tools or that is not root's alone. migrate refuses
-#          unless the newest backup holds the database's migrations and is
-#          newer than the stop of respirate (backup now after the stop),
-#          unless --skip-backup-check. use refuses a release that lacks a
-#          migration the database has applied (a downgrade onto a newer
-#          schema) or that has migrations not applied yet (migrate
-#          first). --for-restore TS takes such a downgrade when backup TS
-#          holds only migrations VERSION knows; restore TS --db-only must
-#          follow before the services start. prune removes all but the N
-#          newest releases, never current or previous. Starting the
-#          services is left to the operator; ubicloud-admin upgrade comes
-#          with M12.
+#          unless a backup made after the services last ran (backup now
+#          after the stop) holds the database, or holds it as it was
+#          before migrations of VERSION that an earlier migrate run
+#          applied, and current can restore it; --skip-backup-check
+#          skips this. use refuses a release that lacks a migration the
+#          database has applied (a downgrade onto a newer schema) or that
+#          has migrations not applied yet (migrate first). --for-restore
+#          TS takes such a downgrade when backup TS holds only migrations
+#          VERSION knows, and holds web, respirate, monitor and the
+#          backup timer's runs (systemd drop-ins, also across a reboot)
+#          until restore TS --db-only swapped the database. prune removes
+#          all but the N newest releases, never current or previous.
+#          Starting the services is left to the operator; ubicloud-admin
+#          upgrade comes with M12.
 #
 # Every command except logs and env keys writes one line with the command
 # name and $SUDO_USER, never its arguments, to the system log (tag
@@ -144,6 +147,11 @@ readonly DB_NAME=ubicloud
 readonly TS_RE='^[0-9]{8}T[0-9]{6}Z$'
 # The units status checks and restore stops and starts.
 readonly SERVICES=(ubicloud-web ubicloud-respirate ubicloud-monitor)
+# release use --for-restore: while this file exists, drop-ins keep the
+# services (and the backup timer's runs) from starting on a schema
+# current does not know.
+readonly HOLD=$STATE/release-hold
+readonly HOLD_DROPIN=50-ubicloud-release-hold.conf
 
 # Keys the env file must never set (the same lists as install.sh).
 readonly KEY_RE='^[A-Z][A-Z0-9_]{0,63}$'
@@ -406,16 +414,21 @@ status_postgres() {
   [[ -z $kept ]] || warn_line "postgres: database(s) $kept are left from restores and use disk; drop each once it is not needed (runuser -u postgres -- dropdb NAME)"
 }
 
-# The newest complete backup: a <timestamp> directory with a manifest.
-latest_backup() {
+# The complete backups, newest first: <timestamp> directories with a
+# manifest.
+backups_newest_first() {
   local target=$1 d
   for d in $(find "$target" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E "$TS_RE" | sort -r); do
-    [[ -f $target/$d/manifest.json ]] && {
-      echo "$d"
-      return 0
-    }
+    [[ ! -f $target/$d/manifest.json ]] || echo "$d"
   done
-  return 0
+}
+
+# The newest complete backup. No head: under pipefail its early exit
+# could fail the pipe with SIGPIPE.
+latest_backup() {
+  local all
+  all=$(backups_newest_first "$1")
+  printf '%s' "${all%%$'\n'*}"
 }
 
 ts_epoch() { date -u -d "$(sed -E 's/^(....)(..)(..)T(..)(..)(..)Z$/\1-\2-\3 \4:\5:\6/' <<<"$1")" +%s; }
@@ -835,7 +848,7 @@ cmd_restore() {
   # the billing rates as they were (restore_rollback).
   RB_TS=$ts
   RB_PREV=${DB_NAME}_prev_$(date -u +%Y%m%d%H%M%S)
-  RB_WAS=$(running_services)
+  RB_WAS=$(active_services)
   restore_snapshot
   RB_HAD_LIVE=0
   db_exists "$DB_NAME" && RB_HAD_LIVE=1
@@ -868,6 +881,9 @@ cmd_restore() {
   report ok "restore: migrations ran ($(grep -c 'Finished applying migration' "$WORK/migrate.log" || true) applied)"
   restore_install_secrets "$force"
   restore_billing_rates "$dir" "$force"
+  # current and the restored database agree now (restore_check_migrations
+  # and the migrations above).
+  hold_clear
   start_services "$RB_WAS ubicloud.target"
   RB_ARMED=0
   trap cleanup_work EXIT
@@ -1136,13 +1152,24 @@ restore_build_db() {
   report ok "restore: built ${DB_NAME}_restore ($n migrations)"
 }
 
-# The services among SERVICES that run now.
+# The services among SERVICES that run now: active, or on their way in
+# or out (activating, deactivating, reloading). systemctl stop
+# ubicloud.target can return while respirate still finishes its strands.
 running_services() {
   local u out=""
-  for u in "${SERVICES[@]}"; do
+  for u in "${SERVICES[@]}" ubicloud.target; do
+    [[ $(unit_state "$u") =~ ^(inactive|failed|unknown)?$ ]] || out+=" $u"
+  done
+  printf '%s' "${out# }"
+}
+
+# The services among SERVICES that are active: what a restore starts
+# again.
+active_services() {
+  local u out=""
+  for u in "${SERVICES[@]}" ubicloud.target; do
     [[ $(unit_state "$u") != active ]] || out+=" $u"
   done
-  [[ $(unit_state ubicloud.target) != active ]] || out+=" ubicloud.target"
   printf '%s' "${out# }"
 }
 
@@ -1642,7 +1669,7 @@ need_stopped() {
   local running
   running=$(running_services)
   [[ -z $running ]] ||
-    usage_die "$running run; stop them first (systemctl stop ubicloud.target), so no process runs one release on the other's schema"
+    usage_die "$running run; stop them first (systemctl stop ubicloud.target ubicloud-web ubicloud-respirate, which waits for them), so no process runs one release on the other's schema"
 }
 
 cmd_release() {
@@ -1715,27 +1742,89 @@ release_check() {
   return "$rc"
 }
 
-# The newest backup must hold the database as it is now: newer than the
-# stop of respirate (no strand ran after it) and with the same
-# migrations. That backup is what a failed switch restores.
+# services_stopped_at: STOP_EPOCH, the last time web, respirate or
+# monitor ran, and STOP_WHAT, which event that was: the latest stop of
+# one of them since boot, or the boot when none ran since. Returns 1 when
+# systemd does not say when it booted.
+STOP_EPOCH=0 STOP_WHAT=""
+services_stopped_at() {
+  local u t j
+  t=$(systemctl show --timestamp=unix -p UserspaceTimestamp --value 2>/dev/null || true)
+  t=${t#@}
+  [[ $t =~ ^[0-9]+$ ]] && ((t > 0)) || return 1
+  STOP_EPOCH=$t STOP_WHAT="the boot"
+  for u in "${SERVICES[@]}"; do
+    # InactiveEnterTimestamp is empty for a unit that has not stopped
+    # since boot, but also for one systemd unloaded after its stop (an
+    # inactive unit nothing refers to, such as when ubicloud.target is
+    # disabled), so the unit's last journal entry of this boot counts
+    # too. It is stopped now (need_stopped), so it ran no later.
+    t=$(systemctl show --timestamp=unix -p InactiveEnterTimestamp --value "$u" 2>/dev/null || true)
+    t=${t#@}
+    [[ $t =~ ^[0-9]+$ ]] || t=0
+    j=$(journalctl -q --no-pager -b -u "$u.service" -n 1 -o short-unix 2>/dev/null | cut -d. -f1 || true)
+    if [[ $j =~ ^[0-9]+$ ]] && ((j > t)); then t=$j; fi
+    if ((t > STOP_EPOCH)); then
+      STOP_EPOCH=$t STOP_WHAT="the stop of $u"
+    fi
+  done
+}
+
+# backup_fits MANIFEST DIR: whether the backup holds the database as it
+# is, or as it was before migrations of release DIR that current lacks
+# (an earlier release migrate of DIR that failed halfway), with only
+# migrations current knows, so that restore --db-only on current takes
+# it. FIT_RAN: the migrations that ran since the backup.
+FIT_RAN=()
+backup_fits() {
+  local m=$1 dir=$2 f
+  local -A in_backup=()
+  FIT_RAN=()
+  while IFS= read -r f; do
+    [[ -f $CURRENT/migrate/$f ]] || return 1
+    in_backup[$f]=1
+  done < <(jq -r '.schema_migrations[]' "$m")
+  while IFS= read -r f; do
+    [[ -f $CURRENT/migrate/ph/$f ]] || return 1
+  done < <(jq -r '.schema_migrations_password[]' "$m")
+  for f in "${APPLIED[@]}"; do
+    if [[ -n ${in_backup[$f]:-} ]]; then
+      unset "in_backup[$f]"
+    elif [[ -f $dir/migrate/$f && ! -f $CURRENT/migrate/$f ]]; then
+      FIT_RAN+=("$f")
+    else
+      return 1
+    fi
+  done
+  ((${#in_backup[@]} == 0))
+}
+
+# release_backup_check DIR: RELEASE_BACKUP, the backup a failed switch to
+# release DIR goes back to. It must be newer than the last time the
+# services ran (no strand or request ran after it), and backup_fits.
 release_backup_check() {
-  local target last bts stopped m db_sm
+  local dir=$1 target newest d cur
   target=$(backup_target)
-  last=$(latest_backup "$target")
-  [[ -n $last ]] ||
+  cur=$(link_version "$CURRENT")
+  newest=$(latest_backup "$target")
+  [[ -n $newest ]] ||
     usage_die "no backup in $target; with the services stopped, run ubicloud-admin backup now first (or pass --skip-backup-check)"
-  bts=$(ts_epoch "$last")
-  stopped=$(systemctl show --timestamp=unix -p InactiveEnterTimestamp --value ubicloud-respirate 2>/dev/null || true)
-  stopped=${stopped#@}
-  if [[ $stopped =~ ^[0-9]+$ ]] && ((bts < stopped)); then
-    usage_die "the newest backup ($last) is older than the stop of ubicloud-respirate, so it lacks what ran until then; run ubicloud-admin backup now first (or pass --skip-backup-check)"
-  fi
-  m=$target/$last/manifest.json
-  db_sm=$(printf '%s\n' "${APPLIED[@]}" | jq -R . | jq -sc 'map(select(length > 0)) | sort')
-  [[ $(jq -c '.schema_migrations | sort' "$m") == "$db_sm" ]] ||
-    usage_die "the newest backup ($last) holds other migrations than the database; run ubicloud-admin backup now first (or pass --skip-backup-check)"
-  report ok "release: backup $last holds the database as it is (restore $last --db-only undoes the migrations)"
-  RELEASE_BACKUP=$last
+  services_stopped_at ||
+    usage_die "systemd does not say when the services last ran, so the age of backup $newest cannot be checked; nothing was changed (pass --skip-backup-check to go on without a backup check)"
+  (($(ts_epoch "$newest") >= STOP_EPOCH)) ||
+    usage_die "the newest backup ($newest) is older than $STOP_WHAT ($(date -u -d "@$STOP_EPOCH" +%Y%m%dT%H%M%SZ)), so it can lack what ran until then; run ubicloud-admin backup now first (or pass --skip-backup-check)"
+  for d in $(backups_newest_first "$target"); do
+    (($(ts_epoch "$d") >= STOP_EPOCH)) || break
+    backup_fits "$target/$d/manifest.json" "$dir" || continue
+    RELEASE_BACKUP=$d
+    if ((${#FIT_RAN[@]})); then
+      report ok "release: backup $d holds the database as it was before the ${#FIT_RAN[@]} migration(s) of ${dir##*/} that ran already ($(first3 "${FIT_RAN[@]}")); restore $d --db-only undoes them"
+    else
+      report ok "release: backup $d holds the database as it is (restore $d --db-only undoes the migrations)"
+    fi
+    return 0
+  done
+  usage_die "no backup made since $STOP_WHAT holds the database as it is (or as it was before migrations of ${dir##*/} that ran already) with only migrations $cur knows; the newest is $newest (ubicloud-admin backup list). Run ubicloud-admin backup now first, or pass --skip-backup-check when the database already has migrations $cur lacks; nothing was changed"
 }
 
 release_migrate() {
@@ -1776,13 +1865,13 @@ release_migrate() {
   if ((skip_backup)); then
     report warn "release: no backup check (--skip-backup-check); without a backup of this schema a failed switch has nothing to go back to"
   else
-    release_backup_check
+    release_backup_check "$dir"
   fi
   SERVICE_RELEASE=$dir
   if ! ruby_as ubicloud-migrate bin/rake-task-runner migrate "" 0 >"$WORK/migrate.log" 2>&1; then
     grep -v -i 'password' "$WORK/migrate.log" | tail -20 >&2
     load_applied
-    die "the migrations of release $v failed; the database keeps the ${#APPLIED[@]} that ran (each migration is one transaction) and the services stay stopped. Fix the cause and run release migrate $v again, or go back with ubicloud-admin restore ${RELEASE_BACKUP:-TS} --db-only (current is still $(link_version "$CURRENT"))"
+    die "the migrations of release $v failed; the database keeps the ${#APPLIED[@]} that ran (each migration is one transaction) and the services stay stopped. Fix the cause and run release migrate $v again, with the services still stopped (it goes on from backup ${RELEASE_BACKUP:-TS}; no new backup is needed), or go back with ubicloud-admin restore ${RELEASE_BACKUP:-TS} --db-only (current is still $(link_version "$CURRENT"))"
   fi
   load_applied
   release_gaps "$dir"
@@ -1797,6 +1886,53 @@ release_install_file() {
   cmp -s "$1" "$2" && return 1
   install -m "$3" -o root -g root "$1" "$2.new"
   mv -f "$2.new" "$2"
+}
+
+# hold_set VERSION TS: until restore TS lifts it, drop-ins keep web,
+# respirate and monitor from starting (an assertion, so a manual start
+# fails visibly; also at boot), and make the backup timer's runs skip.
+hold_set() {
+  local u d
+  printf 'version=%s\nrestore=%s\n' "$1" "$2" >"$HOLD.new"
+  chmod 0644 "$HOLD.new"
+  mv -f "$HOLD.new" "$HOLD"
+  for u in "${SERVICES[@]}" ubicloud-backup; do
+    d=$UNIT_DIR/$u.service.d
+    install -d -m 0755 -o root -g root "$d"
+    {
+      echo "# ubicloud-admin release use --for-restore: current does not know the"
+      echo "# database's schema until ubicloud-admin restore swaps the database;"
+      echo "# the restore removes this file."
+      echo "[Unit]"
+      if [[ $u == ubicloud-backup ]]; then
+        echo "ConditionPathExists=!$HOLD"
+      else
+        echo "AssertPathExists=!$HOLD"
+      fi
+    } >"$d/$HOLD_DROPIN.new"
+    chmod 0644 "$d/$HOLD_DROPIN.new"
+    mv -f "$d/$HOLD_DROPIN.new" "$d/$HOLD_DROPIN"
+  done
+  systemctl daemon-reload
+  report changed "release: web, respirate and monitor are held (they do not start, not even at boot) until ubicloud-admin restore $2 --db-only"
+}
+
+# hold_clear: lifts the hold of hold_set, once the database and current
+# agree.
+hold_clear() {
+  local u d held=0
+  [[ ! -e $HOLD ]] || held=1
+  for u in "${SERVICES[@]}" ubicloud-backup; do
+    d=$UNIT_DIR/$u.service.d
+    [[ -e $d/$HOLD_DROPIN ]] || continue
+    held=1
+    rm -f "$d/$HOLD_DROPIN"
+    rmdir "$d" 2>/dev/null || true
+  done
+  ((held)) || return 0
+  rm -f "$HOLD"
+  systemctl daemon-reload
+  report changed "release: the hold of release use --for-restore is lifted"
 }
 
 release_use() {
@@ -1877,6 +2013,11 @@ release_use() {
     # An older ubicloud-admin could not switch forward again.
     report warn "release: $v's ubicloud-admin has no release command, so $ADMIN_BIN stays as it is"
   fi
+  # Held before current moves: nothing may start v on a schema it does
+  # not know, not even after a reboot.
+  if [[ -n $for_restore ]] && ((${#LACKS[@]} + ${#PENDING[@]})); then
+    hold_set "$v" "$for_restore"
+  fi
   if [[ -n $cur && $cur != "$v" ]]; then
     ln -sfn "releases/$cur" "$PREVIOUS.new"
     mv -T "$PREVIOUS.new" "$PREVIOUS"
@@ -1884,6 +2025,8 @@ release_use() {
   ln -sfn "releases/$v" "$CURRENT.new"
   mv -T "$CURRENT.new" "$CURRENT"
   report changed "release: current -> $v${cur:+ (previous: $cur)}"
+  # The database and v agree: no hold left from an earlier --for-restore.
+  ((${#LACKS[@]} + ${#PENDING[@]})) || hold_clear
   if [[ -n $for_restore ]]; then
     echo "Next, before anything starts the services: sudo ubicloud-admin restore $for_restore --db-only"
   else
@@ -1953,6 +2096,9 @@ status_release() {
     fail_line "release: ${#PENDING[@]} migration(s) of $v are not applied ($(first3 "${PENDING[@]}")); ubicloud-admin release migrate $v"
   else
     report ok "release: $v matches the database's ${#APPLIED[@]} migrations"
+  fi
+  if [[ -e $HOLD ]]; then
+    fail_line "release: the services are held by release use --for-restore until ubicloud-admin restore $(sed -n 's/^restore=//p' "$HOLD") --db-only ($HOLD)"
   fi
   [[ ! -L $PREVIOUS ]] || report ok "release: previous is $(link_version "$PREVIOUS")"
 }

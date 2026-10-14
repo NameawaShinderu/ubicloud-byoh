@@ -69,12 +69,15 @@ before it succeeded.
 3. **Stop the services.**
 
    ```
-   sudo systemctl stop ubicloud.target
+   sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate
    ```
 
    This stops web, respirate and the backup timer. Respirate stops
    gracefully, which takes up to `TimeoutStopSec=100` while a strand
-   finishes.
+   finishes. Name the two services as well as the target: `systemctl
+   stop ubicloud.target` alone can return while respirate is still
+   stopping, and a backup taken then is older than its stop. `release
+   migrate` and `use` count a unit that is still stopping as running.
 
 4. **Back up.**
 
@@ -85,9 +88,12 @@ before it succeeded.
    The backup comes after the stop, so it holds the database as v1 left
    it. The plan put the backup before the stop, which would miss every
    strand that ran in between. `release migrate` refuses a backup that is
-   older than the stop of `ubicloud-respirate`, or that holds other
-   migrations than the database. `--skip-backup-check` overrides this,
-   but then there is nothing to go back to.
+   older than the last time web, respirate or monitor ran: the latest
+   stop of one of them, from systemd or the journal, or the boot when
+   none ran since. It also refuses a backup that holds other migrations
+   than the database, or one with migrations v1 lacks (a restore on v1
+   could not take it). `--skip-backup-check` overrides this, but then
+   there is nothing to go back to.
 
 5. **Migrate with v2.**
 
@@ -139,9 +145,9 @@ guard below.
 |---|---|
 | `install.sh --stage release` | No installed control plane; a settings flag; the version exists with another rev; other tools than the current release |
 | `release migrate`, `release use` | web, respirate or monitor run; the release wants other tools; a file in it is not root's alone or is group/other writable |
-| `release migrate` | The database has a migration the release lacks; the newest backup is older than the stop of respirate or holds other migrations (unless `--skip-backup-check`) |
+| `release migrate` | The database has a migration the release lacks; no backup made since web, respirate or monitor last ran (or since the boot) holds the database's migrations, or holds them minus migrations of this release that an earlier run applied, with only migrations `current` knows (unless `--skip-backup-check`) |
 | `release use` | **Downgrade guard:** the database has a migration (`schema_migrations`, or `schema_migrations_password` for `migrate/ph`) that the release's `migrate/` lacks. Also: the release has migrations that have not run (run `release migrate` first) |
-| `release use --for-restore TS` | Backup `TS` holds a migration the release lacks |
+| `release use --for-restore TS` | Backup `TS` does not exist, or holds a migration the release lacks. When it takes the downgrade, it holds the services until the restore (see Going back) |
 | `release prune --keep N` | Never removes `current` or `previous`, whatever N says |
 
 Migrations only run forward, so a release can never run on a schema
@@ -154,7 +160,7 @@ that was made before it ran.
   `matches` for the old one):
 
   ```
-  sudo systemctl stop ubicloud.target
+  sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate
   sudo ubicloud-admin release use v1
   sudo systemctl start ubicloud.target
   ```
@@ -167,19 +173,24 @@ that was made before it ran.
   backup from step 4 (`ubicloud-admin backup list`):
 
   ```
-  sudo systemctl stop ubicloud.target
+  sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate
   sudo ubicloud-admin release use v1 --for-restore <TS>
   sudo ubicloud-admin restore <TS> --db-only
   ```
 
   `--for-restore` takes the downgrade only if v1 knows every migration
-  in that backup. Start nothing between the two commands: `status` fails
-  until the restore ran. The restore builds the backup beside the live
-  database, swaps the two, and starts the services. The v2 database stays
-  as `ubicloud_prev_<time>`; drop it yourself once it is not needed.
-  Anything written between the backup and the rollback is lost. If the
-  restore fails, it puts the v2 database back. Then `release use v2`
-  returns to v2.
+  in that backup. It then holds the services: it writes
+  `/var/lib/ubicloud/release-hold` and drop-ins
+  (`/etc/systemd/system/<unit>.service.d/50-ubicloud-release-hold.conf`)
+  that make web, respirate and monitor fail to start, by hand, through
+  `ubicloud.target` or at boot, and make the backup timer's runs skip.
+  `status` fails and names the hold until the restore ran. The restore
+  builds the backup beside the live database, swaps the two, runs v1's
+  migrations, lifts the hold and starts the services. The v2 database
+  stays as `ubicloud_prev_<time>`; drop it yourself once it is not
+  needed. Anything written between the backup and the rollback is lost.
+  If the restore fails, it puts the v2 database back and the hold stays.
+  Then `release use v2` returns to v2 and lifts the hold.
 
 - **A migration failed in step 5.** `current` still points at v1, and the
   services stay stopped. Each migration runs in its own transaction, so
@@ -187,6 +198,15 @@ that was made before it ran.
   fix the cause and run `release migrate v2` again, or run `restore <TS>
   --db-only` with the backup from step 4. That restore runs on v1 and
   starts the services.
+
+  A rerun needs no new backup, as long as the services stay stopped: it
+  takes the backup from step 4, which holds the database before the v2
+  migrations that ran, and names it again if the rerun fails. A `backup
+  now` in between does no harm. That backup has v2 migrations, which v1
+  cannot restore, so `release migrate` passes it over. If a service ran
+  after the failure, the step 4 backup is too old and the rerun is
+  refused. Then either restore the step 4 backup, which loses what the
+  services wrote since, or rerun with `--skip-backup-check`.
 
 ### Listing and pruning
 
@@ -210,12 +230,24 @@ races a build.
 The `upgrade-manual` scenario of the container harness
 (`scripts/byoh/test`) ran these steps. Release t1 comes from the harness
 image; t2 is the working tree plus a dummy file; t3 is t2 plus one
-migration. The scenario covered:
+migration. t4 and t5 are copies of t3: t4's `ubicloud-admin` lacks the
+`release` command, and t5 has a second migration that fails. The
+scenario covered:
 - t1 → t2 → t1;
+- the backup guard: a backup older than the stop of web, one older than
+  a reboot with the target disabled, one with other migrations, and
+  `--skip-backup-check`;
+- a migration that fails halfway (t5): reruns, also after a `backup
+  now`, go on from the backup made before it, and `restore --db-only` on
+  t1 goes back;
 - t1 → t3, after which use and migrate of t1 and t2 are refused;
-- going back to t2 with `--for-restore` and `restore --db-only`;
+- going back to t2 with `--for-restore` and `restore --db-only`, with
+  the services held across a manual start, a target start and a reboot;
+- t4 refused for a group-writable file, for another Ruby (`check`,
+  `migrate`, `use`) and for `--for-restore` of a backup that does not
+  exist, then used with a warning that keeps the newer `ubicloud-admin`;
 - logins and `status` after every switch;
-- prune.
+- prune with `current`, then `previous`, outside the N newest.
 
 Results are in `scripts/byoh/test/README.md`. None of this has run on the
 live control plane (UNVERIFIED).
