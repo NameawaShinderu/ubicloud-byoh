@@ -83,6 +83,30 @@ strand_ran() {
   [[ $(psql_q "$1" "SELECT count(*) FROM strand WHERE prog = 'LogVmHostUtilizations' AND schedule > now() + interval '20 seconds'") == 1 ]]
 }
 
+# hold_vm_host_lock NAME SECS: a postgres session holds an ACCESS
+# EXCLUSIVE lock on vm_host for SECS, so a LogVmHostUtilizations run
+# blocks in its query while it holds the strand's lease: a strand that is
+# running, for as long as the harness wants.
+hold_vm_host_lock() {
+  docker exec -d "ubi-m3-$1" runuser -u postgres -- psql -Xq -d ubicloud \
+    -c "BEGIN; LOCK TABLE vm_host IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep($2); COMMIT"
+}
+release_vm_host_lock() {
+  psql_q "$1" "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query LIKE 'BEGIN; LOCK TABLE vm_host%'" >/dev/null
+}
+# blocked_at_least NAME N: N respirate queries wait on that lock.
+blocked_at_least() {
+  (($(psql_q "$1" "SELECT count(*) FROM pg_stat_activity WHERE usename = 'ubicloud' AND wait_event_type = 'Lock'") >= $2))
+}
+
+# stop_respirate NAME LABEL: stops ubicloud-respirate and prints
+# "SECONDS RESULT STATUS".
+stop_respirate() {
+  local t
+  t=$(timed dx "$1" systemctl stop ubicloud-respirate) || fail "$2: systemctl stop failed"
+  echo "$t $(dx "$1" systemctl show -p Result --value ubicloud-respirate) $(dx "$1" systemctl show -p ExecMainStatus --value ubicloud-respirate)"
+}
+
 # boot_cp NAME: a fresh control plane from ubi-m3-release, with the
 # units of the working tree, started and healthy.
 boot_cp() {
@@ -349,6 +373,9 @@ sc_restart() {
   journal_clean restart "$since"
 
   sc_restart_backup
+  sc_restart_running_strand
+  sc_restart_stop_timeout
+  sc_restart_saturated
   assert_active restart
   say "restart: ok"
 }
@@ -380,6 +407,89 @@ sc_restart_backup() {
 }
 # A oneshot service is "activating" while its ExecStart runs.
 backup_active() { [[ $(dx "$1" systemctl is-active ubicloud-backup.service) == activating ]]; }
+
+# field N "SECONDS RESULT STATUS": one field of stop_respirate's output.
+field() { cut -d' ' -f"$1" <<<"$2"; }
+
+# TERM while one strand is running, here blocked in a query on the
+# vm_host lock. respirate stops scanning, gives running strands 2 s and
+# then exits, but Ruby cannot end a thread that waits in a database
+# query, so the exit waits for that query. The lock is released 8 s into
+# the stop: the stop must end soon after, without a SIGKILL.
+sc_restart_running_strand() {
+  local r t out
+  hold_vm_host_lock restart 600
+  poke_strand restart
+  wait_for 30 blocked_at_least restart 1 >/dev/null || fail "restart: no strand blocked on the lock"
+  out=$(mktemp)
+  stop_respirate restart "running strand" >"$out" &
+  sleep 8
+  [[ $(dx restart systemctl is-active ubicloud-respirate || true) == deactivating ]] ||
+    fail "restart: respirate stopped while its strand was still in a query"
+  release_vm_host_lock restart
+  wait $! || fail "restart: stop with a running strand failed"
+  r=$(cat "$out")
+  rm -f "$out"
+  say "restart: stop with a running strand, lock released after 8 s: ${r%% *}s, Result=$(field 2 "$r"), status $(field 3 "$r")"
+  echo "stop with one running strand, lock released after 8 s: $r (seconds Result status)" >>"$LOGS/kill-times.txt"
+  [[ $(field 2 "$r") != timeout ]] || fail "restart: stop with a running strand hit TimeoutStopSec"
+  awk -v t="${r%% *}" 'BEGIN { exit !(t < 20) }' || fail "restart: stop with a running strand took ${r%% *}s"
+  dx restart systemctl reset-failed ubicloud-respirate
+  dx restart systemctl start ubicloud-respirate
+  t=$(wait_for 150 strand_ran restart) || fail "restart: the interrupted strand did not run again within 150 s"
+  say "restart: the interrupted strand ran again ${t}s after the restart"
+  echo "interrupted strand (lock released) ran again ${t}s after respirate restarted" >>"$LOGS/kill-times.txt"
+}
+
+# A strand whose query outlasts TimeoutStopSec: systemd SIGKILLs
+# respirate, and the strand runs again only once its 120 s lease has
+# expired. A drop-in shortens TimeoutStopSec to 10 s for this case.
+sc_restart_stop_timeout() {
+  local r t
+  dx restart bash -c 'mkdir -p /run/systemd/system/ubicloud-respirate.service.d &&
+    printf "[Service]\nTimeoutStopSec=10\n" >/run/systemd/system/ubicloud-respirate.service.d/harness.conf &&
+    systemctl daemon-reload'
+  hold_vm_host_lock restart 600
+  poke_strand restart
+  wait_for 30 blocked_at_least restart 1 >/dev/null || fail "restart: no strand blocked on the lock"
+  r=$(stop_respirate restart "stop timeout")
+  release_vm_host_lock restart
+  dx restart bash -c 'rm -r /run/systemd/system/ubicloud-respirate.service.d && systemctl daemon-reload'
+  say "restart: stop with a strand in a query past TimeoutStopSec=10: ${r%% *}s, Result=$(field 2 "$r")"
+  echo "stop with a strand in a query past TimeoutStopSec=10: $r (seconds Result status)" >>"$LOGS/kill-times.txt"
+  [[ $(field 2 "$r") == timeout ]] || fail "restart: expected a stop timeout, got $r"
+  dx restart systemctl reset-failed ubicloud-respirate
+  dx restart systemctl start ubicloud-respirate
+  t=$(wait_for 150 strand_ran restart) || fail "restart: the killed strand did not run again within 150 s"
+  say "restart: the strand of the killed respirate ran again ${t}s after the restart (lease)"
+  echo "strand of a SIGKILLed respirate ran again ${t}s after respirate restarted" >>"$LOGS/kill-times.txt"
+}
+# TERM while every dispatcher thread runs a strand and the strand queue is
+# full: the scan thread blocks pushing to the queue, so respirate cannot
+# begin its shutdown, and apoptosis (91 s after the first of those
+# strands started) ends it with exit status 2. TimeoutStopSec=100 covers
+# that, so the stop ends without a SIGKILL.
+sc_restart_saturated() {
+  local r t
+  hold_vm_host_lock restart 600
+  psql_q restart "INSERT INTO strand (id, prog, label, stack, schedule)
+    SELECT gen_random_uuid(), 'LogVmHostUtilizations', 'wait', '[{\"harness\": 1}]', now() FROM generate_series(1, 60)" >/dev/null
+  wait_for 30 blocked_at_least restart 1 >/dev/null || fail "restart: the strands did not block on the lock"
+  sleep 5
+  r=$(stop_respirate restart "saturated")
+  release_vm_host_lock restart
+  say "restart: stop with every thread busy: ${r%% *}s, Result=$(field 2 "$r"), status $(field 3 "$r")"
+  echo "stop with every dispatcher thread busy: $r (seconds Result status)" >>"$LOGS/kill-times.txt"
+  [[ $(field 2 "$r") != timeout ]] || fail "restart: the saturated stop hit TimeoutStopSec"
+  [[ $(field 3 "$r") == 2 ]] || fail "restart: the saturated stop did not end by apoptosis: $r"
+  awk -v t="${r%% *}" 'BEGIN { exit !(t < 100) }' || fail "restart: the saturated stop took ${r%% *}s"
+  psql_q restart "DELETE FROM strand WHERE stack @> '[{\"harness\": 1}]'" >/dev/null
+  dx restart systemctl reset-failed ubicloud-respirate
+  dx restart systemctl start ubicloud-respirate
+  poke_strand restart
+  t=$(wait_for 150 strand_ran restart) || fail "restart: no strand ran within 150 s after the saturated stop"
+  say "restart: strands ran again ${t}s after the restart"
+}
 
 sc_reboot() {
   local t since

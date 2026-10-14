@@ -22,9 +22,15 @@ Environment=RESTART_MAX_SLEEP=2
 ExecStart=/opt/ubicloud/tools/bin/ruby bin/restarter bin/respirate
 Restart=always
 RestartSec=1
-# TERM goes to bin/restarter only, which forwards it to respirate for a
-# graceful dispatcher shutdown. A strand may run for about 91 s before
-# apoptosis, so the stop timeout must exceed that before the SIGKILL.
+# TERM goes to bin/restarter only, which forwards it to respirate.
+# respirate stops taking strands, gives running ones 2 s, then exits 1,
+# though a strand thread inside a database query holds the exit until
+# that query returns. When every dispatcher thread is busy, the scan
+# thread cannot start the shutdown at all, and apoptosis ends respirate
+# with status 2 up to 91 s after the oldest strand started. The stop
+# timeout covers that before the SIGKILL; a strand interrupted by the
+# SIGKILL runs again once its 120 s lease expires. The harness measures
+# each case (scripts/byoh/test, restart scenario).
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=100
