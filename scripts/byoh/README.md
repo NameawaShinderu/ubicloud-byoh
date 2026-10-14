@@ -33,7 +33,27 @@ can `ssh root@<data-plane-host>`.
 - Sudo-capable user account on the target host.
 - Outbound internet for apt + rubygems + npm + ubuntu image downloads.
 
-## Usage — control plane
+## Packaged control plane (`install.sh`, M3, in progress)
+
+`install.sh` installs the control plane as root-owned releases under
+`/opt/ubicloud`, run by systemd as user `ubicloud`, with database
+`ubicloud` on peer authentication and settings in `/etc/ubicloud/env`.
+It is safe to re-run and keeps no marker files. This build supports
+`--tls none` only; the TLS fronts, `ubicloud-admin` and the migration
+from the development bootstrap come later in M3, so the live control
+plane keeps using `bootstrap-ctrl-plane.sh` for now. It has run only in
+the container harness (`scripts/byoh/test/`); on a real machine it is
+UNVERIFIED.
+
+```bash
+sudo bash scripts/byoh/install.sh --version v0.1.0 --url http://localhost:3000 \
+  --tls none --admin-email ops@example.com --source-git ~/ubicloud --ref HEAD \
+  --backup-recipient age1...
+```
+
+`bash scripts/byoh/install.sh --help` lists every flag.
+
+## Usage — control plane (development bootstrap)
 
 ```bash
 # On the target host (as a sudo-capable user, NOT as root):

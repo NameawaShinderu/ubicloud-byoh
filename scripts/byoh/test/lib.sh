@@ -91,6 +91,7 @@ stage_art() {
   mkdir -p "$ART/packaging"
   cp -r "$WT/packaging/systemd" "$ART/packaging/"
   cp "$HARNESS_DIR/fixture.sh" "$ART/fixture.sh"
+  cp "$WT/scripts/byoh/install.sh" "$ART/install.sh"
   cp "$WT/mise.toml" "$ART/mise.toml"
   chmod -R a+rX "$ART"
 }

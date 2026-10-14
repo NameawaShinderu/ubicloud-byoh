@@ -4,12 +4,15 @@
 # the ubi-test-net network, with no published ports.
 #
 #   run.sh --prepare-image     build ubi-m3-systemd (Dockerfile.systemd)
-#   run.sh --prepare-tools     ubi-m3-tools: packages, mise, ruby, node
-#   run.sh --prepare-release   ubi-m3-release: a release of the working
-#                              tree, its database, env and units, stopped
+#   run.sh --prepare-tools     ubi-m3-tools: install.sh --stage tools
+#                              (packages, mise, ruby, node)
+#   run.sh --prepare-release   ubi-m3-release: install.sh of the working
+#                              tree (release t1, database, env, units),
+#                              stopped
 #   run.sh SCENARIO...         run scenarios, each in a fresh container
 #
-# Scenarios: envfmt verify smoke kill restart reboot (or "all").
+# Scenarios: envfmt verify fresh rerun flags smoke kill restart reboot
+# (or "all").
 # Logs go to $UBI_M3_LOGS (default: a fresh temp dir, printed at the
 # end). UBI_M3_KEEP=1 keeps the containers for inspection.
 set -euo pipefail
@@ -27,20 +30,43 @@ prepare_image() {
 
 prepare_tools() {
   stage_art
+  src_tarball
   start_sys tools-build ubi-m3-systemd
-  dx tools-build bash /art/fixture.sh tools >"$LOGS/prepare-tools.log" 2>&1 ||
+  dx tools-build bash /art/install.sh --stage tools --source-tarball /art/src.tgz \
+    --source-rev "$(cat "$ART/src.rev")" --skip-check clock >"$LOGS/prepare-tools.log" 2>&1 ||
     fail "tools stage failed, see $LOGS/prepare-tools.log"
   dx tools-build systemctl stop postgresql
   docker commit -c 'CMD ["/sbin/init"]' ubi-m3-tools-build ubi-m3-tools >/dev/null
-  say "committed ubi-m3-tools: $(tail -2 "$LOGS/prepare-tools.log" | tr '\n' ' ')"
+  say "committed ubi-m3-tools: $(tail -3 "$LOGS/prepare-tools.log" | tr '\n' ' ')"
+}
+
+# The arguments of every install.sh run in the harness. The backup
+# recipient is generated in the container by backup_key.
+INSTALL_ARGS=(--version t1 --url http://localhost:3000 --tls none --admin-email ops@example.test
+  --backup-recipient-file /root/backup-recipient --skip-check clock)
+
+# install_cp NAME [ARGS...]: runs install.sh in ubi-m3-NAME with the
+# harness arguments, the source tarball of $ART and ARGS; the output
+# goes to stdout.
+install_cp() {
+  local name=$1
+  shift
+  dx "$name" bash /art/install.sh "${INSTALL_ARGS[@]}" --source-tarball /art/src.tgz \
+    --source-rev "$(cat "$ART/src.rev")" "$@"
+}
+
+backup_key() {
+  dx "$1" bash -c 'test -e /root/backup-key || { age-keygen -o /root/backup-key 2>/dev/null &&
+    age-keygen -y /root/backup-key >/root/backup-recipient; }'
 }
 
 prepare_release() {
   stage_art
   src_tarball
   start_sys release-build ubi-m3-tools
-  dx release-build bash /art/fixture.sh release t1 >"$LOGS/prepare-release.log" 2>&1 ||
-    fail "release stage failed, see $LOGS/prepare-release.log"
+  backup_key release-build
+  install_cp release-build >"$LOGS/prepare-release.log" 2>&1 ||
+    fail "install.sh failed, see $LOGS/prepare-release.log"
   dx release-build systemctl stop ubicloud.target postgresql
   docker commit -c 'CMD ["/sbin/init"]' ubi-m3-release-build ubi-m3-release >/dev/null
   say "committed ubi-m3-release (rev $(cat "$ART/src.rev"))"
@@ -105,6 +131,14 @@ stop_respirate() {
   local t
   t=$(timed dx "$1" systemctl stop ubicloud-respirate) || fail "$2: systemctl stop failed"
   echo "$t $(dx "$1" systemctl show -p Result --value ubicloud-respirate) $(dx "$1" systemctl show -p ExecMainStatus --value ubicloud-respirate)"
+}
+
+# release_rev_to_art NAME: makes the release's own rev the --source-rev
+# of the next install_cp, so that a rerun matches the installed release
+# even when the working tree has moved on. install.sh then reads only
+# mise.toml and bin/byoh-smtp-url from the tarball.
+release_rev_to_art() {
+  dx "$1" sed -n 's/^rev=//p' /opt/ubicloud/current/.ubicloud-release >"$ART/src.rev"
 }
 
 # boot_cp NAME: a fresh control plane from ubi-m3-release, with the
@@ -258,6 +292,292 @@ sc_verify() {
   say "verify: ok"
 }
 
+# Lists the managed files whose bytes a rerun must not change.
+SETTINGS_FILES="/etc/ubicloud/env /etc/ubicloud/backup.conf /etc/ubicloud/backup-recipients
+  /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/pg_ident.conf
+  /etc/systemd/system/ubicloud*"
+settings_sums() { dx "$1" bash -c "sha256sum ${SETTINGS_FILES//$'\n'/ }"; }
+service_pids() { echo "$(main_pid "$1" ubicloud-web) $(main_pid "$1" ubicloud-respirate)"; }
+
+# psql_as NAME OSUSER ARGS...: psql -c 'SELECT 1' as OSUSER; succeeds
+# only when postgres lets that login in.
+psql_as() {
+  local name=$1 user=$2
+  shift 2
+  dx "$name" runuser -u "$user" -- psql -X -tA "$@" -c 'SELECT 1' >/dev/null 2>&1
+}
+
+# One-command install from the tools image (packages, ruby and node
+# already there): a release of the working tree, the database, the env
+# file, migrations and the units, started.
+sc_fresh() {
+  local out since t
+  stage_art
+  src_tarball
+  start_sys fresh ubi-m3-tools
+  since=$(dx fresh date '+%F %T')
+  backup_key fresh
+  install_cp fresh >"$LOGS/fresh-install.log" 2>&1 || fail "fresh: install.sh failed, see $LOGS/fresh-install.log"
+  grep -E '^(ok|changed|skip|warn|notice) ' "$LOGS/fresh-install.log" | tee -a "$LOGS/harness.log" >/dev/null
+  t=$(wait_for 180 web_up fresh) || fail "fresh: web did not answer within 180 s"
+  say "fresh: install done, web answers after ${t}s more"
+  assert_active fresh
+  [[ $(dx fresh systemctl is-enabled ubicloud.target) == enabled ]] || fail "fresh: ubicloud.target is not enabled"
+  [[ $(dx fresh systemctl is-enabled ubicloud-monitor || true) == disabled ]] || fail "fresh: ubicloud-monitor is not disabled"
+  out=$(dx fresh ss -Htln | grep -E ':3000\b' || true)
+  [[ $out == *"127.0.0.1:3000"* && $out != *"0.0.0.0:3000"* && $out != *"[::]:3000"* ]] ||
+    fail "fresh: puma listens on: $out"
+  [[ $(dx fresh runuser -u postgres -- psql -XtAc 'SHOW listen_addresses') == localhost ]] ||
+    fail "fresh: postgres listen_addresses is not localhost"
+
+  # Roles and authentication (M3-e).
+  out=$(dx fresh runuser -u postgres -- psql -XtAc "SELECT string_agg(rolname || ':' || rolsuper || rolcreatedb || rolcreaterole, ' ' ORDER BY rolname) FROM pg_roles WHERE rolname LIKE 'ubicloud%'")
+  [[ $out == "ubicloud:falsefalsefalse ubicloud_password:falsefalsefalse" ]] || fail "fresh: roles are $out"
+  out=$(dx fresh sed -n '/^# BEGIN ubicloud$/,/^# END ubicloud$/p' /etc/postgresql/16/main/pg_hba.conf)
+  [[ -n $out && $out != *trust* && $out != *md5* && $out != *scram* ]] || fail "fresh: the managed hba block: $out"
+  [[ $(dx fresh grep -v -e '^#' -e '^[[:space:]]*$' /etc/postgresql/16/main/pg_hba.conf | head -1) == "local ubicloud postgres peer" ]] ||
+    fail "fresh: the managed hba block is not the first rule"
+  psql_as fresh ubicloud -d ubicloud || fail "fresh: ubicloud cannot log in as role ubicloud"
+  psql_as fresh ubicloud-migrate -d ubicloud -U ubicloud_password || fail "fresh: ubicloud-migrate cannot log in as ubicloud_password"
+  psql_as fresh ubicloud -d ubicloud -U ubicloud_password && fail "fresh: ubicloud logged in as ubicloud_password"
+  psql_as fresh ubicloud -d ubicloud -h 127.0.0.1 && fail "fresh: a TCP login to ubicloud was accepted"
+  psql_as fresh postgres -d ubicloud -h 127.0.0.1 && fail "fresh: a TCP login as postgres to ubicloud was accepted"
+  say "fresh: roles not superuser, peer map only, password role refused to ubicloud, TCP refused"
+
+  # Files and ownership (M3-b, M3-n).
+  out=$(dx fresh stat -c '%U:%G %a %n' /etc/ubicloud/env /etc/ubicloud/backup.conf)
+  [[ $out == "root:root 600 /etc/ubicloud/env"$'\n'"root:root 600 /etc/ubicloud/backup.conf" ]] ||
+    fail "fresh: settings files are $out"
+  dx fresh grep -q '^PRY_ALLOW_UNAUDITED=' /etc/ubicloud/env && fail "fresh: the env file sets PRY_ALLOW_UNAUDITED"
+  dx fresh grep -q '^GIT_REV=' /etc/ubicloud/env && fail "fresh: the env file sets GIT_REV"
+  for k in RACK_ENV CLOVER_DATABASE_URL CLOVER_SESSION_SECRET CLOVER_COLUMN_ENCRYPTION_KEY CLOVER_RUNTIME_TOKEN_SECRET \
+    BASE_URL ADMIN_URL BIND PORT DB_POOL_WEB MAIL_DRIVER MAIL_FROM BOOT_IMAGE_SOURCE DELETED_RECORD_DROP_UNARCHIVED \
+    ALLOW_UNSPREAD_SERVERS BILLING_RATES_EXTRA_DIR; do
+    dx fresh grep -q "^$k='" /etc/ubicloud/env || fail "fresh: the env file has no $k"
+  done
+  dx fresh grep -q '^IP_FROM_HEADER=' /etc/ubicloud/env && fail "fresh: --tls none set IP_FROM_HEADER"
+  dx fresh runuser -u ubicloud -- touch /opt/ubicloud/current/x 2>/dev/null && fail "fresh: ubicloud could write the release"
+  out=$(dx fresh runuser -u ubicloud -- find /opt/ubicloud -xdev ! -type l -writable -print -quit)
+  [[ -z $out ]] || fail "fresh: ubicloud can write $out"
+  out=$(dx fresh runuser -u ubicloud-migrate -- find /opt/ubicloud -xdev ! -type l -writable -print -quit)
+  [[ -z $out ]] || fail "fresh: ubicloud-migrate can write $out"
+  out=$(dx fresh find /opt/ubicloud -xdev ! -user root -print -quit)
+  [[ -z $out ]] || fail "fresh: $out is not owned by root"
+  dx fresh test -s /var/backups/ubicloud/KEYS-README.txt || fail "fresh: no KEYS-README.txt"
+  dx fresh cmp -s /root/backup-recipient /etc/ubicloud/backup-recipients || fail "fresh: backup recipients not installed"
+  out=$(dx fresh find / -xdev -name '*ubi-bootstrap*' -print -quit)
+  [[ -z $out ]] || fail "fresh: found $out"
+  say "fresh: env and backup.conf root 0600 with the full key set, release and tools read-only and root-owned"
+
+  # bundler's settings hold without bundle exec, and both groups load.
+  out=$(dx fresh bash -c 'cd /opt/ubicloud/current && cat .bundle/config')
+  [[ $out == *'BUNDLE_DEPLOYMENT: "true"'* && $out == *'BUNDLE_WITHOUT: "test:rubocop'* ]] ||
+    fail "fresh: .bundle/config is $out"
+
+  # The BYOH config check, as the services run it.
+  dx fresh bash /art/fixture.sh as-service bin/byoh-config-check >"$LOGS/fresh-config-check.txt" 2>&1 || true
+  grep -q '^ok   database role ubicloud: not a superuser' "$LOGS/fresh-config-check.txt" ||
+    fail "fresh: byoh-config-check role check: $(cat "$LOGS/fresh-config-check.txt")"
+  if grep -q '^fail' "$LOGS/fresh-config-check.txt"; then
+    fail "fresh: byoh-config-check fails: $(grep '^fail' "$LOGS/fresh-config-check.txt")"
+  fi
+  say "fresh: byoh-config-check has no fail ($(grep -c '^ok' "$LOGS/fresh-config-check.txt") ok, $(grep -c '^warn' "$LOGS/fresh-config-check.txt") warn)"
+
+  # M3-p: the committed Sequel caches match the migrated schema. The
+  # refresh runs in a scratch copy, never in the release.
+  dx fresh bash -c 'rm -rf /var/tmp/cc && cp -a /opt/ubicloud/releases/t1 /var/tmp/cc && chown -R -h ubicloud-migrate /var/tmp/cc'
+  dx fresh env FIXTURE_CWD=/var/tmp/cc FIXTURE_SETENV=FORCE_AUTOLOAD=1 \
+    bash /art/fixture.sh as-migrate bin/rake-task-runner refresh_sequel_caches >"$LOGS/fresh-caches.log" 2>&1 ||
+    fail "fresh: refresh_sequel_caches failed, see $LOGS/fresh-caches.log"
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  out=$(dx fresh bash -c 'for f in /opt/ubicloud/current/cache/*.cache; do cmp -s "$f" "/var/tmp/cc/cache/${f##*/}" || echo "${f##*/}"; done')
+  [[ -z $out ]] || fail "fresh: the shipped Sequel caches differ from the migrated schema: $out"
+  dx fresh rm -rf /var/tmp/cc
+  say "fresh: the shipped cache/*.cache match a refresh against the installed schema"
+
+  printf '%s\n' "$PASSWORD" | dx fresh bash /art/fixture.sh account "$EMAIL" >"$LOGS/fresh-account.txt" 2>&1 ||
+    fail "fresh: account create: $(cat "$LOGS/fresh-account.txt")"
+  out=$(login fresh) || fail "fresh: login request failed"
+  [[ $out == "302 http://localhost:3000/after-login" ]] || fail "fresh: login: $out"
+  say "fresh: account created, login ok ($out)"
+  poke_strand fresh
+  wait_for 60 strand_ran fresh >/dev/null || fail "fresh: respirate ran no strand"
+  journal_clean fresh "$since"
+  say "fresh: ok"
+}
+
+# install.sh again on an installed control plane: identical arguments
+# change nothing; a setting that differs from the flags exits 2 until
+# --update-env; another version exits 2.
+sc_rerun() {
+  local sums pids out rc since
+  boot_cp rerun
+  since=$(dx rerun date '+%F %T')
+  src_tarball
+  release_rev_to_art rerun
+  sums=$(settings_sums rerun)
+  pids=$(service_pids rerun)
+  install_cp rerun >"$LOGS/rerun-same.log" 2>&1 || fail "rerun: install.sh failed, see $LOGS/rerun-same.log"
+  grep -q '^changed ' "$LOGS/rerun-same.log" && fail "rerun: identical arguments changed: $(grep '^changed ' "$LOGS/rerun-same.log")"
+  [[ $(settings_sums rerun) == "$sums" ]] || fail "rerun: identical arguments changed a managed file"
+  [[ $(service_pids rerun) == "$pids" ]] || fail "rerun: identical arguments restarted a service"
+  say "rerun: identical arguments: exit 0, nothing changed, MainPIDs $pids kept"
+
+  rc=0
+  install_cp rerun --version t2 >"$LOGS/rerun-t2.log" 2>&1 || rc=$?
+  [[ $rc == 2 ]] || fail "rerun: --version t2 exited $rc, not 2"
+  grep -q 'release switch' "$LOGS/rerun-t2.log" || fail "rerun: --version t2: $(cat "$LOGS/rerun-t2.log")"
+  dx rerun test ! -e /opt/ubicloud/releases/t2 || fail "rerun: --version t2 built a release"
+  say "rerun: --version t2 exits 2 and points at the release switch"
+
+  rc=0
+  install_cp rerun --mail-from other@example.test >"$LOGS/rerun-mailfrom.log" 2>&1 || rc=$?
+  [[ $rc == 2 ]] || fail "rerun: a different --mail-from exited $rc, not 2"
+  grep -q "key MAIL_FROM differs; edit with 'ubicloud-admin env set MAIL_FROM' or pass --update-env MAIL_FROM" "$LOGS/rerun-mailfrom.log" ||
+    fail "rerun: a different --mail-from: $(cat "$LOGS/rerun-mailfrom.log")"
+  grep -q 'ops@example.test' "$LOGS/rerun-mailfrom.log" && fail "rerun: install.sh printed a value"
+  [[ $(settings_sums rerun) == "$sums" ]] || fail "rerun: a refused run changed a managed file"
+  say "rerun: a different --mail-from exits 2 naming the key only"
+
+  install_cp rerun --mail-from other@example.test --update-env MAIL_FROM >"$LOGS/rerun-update.log" 2>&1 ||
+    fail "rerun: --update-env MAIL_FROM failed, see $LOGS/rerun-update.log"
+  grep -q '^changed settings: /etc/ubicloud/env: updated MAIL_FROM$' "$LOGS/rerun-update.log" ||
+    fail "rerun: --update-env: $(cat "$LOGS/rerun-update.log")"
+  grep -q 'other@example.test' "$LOGS/rerun-update.log" && fail "rerun: install.sh printed a value"
+  [[ $(dx rerun grep '^MAIL_FROM=' /etc/ubicloud/env) == "MAIL_FROM='other@example.test'" ]] || fail "rerun: MAIL_FROM not updated"
+  [[ $(dx rerun stat -c '%U:%G %a' /etc/ubicloud/env) == "root:root 600" ]] || fail "rerun: the env file mode changed"
+  wait_for 120 web_up rerun >/dev/null || fail "rerun: web down after --update-env"
+  [[ $(service_pids rerun) != "$pids" ]] || fail "rerun: --update-env did not restart the services"
+  say "rerun: --update-env MAIL_FROM updated the key and restarted the services"
+
+  # A key the env file lacks is appended by name; a value is never shown.
+  dx rerun sed -i '/^DB_POOL_WEB=/d' /etc/ubicloud/env
+  install_cp rerun --mail-from other@example.test >"$LOGS/rerun-add.log" 2>&1 || fail "rerun: re-adding a key failed"
+  grep -q '^changed settings: /etc/ubicloud/env: added DB_POOL_WEB$' "$LOGS/rerun-add.log" ||
+    fail "rerun: re-adding a key: $(cat "$LOGS/rerun-add.log")"
+
+  # M3-q: the services never run with the console's opt-in.
+  sums=$(settings_sums rerun)
+  dx rerun bash -c "echo \"PRY_ALLOW_UNAUDITED='true'\" >>/etc/ubicloud/env"
+  rc=0
+  install_cp rerun --mail-from other@example.test >"$LOGS/rerun-pry.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q 'PRY_ALLOW_UNAUDITED' "$LOGS/rerun-pry.log"; then
+    fail "rerun: PRY_ALLOW_UNAUDITED in the env file: exit $rc"
+  fi
+  dx rerun sed -i '/^PRY_ALLOW_UNAUDITED=/d' /etc/ubicloud/env
+  # A malformed line is refused without echoing it.
+  dx rerun bash -c "echo 'SMTP_PASSWORD=\"s3cret-value\"' >>/etc/ubicloud/env"
+  rc=0
+  install_cp rerun --mail-from other@example.test >"$LOGS/rerun-bad.log" 2>&1 || rc=$?
+  if [[ $rc != 1 ]] || ! grep -q "is not KEY='value'" "$LOGS/rerun-bad.log"; then
+    fail "rerun: a malformed env line: exit $rc"
+  fi
+  grep -q 's3cret-value' "$LOGS/rerun-bad.log" && fail "rerun: install.sh printed a malformed line's value"
+  dx rerun sed -i '/^SMTP_PASSWORD=/d' /etc/ubicloud/env
+  [[ $(settings_sums rerun) == "$sums" ]] || fail "rerun: the refused runs changed a managed file"
+  say "rerun: PRY_ALLOW_UNAUDITED and a malformed line are refused without showing values"
+
+  # A lost env file with a migrated database: no new column key.
+  dx rerun mv /etc/ubicloud/env /root/env.saved
+  rc=0
+  install_cp rerun --mail-from other@example.test >"$LOGS/rerun-noenv.log" 2>&1 || rc=$?
+  if [[ $rc != 1 ]] || ! grep -q 'restore the env file' "$LOGS/rerun-noenv.log"; then
+    fail "rerun: a missing env file with a migrated database: exit $rc"
+  fi
+  dx rerun test ! -e /etc/ubicloud/env || fail "rerun: a refused run wrote a new env file"
+  dx rerun mv /root/env.saved /etc/ubicloud/env
+  say "rerun: a missing env file with a migrated database is refused"
+
+  # The same version from another rev is refused before anything changes.
+  echo 0000000000000000000000000000000000000000 >"$ART/src.rev"
+  rc=0
+  install_cp rerun --mail-from other@example.test >"$LOGS/rerun-rev.log" 2>&1 || rc=$?
+  [[ $rc == 2 ]] || fail "rerun: another rev exited $rc, not 2"
+  assert_active rerun
+  journal_clean rerun "$since"
+  say "rerun: ok"
+}
+
+# The install.sh paths that fresh does not take: usage errors, a git
+# source owned by another user, an SMTP URL file, a billing-rates
+# directory, development mode, --no-start and a postgres that listens on
+# every address.
+sc_flags() {
+  local rc out rev
+  stage_art
+  src_tarball
+  start_sys flags ubi-m3-tools
+  backup_key flags
+  # Usage errors exit 2 before anything changes.
+  local spec bad=()
+  for spec in "--mgmt-endpoint cp.example.test:51820" "--smtp smtp://u:p@h" "--tls acme" \
+    "--url https://cp.example.test" "--version bad/version" "--backup-target s3://bucket" \
+    "--cert /etc/hostname" "--import-env-rb /etc/hostname" "--stage release"; do
+    read -ra bad <<<"$spec"
+    rc=0
+    install_cp flags "${bad[@]}" >"$LOGS/flags-usage.log" 2>&1 || rc=$?
+    [[ $rc == 2 ]] || fail "flags: ${bad[*]} exited $rc, not 2: $(cat "$LOGS/flags-usage.log")"
+  done
+  rc=0
+  dx flags bash /art/install.sh "${INSTALL_ARGS[@]}" >"$LOGS/flags-usage.log" 2>&1 || rc=$?
+  [[ $rc == 2 ]] || fail "flags: no source exited $rc, not 2"
+  dx flags test ! -e /etc/ubicloud || fail "flags: a refused run created /etc/ubicloud"
+  say "flags: usage errors exit 2 and change nothing"
+
+  # A git checkout owned by another user, as on the live control plane.
+  dx flags bash -c 'useradd -m dev && install -d -o dev -g dev /home/dev/repo &&
+    runuser -u dev -- tar -xzf /art/src.tgz -C /home/dev/repo &&
+    cd /home/dev/repo && runuser -u dev -- git init -q &&
+    runuser -u dev -- git add -A && runuser -u dev -- git -c user.email=dev@example.test -c user.name=dev commit -qm src'
+  rev=$(dx flags bash -c 'cd /home/dev/repo && runuser -u dev -- git rev-parse HEAD')
+  # The SMTP URL file must be 0600; the password must never be printed.
+  dx flags bash -c "printf 'smtp://mailer:p%%40ss-w0rd@mail.example.test:2525?tls=off\n' >/root/smtp && chmod 0644 /root/smtp &&
+    mkdir -p /root/rates && printf -- '- id: harness\n' >/root/rates/byoh-harness.yml"
+  local -a args=(--version t1 --url http://localhost:3000 --tls none --admin-email ops@example.test
+    --backup-recipient-file /root/backup-recipient --skip-check clock --source-git /home/dev/repo --ref HEAD
+    --smtp-file /root/smtp --billing-rates-dir /root/rates --rack-env development --no-start)
+  rc=0
+  dx flags bash /art/install.sh "${args[@]}" >"$LOGS/flags-smtp-mode.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q 'chmod 600' "$LOGS/flags-smtp-mode.log"; then
+    fail "flags: a 0644 --smtp-file exited $rc"
+  fi
+  dx flags chmod 0600 /root/smtp
+  # As an operator would: the stock commented line, above include_dir.
+  dx flags sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = '*'/" /etc/postgresql/16/main/postgresql.conf
+  dx flags systemctl restart postgresql@16-main
+  [[ $(dx flags runuser -u postgres -- psql -XtAc 'SHOW listen_addresses') == '*' ]] ||
+    fail "flags: could not make postgres listen on '*'"
+  dx flags bash /art/install.sh "${args[@]}" >"$LOGS/flags-install.log" 2>&1 ||
+    fail "flags: install.sh failed, see $LOGS/flags-install.log"
+  grep -q 'p@ss-w0rd\|p%40ss-w0rd' "$LOGS/flags-install.log" && fail "flags: install.sh printed the SMTP password"
+  [[ $(dx flags sed -n 's/^rev=//p' /opt/ubicloud/current/.ubicloud-release) == "$rev" ]] ||
+    fail "flags: the release rev is not the commit of --ref HEAD"
+  out=$(dx flags grep -E '^(RACK_ENV|MAIL_DRIVER|SMTP_[A-Z]*)=' /etc/ubicloud/env | sort | tr '\n' ' ')
+  [[ $out == "MAIL_DRIVER='smtp' RACK_ENV='development' SMTP_HOSTNAME='mail.example.test' SMTP_PASSWORD='p@ss-w0rd' SMTP_PORT='2525' SMTP_TLS='false' SMTP_USER='mailer' " ]] ||
+    fail "flags: env has ${out//p@ss-w0rd/<password>}"
+  [[ $(dx flags stat -c '%U:%G' /var/lib/ubicloud/billing_rates.d/byoh-harness.yml) == ubicloud:ubicloud ]] ||
+    fail "flags: the billing rates were not copied"
+  [[ $(dx flags runuser -u postgres -- psql -XtAc 'SHOW listen_addresses') == localhost ]] ||
+    fail "flags: listen_addresses is not localhost"
+  grep -q '^notice  database: restarting postgresql@16-main' "$LOGS/flags-install.log" || fail "flags: no restart notice"
+  [[ $(dx flags systemctl is-enabled ubicloud.target || true) != enabled ]] || fail "flags: --no-start enabled the target"
+  [[ $(dx flags systemctl is-active ubicloud-web || true) != active ]] || fail "flags: --no-start started web"
+  say "flags: git source as its owner, SMTP from a 0600 file (no password in the output), rates copied, listen fixed, --no-start"
+
+  # The same arguments again (the SMTP file is read again): nothing changes.
+  dx flags bash /art/install.sh "${args[@]}" >"$LOGS/flags-rerun.log" 2>&1 ||
+    fail "flags: rerun failed, see $LOGS/flags-rerun.log"
+  grep -q '^changed ' "$LOGS/flags-rerun.log" && fail "flags: rerun changed: $(grep '^changed ' "$LOGS/flags-rerun.log")"
+  # Development mode runs too: start it by hand.
+  dx flags systemctl start ubicloud.target
+  wait_for 180 web_up flags >/dev/null || fail "flags: web did not answer in development mode"
+  dx flags bash /art/install.sh --stage tools --source-git /home/dev/repo --ref HEAD --skip-check clock >"$LOGS/flags-tools.log" 2>&1 ||
+    fail "flags: --stage tools rerun failed"
+  grep -q '^changed ' "$LOGS/flags-tools.log" && fail "flags: --stage tools rerun changed something"
+  say "flags: reruns change nothing; development mode serves"
+  say "flags: ok"
+}
+
 sc_smoke() {
   local since out
   boot_cp smoke
@@ -313,9 +633,10 @@ sc_smoke() {
   local sums sums2 cab=/var/lib/ubicloud/var/ca_bundles/db_ca_bundle.crt
   sums=$(dx smoke sha256sum /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/pg_ident.conf)
   [[ $(dx smoke stat -c %U "$cab") == ubicloud ]] || fail "smoke: $cab not written by the services"
-  dx smoke sed -n 's/^rev=//p' /opt/ubicloud/current/.ubicloud-release >"$ART/src.rev"
-  dx smoke bash /art/fixture.sh release t1 >"$LOGS/smoke-rerun.log" 2>&1 ||
-    fail "smoke: release rerun failed, see $LOGS/smoke-rerun.log"
+  src_tarball
+  release_rev_to_art smoke
+  install_cp smoke >"$LOGS/smoke-rerun.log" 2>&1 ||
+    fail "smoke: install.sh rerun failed, see $LOGS/smoke-rerun.log"
   sums2=$(dx smoke sha256sum /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/pg_ident.conf)
   [[ $sums == "$sums2" ]] || fail "smoke: the rerun changed pg_hba.conf or pg_ident.conf"
   [[ $(dx smoke grep -c '^# BEGIN ubicloud$' /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/pg_ident.conf | cut -d: -f2 | sort -u) == 1 ]] ||
@@ -329,7 +650,7 @@ sc_smoke() {
   say "smoke: release rerun kept hba/ident, migrate and the services rewrote each other's ca_bundles"
   echo 0000000000000000000000000000000000000000 >"$ART/src.rev"
   local rc=0
-  dx smoke bash /art/fixture.sh release t1 >>"$LOGS/smoke-rerun.log" 2>&1 || rc=$?
+  install_cp smoke >>"$LOGS/smoke-rerun.log" 2>&1 || rc=$?
   [[ $rc == 2 ]] || fail "smoke: a release rerun with another rev exited $rc, not 2"
   say "smoke: a release rerun with another rev exits 2"
   assert_active smoke
@@ -562,8 +883,8 @@ for arg in "$@"; do
     --prepare-image) prepare_image ;;
     --prepare-tools) prepare_tools ;;
     --prepare-release) prepare_release ;;
-    all) for s in envfmt verify smoke kill restart reboot; do "sc_$s"; cleanup; done ;;
-    envfmt | verify | smoke | kill | restart | reboot)
+    all) for s in envfmt verify fresh rerun flags smoke kill restart reboot; do "sc_$s"; cleanup; done ;;
+    envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot)
       "sc_$arg"
       cleanup
       ;;

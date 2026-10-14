@@ -17,32 +17,36 @@ server.
 ```
 docker network create ubi-test-net              # once, if missing
 scripts/byoh/test/run.sh --prepare-image        # ubi-m3-systemd
-scripts/byoh/test/run.sh --prepare-tools        # ubi-m3-tools (ruby build, ~10 min)
-scripts/byoh/test/run.sh --prepare-release      # ubi-m3-release from the working tree
-scripts/byoh/test/run.sh all                    # or: envfmt verify smoke kill restart reboot
+scripts/byoh/test/run.sh --prepare-tools        # ubi-m3-tools: install.sh --stage tools (~4-10 min)
+scripts/byoh/test/run.sh --prepare-release      # ubi-m3-release: install.sh of the working tree
+scripts/byoh/test/run.sh all                    # or: envfmt verify fresh rerun flags smoke kill restart reboot
 ```
 
+`--prepare-tools` runs `scripts/byoh/install.sh --stage tools` (packages,
+pinned mise, Ruby and Node) on a bare `ubi-m3-systemd` container.
 `--prepare-release` archives the working tree (untracked, non-ignored
-files included) and builds release `t1` from it. Each scenario then boots
-a fresh container from that image and installs the units from the
-working tree's `packaging/systemd`. A change to the units needs no
-re-prepare, but a change to the code does.
+files included) and runs the full `install.sh` from that tarball, as
+release `t1`, with `--tls none` and a backup recipient generated in the
+container. Each scenario then boots a fresh container from one of those
+images. `boot_cp` installs the units of the working tree's
+`packaging/systemd` over the release's, so a change to the units needs no
+re-prepare, but a change to the code or to `install.sh`'s release steps
+does.
 
-`fixture.sh` is a test fixture that lays out tools, the release, the
-database, `/etc/ubicloud/env` and the units. `scripts/byoh/install.sh`
-(WP4) replaces it in the scenarios. Like the installer, it can run
-again: `release VERSION` skips the build when that version exists with
-the same rev and exits 2 when the rev differs, and it replaces the
-`# BEGIN ubicloud` .. `# END ubicloud` blocks in `pg_hba.conf` and
-`pg_ident.conf` instead of appending to them.
+`fixture.sh` holds test helpers only: `units` (the working tree's units),
+`account EMAIL` and `as-service`/`as-migrate CMD` (a command in the
+release with exactly the units' environment, parsed by systemd).
 
 ## Scenarios
 
 | Scenario | Checks |
 |---|---|
 | `envfmt` | systemd's `EnvironmentFile=` and bash's `set -a; . F` read the `KEY='value'` lines of `/etc/ubicloud/env` the same way. The run fails if the set of differing cases changes. |
+| `fresh` | One `install.sh` run on `ubi-m3-tools` (no release yet): units active and `ubicloud.target` enabled, monitor disabled, puma only on 127.0.0.1:3000, postgres `listen_addresses` localhost. Roles `ubicloud` and `ubicloud_password` are not superuser, createdb or createrole; the managed hba block is the first rule and has no trust or password method; OS user `ubicloud` gets role `ubicloud` but not `ubicloud_password`, `ubicloud-migrate` gets both, and TCP logins to database `ubicloud` are refused. `/etc/ubicloud/env` and `backup.conf` are root 0600, the env file has the full key set and no `PRY_ALLOW_UNAUDITED`, `GIT_REV` or (with `--tls none`) `IP_FROM_HEADER`. Nothing under `/opt/ubicloud` is writable by `ubicloud` or `ubicloud-migrate` or owned by anyone but root. `.bundle/config` carries deployment and the without-list. `byoh-config-check` has no fail and reports the role check ok. The shipped `cache/*.cache` equal a `refresh_sequel_caches` run (as `ubicloud-migrate`, in a scratch copy) against the installed schema. An account logs in. No `*ubi-bootstrap*` file exists. |
+| `rerun` | `install.sh` again with identical arguments: exit 0, no `changed` line, the env, backup, hba, ident and unit files byte for byte, the MainPIDs kept. `--version t2` exits 2 and names the release switch. A different `--mail-from` exits 2 naming only the key, and with `--update-env MAIL_FROM` updates it and restarts the services. A deleted key is appended by name. `PRY_ALLOW_UNAUDITED` in the env file, a malformed line, and another rev for `t1` exit non-zero without printing a value or changing a file. |
+| `flags` | Usage errors (`--mgmt-endpoint`, `--smtp` on argv, `--tls acme`, an https URL with `--tls none`, a bad version, an `s3://` target, `--cert`, `--import-env-rb`, an unknown stage, no source) exit 2 and create nothing. `--source-git` on a repository owned by another user, with `--ref HEAD`: the release rev is that commit. `--smtp-file` refuses mode 0644, and at 0600 writes `MAIL_DRIVER=smtp` and the `SMTP_*` keys without printing the password. `--billing-rates-dir` copies the files, owned by `ubicloud`. A postgres listening on `*` is set back to localhost with a restart notice. `--no-start` neither enables nor starts the target. A rerun and a `--stage tools` rerun change nothing, and `--rack-env development` serves. |
 | `verify` | `systemd-analyze verify` is clean (apart from the missing `ubicloud-admin`, until WP6). web and respirate are ordered after `postgresql@16-main` and `network-online.target` without `Requires=`. Monitor is installed but disabled. Without `ubicloud-admin`, `ubicloud-backup.service` is skipped on its condition, not failed. Writes the `systemd-analyze security` report. |
-| `smoke` | Every unit is active. An account is created and logs in over the two-step login. puma listens only on 127.0.0.1:3000, also with `BIND` and `PORT` removed from the env file. The release is read-only to `ubicloud`. web, respirate and monitor each run with no capabilities (effective and bounding) and NoNewPrivs. A rerun of `fixture.sh release` while the services run leaves `pg_hba.conf` and `pg_ident.conf` byte for byte, and its migrate as `ubicloud-migrate` rewrites the `var/ca_bundles` files web wrote; web then rewrites them again. A rerun with another rev exits 2. The journal has no Ruby errors. |
+| `smoke` | Every unit is active. An account is created and logs in over the two-step login. puma listens only on 127.0.0.1:3000, also with `BIND` and `PORT` removed from the env file. The release is read-only to `ubicloud`. web, respirate and monitor each run with no capabilities (effective and bounding) and NoNewPrivs. A rerun of `install.sh` while the services run leaves `pg_hba.conf` and `pg_ident.conf` byte for byte, and its migrate as `ubicloud-migrate` rewrites the `var/ca_bundles` files web wrote; web then rewrites them again. A rerun with another rev exits 2. The journal has no Ruby errors. |
 | `kill` | A: SIGKILL to the respirate child; restarter keeps its PID and respawns within 4 s. B: `systemctl kill -s KILL`; a new MainPID within 5 s. Both: a strand runs within 150 s. |
 | `restart` | `systemctl restart ubicloud.target`. A stop while an idle child runs ends with `Result=success`. A stop while restarter sleeps between children ends quickly, with no ESRCH and no leftover process. A running backup (a stand-in drop-in) survives a restart and a stop of the target, and the stop pauses the timer. Then, with strands held in a query by a lock on `vm_host`: a stop with one running strand, a stop past a shortened `TimeoutStopSec`, and a stop with every dispatcher thread busy (below). |
 | `reboot` | `docker restart`: the target starts at boot, web answers, and strands run. A real VM reboot is UNVERIFIED. |
@@ -101,9 +105,9 @@ the review fixes.
   skipped on `ConditionFileIsExecutable=`, so the 03:15 run does not
   leave the system degraded.
 
-## Findings for `install.sh` (WP4)
+## Findings the installer handles
 
-The fixture hit these, and the installer must handle them the same way:
+The WP3 fixture hit these first; `scripts/byoh/install.sh` handles each:
 
 - mise adds `site_ruby/rubygems_plugin.rb`, which runs `mise reshim`
   after every gem install. With no mise on the PATH, `bundle install`
@@ -128,3 +132,35 @@ The fixture hit these, and the installer must handle them the same way:
   changed. Never append: a rerun would add a second copy.
 - A release that exists with the same rev is skipped, and with another
   rev the run exits 2 (M3-d), rather than failing in `mv`.
+
+`install.sh` itself added these (2026-10-14):
+
+- On noble `postgresql-contrib-16` is a virtual package that
+  `postgresql-16` provides, so `dpkg-query` never reports it installed
+  and every run would call apt. The package list names only
+  `postgresql-16`, which ships `citext` and `btree_gist`.
+- `loader.rb` connects to the database, so the "development group is
+  installed" check runs `Bundler.setup(:default, :development)` and
+  `require "pry"` instead of loading the app.
+- A subshell on the left of `||` runs without `set -e`: a failed `npm ci`
+  went unnoticed and the release had no `assets/css/app.css` (every page
+  500s). The build commands are chained with `&&`, and the build checks
+  that `app.css` exists. The build HOME is a temp dir `ubicloud` can
+  enter, not one under root's 0700 work dir.
+
+## install.sh results (2026-10-14, systemd 255.4-1ubuntu8.17, curl 8.5.0)
+
+One `run.sh all` after the last change, plus `flags` separately before it
+joined `all`:
+
+- `--prepare-tools` (bare ubuntu:24.04 with systemd): packages, mise
+  v2026.9.18 and Ruby 4.0.7 / Node 24.12.0 in about 3.5 min.
+- `fresh`: the one-command install (release build included) took under a
+  minute on `ubi-m3-tools`; web answered 4.1 s after it returned.
+- `byoh-config-check` on a fresh production install: 8 ok, 6 warn, no
+  fail. The warnings are expected: `BASE_URL` is localhost,
+  `CONTROL_PLANE_OUTBOUND_CIDRS` is open (M8), mail goes to the logger,
+  and the three audit-log tables end on 2027-01-01 (78 days).
+- The committed Sequel caches matched the installed schema byte for byte.
+- Every other scenario kept its WP3 results on a release that
+  `install.sh` built.
