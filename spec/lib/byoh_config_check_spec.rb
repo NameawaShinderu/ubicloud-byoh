@@ -11,7 +11,17 @@ RSpec.describe ByohConfigCheck do
   let(:checker) { new_checker }
 
   # The isolated role facts of a correctly set-up control plane.
-  let(:isolated) { {role: "ubicloud", superuser: false, ph_member: false, table0: false, table1: false, function0: false, function1: false} }
+  let(:isolated) {
+    {role: "ubicloud", superuser: false, createrole: false, createdb: false, bypassrls: false, ph_member: false}
+      .merge(described_class::HASH_TABLES.each_index.to_h { [:"table#{it}", false] })
+      .merge(described_class::HASH_FUNCTIONS.each_index.to_h { [:"function#{it}", false] })
+  }
+  let(:isolated_ok) { "database role ubicloud: not a superuser, not in ubicloud_password, no SELECT on account_password_hashes, account_previous_password_hashes, admin_password_hash, PUBLIC cannot execute the rodauth hash functions, no CREATEROLE/CREATEDB/BYPASSRLS" }
+
+  # Every table and function fact set to value.
+  def all_hash_facts(value)
+    isolated.to_h { |k, v| [k, k.match?(/\A(table|function)\d+\z/) ? value : v] }
+  end
 
   # The role facts that checkers made by new_checker report; nil queries
   # the real database.
@@ -49,7 +59,7 @@ RSpec.describe ByohConfigCheck do
       stub_good_config
       out = StringIO.new
       expect(new_checker(out:).run([])).to eq 0
-      expect(out.string).to include "ok   preflight: no BYOH warnings\n", "ok   database role ubicloud: password hashes are isolated\n", "ok   audit_log partitions end 2027-01-01 (365 days)\n"
+      expect(out.string).to include "ok   preflight: no BYOH warnings\n", "ok   #{isolated_ok}\n", "ok   audit_log partitions end 2027-01-01 (365 days)\n"
       expect(out.string.lines.map { it[0, 5] }.uniq).to eq ["ok   "]
     end
 
@@ -283,27 +293,46 @@ RSpec.describe ByohConfigCheck do
     end
 
     it "is ok for an isolated role" do
-      expect(role_messages).to eq [["ok", "database role ubicloud: password hashes are isolated"]]
+      expect(role_messages).to eq [["ok", isolated_ok]]
     end
 
     it "fails on membership of the password role and on readable hashes" do
-      expect(role_messages(isolated.merge(ph_member: true, table0: true, table1: true, function0: true, function1: true))).to eq [
+      expect(role_messages(all_hash_facts(true).merge(ph_member: true))).to eq [
         ["fail", "database role ubicloud is a member of ubicloud_password, so it can read password hashes"],
         ["fail", "database role ubicloud can SELECT account_password_hashes"],
+        ["fail", "database role ubicloud can SELECT account_previous_password_hashes"],
         ["fail", "database role ubicloud can SELECT admin_password_hash"],
+        ["fail", "PUBLIC can execute rodauth_get_salt(uuid)"],
         ["fail", "PUBLIC can execute rodauth_valid_password_hash(uuid,text)"],
+        ["fail", "PUBLIC can execute rodauth_get_previous_salt(uuid)"],
+        ["fail", "PUBLIC can execute rodauth_previous_password_hash_match(uuid,text)"],
+        ["fail", "PUBLIC can execute rodauth_admin_get_salt(uuid)"],
         ["fail", "PUBLIC can execute rodauth_admin_valid_password_hash(uuid,text)"],
       ]
     end
 
     it "fails when the password role, tables or functions are missing" do
-      expect(role_messages(isolated.merge(ph_member: nil, table0: nil, table1: nil, function0: nil, function1: nil))).to eq [
+      expect(role_messages(all_hash_facts(nil).merge(ph_member: nil))).to eq [
         ["fail", "database role ubicloud_password does not exist; password hashes are not isolated"],
         ["fail", "table account_password_hashes does not exist"],
+        ["fail", "table account_previous_password_hashes does not exist"],
         ["fail", "table admin_password_hash does not exist"],
-        ["fail", "function rodauth_valid_password_hash(uuid,text) does not exist"],
-        ["fail", "function rodauth_admin_valid_password_hash(uuid,text) does not exist"],
+        *described_class::HASH_FUNCTIONS.map { ["fail", "function #{it} does not exist"] },
       ]
+    end
+
+    it "warns about role attributes the services never need" do
+      expect(role_messages(isolated.merge(createrole: true, createdb: true, bypassrls: true))).to eq %w[CREATEROLE CREATEDB BYPASSRLS].map {
+        ["warn", "database role ubicloud has #{it}, which the services never need; ALTER ROLE ubicloud NO#{it}"]
+      }
+    end
+
+    it "checks every table and function the ph migrations protect against the real database" do
+      stub_role_facts(nil)
+      facts = checker.role_facts
+      expect(facts[:superuser]).to be true
+      expect(facts.keys).to eq isolated.keys
+      expect(facts.values_at(*isolated.keys.grep(/\A(table|function)\d+\z/))).to all(be(true).or(be(false)))
     end
   end
 

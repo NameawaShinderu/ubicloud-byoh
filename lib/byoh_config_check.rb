@@ -30,9 +30,26 @@ class ByohConfigCheck
 
   # Rodauth keeps password hashes away from the application role: only
   # the <role>_password role may read them, and only through these
-  # functions, which PUBLIC must not be able to execute.
-  HASH_TABLES = %w[account_password_hashes admin_password_hash].freeze
-  HASH_FUNCTIONS = %w[rodauth_valid_password_hash(uuid,text) rodauth_admin_valid_password_hash(uuid,text)].freeze
+  # functions, which PUBLIC must not be able to execute (migrate/ph).
+  HASH_TABLES = %w[account_password_hashes account_previous_password_hashes admin_password_hash].freeze
+  HASH_FUNCTIONS = %w[
+    rodauth_get_salt(uuid) rodauth_valid_password_hash(uuid,text)
+    rodauth_get_previous_salt(uuid) rodauth_previous_password_hash_match(uuid,text)
+    rodauth_admin_get_salt(uuid) rodauth_admin_valid_password_hash(uuid,text)
+  ].freeze
+
+  # Role attributes the services never need; a role with them can widen
+  # its own privileges or skip row security.
+  ROLE_ATTRIBUTES = {createrole: "CREATEROLE", createdb: "CREATEDB", bypassrls: "BYPASSRLS"}.freeze
+
+  ROLE_FACTS_SQL = <<~SQL.freeze
+    SELECT current_user AS role, r.rolsuper AS superuser,
+      r.rolcreaterole AS createrole, r.rolcreatedb AS createdb, r.rolbypassrls AS bypassrls,
+      pg_has_role(current_user, (SELECT oid FROM pg_roles WHERE rolname = current_user || '_password'), 'MEMBER') AS ph_member,
+      #{HASH_TABLES.each_index.map { "has_table_privilege(current_user, to_regclass(?), 'SELECT') AS table#{it}" }.join(", ")},
+      #{HASH_FUNCTIONS.each_index.map { "has_function_privilege('public', to_regprocedure(?), 'EXECUTE') AS function#{it}" }.join(", ")}
+    FROM pg_roles r WHERE r.rolname = current_user
+  SQL
 
   # root is the release directory, and code_owner the uid that must own
   # every entry in it outside var/.
@@ -81,18 +98,11 @@ class ByohConfigCheck
     ].compact
   end
 
-  # The privileges of the connected role that decide whether password
-  # hashes are isolated from it.
+  # The attributes and privileges of the connected role that decide
+  # whether password hashes are isolated from it. table<i> and
+  # function<i> follow HASH_TABLES and HASH_FUNCTIONS.
   def role_facts
-    DB.fetch(<<~SQL, HASH_TABLES[0], HASH_TABLES[1], HASH_FUNCTIONS[0], HASH_FUNCTIONS[1]).first
-      SELECT current_user AS role,
-        (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS superuser,
-        pg_has_role(current_user, (SELECT oid FROM pg_roles WHERE rolname = current_user || '_password'), 'MEMBER') AS ph_member,
-        has_table_privilege(current_user, to_regclass(?), 'SELECT') AS table0,
-        has_table_privilege(current_user, to_regclass(?), 'SELECT') AS table1,
-        has_function_privilege('public', to_regprocedure(?), 'EXECUTE') AS function0,
-        has_function_privilege('public', to_regprocedure(?), 'EXECUTE') AS function1
-    SQL
+    DB.fetch(ROLE_FACTS_SQL, *HASH_TABLES, *HASH_FUNCTIONS).first
   end
 
   private
@@ -242,6 +252,10 @@ class ByohConfigCheck
         when true then results << failure("database role #{role} can SELECT #{table}")
         end
       end
+      # A superuser has every attribute, so these would only repeat it.
+      ROLE_ATTRIBUTES.each do |key, attribute|
+        results << warning("database role #{role} has #{attribute}, which the services never need; ALTER ROLE #{role} NO#{attribute}") if facts[key]
+      end
     end
     HASH_FUNCTIONS.each_with_index do |function, i|
       case facts[:"function#{i}"]
@@ -249,7 +263,11 @@ class ByohConfigCheck
       when true then results << failure("PUBLIC can execute #{function}")
       end
     end
-    results.empty? ? [ok("database role #{role}: password hashes are isolated")] : results
+    if results.empty?
+      [ok("database role #{role}: not a superuser, not in #{role}_password, no SELECT on #{HASH_TABLES.join(", ")}, PUBLIC cannot execute the rodauth hash functions, no #{ROLE_ATTRIBUTES.values.join("/")}")]
+    else
+      results
+    end
   end
 
   def partition_runway(tables = PARTITIONED_TABLES)
