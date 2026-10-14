@@ -94,6 +94,15 @@ elsif Config.otel_exporter_otlp_endpoint
   OtelBatcher.new(Config.otel_exporter_otlp_endpoint, default_resource_attrs: {"service.name" => "pry"})
 end
 
+if PRY_LOGGER.nil? && Config.production? && !Config.is_e2e && Config.pry_allow_unaudited
+  # The opt-in must never be silent: tell the operator, and leave one line in
+  # the system log (journald) naming who opened the session. Never argv.
+  warn "WARNING: PRY_ALLOW_UNAUDITED is set and no audit sink is configured: this production console session is NOT audited."
+  system("logger", "-t", "ubicloud-pry", "-p", "auth.warning",
+    "unaudited pry session opened " + PRY_SESSION.map { |k, v| "#{k}=#{v}" }.join(" "),
+    exception: false, out: File::NULL, err: File::NULL)
+end
+
 if PRY_LOGGER
   PRY_LOGGER.log("pry session opened", app: "pry", level: "info", type: "session_open", ssh_connection: ENV["SSH_CONNECTION"], **PRY_SESSION)
 
