@@ -12,7 +12,7 @@ A Ubicloud BYOH deployment needs two kinds of Linux hosts:
 
 | Role | What runs on it | Who runs this script | Script |
 |---|---|---|---|
-| **Control plane** | Postgres, clover (Roda/Puma), respirate dispatcher, `bin/register-byoh-host` CLI, web UI | You, once per deployment | `bootstrap-ctrl-plane.sh` |
+| **Control plane** | Postgres, clover (Roda/Puma), respirate dispatcher, `bin/register-byoh-host` CLI, web UI | You, once per deployment | `install.sh` (packaged), or `bootstrap-dev-ctrl-plane.sh` (development and labs only) |
 | **Data plane** | rhizome agent + vhost-block-backend + cloud-hypervisor + the VMs themselves | You, once per BYOH host you want to add | `bootstrap-data-plane.sh` |
 
 The control plane and data plane can be:
@@ -41,7 +41,7 @@ can `ssh root@<data-plane-host>`.
 It is safe to re-run and keeps no marker files. `--tls` takes `acme`,
 `provided`, `tunnel` or `none`. The migration from the development
 bootstrap comes later in M3, so the live control plane keeps using
-`bootstrap-ctrl-plane.sh` for now. It has run only in the container
+the development bootstrap for now. It has run only in the container
 harness (`scripts/byoh/test/`); on a real machine it is UNVERIFIED.
 
 ```bash
@@ -84,12 +84,34 @@ to `/usr/local/bin`. Run it as root:
 
 `ubicloud-admin --help` has the details.
 
-## Usage — control plane (development bootstrap)
+## Usage — control plane (development bootstrap, labs only)
 
 ```bash
 # On the target host (as a sudo-capable user, NOT as root):
-./scripts/byoh/bootstrap-ctrl-plane.sh
+./scripts/byoh/bootstrap-dev-ctrl-plane.sh
 ```
+
+**Development and labs only.** It makes role `clover` a superuser, sets
+`pg_hba.conf` to trust for local and loopback connections, runs puma on
+`0.0.0.0:3000` in tmux, and nothing survives a reboot. Use `install.sh`
+for anything else.
+
+`bootstrap-ctrl-plane.sh`, the old name, is a shim: it prints a warning
+and runs `bootstrap-dev-ctrl-plane.sh` with the same arguments and
+environment, so existing docs, terraform user data and
+`curl ... | bash` one-liners keep working. Run from disk it uses the
+script next to it; read from a pipe it uses
+`${UBI_REPO_DIR:-$HOME/ubicloud}/scripts/byoh/bootstrap-dev-ctrl-plane.sh`,
+and exits 1 with the clone command when that is missing.
+
+The script refuses, before it changes anything, `UBI_RACK_ENV=production`,
+`UBI_DB_NAME=ubicloud`, and a machine with a packaged control plane
+(`/etc/ubicloud/env` exists, or `ubicloud.target` is active or enabled):
+its trust rules would open the packaged database and its tmux puma
+would take port 3000. `UBI_FORCE_DEV=1` overrides the last check, for
+labs only. Since M3 it also fails instead of continuing when creating
+the roles or database, or refreshing the Sequel caches, fails, and it
+installs JavaScript packages with `npm ci`.
 
 The script is **idempotent** — you can re-run it and it'll skip steps
 that are already done. Every step has a marker file under
@@ -105,6 +127,7 @@ Environment variables you can override:
 - `UBI_START_MONITOR` — `1` to also start `bin/monitor` in tmux (default: `0`; read `docs/byoh/PLATFORMS.md` first, as its health checks misjudge hosts without by-id disk links)
 - `UBI_BILLING_RATES_DIR` — where `bin/byoh-location` writes BYOH billing rates, written to `.env.rb` as `BILLING_RATES_EXTRA_DIR` (default: `$HOME/ubicloud-billing-rates.d`)
 - `UBI_BASE_URL` — the URL users open, written to a new `.env.rb` as `BASE_URL`; account email links use it (default: `http://<first address of hostname -I>:3000`)
+- `UBI_FORCE_DEV` — `1` to run next to a packaged control plane (labs only; default: `0`)
 
 The script does not clone the repository: clone it first
 (`git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud`).

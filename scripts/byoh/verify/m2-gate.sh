@@ -44,14 +44,37 @@
 #   GATE_CTRL_PRIV       control plane private IP (G9b)
 #   GATE_UNDERLAY_PROBE  another underlay address with SSH open (G9b)
 #   GATE_SMTP_PROBE      an internet host that accepts TCP 25 (G9b)
-#   GATE_RESPIRATE_LOG   respirate log (default /tmp/respirate.log)
+#   GATE_SERVICES        how the control plane runs: tmux (the development
+#                        bootstrap) or systemd (scripts/byoh/install.sh).
+#                        Default auto: systemd when /etc/ubicloud/env exists
+#                        or systemd knows ubicloud.target, else tmux
+#   GATE_RESPIRATE_LOG   respirate log file, or "journal" for the journal of
+#                        ubicloud-respirate.service (default: journal under
+#                        systemd, else /tmp/respirate.log). Reading the
+#                        journal needs root or group adm or systemd-journal;
+#                        otherwise the gate tries sudo -n
 #   GATE_STATE_DIR       where snapshots and exports go (default var/m2-gate)
 
 set -euo pipefail
 
 GATE_RATES_FROM=${GATE_RATES_FROM:-hetzner-fsn1}
 GATE_HOST_KEY=${GATE_HOST_KEY:-$HOME/.ssh/byoh_data}
-GATE_RESPIRATE_LOG=${GATE_RESPIRATE_LOG:-/tmp/respirate.log}
+GATE_SERVICES=${GATE_SERVICES:-auto}
+if [[ $GATE_SERVICES == auto ]]; then
+  if [[ -e /etc/ubicloud/env ]] || systemctl cat ubicloud.target >/dev/null 2>&1; then
+    GATE_SERVICES=systemd
+  else
+    GATE_SERVICES=tmux
+  fi
+fi
+case $GATE_SERVICES in
+  systemd) GATE_RESPIRATE_LOG=${GATE_RESPIRATE_LOG:-journal} ;;
+  tmux) GATE_RESPIRATE_LOG=${GATE_RESPIRATE_LOG:-/tmp/respirate.log} ;;
+  *)
+    echo "! GATE_SERVICES must be auto, tmux or systemd, not $GATE_SERVICES" >&2
+    exit 2
+    ;;
+esac
 GATE_STATE_DIR=${GATE_STATE_DIR:-var/m2-gate}
 GATE_EXPECT_MONITOR=${GATE_EXPECT_MONITOR:-0}
 GATE_VM_A_EXPOSURE=${GATE_VM_A_EXPOSURE:-nat}
@@ -111,6 +134,31 @@ vm_ssh() {
     "ubi@$private" "$@"
 }
 
+# as_root CMD...: CMD as root, through sudo -n unless the gate is root.
+as_root() {
+  if [[ $EUID == 0 ]]; then "$@"; else sudo -n "$@"; fi
+}
+
+# Prints the respirate log, from the file or the journal; returns 1 if
+# it cannot be read.
+respirate_log() {
+  if [[ $GATE_RESPIRATE_LOG != journal ]]; then
+    cat -- "$GATE_RESPIRATE_LOG" 2>/dev/null
+    return
+  fi
+  # journalctl without access prints only a hint and exits 0, so access
+  # decides between it and sudo.
+  if [[ $EUID == 0 || " $(id -nG) " =~ \ (adm|systemd-journal)\  ]]; then
+    journalctl -q -u ubicloud-respirate.service --no-pager -o cat
+  else
+    sudo -n journalctl -q -u ubicloud-respirate.service --no-pager -o cat
+  fi
+}
+
+respirate_log_name() {
+  if [[ $GATE_RESPIRATE_LOG == journal ]]; then echo "the journal of ubicloud-respirate.service"; else echo "$GATE_RESPIRATE_LOG"; fi
+}
+
 # The summed packet counts of the byoh_egress rules that contain $1.
 counter() {
   { host_ssh nft list table inet byoh_egress | grep -F -- "$1" |
@@ -124,23 +172,57 @@ IMDS_RULE="ip daddr 169.254.0.0/16 ct direction original"
 DENY4_RULE="ip daddr @deny4"
 SMTP_RULE="dport 25 "
 
-g1() {
-  echo "== G1 control plane services and BILLING_RATES_EXTRA_DIR"
-  local process
-  for process in puma bin/respirate; do
-    if pgrep -f "$process" >/dev/null; then pass "$process is running"; else fail "$process is not running"; fi
-  done
-  if [[ $GATE_EXPECT_MONITOR == 1 ]]; then
-    if pgrep -f bin/monitor >/dev/null; then pass "bin/monitor is running"; else fail "bin/monitor is not running"; fi
-  elif pgrep -f bin/monitor >/dev/null; then
-    info "bin/monitor is running; check docs/byoh/PLATFORMS.md that its health checks suit this host's disks"
+# running NAME: whether the process (tmux) or unit (systemd) of NAME
+# (web, respirate or monitor) runs; prints how it was judged.
+running() {
+  local unit=ubicloud-$1.service process
+  if [[ $GATE_SERVICES == systemd ]]; then
+    echo "$unit"
+    [[ $(systemctl is-active "$unit" 2>/dev/null || true) == active ]]
   else
-    info "bin/monitor is not running (GATE_EXPECT_MONITOR=1 requires it), so hosts are never marked unavailable"
+    case $1 in
+      web) process=puma ;;
+      *) process=bin/$1 ;;
+    esac
+    echo "$process"
+    pgrep -f "$process" >/dev/null
   fi
-  if grep -q BILLING_RATES_EXTRA_DIR .env.rb 2>/dev/null; then
-    pass ".env.rb sets BILLING_RATES_EXTRA_DIR"
+}
+
+g1() {
+  echo "== G1 control plane services and BILLING_RATES_EXTRA_DIR ($GATE_SERVICES)"
+  local service what dir
+  for service in web respirate; do
+    if what=$(running "$service"); then pass "$what is running"; else fail "$what is not running"; fi
+  done
+  if what=$(running monitor); then
+    if [[ $GATE_EXPECT_MONITOR == 1 ]]; then
+      pass "$what is running"
+    else
+      info "$what is running; check docs/byoh/PLATFORMS.md that its health checks suit this host's disks"
+    fi
+  elif [[ $GATE_EXPECT_MONITOR == 1 ]]; then
+    fail "$what is not running"
   else
-    fail ".env.rb does not set BILLING_RATES_EXTRA_DIR (web, respirate and monitor all need it)"
+    info "$what is not running (GATE_EXPECT_MONITOR=1 requires it), so hosts are never marked unavailable"
+  fi
+  if [[ $GATE_SERVICES == tmux ]]; then
+    if grep -q BILLING_RATES_EXTRA_DIR .env.rb 2>/dev/null; then
+      pass ".env.rb sets BILLING_RATES_EXTRA_DIR"
+    else
+      fail ".env.rb does not set BILLING_RATES_EXTRA_DIR (web, respirate and monitor all need it)"
+    fi
+    return 0
+  fi
+  # The env file is root 0600; ubicloud-admin reveals this one key only.
+  if ! dir=$(as_root ubicloud-admin env get BILLING_RATES_EXTRA_DIR --reveal 2>/dev/null); then
+    fail "/etc/ubicloud/env does not set BILLING_RATES_EXTRA_DIR, or ubicloud-admin env get failed (run the gate as root or with sudo -n)"
+  elif [[ -z $dir ]]; then
+    fail "/etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR empty"
+  elif as_root test -d "$dir"; then
+    pass "/etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to $dir, a directory"
+  else
+    fail "/etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to $dir, which is not a directory"
   fi
 }
 
@@ -235,12 +317,17 @@ g7() {
   echo "== G7 VM-B (no IPv4)"
   need GATE_VM_B GATE_VM_KEY GATE_MAIN_IP
   gate_checks vm --vm "$GATE_VM_B" --expect none
-  if grep -F "byoh netns probe gave up" "$GATE_RESPIRATE_LOG" 2>/dev/null | grep -qF "$GATE_VM_B"; then
-    fail "the netns probe gave up on $GATE_VM_B ($GATE_RESPIRATE_LOG)"
-  elif grep -F "byoh netns probe ok" "$GATE_RESPIRATE_LOG" 2>/dev/null | grep -qF "$GATE_VM_B"; then
+  # grep -q would stop reading early, and pipefail would count the
+  # first grep's SIGPIPE as a miss.
+  local log
+  if ! log=$(respirate_log); then
+    fail "cannot read $(respirate_log_name)"
+  elif grep -F "byoh netns probe gave up" <<<"$log" | grep -F "$GATE_VM_B" >/dev/null; then
+    fail "the netns probe gave up on $GATE_VM_B ($(respirate_log_name))"
+  elif grep -F "byoh netns probe ok" <<<"$log" | grep -F "$GATE_VM_B" >/dev/null; then
     pass "$GATE_VM_B was provisioned through the netns probe"
   else
-    fail "no 'byoh netns probe ok' line for $GATE_VM_B in $GATE_RESPIRATE_LOG"
+    fail "no 'byoh netns probe ok' line for $GATE_VM_B in $(respirate_log_name)"
   fi
   egress "$GATE_VM_B"
   info "check that the UI overview says outbound IPv4 goes through the shared NAT"

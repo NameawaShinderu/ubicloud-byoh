@@ -12,7 +12,7 @@
 #   run.sh SCENARIO...         run scenarios, each in a fresh container
 #
 # Scenarios: parity envfmt verify fresh rerun flags smoke kill restart
-# reboot tls-provided tunnel backup admin (or "all").
+# reboot tls-provided tunnel backup admin devshim gate-journal (or "all").
 # Logs go to $UBI_M3_LOGS (default: a fresh temp dir, printed at the
 # end). UBI_M3_KEEP=1 keeps the containers for inspection.
 set -euo pipefail
@@ -2095,6 +2095,192 @@ sc_admin() {
   say "admin: ok"
 }
 
+# --- development bootstrap and its shim (WP8) --------------------------------------------
+
+# as_ubuntu NAME CMD: the bash command line CMD as user ubuntu, in a
+# login-like environment (HOME, no inherited variables), with
+# UBI_START_SERVICES=0; CMD may set more variables in front of it.
+as_ubuntu() {
+  dx "$1" runuser -u ubuntu -- env -i HOME=/home/ubuntu USER=ubuntu LOGNAME=ubuntu LANG=C.UTF-8 \
+    PATH=/usr/local/bin:/usr/bin:/bin UBI_START_SERVICES=0 bash -c "cd ~ && $2"
+}
+
+# dev_run NAME LOG CMD: as_ubuntu, output to $LOGS/LOG; prints the exit
+# status.
+dev_run() {
+  local rc=0
+  as_ubuntu "$1" "$3" >"$LOGS/$2" 2>&1 </dev/null || rc=$?
+  echo "$rc"
+}
+
+# The bootstrap's own markers, the one place it records progress.
+dev_markers() { dx "$1" bash -c 'ls /home/ubuntu/.ubi-bootstrap 2>/dev/null | sort | tr "\n" " "'; }
+
+# Every development step the bootstrap reports as skipped in LOG.
+DEV_SKIPS=(apt-packages ruby-4.0.7 node-24.12.0 postgres-setup pg-hba-trust bundle-install npm-assets migrations caches-refreshed)
+all_skipped() {
+  local m
+  for m in "${DEV_SKIPS[@]}"; do
+    grep -qF "(marker: /home/ubuntu/.ubi-bootstrap/$m)" "$LOGS/$1" || return 1
+  done
+}
+
+# The development bootstrap (scripts/byoh/bootstrap-dev-ctrl-plane.sh)
+# and the old name's shim, as user ubuntu on ubi-m3-tools, with the
+# repository extracted at ~/ubicloud and UBI_START_SERVICES=0.
+sc_devshim() {
+  # shellcheck disable=SC2088 # expanded by the container's bash
+  local rc t n hba shim='~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh'
+  stage_art
+  src_tarball
+  start_sys devshim ubi-m3-tools
+  # Ubuntu cloud images give ubuntu passwordless sudo, as the bootstrap
+  # expects.
+  dx devshim bash -c 'echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/90-ubuntu && chmod 0440 /etc/sudoers.d/90-ubuntu'
+  as_ubuntu devshim 'mkdir ubicloud && tar -xzf /art/src.tgz -C ubicloud' || fail "devshim: cannot extract the source"
+  hba=$(dx devshim sha256sum /etc/postgresql/16/main/pg_hba.conf)
+
+  # Refusals change nothing: no marker directory, pg_hba.conf as it was.
+  rc=$(dev_run devshim devshim-prod.log "UBI_RACK_ENV=production bash $shim")
+  { [[ $rc == 1 ]] && grep -q 'UBI_RACK_ENV=production.*install.sh' "$LOGS/devshim-prod.log"; } ||
+    fail "devshim: UBI_RACK_ENV=production gave $rc, see $LOGS/devshim-prod.log"
+  rc=$(dev_run devshim devshim-dbname.log "UBI_DB_NAME=ubicloud bash $shim")
+  { [[ $rc == 1 ]] && grep -q 'UBI_DB_NAME=ubicloud' "$LOGS/devshim-dbname.log"; } ||
+    fail "devshim: UBI_DB_NAME=ubicloud gave $rc, see $LOGS/devshim-dbname.log"
+  dx devshim bash -c 'install -d -m 0755 /etc/ubicloud && install -m 0600 /dev/null /etc/ubicloud/env'
+  rc=$(dev_run devshim devshim-envfile.log "bash $shim")
+  { [[ $rc == 1 ]] && grep -q '/etc/ubicloud/env exists.*UBI_FORCE_DEV=1' "$LOGS/devshim-envfile.log"; } ||
+    fail "devshim: /etc/ubicloud/env present gave $rc, see $LOGS/devshim-envfile.log"
+  dx devshim rm -rf /etc/ubicloud
+  dx devshim bash -c 'printf "[Unit]\nDescription=stand-in\n[Install]\nWantedBy=multi-user.target\n" >/etc/systemd/system/ubicloud.target &&
+    systemctl daemon-reload && systemctl enable ubicloud.target 2>/dev/null'
+  rc=$(dev_run devshim devshim-target.log "bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh")
+  { [[ $rc == 1 ]] && grep -q 'ubicloud.target is enabled' "$LOGS/devshim-target.log"; } ||
+    fail "devshim: an enabled ubicloud.target gave $rc, see $LOGS/devshim-target.log"
+  dx devshim bash -c 'systemctl disable ubicloud.target 2>/dev/null && systemctl start ubicloud.target'
+  rc=$(dev_run devshim devshim-target-active.log "bash $shim")
+  { [[ $rc == 1 ]] && grep -q 'ubicloud.target is active' "$LOGS/devshim-target-active.log"; } ||
+    fail "devshim: an active ubicloud.target gave $rc, see $LOGS/devshim-target-active.log"
+  dx devshim bash -c 'systemctl stop ubicloud.target && rm /etc/systemd/system/ubicloud.target && systemctl daemon-reload'
+  rc=$(dev_run devshim devshim-norepo.log "cd /tmp && cat $shim | UBI_REPO_DIR=/home/ubuntu/none bash")
+  { [[ $rc == 1 ]] && grep -q 'git clone' "$LOGS/devshim-norepo.log"; } ||
+    fail "devshim: the piped shim without a checkout gave $rc, see $LOGS/devshim-norepo.log"
+  [[ -z $(dev_markers devshim) ]] || fail "devshim: a refusal created markers: $(dev_markers devshim)"
+  [[ $(dx devshim sha256sum /etc/postgresql/16/main/pg_hba.conf) == "$hba" ]] || fail "devshim: a refusal changed pg_hba.conf"
+  say "devshim: production, ubicloud, /etc/ubicloud/env, an enabled or an active ubicloud.target and a missing checkout refuse (exit 1) and change nothing"
+
+  # The old path: the shim warns and runs the development script.
+  t=$(timed as_ubuntu devshim "bash $shim >/tmp/devshim-first.log 2>&1") || {
+    dx devshim cat /tmp/devshim-first.log >"$LOGS/devshim-first.log"
+    fail "devshim: the first run failed, see $LOGS/devshim-first.log"
+  }
+  dx devshim cat /tmp/devshim-first.log >"$LOGS/devshim-first.log"
+  { grep -q 'is renamed to scripts/byoh/bootstrap-dev-ctrl-plane.sh' "$LOGS/devshim-first.log" &&
+    grep -q 'running /home/ubuntu/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh' "$LOGS/devshim-first.log"; } ||
+    fail "devshim: the shim did not warn or name its target"
+  [[ $(dx devshim runuser -u postgres -- psql -XtAc "SELECT count(*) FROM pg_database WHERE datname = 'clover_test'") == 1 ]] ||
+    fail "devshim: no clover_test database"
+  [[ $(dx devshim runuser -u postgres -- psql -XtAc "SELECT string_agg(rolname || ':' || rolsuper, ' ' ORDER BY rolname) FROM pg_roles WHERE rolname LIKE 'clover%'") == "clover:true clover_password:false" ]] ||
+    fail "devshim: the roles are not as the bootstrap always made them"
+  n=$(dx devshim runuser -u postgres -- psql -XtA -d clover_test -c "SELECT count(*) FROM schema_migrations")
+  ((n > 400)) || fail "devshim: clover_test has $n migrations"
+  [[ $(dx devshim stat -c '%a %U' /home/ubuntu/ubicloud/.env.rb) == "600 ubuntu" ]] || fail "devshim: .env.rb is not ubuntu 0600"
+  dx devshim grep -q '^ENV\["RACK_ENV"\] ||= "development"' /home/ubuntu/ubicloud/.env.rb || fail "devshim: .env.rb RACK_ENV is not development"
+  dx devshim test -s /home/ubuntu/ubicloud/assets/css/app.css || fail "devshim: no assets/css/app.css"
+  say "devshim: the path run (through the shim) took ${t}s: clover_test with $n migrations, roles as before, .env.rb 0600, assets built; markers: $(dev_markers devshim)"
+
+  rc=$(dev_run devshim devshim-second.log "bash $shim")
+  { [[ $rc == 0 ]] && all_skipped devshim-second.log; } || fail "devshim: the second run gave $rc or ran a step, see $LOGS/devshim-second.log"
+  rc=$(dev_run devshim devshim-pipe.log "cd /tmp && cat $shim | bash")
+  { [[ $rc == 0 ]] && all_skipped devshim-pipe.log &&
+    grep -q 'running /home/ubuntu/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh' "$LOGS/devshim-pipe.log"; } ||
+    fail "devshim: cat shim | bash gave $rc, see $LOGS/devshim-pipe.log"
+  say "devshim: a second run by path and a cat shim | bash run from /tmp skip every step"
+
+  # Step 3 again: an existing role or database is skipped, not masked.
+  as_ubuntu devshim 'rm ~/.ubi-bootstrap/postgres-setup'
+  rc=$(dev_run devshim devshim-pg.log "bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh")
+  { [[ $rc == 0 ]] && ! grep -qE 'ERROR|role ".*" already exists|database ".*" already exists' "$LOGS/devshim-pg.log"; } ||
+    fail "devshim: step 3 over the existing roles gave $rc, see $LOGS/devshim-pg.log"
+  # A failed cache refresh now stops the run.
+  as_ubuntu devshim 'rm ~/.ubi-bootstrap/caches-refreshed && chmod a-w ~/ubicloud/cache'
+  rc=$(dev_run devshim devshim-cache.log "bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh")
+  as_ubuntu devshim 'chmod u+w ~/ubicloud/cache'
+  { [[ $rc == 1 ]] && grep -q 'ERROR: refresh_sequel_caches failed' "$LOGS/devshim-cache.log" &&
+    ! dx devshim test -e /home/ubuntu/.ubi-bootstrap/caches-refreshed; } ||
+    fail "devshim: a failing refresh_sequel_caches gave $rc, see $LOGS/devshim-cache.log"
+  say "devshim: step 3 over the existing roles and database succeeds quietly; a failing cache refresh exits 1 and sets no marker"
+
+  # UBI_FORCE_DEV=1 runs next to a packaged control plane, with a warning.
+  dx devshim bash -c 'install -d -m 0755 /etc/ubicloud && install -m 0600 /dev/null /etc/ubicloud/env'
+  rc=$(dev_run devshim devshim-force.log "UBI_FORCE_DEV=1 bash $shim")
+  { [[ $rc == 0 ]] && grep -q 'continuing because UBI_FORCE_DEV=1' "$LOGS/devshim-force.log"; } ||
+    fail "devshim: UBI_FORCE_DEV=1 gave $rc, see $LOGS/devshim-force.log"
+  dx devshim rm -rf /etc/ubicloud
+  say "devshim: UBI_FORCE_DEV=1 warns and runs"
+
+  # m2-gate g1 on a development control plane whose services are not
+  # started: tmux mode, the process checks and the .env.rb key.
+  rc=$(dev_run devshim devshim-gate.log "cd ~/ubicloud && bash /art/m2-gate.sh g1")
+  { [[ $rc == 1 ]] && grep -q '^== G1 .*(tmux)' "$LOGS/devshim-gate.log" && grep -q '^FAIL puma is not running' "$LOGS/devshim-gate.log" &&
+    grep -q '^PASS .env.rb sets BILLING_RATES_EXTRA_DIR' "$LOGS/devshim-gate.log"; } ||
+    fail "devshim: m2-gate g1 (tmux) gave $rc, see $LOGS/devshim-gate.log"
+  say "devshim: m2-gate g1 picks tmux mode and checks .env.rb"
+  say "devshim: ok"
+}
+
+# m2-gate on a packaged control plane: systemd mode is detected, G1
+# judges the units and reads BILLING_RATES_EXTRA_DIR through
+# ubicloud-admin, and the respirate log comes from the journal.
+sc_gate_journal() {
+  local rc out first fns who
+  boot_cp gatej
+  rc=0
+  out=$(dx gatej bash -c 'cd / && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
+  printf '%s\n' "$out" >"$LOGS/gatej-root.log"
+  { [[ $rc == 0 ]] && grep -q '^== G1 .*(systemd)' <<<"$out" &&
+    grep -q '^PASS ubicloud-web.service is running' <<<"$out" &&
+    grep -q '^PASS ubicloud-respirate.service is running' <<<"$out" &&
+    grep -q '^INFO ubicloud-monitor.service is not running' <<<"$out" &&
+    grep -q '^PASS /etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to /var/lib/ubicloud/billing_rates.d, a directory' <<<"$out"; } ||
+    fail "gate-journal: g1 as root gave $rc, see $LOGS/gatej-root.log"
+  rc=0
+  out=$(dx gatej bash -c 'cd / && GATE_EXPECT_MONITOR=1 bash /art/m2-gate.sh g1' 2>&1) || rc=$?
+  { [[ $rc == 1 ]] && grep -q '^FAIL ubicloud-monitor.service is not running' <<<"$out"; } ||
+    fail "gate-journal: GATE_EXPECT_MONITOR=1 without monitor gave $rc: $out"
+  # ubuntu (group adm, no sudo here) cannot read the env file.
+  rc=0
+  out=$(dx gatej runuser -u ubuntu -- bash -c 'cd / && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
+  { [[ $rc == 1 ]] && grep -q '^FAIL .*run the gate as root or with sudo -n' <<<"$out"; } ||
+    fail "gate-journal: g1 as ubuntu gave $rc: $out"
+  dx gatej ubicloud-admin env unset BILLING_RATES_EXTRA_DIR --no-restart >/dev/null
+  rc=0
+  out=$(dx gatej bash -c 'cd / && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
+  { [[ $rc == 1 ]] && grep -q '^FAIL /etc/ubicloud/env does not set BILLING_RATES_EXTRA_DIR' <<<"$out"; } ||
+    fail "gate-journal: g1 without the key gave $rc: $out"
+  say "gate-journal: g1 detects systemd, judges the units, reads BILLING_RATES_EXTRA_DIR through ubicloud-admin, and fails without the key or without root"
+
+  # respirate_log, as m2-gate defines it, against the journal.
+  fns=$(sed -n '/^GATE_SERVICES=/,/^esac/p; /^as_root()/,/^}/p; /^respirate_log()/,/^}/p' "$WT/scripts/byoh/verify/m2-gate.sh")
+  first=$(dx gatej bash -c 'journalctl -q -u ubicloud-respirate.service --no-pager -o cat | head -1')
+  [[ -n $first ]] || fail "gate-journal: the respirate journal is empty"
+  dx gatej useradd -M -s /bin/bash gatenoadm 2>/dev/null || true
+  for who in root ubuntu gatenoadm; do
+    rc=0
+    # shellcheck disable=SC2016 # expanded by the container's bash
+    out=$(dx gatej runuser -u "$who" -- bash -c "set -euo pipefail; cd /; $fns"$'\n''l=$(respirate_log); head -1 <<<"$l"' 2>/dev/null) || rc=$?
+    case $who in
+      root | ubuntu) [[ $rc == 0 && $out == "$first" ]] || fail "gate-journal: respirate_log as $who gave $rc: $out" ;;
+      gatenoadm) [[ $rc != 0 && -z $out ]] || fail "gate-journal: respirate_log as a user without journal access gave $rc: $out" ;;
+    esac
+  done
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  out=$(dx gatej bash -c "cd /; GATE_SERVICES=tmux; $fns"$'\n''echo "$GATE_RESPIRATE_LOG"')
+  [[ $out == /tmp/respirate.log ]] || fail "gate-journal: GATE_SERVICES=tmux reads $out"
+  say "gate-journal: the respirate log is the journal under systemd (root and group adm read it; others fail) and /tmp/respirate.log under tmux"
+  say "gate-journal: ok"
+}
+
 sc_reboot() {
   local t since
   boot_cp reboot
@@ -2121,8 +2307,8 @@ for arg in "$@"; do
     --prepare-image) prepare_image ;;
     --prepare-tools) prepare_tools ;;
     --prepare-release) prepare_release ;;
-    all) for s in parity envfmt verify fresh rerun flags smoke kill restart reboot tls_provided tunnel backup admin; do "sc_$s"; cleanup; done ;;
-    parity | envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot | tls-provided | tunnel | backup | admin)
+    all) for s in parity envfmt verify fresh rerun flags smoke kill restart reboot tls_provided tunnel backup admin devshim gate_journal; do "sc_$s"; cleanup; done ;;
+    parity | envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot | tls-provided | tunnel | backup | admin | devshim | gate-journal)
       "sc_${arg//-/_}"
       cleanup
       ;;

@@ -19,7 +19,7 @@ Pool commands are described in [POOL_OPERATIONS.md](POOL_OPERATIONS.md).
 
 BYOH locations are billed from an overlay directory of rate files, written by `bin/byoh-location rates` and `create --rates-from`. The shipped `config/billing_rates/*.yml` is never edited. The name is exactly `BILLING_RATES_EXTRA_DIR`; there is no `CLOVER_` prefix.
 
-Set the variable in `.env.rb`, so that **web, respirate and monitor** all load it. `bootstrap-ctrl-plane.sh` writes it into a new `.env.rb`; add it by hand to an older one. A directory in the operator's home needs no sudo (the live control plane uses `/home/ubuntu/ubicloud-billing-rates.d`):
+Set the variable in `.env.rb`, so that **web, respirate and monitor** all load it. `bootstrap-dev-ctrl-plane.sh` writes it into a new `.env.rb`; add it by hand to an older one. On a packaged control plane (`scripts/byoh/install.sh`) it is in `/etc/ubicloud/env`, and G1 reads it there with `ubicloud-admin env get BILLING_RATES_EXTRA_DIR --reveal`, so run the gate as root or with passwordless sudo. A directory in the operator's home needs no sudo (the live control plane uses `/home/ubuntu/ubicloud-billing-rates.d`):
 
 ```ruby
 ENV["BILLING_RATES_EXTRA_DIR"] ||= "/home/ubuntu/ubicloud-billing-rates.d"
@@ -31,7 +31,9 @@ ENV["BILLING_RATES_EXTRA_DIR"] ||= "/home/ubuntu/ubicloud-billing-rates.d"
 
 ### 1.2 Processes
 
-The gate requires `puma` and `respirate`. It requires `bin/monitor` only with `GATE_EXPECT_MONITOR=1`; otherwise it reports whether the monitor runs as INFO. `bootstrap-ctrl-plane.sh` starts the monitor only with `UBI_START_MONITOR=1`.
+The gate requires `puma` and `respirate`. It requires `bin/monitor` only with `GATE_EXPECT_MONITOR=1`; otherwise it reports whether the monitor runs as INFO. `bootstrap-dev-ctrl-plane.sh` starts the monitor only with `UBI_START_MONITOR=1`.
+
+The gate finds out how the control plane runs (`GATE_SERVICES`, default `auto`). With `/etc/ubicloud/env` present, or `ubicloud.target` known to systemd, it is `systemd`: G1 checks the units `ubicloud-web`, `ubicloud-respirate` and `ubicloud-monitor`, and G7 reads the respirate log from the journal of `ubicloud-respirate.service` (`GATE_RESPIRATE_LOG=journal`), which needs root or group `adm` or `systemd-journal` (otherwise the gate tries `sudo -n`, and fails the step if it cannot read the log). Otherwise it is `tmux`: G1 looks for the processes and G7 reads `/tmp/respirate.log`. The database steps run `bundle exec` from the current directory, which on a packaged control plane only reaches the database as user `ubicloud` with the env file; that combination is UNVERIFIED.
 
 Upstream health checks misjudge hosts without `wwn-`/`nvme-eui` disk links and SMART, which today means AWS EBS and Proxmox virtio disks, and may mark them `unavailable` ([PLATFORMS.md](PLATFORMS.md) F5). On such hosts, leave the monitor off. If you start it, watch `allocation_state`.
 

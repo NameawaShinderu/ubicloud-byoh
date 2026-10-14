@@ -1058,7 +1058,7 @@ step_migrate() {
 
 # check_start: exits 2 before anything changes when this run would start
 # the units while something else serves the port, or while a development
-# control plane (scripts/byoh/bootstrap-ctrl-plane.sh) lives on this
+# control plane (scripts/byoh/bootstrap-dev-ctrl-plane.sh) lives on this
 # machine. Its tmux puma holds 0.0.0.0:3000: the packaged web would loop
 # on EADDRINUSE, then take the port over when the tmux puma stops.
 check_start() {

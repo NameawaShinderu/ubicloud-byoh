@@ -32,7 +32,9 @@ Run these on the control plane, from the repository root, with mise and Ruby on 
 
 | Symptom | Cause | Fix | Platform notes |
 |---|---|---|---|
-| `bootstrap-ctrl-plane.sh`: "… does not contain a ubicloud checkout" | The script does not clone | `git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud` first | |
+| `bootstrap-dev-ctrl-plane.sh`: "… does not contain a ubicloud checkout", or the `bootstrap-ctrl-plane.sh` shim: "no ubicloud checkout with scripts/byoh/bootstrap-dev-ctrl-plane.sh" | The script does not clone | `git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud` first (or set `UBI_REPO_DIR`) | |
+| `bootstrap-ctrl-plane.sh` warns "is renamed to scripts/byoh/bootstrap-dev-ctrl-plane.sh" | The old name is a shim since M3 | Nothing to fix: it runs the development script. Use the new name, or `scripts/byoh/install.sh` for production | |
+| The development bootstrap refuses: "/etc/ubicloud/env exists" or "ubicloud.target is active/enabled", "UBI_RACK_ENV=production", "UBI_DB_NAME=ubicloud" | A packaged control plane lives on this machine, or production settings were passed to a development-only script | Operate the packaged one with `ubicloud-admin`. `UBI_FORCE_DEV=1` overrides the packaged-machine check, for labs only | |
 | `bundle install` fails: "No such file or directory - mise" | `~/.local/bin` (mise) not on PATH (verified live, 2026-10-13) | `export PATH=$HOME/.local/bin:$HOME/.local/share/mise/installs/ruby/4.0.7/bin:$PATH` | |
 | `bundle` or `ruby -v` uses the system Ruby | mise's Ruby is not on PATH | As above. After a Ruby upgrade, change the version in the path too | |
 | `register-byoh-host` aborts with `InvalidOption` on `--provider` | There is no such flag | Use `--location` | Older docs pass it |
@@ -45,7 +47,7 @@ Run these on the control plane, from the repository root, with mise and Ruby on 
 | `byoh-location show` warns "CONTROL_PLANE_OUTBOUND_CIDRS includes 0.0.0.0/0, ::/0, so Postgres and Kubernetes firewalls allow SSH from anywhere" | The `config.rb` default `0.0.0.0/0,::/0` | Security setting: `ENV["CONTROL_PLANE_OUTBOUND_CIDRS"] ||= "<the --cp-source CIDRs>"` in `.env.rb`, then restart the services (NETWORKING §6.6) | LAN sites: the control plane's LAN IP; off-site: its egress IP ([own-hardware.md](platforms/own-hardware.md) §3.3) |
 | Warns "location X: cp_source_cidrs … is not in CONTROL_PLANE_OUTBOUND_CIDRS" | You narrowed the variable and left a `--cp-source` CIDR out | Add that CIDR | |
 | UI on port 3000 unreachable | Firewall in front of the control plane | Open 3000 from your address only | AWS: `web_ui_cidr` ([aws.md](platforms/aws.md) §3.10) |
-| `puma` and `respirate` gone after the control plane rebooted | They run in tmux; nothing restarts them (no systemd units yet, PLATFORMS PF21) | `bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh` again: it restarts them and skips finished steps | |
+| `puma` and `respirate` gone after the control plane rebooted | The development bootstrap runs them in tmux; nothing restarts them | `bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh` again: it restarts them and skips finished steps. A packaged control plane (`scripts/byoh/install.sh`) runs them under systemd | |
 
 ---
 

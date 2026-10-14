@@ -98,6 +98,7 @@ stage_art() {
   cp -R "$WT/packaging/systemd" "$WT/packaging/bin" "$ART/packaging/"
   cp "$HARNESS_DIR/fixture.sh" "$ART/fixture.sh"
   cp "$WT/scripts/byoh/install.sh" "$ART/install.sh"
+  cp "$WT/scripts/byoh/verify/m2-gate.sh" "$ART/m2-gate.sh"
   cp "$WT/mise.toml" "$ART/mise.toml"
   chmod -R a+rX "$ART"
 }
