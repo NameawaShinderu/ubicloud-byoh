@@ -472,6 +472,69 @@ sc_fresh() {
   dx fresh pkill -f TCPServer
   adm fresh smoke >"$LOGS/fresh-smoke-again.log" 2>&1 || fail "fresh: smoke after the fixes: $(grep '^fail' "$LOGS/fresh-smoke-again.log")"
   say "fresh: install.sh exits 1 with the logs hint when step 12 fails (port 8081 taken), and passes again once it is free"
+
+  # PORT 8081 is production_check's: install.sh exits 2 before changing
+  # anything, env set refuses it, and smoke names it when the env file
+  # was edited by hand.
+  local before
+  dx fresh cp -p /etc/ubicloud/env /root/env.orig
+  dx fresh sed -i "s/^PORT=.*/PORT='8081'/" /etc/ubicloud/env
+  before=$(settings_sums fresh)
+  rc=0
+  install_cp fresh >"$LOGS/fresh-port-8081.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q '^install.sh: /etc/ubicloud/env sets PORT 8081, which is reserved for the puma of bin/production_check' "$LOGS/fresh-port-8081.log"; then
+    fail "fresh: install.sh with PORT 8081 exited $rc: $(tail -3 "$LOGS/fresh-port-8081.log")"
+  fi
+  [[ $(settings_sums fresh) == "$before" ]] || fail "fresh: the refused PORT 8081 run changed a file"
+  dx fresh systemctl restart ubicloud-web
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  wait_for 120 dx fresh bash -c '[[ $(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8081/login) == 200 ]]' >/dev/null ||
+    fail "fresh: web did not answer on 8081"
+  rc=0
+  adm fresh smoke >"$LOGS/fresh-smoke-8081.log" 2>&1 || rc=$?
+  if [[ $rc != 1 ]] || ! grep -q '^fail    smoke: PORT is 8081, which bin/production_check needs for its own puma' "$LOGS/fresh-smoke-8081.log"; then
+    fail "fresh: smoke with PORT 8081 exited $rc: $(grep smoke "$LOGS/fresh-smoke-8081.log")"
+  fi
+  dx fresh cp -p /root/env.orig /etc/ubicloud/env
+  dx fresh systemctl restart ubicloud-web
+  wait_for 120 web_up fresh >/dev/null || fail "fresh: web down after PORT 8081"
+  rc=0
+  printf '8081' | adm fresh env set PORT --no-restart >"$LOGS/fresh-env-8081.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q 'PORT 8081 is reserved for the puma of bin/production_check' "$LOGS/fresh-env-8081.log"; then
+    fail "fresh: env set PORT 8081 exited $rc: $(cat "$LOGS/fresh-env-8081.log")"
+  fi
+  dx fresh cmp -s /root/env.orig /etc/ubicloud/env || fail "fresh: env set PORT 8081 changed the env file"
+  say "fresh: PORT 8081 makes install.sh exit 2 unchanged and env set refuse it, and smoke names it"
+
+  # A production_check that fails for another reason than the port:
+  # smoke prints the tail of its output and fails.
+  local rel
+  rel=$(dx fresh readlink -f /opt/ubicloud/current)
+  dx fresh bash -c "printf '%s\n' 'puts \"harness: production_check stand-in fails\"' 'exit 1' >/root/pc-fail.rb &&
+    mount --bind /root/pc-fail.rb $rel/bin/production_check"
+  rc=0
+  adm fresh smoke >"$LOGS/fresh-smoke-pc.log" 2>&1 || rc=$?
+  dx fresh umount "$rel/bin/production_check"
+  if [[ $rc != 1 ]] || ! { grep -q '^  harness: production_check stand-in fails$' "$LOGS/fresh-smoke-pc.log" &&
+    grep -q '^fail    smoke: bin/production_check failed (above)$' "$LOGS/fresh-smoke-pc.log"; }; then
+    fail "fresh: smoke with a failing production_check exited $rc: $(cat "$LOGS/fresh-smoke-pc.log")"
+  fi
+  say "fresh: a production_check that fails shows its output and fails smoke"
+
+  # A release whose ubicloud-admin predates smoke (an upgrade from an
+  # older release): step 12 warns and install.sh exits 0.
+  dx fresh bash -c "sed 's/^cmd_smoke()/cmd_smoke_absent()/' $rel/packaging/bin/ubicloud-admin >/root/old-admin &&
+    chmod 0755 /root/old-admin && mount --bind /root/old-admin $rel/packaging/bin/ubicloud-admin"
+  rc=0
+  install_cp fresh >"$LOGS/fresh-old-admin.log" 2>&1 || rc=$?
+  dx fresh umount "$rel/packaging/bin/ubicloud-admin"
+  if [[ $rc != 0 ]] || ! grep -q "^warn    smoke: not run; the current release's ubicloud-admin has no smoke command$" "$LOGS/fresh-old-admin.log"; then
+    fail "fresh: install.sh with an ubicloud-admin without smoke exited $rc: $(grep -E 'smoke|admin' "$LOGS/fresh-old-admin.log")"
+  fi
+  install_cp fresh >"$LOGS/fresh-new-admin.log" 2>&1 || fail "fresh: install.sh after the old ubicloud-admin: $(tail -3 "$LOGS/fresh-new-admin.log")"
+  { grep -q '^changed admin: installed /usr/local/bin/ubicloud-admin' "$LOGS/fresh-new-admin.log" && grep -q '^smoke: ok ' "$LOGS/fresh-new-admin.log"; } ||
+    fail "fresh: the rerun did not put back ubicloud-admin and pass smoke: $(grep -E 'smoke|admin' "$LOGS/fresh-new-admin.log")"
+  say "fresh: an ubicloud-admin without smoke makes step 12 warn and exit 0; the next run installs the new one and passes"
   poke_strand fresh
   wait_for 60 strand_ran fresh >/dev/null || fail "fresh: respirate ran no strand"
   journal_clean fresh "$since"
@@ -1250,6 +1313,45 @@ sc_tls_provided() {
   [[ $out == "$serial" ]] || fail "tls-provided: caddy serves $out, not the reissued $serial"
   say "tls-provided: a reissued certificate warns at 10 days left, is installed and served, and restarts caddy only"
 
+  # Step 12's front checks (ubicloud-admin smoke). acme with a host caddy
+  # has no certificate for: the handshake fails (curl exit 35), which is
+  # a certificate not issued yet and only warns. A stopped caddy fails
+  # for acme too. A BASE_URL that is not https://HOST, and an unknown
+  # front, fail.
+  dx tlsp cp -p /etc/ubicloud/env /root/env.orig
+  dx tlsp cp -p /etc/ubicloud/front.conf /root/front.orig
+  dx tlsp sed -i "s/^TLS_FRONT=.*/TLS_FRONT='acme'/" /etc/ubicloud/front.conf
+  dx tlsp sed -i "s|^BASE_URL=.*|BASE_URL='https://nocert.test'|" /etc/ubicloud/env
+  rc=0
+  adm tlsp smoke >"$LOGS/tlsp-smoke-acme.log" 2>&1 || rc=$?
+  if [[ $rc != 0 ]] || ! { grep -q '^ok      smoke: caddy.service active$' "$LOGS/tlsp-smoke-acme.log" &&
+    grep -q '^warn    smoke: caddy has no certificate for nocert.test yet (curl exit 35' "$LOGS/tlsp-smoke-acme.log"; }; then
+    fail "tls-provided: smoke, acme without a certificate, exited $rc: $(grep smoke "$LOGS/tlsp-smoke-acme.log")"
+  fi
+  dx tlsp systemctl stop caddy
+  rc=0
+  adm tlsp smoke >"$LOGS/tlsp-smoke-nocaddy.log" 2>&1 || rc=$?
+  dx tlsp systemctl start caddy
+  if [[ $rc != 1 ]] || ! grep -q '^fail    smoke: caddy.service is inactive, so nothing serves https://nocert.test (systemctl start caddy.service; ubicloud-admin logs caddy)$' "$LOGS/tlsp-smoke-nocaddy.log"; then
+    fail "tls-provided: smoke, acme with caddy stopped, exited $rc: $(grep smoke "$LOGS/tlsp-smoke-nocaddy.log")"
+  fi
+  dx tlsp cp -p /root/front.orig /etc/ubicloud/front.conf
+  dx tlsp sed -i "s|^BASE_URL=.*|BASE_URL='http://cp.test'|" /etc/ubicloud/env
+  rc=0
+  adm tlsp smoke >"$LOGS/tlsp-smoke-http.log" 2>&1 || rc=$?
+  if [[ $rc != 1 ]] || ! grep -q '^fail    smoke: front --tls provided, but BASE_URL is not https://HOST$' "$LOGS/tlsp-smoke-http.log"; then
+    fail "tls-provided: smoke with an http BASE_URL exited $rc: $(grep smoke "$LOGS/tlsp-smoke-http.log")"
+  fi
+  dx tlsp cp -p /root/env.orig /etc/ubicloud/env
+  dx tlsp sed -i "s/^TLS_FRONT=.*/TLS_FRONT='bogus'/" /etc/ubicloud/front.conf
+  rc=0
+  adm tlsp smoke >"$LOGS/tlsp-smoke-bogus.log" 2>&1 || rc=$?
+  dx tlsp cp -p /root/front.orig /etc/ubicloud/front.conf
+  if [[ $rc != 1 ]] || ! grep -q '^fail    smoke: /etc/ubicloud/front.conf names an unknown front bogus$' "$LOGS/tlsp-smoke-bogus.log"; then
+    fail "tls-provided: smoke with an unknown front exited $rc: $(grep smoke "$LOGS/tlsp-smoke-bogus.log")"
+  fi
+  say "tls-provided: smoke warns on an acme certificate not issued yet (curl exit 35) and fails on a stopped caddy, an http BASE_URL and an unknown front"
+
   # The acme Caddyfile: install.sh's own render_caddyfile with --tls
   # acme, parsed by the installed caddy. A real acme run is UNVERIFIED
   # (it needs public DNS and Let's Encrypt).
@@ -1340,7 +1442,8 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
   grep -q 'dummy-live-token' "$LOGS/tunnel-existing.log" && fail "tunnel: install.sh printed the token"
   # Step 12: the public name does not resolve here, which is a warning;
   # puma itself answers.
-  if ! { grep -q '^warn    smoke: no answer from https://cp.example.test (curl exit 6)' "$LOGS/tunnel-existing.log" &&
+  if ! { grep -q '^warn    smoke: no answer from https://cp.example.test yet (HTTP 000, curl exit 6)' "$LOGS/tunnel-existing.log" &&
+    grep -q '^ok      smoke: cloudflared.service active$' "$LOGS/tunnel-existing.log" &&
     grep -q '^smoke: ok ' "$LOGS/tunnel-existing.log"; }; then
     fail "tunnel: step 12: $(grep smoke "$LOGS/tunnel-existing.log")"
   fi
@@ -1370,6 +1473,58 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
     fail "tunnel: the rerun touched cloudflared.service"
   say "tunnel: an existing cloudflared.service is left byte for byte and running, its argv token is warned about unprinted, IP_FROM_HEADER is CF-Connecting-IP"
 
+  # Step 12 through a stand-in for Cloudflare's edge under the public
+  # name: 200 passes, 530 (a tunnel without a connector yet) warns,
+  # another code fails, and a stopped cloudflared.service fails.
+  dx tunnel bash -c 'cp /etc/hosts /root/hosts.orig && echo "127.0.0.1 cp.example.test" >>/etc/hosts &&
+    cp /root/tls/cert.pem /usr/local/share/ca-certificates/ubi-m3-edge.crt && update-ca-certificates >/dev/null 2>&1'
+  local code edge want
+  # shellcheck disable=SC2016 # Ruby code
+  edge='ctx = OpenSSL::SSL::SSLContext.new
+    ctx.cert = OpenSSL::X509::Certificate.new(File.read("/root/tls/cert.pem"))
+    ctx.key = OpenSSL::PKey.read(File.read("/root/tls/key.pem"))
+    srv = OpenSSL::SSL::SSLServer.new(TCPServer.new("127.0.0.1", 443), ctx)
+    loop do
+      c = begin; srv.accept; rescue; next; end
+      begin
+        while (l = c.gets) && l != "\r\n"; end
+        c.write("HTTP/1.1 #{ARGV[0]} Stand-in\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+      rescue
+      ensure
+        c.close rescue nil
+      end
+    end'
+  for code in 200 530 404; do
+    docker exec -d ubi-m3-tunnel /opt/ubicloud/tools/bin/ruby -rsocket -ropenssl -e "$edge" "$code" ubi-m3-edge
+    # shellcheck disable=SC2016 # expanded by the container's bash
+    wait_for 20 dx tunnel bash -c '[[ -n $(ss -Htln "sport = :443") ]]' >/dev/null || fail "tunnel: the edge stand-in did not start"
+    rc=0
+    adm tunnel smoke >"$LOGS/tunnel-smoke-$code.log" 2>&1 || rc=$?
+    dx tunnel pkill -f ubi-m3-edge
+    # shellcheck disable=SC2016 # expanded by the container's bash
+    wait_for 20 dx tunnel bash -c '[[ -z $(ss -Htln "sport = :443") ]]' >/dev/null || fail "tunnel: the edge stand-in did not stop"
+    case $code in
+      200) out='^ok      smoke: https://cp.example.test answers through the tunnel \(HTTP 200\)$' want=0 ;;
+      530) out='^warn    smoke: no answer from https://cp.example.test yet \(HTTP 530, curl exit 0\)' want=0 ;;
+      404) out='^fail    smoke: https://cp.example.test answers HTTP 404 through the tunnel' want=1 ;;
+    esac
+    if [[ $rc != "$want" ]] || ! grep -qE "$out" "$LOGS/tunnel-smoke-$code.log" ||
+      ! grep -q '^ok      smoke: cloudflared.service active$' "$LOGS/tunnel-smoke-$code.log"; then
+      fail "tunnel: smoke with the edge answering $code exited $rc: $(grep smoke "$LOGS/tunnel-smoke-$code.log")"
+    fi
+  done
+  dx tunnel systemctl stop cloudflared
+  rc=0
+  adm tunnel smoke >"$LOGS/tunnel-smoke-stopped.log" 2>&1 || rc=$?
+  dx tunnel systemctl start cloudflared
+  pid=$(main_pid tunnel cloudflared)
+  if [[ $rc != 1 ]] || ! grep -q '^fail    smoke: cloudflared.service is inactive, so nothing serves https://cp.example.test (systemctl start cloudflared.service; ubicloud-admin logs cloudflared)$' "$LOGS/tunnel-smoke-stopped.log"; then
+    fail "tunnel: smoke with cloudflared.service stopped exited $rc: $(grep smoke "$LOGS/tunnel-smoke-stopped.log")"
+  fi
+  dx tunnel bash -c 'cp /root/hosts.orig /etc/hosts && rm /usr/local/share/ca-certificates/ubi-m3-edge.crt &&
+    update-ca-certificates --fresh >/dev/null 2>&1'
+  say "tunnel: smoke passes on 200, warns on Cloudflare's 530, fails on another code and on a stopped cloudflared.service"
+
   # Next to that unit, Caddy would make puma trust an X-Real-IP the
   # tunnel passes through, and a token file would never be used: both
   # exit 2 and change nothing.
@@ -1390,14 +1545,19 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
   dx tunnel test ! -e /etc/caddy || fail "tunnel: a refused run installed caddy"
   say "tunnel: Caddy next to a running cloudflared.service, and a token file it would not use, exit 2 and change nothing"
 
-  # A stopped, disabled unit serves nothing: the run warns.
+  # A stopped, disabled unit serves nothing: the front step warns (the
+  # unit is not install.sh's to start), and step 12 fails on it.
   dx tunnel systemctl disable -q --now cloudflared
-  install_cp tunnel "${tun[@]}" >"$LOGS/tunnel-stopped.log" 2>&1 || fail "tunnel: rerun with a stopped unit failed"
+  rc=0
+  install_cp tunnel "${tun[@]}" >"$LOGS/tunnel-stopped.log" 2>&1 || rc=$?
+  [[ $rc == 1 ]] || fail "tunnel: rerun with a stopped unit exited $rc, not 1"
   if ! grep -q '^warn    front: cloudflared.service is not running, so nothing serves https://cp.example.test' "$LOGS/tunnel-stopped.log" ||
-    ! grep -q '^warn    front: cloudflared.service is not enabled' "$LOGS/tunnel-stopped.log"; then
-    fail "tunnel: no warning for a stopped, disabled cloudflared.service: $(grep front "$LOGS/tunnel-stopped.log")"
+    ! grep -q '^warn    front: cloudflared.service is not enabled' "$LOGS/tunnel-stopped.log" ||
+    ! grep -q '^fail    smoke: cloudflared.service is inactive, so nothing serves https://cp.example.test' "$LOGS/tunnel-stopped.log" ||
+    ! grep -q '^install.sh: the install smoke test failed' "$LOGS/tunnel-stopped.log"; then
+    fail "tunnel: a stopped, disabled cloudflared.service: $(grep -E 'front|smoke' "$LOGS/tunnel-stopped.log")"
   fi
-  say "tunnel: a stopped, disabled cloudflared.service is warned about"
+  say "tunnel: a stopped, disabled cloudflared.service is warned about, and step 12 fails on it"
 
   # A fresh tunnel.
   dx tunnel bash -c 'systemctl disable -q --now cloudflared && rm /etc/systemd/system/cloudflared.service && systemctl daemon-reload'
@@ -1418,6 +1578,10 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
   grep -E '^(ok|changed|skip|warn|notice) ' "$LOGS/tunnel-fresh.log" | tee -a "$LOGS/harness.log" >/dev/null
   grep -q 'harness-dummy' "$LOGS/tunnel-fresh.log" && fail "tunnel: install.sh printed the token"
   grep -q '^changed front: installed cloudflared 2026.9.3$' "$LOGS/tunnel-fresh.log" || fail "tunnel: cloudflared was not installed"
+  # Type=notify: with the dummy token cloudflared never reports ready,
+  # which step 12 takes for a tunnel still connecting.
+  grep -q '^warn    smoke: ubicloud-cloudflared.service is activating; cloudflared connects in the background' "$LOGS/tunnel-fresh.log" ||
+    fail "tunnel: step 12 on a connecting ubicloud-cloudflared: $(grep smoke "$LOGS/tunnel-fresh.log")"
   out=$(dx tunnel stat -c '%U:%G %a' /etc/ubicloud/cloudflared.token)
   [[ $out == "root:root 600" ]] || fail "tunnel: the token copy is $out"
   [[ $(dx tunnel systemctl is-enabled ubicloud-cloudflared) == enabled ]] || fail "tunnel: ubicloud-cloudflared is not enabled"

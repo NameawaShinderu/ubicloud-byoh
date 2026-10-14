@@ -53,13 +53,19 @@ sudo bash scripts/byoh/install.sh --version v0.1.0 --url http://localhost:3000 \
 `bash scripts/byoh/install.sh --help` lists every flag.
 
 The last step runs `ubicloud-admin smoke` (skipped with `--no-start`).
-It checks that puma answers, that the front answers, that web and
-respirate run, and that `bin/byoh-config-check` reports no fail. With
-`RACK_ENV=production` it also runs `bin/production_check`, which needs
-port 8081. If any check fails, install.sh exits 1 and points at
-`ubicloud-admin logs`. Two cases only warn, because both come up in the
-background: an `acme` certificate that has not been issued yet, and a
-tunnel hostname that does not answer yet.
+It checks that puma answers, that the front's unit (caddy, or the
+cloudflared unit) runs and the front answers, that web and respirate
+run, and that `bin/byoh-config-check` reports no fail. With
+`RACK_ENV=production` it also runs `bin/production_check`, whose own
+puma needs port 8081: `PORT` must not be 8081 (install.sh and
+`ubicloud-admin env set PORT` refuse it). If any check fails, install.sh
+exits 1 and points at `ubicloud-admin logs`. Two cases only warn,
+because both come up in the background: an `acme` certificate that
+caddy has not got yet (the TLS handshake fails), and a tunnel that has
+not connected yet (cloudflared still starting, no answer, or
+Cloudflare's HTTP 530). A stopped front fails. Smoke changes no setting
+and no unit, but its two checks boot the app as `ubicloud`, which
+rewrites `/var/lib/ubicloud/var/ca_bundles`.
 
 install.sh also installs `ubicloud-admin` (`packaging/bin/ubicloud-admin`)
 to `/usr/local/bin`. Run it as root:
@@ -67,7 +73,7 @@ to `/usr/local/bin`. Run it as root:
 | Command | Does |
 |---|---|
 | `ubicloud-admin status` | units, web, env file, pg_hba trust rules, backup recipient and age, `bin/byoh-config-check`; exits 1 on any fail |
-| `ubicloud-admin smoke` | install.sh's step 12: puma and the front (`front.conf`) answer, web and respirate active, `bin/byoh-config-check` has no fail, `bin/production_check` in production; exits 1 on any fail |
+| `ubicloud-admin smoke` | install.sh's step 12: puma and the front (`front.conf`) answer, the front's unit, web and respirate active, `bin/byoh-config-check` has no fail, `bin/production_check` in production; exits 1 on any fail |
 | `ubicloud-admin backup now\|list\|prune --keep N` | `pg_dump` plus the age-encrypted `/etc/ubicloud` under `BACKUP_TARGET`; the daily `ubicloud-backup.timer` runs `backup now` |
 | `ubicloud-admin restore TS --key-file F [--env-only\|--db-only] [--force]` | checks the backup, restores into `ubicloud_restore` as the non-superuser role `ubicloud_restorer`, then swaps it in (the old database stays as `ubicloud_prev_*`), migrates and starts; any failure after the swap puts back the database, `/etc/ubicloud` and the billing rates. A replaced env file is kept as `env.before-restore-*`. Backups are trusted: keep them where only root can write |
 | `ubicloud-admin env set\|unset\|get --reveal\|keys` | edits `/etc/ubicloud/env` (values on stdin, never printed) and restarts the services, putting the old file back if web does not answer; refuses the secrets, install.sh's flag keys and code-loading keys |

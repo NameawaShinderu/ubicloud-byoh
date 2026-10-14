@@ -53,10 +53,11 @@
 # the port or a development control plane lives on the machine.
 #
 # The last step runs ubicloud-admin smoke (skipped with --no-start): it
-# GETs the login page from puma and through the front, checks that web
-# and respirate run, runs bin/byoh-config-check and, with
-# RACK_ENV=production, bin/production_check (port 8081). A fail exits 1
-# with everything installed; a rerun repeats only what changed.
+# GETs the login page from puma and through the front, checks that the
+# front's unit, web and respirate run, runs bin/byoh-config-check and,
+# with RACK_ENV=production, bin/production_check (port 8081, which PORT
+# therefore must not be). A fail exits 1 with everything installed; a
+# rerun repeats only what changed.
 #
 # Docs: docs/byoh/INSTALL.md (flags, settings), docs/byoh/OPERATIONS.md.
 set -euo pipefail
@@ -88,6 +89,8 @@ readonly PG_UNIT=postgresql@$PG_VERSION-main
 readonly SERVICE_PATH=$TOOLS/bin:/usr/bin:/bin
 readonly UNIT_DIR=/etc/systemd/system
 readonly ADMIN_BIN=/usr/local/bin/ubicloud-admin
+# The port of the puma that bin/production_check starts (step 12).
+readonly CHECK_PORT=8081
 # A mise release at least two weeks old; the checksum is the one
 # published with it for the linux-x64 binary.
 readonly MISE_VERSION=v2026.9.18
@@ -327,7 +330,8 @@ as_service() {
     done
     export PATH=$SERVICE_PATH HOME=$STATE
     umask 0007
-    exec setpriv --reuid="$user" --regid="$group" --init-groups -- "$@"
+    # fd 9 is this script's lock, which no unprivileged process may hold.
+    exec setpriv --reuid="$user" --regid="$group" --init-groups -- "$@" 9>&-
   )
 }
 
@@ -580,6 +584,9 @@ check_settings() {
     kv_read "$ENV_FILE"
     EFFECTIVE_PORT=${KV[PORT]:-3000}
   fi
+  # The install smoke runs bin/production_check, whose puma takes 8081.
+  [[ $EFFECTIVE_PORT != "$CHECK_PORT" ]] ||
+    usage_die "$ENV_FILE sets PORT $CHECK_PORT, which is reserved for the puma of bin/production_check (step 12); move puma to another port (ubicloud-admin env set PORT), with --url to match under --tls none"
   [[ -z $URL_PORT || $URL_PORT == "$EFFECTIVE_PORT" ]] ||
     usage_die "--url names port $URL_PORT, but puma listens on PORT $EFFECTIVE_PORT"
   if [[ -e $BACKUP_CONF ]]; then
@@ -1512,10 +1519,12 @@ EOF
 
 # --- step 12: install smoke ---------------------------------------------------------------------
 
-# ubicloud-admin smoke: puma and the front answer, web and respirate
-# run, bin/byoh-config-check has no fail, and in production
-# bin/production_check passes. It changes nothing and takes no lock, so
-# it runs under this script's lock.
+# ubicloud-admin smoke: puma and the front answer, the front's unit, web
+# and respirate run, bin/byoh-config-check has no fail, and in
+# production bin/production_check passes. It changes no setting and no
+# unit (its two checks boot the app as ubicloud, which rewrites
+# /var/lib/ubicloud/var/ca_bundles) and takes no lock, so it runs under
+# this script's lock; its unprivileged children do not inherit it.
 step_smoke() {
   if ((NO_START)); then
     report skip "smoke: not run (--no-start); run ubicloud-admin smoke once the services run"

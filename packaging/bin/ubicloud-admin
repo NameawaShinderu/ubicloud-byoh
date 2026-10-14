@@ -19,14 +19,18 @@
 # status   Units, settings (bin/byoh-config-check), pg_hba trust rules,
 #          backup recipient and age, release. Exits 1 on any fail.
 # smoke    What install.sh runs last (step 12): puma answers on its
-#          address, and through the front in /etc/ubicloud/front.conf
-#          (caddy on 127.0.0.1:443 under the BASE_URL host for acme and
-#          provided, BASE_URL itself for tunnel); web and respirate are
-#          active; bin/byoh-config-check has no fail; and with
-#          RACK_ENV=production, bin/production_check passes (it needs
-#          port 8081). No answer yet from an acme certificate or a tunnel
-#          is a warning, since both come up in the background. Exits 1
-#          on any fail.
+#          address; the front in /etc/ubicloud/front.conf runs (caddy,
+#          or the cloudflared unit) and answers (caddy on 127.0.0.1:443
+#          under the BASE_URL host for acme and provided, BASE_URL itself
+#          for tunnel); web and respirate are active; bin/byoh-config-check
+#          has no fail; and with RACK_ENV=production, bin/production_check
+#          passes (it needs port 8081, so PORT must not be 8081). Only what
+#          comes up in the background warns: an acme certificate caddy
+#          has not got yet (TLS handshake failure), and a tunnel not yet
+#          connected (no answer, or Cloudflare's 530). Exits 1 on any
+#          fail. It changes no setting and no unit, but the two checks
+#          boot the app as ubicloud, which rewrites
+#          /var/lib/ubicloud/var/ca_bundles.
 # backup   now: <target>/<UTC timestamp>/ with db.dump (pg_dump -Fc),
 #          globals.sql, billing-rates.tar and manifest.json, and
 #          <target>/secrets/<timestamp>.age, a tar of /etc/ubicloud
@@ -237,7 +241,9 @@ as_service() {
     for x in "${SERVICE_EXTRA[@]}"; do export "${x?}"; done
     export PATH=$SERVICE_PATH HOME=$SERVICE_HOME
     umask 0007
-    exec setpriv --reuid="$user" --regid="$group" --init-groups -- "$@"
+    # fd 9 is the lock of install.sh or ubicloud-admin, which no
+    # unprivileged process may hold.
+    exec setpriv --reuid="$user" --regid="$group" --init-groups -- "$@" 9>&-
   )
 }
 
@@ -428,16 +434,73 @@ probe() {
   done
 }
 
+# front_unit FRONT: the unit that serves FRONT (none for none): caddy for
+# acme and provided; for tunnel install.sh's ubicloud-cloudflared, or the
+# cloudflared.service it left as it was.
+front_unit() {
+  case $1 in
+    acme | provided) echo caddy.service ;;
+    tunnel)
+      if [[ -e /etc/systemd/system/ubicloud-cloudflared.service ]]; then
+        echo ubicloud-cloudflared.service
+      else
+        echo cloudflared.service
+      fi
+      ;;
+  esac
+}
+
+# settled_state UNIT: its state once it is active or 10 s pass.
+settled_state() {
+  local i
+  for i in $(seq 10); do
+    [[ $(unit_state "$1") != active ]] || break
+    sleep 1
+  done
+  unit_state "$1"
+}
+
 # The front through which the smoke GET goes: TLS_FRONT in front.conf,
-# which install.sh writes once the front runs (none before that).
+# which install.sh writes once the front runs (none before that). Its
+# unit must run first: a front that is down fails, whatever curl says.
+# Only what comes up in the background warns: an acme certificate that
+# caddy has not got yet (the TLS handshake fails, curl exit 35), and a
+# tunnel that has not connected (activating, no answer, or Cloudflare's
+# 530 for a tunnel without a connector).
 smoke_front() {
-  local front base host
+  local front base host unit state
   kv_read "$FRONT_CONF"
   front=${KV[TLS_FRONT]:-none}
   base=$(env_value BASE_URL)
   base=${base%/}
   case $front in
-    none) ;;
+    none) return ;;
+    acme | provided | tunnel) ;;
+    *)
+      fail_line "smoke: $FRONT_CONF names an unknown front $front"
+      return
+      ;;
+  esac
+  unit=$(front_unit "$front")
+  state=$(settled_state "$unit")
+  case $state in
+    active) report ok "smoke: $unit active" ;;
+    activating | reloading)
+      if [[ $front == tunnel ]]; then
+        warn_line "smoke: $unit is $state; cloudflared connects in the background (ubicloud-admin logs cloudflared)"
+      else
+        fail_line "smoke: $unit is still $state after 10 s (ubicloud-admin logs caddy)"
+        return
+      fi
+      ;;
+    *)
+      local logs=caddy
+      [[ $front != tunnel ]] || logs=cloudflared
+      fail_line "smoke: $unit is ${state:-unknown}, so nothing serves $base (systemctl start $unit; ubicloud-admin logs $logs)"
+      return
+      ;;
+  esac
+  case $front in
     acme | provided)
       if [[ ! $base =~ ^https://([A-Za-z0-9.-]+)$ ]]; then
         fail_line "smoke: front --tls $front, but BASE_URL is not https://HOST"
@@ -449,24 +512,24 @@ smoke_front() {
       # machine's caddy under the name it serves.
       if probe 30 "https://$host/login" -k --resolve "$host:443:127.0.0.1"; then
         report ok "smoke: caddy serves https://$host (HTTP $PROBE_CODE)"
-      elif [[ $front == acme && $PROBE_CODE == 000 ]]; then
-        warn_line "smoke: caddy gives no HTTPS answer for $host yet (curl exit $PROBE_RC); it gets the certificate from Let's Encrypt in the background, which needs public DNS and ports 80 and 443 (ubicloud-admin logs caddy)"
+      elif [[ $front == acme && $PROBE_CODE == 000 && $PROBE_RC == 35 ]]; then
+        warn_line "smoke: caddy has no certificate for $host yet (curl exit 35, TLS handshake); it gets one from Let's Encrypt in the background, which needs public DNS and ports 80 and 443 (ubicloud-admin logs caddy)"
       else
-        fail_line "smoke: https://$host through caddy answers HTTP $PROBE_CODE (curl exit $PROBE_RC; ubicloud-admin logs caddy web)"
+        fail_line "smoke: https://$host through caddy on 127.0.0.1:443 answers HTTP $PROBE_CODE (curl exit $PROBE_RC; ubicloud-admin logs caddy web)"
       fi
       ;;
     tunnel)
       if probe 30 "$base/login"; then
         report ok "smoke: $base answers through the tunnel (HTTP $PROBE_CODE)"
-      elif [[ $PROBE_CODE == 000 ]]; then
-        # cloudflared connects in the background, and the public name
-        # may not resolve from this machine.
-        warn_line "smoke: no answer from $base (curl exit $PROBE_RC); the tunnel connects in the background, and its public hostname must route to http://$(web_addr) (ubicloud-admin logs cloudflared)"
+      elif [[ $PROBE_CODE == 000 || $PROBE_CODE == 530 ]]; then
+        # cloudflared connects in the background (Cloudflare answers 530
+        # until it has), and the public name may not resolve from this
+        # machine.
+        warn_line "smoke: no answer from $base yet (HTTP $PROBE_CODE, curl exit $PROBE_RC); the tunnel connects in the background, and its public hostname must route to http://$(web_addr) (ubicloud-admin logs cloudflared)"
       else
         fail_line "smoke: $base answers HTTP $PROBE_CODE through the tunnel; check that its public hostname routes to http://$(web_addr) (ubicloud-admin logs cloudflared web)"
       fi
       ;;
-    *) fail_line "smoke: $FRONT_CONF names an unknown front $front" ;;
   esac
 }
 
@@ -479,6 +542,10 @@ smoke_front() {
 smoke_production_check() {
   if [[ $(env_value RACK_ENV) != production ]]; then
     report skip "smoke: bin/production_check (RACK_ENV is $(env_value RACK_ENV development), not production)"
+    return
+  fi
+  if [[ $(env_value PORT 3000) == "$CHECK_PORT" ]]; then
+    fail_line "smoke: PORT is $CHECK_PORT, which bin/production_check needs for its own puma; move puma to another port (ubicloud-admin env set PORT)"
     return
   fi
   if [[ -n $(ss -Htln "sport = :$CHECK_PORT") ]]; then
@@ -509,13 +576,10 @@ cmd_smoke() {
     fail_line "smoke: puma does not answer on $(web_addr) (HTTP $PROBE_CODE)"
   fi
   smoke_front
-  local u i
+  local u state
   for u in ubicloud-web ubicloud-respirate; do
-    for i in $(seq 10); do
-      [[ $(unit_state "$u") != active ]] || break
-      sleep 1
-    done
-    if [[ $(unit_state "$u") == active ]]; then report ok "smoke: $u active"; else fail_line "smoke: $u is $(unit_state "$u")"; fi
+    state=$(settled_state "$u")
+    if [[ $state == active ]]; then report ok "smoke: $u active"; else fail_line "smoke: $u is $state"; fi
   done
   local out rc=0
   out=$(ruby_as ubicloud bin/byoh-config-check 2>&1) || rc=$?
@@ -1147,6 +1211,8 @@ cmd_env() {
     value=$(read_value "$key")
     [[ -n $value ]] || usage_die "the value is empty; use env unset $key to remove the key"
     valid_value "$value" || usage_die "the value contains a quote, backslash, newline or CR, which $ENV_FILE cannot hold"
+    [[ $key != PORT || $value != "$CHECK_PORT" ]] ||
+      usage_die "PORT $CHECK_PORT is reserved for the puma of bin/production_check (ubicloud-admin smoke); choose another port"
   fi
   audit "env $sub"
   take_lock 60
