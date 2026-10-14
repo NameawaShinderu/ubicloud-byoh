@@ -54,7 +54,9 @@
 #            same release (migrate-compare.sql), the row counts against
 #            the source (migrate-row-counts.sql) and the password-hash
 #            isolation (bin/byoh-config-check).
-# start      Enables and starts ubicloud.target, checks that every
+# start      Refuses a copy that a rollback gave up or whose development
+#            database accepts connections again. Enables and starts
+#            ubicloud.target, checks that every
 #            Sshable runs a command and that nothing listens on a
 #            non-loopback address of the web port, runs install_rhizome
 #            on every host when preflight found rhizome changes, then
@@ -65,15 +67,22 @@
 #            --simulate-production, which must have no fail, then
 #            install.sh again with --rack-env production. --back returns
 #            to development the same way, without the check.
-# rollback   Disables and stops ubicloud.target, switches the development
-#            database's connections on again, prints what the packaged
+# rollback   Disables and stops ubicloud.target, marks database ubicloud
+#            rolled back (start then refuses it, and copy-db replaces it
+#            only with --i-understand-this-drops-live-data), switches the
+#            development database's connections on again, prints what
+#            the packaged
 #            control plane did after the copy (VMs, pages, strands) and
 #            the tmux commands that start the development control plane
-#            again. Run them as the development user.
+#            again, with a warning when a BMC password variable came
+#            from respirate's environment, not .env.rb. Run them as the
+#            development user.
 # retire     Once the packaged control plane ran 14 nights with backups
 #            and a restore drill passed: the bootstrap's trust rules in
 #            pg_hba.conf go back to Ubuntu's peer and scram-sha-256,
-#            role clover can no longer log in and is no superuser, the
+#            the role that owns the development tables (clover; never
+#            postgres or a ubicloud role) can no longer log in and is no
+#            superuser, the
 #            development database is renamed to <db>_retired_<date>
 #            (never dropped) and the bootstrap's marker directory is
 #            moved aside. ubicloud-admin status then has no trust fail.
@@ -258,12 +267,18 @@ load_state() {
     fi
     ARG[$p]=${st[$sk]:-}
   done
-  for k in REV R0_REV RENAME RHIZOME CUTOVER_TS STARTED_TS RACK_ENV_NOW DEV_HOME; do
+  for k in "${STATE_KEYS[@]}"; do
     S[$k]=${st[$k]:-}
   done
 }
 
 declare -A S=()
+# What preflight found and the later phases recorded. DEV_ROLE is the
+# role that owns the development database's tables (retire demotes it);
+# BMC_FROM_PROC names the BMC password variables found only in the
+# running respirate's environment; ROLLED_BACK is the time of the last
+# rollback, cleared by the copy-db after it.
+readonly STATE_KEYS=(REV R0_REV RENAME RHIZOME CUTOVER_TS STARTED_TS RACK_ENV_NOW DEV_HOME DEV_ROLE BMC_FROM_PROC ROLLED_BACK)
 
 # write_state: the flags and what preflight found, root 0600.
 write_state() {
@@ -277,7 +292,7 @@ write_state() {
     fi
   done
   local k
-  for k in REV R0_REV RENAME RHIZOME CUTOVER_TS STARTED_TS RACK_ENV_NOW DEV_HOME; do
+  for k in "${STATE_KEYS[@]}"; do
     out+=("$k='${S[$k]:-}'")
   done
   install -d -m 0700 -o root -g root "$MIG_DIR"
@@ -338,6 +353,16 @@ psql_admin() { runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 "$@"; }
 db_exists() { [[ -n $(psql_value -d postgres -c "SELECT 1 FROM pg_database WHERE datname = '$1'") ]]; }
 db_comment() { psql_value -d postgres -c "SELECT coalesce(shobj_description(oid, 'pg_database'), '') FROM pg_database WHERE datname = '$1'"; }
 unit_state() { systemctl is-active "$1" 2>/dev/null || true; }
+db_allows_connections() { [[ $(psql_value -d postgres -c "SELECT datallowconn FROM pg_database WHERE datname = '$1'") == t ]]; }
+
+# retirable_role ROLE: ROLE exists and is one retire may make NOLOGIN
+# NOSUPERUSER: not the cluster's bootstrap superuser (oid 10, postgres),
+# no pg_* role and none of the packaged control plane's.
+retirable_role() {
+  [[ $1 =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || return 1
+  case $1 in postgres | ubicloud | ubicloud_* | pg_*) return 1 ;; esac
+  [[ $(psql_value -d postgres -c "SELECT oid = 10 FROM pg_roles WHERE rolname = '$1'") == f ]]
+}
 
 # as_dev CMD...: CMD as the development user with a clean environment.
 as_dev() {
@@ -419,11 +444,22 @@ dev_ruby_version() {
 
 # Loads .env.rb as the development user with an empty environment and
 # prints, NUL-separated, every KEY and value it sets. The values reach
-# only root's pipe.
+# only root's pipe. When loading fails, the last line on stderr is the
+# exception class and the line of .env.rb, never Ruby's message, which
+# quotes source tokens (an unquoted value in a NameError, the offending
+# line in a SyntaxError). It runs on the system Ruby too, so no "it".
 # shellcheck disable=SC2016 # Ruby code
 readonly IMPORT_RB='before = ENV.to_h
-Dir.chdir(File.dirname(ARGV[0]))
-load ARGV[0]
+path = File.expand_path(ARGV[0])
+Dir.chdir(File.dirname(path))
+begin
+  load path
+rescue Exception => e
+  line = e.backtrace_locations&.find { |l| l.absolute_path == path }&.lineno
+  line ||= e.message.to_s[/#{Regexp.escape(path)}:(\d+)/, 1] if e.is_a?(SyntaxError)
+  warn "#{e.class.name}#{" at line #{line}" if line}"
+  exit 1
+end
 ENV.to_h.sort.each { |k, v| $stdout.write(k, "\0", v, "\0") unless before[k] == v }'
 
 declare -A IMP=() FINAL=()
@@ -439,7 +475,12 @@ read_env_rb() {
   }
   make_work
   if ! as_dev "$ruby" -e "$IMPORT_RB" "${ARG[dev-repo]}/.env.rb" >"$WORK/import" 2>"$WORK/import.err"; then
-    fatal "env: loading ${ARG[dev-repo]}/.env.rb as ${ARG[dev-user]} failed: $(grep -v -i 'secret\|password\|key' "$WORK/import.err" | head -1)"
+    # Only the line IMPORT_RB wrote, and only in its own shape.
+    local why
+    why=$(tail -1 "$WORK/import.err")
+    [[ $why =~ ^[A-Z][A-Za-z0-9_:]{0,80}( at line [0-9]{1,6})?$ ]] || why="see the Ruby error by loading it yourself as ${ARG[dev-user]}; it is not shown here, as it may quote a value"
+    rm -f "$WORK/import.err"
+    fatal "env: loading ${ARG[dev-repo]}/.env.rb as ${ARG[dev-user]} failed: $why"
     return 0
   fi
   while IFS= read -r -d '' k && IFS= read -r -d '' v; do
@@ -543,7 +584,8 @@ plan_import() {
 # must have a value, from .env.rb or the environment of the running
 # development respirate; the found ones join FINAL.
 check_bmc_envs() {
-  local has names n pid found v
+  local has names n pid found v from_proc=()
+  S[BMC_FROM_PROC]=""
   has=$(psql_value -d "${ARG[dev-db]}" -c "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'host_provider' AND column_name = 'config'") || {
     fatal "bmc: cannot read ${ARG[dev-db]}"
     return 0
@@ -581,9 +623,11 @@ check_bmc_envs() {
     else
       FINAL[$n]=$found
       FINAL_KEYS+=("$n")
-      report ok "bmc: $n comes from the environment of the running development respirate"
+      from_proc+=("$n")
+      warn "bmc: $n comes from the environment of the running development respirate, not .env.rb; the tmux commands of a rollback start respirate without it, so add it to .env.rb"
     fi
   done <<<"$names"
+  S[BMC_FROM_PROC]="${from_proc[*]:-}"
 }
 
 # --- preflight ---------------------------------------------------------------------
@@ -687,8 +731,14 @@ pf_schema() {
   [[ -z $ext ]] || fatal "schema: ${ARG[dev-db]} uses extension(s) $ext; the copy creates only citext and btree_gist"
   local roles
   roles=$(psql_value -d "${ARG[dev-db]}" -c "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'public.schema_migrations'::regclass")
-  [[ $roles =~ ^[a-z_][a-z0-9_]*$ ]] || fatal "schema: cannot tell which role owns ${ARG[dev-db]}"
-  report ok "schema: ${ARG[dev-db]} belongs to role $roles (password hashes: ${roles}_password)"
+  if [[ ! $roles =~ ^[a-z_][a-z0-9_]*$ ]]; then
+    fatal "schema: cannot tell which role owns ${ARG[dev-db]}"
+  elif ! retirable_role "$roles"; then
+    fatal "schema: the tables of ${ARG[dev-db]} belong to role $roles, which retire would demote; the development bootstrap's role is clover"
+  else
+    S[DEV_ROLE]=$roles
+    report ok "schema: ${ARG[dev-db]} belongs to role $roles (password hashes: ${roles}_password)"
+  fi
 }
 
 pf_rhizome() {
@@ -833,7 +883,7 @@ phase_preflight() {
   if [[ -f $MIG_STATE ]]; then
     kv_read "$MIG_STATE"
     local k
-    for k in RENAME CUTOVER_TS STARTED_TS RACK_ENV_NOW; do S[$k]=${KV[$k]:-}; done
+    for k in RENAME CUTOVER_TS STARTED_TS RACK_ENV_NOW DEV_ROLE BMC_FROM_PROC ROLLED_BACK; do S[$k]=${KV[$k]:-}; done
   fi
   validate_plan
   run_preflight || exit 1
@@ -903,7 +953,7 @@ take_locks() {
 }
 
 # The kind of the database ubicloud: none, migrating (a copy-db that did
-# not finish), migrated, pristine (install.sh's: no account, and no
+# not finish), migrated (a finished copy, rolled back or not), pristine (install.sh's: no account, and no
 # strand but the ones migrations seed) or used.
 ubicloud_kind() {
   db_exists "$DB_NAME" || {
@@ -913,7 +963,7 @@ ubicloud_kind() {
   local c n
   c=$(db_comment "$DB_NAME")
   case $c in
-    "migrated-from "*) echo migrated ;;
+    "migrated-from "* | "rolled-back-from "*) echo migrated ;;
     "migrating-from "*) echo migrating ;;
     *)
       # A fresh migrate seeds one LocationNexus strand per location; a
@@ -1037,6 +1087,8 @@ $procs" 2
   report ok "copy-db: $dump ($(du -h "$dump" | cut -f1))"
   runuser -u postgres -- psql -X -q -d "$dev" -f "$CURRENT/scripts/byoh/migrate-row-counts.sql" >"$WORK/rows.src"
   src_role=$(psql_value -d "$dev" -c "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'public.schema_migrations'::regclass")
+  retirable_role "$src_role" || die "the tables of $dev belong to role $src_role, which retire would demote; the development bootstrap's role is clover"
+  [[ -z ${S[DEV_ROLE]:-} || ${S[DEV_ROLE]} == "$src_role" ]] || die "the tables of $dev belong to role $src_role, preflight found ${S[DEV_ROLE]}; run preflight again"
   ph_tables=$(psql_value -d "$dev" -c "SELECT coalesce(string_agg(relname, ',' ORDER BY relname), '') FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relkind IN ('r', 'p', 'v', 'm', 'S', 'f') AND pg_get_userbyid(relowner) = '${src_role}_password'")
   ph_funcs=$(psql_value -d "$dev" -c "SELECT coalesce(string_agg(oid::regprocedure::text, '|' ORDER BY 1), '') FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND pg_get_userbyid(proowner) = '${src_role}_password'")
   psql_value -d postgres -c "ALTER DATABASE \"$dev\" ALLOW_CONNECTIONS false" >/dev/null
@@ -1136,13 +1188,16 @@ $procs" 2
   local bad=0
   runuser -u postgres -- psql -X -q -d "$DB_NAME" -f "$CURRENT/scripts/byoh/migrate-compare.sql" >"$WORK/cmp.copy"
   runuser -u postgres -- psql -X -q -d "${DB_NAME}_ref" -f "$CURRENT/scripts/byoh/migrate-compare.sql" >"$WORK/cmp.ref"
-  # Lines of objects both have that differ, and objects only the copy has
+  # Lines of objects both have that differ, objects only the copy has
   # (the partitions respirate made) unless they are ubicloud's without
-  # grants.
+  # grants, and every object only the reference has: no migration and no
+  # respirate drops an object a fresh migrate makes, so one the copy
+  # lacks was lost by the restore or the role map.
   awk -F'\t' '
-    NR == FNR { ref[$1] = $2; next }
+    NR == FNR { ref[$1] = $2; order[++n] = $1; next }
     ($1 in ref) { if (ref[$1] != $2) print "differs: " $1 ": copy " $2 " / reference " ref[$1]; seen[$1] = 1; next }
     $1 !~ /^rel\|/ || $2 != "owner=ubicloud acl=" { print "only in the copy: " $1 ": " $2 }
+    END { for (i = 1; i <= n; i++) if (!(order[i] in seen)) print "only in the reference: " order[i] ": " ref[order[i]] }
   ' "$WORK/cmp.ref" "$WORK/cmp.copy" >"$WORK/cmp.diff"
   if [[ -s $WORK/cmp.diff ]]; then
     sed 's/^/  /' "$WORK/cmp.diff" | head -30 >&2
@@ -1177,7 +1232,7 @@ $procs" 2
   runuser -u postgres -- dropdb "${DB_NAME}_ref"
   psql_value -d postgres -c "COMMENT ON DATABASE $DB_NAME IS 'migrated-from $dev $ts'" >/dev/null
   COPY_ARMED=0
-  S[CUTOVER_TS]=$ts
+  S[CUTOVER_TS]=$ts S[STARTED_TS]="" S[ROLLED_BACK]="" S[DEV_ROLE]=$src_role
   write_state
   report changed "copy-db: database $DB_NAME is the copy of $dev at $ts"
   echo
@@ -1213,6 +1268,26 @@ check_listen() {
   report ok "start: port $port listens on ${addrs//$'\n'/ } only"
 }
 
+# require_live_copy: database ubicloud is a finished copy that no
+# rollback gave up, and the development database still accepts no
+# connections. After a rollback the development control plane may have
+# run on, so the copy is stale: starting respirate on it would act on
+# the hosts from an old snapshot.
+require_live_copy() {
+  local c dev=${ARG[dev-db]}
+  c=$(db_comment "$DB_NAME")
+  case $c in
+    "migrated-from "*) ;;
+    "rolled-back-from "*) die "database $DB_NAME was rolled back ($c) and $dev may have changed since; stop the development control plane and run copy-db --i-understand-this-drops-live-data first" 2 ;;
+    *) die "database $DB_NAME is not a finished copy; run copy-db first" 2 ;;
+  esac
+  [[ $c == "migrated-from $dev "* ]] || die "database $DB_NAME is a copy of another database ($c), not of $dev" 2
+  [[ -z ${S[ROLLED_BACK]:-} ]] || die "rollback ran at ${S[ROLLED_BACK]} after the copy; run copy-db --i-understand-this-drops-live-data first" 2
+  if db_exists "$dev" && db_allows_connections "$dev"; then
+    die "$dev accepts connections, so the development control plane may have run on it since the copy; stop it and run copy-db --i-understand-this-drops-live-data first" 2
+  fi
+}
+
 console_code() { "$ADMIN_BIN" console -e - 2>/dev/null 8>&- 9>&-; }
 
 # admin ARGS...: ubicloud-admin without this script's locks.
@@ -1222,7 +1297,7 @@ phase_start() {
   load_state
   exec 8>>"$MIG_LOCK"
   flock -n 8 || die "another migrate-from-dev.sh run holds $MIG_LOCK"
-  [[ $(db_comment "$DB_NAME") == "migrated-from "* ]] || die "database $DB_NAME is not a finished copy; run copy-db first" 2
+  require_live_copy
   local procs
   procs=$(dev_processes)
   [[ -z $procs ]] || die "the development control plane runs again; stop it first:
@@ -1349,6 +1424,15 @@ phase_rollback() {
   [[ -z $(ss -Htln "sport = :$port") ]] || die "port $port is still in use (ss -tlnp 'sport = :$port')"
   report changed "rollback: ubicloud.target disabled and stopped; port $port is free"
   db_exists "$dev" || die "database $dev does not exist (retired?); there is nothing to roll back to"
+  # The copy is stale from here on: start and retire refuse it, and
+  # copy-db replaces it only with --i-understand-this-drops-live-data.
+  local rb_ts
+  rb_ts=$(date -u +%Y%m%dT%H%M%SZ)
+  if [[ $(db_comment "$DB_NAME" 2>/dev/null) == "migrated-from "* ]]; then
+    psql_value -d postgres -c "COMMENT ON DATABASE $DB_NAME IS 'rolled-back-from $dev $rb_ts'" >/dev/null
+    report changed "rollback: database $DB_NAME is marked rolled back; start refuses it until copy-db --i-understand-this-drops-live-data makes a new copy"
+  fi
+  set_state ROLLED_BACK "$rb_ts"
   psql_value -d postgres -c "ALTER DATABASE \"$dev\" ALLOW_CONNECTIONS true" >/dev/null
   report changed "rollback: $dev accepts connections again"
   if [[ -n ${S[CUTOVER_TS]:-} ]] && db_exists "$DB_NAME"; then
@@ -1365,6 +1449,10 @@ phase_rollback() {
       echo "start ran install_rhizome on every host: the hosts run the release's rhizome; run vm_host.install_rhizome from ${ARG[dev-repo]} to go back"
     echo "Review host-side changes (reboots, rhizome installs, VMs above) before the development control plane runs on $dev again."
   fi
+  if [[ -n ${S[BMC_FROM_PROC]:-} ]]; then
+    echo
+    warn "rollback: preflight took the BMC password variable(s) ${S[BMC_FROM_PROC]} from the running respirate's environment, not .env.rb; the R0 commands below start respirate without them, and its Redfish calls then go out with no password. Add them to ${ARG[dev-repo]}/.env.rb first (they are in $ENV_FILE)"
+  fi
   echo
   r0_commands
   echo "rollback: done. The database ubicloud is kept; copy-db --i-understand-this-drops-live-data replaces it on the next move."
@@ -1380,7 +1468,7 @@ phase_retire() {
   ((DRILL_DONE)) || usage_die "retire needs --restore-drill-done: run a restore drill first (docs/byoh/OPERATIONS.md)"
   [[ $(unit_state ubicloud.target) == active && $(systemctl is-enabled ubicloud.target 2>/dev/null || true) == enabled ]] ||
     die "ubicloud.target is not active and enabled; retire only a moved control plane" 2
-  [[ $(db_comment "$DB_NAME") == "migrated-from "* ]] || die "database $DB_NAME is not a finished copy" 2
+  require_live_copy
   [[ -z $(dev_processes) ]] || die "the development control plane runs; stop it first" 2
   local target n=0 d
   target=$(backup_target)
@@ -1397,8 +1485,11 @@ phase_retire() {
     report ok "retire: $n backups since the copy"
   fi
   db_exists "$dev" || die "database $dev does not exist; already retired?" 2
-  local role
-  role=$(db_owner "$dev")
+  # The role whose tables preflight and copy-db saw, never the
+  # database's owner, which a hand-made database may give to postgres.
+  local role=${S[DEV_ROLE]:-}
+  [[ -n $role ]] || die "$MIG_STATE names no DEV_ROLE (the role of the development database's tables); run preflight again" 2
+  retirable_role "$role" || die "retire would demote role $role, which is no development bootstrap role (postgres, pg_* and ubicloud* are refused, and the role must exist); nothing was changed" 2
   local hba=$PG_CONF/pg_hba.conf saved
   saved=$hba.before-retire-$(date -u +%Y%m%dT%H%M%SZ)
   cp -p "$hba" "$saved"
@@ -1438,8 +1529,6 @@ phase_retire() {
   ! grep -q 'use trust for database ubicloud or all' <<<"$out" || die "status still reports a trust rule (above)"
   echo "retire: done."
 }
-
-db_owner() { psql_value -d postgres -c "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '$1'"; }
 
 # --- main -------------------------------------------------------------------------------
 

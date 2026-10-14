@@ -25,9 +25,9 @@ exactly as it was at the copy.
 | `preflight` | Nothing; it writes `/var/lib/ubicloud-migration/state` (root 0600) | Checks are listed below. Every `fatal` line must be resolved first. |
 | `install` | `/etc/ubicloud/env` from `.env.rb`, then `install.sh --no-start` | Nothing stops. The development control plane keeps serving. |
 | `copy-db` | `<backup target>/pre-migration-<UTC>.dump`, database `ubicloud`, `clover_test` connections off | Refuses while tmux or the units run. |
-| `start` | Enables and starts `ubicloud.target` | Runs `install_rhizome` only if preflight found rhizome changes. |
+| `start` | Enables and starts `ubicloud.target` | Refuses a rolled-back copy, or one whose `clover_test` accepts connections. Runs `install_rhizome` only if preflight found rhizome changes. |
 | `flip-production` | `RACK_ENV=production` through `install.sh` | Window B; blocked on the E1 canary. |
-| `rollback` | Disables the units; `clover_test` connections on | Prints the tmux commands to run. |
+| `rollback` | Disables the units; marks `ubicloud` rolled back; `clover_test` connections on | Prints the tmux commands to run. |
 | `retire` | `pg_hba.conf` trust lines, role `clover`, `clover_test` renamed | At least 14 days later. |
 
 **`preflight`** (read-only). It checks:
@@ -37,7 +37,9 @@ exactly as it was at the copy.
   `20260412000000_add_generic_provider.rb` is renamed by `copy-db`, in
   `ubicloud` only.
 - The names of every key `.env.rb` sets. It loads `.env.rb` as the
-  development user with an empty environment.
+  development user with an empty environment. If it fails to load, only
+  the exception class and line are shown, never Ruby's message, which can
+  quote a value.
   - `CLOVER_DATABASE_URL` and `GIT_REV` are dropped.
   - `RACK_ENV` becomes `--rack-env`.
   - `BILLING_RATES_EXTRA_DIR` becomes `/var/lib/ubicloud/billing_rates.d`.
@@ -51,7 +53,11 @@ exactly as it was at the copy.
     `BIND`, `PORT` 8081.
 - Every `password_env` in `host_provider.config`. Its value must come
   from `.env.rb` or from the environment of the running development
-  respirate, and it is imported.
+  respirate, and it is imported. One found only in respirate's
+  environment is a `warn`: the rollback's tmux commands start respirate
+  without it, so add it to `.env.rb` (a rollback names it again).
+- The role that owns `clover_test`'s tables (`clover`). It is recorded
+  for `retire`; `postgres`, `pg_*` and `ubicloud*` are fatal.
 - The billing-rates directory exists.
 - `cloudflared.service`: whether its `ExecStart` carries a token (yes/no),
   and which address its connections to port 3000 reach while it curls
@@ -67,7 +73,7 @@ exactly as it was at the copy.
    - `ubicloud.target` or a unit is active
    - a development puma or respirate runs
    - a client is connected to `clover_test`
-   - `ubicloud` already holds a finished copy, unless `--i-understand-this-drops-live-data` is passed; the old copy is then kept as `ubicloud_prev_<time>`
+   - `ubicloud` already holds a finished copy (rolled back or not), unless `--i-understand-this-drops-live-data` is passed; the old copy is then kept as `ubicloud_prev_<time>`
 2. It waits up to 150 s for `strand.lease` to end, and never forces it.
 3. It runs `pg_dump -Fc`, counts the rows of every table, and switches
    `clover_test`'s connections off.
@@ -84,7 +90,10 @@ exactly as it was at the copy.
    `ubicloud-migrate`.
 9. It checks the result. `migrate-compare.sql` on the copy and the
    reference must agree on owners, ACLs, column ACLs, SECURITY DEFINER
-   and `has_function_privilege('public', …)`. `schema_migrations*` must
+   and `has_function_privilege('public', …)`, in both directions: an
+   object only the reference has fails, and so does one only the copy
+   has, except tables of `ubicloud` without grants (the
+   `deleted_record_*` partitions respirate makes). `schema_migrations*` must
    equal the release's files. `bin/byoh-config-check` must report the
    password-hash isolation of role `ubicloud` as ok.
 10. It drops `ubicloud_ref` and sets the comment
@@ -189,7 +198,12 @@ disposable canary that the user approves first.
 1. `sudo bash ~/ubicloud-m3/scripts/byoh/migrate-from-dev.sh rollback` does the following:
    - It disables and stops `ubicloud.target`, and checks that it stays
      disabled and that port 3000 is free.
+   - It marks `ubicloud` `rolled-back-from clover_test <UTC>`. From then
+     on `start` and `retire` refuse it, because the development control
+     plane may change `clover_test` after the copy.
    - It switches `clover_test`'s connections on again.
+   - It warns, by name, about a BMC password variable that preflight took
+     from respirate's environment rather than `.env.rb`.
    - It prints what the packaged control plane did after the copy: the VMs
      created, the pages opened, the strands that differ from `clover_test`,
      and whether `start` ran `install_rhizome`.
@@ -220,8 +234,11 @@ sudo bash ~/ubicloud-m3/scripts/byoh/migrate-from-dev.sh retire --restore-drill-
 - puts the bootstrap's four trust lines in `pg_hba.conf` back to Ubuntu's
   `peer` and `scram-sha-256`, keeping the old file as
   `pg_hba.conf.before-retire-<UTC>`
-- runs `ALTER ROLE clover NOLOGIN NOSUPERUSER` (and `clover_password NOLOGIN`)
 - renames `clover_test` to `clover_test_retired_<date>` (never dropped)
+  and runs `ALTER ROLE clover NOLOGIN NOSUPERUSER` (and `clover_password
+  NOLOGIN`), in one transaction. The role is the one preflight and
+  copy-db found owning the tables, never the database's owner; retire
+  refuses `postgres`, `pg_*` and `ubicloud*` before it changes anything
 - moves `~/.ubi-bootstrap` aside, so that install.sh no longer sees a
   development control plane
 - runs `ubicloud-admin status`, which must then show no trust fail
@@ -239,10 +256,13 @@ container. It uses R0 = fc693b1e0, or `UBI_M3_R0`:
 - the R0 bootstrap
 - a seeded host, account and BMC variable
 - preflight (first refused on a tunnel origin that is not loopback), install, the tmux stop, copy-db and start
-- rollback across a `docker restart`, then the printed tmux commands
-- the re-cutover
-- flip-production, refused without `MAIL_FROM` and then passing
-- retire
+- copy-db failing on an object only the reference has, then a rerun that cleans up and passes
+- rollback across a `docker restart` (start then refuses the copy), then the printed tmux commands
+- preflight on a `.env.rb` that fails to load (class and line only) and on a BMC variable only in respirate's environment
+- preflight and copy-db refusing a downgrade, copy-db refusing a held lease after 150 s
+- the re-cutover, a second rollback (naming the BMC variable), copy-db and start again
+- flip-production, refused without `MAIL_FROM` and then passing, and `--back`
+- retire, refused with the role `postgres`, then passing
 
 `migrate-preM1` runs the cutover from aca70df27 (pre-M1: Ruby 4.0.2,
 the 14-digit migration, about 140 pending migrations, rhizome changed).

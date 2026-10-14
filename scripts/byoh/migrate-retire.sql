@@ -4,9 +4,13 @@
 -- to database postgres, with -v dev_db=clover_test
 -- -v retired_db=clover_test_retired_<date> -v dev_role=clover. The
 -- database is renamed, never dropped; the roles keep their objects but
--- can no longer log in, and the superuser stops being one.
+-- can no longer log in, and the superuser stops being one. All of it
+-- happens in one transaction: a refused ALTER ROLE leaves the database
+-- under its old name, so retire can run again once the cause is fixed.
 
 \set ON_ERROR_STOP 1
+
+BEGIN;
 
 ALTER DATABASE :"dev_db" ALLOW_CONNECTIONS false;
 ALTER DATABASE :"dev_db" RENAME TO :"retired_db";
@@ -14,3 +18,5 @@ ALTER ROLE :"dev_role" NOLOGIN NOSUPERUSER;
 
 SELECT format('ALTER ROLE %I NOLOGIN', :'dev_role' || '_password')
 WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'dev_role' || '_password') \gexec
+
+COMMIT;

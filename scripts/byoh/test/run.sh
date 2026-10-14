@@ -2430,6 +2430,7 @@ r0_tmux_start() {
 }
 
 dev_pids() { dx "$1" bash -c "ps -u ubuntu -o pid=,comm=,args= | awk '\$2 !~ /^tmux/ && (\$0 ~ /bin\\/respirate/ || \$0 ~ /puma/) { print \$1 }'"; }
+respirate_up() { ! respirate_gone "$1"; }
 respirate_gone() { [[ -z $(dx "$1" bash -c "ps -u ubuntu -o comm=,args= | awk '\$1 !~ /^tmux/ && /bin\\/respirate/'") ]]; }
 
 # Stops the development control plane as the runbook says: respirate
@@ -2617,8 +2618,29 @@ mig_cutover() {
   { [[ $rc == 2 ]] && grep -q 'the development control plane still runs' "$LOGS/$name-copy-busy.log"; } ||
     fail "$name: copy-db with tmux running gave $rc, see $LOGS/$name-copy-busy.log"
   r0_tmux_stop "$name"
+  if ((prem1 == 0)); then
+    # The pristine database install.sh migrated becomes copy-db's
+    # reference. A column grant only it has is an object the copy lacks:
+    # the comparison must fail, and a rerun must clean up after it
+    # (the unfinished copy, the reference) and pass.
+    psql_q "$name" "GRANT SELECT (id) ON strand TO ubicloud_password" >/dev/null
+    rc=$(mig "$name" "$name-copy-refonly.log" copy-db)
+    { [[ $rc == 1 ]] && grep -q '^  only in the reference: col|strand.id: acl=' "$LOGS/$name-copy-refonly.log" &&
+      grep -q '^fail    copy-db: owners or privileges of the copy differ from the reference' "$LOGS/$name-copy-refonly.log" &&
+      grep -q 'copy-db stopped (exit 1); clover_test accepts no connections' "$LOGS/$name-copy-refonly.log"; } ||
+      fail "$name: copy-db with an object only in the reference gave $rc, see $LOGS/$name-copy-refonly.log"
+    [[ $(db_names "$name") == "ubicloud ubicloud_ref" &&
+      $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = 'ubicloud'") == "migrating-from clover_test "* ]] ||
+      fail "$name: after the failed copy-db: $(db_names "$name")"
+    say "$name: copy-db fails on an object only in the reference (exit 1, unfinished copy and reference left, clover_test off)"
+  fi
   rc=$(mig "$name" "$name-copy.log" copy-db)
   [[ $rc == 0 ]] || fail "$name: copy-db gave $rc, see $LOGS/$name-copy.log"
+  if ((prem1 == 0)); then
+    { grep -q '^notice  copy-db: dropped ubicloud_ref, left by an earlier copy-db' "$LOGS/$name-copy.log" &&
+      grep -q '^notice  copy-db: dropped ubicloud, the copy of an earlier copy-db that did not finish' "$LOGS/$name-copy.log"; } ||
+      fail "$name: the rerun of copy-db did not clean up the failed run"
+  fi
   for out in '^ok      copy-db: restored as ubicloud_restorer; row counts equal clover_test' \
     '^ok      copy-db: owners, privileges and SECURITY DEFINER settings equal the reference' \
     '^ok      copy-db: password hashes isolated' '^ok      copy-db: schema_migrations '; do
@@ -2672,6 +2694,14 @@ sc_migrate() {
   rc=$(mig "$name" "$name-rollback.log" rollback)
   [[ $rc == 0 ]] || fail "$name: rollback gave $rc, see $LOGS/$name-rollback.log"
   grep -q '^> .* Vm::HostNexus configure_metrics' "$LOGS/$name-rollback.log" || fail "$name: rollback did not list the host strand's move"
+  grep -q '^warn    rollback: preflight took the BMC' "$LOGS/$name-rollback.log" && fail "$name: rollback warned about a BMC variable .env.rb sets"
+  [[ $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = 'ubicloud'") == "rolled-back-from clover_test "* ]] ||
+    fail "$name: rollback did not mark the copy rolled back"
+  rc=$(mig "$name" "$name-start-rolledback.log" start)
+  { [[ $rc == 2 ]] && grep -q 'was rolled back' "$LOGS/$name-start-rolledback.log"; } ||
+    fail "$name: start after a rollback gave $rc, see $LOGS/$name-start-rolledback.log"
+  [[ $(dx "$name" systemctl is-active ubicloud-web || true) != active ]] || fail "$name: the refused start started web"
+  say "$name: rollback marks the copy rolled back; start refuses it (exit 2)"
   docker restart -t 60 "ubi-m3-$name" >/dev/null
   wait_booted "$name"
   [[ $(dx "$name" systemctl is-enabled ubicloud.target || true) == disabled && $(dx "$name" systemctl is-active ubicloud-web || true) == inactive ]] ||
@@ -2688,8 +2718,51 @@ sc_migrate() {
   [[ $out == ok ]] || fail "$name: the development Sshable#cmd after rollback printed '$out'"
   say "$name: rollback: target disabled across docker restart; the printed R0 commands serve clover_test again (web after ${t}s), login and Sshable#cmd work"
 
-  # Re-cutover: copy-db over the finished copy needs the flag.
+  # A .env.rb that fails to load: the class and line, never the value.
+  as_ubuntu "$name" "echo 'ENV[\"HARNESS_BAD\"] = harnessleak0123' >>~/ubicloud/.env.rb"
+  rc=$(mig "$name" "$name-preflight-badenv.log" preflight "${MIG_FLAGS[@]}")
+  { [[ $rc == 1 ]] && grep -qE '^fatal   env: loading /home/ubuntu/ubicloud/.env.rb as ubuntu failed: NameError at line [0-9]+$' "$LOGS/$name-preflight-badenv.log"; } ||
+    fail "$name: preflight with a broken .env.rb gave $rc, see $LOGS/$name-preflight-badenv.log"
+  grep -q harnessleak0123 "$LOGS/$name-preflight-badenv.log" && fail "$name: preflight printed a token of the broken .env.rb"
+  as_ubuntu "$name" "sed -i '/HARNESS_BAD/d' ~/ubicloud/.env.rb"
+  say "$name: a .env.rb that does not load is reported as NameError at its line, without the token"
+
+  # The BMC password only in the running respirate's environment: a
+  # preflight warn, and a rollback warning naming it.
+  as_ubuntu "$name" "sed -i '/BYOH_BMC_PASS_TEST/d' ~/ubicloud/.env.rb && tmux send-keys -t respirate C-c" || fail "$name: no tmux session respirate"
+  wait_for 150 respirate_gone "$name" >/dev/null || fail "$name: respirate did not exit within 150 s of C-c"
+  as_ubuntu "$name" 'tmux kill-session -t respirate 2>/dev/null; true'
+  local p="/home/ubuntu/.local/bin:/home/ubuntu/.local/share/mise/installs/ruby/$ruby/bin"
+  as_ubuntu "$name" "tmux new-session -d -s respirate \"cd /home/ubuntu/ubicloud && export PATH=$p:\\\$PATH BYOH_BMC_PASS_TEST=bmc-pass-harness-0123 && RACK_ENV=development bundle exec bin/respirate > /tmp/respirate.log 2> /tmp/respirate.err\"" ||
+    fail "$name: cannot start respirate with the BMC variable"
+  wait_for 60 respirate_up "$name" >/dev/null || fail "$name: respirate did not start"
+  rc=$(mig "$name" "$name-preflight-bmcproc.log" preflight "${MIG_FLAGS[@]}")
+  { [[ $rc == 0 ]] && grep -q '^warn    bmc: BYOH_BMC_PASS_TEST comes from the environment of the running development respirate' "$LOGS/$name-preflight-bmcproc.log"; } ||
+    fail "$name: preflight with the BMC variable only in respirate's environment gave $rc, see $LOGS/$name-preflight-bmcproc.log"
+  grep -q 'bmc-pass-harness' "$LOGS/$name-preflight-bmcproc.log" && fail "$name: preflight printed the BMC password"
+  dx "$name" grep -qx "BMC_FROM_PROC='BYOH_BMC_PASS_TEST'" /var/lib/ubicloud-migration/state || fail "$name: preflight did not record the BMC variable's source"
+  say "$name: preflight takes a BMC variable from the running respirate's environment, with a warn"
+
+  # Re-cutover. A downgrade and a held lease are refused first.
   r0_tmux_stop "$name"
+  dx "$name" runuser -u postgres -- psql -XtAq -d clover_test -c "INSERT INTO schema_migrations (filename) VALUES ('20991231_harness_downgrade.rb')"
+  rc=$(mig "$name" "$name-preflight-downgrade.log" preflight "${MIG_FLAGS[@]}")
+  { [[ $rc == 1 ]] && grep -q '^fatal   schema: clover_test has 1 migration(s) the release lacks (20991231_harness_downgrade.rb).*downgrade' "$LOGS/$name-preflight-downgrade.log"; } ||
+    fail "$name: preflight of a newer clover_test gave $rc, see $LOGS/$name-preflight-downgrade.log"
+  rc=$(mig "$name" "$name-copy-downgrade.log" copy-db --i-understand-this-drops-live-data)
+  { [[ $rc == 2 ]] && grep -q 'that would be a downgrade' "$LOGS/$name-copy-downgrade.log"; } ||
+    fail "$name: copy-db of a newer clover_test gave $rc, see $LOGS/$name-copy-downgrade.log"
+  dx "$name" runuser -u postgres -- psql -XtAq -d clover_test -c "DELETE FROM schema_migrations WHERE filename = '20991231_harness_downgrade.rb'"
+  dx "$name" runuser -u postgres -- psql -XtAq -d clover_test -c "UPDATE strand SET lease = now() + interval '1 hour' WHERE id = (SELECT id FROM strand ORDER BY id LIMIT 1)"
+  rc=$(mig "$name" "$name-copy-lease.log" copy-db --i-understand-this-drops-live-data)
+  { [[ $rc == 2 ]] && grep -q 'strand lease(s) in clover_test are still held after 150 s' "$LOGS/$name-copy-lease.log"; } ||
+    fail "$name: copy-db with a held lease gave $rc, see $LOGS/$name-copy-lease.log"
+  [[ $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT datallowconn FROM pg_database WHERE datname = 'clover_test'") == t &&
+    $(db_names "$name") == ubicloud ]] || fail "$name: the lease refusal changed clover_test or the databases: $(db_names "$name")"
+  dx "$name" runuser -u postgres -- psql -XtAq -d clover_test -c "UPDATE strand SET lease = now() - interval '1000 years' WHERE lease > now()"
+  say "$name: preflight and copy-db refuse a clover_test with a migration the release lacks; copy-db waits 150 s for a held lease, then refuses with clover_test as it was"
+
+  # copy-db over the rolled-back copy needs the flag.
   rc=$(mig "$name" "$name-recopy-refused.log" copy-db)
   { [[ $rc == 2 ]] && grep -q 'i-understand-this-drops-live-data' "$LOGS/$name-recopy-refused.log"; } ||
     fail "$name: copy-db over a finished copy gave $rc"
@@ -2699,6 +2772,22 @@ sc_migrate() {
   rc=$(mig "$name" "$name-restart.log" start)
   [[ $rc == 0 ]] || fail "$name: the second start gave $rc, see $LOGS/$name-restart.log"
   say "$name: re-cutover: copy-db refuses a finished copy without the flag, keeps it as ubicloud_prev_* with it, and start passes"
+
+  # A second rollback warns that respirate's BMC variable is not in
+  # .env.rb; start refuses the stale copy until a new copy-db.
+  rc=$(mig "$name" "$name-rollback2.log" rollback)
+  [[ $rc == 0 ]] || fail "$name: the second rollback gave $rc, see $LOGS/$name-rollback2.log"
+  grep -q "^warn    rollback: preflight took the BMC password variable(s) BYOH_BMC_PASS_TEST from the running respirate's environment" "$LOGS/$name-rollback2.log" ||
+    fail "$name: the second rollback did not warn about BYOH_BMC_PASS_TEST"
+  grep -q 'bmc-pass-harness' "$LOGS/$name-rollback2.log" && fail "$name: rollback printed the BMC password"
+  rc=$(mig "$name" "$name-start-rolledback2.log" start)
+  [[ $rc == 2 ]] || fail "$name: start after the second rollback gave $rc"
+  rc=$(mig "$name" "$name-recopy2.log" copy-db --i-understand-this-drops-live-data)
+  [[ $rc == 0 ]] || fail "$name: copy-db after the second rollback gave $rc, see $LOGS/$name-recopy2.log"
+  rc=$(mig "$name" "$name-restart2.log" start)
+  [[ $rc == 0 ]] || fail "$name: start after the second copy gave $rc, see $LOGS/$name-restart2.log"
+  dx "$name" grep -qx "ROLLED_BACK=''" /var/lib/ubicloud-migration/state || fail "$name: copy-db did not clear ROLLED_BACK"
+  say "$name: a second rollback names the BMC variable to add to .env.rb; start refuses until copy-db makes a new copy, then passes"
 
   # Window B: flip-production refuses on a simulated-production fail.
   dx "$name" sed -i '/^MAIL_FROM=/d' /etc/ubicloud/env
@@ -2717,10 +2806,27 @@ sc_migrate() {
   [[ $out == "302 "*/after-login ]] || fail "$name: login in production: $out"
   adm "$name" smoke >"$LOGS/$name-smoke-prod.log" 2>&1 || fail "$name: smoke after the flip, see $LOGS/$name-smoke-prod.log"
   say "$name: flip-production refuses without MAIL_FROM (exit 2, RACK_ENV unchanged), then flips; production_check, login and smoke pass"
+  rc=$(mig "$name" "$name-flip-back.log" flip-production --back)
+  [[ $rc == 0 ]] || fail "$name: flip-production --back gave $rc, see $LOGS/$name-flip-back.log"
+  dx "$name" grep -qx "RACK_ENV='development'" /etc/ubicloud/env || fail "$name: RACK_ENV is not development after --back"
+  wait_for 120 web_up "$name" >/dev/null || fail "$name: web down after flip-production --back"
+  out=$(login "$name") || fail "$name: login after flip-production --back failed"
+  [[ $out == "302 "*/after-login ]] || fail "$name: login after flip-production --back: $out"
+  say "$name: flip-production --back returns to development; login works"
 
   # Retire.
   rc=$(mig "$name" "$name-retire-early.log" retire --restore-drill-done)
   { [[ $rc == 2 ]] && grep -q 'retire after 14' "$LOGS/$name-retire-early.log"; } || fail "$name: retire without 14 backups gave $rc"
+  # retire never demotes postgres, whatever the state file says.
+  dx "$name" sed -i "s/^DEV_ROLE='clover'\$/DEV_ROLE='postgres'/" /var/lib/ubicloud-migration/state
+  rc=$(mig "$name" "$name-retire-postgres.log" retire --restore-drill-done --skip-backup-count)
+  { [[ $rc == 2 ]] && grep -q 'retire would demote role postgres' "$LOGS/$name-retire-postgres.log"; } ||
+    fail "$name: retire with DEV_ROLE postgres gave $rc, see $LOGS/$name-retire-postgres.log"
+  [[ -n $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT 1 FROM pg_hba_file_rules WHERE auth_method = 'trust' LIMIT 1") &&
+    $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT count(*) FROM pg_database WHERE datname = 'clover_test'") == 1 ]] ||
+    fail "$name: the refused retire changed pg_hba.conf or clover_test"
+  dx "$name" sed -i "s/^DEV_ROLE='postgres'\$/DEV_ROLE='clover'/" /var/lib/ubicloud-migration/state
+  say "$name: retire refuses to demote postgres before it changes anything"
   rc=$(mig "$name" "$name-retire.log" retire --restore-drill-done --skip-backup-count)
   [[ $rc == 0 ]] || fail "$name: retire gave $rc, see $LOGS/$name-retire.log"
   grep -q 'use trust' "$LOGS/$name-retire.log" && fail "$name: status still reports trust after retire"
