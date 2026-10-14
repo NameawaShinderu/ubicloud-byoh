@@ -1,0 +1,13 @@
+# Throwaway Ubuntu 24.04 with systemd as PID 1, for the BYOH container
+# harness (scripts/byoh/test/run.sh). Never used outside tests.
+FROM docker.io/library/ubuntu:24.04
+ENV container=docker DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+      systemd systemd-sysv dbus sudo ca-certificates curl git locales iproute2 procps && \
+    locale-gen en_US.UTF-8 && \
+    systemctl mask getty.target console-getty.service systemd-logind.service \
+      systemd-timesyncd.service apt-daily.timer apt-daily-upgrade.timer && \
+    rm -rf /var/lib/apt/lists/*
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
