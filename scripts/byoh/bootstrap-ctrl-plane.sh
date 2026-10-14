@@ -12,7 +12,10 @@
 #   2. ${UBI_REPO_DIR:-$HOME/ubicloud}/scripts/byoh/bootstrap-dev-ctrl-plane.sh,
 #      which covers `curl ... | bash` and `cat ... | bash` (the
 #      development script never cloned the repository; neither does this);
-#   3. otherwise it exits 1 and names the clone step.
+#   3. otherwise it exits 1: with the clone step when that directory is
+#      missing, and with the pull step when it holds a checkout from
+#      before the rename (such as a control plane kept at an older
+#      revision on purpose).
 #
 # Everything is in main, which runs only after bash has read the whole
 # file, so a truncated download runs nothing.
@@ -37,10 +40,21 @@ main() {
     local repo=${UBI_REPO_DIR:-$HOME/ubicloud}
     if [[ -f $repo/scripts/byoh/bootstrap-dev-ctrl-plane.sh ]]; then
       target=$repo/scripts/byoh/bootstrap-dev-ctrl-plane.sh
+    elif [[ -f $repo/scripts/byoh/bootstrap-ctrl-plane.sh ]]; then
+      echo "ERROR: the checkout at $repo predates the rename: it has no scripts/byoh/bootstrap-dev-ctrl-plane.sh." >&2
+      echo "  Either update it and run this again:" >&2
+      echo "    git -C $repo pull" >&2
+      echo "  or run the bootstrap of that revision from disk, which leaves it at its revision:" >&2
+      echo "    bash $repo/scripts/byoh/bootstrap-ctrl-plane.sh" >&2
+      exit 1
+    elif [[ -e $repo ]]; then
+      echo "ERROR: $repo is not an ubicloud checkout (no scripts/byoh/bootstrap-dev-ctrl-plane.sh)." >&2
+      echo "  Set UBI_REPO_DIR to the checkout." >&2
+      exit 1
     else
-      echo "ERROR: no ubicloud checkout with scripts/byoh/bootstrap-dev-ctrl-plane.sh at $repo." >&2
+      echo "ERROR: no ubicloud checkout at $repo." >&2
       echo "  Clone it first (or set UBI_REPO_DIR to where it is):" >&2
-      echo "    git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud" >&2
+      echo "    git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git $repo" >&2
       exit 1
     fi
   fi

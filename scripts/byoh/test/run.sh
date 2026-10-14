@@ -2163,11 +2163,24 @@ sc_devshim() {
     fail "devshim: an active ubicloud.target gave $rc, see $LOGS/devshim-target-active.log"
   dx devshim bash -c 'systemctl stop ubicloud.target && rm /etc/systemd/system/ubicloud.target && systemctl daemon-reload'
   rc=$(dev_run devshim devshim-norepo.log "cd /tmp && cat $shim | UBI_REPO_DIR=/home/ubuntu/none bash")
-  { [[ $rc == 1 ]] && grep -q 'git clone' "$LOGS/devshim-norepo.log"; } ||
+  { [[ $rc == 1 ]] && grep -q 'git clone .* /home/ubuntu/none$' "$LOGS/devshim-norepo.log"; } ||
     fail "devshim: the piped shim without a checkout gave $rc, see $LOGS/devshim-norepo.log"
+  # A checkout from before the rename (the live control plane keeps one)
+  # gets the pull step, not a clone into a directory that exists.
+  as_ubuntu devshim 'mkdir -p old/scripts/byoh && touch old/Gemfile && printf "echo old bootstrap ran\n" >old/scripts/byoh/bootstrap-ctrl-plane.sh'
+  rc=$(dev_run devshim devshim-oldrepo.log "cd /tmp && cat $shim | UBI_REPO_DIR=/home/ubuntu/old bash")
+  { [[ $rc == 1 ]] && grep -q 'checkout at /home/ubuntu/old predates the rename' "$LOGS/devshim-oldrepo.log" &&
+    grep -q 'git -C /home/ubuntu/old pull' "$LOGS/devshim-oldrepo.log" &&
+    ! grep -q 'git clone\|old bootstrap ran' "$LOGS/devshim-oldrepo.log"; } ||
+    fail "devshim: the piped shim with a pre-rename checkout gave $rc, see $LOGS/devshim-oldrepo.log"
+  rc=$(dev_run devshim devshim-notrepo.log "cd /tmp && cat $shim | UBI_REPO_DIR=/home/ubuntu/old/scripts bash")
+  { [[ $rc == 1 ]] && grep -q '/home/ubuntu/old/scripts is not an ubicloud checkout' "$LOGS/devshim-notrepo.log" &&
+    ! grep -q 'git clone' "$LOGS/devshim-notrepo.log"; } ||
+    fail "devshim: the piped shim with a directory that is no checkout gave $rc, see $LOGS/devshim-notrepo.log"
+  as_ubuntu devshim 'rm -rf old'
   [[ -z $(dev_markers devshim) ]] || fail "devshim: a refusal created markers: $(dev_markers devshim)"
   [[ $(dx devshim sha256sum /etc/postgresql/16/main/pg_hba.conf) == "$hba" ]] || fail "devshim: a refusal changed pg_hba.conf"
-  say "devshim: production, ubicloud, /etc/ubicloud/env, an enabled or an active ubicloud.target and a missing checkout refuse (exit 1) and change nothing"
+  say "devshim: production, ubicloud, /etc/ubicloud/env, an enabled or an active ubicloud.target, and a missing, pre-rename or foreign checkout refuse (exit 1) and change nothing"
 
   # The old path: the shim warns and runs the development script.
   t=$(timed as_ubuntu devshim "bash $shim >/tmp/devshim-first.log 2>&1") || {
@@ -2196,6 +2209,31 @@ sc_devshim() {
     grep -q 'running /home/ubuntu/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh' "$LOGS/devshim-pipe.log"; } ||
     fail "devshim: cat shim | bash gave $rc, see $LOGS/devshim-pipe.log"
   say "devshim: a second run by path and a cat shim | bash run from /tmp skip every step"
+
+  # Resolution order 1: run from disk, the shim takes the development
+  # script beside it, even when UBI_REPO_DIR names another place. The
+  # copy's target does its work in ~/ubicloud, so it succeeds; with
+  # UBI_REPO_DIR missing, order 2 would have exited before naming it.
+  as_ubuntu devshim 'mkdir -p copy/scripts && cp -R ubicloud/scripts/byoh copy/scripts/'
+  rc=$(dev_run devshim devshim-copy.log "UBI_REPO_DIR=/home/ubuntu/ubicloud bash ~/copy/scripts/byoh/bootstrap-ctrl-plane.sh")
+  { [[ $rc == 0 ]] && grep -q 'running /home/ubuntu/copy/scripts/byoh/bootstrap-dev-ctrl-plane.sh' "$LOGS/devshim-copy.log" &&
+    all_skipped devshim-copy.log; } ||
+    fail "devshim: the shim in a second copy gave $rc, see $LOGS/devshim-copy.log"
+  rc=$(dev_run devshim devshim-order1.log "UBI_REPO_DIR=/home/ubuntu/none bash $shim")
+  { [[ $rc == 1 ]] && grep -q 'running /home/ubuntu/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh' "$LOGS/devshim-order1.log" &&
+    grep -q 'ERROR: /home/ubuntu/none does not contain a ubicloud checkout' "$LOGS/devshim-order1.log"; } ||
+    fail "devshim: the shim from disk with UBI_REPO_DIR missing gave $rc, see $LOGS/devshim-order1.log"
+  as_ubuntu devshim 'rm -rf copy'
+  say "devshim: run from disk, the shim takes the script beside it whatever UBI_REPO_DIR says"
+
+  # Step 6 needs its marker as well as a passing bundle check; the old
+  # test skipped on bundle check alone.
+  as_ubuntu devshim 'rm ~/.ubi-bootstrap/bundle-install'
+  rc=$(dev_run devshim devshim-bundle.log "bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh")
+  { [[ $rc == 0 ]] && ! grep -qF '(marker: /home/ubuntu/.ubi-bootstrap/bundle-install)' "$LOGS/devshim-bundle.log" &&
+    grep -q 'Bundle complete' "$LOGS/devshim-bundle.log" && dx devshim test -e /home/ubuntu/.ubi-bootstrap/bundle-install; } ||
+    fail "devshim: without its marker step 6 gave $rc or skipped, see $LOGS/devshim-bundle.log"
+  say "devshim: without its marker, step 6 runs bundle install although bundle check passes, and sets the marker again"
 
   # Step 3 again: an existing role or database is skipped, not masked.
   as_ubuntu devshim 'rm ~/.ubi-bootstrap/postgres-setup'
@@ -2253,6 +2291,23 @@ sc_gate_journal() {
   out=$(dx gatej runuser -u ubuntu -- bash -c 'cd / && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
   { [[ $rc == 1 ]] && grep -q '^FAIL .*run the gate as root or with sudo -n' <<<"$out"; } ||
     fail "gate-journal: g1 as ubuntu gave $rc: $out"
+  # The services cannot use a directory that root can: under /home
+  # (ProtectHome=yes), also through a symlink, or one user ubicloud
+  # cannot write.
+  dx gatej bash -c 'install -d -o ubicloud -g ubicloud /home/ubuntu/rates &&
+    ln -sfn /home/ubuntu/rates /var/lib/ubicloud/rates-link && install -d -m 0700 /srv/rates-root'
+  for who in /home/ubuntu/rates:'under /home, which ProtectHome=yes hides' \
+    /var/lib/ubicloud/rates-link:'under /home, which ProtectHome=yes hides' \
+    /srv/rates-root:'which is not a directory user ubicloud can read and write'; do
+    printf '%s' "${who%%:*}" | dx gatej ubicloud-admin env set BILLING_RATES_EXTRA_DIR --no-restart >/dev/null ||
+      fail "gate-journal: env set BILLING_RATES_EXTRA_DIR ${who%%:*}"
+    rc=0
+    out=$(dx gatej bash -c 'cd / && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
+    { [[ $rc == 1 ]] && grep -qF "FAIL /etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to ${who%%:*}, " <<<"$out" &&
+      grep -qF "${who#*:}" <<<"$out"; } ||
+      fail "gate-journal: g1 with BILLING_RATES_EXTRA_DIR=${who%%:*} gave $rc: $out"
+  done
+  printf '%s' /var/lib/ubicloud/billing_rates.d | dx gatej ubicloud-admin env set BILLING_RATES_EXTRA_DIR --no-restart >/dev/null
   dx gatej ubicloud-admin env unset BILLING_RATES_EXTRA_DIR --no-restart >/dev/null
   rc=0
   out=$(dx gatej bash -c 'cd / && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
@@ -2278,61 +2333,6 @@ sc_gate_journal() {
   out=$(dx gatej bash -c "cd /; GATE_SERVICES=tmux; $fns"$'\n''echo "$GATE_RESPIRATE_LOG"')
   [[ $out == /tmp/respirate.log ]] || fail "gate-journal: GATE_SERVICES=tmux reads $out"
   say "gate-journal: the respirate log is the journal under systemd (root and group adm read it; others fail) and /tmp/respirate.log under tmux"
-  say "gate-journal: ok"
-}
-
-sc_reboot() {
-  local t since
-  boot_cp reboot
-  docker restart -t 120 ubi-m3-reboot >/dev/null
-  wait_booted reboot
-  since=$(dx reboot date '+%F %T')
-  t=$(wait_for 180 web_up reboot) || fail "reboot: web did not come back"
-  say "reboot: web answers ${t}s after boot"
-  poke_strand reboot
-  t=$(wait_for 150 strand_ran reboot) || fail "reboot: no strand ran after boot"
-  # The services cannot use a directory that root can: under /home
-  # (ProtectHome=yes), also through a symlink, or one user ubicloud
-  # cannot write.
-  dx gatej bash -c 'install -d -o ubicloud -g ubicloud /home/ubuntu/rates &&
-    ln -sfn /home/ubuntu/rates /var/lib/ubicloud/rates-link && install -d -m 0700 /srv/rates-root'
-  for who in /home/ubuntu/rates:'under /home, which ProtectHome=yes hides' \
-    /var/lib/ubicloud/rates-link:'under /home, which ProtectHome=yes hides' \
-    /srv/rates-root:'which is not a directory user ubicloud can read and write'; do
-    printf '%s' "${who%%:*}" | dx gatej ubicloud-admin env set BILLING_RATES_EXTRA_DIR --no-restart >/dev/null ||
-      fail "gate-journal: env set BILLING_RATES_EXTRA_DIR ${who%%:*}"
-    rc=0
-    out=$(dx gatej bash -c 'cd / && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
-    { [[ $rc == 1 ]] && grep -qF "FAIL /etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to ${who%%:*}, " <<<"$out" &&
-      grep -qF "${who#*:}" <<<"$out"; } ||
-      fail "gate-journal: g1 with BILLING_RATES_EXTRA_DIR=${who%%:*} gave $rc: $out"
-  done
-  printf '%s' /var/lib/ubicloud/billing_rates.d | dx gatej ubicloud-admin env set BILLING_RATES_EXTRA_DIR --no-restart >/dev/null
-  say "reboot: strand ran ${t}s after poke"
-  assert_active reboot
-  [[ $(dx reboot systemctl is-active postgresql@16-main) == active ]] || fail "reboot: postgres down"
-  journal_clean reboot "$since"
-  say "reboot: ok (docker restart; a real VM reboot is UNVERIFIED)"
-}
-
-[[ $# -gt 0 ]] || {
-  sed -n '2,15p' "$0"
-  exit 2
-}
-for arg in "$@"; do
-  case $arg in
-    --prepare-image) prepare_image ;;
-    --prepare-tools) prepare_tools ;;
-    --prepare-release) prepare_release ;;
-    all) for s in parity envfmt verify fresh rerun flags smoke kill restart reboot tls_provided tunnel backup admin devshim gate_journal; do "sc_$s"; cleanup; done ;;
-    parity | envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot | tls-provided | tunnel | backup | admin | devshim | gate-journal)
-      "sc_${arg//-/_}"
-      cleanup
-      ;;
-    *) fail "unknown argument $arg" ;;
-  esac
-done
-say "logs: $LOGS"
 
   # probe_verdict, which g7 judges VM-B by: on the journal, which has no
   # probe line, and on a file whose matching line comes first and is
@@ -2384,3 +2384,41 @@ say "logs: $LOGS"
   [[ $out == "systemd journal" ]] || fail "gate-journal: an enabled, stopped target gives $out"
   dx gatej pkill -f '^(puma|bin/respirate) 600$' || true
   say "gate-journal: with the units installed but disabled the gate judges the tmux processes and .env.rb, and reads /tmp/respirate.log; enabled, it is systemd again"
+  say "gate-journal: ok"
+}
+
+sc_reboot() {
+  local t since
+  boot_cp reboot
+  docker restart -t 120 ubi-m3-reboot >/dev/null
+  wait_booted reboot
+  since=$(dx reboot date '+%F %T')
+  t=$(wait_for 180 web_up reboot) || fail "reboot: web did not come back"
+  say "reboot: web answers ${t}s after boot"
+  poke_strand reboot
+  t=$(wait_for 150 strand_ran reboot) || fail "reboot: no strand ran after boot"
+  say "reboot: strand ran ${t}s after poke"
+  assert_active reboot
+  [[ $(dx reboot systemctl is-active postgresql@16-main) == active ]] || fail "reboot: postgres down"
+  journal_clean reboot "$since"
+  say "reboot: ok (docker restart; a real VM reboot is UNVERIFIED)"
+}
+
+[[ $# -gt 0 ]] || {
+  sed -n '2,15p' "$0"
+  exit 2
+}
+for arg in "$@"; do
+  case $arg in
+    --prepare-image) prepare_image ;;
+    --prepare-tools) prepare_tools ;;
+    --prepare-release) prepare_release ;;
+    all) for s in parity envfmt verify fresh rerun flags smoke kill restart reboot tls_provided tunnel backup admin devshim gate_journal; do "sc_$s"; cleanup; done ;;
+    parity | envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot | tls-provided | tunnel | backup | admin | devshim | gate-journal)
+      "sc_${arg//-/_}"
+      cleanup
+      ;;
+    *) fail "unknown argument $arg" ;;
+  esac
+done
+say "logs: $LOGS"
