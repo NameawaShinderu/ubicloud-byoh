@@ -10,7 +10,8 @@ RSpec.describe ByohAccountCli do
   def cli(*argv, stdin: "")
     out = StringIO.new
     err = StringIO.new
-    status = described_class.new(out:, err:, stdin: StringIO.new(stdin), random:).run(argv)
+    stdin = StringIO.new(stdin) if stdin.is_a?(String)
+    status = described_class.new(out:, err:, stdin:, random:).run(argv)
     [status, out.string, err.string]
   end
 
@@ -75,18 +76,38 @@ RSpec.describe ByohAccountCli do
       Dir.mktmpdir do |dir|
         file = File.join(dir, "pw")
         File.write(file, "File-password-1\n")
+        File.chmod(0o600, file)
         expect(cli("create", "--email", "b@example.com", "--password-file", file)[0]).to eq 0
         account = Account.first(email: "b@example.com")
         expect(verify(account, "File-password-1")).to be true
         expect(account.name).to eq "Ubicloud User"
 
-        expect(cli("create", "--email", "c@example.com", "--password-file", File.join(dir, "missing"))).to eq [1, "", "! cannot read --password-file: No such file or directory @ rb_sysopen - #{dir}/missing\n"]
+        expect(cli("create", "--email", "c@example.com", "--password-file", File.join(dir, "missing"))).to eq [1, "", "! cannot read --password-file: No such file or directory @ rb_file_s_stat - #{dir}/missing\n"]
 
         File.write(file, "")
         expect(cli("create", "--email", "c@example.com", "--password-file", file)).to eq [1, "", "! no password in #{file}\n"]
       end
       expect(cli("create", "--email", "c@example.com", "--password-stdin")).to eq [1, "", "! no password in stdin\n"]
       expect(Account.where(email: "c@example.com").count).to eq 0
+    end
+
+    it "does not echo a password typed at a terminal" do
+      typed = StringIO.new("Typed-password-1\n")
+      terminal = instance_double(IO, tty?: true)
+      expect(terminal).to receive(:noecho).and_yield(typed)
+      status, out, err = cli("create", "--email", "tty@example.com", "--password-stdin", stdin: terminal)
+      expect([status, err]).to eq [0, "Password: \n"]
+      expect(out).not_to include "Typed-password-1"
+      expect(verify(Account.first(email: "tty@example.com"), "Typed-password-1")).to be true
+    end
+
+    it "warns about a password file that its group or others can access" do
+      Dir.mktmpdir do |dir|
+        file = File.join(dir, "pw")
+        File.write(file, "File-password-1\n")
+        File.chmod(0o640, file)
+        expect(cli("create", "--email", "loose@example.com", "--password-file", file)).to match [0, start_with("Created account"), "warning: #{file} is readable or writable by its group or others; keep password files at mode 0600\n"]
+      end
     end
 
     it "refuses an existing email, case-insensitively, but allows reusing a closed account's email" do

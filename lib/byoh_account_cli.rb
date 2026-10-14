@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "argon2"
+require "io/console"
 require "optparse"
 require "securerandom"
 
@@ -18,7 +19,8 @@ class ByohAccountCli
                [--password-stdin | --password-file FILE]
       list
 
-    Without a password option, create generates one and prints it once.
+    Without a password option, create generates one and prints it once on
+    stdout, so keep that output out of logs and the journal.
   USAGE
 
   # The accounts.valid_email check constraint.
@@ -145,13 +147,14 @@ class ByohAccountCli
   # Returns the password and whether it was generated.
   def read_password(opts)
     if opts[:password_stdin]
-      [first_line(@stdin.gets, "stdin"), false]
+      [first_line(read_stdin, "stdin"), false]
     elsif (file = opts[:password_file])
-      line = begin
-        File.open(file, &:gets)
+      mode, line = begin
+        [File.stat(file).mode, File.open(file, &:gets)]
       rescue SystemCallError => e
         raise Error, "cannot read --password-file: #{e.message}"
       end
+      @err.puts "warning: #{file} is readable or writable by its group or others; keep password files at mode 0600" if mode & 0o077 != 0
       [first_line(line, file), false]
     else
       # A random password can lack a digit or a case.
@@ -169,6 +172,15 @@ class ByohAccountCli
     rodauth = Clover.rodauth.new(Clover.allocate)
     return if rodauth.password_meets_requirements?(password)
     rodauth.send(:password_requirement_message) || rodauth.send(:password_does_not_meet_requirements_message)
+  end
+
+  # Does not echo a password typed at a terminal.
+  def read_stdin
+    return @stdin.gets unless @stdin.tty?
+    @err.print "Password: "
+    line = @stdin.noecho(&:gets)
+    @err.puts
+    line
   end
 
   def first_line(line, source)
