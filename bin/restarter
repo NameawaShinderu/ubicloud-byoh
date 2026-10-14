@@ -20,18 +20,27 @@ puts JSON.generate(restarter: {
   },
 })
 
-loop do
-  pid = Process.spawn(*command)
-  Signal.trap("TERM") do
+# One trap for the whole run. It signals only a child that has not been
+# reaped yet, so a TERM between children can never reach a reused pid.
+child_pid = nil
+Signal.trap("TERM") do
+  shutting_down = true
+  if (pid = child_pid)
     begin
       Process.kill(:TERM, pid)
     rescue Errno::ESRCH
-      # The child already exited; the loop sees shutting_down next.
+      # The child exited but is not reaped yet; Process.wait returns.
     end
-    shutting_down = true
   end
-  Process.wait(pid)
+end
+
+loop do
+  child_pid = Process.spawn(*command)
+  # TERM that arrived before child_pid was set found no child to signal.
+  Process.kill(:TERM, child_pid) if shutting_down
+  Process.wait(child_pid)
   status = $?
+  child_pid = nil
 
   # Extra newline to prevent blending with subprocess just in
   # case. Done as a separate system call, to be extra-accommodating to
