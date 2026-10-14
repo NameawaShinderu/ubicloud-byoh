@@ -3,12 +3,6 @@
 
 Dir.chdir(File.dirname(__dir__))
 
-# bin/pry runs unaudited in production with this set, so it belongs only
-# in the environment of a console session, never in a service's.
-if ENV["PRY_ALLOW_UNAUDITED"] == "true"
-  warn "warning: PRY_ALLOW_UNAUDITED=true is set; set it only for ubicloud-admin console"
-end
-
 require "open3"
 require "net/http"
 require "json"
