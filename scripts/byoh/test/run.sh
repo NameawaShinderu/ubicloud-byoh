@@ -302,6 +302,34 @@ sc_smoke() {
   dx smoke systemctl restart ubicloud-web
   wait_for 120 web_up smoke >/dev/null || fail "smoke: web down after restoring the env"
   say "smoke: without BIND in the env file, puma listens on 127.0.0.1:3000 only"
+
+  # A rerun of the release step while the services run: the managed
+  # pg_hba/pg_ident blocks stay as they are, and ubicloud-migrate
+  # rewrites the var/ca_bundles files that web and respirate wrote at
+  # boot. Then web and respirate rewrite them in turn.
+  local sums sums2 cab=/var/lib/ubicloud/var/ca_bundles/db_ca_bundle.crt
+  sums=$(dx smoke sha256sum /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/pg_ident.conf)
+  [[ $(dx smoke stat -c %U "$cab") == ubicloud ]] || fail "smoke: $cab not written by the services"
+  dx smoke sed -n 's/^rev=//p' /opt/ubicloud/current/.ubicloud-release >"$ART/src.rev"
+  dx smoke bash /art/fixture.sh release t1 >"$LOGS/smoke-rerun.log" 2>&1 ||
+    fail "smoke: release rerun failed, see $LOGS/smoke-rerun.log"
+  sums2=$(dx smoke sha256sum /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/pg_ident.conf)
+  [[ $sums == "$sums2" ]] || fail "smoke: the rerun changed pg_hba.conf or pg_ident.conf"
+  [[ $(dx smoke grep -c '^# BEGIN ubicloud$' /etc/postgresql/16/main/pg_hba.conf /etc/postgresql/16/main/pg_ident.conf | cut -d: -f2 | sort -u) == 1 ]] ||
+    fail "smoke: more than one managed block"
+  [[ $(dx smoke stat -c %U "$cab") == ubicloud-migrate ]] || fail "smoke: the rerun's migrate did not rewrite $cab"
+  dx smoke systemctl restart ubicloud-web ubicloud-respirate
+  wait_for 120 web_up smoke >/dev/null || fail "smoke: web down after the migrate rerun"
+  [[ $(dx smoke stat -c %U "$cab") == ubicloud ]] || fail "smoke: web did not rewrite $cab"
+  poke_strand smoke
+  wait_for 60 strand_ran smoke >/dev/null || fail "smoke: no strand after the migrate rerun"
+  say "smoke: release rerun kept hba/ident, migrate and the services rewrote each other's ca_bundles"
+  echo 0000000000000000000000000000000000000000 >"$ART/src.rev"
+  local rc=0
+  dx smoke bash /art/fixture.sh release t1 >>"$LOGS/smoke-rerun.log" 2>&1 || rc=$?
+  [[ $rc == 2 ]] || fail "smoke: a release rerun with another rev exited $rc, not 2"
+  say "smoke: a release rerun with another rev exits 2"
+  assert_active smoke
   journal_clean smoke "$since"
   say "smoke: ok"
 }

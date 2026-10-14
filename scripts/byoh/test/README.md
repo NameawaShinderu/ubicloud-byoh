@@ -27,7 +27,11 @@ re-prepare, but a change to the code does.
 
 `fixture.sh` is a test fixture that lays out tools, the release, the
 database, `/etc/ubicloud/env` and the units. `scripts/byoh/install.sh`
-(WP4) replaces it in the scenarios.
+(WP4) replaces it in the scenarios. Like the installer, it can run
+again: `release VERSION` skips the build when that version exists with
+the same rev and exits 2 when the rev differs, and it replaces the
+`# BEGIN ubicloud` .. `# END ubicloud` blocks in `pg_hba.conf` and
+`pg_ident.conf` instead of appending to them.
 
 ## Scenarios
 
@@ -35,7 +39,7 @@ database, `/etc/ubicloud/env` and the units. `scripts/byoh/install.sh`
 |---|---|
 | `envfmt` | systemd's `EnvironmentFile=` and bash's `set -a; . F` read the `KEY='value'` lines of `/etc/ubicloud/env` the same way. The run fails if the set of differing cases changes. |
 | `verify` | `systemd-analyze verify` is clean (apart from the missing `ubicloud-admin`, until WP6). web and respirate are ordered after `postgresql@16-main` and `network-online.target` without `Requires=`. Monitor is installed but disabled. Without `ubicloud-admin`, `ubicloud-backup.service` is skipped on its condition, not failed. Writes the `systemd-analyze security` report. |
-| `smoke` | Every unit is active. An account is created and logs in over the two-step login. puma listens only on 127.0.0.1:3000, also with `BIND` and `PORT` removed from the env file. The release is read-only to `ubicloud`. web has no capabilities and respirate runs with NoNewPrivs. The journal has no Ruby errors. |
+| `smoke` | Every unit is active. An account is created and logs in over the two-step login. puma listens only on 127.0.0.1:3000, also with `BIND` and `PORT` removed from the env file. The release is read-only to `ubicloud`. web has no capabilities and respirate runs with NoNewPrivs. A rerun of `fixture.sh release` while the services run leaves `pg_hba.conf` and `pg_ident.conf` byte for byte, and its migrate as `ubicloud-migrate` rewrites the `var/ca_bundles` files web wrote; web then rewrites them again. A rerun with another rev exits 2. The journal has no Ruby errors. |
 | `kill` | A: SIGKILL to the respirate child; restarter keeps its PID and respawns within 4 s. B: `systemctl kill -s KILL`; a new MainPID within 5 s. Both: a strand runs within 150 s. |
 | `restart` | `systemctl restart ubicloud.target`. A stop while an idle child runs ends with `Result=success`. A stop while restarter sleeps between children ends quickly, with no ESRCH and no leftover process. A running backup (a stand-in drop-in) survives a restart and a stop of the target, and the stop pauses the timer. Then, with strands held in a query by a lock on `vm_host`: a stop with one running strand, a stop past a shortened `TimeoutStopSec`, and a stop with every dispatcher thread busy (below). |
 | `reboot` | `docker restart`: the target starts at boot, web answers, and strands run. A real VM reboot is UNVERIFIED. |
@@ -113,5 +117,11 @@ The fixture hit these, and the installer must handle them the same way:
   files, which web and respirate open read-write at boot. Run
   migrations with `UMask=0007`, and give the services `UMask=0007` too,
   not `0077`, so either side can rewrite the other's files through the
-  shared `ubicloud` group. `/var/lib/ubicloud` is 0750 and holds no
+  shared `ubicloud` group. `smoke` tests both directions. A restore
+  (WP6) is not tested yet. `/var/lib/ubicloud` is 0750 and holds no
   secrets.
+- Replace the managed `# BEGIN ubicloud` .. `# END ubicloud` blocks in
+  `pg_hba.conf` (first) and `pg_ident.conf`, and reload only when a file
+  changed. Never append: a rerun would add a second copy.
+- A release that exists with the same rev is skipped, and with another
+  rev the run exits 2 (M3-d), rather than failing in `mv`.

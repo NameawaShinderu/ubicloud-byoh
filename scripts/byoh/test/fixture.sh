@@ -93,11 +93,36 @@ ensure_users() {
   install -d -m 0750 -o ubicloud -g ubicloud "$STATE/billing_rates.d"
 }
 
+# release_rev VERSION: the rev an existing release was built from.
+release_rev() { sed -n 's/^rev=//p' "$RELEASES/$1/.ubicloud-release"; }
+
 stage_release() {
-  local ver=$1 rev tmp
+  local ver=$1 rev
   rev=$(cat /art/src.rev)
   ensure_users
   install -d -m 0755 /opt/ubicloud "$RELEASES"
+  # As install.sh (M3-d): the same version and rev is skipped, the same
+  # version with another rev is refused.
+  if [[ -d $RELEASES/$ver ]]; then
+    if [[ $(release_rev "$ver") != "$rev" ]]; then
+      echo "release $ver exists with rev $(release_rev "$ver"), not $rev" >&2
+      exit 2
+    fi
+    log "release $ver at rev $rev exists, skipping the build"
+  else
+    build_release "$ver" "$rev"
+  fi
+
+  stage_database
+  stage_env
+  log "migrate as ubicloud-migrate"
+  service_env_run ubicloud-migrate bin/rake-task-runner migrate "" 0 >/dev/null
+  stage_units
+  systemctl enable ubicloud.target
+}
+
+build_release() {
+  local ver=$1 rev=$2 tmp
   tmp=$RELEASES/$ver.tmp
   rm -rf "$tmp"
   install -d -m 0755 -o ubicloud -g ubicloud "$tmp"
@@ -129,19 +154,12 @@ stage_release() {
   ln -sfn "releases/$ver" /opt/ubicloud/current
   runuser -u ubicloud -- env -i PATH="$TOOLS/bin:/usr/bin:/bin" HOME="$STATE" \
     sh -c 'cd /opt/ubicloud/current && bundle check' >/dev/null
-
-  stage_database
-  stage_env
-  log "migrate as ubicloud-migrate"
-  service_env_run ubicloud-migrate bin/rake-task-runner migrate "" 0 >/dev/null
-  stage_units
-  systemctl enable ubicloud.target
 }
 
 psql_admin() { runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 "$@"; }
 
 stage_database() {
-  local conf=/etc/postgresql/16/main hba
+  local conf=/etc/postgresql/16/main
   systemctl start postgresql@16-main
   psql_admin <<'SQL'
 DO $$BEGIN
@@ -159,13 +177,18 @@ SQL
   psql_admin -d ubicloud -c 'CREATE EXTENSION IF NOT EXISTS citext' \
     -c 'CREATE EXTENSION IF NOT EXISTS btree_gist' -c 'ALTER SCHEMA public OWNER TO ubicloud'
 
-  cat >>"$conf/pg_ident.conf" <<'EOF'
+  local ident hba
+  ident=$(mktemp)
+  hba=$(mktemp)
+  cat >"$ident" <<'EOF'
+# BEGIN ubicloud
 ubicloud ubicloud ubicloud
 ubicloud ubicloud-migrate ubicloud
 ubicloud ubicloud-migrate ubicloud_password
 ubicloud postgres postgres
+# END ubicloud
 EOF
-  hba=$(mktemp)
+  # The hba block goes before every other rule: the first match wins.
   cat >"$hba" <<'EOF'
 # BEGIN ubicloud
 local ubicloud postgres peer
@@ -175,10 +198,38 @@ host ubicloud all 127.0.0.1/32 reject
 host ubicloud all ::1/128 reject
 # END ubicloud
 EOF
-  cat "$conf/pg_hba.conf" >>"$hba"
-  install -m 0640 -o postgres -g postgres "$hba" "$conf/pg_hba.conf"
-  rm -f "$hba"
-  systemctl reload postgresql@16-main
+  BLOCK_CHANGED=0
+  put_block "$conf/pg_ident.conf" "$ident" bottom
+  put_block "$conf/pg_hba.conf" "$hba" top
+  rm -f "$ident" "$hba"
+  if ((BLOCK_CHANGED)); then
+    systemctl reload postgresql@16-main
+  else
+    log "pg_hba.conf and pg_ident.conf unchanged"
+  fi
+}
+
+# put_block FILE BLOCK top|bottom: makes BLOCK (a "# BEGIN ubicloud" ..
+# "# END ubicloud" block) the only managed block in FILE, at its top or
+# bottom. FILE is rewritten, keeping its owner and mode, only when that
+# changes it, and then BLOCK_CHANGED is set to 1. A rerun replaces the
+# block and never appends a second copy, as install.sh must not either.
+put_block() {
+  local file=$1 block=$2 where=$3 rest new
+  rest=$(mktemp)
+  new=$(mktemp)
+  sed '/^# BEGIN ubicloud$/,/^# END ubicloud$/d' "$file" >"$rest"
+  if [[ $where == top ]]; then
+    cat "$block" "$rest" >"$new"
+  else
+    cat "$rest" "$block" >"$new"
+  fi
+  rm -f "$rest"
+  if ! cmp -s "$new" "$file"; then
+    install -m "$(stat -c %a "$file")" -o "$(stat -c %U "$file")" -g "$(stat -c %G "$file")" "$new" "$file"
+    BLOCK_CHANGED=1
+  fi
+  rm -f "$new"
 }
 
 stage_env() {
