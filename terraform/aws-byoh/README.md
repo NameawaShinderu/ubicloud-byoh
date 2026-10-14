@@ -121,11 +121,13 @@ control plane and runs the Ubicloud software-side setup:
 ssh -i terraform/aws-byoh/.generated/byoh_ssh_key ubuntu@<ctrl_public_ip>
 
 # On the control plane:
-git clone <github-url> ubicloud
-cd ubicloud && git checkout byoh-driver
-./scripts/byoh/bootstrap-ctrl-plane.sh
-# follow docs/byoh/QUICKSTART.md for the rest
+git clone -b byoh-driver <github-url> ~/ubicloud
+# Packaged (production) control plane; flags in docs/byoh/INSTALL.md:
+sudo bash ~/ubicloud/scripts/byoh/install.sh --version v0.1.0 --url https://<host> ...
+# Or a development control plane; follow docs/byoh/QUICKSTART.md:
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
 ```
+
 
 The `QUICKSTART.md` walks through generating the ctrl→data SSH key,
 installing it on the data plane, running `bin/register-byoh-host`,

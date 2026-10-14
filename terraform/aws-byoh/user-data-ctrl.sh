@@ -5,12 +5,14 @@
 #
 # Runs ONCE via cloud-init on first boot. Keeps things minimal —
 # just enough prerequisites so the operator can `git clone` + run
-# scripts/byoh/bootstrap-ctrl-plane.sh to finish setup.
+# scripts/byoh/install.sh (the packaged control plane) or
+# scripts/byoh/bootstrap-dev-ctrl-plane.sh (development) to finish setup.
 #
-# Everything heavy (Ruby 4.0.2 via mise, Postgres 16, bundle install,
-# npm run prod, migrations) lives in bootstrap-ctrl-plane.sh which
-# the operator runs manually after SSH-ing in. That keeps the
-# cloud-init path short and debuggable.
+# Everything heavy (Ruby via mise, Postgres 16, bundle install,
+# npm run prod, migrations) lives in those scripts, which the operator
+# runs manually after SSH-ing in. That keeps the cloud-init path short
+# and debuggable. main.tf ignores changes to user_data, so editing this
+# file never replaces a running instance.
 set -eu
 exec > /var/log/user-data.log 2>&1
 
@@ -32,10 +34,11 @@ cat <<BANNER
   BYOH control plane host.
 
   To finish setting up Ubicloud:
-    git clone <repo-url> ubicloud
-    cd ubicloud && git checkout byoh-driver
-    ./scripts/byoh/bootstrap-ctrl-plane.sh
-    follow docs/byoh/QUICKSTART.md
+    git clone -b byoh-driver <repo-url> ~/ubicloud
+    Production: sudo bash ~/ubicloud/scripts/byoh/install.sh ...
+      (flags: docs/byoh/INSTALL.md)
+    Development: bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
+      (docs/byoh/QUICKSTART.md)
 
   Web UI will be at http://$(curl -s https://checkip.amazonaws.com 2>/dev/null || hostname -I | awk '{print $1}'):3000 after bootstrap.
 

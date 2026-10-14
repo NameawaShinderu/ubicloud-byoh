@@ -140,9 +140,11 @@ output "handoff_instructions" {
          scp -i ${local_sensitive_file.ssh_private.filename} ${local_file.pools_yaml.filename} ${local_sensitive_file.ssh_private.filename} ubuntu@${aws_instance.ctrl.public_ip}:
          ssh -i ${local_sensitive_file.ssh_private.filename} ubuntu@${aws_instance.ctrl.public_ip}
 
-      2. Clone the BYOH fork and bootstrap the control plane:
+      2. Clone the BYOH fork and set up the control plane, packaged
+         (sudo bash ~/ubicloud/scripts/byoh/install.sh ..., docs/byoh/INSTALL.md)
+         or for development:
          git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
-         bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh
+         bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
 
       3. Create the BYOH location (cd ~/ubicloud): run the commands in
          terraform output -raw byoh_location_create_command
