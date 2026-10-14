@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "find"
 require "optparse"
 require "time"
 require "uri"
@@ -33,11 +34,14 @@ class ByohConfigCheck
   HASH_TABLES = %w[account_password_hashes admin_password_hash].freeze
   HASH_FUNCTIONS = %w[rodauth_valid_password_hash(uuid,text) rodauth_admin_valid_password_hash(uuid,text)].freeze
 
-  def initialize(out: $stdout, err: $stderr, env: ENV, root: Dir.pwd, now: Time.now, preflight: ByohPreflightWarnings)
+  # root is the release directory, and code_owner the uid that must own
+  # every entry in it outside var/.
+  def initialize(out: $stdout, err: $stderr, env: ENV, root: Dir.pwd, code_owner: 0, now: Time.now, preflight: ByohPreflightWarnings)
     @out = out
     @err = err
     @env = env
     @root = root
+    @code_owner = code_owner
     @now = now
     @preflight = preflight
   end
@@ -193,13 +197,26 @@ class ByohConfigCheck
     else
       failure("#{var} is not a directory that uid #{Process.euid} can write; CA bundles and API metrics are written there")
     end
-    if @production
-      stat = File.stat(@root)
-      if stat.uid != 0 || stat.mode & 0o022 != 0
-        results << warning("#{@root} is not owned by root or is writable by its group or others; production code should be root:root and go-w so a compromised service cannot change it")
-      end
-    end
+    results.concat(code_ownership) if @production
     results
+  end
+
+  # Walks the release, skipping var/ (runtime state, a symlink to
+  # /var/lib/ubicloud in the packaged layout), for entries a service user
+  # could change: not owned by @code_owner, or writable by group or
+  # others. Symlinks are not followed, and only their owner counts since
+  # their own mode is never used.
+  def code_ownership
+    root = File.realpath(@root)
+    var = File.join(root, "var")
+    loose = []
+    Find.find(root) do |path|
+      Find.prune if path == var
+      stat = File.lstat(path)
+      loose << path if stat.uid != @code_owner || (!stat.symlink? && stat.mode & 0o022 != 0)
+    end
+    return [] if loose.empty?
+    [warning("#{loose.size} entries under #{root} are not owned by uid #{@code_owner} or are writable by group or others, first #{loose.first}; production code should be root:root and go-w so a compromised service cannot change it")]
   end
 
   def role_isolation

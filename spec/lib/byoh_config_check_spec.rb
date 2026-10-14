@@ -20,7 +20,7 @@ RSpec.describe ByohConfigCheck do
   end
 
   def new_checker(**)
-    checker = described_class.new(env: check_env, root: code_root, now: check_now, preflight:, **)
+    checker = described_class.new(env: check_env, root: code_root, code_owner: Process.euid, now: check_now, preflight:, **)
     allow(checker).to receive(:role_facts).and_wrap_original { |original| @role_facts || original.call }
     checker
   end
@@ -84,7 +84,7 @@ RSpec.describe ByohConfigCheck do
 
     it "uses ByohPreflightWarnings by default" do
       allow(Config).to receive_messages(base_url: "http://localhost:9292", control_plane_outbound_cidrs: [])
-      checker = described_class.new(env: check_env, root: code_root, now: check_now)
+      checker = described_class.new(env: check_env, root: code_root, code_owner: Process.euid, now: check_now)
       allow(checker).to receive(:role_facts).and_return(isolated)
       results = checker.check(production: false)
       expect(messages(results, "warn")).to eq ["BASE_URL is http://localhost:9292; set it to the URL customers use to reach this control plane"]
@@ -196,15 +196,64 @@ RSpec.describe ByohConfigCheck do
       expect(messages(checker.check(production: false), "warn")).to eq ["CLOVER_RUNTIME_TOKEN_SECRET is unset, so VM runtime tokens cannot be signed"]
     end
 
-    it "fails without a writable var directory and warns about writable code in production" do
+    it "fails without a writable var directory" do
       FileUtils.rm_rf(File.join(code_root, "var"))
       expect(messages(checker.check(production: false), "fail")).to eq ["#{code_root}/var is not a directory that uid #{Process.euid} can write; CA bundles and API metrics are written there"]
       FileUtils.mkdir_p(File.join(code_root, "var"))
       expect(messages(checker.check(production: false), "ok")).to include "#{code_root}/var is writable"
-      expect(messages(checker.check(production: true), "warn")).to eq []
-      File.chmod(0o775, code_root)
-      expect(messages(checker.check(production: true), "warn")).to eq ["#{code_root} is not owned by root or is writable by its group or others; production code should be root:root and go-w so a compromised service cannot change it"]
-      expect(messages(new_checker(root: "/").check(production: true), "warn")).to eq []
+    end
+
+    describe "code ownership in production" do
+      # The specs run as any uid, so the expected owner is the runner's.
+      let(:tree) { File.realpath(code_root) }
+
+      def ownership_warnings(chk = checker)
+        messages(chk.check(production: true), "warn")
+      end
+
+      def loose_warning(count, first, owner: Process.euid)
+        "#{count} entries under #{tree} are not owned by uid #{owner} or are writable by group or others, first #{first}; production code should be root:root and go-w so a compromised service cannot change it"
+      end
+
+      before do
+        FileUtils.mkdir_p(File.join(code_root, "lib", "deep"))
+        File.write(File.join(code_root, "lib", "deep", "code.rb"), "")
+        File.chmod(0o644, File.join(code_root, "lib", "deep", "code.rb"))
+        File.chmod(0o755, File.join(code_root, "lib"))
+        File.chmod(0o755, File.join(code_root, "lib", "deep"))
+        File.chmod(0o777, File.join(code_root, "var"))
+        File.write(File.join(code_root, "var", "loose"), "")
+        File.chmod(0o666, File.join(code_root, "var", "loose"))
+        File.symlink("lib/deep/code.rb", File.join(code_root, "link"))
+      end
+
+      it "accepts a tree owned by the code owner and not writable by others, ignoring var/ and symlink modes" do
+        expect(ownership_warnings).to eq []
+        expect(messages(checker.check(production: false), "warn")).to eq []
+      end
+
+      it "warns about a group- or world-writable entry anywhere in the tree" do
+        File.chmod(0o666, File.join(code_root, "lib", "deep", "code.rb"))
+        expect(ownership_warnings).to eq [loose_warning(1, "#{tree}/lib/deep/code.rb")]
+        File.chmod(0o775, File.join(code_root, "lib"))
+        expect(ownership_warnings).to eq [loose_warning(2, "#{tree}/lib")]
+        File.chmod(0o775, code_root)
+        expect(ownership_warnings).to eq [loose_warning(3, tree)]
+      end
+
+      it "warns about entries owned by another uid, symlinks included" do
+        other = Process.euid + 1
+        expect(ownership_warnings(new_checker(code_owner: other))).to eq [loose_warning(5, tree, owner: other)]
+      end
+
+      it "walks the release behind a symlinked root" do
+        Dir.mktmpdir do |dir|
+          current = File.join(dir, "current")
+          File.symlink(code_root, current)
+          File.chmod(0o666, File.join(code_root, "lib", "deep", "code.rb"))
+          expect(ownership_warnings(new_checker(root: current))).to eq [loose_warning(1, "#{tree}/lib/deep/code.rb")]
+        end
+      end
     end
   end
 

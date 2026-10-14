@@ -9,7 +9,11 @@
 #
 #   bundle exec bin/byoh-config-check [--simulate-production]
 #
-# Uses RACK_ENV from the environment (defaults to "development").
+# Uses RACK_ENV from the environment (defaults to "development"). It
+# checks the release this script belongs to, whatever the current
+# directory.
+
+Dir.chdir(File.dirname(__dir__))
 
 unless ENV["RACK_ENV"]
   ENV["RACK_ENV"] = "development"
