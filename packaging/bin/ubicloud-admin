@@ -15,6 +15,11 @@
 #   ubicloud-admin account list
 #   ubicloud-admin run TOOL [ARGS...]
 #   ubicloud-admin console [-e CODE|-e -]
+#   ubicloud-admin release list
+#   ubicloud-admin release check VERSION
+#   ubicloud-admin release migrate VERSION [--skip-backup-check]
+#   ubicloud-admin release use VERSION [--for-restore TS]
+#   ubicloud-admin release prune --keep N
 #
 # status   Units, settings (bin/byoh-config-check), pg_hba trust rules,
 #          backup recipient and age, release. Exits 1 on any fail.
@@ -80,6 +85,29 @@
 #          when), and the commands themselves are NOT audited. -e CODE is
 #          on sudo's command line, which sudo logs; -e - reads the code
 #          from stdin instead.
+# release  The manual release switch (docs/byoh/OPERATIONS.md, release
+#          switch); install.sh --stage release builds VERSION next to the
+#          current one. list shows the releases, which is current and
+#          previous, and how each stands to the database's migrations.
+#          check VERSION says, changing nothing, whether migrate and use
+#          would take VERSION. migrate VERSION runs the migrations of
+#          VERSION as ubicloud-migrate, from its directory. use VERSION
+#          installs its units and ubicloud-admin and points current at it
+#          (the old one becomes previous). Both refuse while web,
+#          respirate or monitor run (systemctl stop ubicloud.target
+#          first), and refuse a release that runs other tools than
+#          /opt/ubicloud/tools or that is not root's alone. migrate refuses
+#          unless the newest backup holds the database's migrations and is
+#          newer than the stop of respirate (backup now after the stop),
+#          unless --skip-backup-check. use refuses a release that lacks a
+#          migration the database has applied (a downgrade onto a newer
+#          schema) or that has migrations not applied yet (migrate
+#          first). --for-restore TS takes such a downgrade when backup TS
+#          holds only migrations VERSION knows; restore TS --db-only must
+#          follow before the services start. prune removes all but the N
+#          newest releases, never current or previous. Starting the
+#          services is left to the operator; ubicloud-admin upgrade comes
+#          with M12.
 #
 # Every command except logs and env keys writes one line with the command
 # name and $SUDO_USER, never its arguments, to the system log (tag
@@ -96,6 +124,11 @@ umask 077
 readonly OPT=/opt/ubicloud
 readonly TOOLS=$OPT/tools
 readonly CURRENT=$OPT/current
+readonly RELEASES=$OPT/releases
+readonly PREVIOUS=$OPT/previous
+readonly UNIT_DIR=/etc/systemd/system
+readonly ADMIN_BIN=/usr/local/bin/ubicloud-admin
+readonly VERSION_RE='^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$'
 readonly STATE=/var/lib/ubicloud
 readonly ETC=/etc/ubicloud
 readonly ENV_FILE=$ETC/env
@@ -215,8 +248,10 @@ backup_target() {
 # Extra NAME=value pairs for the next as_service, after the env file.
 SERVICE_EXTRA=()
 SERVICE_HOME=$STATE
+# The release as_service runs in: current, except for release migrate.
+SERVICE_RELEASE=$CURRENT
 
-# as_service USER CMD...: runs CMD in the current release as USER with
+# as_service USER CMD...: runs CMD in SERVICE_RELEASE as USER with
 # exactly the env file, the release env, SERVICE_EXTRA, PATH, HOME and
 # LANG=C.UTF-8, umask 0007, as the units run. The values travel in the environment,
 # never in argv, and setpriv execs CMD without a PAM session.
@@ -225,14 +260,14 @@ as_service() {
   shift
   group=$(id -gn "$user")
   (
-    cd "$CURRENT" || exit 1
+    cd "$SERVICE_RELEASE" || exit 1
     local k f x
     while IFS= read -r k; do unset "$k" 2>/dev/null || exit 1; done < <(compgen -e)
     # Unlike the units, these commands print to a terminal: puma's and
     # pry's output is UTF-8, which Ruby rejects under the C locale. The
     # env file may still set LANG.
     export LANG=C.UTF-8
-    for f in "$ENV_FILE" "$CURRENT/.release-env"; do
+    for f in "$ENV_FILE" "$SERVICE_RELEASE/.release-env"; do
       kv_read "$f"
       for k in "${KV_KEYS[@]}"; do
         export "$k=${KV[$k]}" 2>/dev/null || die "$f sets $k, which bash cannot export"
@@ -292,6 +327,7 @@ cmd_status() {
   else
     fail_line "release: $CURRENT has no .ubicloud-release"
   fi
+  status_release
 
   local code
   code=$(web_code)
@@ -1503,6 +1539,424 @@ cmd_console() {
   ruby_as ubicloud --enable-frozen-string-literal bin/pry
 }
 
+# --- release switch (WP10) ------------------------------------------------------------
+#
+# A release runs only on a schema it knows: every applied migration must
+# be a file in its migrate/ (migrate/ph/ for schema_migrations_password),
+# and its own migrations must have run. The full ubicloud-admin upgrade
+# comes with M12; these are the guarded steps of the manual switch.
+
+# The version a link such as current or previous points at, or nothing.
+link_version() {
+  local l
+  l=$(readlink "$1" 2>/dev/null) || return 0
+  printf '%s' "${l##*/}"
+}
+
+# release_dir VERSION: the directory of a built release; exits 2 otherwise.
+release_dir() {
+  local v=$1
+  [[ $v =~ $VERSION_RE && $v != *.tmp ]] ||
+    usage_die "a release version is letters, digits, '.', '_', '+' or '-' (ubicloud-admin release list)"
+  [[ -d $RELEASES/$v && ! -L $RELEASES/$v && -f $RELEASES/$v/.ubicloud-release ]] ||
+    usage_die "release $v is not in $RELEASES; build it with install.sh --stage release --version $v"
+  printf '%s' "$RELEASES/$v"
+}
+
+# load_applied: APPLIED and APPLIED_PH, the migrations the database has
+# applied.
+APPLIED=() APPLIED_PH=()
+load_applied() {
+  local sm smp
+  sm=$(psql_value -d "$DB_NAME" -c "SELECT filename FROM schema_migrations ORDER BY 1") ||
+    die "cannot read schema_migrations of database $DB_NAME"
+  smp=$(psql_value -d "$DB_NAME" -c "SELECT filename FROM schema_migrations_password ORDER BY 1") ||
+    die "cannot read schema_migrations_password of database $DB_NAME"
+  APPLIED=() APPLIED_PH=()
+  [[ -z $sm ]] || mapfile -t APPLIED <<<"$sm"
+  [[ -z $smp ]] || mapfile -t APPLIED_PH <<<"$smp"
+}
+
+# release_gaps DIR: LACKS, the applied migrations DIR has no file for
+# (running DIR would be a downgrade onto a newer schema), and PENDING,
+# the migrations of DIR not applied yet. rake-task-runner runs the ph
+# migrations only on a database without both password tables, so only
+# migrate/ counts for PENDING.
+LACKS=() PENDING=()
+release_gaps() {
+  local dir=$1 f
+  local -A have=()
+  LACKS=() PENDING=()
+  for f in "${APPLIED[@]}"; do
+    have[$f]=1
+    [[ -f $dir/migrate/$f ]] || LACKS+=("$f")
+  done
+  for f in "${APPLIED_PH[@]}"; do
+    [[ -f $dir/migrate/ph/$f ]] || LACKS+=("ph/$f")
+  done
+  while IFS= read -r f; do
+    [[ -n ${have[$f]:-} ]] || PENDING+=("$f")
+  done < <(find "$dir/migrate" -maxdepth 1 -type f -name '[0-9]*_*.rb' -printf '%f\n' | sort)
+}
+
+# first3 ITEM...: up to three items, and how many more there are.
+first3() {
+  local more=$(($# - 3))
+  printf '%s' "${*:1:3}"
+  ((more <= 0)) || printf ' and %d more' "$more"
+}
+
+# release_static_check DIR: the checks that do not need the database.
+# Prints one line each; returns 1 when one fails.
+release_static_check() {
+  local dir=$1 v=${1##*/} ok=0 ruby node have_ruby have_node bad
+  ruby=$(sed -n 's/^ruby = "\(.*\)"$/\1/p' "$dir/mise.toml" 2>/dev/null)
+  node=$(sed -n 's/^node = "\(.*\)"$/\1/p' "$dir/mise.toml" 2>/dev/null)
+  have_ruby=$("$TOOLS/bin/ruby" -e 'print RUBY_VERSION' 2>/dev/null || true)
+  have_node=$("$TOOLS/bin/node" -v 2>/dev/null || true)
+  if [[ -n $ruby && $ruby == "$have_ruby" && "v$node" == "$have_node" ]]; then
+    report ok "release $v: runs on the tools in $TOOLS (ruby $ruby, node $node)"
+  else
+    report fail "release $v: wants ruby ${ruby:-?} and node ${node:-?}, and $TOOLS has ruby ${have_ruby:-none} and node ${have_node:-none}; every release runs on the same tools, so changing them needs tools per release (M12)"
+    ok=1
+  fi
+  # M3-n: root runs this code (migrate, use) and the services read it.
+  bad=$(find "$dir" -xdev ! -type l \( ! -user root -o -perm /022 \) -print -quit 2>/dev/null)
+  if [[ -z $bad ]]; then
+    report ok "release $v: owned by root and writable by root only"
+  else
+    report fail "release $v: $bad is not root's alone (owner or group/other write); rebuild it with install.sh --stage release"
+    ok=1
+  fi
+  if [[ -d $dir/packaging/systemd && -f $dir/packaging/bin/ubicloud-admin && -f $dir/bin/rake-task-runner ]]; then
+    report ok "release $v: has its units, ubicloud-admin and bin/rake-task-runner"
+  else
+    report fail "release $v: lacks packaging/systemd, packaging/bin/ubicloud-admin or bin/rake-task-runner"
+    ok=1
+  fi
+  return "$ok"
+}
+
+# The services that must not run while the schema or the release changes.
+need_stopped() {
+  local running
+  running=$(running_services)
+  [[ -z $running ]] ||
+    usage_die "$running run; stop them first (systemctl stop ubicloud.target), so no process runs one release on the other's schema"
+}
+
+cmd_release() {
+  local sub=${1:-}
+  shift || true
+  case $sub in
+    list) release_list "$@" ;;
+    check) release_check "$@" ;;
+    migrate) release_migrate "$@" ;;
+    use) release_use "$@" ;;
+    prune) release_prune "$@" ;;
+    *) usage_die "release takes list, check VERSION, migrate VERSION, use VERSION or prune --keep N" ;;
+  esac
+}
+
+release_list() {
+  [[ $# -eq 0 ]] || usage_die "release list takes no arguments"
+  need_root
+  local cur prev d v mark mig db=1
+  cur=$(link_version "$CURRENT")
+  prev=$(link_version "$PREVIOUS")
+  if (load_applied) >/dev/null 2>&1; then load_applied; else db=0; fi
+  printf '%-16s %-12s %-20s %-9s %s\n' VERSION REV BUILT ROLE MIGRATIONS
+  while IFS= read -r d; do
+    v=${d##*/}
+    mark=-
+    [[ $v != "$prev" ]] || mark=previous
+    [[ $v != "$cur" ]] || mark=current
+    if [[ $v == *.tmp ]]; then
+      printf '%-16s %-12s %-20s %-9s %s\n' "$v" - - - "(an unfinished build; release prune removes it)"
+      continue
+    fi
+    if ((db)); then
+      release_gaps "$d"
+      if ((${#LACKS[@]})); then
+        mig="lacks ${#LACKS[@]} applied (downgrade refused)"
+      elif ((${#PENDING[@]})); then
+        mig="${#PENDING[@]} to apply (release migrate $v)"
+      else
+        mig=matches
+      fi
+    else
+      mig="(database not readable)"
+    fi
+    printf '%-16s %-12s %-20s %-9s %s\n' "$v" "$(sed -n 's/^rev=//p' "$d/.ubicloud-release" | cut -c1-12)" \
+      "$(sed -n 's/^built=//p' "$d/.ubicloud-release")" "$mark" "$mig"
+  done < <(find "$RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%p\n' 2>/dev/null | sort)
+}
+
+release_check() {
+  [[ $# -eq 1 ]] || usage_die "release check takes one VERSION"
+  need_root
+  need_release
+  local dir rc=0
+  dir=$(release_dir "$1")
+  release_static_check "$dir" || rc=2
+  load_applied
+  release_gaps "$dir"
+  if ((${#LACKS[@]})); then
+    report fail "release $1: the database has ${#LACKS[@]} migration(s) it lacks ($(first3 "${LACKS[@]}")), so it would be a downgrade onto a newer schema; use refuses it (see --for-restore)"
+    rc=2
+  elif ((${#PENDING[@]})); then
+    report notice "release $1: release migrate $1 applies ${#PENDING[@]} migration(s) ($(first3 "${PENDING[@]}"))"
+  else
+    report ok "release $1: knows every applied migration and has none to apply"
+  fi
+  local running
+  running=$(running_services)
+  [[ -z $running ]] || report notice "release: $running run; migrate and use need them stopped"
+  return "$rc"
+}
+
+# The newest backup must hold the database as it is now: newer than the
+# stop of respirate (no strand ran after it) and with the same
+# migrations. That backup is what a failed switch restores.
+release_backup_check() {
+  local target last bts stopped m db_sm
+  target=$(backup_target)
+  last=$(latest_backup "$target")
+  [[ -n $last ]] ||
+    usage_die "no backup in $target; with the services stopped, run ubicloud-admin backup now first (or pass --skip-backup-check)"
+  bts=$(ts_epoch "$last")
+  stopped=$(systemctl show --timestamp=unix -p InactiveEnterTimestamp --value ubicloud-respirate 2>/dev/null || true)
+  stopped=${stopped#@}
+  if [[ $stopped =~ ^[0-9]+$ ]] && ((bts < stopped)); then
+    usage_die "the newest backup ($last) is older than the stop of ubicloud-respirate, so it lacks what ran until then; run ubicloud-admin backup now first (or pass --skip-backup-check)"
+  fi
+  m=$target/$last/manifest.json
+  db_sm=$(printf '%s\n' "${APPLIED[@]}" | jq -R . | jq -sc 'map(select(length > 0)) | sort')
+  [[ $(jq -c '.schema_migrations | sort' "$m") == "$db_sm" ]] ||
+    usage_die "the newest backup ($last) holds other migrations than the database; run ubicloud-admin backup now first (or pass --skip-backup-check)"
+  report ok "release: backup $last holds the database as it is (restore $last --db-only undoes the migrations)"
+  RELEASE_BACKUP=$last
+}
+
+release_migrate() {
+  local v="" skip_backup=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --skip-backup-check) skip_backup=1 ;;
+      -*) usage_die "unknown release migrate option $1" ;;
+      *)
+        [[ -z $v ]] || usage_die "release migrate takes one VERSION"
+        v=$1
+        ;;
+    esac
+    shift
+  done
+  [[ -n $v ]] || usage_die "release migrate needs a VERSION (ubicloud-admin release list)"
+  need_root
+  need_release
+  audit "release migrate"
+  local dir
+  dir=$(release_dir "$v")
+  take_lock 600
+  make_work
+  need_stopped
+  release_static_check "$dir" >"$WORK/static" || {
+    cat "$WORK/static"
+    die "release $v cannot be migrated to (above); nothing was changed" 2
+  }
+  load_applied
+  release_gaps "$dir"
+  ((${#LACKS[@]} == 0)) ||
+    usage_die "the database has ${#LACKS[@]} migration(s) release $v lacks ($(first3 "${LACKS[@]}")); it is older than the schema, and migrations never run backwards. Restore a backup made before them (release use $v --for-restore TS); nothing was changed"
+  if ((${#PENDING[@]} == 0)); then
+    report ok "release: $v has no migration to apply (${#APPLIED[@]} applied)"
+    return 0
+  fi
+  RELEASE_BACKUP=""
+  if ((skip_backup)); then
+    report warn "release: no backup check (--skip-backup-check); without a backup of this schema a failed switch has nothing to go back to"
+  else
+    release_backup_check
+  fi
+  SERVICE_RELEASE=$dir
+  if ! ruby_as ubicloud-migrate bin/rake-task-runner migrate "" 0 >"$WORK/migrate.log" 2>&1; then
+    grep -v -i 'password' "$WORK/migrate.log" | tail -20 >&2
+    load_applied
+    die "the migrations of release $v failed; the database keeps the ${#APPLIED[@]} that ran (each migration is one transaction) and the services stay stopped. Fix the cause and run release migrate $v again, or go back with ubicloud-admin restore ${RELEASE_BACKUP:-TS} --db-only (current is still $(link_version "$CURRENT"))"
+  fi
+  load_applied
+  release_gaps "$dir"
+  ((${#PENDING[@]} == 0)) || die "release $v still has ${#PENDING[@]} migration(s) to apply after the run ($(first3 "${PENDING[@]}"))"
+  report changed "release: applied the migrations of $v (${#APPLIED[@]} applied now); current is still $(link_version "$CURRENT"), switch with release use $v"
+}
+
+# release_install_file SRC DEST MODE: installs SRC at DEST through a
+# rename, so a running copy (this script) keeps its own file. Returns 1
+# when DEST already matched.
+release_install_file() {
+  cmp -s "$1" "$2" && return 1
+  install -m "$3" -o root -g root "$1" "$2.new"
+  mv -f "$2.new" "$2"
+}
+
+release_use() {
+  local v="" for_restore=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --for-restore)
+        [[ $# -ge 2 && $2 =~ $TS_RE ]] || usage_die "--for-restore needs a backup timestamp such as 20261014T031500Z (ubicloud-admin backup list)"
+        for_restore=$2
+        shift
+        ;;
+      -*) usage_die "unknown release use option $1" ;;
+      *)
+        [[ -z $v ]] || usage_die "release use takes one VERSION"
+        v=$1
+        ;;
+    esac
+    shift
+  done
+  [[ -n $v ]] || usage_die "release use needs a VERSION (ubicloud-admin release list)"
+  need_root
+  need_release
+  audit "release use"
+  local dir cur
+  dir=$(release_dir "$v")
+  take_lock 600
+  make_work
+  cur=$(link_version "$CURRENT")
+  if [[ $cur == "$v" && -z $for_restore ]]; then
+    report ok "release: $v is current"
+    return 0
+  fi
+  need_stopped
+  release_static_check "$dir" >"$WORK/static" || {
+    cat "$WORK/static"
+    die "release $v cannot be used (above); nothing was changed" 2
+  }
+  load_applied
+  release_gaps "$dir"
+  if [[ -n $for_restore ]]; then
+    local m f missing=()
+    m=$(backup_target)/$for_restore/manifest.json
+    [[ -f $m ]] || usage_die "$m does not exist (ubicloud-admin backup list)"
+    while IFS= read -r f; do
+      [[ -f $dir/migrate/$f ]] || missing+=("$f")
+    done < <(jq -r '.schema_migrations[]' "$m")
+    while IFS= read -r f; do
+      [[ -f $dir/migrate/ph/$f ]] || missing+=("ph/$f")
+    done < <(jq -r '.schema_migrations_password[]' "$m")
+    ((${#missing[@]} == 0)) ||
+      usage_die "backup $for_restore has ${#missing[@]} migration(s) release $v lacks ($(first3 "${missing[@]}")), so restore would refuse it; pick a backup that $v made; nothing was changed"
+    ((${#LACKS[@]} == 0)) ||
+      report warn "release: the database has ${#LACKS[@]} migration(s) $v lacks ($(first3 "${LACKS[@]}")); do not start the services before ubicloud-admin restore $for_restore --db-only"
+  else
+    ((${#LACKS[@]} == 0)) ||
+      usage_die "downgrade refused: the database has ${#LACKS[@]} migration(s) release $v lacks ($(first3 "${LACKS[@]}")), and $v would run on a schema it does not know. Go back to a backup made before them: release use $v --for-restore TS, then restore TS --db-only (docs/byoh/OPERATIONS.md, release switch); nothing was changed"
+    ((${#PENDING[@]} == 0)) ||
+      usage_die "release $v has ${#PENDING[@]} migration(s) the database lacks ($(first3 "${PENDING[@]}")); run ubicloud-admin release migrate $v first; nothing was changed"
+  fi
+
+  # The units and ubicloud-admin of the release, as install.sh installs
+  # them from current.
+  local u changed=0
+  for u in "$dir"/packaging/systemd/*; do
+    release_install_file "$u" "$UNIT_DIR/${u##*/}" 0644 && changed=1
+  done
+  if ((changed)); then
+    systemctl daemon-reload
+    report changed "release: units installed from $v"
+  else
+    report ok "release: the units of $v are installed"
+  fi
+  if grep -q '^cmd_release()' "$dir/packaging/bin/ubicloud-admin"; then
+    if release_install_file "$dir/packaging/bin/ubicloud-admin" "$ADMIN_BIN" 0755; then
+      report changed "release: installed $ADMIN_BIN from $v"
+    fi
+  else
+    # An older ubicloud-admin could not switch forward again.
+    report warn "release: $v's ubicloud-admin has no release command, so $ADMIN_BIN stays as it is"
+  fi
+  if [[ -n $cur && $cur != "$v" ]]; then
+    ln -sfn "releases/$cur" "$PREVIOUS.new"
+    mv -T "$PREVIOUS.new" "$PREVIOUS"
+  fi
+  ln -sfn "releases/$v" "$CURRENT.new"
+  mv -T "$CURRENT.new" "$CURRENT"
+  report changed "release: current -> $v${cur:+ (previous: $cur)}"
+  if [[ -n $for_restore ]]; then
+    echo "Next, before anything starts the services: sudo ubicloud-admin restore $for_restore --db-only"
+  else
+    echo "Next: sudo systemctl start ubicloud.target && sudo ubicloud-admin status"
+    echo "A front template change of $v needs install.sh again with its usual flags and --version $v."
+  fi
+}
+
+release_prune() {
+  local keep=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --keep)
+        [[ $# -ge 2 ]] || usage_die "--keep needs a number"
+        keep=$2
+        shift
+        ;;
+      *) usage_die "release prune takes --keep N" ;;
+    esac
+    shift
+  done
+  [[ $keep =~ ^[1-9][0-9]*$ ]] || usage_die "release prune needs --keep N, with N at least 1"
+  need_root
+  need_release
+  audit "release prune"
+  take_lock 600
+  local cur prev d v n=0 kept=0 all=()
+  cur=$(link_version "$CURRENT")
+  prev=$(link_version "$PREVIOUS")
+  # Unfinished builds: install.sh holds the same lock while it builds.
+  for d in "$RELEASES"/*.tmp; do
+    [[ -d $d ]] || continue
+    rm -rf "$d"
+    report changed "release: removed the unfinished build ${d##*/}"
+  done
+  # Newest first, by build time.
+  mapfile -t all < <(for d in "$RELEASES"/*/; do
+    d=${d%/}
+    [[ -f $d/.ubicloud-release ]] || continue
+    printf '%s %s\n' "$(sed -n 's/^built=//p' "$d/.ubicloud-release")" "${d##*/}"
+  done | sort -r | cut -d' ' -f2)
+  for v in "${all[@]}"; do
+    if [[ $v == "$cur" || $v == "$prev" ]] || ((kept < keep)); then
+      kept=$((kept + 1))
+      continue
+    fi
+    rm -rf "${RELEASES:?}/$v"
+    n=$((n + 1))
+    report changed "release: removed $v"
+  done
+  report ok "release: kept $kept (current ${cur:-none}, previous ${prev:-none}), removed $n"
+}
+
+# status: the current release against the database's migrations.
+status_release() {
+  if ! (load_applied) >/dev/null 2>&1; then
+    fail_line "release: cannot read the migrations of database $DB_NAME"
+    return
+  fi
+  load_applied
+  release_gaps "$CURRENT/"
+  local v
+  v=$(link_version "$CURRENT")
+  if ((${#LACKS[@]})); then
+    fail_line "release: the database has ${#LACKS[@]} migration(s) $v lacks ($(first3 "${LACKS[@]}")); restore a backup $v made (docs/byoh/OPERATIONS.md, release switch)"
+  elif ((${#PENDING[@]})); then
+    fail_line "release: ${#PENDING[@]} migration(s) of $v are not applied ($(first3 "${PENDING[@]}")); ubicloud-admin release migrate $v"
+  else
+    report ok "release: $v matches the database's ${#APPLIED[@]} migrations"
+  fi
+  [[ ! -L $PREVIOUS ]] || report ok "release: previous is $(link_version "$PREVIOUS")"
+}
+
 # --- main -------------------------------------------------------------------------------
 
 main() {
@@ -1529,6 +1983,7 @@ main() {
     account) cmd_account "$@" ;;
     run) cmd_run "$@" ;;
     console) cmd_console "$@" ;;
+    release) cmd_release "$@" ;;
     -h | --help | help) usage ;;
     "")
       usage >&2

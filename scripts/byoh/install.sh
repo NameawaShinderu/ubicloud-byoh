@@ -14,7 +14,10 @@
 #     [--smtp-file F|-] [--billing-rates-dir DIR] \
 #     [--backup-target DIR] [--backup-recipient age1...|--backup-recipient-file F] \
 #     [--update-env KEY]... [--skip-check clock|mem|listen]... \
-#     [--stage tools|all] [--no-start]
+#     [--stage tools|release|all] [--no-start]
+#
+#   sudo bash install.sh --stage release --version v0.2.0 \
+#     --source-git ~/ubicloud --ref <commit>
 #
 # Source: --source-git DIR --ref REF (git archive runs as the owner of
 # DIR), or --source-tarball F --source-rev REV.
@@ -45,10 +48,18 @@
 # a source (for mise.toml). The default stage, all, also needs --version,
 # --url, --tls and --admin-email.
 #
+# --stage release builds another release next to the current one on an
+# installed control plane and changes nothing else: not current, the
+# settings, the database or the units. It takes --version, the source
+# and --skip-check only. The switch to it is manual (ubicloud-admin
+# release migrate and release use; docs/byoh/OPERATIONS.md, release
+# switch). Its tools must be the current release's.
+#
 # Exit status: 0 on success, 1 on a failure, 2 on a usage error or when
 # the run would change something it must not change silently (another
-# rev for an existing version, another version than the current one,
-# other tools than the current release runs on, a setting that differs
+# rev for an existing version, another version than the current one
+# without --stage release, other tools than the current release runs
+# on, a setting that differs
 # from the flags), or would start the units while another process holds
 # the port or a development control plane lives on the machine.
 #
@@ -175,7 +186,7 @@ parse_args() {
 
 validate_args() {
   local k
-  case $STAGE in tools | all) ;; *) usage_die "--stage must be tools or all" ;; esac
+  case $STAGE in tools | release | all) ;; *) usage_die "--stage must be tools, release or all" ;; esac
   for k in "${!SKIP_CHECK[@]}"; do
     case $k in clock | mem | listen) ;; *) usage_die "--skip-check takes clock, mem or listen" ;; esac
   done
@@ -201,6 +212,13 @@ validate_args() {
 
   [[ $VERSION =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ && $VERSION != *.tmp ]] ||
     usage_die "--version must be letters, digits, '.', '_', '+' or '-' (such as v0.1.0)"
+  if [[ $STAGE == release ]]; then
+    # The settings belong to the control plane, not to a release: a flag
+    # here would look applied and never be.
+    [[ -z $URL$TLS$ADMIN_EMAIL$MAIL_FROM_ARG$RACK_ENV_ARG$CERT_FILE$KEY_FILE$CF_TOKEN_FILE$SMTP_FILE$BILLING_DIR$BACKUP_TARGET$BACKUP_RECIPIENT$BACKUP_RECIPIENT_FILE && ${#UPDATE_ENV[@]} == 0 && $NO_START == 0 ]] ||
+      usage_die "--stage release builds a release and changes no setting, so it takes only --version, the source and --skip-check"
+    return 0
+  fi
   case $TLS in
     none)
       # The port is required: BASE_URL must name the port puma listens
@@ -430,7 +448,7 @@ check_tools() {
   ruby=$(sed -n 's/^ruby = "\(.*\)"$/\1/p' "$CURRENT/mise.toml")
   node=$(sed -n 's/^node = "\(.*\)"$/\1/p' "$CURRENT/mise.toml")
   [[ $ruby == "$RUBY_V" && $node == "$NODE_V" ]] ||
-    usage_die "the current release runs ruby $ruby and node $node, and this source wants ruby $RUBY_V and node $NODE_V; the tools are shared, so changing them is a release switch, see docs/byoh/OPERATIONS.md (release switch)"
+    usage_die "the current release runs ruby $ruby and node $node, and this source wants ruby $RUBY_V and node $NODE_V; every release runs on the same tools, so changing them is a release switch that needs tools per release (M12), see docs/byoh/OPERATIONS.md (release switch)"
 }
 
 step_tools() {
@@ -754,14 +772,18 @@ ensure_users() {
 release_rev() { sed -n 's/^rev=//p' "$RELEASES/$1/.ubicloud-release" 2>/dev/null; }
 
 # check_release: exits 2 before anything changes when this run would
-# rebuild an existing version or switch versions.
+# rebuild an existing version or, without --stage release, switch
+# versions.
 check_release() {
   local cur
-  if [[ -L $CURRENT ]]; then
+  if [[ $STAGE == release ]]; then
+    { [[ -L $CURRENT && -f $CURRENT/.ubicloud-release ]] && id ubicloud >/dev/null 2>&1; } ||
+      usage_die "--stage release adds a release to an installed control plane, and $CURRENT is missing; install with the default stage first"
+  elif [[ -L $CURRENT ]]; then
     cur=$(readlink "$CURRENT")
     cur=${cur##*/}
     [[ $cur == "$VERSION" ]] ||
-      usage_die "release $cur is current; switching to $VERSION is a release switch, see docs/byoh/OPERATIONS.md (release switch)"
+      usage_die "release $cur is current; switching to $VERSION is a release switch: build it with --stage release --version $VERSION, then see docs/byoh/OPERATIONS.md (release switch)"
   fi
   if [[ -d $RELEASES/$VERSION ]]; then
     [[ $(release_rev "$VERSION") == "$SRC_REV" ]] ||
@@ -829,6 +851,25 @@ build_release() {
   mv -T "$tmp" "$RELEASES/$VERSION"
   RELEASE_CHANGED=1
   report changed "release: built $VERSION at rev $SRC_REV"
+}
+
+# --stage release: builds the release next to the current one. The
+# tools are the current release's (check_tools), so they are not built.
+stage_release() {
+  tools_current || die "the tools in $TOOLS do not run ruby $RUBY_V and node $NODE_V; run install.sh --stage tools first"
+  if [[ -d $RELEASES/$VERSION ]]; then
+    report ok "release: $VERSION at rev $SRC_REV"
+  else
+    build_release
+  fi
+  report ok "stage release done; current is still $(readlink "$CURRENT")"
+  echo
+  echo "Release $VERSION (rev $SRC_REV) is staged. To switch to it (docs/byoh/OPERATIONS.md, release switch):"
+  echo "  sudo systemctl stop ubicloud.target"
+  echo "  sudo ubicloud-admin backup now"
+  echo "  sudo ubicloud-admin release migrate $VERSION"
+  echo "  sudo ubicloud-admin release use $VERSION"
+  echo "  sudo systemctl start ubicloud.target && sudo ubicloud-admin status"
 }
 
 # The bundler settings hold with an empty environment (as restarter and
@@ -1556,6 +1597,10 @@ main() {
   # step_tools can change the tools only where no release runs on them.
   [[ $STAGE == tools ]] || check_release
   check_tools
+  [[ $STAGE == release ]] && {
+    stage_release
+    return 0
+  }
   step_packages
   step_tools
   [[ $STAGE == tools ]] && {
