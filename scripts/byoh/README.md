@@ -38,12 +38,11 @@ can `ssh root@<data-plane-host>`.
 `install.sh` installs the control plane as root-owned releases under
 `/opt/ubicloud`, run by systemd as user `ubicloud`, with database
 `ubicloud` on peer authentication and settings in `/etc/ubicloud/env`.
-It is safe to re-run and keeps no marker files. This build supports
-`--tls none` only; the TLS fronts, `ubicloud-admin` and the migration
-from the development bootstrap come later in M3, so the live control
-plane keeps using `bootstrap-ctrl-plane.sh` for now. It has run only in
-the container harness (`scripts/byoh/test/`); on a real machine it is
-UNVERIFIED.
+It is safe to re-run and keeps no marker files. `--tls` takes `acme`,
+`provided`, `tunnel` or `none`. The migration from the development
+bootstrap comes later in M3, so the live control plane keeps using
+`bootstrap-ctrl-plane.sh` for now. It has run only in the container
+harness (`scripts/byoh/test/`); on a real machine it is UNVERIFIED.
 
 ```bash
 sudo bash scripts/byoh/install.sh --version v0.1.0 --url http://localhost:3000 \
@@ -52,6 +51,22 @@ sudo bash scripts/byoh/install.sh --version v0.1.0 --url http://localhost:3000 \
 ```
 
 `bash scripts/byoh/install.sh --help` lists every flag.
+
+install.sh also installs `ubicloud-admin` (`packaging/bin/ubicloud-admin`)
+to `/usr/local/bin`. Run it as root:
+
+| Command | Does |
+|---|---|
+| `ubicloud-admin status` | units, web, env file, pg_hba trust rules, backup recipient and age, `bin/byoh-config-check`; exits 1 on any fail |
+| `ubicloud-admin backup now\|list\|prune --keep N` | `pg_dump` plus the age-encrypted `/etc/ubicloud` under `BACKUP_TARGET`; the daily `ubicloud-backup.timer` runs `backup now` |
+| `ubicloud-admin restore TS --key-file F [--env-only\|--db-only] [--force]` | checks the backup, restores into `ubicloud_restore`, then swaps it in (the old database stays as `ubicloud_prev_*`), migrates and starts; a failed migration swaps back |
+| `ubicloud-admin env set\|unset\|get --reveal\|keys` | edits `/etc/ubicloud/env` (values on stdin, never printed) and restarts the services |
+| `ubicloud-admin logs [web\|respirate\|monitor\|backup\|caddy\|cloudflared] [-f]` | journalctl |
+| `ubicloud-admin account create\|list` | `bin/byoh-account` |
+| `ubicloud-admin run TOOL ...` | `byoh-location`, `byoh-pool`, `byoh-host`, `register-byoh-host`, `byoh-config-check`, `production_check`, `create_prod_admin_account` |
+| `ubicloud-admin console [-e CODE]` | `bin/pry`, unaudited (one system log line) |
+
+`ubicloud-admin --help` has the details.
 
 ## Usage — control plane (development bootstrap)
 

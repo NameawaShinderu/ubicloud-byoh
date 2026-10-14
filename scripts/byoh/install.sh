@@ -81,6 +81,7 @@ readonly PG_CONF=/etc/postgresql/$PG_VERSION/main
 readonly PG_UNIT=postgresql@$PG_VERSION-main
 readonly SERVICE_PATH=$TOOLS/bin:/usr/bin:/bin
 readonly UNIT_DIR=/etc/systemd/system
+readonly ADMIN_BIN=/usr/local/bin/ubicloud-admin
 # A mise release at least two weeks old; the checksum is the one
 # published with it for the linux-x64 binary.
 readonly MISE_VERSION=v2026.9.18
@@ -1049,6 +1050,18 @@ check_start() {
 
 # --- step 9: units ------------------------------------------------------------------------------
 
+# ubicloud-admin, from the current release. The backup service runs it.
+step_admin() {
+  local src=$CURRENT/packaging/bin/ubicloud-admin
+  [[ -f $src ]] || die "the release has no packaging/bin/ubicloud-admin"
+  if cmp -s "$src" "$ADMIN_BIN"; then
+    report ok "admin: $ADMIN_BIN"
+  else
+    install -m 0755 -o root -g root "$src" "$ADMIN_BIN"
+    report changed "admin: installed $ADMIN_BIN from $(readlink "$CURRENT")"
+  fi
+}
+
 step_units() {
   local u changed=0
   for u in "$CURRENT"/packaging/systemd/*; do
@@ -1454,8 +1467,9 @@ Ubicloud control plane backups ($(hostname -f 2>/dev/null || hostname), written 
                           CLOVER_COLUMN_ENCRYPTION_KEY, so the dump is useless
                           without that key, but it still holds sensitive data
                           (accounts, configuration, audit logs): protect it.
-<timestamp>/globals.sql   pg_dumpall --globals-only (roles, no passwords: the
-                          roles use peer authentication).
+<timestamp>/globals.sql   pg_dumpall --globals-only --no-role-passwords (roles;
+                          the ubicloud roles use peer authentication).
+<timestamp>/billing-rates.tar  $STATE/billing_rates.d.
 <timestamp>/manifest.json version, rev, applied migrations, sha256 of each file.
 secrets/<timestamp>.age   tar of $ETC/env (with CLOVER_COLUMN_ENCRYPTION_KEY,
                           CLOVER_SESSION_SECRET, CLOVER_RUNTIME_TOKEN_SECRET and
@@ -1512,6 +1526,7 @@ main() {
   step_database
   step_env
   step_migrate
+  step_admin
   # The services restart with the new IP_FROM_HEADER in step_units.
   # Caddy drops CF-Connecting-IP, so it comes up before that restart
   # and the old tunnel stops before puma trusts X-Real-IP. cloudflared
@@ -1531,12 +1546,9 @@ main() {
   echo "  URL:      $URL"
   echo "  RACK_ENV: $(kv_read "$ENV_FILE" && echo "${KV[RACK_ENV]}")"
   echo "Next:"
-  if [[ -x /usr/local/bin/ubicloud-admin ]]; then
-    echo "  sudo ubicloud-admin account create --email $ADMIN_EMAIL"
-    echo "  sudo ubicloud-admin status"
-  else
-    echo "  (ubicloud-admin is not installed by this build; see docs/byoh/INSTALL.md)"
-  fi
+  echo "  sudo ubicloud-admin account create --email $ADMIN_EMAIL"
+  echo "  sudo ubicloud-admin backup now"
+  echo "  sudo ubicloud-admin status"
   echo "  Front:    --tls $TLS"
   [[ $TLS != none ]] || echo "  --tls none serves 127.0.0.1:3000 only; reach it with ssh -L 3000:127.0.0.1:3000 (browser use UNVERIFIED)"
 }

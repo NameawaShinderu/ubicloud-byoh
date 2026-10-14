@@ -11,8 +11,8 @@
 #                              stopped
 #   run.sh SCENARIO...         run scenarios, each in a fresh container
 #
-# Scenarios: envfmt verify fresh rerun flags smoke kill restart reboot
-# tls-provided tunnel (or "all").
+# Scenarios: parity envfmt verify fresh rerun flags smoke kill restart
+# reboot tls-provided tunnel backup admin (or "all").
 # Logs go to $UBI_M3_LOGS (default: a fresh temp dir, printed at the
 # end). UBI_M3_KEEP=1 keeps the containers for inspection.
 set -euo pipefail
@@ -277,8 +277,6 @@ sc_verify() {
   local out after req
   boot_cp verify
   out=$(dx verify bash -c 'cd /etc/systemd/system && systemd-analyze verify ubicloud.target ubicloud-*.service ubicloud-*.timer 2>&1' || true)
-  # The backup service names ubicloud-admin, which WP6 installs.
-  out=$(grep -v 'ubicloud-admin' <<<"$out" || true)
   [[ -z $out ]] || {
     printf '%s\n' "$out" >>"$LOGS/harness.log"
     fail "systemd-analyze verify: $out"
@@ -296,14 +294,13 @@ sc_verify() {
     fail "ubicloud-monitor is not disabled"
   [[ $(dx verify systemctl is-active ubicloud-monitor || true) == inactive ]] ||
     fail "ubicloud-monitor is running"
-  # Until WP6 installs ubicloud-admin, a backup run is skipped, not failed.
-  dx verify test ! -e /usr/local/bin/ubicloud-admin || fail "verify: ubicloud-admin exists, update this check"
-  dx verify systemctl start ubicloud-backup.service || fail "verify: starting ubicloud-backup failed"
-  [[ $(dx verify systemctl show -p ConditionResult --value ubicloud-backup.service) == no ]] ||
-    fail "verify: ubicloud-backup did not skip on its condition"
-  [[ $(dx verify systemctl is-failed ubicloud-backup.service || true) != failed ]] ||
-    fail "verify: ubicloud-backup failed"
-  say "verify: ubicloud-backup without ubicloud-admin is skipped, not failed"
+  # The timer's service runs ubicloud-admin backup now.
+  dx verify systemctl start ubicloud-backup.service || fail "verify: ubicloud-backup failed"
+  [[ $(dx verify systemctl show -p Result --value ubicloud-backup.service) == success ]] ||
+    fail "verify: ubicloud-backup did not succeed"
+  [[ -n $(dx verify find /var/backups/ubicloud -mindepth 2 -maxdepth 2 -name manifest.json) ]] ||
+    fail "verify: ubicloud-backup wrote no backup"
+  say "verify: ubicloud-backup.service ran ubicloud-admin backup now"
   say "verify: ok"
 }
 
@@ -413,11 +410,18 @@ sc_fresh() {
   dx fresh rm -rf /var/tmp/cc
   say "fresh: the shipped cache/*.cache match a refresh against the installed schema"
 
-  printf '%s\n' "$PASSWORD" | dx fresh bash /art/fixture.sh account "$EMAIL" >"$LOGS/fresh-account.txt" 2>&1 ||
-    fail "fresh: account create: $(cat "$LOGS/fresh-account.txt")"
+  [[ $(dx fresh stat -c '%U:%G %a' /usr/local/bin/ubicloud-admin) == "root:root 755" ]] ||
+    fail "fresh: /usr/local/bin/ubicloud-admin is not root 0755"
+  dx fresh cmp -s /usr/local/bin/ubicloud-admin /opt/ubicloud/current/packaging/bin/ubicloud-admin ||
+    fail "fresh: /usr/local/bin/ubicloud-admin is not the release's"
+  printf '%s\n' "$PASSWORD" | adm fresh account create --email "$EMAIL" --password-stdin >"$LOGS/fresh-account.txt" 2>&1 ||
+    fail "fresh: ubicloud-admin account create: $(cat "$LOGS/fresh-account.txt")"
+  grep -q "$EMAIL" <<<"$(adm fresh account list)" || fail "fresh: ubicloud-admin account list from /"
   out=$(login fresh) || fail "fresh: login request failed"
   [[ $out == "302 http://localhost:3000/after-login" ]] || fail "fresh: login: $out"
-  say "fresh: account created, login ok ($out)"
+  say "fresh: account created with ubicloud-admin from /, login ok ($out)"
+  adm fresh status >"$LOGS/fresh-status.txt" 2>&1 || fail "fresh: ubicloud-admin status: $(grep '^fail' "$LOGS/fresh-status.txt")"
+  say "fresh: ubicloud-admin status passes ($(tail -1 "$LOGS/fresh-status.txt"))"
   poke_strand fresh
   wait_for 60 strand_ran fresh >/dev/null || fail "fresh: respirate ran no strand"
   journal_clean fresh "$since"
@@ -957,7 +961,7 @@ sc_restart() {
 }
 
 # A backup that runs survives a restart and a stop of the target. A
-# drop-in stands in for ubicloud-admin (WP6) with a sleep.
+# drop-in stands in for ubicloud-admin backup now with a sleep.
 sc_restart_backup() {
   local inv
   dx restart bash -c 'mkdir -p /run/systemd/system/ubicloud-backup.service.d &&
@@ -1422,6 +1426,296 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
   say "tunnel: ok (a real tunnel is UNVERIFIED)"
 }
 
+# --- ubicloud-admin (WP6) -----------------------------------------------------------
+
+# adm NAME ARGS...: ubicloud-admin ARGS as root in ubi-m3-NAME, from /.
+adm() {
+  local name=ubi-m3-$1
+  shift
+  docker exec -i -w / "$name" ubicloud-admin "$@"
+}
+
+# adm_rc NAME ARGS...: prints ubicloud-admin's exit status; its output
+# goes to $LOGS/adm.log.
+adm_rc() {
+  local rc=0
+  {
+    echo "### ubicloud-admin ${*:2}"
+    adm "$@" 2>&1 || rc=$?
+  } </dev/null >>"$LOGS/adm.log"
+  echo "$rc"
+}
+
+# The database names of the container's postgres, one line.
+db_names() { dx "$1" runuser -u postgres -- psql -XtAc "SELECT string_agg(datname, ' ' ORDER BY datname) FROM pg_database WHERE datname LIKE 'ubicloud%'"; }
+
+# A plain sshd on ubi-test-net, so a Sshable proves that the column key
+# of a restored env file decrypts the restored private key.
+start_sshd() {
+  docker run -d --name ubi-m3-sshd --network "$NET" ubuntu:24.04 sleep infinity >/dev/null
+  echo ubi-m3-sshd >>"$STATE/created"
+  docker exec ubi-m3-sshd bash -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openssh-server >/dev/null &&
+    mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh' || fail "sshd: openssh-server did not install"
+  docker exec -d ubi-m3-sshd /usr/sbin/sshd -D
+  SSHD_IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" ubi-m3-sshd)
+}
+
+# The first connect also prints a "host keys added" log line.
+sshable_ok() { grep -qx ok <<<"$(adm "$1" console -e 'puts Sshable.first.cmd("echo ok")' 2>/dev/null)"; }
+
+# install.sh's and ubicloud-admin's copies of the env file format must
+# not drift apart.
+sc_parity() {
+  local f a b
+  a=$(sed -n '/^kv_read() {/,/^}/p' "$WT/scripts/byoh/install.sh")
+  b=$(sed -n '/^kv_read() {/,/^}/p' "$WT/packaging/bin/ubicloud-admin")
+  [[ -n $a && $a == "$b" ]] || fail "parity: kv_read differs between install.sh and ubicloud-admin"
+  for f in "valid_value() " "readonly KEY_RE=" "readonly DENIED_KEY_RE=" "readonly LOCK="; do
+    a=$(grep "^$f" "$WT/scripts/byoh/install.sh")
+    b=$(grep "^$f" "$WT/packaging/bin/ubicloud-admin")
+    [[ -n $a && $a == "$b" ]] || fail "parity: $f differs between install.sh and ubicloud-admin"
+  done
+  say "parity: kv_read, valid_value, KEY_RE, DENIED_KEY_RE and LOCK match"
+}
+
+sc_backup() {
+  local out ts ts2 smp env_sum since dir f
+  boot_cp backup
+  since=$(dx backup date '+%F %T')
+  start_sshd
+  out=$(adm backup console -e "k = SshKey.generate; Sshable.create(host: '$SSHD_IP', unix_user: 'root', raw_private_key_1: k.keypair); puts k.public_key" 2>/dev/null) ||
+    fail "backup: console -e could not create a Sshable"
+  printf '%s\n' "$out" | docker exec -i ubi-m3-sshd tee -a /root/.ssh/authorized_keys >/dev/null
+  wait_for 30 sshable_ok backup >/dev/null || fail "backup: Sshable#cmd fails before the backup"
+  printf '%s\n' "$PASSWORD" | adm backup account create --email "$EMAIL" --password-stdin >"$LOGS/backup-account.txt" 2>&1 ||
+    fail "backup: account create: $(cat "$LOGS/backup-account.txt")"
+  [[ $(login backup) == "302 http://localhost:3000/after-login" ]] || fail "backup: login before the backup"
+  say "backup: Sshable#cmd ok, account created, login ok"
+
+  # backup now
+  out=$(adm backup backup now 2>&1) || fail "backup: backup now: $out"
+  ts=$(grep -oE '[0-9]{8}T[0-9]{6}Z' <<<"$out" | head -1)
+  dir=/var/backups/ubicloud/$ts
+  [[ $(dx backup stat -c '%U %a' "$dir") == "root 700" ]] || fail "backup: $dir is not root 0700"
+  out=$(dx backup find "$dir" /var/backups/ubicloud/secrets -type f ! -perm 0600)
+  [[ -z $out ]] || fail "backup: not 0600: $out"
+  for f in db.dump globals.sql billing-rates.tar manifest.json; do dx backup test -s "$dir/$f" || fail "backup: no $f"; done
+  dx backup test -s "/var/backups/ubicloud/secrets/$ts.age" || fail "backup: no secrets/$ts.age"
+  dx backup grep -q CLOVER_COLUMN_ENCRYPTION_KEY "/var/backups/ubicloud/secrets/$ts.age" && fail "backup: the secrets file is not encrypted"
+  grep -qx 'etc/ubicloud/env' <<<"$(dx backup age -d -i /root/backup-key "/var/backups/ubicloud/secrets/$ts.age" | tar -tf -)" ||
+    fail "backup: the secrets do not hold etc/ubicloud/env"
+  [[ $(dx backup jq -r '.files["db.dump"]' "$dir/manifest.json") == "$(dx backup sha256sum "$dir/db.dump" | cut -d' ' -f1)" ]] ||
+    fail "backup: the manifest's sha256 of db.dump is wrong"
+  grep -qE "^$ts +[^ ]+ +yes +t1 " <<<"$(adm backup backup list)" || fail "backup: backup list: $(adm backup backup list)"
+  smp=$(psql_q backup "SELECT string_agg(filename, ',' ORDER BY filename) FROM schema_migrations_password")
+  env_sum=$(dx backup sha256sum /etc/ubicloud/env)
+  say "backup: $ts: files 0600 in a 0700 directory, manifest sha256 ok, secrets encrypted"
+
+  # A changed dump is refused before anything changes.
+  dx backup cp -p "$dir/db.dump" /root/db.dump.good
+  printf 'x' | dx backup tee -a "$dir/db.dump" >/dev/null
+  [[ $(adm_rc backup restore "$ts" --key-file /root/backup-key) == 2 ]] || fail "backup: a changed db.dump was not refused with exit 2"
+  dx backup cp -p /root/db.dump.good "$dir/db.dump"
+  # A dump that matches a rewritten manifest but is no dump.
+  dx backup cp -a "$dir" /var/backups/ubicloud/20200101T000000Z
+  dx backup cp -p "/var/backups/ubicloud/secrets/$ts.age" /var/backups/ubicloud/secrets/20200101T000000Z.age
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  dx backup bash -c 'd=/var/backups/ubicloud/20200101T000000Z; head -c 4096 /dev/urandom >$d/db.dump &&
+    jq --arg s "$(sha256sum $d/db.dump | cut -d" " -f1)" ".files[\"db.dump\"] = \$s" $d/manifest.json >$d/m && mv $d/m $d/manifest.json'
+  [[ $(adm_rc backup restore 20200101T000000Z --key-file /root/backup-key) == 2 ]] || fail "backup: a dump pg_restore cannot list was not refused with exit 2"
+  grep -q 'pg_restore --list cannot read' "$LOGS/adm.log" || fail "backup: no pg_restore --list message"
+  # A key that is no recipient's.
+  dx backup age-keygen -o /root/other-key 2>/dev/null
+  [[ $(adm_rc backup restore "$ts" --key-file /root/other-key) == 2 ]] || fail "backup: a wrong --key-file was not refused with exit 2"
+  [[ $(db_names backup) == ubicloud ]] || fail "backup: a refused restore left databases: $(db_names backup)"
+  [[ $(login backup) == "302 http://localhost:3000/after-login" ]] || fail "backup: login after the refused restores"
+  say "backup: a changed dump, an unreadable dump and a wrong key are refused (exit 2); the live database serves logins"
+
+  # Another column key in the env file needs --force.
+  dx backup cp -p /etc/ubicloud/env /root/env.good
+  dx backup sed -i "s|^CLOVER_COLUMN_ENCRYPTION_KEY=.*|CLOVER_COLUMN_ENCRYPTION_KEY='$(head -c 32 /dev/urandom | base64 -w0)'|" /etc/ubicloud/env
+  out=$(dx backup sha256sum /etc/ubicloud/env)
+  [[ $(adm_rc backup restore "$ts" --key-file /root/backup-key) == 2 ]] || fail "backup: another column key was not refused"
+  [[ $(adm_rc backup restore "$ts" --db-only) == 2 ]] || fail "backup: --db-only with another column key was not refused"
+  [[ $(dx backup sha256sum /etc/ubicloud/env) == "$out" ]] || fail "backup: a refused restore changed the env file"
+  dx backup cp -p /root/env.good /etc/ubicloud/env
+  [[ $(db_names backup) == ubicloud ]] || fail "backup: a refused restore left databases: $(db_names backup)"
+  say "backup: another column key is refused without --force, also with --db-only"
+
+  # A restore whose migrations fail puts the old database back.
+  printf '%s\n' "$PASSWORD" | adm backup account create --email after@example.test --password-stdin >/dev/null 2>&1 ||
+    fail "backup: account create after@"
+  dx backup bash -c 'printf "# frozen_string_literal: true\n\nSequel.migration { up { raise \"harness: failing migration\" } }\n" >/opt/ubicloud/current/migrate/20991231_harness_fail.rb'
+  [[ $(adm_rc backup restore "$ts" --key-file /root/backup-key) == 1 ]] || fail "backup: a restore with a failing migration did not exit 1"
+  dx backup rm -f /opt/ubicloud/current/migrate/20991231_harness_fail.rb
+  grep -q 'database ubicloud and /etc/ubicloud/env are as before' "$LOGS/adm.log" || fail "backup: no rollback message"
+  grep -q after@example.test <<<"$(adm backup account list)" || fail "backup: the rollback did not bring the old database back"
+  [[ $(dx backup sha256sum /etc/ubicloud/env) == "$env_sum" ]] || fail "backup: the rollback changed the env file"
+  wait_for 120 web_up backup >/dev/null || fail "backup: web down after the rollback"
+  assert_active backup
+  [[ $(db_names backup) =~ ^ubicloud\ ubicloud_failed_[0-9]{14}$ ]] || fail "backup: databases after the rollback: $(db_names backup)"
+  dx backup runuser -u postgres -- dropdb "$(db_names backup | cut -d' ' -f2)"
+  say "backup: a failing migration rolls the restore back: old database and env file, services running"
+
+  # A restore over the live database keeps it as ubicloud_prev_*.
+  [[ $(adm_rc backup restore "$ts" --key-file /root/backup-key) == 0 ]] || fail "backup: restore over the live database failed"
+  grep -q after@example.test <<<"$(adm backup account list)" && fail "backup: the restore kept an account made after the backup"
+  [[ $(db_names backup) =~ ^ubicloud\ ubicloud_prev_[0-9]{14}$ ]] || fail "backup: databases after the restore: $(db_names backup)"
+  [[ $(adm_rc backup status) == 0 ]] || fail "backup: status after the restore"
+  [[ $(login backup) == "302 http://localhost:3000/after-login" ]] || fail "backup: login after the restore"
+  say "backup: a restore over the live database ran; the old one is $(db_names backup | cut -d' ' -f2); status ok"
+
+  # The disaster: no database, no env file.
+  dx backup systemctl stop ubicloud.target
+  dx backup runuser -u postgres -- dropdb ubicloud
+  dx backup rm /etc/ubicloud/env
+  [[ $(adm_rc backup restore "$ts" --key-file /root/backup-key) == 0 ]] || fail "backup: the restore without database and env file failed"
+  [[ $(dx backup sha256sum /etc/ubicloud/env) == "$env_sum" ]] || fail "backup: the restored env file differs"
+  [[ $(dx backup stat -c '%U:%G %a' /etc/ubicloud/env) == "root:root 600" ]] || fail "backup: the restored env file is not root 0600"
+  wait_for 30 sshable_ok backup >/dev/null || fail "backup: Sshable#cmd fails after the restore"
+  [[ $(login backup) == "302 http://localhost:3000/after-login" ]] || fail "backup: login after the disaster restore"
+  [[ $(psql_q backup "SELECT string_agg(filename, ',' ORDER BY filename) FROM schema_migrations_password") == "$smp" ]] ||
+    fail "backup: schema_migrations_password changed"
+  [[ $(psql_q backup "SELECT nspowner::regrole FROM pg_namespace WHERE nspname = 'public'") == ubicloud ]] || fail "backup: public is not owned by ubicloud"
+  [[ $(adm_rc backup status) == 0 ]] || fail "backup: status after the disaster restore: $(tail -30 "$LOGS/adm.log")"
+  say "backup: restore without database and env file: env identical, Sshable#cmd ok, login ok, password migrations unchanged, public owned by ubicloud, status ok"
+
+  # prune keeps the newest and never touches other directories.
+  out=$(adm backup backup now 2>&1) || fail "backup: second backup now: $out"
+  ts2=$(grep -oE '[0-9]{8}T[0-9]{6}Z' <<<"$out" | head -1)
+  dx backup mkdir /var/backups/ubicloud/pre-migration-harness
+  [[ $(adm_rc backup backup prune --keep 1) == 0 ]] || fail "backup: prune failed"
+  out=$(dx backup ls /var/backups/ubicloud /var/backups/ubicloud/secrets | tr '\n' ' ')
+  [[ $out == *"$ts2 "* && $out == *"$ts2.age"* && $out == *pre-migration-harness* && $out != *"$ts "* && $out != *"$ts.age"* && $out != *20200101T000000Z* ]] ||
+    fail "backup: after prune --keep 1: $out"
+  [[ $(adm_rc backup backup prune --keep 0) == 2 ]] || fail "backup: prune --keep 0 was not refused"
+  say "backup: prune --keep 1 kept $ts2 and its secrets, and pre-migration-harness"
+
+  # A backup started while a restore runs waits for the restore's lock.
+  docker exec -d ubi-m3-backup bash -c "ubicloud-admin restore $ts2 --key-file /root/backup-key >/root/restore.log 2>&1; echo \$? >/root/restore.rc; date +%s.%N >/root/restore.done"
+  wait_for 30 dx backup bash -c '! flock -n /run/ubicloud-admin.lock true' >/dev/null || fail "backup: the restore never took the lock"
+  out=$(adm backup backup now 2>&1) || fail "backup: backup now during a restore: $out"
+  [[ $out == *"waiting for /run/ubicloud-admin.lock"* ]] || fail "backup: backup now did not wait for the lock: $out"
+  dx backup test -e /root/restore.done || fail "backup: backup now finished before the restore"
+  [[ $(dx backup cat /root/restore.rc) == 0 ]] || fail "backup: the concurrent restore failed: $(dx backup cat /root/restore.log)"
+  say "backup: backup now during a restore waited for its lock and ran after it"
+
+  # The timer's service runs the same command.
+  dx backup systemctl start ubicloud-backup.service || fail "backup: ubicloud-backup.service failed"
+  [[ $(dx backup systemctl show -p Result --value ubicloud-backup.service) == success ]] || fail "backup: ubicloud-backup.service result"
+  grep -q '^ok      backup: /var/backups/ubicloud/' <<<"$(dx backup journalctl -u ubicloud-backup --no-pager -o cat)" ||
+    fail "backup: the service wrote no backup"
+  wait_for 120 web_up backup >/dev/null || fail "backup: web down at the end"
+  journal_clean backup "$since"
+  say "backup: ok"
+}
+
+sc_admin() {
+  local out pid since pw
+  boot_cp admin
+  since=$(dx admin date '+%F %T')
+  [[ $(adm_rc admin --help) == 0 ]] || fail "admin: --help"
+  [[ $(adm_rc admin restore --help) == 0 ]] || fail "admin: restore --help"
+  [[ $(adm_rc admin bogus) == 2 ]] || fail "admin: an unknown command did not exit 2"
+  [[ $(dx admin runuser -u ubicloud -- /usr/local/bin/ubicloud-admin status 2>&1 || true) == *"run ubicloud-admin as root"* ]] ||
+    fail "admin: ubicloud-admin ran as a non-root user"
+
+  # account: a password file relative to the caller's directory, which
+  # ubicloud cannot read, and a generated password that is printed once.
+  printf '%s\n' "$PASSWORD" | dx admin bash -c 'umask 077 && cat >/root/pw.txt'
+  docker exec -i -w /root ubi-m3-admin ubicloud-admin account create --email "$EMAIL" --password-file pw.txt >/dev/null 2>&1 ||
+    fail "admin: account create --password-file (relative, root 0600)"
+  [[ $(login admin) == "302 http://localhost:3000/after-login" ]] || fail "admin: login"
+  out=$(adm admin account create --email gen@example.test 2>&1) || fail "admin: account create with a generated password: $out"
+  pw=$(sed -n 's/^Password: //p' <<<"$out")
+  [[ ${#pw} -ge 16 ]] || fail "admin: account create printed no generated password"
+  grep -qF -- "$pw" <<<"$(dx admin journalctl --no-pager)" && fail "admin: the generated password is in the journal"
+  grep -q gen@example.test <<<"$(adm admin account list)" || fail "admin: account list from /"
+  say "admin: account create (relative --password-file, generated password) and list from /"
+
+  # env
+  pid=$(main_pid admin ubicloud-web)
+  out=$(printf 'ops@example.test\n' | adm admin env set MAIL_FROM 2>&1) || fail "admin: env set MAIL_FROM: $out"
+  [[ $out != *ops@example.test* ]] || fail "admin: env set printed the value"
+  [[ $(adm admin env get MAIL_FROM --reveal) == ops@example.test ]] || fail "admin: env get --reveal"
+  [[ $(main_pid admin ubicloud-web) != "$pid" ]] || fail "admin: env set did not restart web"
+  [[ $(dx admin stat -c '%U:%G %a' /etc/ubicloud/env) == "root:root 600" ]] || fail "admin: env set changed the env file's mode"
+  out=$(dx admin sha256sum /etc/ubicloud/env)
+  [[ $(adm_rc admin env get MAIL_FROM) == 2 ]] || fail "admin: env get without --reveal"
+  for k in PATH LD_PRELOAD PRY_ALLOW_UNAUDITED CLOVER_COLUMN_ENCRYPTION_KEY GIT_REV IP_FROM_HEADER lower; do
+    [[ $(printf 'v' | adm admin env set "$k" >/dev/null 2>&1; echo $?) == 2 ]] || fail "admin: env set $k was not refused"
+  done
+  for v in "a'b" 'a\b' $'a\nb' ''; do
+    [[ $(printf '%s' "$v" | adm admin env set MAIL_FROM >/dev/null 2>&1; echo $?) == 2 ]] || fail "admin: env set took a bad value"
+  done
+  [[ $(printf 'a\0b' | adm admin env set MAIL_FROM >/dev/null 2>&1; echo $?) == 2 ]] || fail "admin: env set took a NUL"
+  [[ $(dx admin sha256sum /etc/ubicloud/env) == "$out" ]] || fail "admin: a refused env set changed the env file"
+  pid=$(main_pid admin ubicloud-web)
+  printf 'x' | adm admin env set HARNESS_KEY --no-restart >/dev/null || fail "admin: env set --no-restart"
+  [[ $(main_pid admin ubicloud-web) == "$pid" ]] || fail "admin: env set --no-restart restarted web"
+  grep -qx HARNESS_KEY <<<"$(adm admin env keys)" || fail "admin: env keys"
+  grep -q "=" <<<"$(adm admin env keys)" && fail "admin: env keys printed a value"
+  adm admin env unset HARNESS_KEY >/dev/null || fail "admin: env unset"
+  grep -qx HARNESS_KEY <<<"$(adm admin env keys)" && fail "admin: env unset left the key"
+  wait_for 120 web_up admin >/dev/null || fail "admin: web down after env set"
+  say "admin: env set/get/unset/keys, refusals change nothing, values never printed"
+
+  # status fails on unaudited pry, a missing recipient and a trust rule.
+  [[ $(adm_rc admin status) == 0 ]] || fail "admin: status on a healthy control plane"
+  dx admin bash -c "echo \"PRY_ALLOW_UNAUDITED='true'\" >>/etc/ubicloud/env"
+  [[ $(adm_rc admin status) == 1 ]] || fail "admin: status passed with PRY_ALLOW_UNAUDITED in the env file"
+  adm admin env unset PRY_ALLOW_UNAUDITED --no-restart >/dev/null || fail "admin: env unset PRY_ALLOW_UNAUDITED"
+  dx admin mv /etc/ubicloud/backup-recipients /root/recipients.saved
+  [[ $(adm_rc admin status) == 1 ]] || fail "admin: status passed without a backup recipient"
+  dx admin mv /root/recipients.saved /etc/ubicloud/backup-recipients
+  dx admin bash -c 'echo "local all all trust" >>/etc/postgresql/16/main/pg_hba.conf && systemctl reload postgresql@16-main'
+  [[ $(adm_rc admin status) == 1 ]] || fail "admin: status passed with a trust rule"
+  grep -q 'use trust for database ubicloud or all' "$LOGS/adm.log" || fail "admin: no trust message"
+  # shellcheck disable=SC2016 # sed's $, the last line
+  dx admin bash -c 'sed -i "\$d" /etc/postgresql/16/main/pg_hba.conf && systemctl reload postgresql@16-main'
+  [[ $(adm_rc admin status) == 0 ]] || fail "admin: status after the fixes"
+  # The backup age: a newest backup 40 h old warns, 100 h old fails.
+  out=/var/backups/ubicloud/$(dx admin date -u -d '40 hours ago' +%Y%m%dT%H%M%SZ)
+  dx admin mkdir "$out"
+  dx admin touch "$out/manifest.json"
+  [[ $(adm_rc admin status) == 0 ]] || fail "admin: status failed on a backup 40 h old"
+  grep -qE '^warn +backup: the last backup \([0-9TZ]+\) is 40 h old$' "$LOGS/adm.log" || fail "admin: no warning for a backup 40 h old"
+  dx admin mv "$out" "/var/backups/ubicloud/$(dx admin date -u -d '100 hours ago' +%Y%m%dT%H%M%SZ)"
+  [[ $(adm_rc admin status) == 1 ]] || fail "admin: status passed with a backup 100 h old"
+  grep -qE '^fail +backup: the last backup \([0-9TZ]+\) is 100 h old' "$LOGS/adm.log" || fail "admin: no failure for a backup 100 h old"
+  say "admin: status fails on PRY_ALLOW_UNAUDITED, a missing recipient, a trust rule and a backup 100 h old, passes once each is fixed, and warns at 40 h"
+
+  # run
+  [[ $(adm_rc admin run bogus) == 2 ]] || fail "admin: run bogus"
+  [[ $(adm_rc admin run register-byoh-host --bmc-password x) == 2 ]] || fail "admin: --bmc-password"
+  [[ $(adm_rc admin run register-byoh-host --bmc-passw=x) == 2 ]] || fail "admin: --bmc-passw="
+  adm admin run byoh-location list >/dev/null || fail "admin: run byoh-location list"
+  adm admin run byoh-config-check >/dev/null || fail "admin: run byoh-config-check"
+  docker exec -i -w /root ubi-m3-admin ubicloud-admin run byoh-host export-audit --out audit.jsonl >/dev/null || fail "admin: export-audit --out"
+  [[ $(dx admin stat -c '%U %a' /root/audit.jsonl) == "root 600" ]] || fail "admin: --out file"
+  dx admin grep -q 'byoh-account create' /root/audit.jsonl || fail "admin: the audit export lacks the account rows"
+  grep -q '^Password for account is: ' <<<"$(adm admin run create_prod_admin_account harness-admin 2>&1)" || fail "admin: create_prod_admin_account"
+  adm admin run production_check >"$LOGS/admin-production-check.log" 2>&1 || fail "admin: production_check, see $LOGS/admin-production-check.log"
+  say "admin: run refuses unknown tools and --bmc-password; tools run from /, --out is written back, production_check passes"
+
+  # console
+  out=$(adm admin console -e 'puts "harness-console-#{6 * 7}"' 2>&1) || fail "admin: console -e: $out"
+  [[ $out == *harness-console-42* && $out == *"NOT audited"* ]] || fail "admin: console -e: $out"
+  out=$(printf 'puts "harness-pry-#{6 * 7}"\nexit\n' | adm admin console 2>&1) || fail "admin: console: $out"
+  [[ $out == *harness-pry-42* && $out == *"NOT audited"* ]] || fail "admin: console (pry): $out"
+  out=$(dx admin journalctl --no-pager -t ubicloud-admin -t ubicloud-pry -o cat)
+  [[ $out == *"console -e by root"* && $out == *"unaudited pry session opened"* ]] || fail "admin: console log lines: $out"
+  grep -q 'harness-console' <<<"$(dx admin journalctl --no-pager)" && fail "admin: console code reached the journal"
+  dx admin grep -q PRY_ALLOW_UNAUDITED /etc/ubicloud/env && fail "admin: console left PRY_ALLOW_UNAUDITED in the env file"
+  say "admin: console -e and pry run unaudited with one log line each; the code stays out of the journal"
+
+  # logs
+  [[ -n $(adm admin logs web -n 5) ]] || fail "admin: logs web"
+  [[ $(adm_rc admin logs bogus) == 2 ]] || fail "admin: logs bogus"
+  journal_clean admin "$since"
+  say "admin: ok"
+}
+
 sc_reboot() {
   local t since
   boot_cp reboot
@@ -1448,8 +1742,8 @@ for arg in "$@"; do
     --prepare-image) prepare_image ;;
     --prepare-tools) prepare_tools ;;
     --prepare-release) prepare_release ;;
-    all) for s in envfmt verify fresh rerun flags smoke kill restart reboot tls_provided tunnel; do "sc_$s"; cleanup; done ;;
-    envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot | tls-provided | tunnel)
+    all) for s in parity envfmt verify fresh rerun flags smoke kill restart reboot tls_provided tunnel backup admin; do "sc_$s"; cleanup; done ;;
+    parity | envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot | tls-provided | tunnel | backup | admin)
       "sc_${arg//-/_}"
       cleanup
       ;;

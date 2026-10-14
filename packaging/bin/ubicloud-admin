@@ -1,0 +1,1150 @@
+#!/bin/bash
+# Operates a control plane that scripts/byoh/install.sh installed. Run it
+# as root (sudo); install.sh puts it in /usr/local/bin.
+#
+#   ubicloud-admin status
+#   ubicloud-admin backup now|list|prune --keep N
+#   ubicloud-admin restore TS --key-file F [--env-only|--db-only] [--force]
+#   ubicloud-admin env set KEY [--no-restart]   (the value on stdin, or typed)
+#   ubicloud-admin env unset KEY [--no-restart]
+#   ubicloud-admin env get KEY --reveal
+#   ubicloud-admin env keys
+#   ubicloud-admin logs [web|respirate|monitor|backup|caddy|cloudflared]... [-f] [--since T] [-n N]
+#   ubicloud-admin account create --email E [--name N] [--project P] [--password-stdin|--password-file F]
+#   ubicloud-admin account list
+#   ubicloud-admin run TOOL [ARGS...]
+#   ubicloud-admin console [-e CODE]
+#
+# status   Units, settings (bin/byoh-config-check), pg_hba trust rules,
+#          backup recipient and age, release. Exits 1 on any fail.
+# backup   now: <target>/<UTC timestamp>/ with db.dump (pg_dump -Fc),
+#          globals.sql, billing-rates.tar and manifest.json, and
+#          <target>/secrets/<timestamp>.age, a tar of /etc/ubicloud
+#          encrypted to the recipients in /etc/ubicloud/backup-recipients
+#          (skipped, with a warning, when there are none). prune keeps the
+#          newest N and never touches other directories (pre-migration-*).
+#          The target is BACKUP_TARGET in /etc/ubicloud/backup.conf.
+# restore  Checks the backup (sha256, pg_restore --list, no migration the
+#          release lacks) and restores it into database ubicloud_restore.
+#          Only then does it stop the services and swap the databases:
+#          ubicloud becomes ubicloud_prev_<time> (kept; drop it yourself)
+#          and ubicloud_restore becomes ubicloud. It migrates, starts the
+#          services and prints status. If the migration fails, it swaps
+#          the old database and env file back. The env file is replaced
+#          only when it is missing or with --force, and a backup made with
+#          another CLOVER_COLUMN_ENCRYPTION_KEY needs --force. --db-only
+#          needs no --key-file: it keeps the env file, whose column key
+#          must match the backup's. On a new machine, run install.sh, copy
+#          the backups into the target, then restore TS --key-file F --force.
+# env      Changes /etc/ubicloud/env and restarts the services. Values are
+#          never printed, except by env get --reveal.
+# run      TOOL is byoh-location, byoh-pool, byoh-host, register-byoh-host,
+#          byoh-config-check, production_check or create_prod_admin_account
+#          (bin/rake-task-runner). It runs in the release as user ubicloud;
+#          the files named by --pool-file, --ssh-key, --external-map and
+#          --password-file are copied for it, and --out FILE is written
+#          back. --bmc-password is refused: put the password in the env
+#          file (env set BMC_PASS) and pass --bmc-pass-env BMC_PASS.
+# console  bin/pry, or the code of -e with the application loaded, as user
+#          ubicloud with PRY_ALLOW_UNAUDITED=true for this session only.
+#          One line goes to the system log (who and when); the commands
+#          themselves are NOT audited.
+#
+# Every command except logs and env keys writes one line with the command
+# name and $SUDO_USER, never its arguments, to the system log (tag
+# ubicloud-admin). backup, restore and env changes hold
+# /run/ubicloud-admin.lock, the lock install.sh takes.
+#
+# Exit status: 0 on success, 1 on a failure, 2 on a usage error or a
+# refusal that changed nothing.
+#
+# Docs: docs/byoh/OPERATIONS.md.
+set -euo pipefail
+umask 077
+
+readonly OPT=/opt/ubicloud
+readonly TOOLS=$OPT/tools
+readonly CURRENT=$OPT/current
+readonly STATE=/var/lib/ubicloud
+readonly ETC=/etc/ubicloud
+readonly ENV_FILE=$ETC/env
+readonly BACKUP_CONF=$ETC/backup.conf
+readonly BACKUP_RECIPIENTS=$ETC/backup-recipients
+readonly LOCK=/run/ubicloud-admin.lock
+readonly PG_UNIT=postgresql@16-main
+readonly SERVICE_PATH=$TOOLS/bin:/usr/bin:/bin
+readonly DB_NAME=ubicloud
+readonly TS_RE='^[0-9]{8}T[0-9]{6}Z$'
+# The units status checks and restore stops and starts.
+readonly SERVICES=(ubicloud-web ubicloud-respirate ubicloud-monitor)
+
+# Keys the env file must never set (the same lists as install.sh).
+readonly KEY_RE='^[A-Z][A-Z0-9_]{0,63}$'
+readonly DENIED_KEY_RE='^(PATH|IFS|BASH_ENV|ENV|HOME|SHELL|LD_[A-Z0-9_]*)$'
+
+# --- output ---------------------------------------------------------------
+
+FAILS=0 WARNS=0
+report() { printf '%-7s %s\n' "$1" "$2"; }
+fail_line() {
+  report fail "$1"
+  FAILS=$((FAILS + 1))
+}
+warn_line() {
+  report warn "$1"
+  WARNS=$((WARNS + 1))
+}
+die() {
+  printf 'ubicloud-admin: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+usage_die() { die "$1" 2; }
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+
+# audit NAME: one line in the system log, never the arguments.
+audit() {
+  logger -t ubicloud-admin -p auth.notice -- "$1 by ${SUDO_USER:-root} (uid ${SUDO_UID:-0})" 2>/dev/null || true
+}
+
+WORK=""
+cleanup_work() { [[ -z $WORK ]] || rm -rf "$WORK"; }
+make_work() {
+  [[ -n $WORK ]] && return 0
+  WORK=$(mktemp -d /tmp/ubicloud-admin.XXXXXX)
+  trap cleanup_work EXIT
+}
+
+# take_lock SECONDS: the lock install.sh and every changing command take.
+take_lock() {
+  exec 9>>"$LOCK"
+  if ! flock -n 9; then
+    printf 'ubicloud-admin: waiting for %s (another install.sh or ubicloud-admin run holds it)\n' "$LOCK" >&2
+    flock -w "$1" 9 || die "another install.sh or ubicloud-admin run still holds $LOCK after $1 s"
+  fi
+}
+
+need_root() { [[ $EUID == 0 ]] || die "run ubicloud-admin as root (sudo ubicloud-admin ...)"; }
+need_release() { [[ -d $CURRENT/ && -f $ENV_FILE ]] || die "no control plane here: $CURRENT or $ENV_FILE is missing (install with scripts/byoh/install.sh)"; }
+
+# --- the KEY='value' file format (M3-b), as in install.sh -------------------
+
+declare -A KV=()
+KV_KEYS=()
+KV_LINES=()
+
+# kv_read FILE: loads FILE into KV, KV_KEYS (in file order) and KV_LINES
+# (every line, comments included). Errors name the line, never a value.
+kv_read() {
+  local file=$1 line n=0 re="^([A-Z][A-Z0-9_]{0,63})='([^']*)'$"
+  KV=() KV_KEYS=() KV_LINES=()
+  [[ -e $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    KV_LINES+=("$line")
+    [[ -z $line || $line == \#* ]] && continue
+    [[ $line =~ $re ]] || die "$file line $n is not KEY='value' (the value is not shown)"
+    local key=${BASH_REMATCH[1]} value=${BASH_REMATCH[2]}
+    [[ ! $key =~ $DENIED_KEY_RE ]] || die "$file line $n sets $key, which the env file must not set"
+    [[ $value != *\\* && $value != *$'\r'* ]] || die "$file line $n: the value of $key has a backslash or CR"
+    [[ -z ${KV[$key]+x} ]] || die "$file line $n sets $key a second time"
+    KV[$key]=$value
+    KV_KEYS+=("$key")
+  done <"$file"
+}
+
+valid_value() { [[ $1 != *"'"* && $1 != *\\* && $1 != *$'\n'* && $1 != *$'\r'* ]]; }
+
+# env_value KEY [DEFAULT]: KEY from the env file.
+env_value() {
+  kv_read "$ENV_FILE"
+  printf '%s' "${KV[$1]:-${2:-}}"
+}
+
+backup_target() {
+  kv_read "$BACKUP_CONF"
+  local t=${KV[BACKUP_TARGET]:-/var/backups/ubicloud}
+  [[ $t == /* && $t != s3://* ]] || die "BACKUP_TARGET in $BACKUP_CONF must be an absolute directory (s3:// comes with E5)"
+  printf '%s' "${t%/}"
+}
+
+# --- running code of the release ----------------------------------------------
+
+# Extra NAME=value pairs for the next as_service, after the env file.
+SERVICE_EXTRA=()
+SERVICE_HOME=$STATE
+
+# as_service USER CMD...: runs CMD in the current release as USER with
+# exactly the env file, the release env, SERVICE_EXTRA, PATH, HOME and
+# LANG=C.UTF-8, umask 0007, as the units run. The values travel in the environment,
+# never in argv, and setpriv execs CMD without a PAM session.
+as_service() {
+  local user=$1 group
+  shift
+  group=$(id -gn "$user")
+  (
+    cd "$CURRENT" || exit 1
+    local k f x
+    while IFS= read -r k; do unset "$k" 2>/dev/null || exit 1; done < <(compgen -e)
+    # Unlike the units, these commands print to a terminal: puma's and
+    # pry's output is UTF-8, which Ruby rejects under the C locale. The
+    # env file may still set LANG.
+    export LANG=C.UTF-8
+    for f in "$ENV_FILE" "$CURRENT/.release-env"; do
+      kv_read "$f"
+      for k in "${KV_KEYS[@]}"; do
+        export "$k=${KV[$k]}" 2>/dev/null || die "$f sets $k, which bash cannot export"
+      done
+    done
+    for x in "${SERVICE_EXTRA[@]}"; do export "${x?}"; done
+    export PATH=$SERVICE_PATH HOME=$SERVICE_HOME
+    umask 0007
+    exec setpriv --reuid="$user" --regid="$group" --init-groups -- "$@"
+  )
+}
+
+ruby_as() {
+  local user=$1
+  shift
+  as_service "$user" "$TOOLS/bin/ruby" "$@"
+}
+
+# --- postgres -----------------------------------------------------------------
+
+psql_value() { runuser -u postgres -- psql -X -tA -v ON_ERROR_STOP=1 "$@"; }
+psql_admin() { runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 "$@"; }
+db_exists() { [[ -n $(psql_value -d postgres -c "SELECT 1 FROM pg_database WHERE datname = '$1'") ]]; }
+
+# --- status ---------------------------------------------------------------------
+
+unit_state() { systemctl is-active "$1" 2>/dev/null || true; }
+
+cmd_status() {
+  [[ $# -eq 0 ]] || usage_die "status takes no arguments"
+  need_root
+  need_release
+  audit status
+  FAILS=0 WARNS=0
+  local u s
+  for u in ubicloud.target ubicloud-web ubicloud-respirate ubicloud-backup.timer "$PG_UNIT"; do
+    s=$(unit_state "$u")
+    if [[ $s == active ]]; then report ok "unit: $u active"; else fail_line "unit: $u $s (ubicloud-admin logs)"; fi
+  done
+  if [[ $(systemctl is-enabled ubicloud.target 2>/dev/null || true) != enabled ]]; then
+    fail_line "unit: ubicloud.target is not enabled, so nothing starts at boot (systemctl enable ubicloud.target)"
+  fi
+  if [[ $(systemctl is-enabled ubicloud-monitor 2>/dev/null || true) == enabled ]]; then
+    warn_line "unit: ubicloud-monitor is enabled; host health checks are meant to start with M9"
+  else
+    report ok "unit: ubicloud-monitor disabled (expected until M9)"
+  fi
+  [[ $(systemctl is-failed ubicloud-backup.service 2>/dev/null || true) != failed ]] ||
+    fail_line "unit: the last ubicloud-backup run failed (ubicloud-admin logs backup)"
+
+  local rel
+  rel=$(readlink "$CURRENT" 2>/dev/null || true)
+  if [[ -f $CURRENT/.ubicloud-release ]]; then
+    report ok "release: ${rel##*/} rev $(sed -n 's/^rev=//p' "$CURRENT/.ubicloud-release")"
+  else
+    fail_line "release: $CURRENT has no .ubicloud-release"
+  fi
+
+  local code
+  code=$(web_code)
+  if [[ $code =~ ^[1-5][0-9][0-9]$ ]]; then report ok "web: answers on $(web_addr) (HTTP $code)"; else fail_line "web: no answer on $(web_addr)"; fi
+
+  status_env
+  status_postgres
+  status_backups
+
+  # The settings and database checks of the release (bin/byoh-config-check).
+  local out rc=0
+  out=$(ruby_as ubicloud bin/byoh-config-check 2>&1) || rc=$?
+  printf '%s\n' "$out" | sed 's/^/  /'
+  WARNS=$((WARNS + $(grep -c '^warn' <<<"$out" || true)))
+  if ((rc)); then fail_line "config: bin/byoh-config-check reports failures (above)"; else report ok "config: bin/byoh-config-check has no fail"; fi
+
+  echo
+  if ((FAILS)); then
+    echo "status: $FAILS fail, $WARNS warn"
+    return 1
+  fi
+  echo "status: ok ($WARNS warn)"
+}
+
+# Where puma listens, as host:port for curl.
+web_addr() {
+  local port bind
+  port=$(env_value PORT 3000)
+  bind=$(env_value BIND 127.0.0.1)
+  [[ $bind == 0.0.0.0 || $bind == "::" ]] && bind=127.0.0.1
+  [[ $bind != *:* ]] || bind="[$bind]"
+  printf '%s:%s' "$bind" "$port"
+}
+
+# The HTTP status of puma's front page, or 000.
+web_code() { curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$(web_addr)/" 2>/dev/null || true; }
+
+# wait_web SECONDS: waits for puma to answer after a start.
+wait_web() {
+  local i
+  for ((i = 0; i < $1; i++)); do
+    [[ $(web_code) =~ ^[1-5][0-9][0-9]$ ]] && return 0
+    sleep 1
+  done
+  return 1
+}
+
+status_env() {
+  local mode
+  mode=$(stat -c '%U:%G %a' "$ENV_FILE")
+  if [[ $mode == "root:root 600" ]]; then report ok "env: $ENV_FILE root 0600"; else fail_line "env: $ENV_FILE is $mode, not root:root 600"; fi
+  kv_read "$ENV_FILE"
+  # M3-q: the console sets it for one session; the services never may.
+  if [[ -n ${KV[PRY_ALLOW_UNAUDITED]+x} ]]; then
+    fail_line "env: $ENV_FILE sets PRY_ALLOW_UNAUDITED, which lets bin/pry run unaudited from every service; remove it (ubicloud-admin env unset PRY_ALLOW_UNAUDITED)"
+  fi
+  [[ -n ${KV[CLOVER_COLUMN_ENCRYPTION_KEY]:-} ]] || fail_line "env: $ENV_FILE has no CLOVER_COLUMN_ENCRYPTION_KEY"
+}
+
+status_postgres() {
+  local lines supers
+  # A trust rule that can match database ubicloud lets any local user in
+  # without a password. The managed block rejects such logins first, but
+  # a trust rule also reaches superusers, and a superuser reaches ubicloud.
+  lines=$(psql_value -d postgres -c "SELECT string_agg(line_number::text, ',' ORDER BY line_number) FROM pg_hba_file_rules WHERE auth_method = 'trust' AND database && ARRAY['ubicloud', 'all', 'sameuser', 'samerole']") ||
+    { fail_line "postgres: cannot read pg_hba_file_rules"; return; }
+  if [[ -n $lines ]]; then
+    fail_line "postgres: pg_hba.conf line(s) $lines use trust for database ubicloud or all; on a control plane moved from the development bootstrap this is expected until migrate-from-dev.sh retire (docs/byoh/MIGRATE_FROM_DEV.md)"
+  else
+    report ok "postgres: no trust rule for database ubicloud"
+  fi
+  supers=$(psql_value -d postgres -c "SELECT string_agg(rolname, ',' ORDER BY rolname) FROM pg_roles WHERE rolsuper AND rolcanlogin AND rolname <> 'postgres'")
+  [[ -z $supers ]] || warn_line "postgres: role(s) $supers are superusers that can log in; a superuser can reach ubicloud"
+  local kept
+  kept=$(psql_value -d postgres -c "SELECT string_agg(datname, ' ' ORDER BY datname) FROM pg_database WHERE datname ~ '^ubicloud_(prev|failed|restore)'")
+  [[ -z $kept ]] || warn_line "postgres: database(s) $kept are left from restores and use disk; drop each once it is not needed (runuser -u postgres -- dropdb NAME)"
+}
+
+# The newest complete backup: a <timestamp> directory with a manifest.
+latest_backup() {
+  local target=$1 d
+  for d in $(find "$target" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E "$TS_RE" | sort -r); do
+    [[ -f $target/$d/manifest.json ]] && {
+      echo "$d"
+      return 0
+    }
+  done
+  return 0
+}
+
+ts_epoch() { date -u -d "$(sed -E 's/^(....)(..)(..)T(..)(..)(..)Z$/\1-\2-\3 \4:\5:\6/' <<<"$1")" +%s; }
+
+status_backups() {
+  local target last age hours
+  target=$(backup_target)
+  if [[ -s $BACKUP_RECIPIENTS ]] && grep -q '^age1' "$BACKUP_RECIPIENTS"; then
+    report ok "backup: secrets are encrypted to $(grep -c '^age1' "$BACKUP_RECIPIENTS") recipient(s) in $BACKUP_RECIPIENTS"
+  else
+    fail_line "backup: no recipient in $BACKUP_RECIPIENTS, so the secrets in $ETC (the column key) are not backed up; run install.sh with --backup-recipient age1... --update-env BACKUP_RECIPIENTS"
+  fi
+  last=$(latest_backup "$target")
+  if [[ -n $last ]]; then
+    age=$(($(date +%s) - $(ts_epoch "$last")))
+  elif [[ -e $BACKUP_CONF ]]; then
+    # No backup yet: judged by how long the install has been without one.
+    age=$(($(date +%s) - $(stat -c %Y "$BACKUP_CONF")))
+  else
+    age=0
+  fi
+  hours=$((age / 3600))
+  local what="no backup in $target for ${hours} h"
+  [[ -z $last ]] || what="the last backup ($last) is ${hours} h old"
+  if ((age > 72 * 3600)); then
+    fail_line "backup: $what (ubicloud-admin logs backup)"
+  elif ((age > 36 * 3600)); then
+    warn_line "backup: $what"
+  elif [[ -n $last ]]; then
+    report ok "backup: last $last (${hours} h ago) in $target"
+  else
+    report ok "backup: none yet in $target (the timer runs daily at 03:15; ubicloud-admin backup now)"
+  fi
+}
+
+# --- backup -------------------------------------------------------------------------
+
+cmd_backup() {
+  local sub=${1:-}
+  shift || true
+  case $sub in
+    now) backup_now "$@" ;;
+    list) backup_list "$@" ;;
+    prune) backup_prune "$@" ;;
+    *) usage_die "backup takes now, list or prune --keep N" ;;
+  esac
+}
+
+sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# The column key's fingerprint, so a restore can tell whether an env
+# file belongs to a backup without decrypting either.
+key_fingerprint() { printf 'ubicloud-column-key:%s' "$1" | sha256sum | cut -d' ' -f1; }
+
+backup_now() {
+  [[ $# -eq 0 ]] || usage_die "backup now takes no arguments"
+  need_root
+  need_release
+  audit "backup now"
+  local target ts dir partial
+  target=$(backup_target)
+  # A timer run waits for an install or restore to finish.
+  take_lock 7200
+  make_work
+  install -d -m 0700 -o root -g root "$target" "$target/secrets"
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  while [[ -e $target/$ts ]]; do
+    sleep 1
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+  done
+  dir=$target/$ts
+  partial=$target/.$ts.partial
+  rm -rf "$partial"
+  install -d -m 0700 "$partial"
+  trap 'rm -rf "$partial" "$target/secrets/.$ts.age.partial"; cleanup_work' EXIT
+
+  db_exists "$DB_NAME" || die "database $DB_NAME does not exist"
+  # pg_dump runs as postgres, so the dump holds the password-hash tables
+  # too; root writes the files.
+  runuser -u postgres -- pg_dump -Fc "$DB_NAME" >"$partial/db.dump" || die "pg_dump failed"
+  runuser -u postgres -- pg_dumpall --globals-only --no-role-passwords >"$partial/globals.sql" || die "pg_dumpall --globals-only failed"
+  tar -C "$STATE" -cf "$partial/billing-rates.tar" billing_rates.d || die "cannot archive $STATE/billing_rates.d"
+
+  local sm smp key secrets_json=null
+  sm=$(psql_value -d "$DB_NAME" -c "SELECT coalesce(json_agg(filename ORDER BY filename), '[]') FROM schema_migrations") ||
+    die "cannot read schema_migrations"
+  smp=$(psql_value -d "$DB_NAME" -c "SELECT coalesce(json_agg(filename ORDER BY filename), '[]') FROM schema_migrations_password") ||
+    die "cannot read schema_migrations_password"
+  key=$(env_value CLOVER_COLUMN_ENCRYPTION_KEY)
+  [[ -n $key ]] || die "$ENV_FILE has no CLOVER_COLUMN_ENCRYPTION_KEY"
+
+  if [[ -s $BACKUP_RECIPIENTS ]] && grep -q '^age1' "$BACKUP_RECIPIENTS"; then
+    local age_part=$target/secrets/.$ts.age.partial
+    tar -C / -cf - "${ETC#/}" | age -R "$BACKUP_RECIPIENTS" -o "$age_part" || die "encrypting $ETC with age failed"
+    chmod 0600 "$age_part"
+    secrets_json=$(jq -n --arg f "secrets/$ts.age" --arg s "$(sha_of "$age_part")" '{file: $f, sha256: $s}')
+  else
+    report warn "backup: no recipient in $BACKUP_RECIPIENTS, so $ETC (the column key) is NOT in this backup"
+  fi
+
+  local version rev
+  version=$(sed -n 's/^version=//p' "$CURRENT/.ubicloud-release")
+  rev=$(sed -n 's/^rev=//p' "$CURRENT/.ubicloud-release")
+  jq -n --argjson format 1 --arg ts "$ts" --arg host "$(hostname)" \
+    --arg version "$version" --arg rev "$rev" \
+    --argjson sm "$sm" --argjson smp "$smp" \
+    --arg dump "$(sha_of "$partial/db.dump")" --arg globals "$(sha_of "$partial/globals.sql")" \
+    --arg rates "$(sha_of "$partial/billing-rates.tar")" \
+    --arg keyfp "$(key_fingerprint "$key")" --argjson secrets "$secrets_json" \
+    '{format: $format, timestamp: $ts, host: $host, version: $version, rev: $rev,
+      schema_migrations: $sm, schema_migrations_password: $smp,
+      files: {"db.dump": $dump, "globals.sql": $globals, "billing-rates.tar": $rates},
+      column_key_sha256: $keyfp, secrets: $secrets}' >"$partial/manifest.json"
+  chmod 0600 "$partial"/*
+  [[ $secrets_json == null ]] || mv -T "$target/secrets/.$ts.age.partial" "$target/secrets/$ts.age"
+  mv -T "$partial" "$dir"
+  trap cleanup_work EXIT
+  report ok "backup: $dir ($(du -sh "$dir" | cut -f1))"
+  [[ $secrets_json == null ]] || report ok "backup: $target/secrets/$ts.age"
+}
+
+backup_list() {
+  [[ $# -eq 0 ]] || usage_die "backup list takes no arguments"
+  need_root
+  local target d m
+  target=$(backup_target)
+  [[ -d $target ]] || die "$target does not exist"
+  printf '%-18s %-8s %-10s %-12s %s\n' TIMESTAMP SIZE SECRETS VERSION MIGRATIONS
+  while IFS= read -r d; do
+    m=$target/$d/manifest.json
+    if [[ -f $m ]]; then
+      printf '%-18s %-8s %-10s %-12s %s\n' "$d" "$(du -sh "$target/$d" | cut -f1)" \
+        "$(if jq -e '.secrets' "$m" >/dev/null; then [[ -f $target/secrets/$d.age ]] && echo yes || echo missing; else echo no; fi)" \
+        "$(jq -r '.version' "$m")" "$(jq -r '"\(.schema_migrations | length)/\(.schema_migrations_password | length)"' "$m")"
+    else
+      printf '%-18s %-8s %s\n' "$d" "$(du -sh "$target/$d" | cut -f1)" "(no manifest; not a backup this command made)"
+    fi
+  done < <(find "$target" -mindepth 1 -maxdepth 1 -type d ! -name secrets ! -name '.*' -printf '%f\n' | sort)
+}
+
+backup_prune() {
+  local keep=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --keep)
+        [[ $# -ge 2 ]] || usage_die "--keep needs a number"
+        keep=$2
+        shift
+        ;;
+      *) usage_die "backup prune takes --keep N" ;;
+    esac
+    shift
+  done
+  [[ $keep =~ ^[1-9][0-9]*$ ]] || usage_die "backup prune needs --keep N, with N at least 1"
+  need_root
+  audit "backup prune"
+  local target all=() d n=0
+  target=$(backup_target)
+  take_lock 600
+  mapfile -t all < <(find "$target" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep -E "$TS_RE" | sort -r)
+  for d in "${all[@]:keep}"; do
+    rm -rf "${target:?}/$d"
+    rm -f "$target/secrets/$d.age"
+    n=$((n + 1))
+  done
+  report ok "backup: kept $((${#all[@]} - n)), removed $n in $target"
+}
+
+# --- restore --------------------------------------------------------------------------
+
+cmd_restore() {
+  local ts="" key_file="" mode=all force=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --key-file)
+        [[ $# -ge 2 && -n $2 ]] || usage_die "--key-file needs a file"
+        key_file=$2
+        shift
+        ;;
+      --env-only) [[ $mode == all ]] || usage_die "give --env-only or --db-only, not both"; mode="env" ;;
+      --db-only) [[ $mode == all ]] || usage_die "give --env-only or --db-only, not both"; mode="db" ;;
+      --force) force=1 ;;
+      -*) usage_die "unknown restore option $1" ;;
+      *)
+        [[ -z $ts ]] || usage_die "restore takes one timestamp"
+        ts=$1
+        ;;
+    esac
+    shift
+  done
+  [[ $ts =~ $TS_RE ]] || usage_die "restore needs a backup timestamp such as 20261014T031500Z (ubicloud-admin backup list)"
+  [[ $mode == db || -n $key_file ]] || usage_die "restore needs --key-file F, the age identity of a backup recipient (or --db-only)"
+  [[ -z $key_file || -f $key_file ]] || usage_die "--key-file $key_file is not a file"
+  need_root
+  [[ -d $CURRENT/ ]] || die "no release at $CURRENT (install with scripts/byoh/install.sh first)"
+  audit restore
+  local target dir
+  target=$(backup_target)
+  dir=$target/$ts
+  [[ -f $dir/manifest.json ]] || usage_die "$dir/manifest.json does not exist (ubicloud-admin backup list)"
+  take_lock 600
+  make_work
+
+  # 1. The backup is whole and this release can run it.
+  restore_check_files "$dir" "$mode" "$target"
+  restore_check_migrations "$dir/manifest.json"
+
+  # 2. The env file: from the backup, or the current one.
+  local env_src="" replace_env=0
+  if [[ $mode != db ]]; then
+    restore_decrypt "$target/secrets/$ts.age" "$key_file"
+    env_src=$WORK/secrets/${ETC#/}/env
+    [[ -f $env_src ]] || die "the secrets of $ts hold no ${ETC#/}/env"
+    kv_read "$env_src"
+    [[ -n ${KV[CLOVER_COLUMN_ENCRYPTION_KEY]:-} ]] || die "the env file of $ts has no CLOVER_COLUMN_ENCRYPTION_KEY"
+  fi
+  restore_plan_env "$dir/manifest.json" "$env_src" "$force" "$mode"
+  replace_env=$REPLACE_ENV
+
+  if [[ $mode == env ]]; then
+    restore_install_secrets "$replace_env" "$force"
+    local active
+    active=$(unit_state ubicloud.target)
+    if ((replace_env)) && [[ $active == active ]]; then
+      systemctl try-restart ubicloud.target
+      report changed "services: restarted with the restored env file"
+    fi
+    return 0
+  fi
+
+  # 3. The restored database, built beside the live one.
+  restore_build_db "$dir"
+
+  # 4. The swap: the only step that touches the live database.
+  local prev was_active
+  prev=${DB_NAME}_prev_$(date -u +%Y%m%d%H%M%S)
+  was_active=$(running_services)
+  stop_services
+  local had_live=0
+  db_exists "$DB_NAME" && had_live=1
+  if ((had_live)); then
+    rename_db "$DB_NAME" "$prev"
+  fi
+  if ! rename_db_try "${DB_NAME}_restore" "$DB_NAME"; then
+    ((had_live)) && rename_db "$prev" "$DB_NAME"
+    start_services "$was_active"
+    die "renaming ${DB_NAME}_restore failed; the live database is back as it was"
+  fi
+  ((had_live)) && report changed "database: $DB_NAME is now $prev"
+  report changed "database: ${DB_NAME}_restore is now $DB_NAME"
+
+  local env_saved=""
+  if ((replace_env)); then
+    if [[ -e $ENV_FILE ]]; then
+      env_saved=$ETC/env.before-restore-$(date -u +%Y%m%dT%H%M%SZ)
+      cp -p "$ENV_FILE" "$env_saved"
+    fi
+  fi
+  restore_install_secrets "$replace_env" "$force"
+  restore_billing_rates "$dir" "$force"
+
+  # 5. Migrations of the release on the restored data, then the services.
+  if ! ruby_as ubicloud-migrate bin/rake-task-runner migrate "" 0 >"$WORK/migrate.log" 2>&1; then
+    grep -v -i 'password' "$WORK/migrate.log" | tail -20 >&2
+    report fail "restore: migrations failed on the restored database; putting the old database back"
+    stop_services
+    local failed
+    failed=${DB_NAME}_failed_$(date -u +%Y%m%d%H%M%S)
+    rename_db "$DB_NAME" "$failed"
+    if ((had_live)); then rename_db "$prev" "$DB_NAME"; fi
+    if [[ -n $env_saved ]]; then
+      install -m 0600 -o root -g root "$env_saved" "$ENV_FILE"
+      rm -f "$env_saved"
+    fi
+    start_services "$was_active"
+    die "restore of $ts failed in its migrations; database $DB_NAME and $ENV_FILE are as before, the restored copy is $failed"
+  fi
+  report ok "restore: migrations ran ($(grep -c 'Finished applying migration' "$WORK/migrate.log" || true) applied)"
+  start_services "$was_active ubicloud.target"
+  [[ -z $env_saved ]] || report notice "restore: the env file before the restore is $env_saved (root 0600)"
+  ((had_live == 0)) || report notice "restore: the database before the restore is $prev; drop it once the restore is checked (runuser -u postgres -- dropdb $prev)"
+  report ok "restore: $ts restored"
+  wait_web 120 || report warn "restore: web does not answer after 120 s (ubicloud-admin logs web)"
+  echo
+  local rc=0
+  cmd_status || rc=$?
+  ((rc == 0)) || report warn "restore: the restore finished, but status reports failures (above)"
+  return 0
+}
+
+restore_check_files() {
+  local dir=$1 mode=$2 target=$3 m=$1/manifest.json f want
+  jq -e '.format == 1' "$m" >/dev/null 2>&1 || die "$m is not a backup manifest of this format"
+  if [[ $mode != env ]]; then
+    for f in db.dump globals.sql billing-rates.tar; do
+      want=$(jq -r --arg f "$f" '.files[$f] // empty' "$m")
+      [[ -f $dir/$f && -n $want && $(sha_of "$dir/$f") == "$want" ]] ||
+        die "$dir/$f is missing or does not match its sha256 in the manifest; nothing was changed" 2
+    done
+    runuser -u postgres -- pg_restore --list <"$dir/db.dump" >/dev/null 2>"$WORK/list.err" ||
+      die "pg_restore --list cannot read $dir/db.dump ($(head -1 "$WORK/list.err")); nothing was changed" 2
+    report ok "restore: $dir matches its manifest"
+  fi
+  if [[ $mode != db ]]; then
+    local ts=${dir##*/} s
+    s=$target/secrets/$ts.age
+    want=$(jq -r '.secrets.sha256 // empty' "$m")
+    [[ -n $want ]] || die "backup $ts holds no secrets (it was made without a recipient); use --db-only with the current env file" 2
+    [[ -f $s && $(sha_of "$s") == "$want" ]] || die "$s is missing or does not match its sha256; nothing was changed" 2
+  fi
+}
+
+# The release must know every migration of the backup: running an older
+# release on newer data is a downgrade.
+restore_check_migrations() {
+  local m=$1 f missing=()
+  while IFS= read -r f; do
+    [[ -f $CURRENT/migrate/$f ]] || missing+=("$f")
+  done < <(jq -r '.schema_migrations[]' "$m")
+  while IFS= read -r f; do
+    [[ -f $CURRENT/migrate/ph/$f ]] || missing+=("ph/$f")
+  done < <(jq -r '.schema_migrations_password[]' "$m")
+  ((${#missing[@]} == 0)) ||
+    die "the backup has ${#missing[@]} migration(s) this release lacks (${missing[*]:0:3}); restore it with the release that made it ($(jq -r '.version' "$m")); nothing was changed" 2
+}
+
+restore_decrypt() {
+  local file=$1 key=$2
+  install -d -m 0700 "$WORK/secrets"
+  age -d -i "$key" "$file" 2>"$WORK/age.err" | tar -C "$WORK/secrets" -xf - 2>>"$WORK/age.err" || {
+    sed 's/^/  /' "$WORK/age.err" >&2
+    die "cannot decrypt ${file##*/} with --key-file $key; nothing was changed" 2
+  }
+}
+
+# Decides whether the restore replaces the env file (REPLACE_ENV) and
+# refuses a column key that does not belong to the backup.
+REPLACE_ENV=0
+restore_plan_env() {
+  local m=$1 env_src=$2 force=$3 mode=$4 want cur=""
+  want=$(jq -r '.column_key_sha256' "$m")
+  if [[ -e $ENV_FILE ]]; then
+    kv_read "$ENV_FILE"
+    cur=${KV[CLOVER_COLUMN_ENCRYPTION_KEY]:-}
+  fi
+  REPLACE_ENV=0
+  if [[ $mode == db ]]; then
+    [[ -n $cur ]] || die "$ENV_FILE is missing or has no column key; --db-only keeps the env file, so restore it too (drop --db-only)" 2
+    if [[ $(key_fingerprint "$cur") != "$want" ]]; then
+      ((force)) || die "the backup was made with another CLOVER_COLUMN_ENCRYPTION_KEY than $ENV_FILE holds, so its encrypted columns would be unreadable; restore the env file too (drop --db-only), or pass --force" 2
+      report warn "restore: --force: the backup's column key differs from $ENV_FILE's"
+    fi
+    return 0
+  fi
+  kv_read "$env_src"
+  [[ $(key_fingerprint "${KV[CLOVER_COLUMN_ENCRYPTION_KEY]}") == "$want" ]] ||
+    die "the env file in the secrets of this backup does not hold the column key its manifest names; nothing was changed"
+  if [[ -z $cur ]]; then
+    REPLACE_ENV=1
+  elif [[ $(key_fingerprint "$cur") != "$want" ]]; then
+    ((force)) || die "$ENV_FILE holds another CLOVER_COLUMN_ENCRYPTION_KEY than the backup; pass --force to replace the env file with the backup's (the current one is kept as env.before-restore-*)" 2
+    REPLACE_ENV=1
+  elif ((force)); then
+    REPLACE_ENV=1
+  else
+    report ok "restore: $ENV_FILE has the backup's column key; it is kept (--force replaces it with the backup's)"
+  fi
+}
+
+# Installs the env file (when REPLACE_ENV) and the TLS files, tunnel
+# token and billing rates that are missing (all of them with --force).
+restore_install_secrets() {
+  local replace=$1 force=$2 src=$WORK/secrets/${ETC#/} f
+  if [[ -d $src ]]; then
+    install -d -m 0755 -o root -g root "$ETC"
+    if ((replace)); then
+      install -m 0600 -o root -g root "$src/env" "$ENV_FILE.new"
+      mv -f "$ENV_FILE.new" "$ENV_FILE"
+      report changed "restore: $ENV_FILE from the backup"
+    fi
+    if [[ -d $src/tls && (! -d $ETC/tls || $force == 1) ]]; then
+      rm -rf "$ETC/tls.new"
+      cp -a "$src/tls" "$ETC/tls.new"
+      rm -rf "$ETC/tls"
+      mv -T "$ETC/tls.new" "$ETC/tls"
+      report changed "restore: $ETC/tls from the backup (restart the front: systemctl restart caddy)"
+    fi
+    for f in cloudflared.token backup.conf front.conf backup-recipients; do
+      if [[ -f $src/$f && (! -e $ETC/$f || $force == 1) ]]; then
+        cp -p "$src/$f" "$ETC/$f"
+        report changed "restore: $ETC/$f from the backup"
+      fi
+    done
+  fi
+}
+
+# Restores the billing rates that are missing (all with --force).
+restore_billing_rates() {
+  local dir=$1 force=$2
+  mkdir "$WORK/rates"
+  tar -C "$WORK/rates" -xf "$dir/billing-rates.tar"
+  local f n=0
+  install -d -m 0750 -o ubicloud -g ubicloud "$STATE/billing_rates.d"
+  shopt -s nullglob
+  for f in "$WORK/rates/billing_rates.d"/*; do
+    if [[ ! -e $STATE/billing_rates.d/${f##*/} || $force == 1 ]] && ! cmp -s "$f" "$STATE/billing_rates.d/${f##*/}"; then
+      install -m 0640 -o ubicloud -g ubicloud "$f" "$STATE/billing_rates.d/${f##*/}"
+      n=$((n + 1))
+    fi
+  done
+  shopt -u nullglob
+  ((n == 0)) || report changed "restore: $n billing rate file(s) into $STATE/billing_rates.d"
+}
+
+restore_build_db() {
+  local dir=$1 r
+  for r in ubicloud ubicloud_password; do
+    [[ -n $(psql_value -d postgres -c "SELECT 1 FROM pg_roles WHERE rolname = '$r'") ]] ||
+      die "database role $r does not exist; run scripts/byoh/install.sh first"
+  done
+  if db_exists "${DB_NAME}_restore"; then
+    runuser -u postgres -- dropdb "${DB_NAME}_restore"
+    report notice "restore: dropped ${DB_NAME}_restore, left by an earlier restore that did not finish"
+  fi
+  runuser -u postgres -- createdb -O ubicloud "${DB_NAME}_restore"
+  psql_admin -d "${DB_NAME}_restore" -c 'CREATE EXTENSION IF NOT EXISTS citext' -c 'CREATE EXTENSION IF NOT EXISTS btree_gist'
+  if ! runuser -u postgres -- pg_restore --exit-on-error -d "${DB_NAME}_restore" <"$dir/db.dump" 2>"$WORK/restore.err"; then
+    head -5 "$WORK/restore.err" >&2
+    runuser -u postgres -- dropdb "${DB_NAME}_restore" || true
+    die "pg_restore into ${DB_NAME}_restore failed; the live database was not touched"
+  fi
+  psql_admin -d "${DB_NAME}_restore" -c "ALTER SCHEMA public OWNER TO ubicloud"
+  local n want
+  n=$(psql_value -d "${DB_NAME}_restore" -c 'SELECT count(*) FROM schema_migrations')
+  want=$(jq -r '.schema_migrations | length' "$dir/manifest.json")
+  [[ $n == "$want" ]] || {
+    runuser -u postgres -- dropdb "${DB_NAME}_restore" || true
+    die "the restored database has $n migrations, the manifest $want; the live database was not touched"
+  }
+  report ok "restore: built ${DB_NAME}_restore ($n migrations)"
+}
+
+# The services among SERVICES that run now.
+running_services() {
+  local u out=""
+  for u in "${SERVICES[@]}"; do
+    [[ $(unit_state "$u") != active ]] || out+=" $u"
+  done
+  [[ $(unit_state ubicloud.target) != active ]] || out+=" ubicloud.target"
+  printf '%s' "${out# }"
+}
+
+stop_services() {
+  systemctl stop ubicloud.target "${SERVICES[@]}"
+}
+
+# start_services "UNIT...": starts the units that ran before.
+start_services() {
+  local units
+  read -r -a units <<<"$1"
+  ((${#units[@]} == 0)) || systemctl start "${units[@]}"
+}
+
+# rename_db_try FROM TO: renames a database nobody is connected to; a
+# session that connects in between (a console, a stray psql) is ended.
+rename_db_try() {
+  local _
+  for _ in 1 2 3 4 5; do
+    psql_value -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$1' AND pid <> pg_backend_pid()" >/dev/null
+    psql_value -d postgres -c "ALTER DATABASE \"$1\" RENAME TO \"$2\"" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+rename_db() { rename_db_try "$1" "$2" || die "cannot rename database $1 to $2; do it by hand (sudo -u postgres psql), then start ubicloud.target"; }
+
+# --- env --------------------------------------------------------------------------------
+
+# Keys env set and env unset refuse, with the reason.
+env_refusal() {
+  case $1 in
+    PRY_ALLOW_UNAUDITED) echo "it would let bin/pry run unaudited from every service; ubicloud-admin console sets it for its own session" ;;
+    CLOVER_COLUMN_ENCRYPTION_KEY) echo "another key makes every encrypted column unreadable; restore the env file from a backup instead" ;;
+    GIT_REV) echo "the release's .release-env sets it" ;;
+    IP_FROM_HEADER) echo "it follows the TLS front; change it with install.sh --tls ... --update-env IP_FROM_HEADER" ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_env() {
+  local sub=${1:-} key="" restart=1 reveal=0
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --no-restart) restart=0 ;;
+      --reveal) reveal=1 ;;
+      -*) usage_die "unknown env option $1" ;;
+      *)
+        [[ -z $key ]] || usage_die "env $sub takes one key"
+        key=$1
+        ;;
+    esac
+    shift
+  done
+  need_root
+  need_release
+  case $sub in
+    keys)
+      [[ -z $key ]] || usage_die "env keys takes no key"
+      kv_read "$ENV_FILE"
+      printf '%s\n' "${KV_KEYS[@]}"
+      return 0
+      ;;
+    get | set | unset) ;;
+    *) usage_die "env takes set KEY, unset KEY, get KEY --reveal or keys" ;;
+  esac
+  [[ $key =~ $KEY_RE ]] || usage_die "env $sub needs a key name, such as MAIL_FROM"
+  [[ ! $key =~ $DENIED_KEY_RE ]] || usage_die "the env file must not set $key"
+  if [[ $sub == get ]]; then
+    ((reveal)) || usage_die "env get prints a value, which may be a secret; pass --reveal"
+    audit "env get --reveal"
+    kv_read "$ENV_FILE"
+    [[ -n ${KV[$key]+x} ]] || die "$ENV_FILE does not set $key"
+    printf '%s\n' "${KV[$key]}"
+    return 0
+  fi
+  local why
+  if why=$(env_refusal "$key"); then
+    [[ $sub == unset && $key == PRY_ALLOW_UNAUDITED ]] || usage_die "env $sub $key is refused: $why"
+  fi
+  local value=""
+  if [[ $sub == set ]]; then
+    value=$(read_value "$key")
+    [[ -n $value ]] || usage_die "the value is empty; use env unset $key to remove the key"
+    valid_value "$value" || usage_die "the value contains a quote, backslash, newline or CR, which $ENV_FILE cannot hold"
+  fi
+  audit "env $sub"
+  take_lock 60
+  kv_read "$ENV_FILE"
+  local out=() line found=0
+  for line in "${KV_LINES[@]}"; do
+    if [[ $line == "$key='"* ]]; then
+      found=1
+      [[ $sub == unset ]] && continue
+      out+=("$key='$value'")
+    else
+      out+=("$line")
+    fi
+  done
+  if [[ $sub == set ]]; then
+    ((found)) || out+=("$key='$value'")
+  elif ((!found)); then
+    report ok "env: $key is not set"
+    return 0
+  fi
+  install -m 0600 -o root -g root /dev/null "$ENV_FILE.new"
+  printf '%s\n' "${out[@]}" >"$ENV_FILE.new"
+  mv -f "$ENV_FILE.new" "$ENV_FILE"
+  report changed "env: $sub $key"
+  if ((restart)) && [[ $(unit_state ubicloud.target) == active ]]; then
+    systemctl try-restart ubicloud.target
+    # Back to back restarts would stop puma while it loads the app.
+    if wait_web 120; then
+      report changed "services: restarted ubicloud.target; web answers"
+    else
+      die "services: restarted ubicloud.target, but web does not answer after 120 s (ubicloud-admin logs web)"
+    fi
+  elif ((restart)); then
+    report ok "services: ubicloud.target is not running; the next start reads $ENV_FILE"
+  else
+    report notice "services: not restarted (--no-restart); they read $ENV_FILE at their next start"
+  fi
+}
+
+# read_value KEY: the value from stdin, typed without echo on a terminal.
+# One trailing newline is dropped; a NUL is refused.
+read_value() {
+  local v tmp
+  if [[ -t 0 ]]; then
+    IFS= read -r -s -p "value for $1: " v
+    echo >&2
+    printf '%s' "$v"
+    return 0
+  fi
+  make_work
+  tmp=$WORK/value
+  cat >"$tmp"
+  [[ $(wc -c <"$tmp") == "$(tr -d '\000' <"$tmp" | wc -c)" ]] || usage_die "the value contains a NUL byte"
+  v=$(
+    cat "$tmp"
+    printf x
+  )
+  v=${v%x}
+  printf '%s' "${v%$'\n'}"
+}
+
+# --- logs -------------------------------------------------------------------------------
+
+cmd_logs() {
+  local args=() units=() u
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -f | --follow) args+=(-f) ;;
+      --since | -n | --lines | --until)
+        [[ $# -ge 2 ]] || usage_die "$1 needs a value"
+        args+=("$1" "$2")
+        shift
+        ;;
+      web | respirate | monitor) units+=("ubicloud-$1.service") ;;
+      backup) units+=(ubicloud-backup.service) ;;
+      caddy) units+=(caddy.service) ;;
+      cloudflared) units+=(cloudflared.service ubicloud-cloudflared.service) ;;
+      *) usage_die "logs takes web, respirate, monitor, backup, caddy or cloudflared, and -f, --since T, --until T, -n N" ;;
+    esac
+    shift
+  done
+  need_root
+  ((${#units[@]})) || units=(ubicloud-web.service ubicloud-respirate.service ubicloud-monitor.service ubicloud-backup.service)
+  local sel=()
+  for u in "${units[@]}"; do sel+=(-u "$u"); done
+  exec journalctl --no-pager "${sel[@]}" "${args[@]}"
+}
+
+# --- account and run --------------------------------------------------------------------
+
+# Copies of the files a command names, readable by ubicloud only.
+STAGE_DIR=""
+stage_dir() {
+  if [[ -z $STAGE_DIR ]]; then
+    make_work
+    STAGE_DIR=$(mktemp -d /tmp/ubicloud-admin-files.XXXXXX)
+    chown ubicloud:ubicloud "$STAGE_DIR"
+    trap 'rm -rf "$STAGE_DIR"; cleanup_work' EXIT
+  fi
+}
+
+# stage_in FILE: copies FILE (relative to the caller's directory) for
+# ubicloud and prints the copy's path.
+stage_in() {
+  local src=$1 dest
+  [[ $src == /* ]] || src=$CALLER_PWD/$src
+  [[ -f $src && -r $src ]] || usage_die "$1 is not a readable file"
+  stage_dir
+  dest=$(mktemp "$STAGE_DIR/in.XXXXXX")
+  cat "$src" >"$dest"
+  chown ubicloud:ubicloud "$dest"
+  chmod 0400 "$dest"
+  printf '%s' "$dest"
+}
+
+# Input file options of the tools, and the output option.
+readonly IN_FILE_OPTS='^--(pool-file|ssh-key|external-map|password-file)$'
+OUT_FILE="" OUT_STAGED=""
+
+# stage_args ARGS...: sets STAGED_ARGS to ARGS with the files staged.
+stage_args() {
+  STAGED_ARGS=()
+  local a opt val
+  while [[ $# -gt 0 ]]; do
+    a=$1
+    # OptionParser takes unique prefixes: --bmc-passw is --bmc-password.
+    if [[ $a =~ ^--bmc-passw(o(r(d)?)?)?(=.*)?$ ]]; then
+      usage_die "--bmc-password would put the BMC password on a command line and store it in plain text; set it with 'ubicloud-admin env set BMC_PASS' and pass --bmc-pass-env BMC_PASS"
+    fi
+    if [[ $a == --*=* ]]; then
+      opt=${a%%=*} val=${a#*=}
+    else
+      opt=$a val=""
+    fi
+    if [[ $opt =~ $IN_FILE_OPTS || $opt == --out ]]; then
+      if [[ $a != --*=* ]]; then
+        [[ $# -ge 2 ]] || usage_die "$opt needs a file"
+        val=$2
+        shift
+      fi
+      if [[ $opt == --out ]]; then
+        [[ $val == /* ]] || val=$CALLER_PWD/$val
+        [[ -d $(dirname "$val") ]] || usage_die "--out: the directory of $val does not exist"
+        stage_dir
+        OUT_FILE=$val
+        OUT_STAGED=$STAGE_DIR/out
+        STAGED_ARGS+=(--out "$OUT_STAGED")
+      else
+        # In this shell: its EXIT trap removes the copies.
+        stage_dir
+        STAGED_ARGS+=("$opt" "$(stage_in "$val")")
+      fi
+    else
+      STAGED_ARGS+=("$a")
+    fi
+    shift
+  done
+}
+
+# Writes the staged --out file to where the caller asked, owned by the
+# caller.
+deliver_out() {
+  [[ -n $OUT_FILE && -f $OUT_STAGED ]] || return 0
+  install -m 0600 -o "${SUDO_UID:-0}" -g "${SUDO_GID:-0}" "$OUT_STAGED" "$OUT_FILE"
+}
+
+cmd_account() {
+  local sub=${1:-}
+  case $sub in
+    create | list) ;;
+    *) usage_die "account takes create or list" ;;
+  esac
+  need_root
+  need_release
+  audit "account $sub"
+  stage_args "$@"
+  # The output is the caller's: a generated password is printed there,
+  # so it is never logged or copied.
+  ruby_as ubicloud bin/byoh-account "${STAGED_ARGS[@]}"
+}
+
+cmd_run() {
+  local tool=${1:-}
+  shift || true
+  local cmd=()
+  case $tool in
+    byoh-location | byoh-pool | byoh-host | register-byoh-host | byoh-config-check | production_check)
+      cmd=("bin/$tool")
+      ;;
+    create_prod_admin_account) cmd=(bin/rake-task-runner create_prod_admin_account) ;;
+    "") usage_die "run needs a tool: byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-config-check, production_check or create_prod_admin_account" ;;
+    *) usage_die "run does not run $tool; it runs byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-config-check, production_check and create_prod_admin_account" ;;
+  esac
+  need_root
+  need_release
+  stage_args "$@"
+  audit "run $tool"
+  local rc=0
+  ruby_as ubicloud "${cmd[@]}" "${STAGED_ARGS[@]}" || rc=$?
+  ((rc)) || deliver_out
+  return "$rc"
+}
+
+# --- console ----------------------------------------------------------------------------
+
+cmd_console() {
+  local code="" have_code=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -e)
+        [[ $# -ge 2 ]] || usage_die "-e needs code"
+        code=$2
+        have_code=1
+        shift
+        ;;
+      *) usage_die "console takes only -e CODE" ;;
+    esac
+    shift
+  done
+  need_root
+  need_release
+  local label=console
+  ((have_code == 0)) || label+=" -e"
+  audit "$label"
+  # A throwaway HOME, so pry's history (which may hold secrets) never
+  # lands in the state directory the services can read.
+  make_work
+  SERVICE_HOME=$(mktemp -d /tmp/ubicloud-console.XXXXXX)
+  chown ubicloud:ubicloud "$SERVICE_HOME"
+  trap 'rm -rf "$SERVICE_HOME"; cleanup_work' EXIT
+  SERVICE_EXTRA=(PRY_ALLOW_UNAUDITED=true "SUDO_USER=${SUDO_USER:-root}")
+  if ((have_code)); then
+    printf 'ubicloud-admin: this console session is NOT audited (a system log line records who ran it)\n' >&2
+    # The code travels in the environment, never on a command line.
+    SERVICE_EXTRA+=("UBICLOUD_CONSOLE_CODE=$code")
+    ruby_as ubicloud --enable-frozen-string-literal -e 'code = ENV.delete("UBICLOUD_CONSOLE_CODE"); REPL = true; require "./loader"; eval(code, TOPLEVEL_BINDING, "-e")'
+  else
+    ruby_as ubicloud bin/pry
+  fi
+}
+
+# --- main -------------------------------------------------------------------------------
+
+main() {
+  CALLER_PWD=$PWD
+  local command=${1:-}
+  shift || true
+  # run and account pass --help to the tool.
+  if [[ $command != run && $command != account ]]; then
+    local a
+    for a in "$@"; do
+      if [[ $a == -h || $a == --help ]]; then
+        usage
+        return 0
+      fi
+    done
+  fi
+  case $command in
+    status) cmd_status "$@" ;;
+    backup) cmd_backup "$@" ;;
+    restore) cmd_restore "$@" ;;
+    env) cmd_env "$@" ;;
+    logs) cmd_logs "$@" ;;
+    account) cmd_account "$@" ;;
+    run) cmd_run "$@" ;;
+    console) cmd_console "$@" ;;
+    -h | --help | help) usage ;;
+    "")
+      usage >&2
+      exit 2
+      ;;
+    *) usage_die "unknown command $command (see --help)" ;;
+  esac
+}
+
+main "$@"

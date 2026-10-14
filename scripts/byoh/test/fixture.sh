@@ -4,6 +4,7 @@
 # lays out the control plane itself.
 #
 #   fixture.sh units            install the units from /art/packaging/systemd
+#                               and ubicloud-admin from /art/packaging/bin
 #                               (the working tree's, over the release's)
 #   fixture.sh account EMAIL    create a verified account (password on stdin)
 #   fixture.sh as-service CMD…  run CMD in the release as ubicloud, with the
@@ -32,6 +33,7 @@ stage_units() {
     fi
   done
   if ((changed)); then systemctl daemon-reload; fi
+  install -m 0755 /art/packaging/bin/ubicloud-admin /usr/local/bin/ubicloud-admin
 }
 
 # Runs a command in the release as USER with exactly the environment the

@@ -95,7 +95,7 @@ src_tarball() {
 stage_art() {
   rm -rf "$ART/packaging"
   mkdir -p "$ART/packaging"
-  cp -R "$WT/packaging/systemd" "$ART/packaging/"
+  cp -R "$WT/packaging/systemd" "$WT/packaging/bin" "$ART/packaging/"
   cp "$HARNESS_DIR/fixture.sh" "$ART/fixture.sh"
   cp "$WT/scripts/byoh/install.sh" "$ART/install.sh"
   cp "$WT/mise.toml" "$ART/mise.toml"
