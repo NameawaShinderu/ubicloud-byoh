@@ -19,11 +19,13 @@ Pool commands are described in [POOL_OPERATIONS.md](POOL_OPERATIONS.md).
 
 BYOH locations are billed from an overlay directory of rate files, written by `bin/byoh-location rates` and `create --rates-from`. The shipped `config/billing_rates/*.yml` is never edited. The name is exactly `BILLING_RATES_EXTRA_DIR`; there is no `CLOVER_` prefix.
 
-Set the variable in `.env.rb`, so that **web, respirate and monitor** all load it. `bootstrap-dev-ctrl-plane.sh` writes it into a new `.env.rb`; add it by hand to an older one. On a packaged control plane (`scripts/byoh/install.sh`) it is in `/etc/ubicloud/env`, and G1 reads it there with `ubicloud-admin env get BILLING_RATES_EXTRA_DIR --reveal`, so run the gate as root or with passwordless sudo. A directory in the operator's home needs no sudo (the live control plane uses `/home/ubuntu/ubicloud-billing-rates.d`):
+Set the variable in `.env.rb`, so that **web, respirate and monitor** all load it. `bootstrap-dev-ctrl-plane.sh` writes it into a new `.env.rb`; add it by hand to an older one. On the development layout, a directory in the operator's home needs no sudo (the live control plane uses `/home/ubuntu/ubicloud-billing-rates.d`):
 
 ```ruby
 ENV["BILLING_RATES_EXTRA_DIR"] ||= "/home/ubuntu/ubicloud-billing-rates.d"
 ```
+
+On a packaged control plane (`scripts/byoh/install.sh`) the variable is in `/etc/ubicloud/env` and defaults to `/var/lib/ubicloud/billing_rates.d`. The services run as user `ubicloud` with `ProtectHome=yes`, so they cannot see anything under `/home`, `/root` or `/run/user`: never point the variable at the operator's home there, and move the files when you migrate a development control plane. G1 reads the value with `ubicloud-admin env get BILLING_RATES_EXTRA_DIR --reveal`, fails a path that resolves under those three, and checks that user `ubicloud` can read and write the directory, so run the gate as root or with passwordless sudo.
 
 - A process started without the variable cannot resolve a BYOH rate id. VM create fails, and invoices cannot be built.
 - Rates are read once at process start. Restart all three processes after every `create --rates-from` or `rates` command.
@@ -33,7 +35,7 @@ ENV["BILLING_RATES_EXTRA_DIR"] ||= "/home/ubuntu/ubicloud-billing-rates.d"
 
 The gate requires `puma` and `respirate`. It requires `bin/monitor` only with `GATE_EXPECT_MONITOR=1`; otherwise it reports whether the monitor runs as INFO. `bootstrap-dev-ctrl-plane.sh` starts the monitor only with `UBI_START_MONITOR=1`.
 
-The gate finds out how the control plane runs (`GATE_SERVICES`, default `auto`). With `/etc/ubicloud/env` present, or `ubicloud.target` known to systemd, it is `systemd`: G1 checks the units `ubicloud-web`, `ubicloud-respirate` and `ubicloud-monitor`, and G7 reads the respirate log from the journal of `ubicloud-respirate.service` (`GATE_RESPIRATE_LOG=journal`), which needs root or group `adm` or `systemd-journal` (otherwise the gate tries `sudo -n`, and fails the step if it cannot read the log). Otherwise it is `tmux`: G1 looks for the processes and G7 reads `/tmp/respirate.log`. The database steps run `bundle exec` from the current directory, which on a packaged control plane only reaches the database as user `ubicloud` with the env file; that combination is UNVERIFIED.
+The gate finds out how the control plane runs (`GATE_SERVICES`, default `auto`). When `ubicloud.target` is active or enabled, it is `systemd`: G1 checks the units `ubicloud-web`, `ubicloud-respirate` and `ubicloud-monitor`, and G7 reads the respirate log from the journal of `ubicloud-respirate.service` (`GATE_RESPIRATE_LOG=journal`), which needs root or group `adm` or `systemd-journal` (otherwise the gate tries `sudo -n`, and fails the step if it cannot read the log). Otherwise it is `tmux`: G1 looks for the processes and G7 reads `/tmp/respirate.log`. Installed units that are neither active nor enabled count as `tmux`, because that is the state while a development control plane is migrated (after `install.sh --no-start`, before the cutover) and after a rollback to it; `/etc/ubicloud/env` alone does not matter. `bootstrap-dev-ctrl-plane.sh` judges the target the same way. Set `GATE_SERVICES=tmux` or `systemd` to override the guess. The database steps run `bundle exec` from the current directory, which on a packaged control plane only reaches the database as user `ubicloud` with the env file; that combination is UNVERIFIED.
 
 Upstream health checks misjudge hosts without `wwn-`/`nvme-eui` disk links and SMART, which today means AWS EBS and Proxmox virtio disks, and may mark them `unavailable` ([PLATFORMS.md](PLATFORMS.md) F5). On such hosts, leave the monitor off. If you start it, watch `allocation_state`.
 

@@ -46,8 +46,13 @@
 #   GATE_SMTP_PROBE      an internet host that accepts TCP 25 (G9b)
 #   GATE_SERVICES        how the control plane runs: tmux (the development
 #                        bootstrap) or systemd (scripts/byoh/install.sh).
-#                        Default auto: systemd when /etc/ubicloud/env exists
-#                        or systemd knows ubicloud.target, else tmux
+#                        Default auto: systemd when ubicloud.target is
+#                        active or enabled, else tmux. Installed but
+#                        disabled units (install.sh --no-start before a
+#                        migration's cutover, or after its rollback) leave
+#                        the tmux control plane in charge, so they count
+#                        as tmux; bootstrap-dev-ctrl-plane.sh judges the
+#                        target the same way
 #   GATE_RESPIRATE_LOG   respirate log file, or "journal" for the journal of
 #                        ubicloud-respirate.service (default: journal under
 #                        systemd, else /tmp/respirate.log). Reading the
@@ -61,7 +66,8 @@ GATE_RATES_FROM=${GATE_RATES_FROM:-hetzner-fsn1}
 GATE_HOST_KEY=${GATE_HOST_KEY:-$HOME/.ssh/byoh_data}
 GATE_SERVICES=${GATE_SERVICES:-auto}
 if [[ $GATE_SERVICES == auto ]]; then
-  if [[ -e /etc/ubicloud/env ]] || systemctl cat ubicloud.target >/dev/null 2>&1; then
+  if [[ $(systemctl is-active ubicloud.target 2>/dev/null || true) == active ||
+    $(systemctl is-enabled ubicloud.target 2>/dev/null || true) == enabled ]]; then
     GATE_SERVICES=systemd
   else
     GATE_SERVICES=tmux
@@ -155,6 +161,20 @@ respirate_log() {
   fi
 }
 
+# probe_verdict VM: prints gave-up, ok or missing for the netns probe of
+# VM in the respirate log (gave-up wins over ok); returns 1 if the log
+# cannot be read. One awk reads the whole log without a pipe: grep -q
+# at the end of a pipe stops reading at the first match, and pipefail
+# counts the writer's SIGPIPE as a miss.
+probe_verdict() {
+  local log
+  log=$(respirate_log) || return 1
+  awk -v vm="$1" '
+    index($0, vm) && index($0, "byoh netns probe gave up") { gave_up = 1 }
+    index($0, vm) && index($0, "byoh netns probe ok") { ok = 1 }
+    END { print gave_up ? "gave-up" : ok ? "ok" : "missing" }' <<<"$log"
+}
+
 respirate_log_name() {
   if [[ $GATE_RESPIRATE_LOG == journal ]]; then echo "the journal of ubicloud-respirate.service"; else echo "$GATE_RESPIRATE_LOG"; fi
 }
@@ -219,10 +239,31 @@ g1() {
     fail "/etc/ubicloud/env does not set BILLING_RATES_EXTRA_DIR, or ubicloud-admin env get failed (run the gate as root or with sudo -n)"
   elif [[ -z $dir ]]; then
     fail "/etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR empty"
-  elif as_root test -d "$dir"; then
-    pass "/etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to $dir, a directory"
   else
-    fail "/etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to $dir, which is not a directory"
+    billing_dir_verdict "$dir"
+  fi
+}
+
+# billing_dir_verdict DIR: whether the services, which run as user
+# ubicloud with ProtectHome=yes, can use DIR. ProtectHome hides /home,
+# /root and /run/user from them, even when root or ubicloud can see a
+# directory there, so a path that resolves under them fails first.
+billing_dir_verdict() {
+  local dir=$1 real hidden=""
+  real=$(as_root realpath -m -- "$dir" 2>/dev/null) || real=$dir
+  case $real/ in
+    /home/*) hidden=/home ;;
+    /root/*) hidden=/root ;;
+    /run/user/*) hidden=/run/user ;;
+  esac
+  if [[ -n $hidden ]]; then
+    fail "/etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to $dir, under $hidden, which ProtectHome=yes hides from the ubicloud services; use /var/lib/ubicloud/billing_rates.d"
+    return 0
+  fi
+  if as_root runuser -u ubicloud -- test -d "$dir" -a -r "$dir" -a -w "$dir" -a -x "$dir"; then
+    pass "/etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to $dir, a directory user ubicloud can read and write"
+  else
+    fail "/etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to $dir, which is not a directory user ubicloud can read and write"
   fi
 }
 
@@ -317,17 +358,15 @@ g7() {
   echo "== G7 VM-B (no IPv4)"
   need GATE_VM_B GATE_VM_KEY GATE_MAIN_IP
   gate_checks vm --vm "$GATE_VM_B" --expect none
-  # grep -q would stop reading early, and pipefail would count the
-  # first grep's SIGPIPE as a miss.
-  local log
-  if ! log=$(respirate_log); then
+  local verdict
+  if ! verdict=$(probe_verdict "$GATE_VM_B"); then
     fail "cannot read $(respirate_log_name)"
-  elif grep -F "byoh netns probe gave up" <<<"$log" | grep -F "$GATE_VM_B" >/dev/null; then
-    fail "the netns probe gave up on $GATE_VM_B ($(respirate_log_name))"
-  elif grep -F "byoh netns probe ok" <<<"$log" | grep -F "$GATE_VM_B" >/dev/null; then
-    pass "$GATE_VM_B was provisioned through the netns probe"
   else
-    fail "no 'byoh netns probe ok' line for $GATE_VM_B in $(respirate_log_name)"
+    case $verdict in
+      gave-up) fail "the netns probe gave up on $GATE_VM_B ($(respirate_log_name))" ;;
+      ok) pass "$GATE_VM_B was provisioned through the netns probe" ;;
+      *) fail "no 'byoh netns probe ok' line for $GATE_VM_B in $(respirate_log_name)" ;;
+    esac
   fi
   egress "$GATE_VM_B"
   info "check that the UI overview says outbound IPv4 goes through the shared NAT"

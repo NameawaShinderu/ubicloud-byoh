@@ -2258,10 +2258,10 @@ sc_gate_journal() {
   out=$(dx gatej bash -c 'cd / && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
   { [[ $rc == 1 ]] && grep -q '^FAIL /etc/ubicloud/env does not set BILLING_RATES_EXTRA_DIR' <<<"$out"; } ||
     fail "gate-journal: g1 without the key gave $rc: $out"
-  say "gate-journal: g1 detects systemd, judges the units, reads BILLING_RATES_EXTRA_DIR through ubicloud-admin, and fails without the key or without root"
+  say "gate-journal: g1 detects systemd, judges the units, reads BILLING_RATES_EXTRA_DIR through ubicloud-admin, fails a directory under /home (also through a symlink) or one user ubicloud cannot write, and fails without the key or without root"
 
   # respirate_log, as m2-gate defines it, against the journal.
-  fns=$(sed -n '/^GATE_SERVICES=/,/^esac/p; /^as_root()/,/^}/p; /^respirate_log()/,/^}/p' "$WT/scripts/byoh/verify/m2-gate.sh")
+  fns=$(sed -n '/^GATE_SERVICES=/,/^esac/p; /^as_root()/,/^}/p; /^respirate_log()/,/^}/p; /^probe_verdict()/,/^}/p' "$WT/scripts/byoh/verify/m2-gate.sh")
   first=$(dx gatej bash -c 'journalctl -q -u ubicloud-respirate.service --no-pager -o cat | head -1')
   [[ -n $first ]] || fail "gate-journal: the respirate journal is empty"
   dx gatej useradd -M -s /bin/bash gatenoadm 2>/dev/null || true
@@ -2291,6 +2291,23 @@ sc_reboot() {
   say "reboot: web answers ${t}s after boot"
   poke_strand reboot
   t=$(wait_for 150 strand_ran reboot) || fail "reboot: no strand ran after boot"
+  # The services cannot use a directory that root can: under /home
+  # (ProtectHome=yes), also through a symlink, or one user ubicloud
+  # cannot write.
+  dx gatej bash -c 'install -d -o ubicloud -g ubicloud /home/ubuntu/rates &&
+    ln -sfn /home/ubuntu/rates /var/lib/ubicloud/rates-link && install -d -m 0700 /srv/rates-root'
+  for who in /home/ubuntu/rates:'under /home, which ProtectHome=yes hides' \
+    /var/lib/ubicloud/rates-link:'under /home, which ProtectHome=yes hides' \
+    /srv/rates-root:'which is not a directory user ubicloud can read and write'; do
+    printf '%s' "${who%%:*}" | dx gatej ubicloud-admin env set BILLING_RATES_EXTRA_DIR --no-restart >/dev/null ||
+      fail "gate-journal: env set BILLING_RATES_EXTRA_DIR ${who%%:*}"
+    rc=0
+    out=$(dx gatej bash -c 'cd / && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
+    { [[ $rc == 1 ]] && grep -qF "FAIL /etc/ubicloud/env sets BILLING_RATES_EXTRA_DIR to ${who%%:*}, " <<<"$out" &&
+      grep -qF "${who#*:}" <<<"$out"; } ||
+      fail "gate-journal: g1 with BILLING_RATES_EXTRA_DIR=${who%%:*} gave $rc: $out"
+  done
+  printf '%s' /var/lib/ubicloud/billing_rates.d | dx gatej ubicloud-admin env set BILLING_RATES_EXTRA_DIR --no-restart >/dev/null
   say "reboot: strand ran ${t}s after poke"
   assert_active reboot
   [[ $(dx reboot systemctl is-active postgresql@16-main) == active ]] || fail "reboot: postgres down"
@@ -2316,3 +2333,54 @@ for arg in "$@"; do
   esac
 done
 say "logs: $LOGS"
+
+  # probe_verdict, which g7 judges VM-B by: on the journal, which has no
+  # probe line, and on a file whose matching line comes first and is
+  # followed by far more output than a pipe buffer holds.
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  out=$(dx gatej bash -c "set -euo pipefail; cd /; $fns"$'\n''probe_verdict vmnotthere')
+  [[ $out == missing ]] || fail "gate-journal: probe_verdict on the journal gave $out"
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  dx gatej bash -c 'f=/tmp/probe.log; {
+      echo "x byoh netns probe ok {\"vm_ubid\":\"vmfirst\"}"
+      for i in $(seq 1 30000); do echo "x byoh netns probe ok {\"vm_ubid\":\"vmother$i\"}"; done
+      echo "x byoh netns probe gave up {\"vm_ubid\":\"vmbad\"}"
+      echo "x byoh netns probe ok {\"vm_ubid\":\"vmbad\"}"
+      echo "x some other line {\"vm_ubid\":\"vmquiet\"}"
+    } >$f'
+  for who in vmfirst:ok vmbad:gave-up vmquiet:missing; do
+    rc=0
+    # shellcheck disable=SC2016 # expanded by the container's bash
+    out=$(dx gatej bash -c "set -euo pipefail; cd /; GATE_SERVICES=tmux GATE_RESPIRATE_LOG=/tmp/probe.log; $fns"$'\n'"probe_verdict ${who%%:*}") || rc=$?
+    [[ $rc == 0 && $out == "${who#*:}" ]] || fail "gate-journal: probe_verdict ${who%%:*} gave $rc: $out"
+  done
+  rc=0
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  out=$(dx gatej bash -c "set -euo pipefail; cd /; GATE_SERVICES=tmux GATE_RESPIRATE_LOG=/tmp/no-such.log; $fns"$'\n''probe_verdict vmfirst') || rc=$?
+  [[ $rc == 1 && -z $out ]] || fail "gate-journal: probe_verdict on a missing log gave $rc: $out"
+  say "gate-journal: probe_verdict finds ok, gave-up (which wins) and missing in a 30000-line log, reads the journal, and returns 1 on a missing log"
+
+  # Installed but neither active nor enabled (install.sh --no-start
+  # before a migration's cutover, or after its rollback) is tmux mode:
+  # the development processes and .env.rb are judged. Enabled is
+  # systemd again, even while stopped.
+  dx gatej systemctl disable --now -q ubicloud.target
+  dx gatej bash -c 'install -d /root/devcp && echo "ENV[\"BILLING_RATES_EXTRA_DIR\"] ||= \"/root/rates\"" >/root/devcp/.env.rb'
+  docker exec -d ubi-m3-gatej bash -c 'exec -a puma sleep 600'
+  docker exec -d ubi-m3-gatej bash -c 'exec -a bin/respirate sleep 600'
+  wait_for 10 dx gatej pgrep -f bin/respirate >/dev/null || fail "gate-journal: the stand-in processes did not start"
+  rc=0
+  out=$(dx gatej bash -c 'cd /root/devcp && bash /art/m2-gate.sh g1' 2>&1) || rc=$?
+  printf '%s\n' "$out" >"$LOGS/gatej-disabled.log"
+  { [[ $rc == 0 ]] && grep -q '^== G1 .*(tmux)' <<<"$out" && grep -q '^PASS puma is running' <<<"$out" &&
+    grep -q '^PASS bin/respirate is running' <<<"$out" && grep -q '^PASS .env.rb sets BILLING_RATES_EXTRA_DIR' <<<"$out"; } ||
+    fail "gate-journal: g1 with disabled units and the tmux services gave $rc, see $LOGS/gatej-disabled.log"
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  out=$(dx gatej bash -c "cd /; $fns"$'\n''echo "$GATE_SERVICES $GATE_RESPIRATE_LOG"')
+  [[ $out == "tmux /tmp/respirate.log" ]] || fail "gate-journal: disabled units give $out"
+  dx gatej systemctl enable -q ubicloud.target
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  out=$(dx gatej bash -c "cd /; $fns"$'\n''echo "$GATE_SERVICES $GATE_RESPIRATE_LOG"')
+  [[ $out == "systemd journal" ]] || fail "gate-journal: an enabled, stopped target gives $out"
+  dx gatej pkill -f '^(puma|bin/respirate) 600$' || true
+  say "gate-journal: with the units installed but disabled the gate judges the tmux processes and .env.rb, and reads /tmp/respirate.log; enabled, it is systemd again"
