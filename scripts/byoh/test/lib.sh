@@ -31,6 +31,9 @@ start_sys() {
     --tmpfs /run --tmpfs /run/lock -v "$ART:/art:ro" "$image" /sbin/init >/dev/null
   echo "$name" >>"$STATE/created"
   wait_booted "$1"
+  # The login check relies on curl sending Secure cookies to localhost
+  # over http, which depends on the curl version.
+  say "$1: $(docker exec "$name" systemctl --version | head -1); $(docker exec "$name" curl --version | head -1)"
 }
 
 wait_booted() {

@@ -281,13 +281,16 @@ sc_smoke() {
   sleep 10
   [[ $(dx smoke systemctl is-active ubicloud-monitor) == active ]] || fail "monitor did not stay up"
   [[ $(dx smoke systemctl show -p NRestarts --value ubicloud-monitor) == 0 ]] || fail "monitor restarted"
+  local u st pid
+  for u in ubicloud-web ubicloud-respirate ubicloud-monitor; do
+    pid=$(main_pid smoke "$u")
+    st=$(dx smoke cat "/proc/$pid/status")
+    [[ $(grep '^CapEff:' <<<"$st") == *0000000000000000 ]] || fail "$u has capabilities"
+    [[ $(grep '^CapBnd:' <<<"$st") == *0000000000000000 ]] || fail "$u has a capability bounding set"
+    [[ $(grep '^NoNewPrivs:' <<<"$st") == *1 ]] || fail "$u runs without NoNewPrivs"
+  done
+  say "smoke: web, respirate and monitor run with no capabilities and NoNewPrivs"
   dx smoke systemctl stop ubicloud-monitor
-  # shellcheck disable=SC2016 # expanded by the inner bash
-  out=$(dx smoke bash -c 'grep CapEff /proc/$(systemctl show -p MainPID --value ubicloud-web)/status')
-  [[ $out == *0000000000000000 ]] || fail "web has capabilities: $out"
-  # shellcheck disable=SC2016 # expanded by the inner bash
-  out=$(dx smoke bash -c 'cat /proc/$(systemctl show -p MainPID --value ubicloud-respirate)/status | grep NoNewPrivs')
-  [[ $out == *1 ]] || fail "respirate without NoNewPrivs: $out"
 
   # Without BIND and PORT in the env file, the unit's defaults keep puma
   # on loopback (puma_config.rb alone would bind 0.0.0.0).
