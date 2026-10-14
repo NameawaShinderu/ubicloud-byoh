@@ -196,14 +196,14 @@ Second line of defence, since a092f1b8b: if a pool address is ever local on the 
 
 ### 3.4 Control plane
 
-Follow [SETUP.md §4](../SETUP.md). On AWS:
+Follow [SETUP.md §4](../SETUP.md). The commands below use the development bootstrap, which the live environment runs. For the packaged layout, run `scripts/byoh/install.sh` instead ([INSTALL.md](../INSTALL.md)): `--tls tunnel` with a Cloudflare tunnel, or `--tls acme` with ports 80 and 443 open in the security group (`web_ui_cidr` covers 443 only, so add 80 for ACME; UNVERIFIED). On AWS:
 
 ```bash
 scp -i .generated/<ws>/byoh_ssh_key .generated/<ws>/pools.yaml .generated/<ws>/byoh_ssh_key ubuntu@<ctrl_public_ip>:
 ssh -i .generated/<ws>/byoh_ssh_key ubuntu@<ctrl_public_ip>
 git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
 export UBI_BASE_URL=http://<ctrl_public_ip>:3000     # before the bootstrap: it writes BASE_URL only into a new .env.rb
-bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
 export PATH=$HOME/.local/bin:$HOME/.local/share/mise/installs/ruby/4.0.7/bin:$PATH
 cd ~/ubicloud
 ```
@@ -237,7 +237,7 @@ bundle exec bin/byoh-location create \
   --rates-from hetzner-fsn1
 ```
 
-- **The billing-rate directory must match.** The terraform output also prints `sudo install -d ... /etc/ubicloud/billing_rates.d`, `export BILLING_RATES_EXTRA_DIR=/etc/ubicloud/billing_rates.d`, and a comment that tells you to add `ENV["BILLING_RATES_EXTRA_DIR"] ||= "/etc/ubicloud/billing_rates.d"` to `.env.rb`. A control plane bootstrapped by `bootstrap-ctrl-plane.sh` already sets `ENV["BILLING_RATES_EXTRA_DIR"] ||= "/home/ubuntu/ubicloud-billing-rates.d"` (the expanded `$HOME/ubicloud-billing-rates.d`) in `.env.rb`, and the services read that directory. On such a control plane, **skip those two lines and ignore that comment**. Otherwise the rates are written where `puma` and `respirate` never look. `bin/byoh-location show` prints the `Rate file` it uses. The live environment uses `/home/ubuntu/ubicloud-billing-rates.d`.
+- **The billing-rate directory must match.** The terraform output also prints `sudo install -d ... /etc/ubicloud/billing_rates.d`, `export BILLING_RATES_EXTRA_DIR=/etc/ubicloud/billing_rates.d`, and a comment that tells you to add `ENV["BILLING_RATES_EXTRA_DIR"] ||= "/etc/ubicloud/billing_rates.d"` to `.env.rb`. A packaged control plane (`install.sh`) sets `BILLING_RATES_EXTRA_DIR=/var/lib/ubicloud/billing_rates.d` in `/etc/ubicloud/env`; skip those lines there too. A control plane bootstrapped by `bootstrap-dev-ctrl-plane.sh` (formerly `bootstrap-ctrl-plane.sh`) already sets `ENV["BILLING_RATES_EXTRA_DIR"] ||= "/home/ubuntu/ubicloud-billing-rates.d"` (the expanded `$HOME/ubicloud-billing-rates.d`) in `.env.rb`, and the services read that directory. On such a control plane, **skip those two lines and ignore that comment**. Otherwise the rates are written where `puma` and `respirate` never look. `bin/byoh-location show` prints the `Rate file` it uses. The live environment uses `/home/ubuntu/ubicloud-billing-rates.d`.
 - With `operator_ssh_cidr = 0.0.0.0/0`, the output warns and leaves the operator out of `--mgmt-allow`. VMs behind the host NAT are denied every `mgmt_allow` network, so a world-open CIDR there would cut VMs off from the internet.
 - `--ula48` is random by default. Pass one only to fit an existing host's `net6`, as the live window did (`--ula48 fd1b:3821:6123::/48`).
 
@@ -245,7 +245,7 @@ Then restart the services so they load the rates, check the location, and grant 
 
 ```bash
 tmux kill-session -t puma; tmux kill-session -t respirate
-bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh     # packaged: sudo systemctl restart ubicloud.target
 bundle exec bin/byoh-location show --location byoh-aws-mysite
 bundle exec bin/byoh-location grant --location byoh-aws-mysite --project pj...
 ```

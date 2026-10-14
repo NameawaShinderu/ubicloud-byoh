@@ -28,7 +28,8 @@ Anything marked UNVERIFIED was never executed.
 | `docs/byoh/VERIFY.md` | M2 canary gate G0–G17 (`scripts/byoh/verify/m2-gate.sh`), live window L0–L4, rollback R1–R3, backup checklist |
 | `docs/byoh/POOL_OPERATIONS.md` | pools.yaml v2, `bin/byoh-pool`, billing `resource_name` rule, location egress keys |
 | `docs/byoh/platforms/` | Operator guides per platform (AWS, rented bare metal, own hardware/colo, Proxmox and other hypervisors, GCP/Azure, other clouds/VPS); `README.md` has the chooser table, the common 6-step flow and which branch carries which fix. Only AWS is tested |
-| `docs/byoh/TROUBLESHOOTING.md` | One Symptom/Cause/Fix catalogue by phase (install, bring-up labels, allocation, VM networking, DNS, billing, upgrades, monitor/BMC), with platform pointers |
+| `docs/byoh/TROUBLESHOOTING.md` | One Symptom/Cause/Fix catalogue by phase (install, bring-up labels, allocation, VM networking, DNS, billing, upgrades, monitor/BMC), with platform pointers; covers both control-plane layouts |
+| `docs/byoh/INSTALL.md`, `OPERATIONS.md`, `MIGRATE_FROM_DEV.md` | M3: the packaged control plane (`install.sh` flags, env reference, TLS fronts, production differences), day-2 operation (`ubicloud-admin`, backups, restore, release switch, the 2027-01-01 partition deadline), and the live move from tmux/`clover_test` |
 
 Product direction from the user:
 - production-grade
@@ -49,6 +50,7 @@ Product direction from the user:
 | `origin/main` | fad16215c (committed 2026-10-09) | fetched 2026-10-11 |
 
 - The fork has **no `main` branch**.
+- `m3-packaging` (worktree `.claude/worktrees/m3`, from `m2-network` fc693b1e0) carries M3, the packaged control plane; not pushed or merged yet.
 - The GitHub fork is the source of truth. Local `byoh-driver` tracks `byoh-fork/byoh-driver`.
 - Ask before pushing.
 - Authors:
@@ -113,7 +115,12 @@ Product direction from the user:
 | `.gitignore` | M | `/backups/` |
 | `spec/lib/hosting/{generic_apis,redfish_client}_spec.rb`, `spec/lib/byoh_registration_spec.rb`, `spec/lib/byoh_registration_end_to_end_spec.rb` | A | BYOH specs; every BYOH file is at 100% line and branch coverage. |
 | `spec/prog/vm/host_nexus_spec.rb` | M | Adds a "generic (BYOH) provider" block (+10 `it` blocks, 81 in total). |
-| `scripts/byoh/bootstrap-ctrl-plane.sh`, `bootstrap-data-plane.sh`, `README.md` | A | Platform-neutral ops tooling. `providers/aws-routed-network-setup.sh` is retired and broken. |
+| `scripts/byoh/bootstrap-dev-ctrl-plane.sh` (renamed in M3; `bootstrap-ctrl-plane.sh` is now a shim that runs it), `bootstrap-data-plane.sh`, `README.md` | A | Platform-neutral ops tooling; the control-plane bootstrap is development/labs only. `providers/aws-routed-network-setup.sh` is retired and broken. |
+| `scripts/byoh/install.sh`, `packaging/{systemd,caddy,cloudflared,bin}/*` | A (M3) | Packaged control plane: root-owned releases in `/opt/ubicloud`, units as user `ubicloud`, DB `ubicloud` with peer auth, `/etc/ubicloud/env`, TLS front, `ubicloud-admin` (bash). `docs/byoh/INSTALL.md`, `OPERATIONS.md` |
+| `scripts/byoh/migrate-from-dev.sh`, `scripts/byoh/migrate-*.sql` | A (M3) | Phased move of a tmux/`clover_test` control plane (preflight, install, copy-db, start, flip-production, rollback, retire). `docs/byoh/MIGRATE_FROM_DEV.md` |
+| `lib/byoh_{account_cli,config_check,smtp_url}.rb`, `bin/byoh-{account,config-check,smtp-url}` | A (M3) | Verified accounts without mail; settings, role-isolation and partition-runway checks; SMTP URL to env lines. 100% covered |
+| `config.rb`, `puma_config.rb`, `bin/restarter`, `bin/pry`, `prog/download_boot_image.rb`, `prog/deleted_record_archiver.rb` | M (M3) | Opt-ins with upstream defaults: `BIND`, `RESTART_MAX_SLEEP`, `BOOT_IMAGE_SOURCE` (auto/public), `DELETED_RECORD_DROP_UNARCHIVED`, `PRY_ALLOW_UNAUDITED` (console session only); restarter signals only a live child |
+| `scripts/byoh/test/` | A (M3) | Container harness (systemd in `ubi-m3-*` containers), §7 |
 | `terraform/aws-byoh/*` | A | VPC 10.98.0.0/16; t3.medium control plane; m5d.metal data plane with `source_dest_check=false`; 3 secondary IPs + EIPs. |
 | `docs/byoh/{QUICKSTART,SETUP,SETUP_PROXMOX}.md`, `docs/providers/generic.md` | A | Docs, rewritten for M2 on 2026-10-13: SETUP is platform-neutral with an "AWS-specific (optional)" section; SETUP_PROXMOX is the Proxmox runbook (UNVERIFIED). `SETUP_PROXMOX_LOWTIER.md` is superseded, `deploy-scripts/` unsupported (they exit unless `BYOH_RUN_UNSUPPORTED_DEPLOY_SCRIPTS=1`). |
 
@@ -217,13 +224,22 @@ The file and class names are load-bearing: `"generic"` must resolve to `Hosting:
 
 ## 5. Deployment flow (real commands)
 
-### Control plane
+### Control plane, packaged (M3, `m3-packaging`; UNVERIFIED outside the container harness)
+
+`sudo bash ~/ubicloud/scripts/byoh/install.sh --version V --source-git ~/ubicloud --ref <rev> --url https://HOST --tls acme|provided|tunnel|none --admin-email E --backup-recipient age1...` (`docs/byoh/INSTALL.md`).
+- Idempotent, no markers; a flag that would change an existing setting exits 2 unless `--update-env KEY`. Exit 0/1/2.
+- Default `--rack-env production` with `BOOT_IMAGE_SOURCE=public`, `MAIL_DRIVER=logger`, `DELETED_RECORD_DROP_UNARCHIVED=true`, `ALLOW_UNSPREAD_SERVERS=true`, `BIND=127.0.0.1`. The **E1 canary** (a production-mode VM boot) has not run.
+- Operate with `sudo ubicloud-admin status|smoke|backup|restore|env|logs|account|run <tool>|console|release` (`docs/byoh/OPERATIONS.md`). Tools run as `ubicloud-admin run byoh-location ...`; DB access `sudo -u postgres psql -d ubicloud`.
+- Refuses to start the units while `~/.ubi-bootstrap` exists: a dev control plane moves with `migrate-from-dev.sh` (`docs/byoh/MIGRATE_FROM_DEV.md`), window A (layout) then window B (production, after the E1 canary). Rollback = the R0 tmux commands on the untouched `clover_test`.
+
+### Control plane, development (live today)
 
 Ubuntu 24.04, run as a non-root sudo user.
 
 1. `git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud`
    - **The bootstrap does not clone.** Step 5 exits 1 if the repo is missing.
-2. `bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh`
+2. `bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh` (the old name `bootstrap-ctrl-plane.sh` is a shim since M3; terraform user data and `curl | bash` keep working)
+   - Since M3 it refuses `UBI_RACK_ENV=production`, `UBI_DB_NAME=ubicloud`, and a machine with `/etc/ubicloud/env` or an active/enabled `ubicloud.target` (`UBI_FORCE_DEV=1` overrides the last).
    - Env overrides: `UBI_REPO_DIR`, `UBI_RUBY_VERSION` (4.0.7), `UBI_NODE_VERSION` (24.12.0), `UBI_DB_NAME` (**clover_test**), `UBI_RACK_ENV` (development), `UBI_START_SERVICES`, `UBI_START_MONITOR` (0), `UBI_BILLING_RATES_DIR` (`~/ubicloud-billing-rates.d`).
    - It installs PG16 and creates roles `clover` (superuser) and `clover_password`.
    - It sets **pg_hba to trust** for local and loopback connections.
@@ -292,7 +308,7 @@ It is still in git history (`git show 0a24426cc:scripts/byoh-ops/reconfigure-rou
 
 ## 6. Debugging playbook
 
-The operator-facing catalogue is `docs/byoh/TROUBLESHOOTING.md`; keep it consistent with this section.
+The operator-facing catalogue is `docs/byoh/TROUBLESHOOTING.md`; keep it consistent with this section. The commands below are for the development layout; on a packaged control plane use `sudo -u postgres psql -d ubicloud`, `sudo ubicloud-admin logs respirate`, `sudo ubicloud-admin console` and `sudo ubicloud-admin status` (TROUBLESHOOTING §0).
 
 - **Host state** (use the `vm_host` id = strand id):
   `SELECT prog,label,try,schedule,stack FROM strand WHERE id='<uuid>';`
@@ -358,6 +374,8 @@ docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test u
 - **Lint:** rubocop + standard. Multiline literals need trailing commas (`diff_comma`). The whole repo is rubocop-clean since 2026-10-12; keep it that way.
 - **Never run `RACK_ENV=test` on a real control plane.** It disables SSH.
 - **Never run `rake setup_database[test]` on a control plane.** It drops `clover_test`, which is the deployment DB.
+- **M3 (2026-10-14):** image `ubi-bundler-m1`, databases `clover_m2_test1..6` (the worktree's `.env.rb`). Gate order: `rake coverage_pspec`, `frozen_pspec`, `rubocop`, then `rake rhizome_spec` with `/etc/os-release` mounted when `rhizome/` changes. `bash -n` and shellcheck (`docker run --rm --name ubi-m3-shellcheck --network ubi-test-net -v $WT:/mnt:ro koalaman/shellcheck-alpine shellcheck -x <files>`) on every shell script.
+- **Container harness** (`scripts/byoh/test/run.sh`, README there): systemd 255 as PID 1 in `--privileged` containers with a private cgroup namespace (never bind-mount `/sys/fs/cgroup`). Every container is `ubi-m3-*`, joins only `ubi-test-net`, publishes no port; a run removes only its own (`UBI_M3_KEEP=1` keeps them). Images: `ubi-m3-systemd` (`--prepare-image`), `ubi-m3-tools` (`--prepare-tools`: `install.sh --stage tools`), `ubi-m3-release` (`--prepare-release`: the working tree installed as release `t1`); re-prepare the release after a change to code or install.sh's release steps. Scenarios: `parity envfmt verify fresh rerun flags smoke kill restart reboot tls-provided tunnel backup admin devshim gate-journal migrate migrate-preM1 upgrade-manual` (`all`). It never reaches a real server; ACME, a real tunnel and a real reboot stay UNVERIFIED.
 
 ## 8. Upstream merge (M1, 2026-10-12)
 
@@ -451,7 +469,10 @@ Code:
 10. The `host_provider` annotation is missing `config`; the migration name is 14 digits. (RedfishClient timeouts were added on 2026-10-12.)
 11. Upstream gap, not ours to fix (U1 forbids changing non-BYOH output): an IPv6-only load balancer accepts a VM without IPv4 on non-BYOH hosts. Report it upstream.
 
-Scripts:
+12. **Audit partitions end 2027-01-01** (upstream `migrate/20260331_2026_partitions.rb`, `20260325_authentication_audit_logs.rb`, no DEFAULT partition): every login and audited action fails after that. `bin/byoh-config-check` (so `ubicloud-admin status`) warns under 90 days and fails from 2026-12-02. Fix by merging upstream (which brings 2027 partitions) and deploying before 2026-12-02; no fork migration (it would break the next merge). The live dev control plane has the same deadline (OPERATIONS.md §8).
+13. The packaged backup timer never prunes; `ubicloud-admin backup prune --keep N` is manual (OPERATIONS.md §6.1).
+
+Scripts (the development bootstrap; `install.sh` fixes each for packaged control planes, the dev script keeps them for labs):
 - The bootstrap DB is named `clover_test` while running in development.
 - pg_hba is set to trust.
 - Monitor is opt-in (`UBI_START_MONITOR=1`); no restarter.

@@ -2992,7 +2992,7 @@ sc_upgrade_manual() {
   [[ $(adm_rc "$n" release use t3) == 2 ]] || fail "$n: release use t3 before its migration was not refused"
   grep -q 'run ubicloud-admin release migrate t3 first' "$LOGS/adm.log" || fail "$n: no migrate-first message"
   [[ $(adm_rc "$n" release migrate t3) == 2 ]] || fail "$n: release migrate took a backup older than the stop of web"
-  adm_last | grep -q 'is older than the stop of ubicloud-web' || fail "$n: no stale-backup message naming web: $(adm_last)"
+  grep -q 'is older than the stop of ubicloud-web' <<<"$(adm_last)" || fail "$n: no stale-backup message naming web: $(adm_last)"
   # 5b. A reboot with ubicloud.target disabled: no service ran since
   # boot, so systemd has no stop time, and the boot is the bound.
   dx "$n" systemctl disable -q ubicloud.target
@@ -3000,14 +3000,14 @@ sc_upgrade_manual() {
   wait_booted "$n"
   [[ $(dx "$n" systemctl is-active ubicloud-respirate) != active ]] || fail "$n: respirate started with the target disabled"
   [[ $(adm_rc "$n" release migrate t3) == 2 ]] || fail "$n: release migrate took a backup from before the reboot"
-  adm_last | grep -q 'is older than the boot' || fail "$n: no stale-backup message naming the boot: $(adm_last)"
+  grep -q 'is older than the boot' <<<"$(adm_last)" || fail "$n: no stale-backup message naming the boot: $(adm_last)"
   dx "$n" systemctl enable -q ubicloud.target
   # 5c. A backup whose migrations are not the database's.
   out=$(adm "$n" backup now 2>&1) || fail "$n: backup now after the reboot"
   ts_pre=$(grep -oE '[0-9]{8}T[0-9]{6}Z' <<<"$out" | head -1)
   dx "$n" bash -c "m=/var/backups/ubicloud/$ts_pre/manifest.json && jq '.schema_migrations |= .[1:]' \$m >\$m.new && mv \$m.new \$m"
   [[ $(adm_rc "$n" release migrate t3) == 2 ]] || fail "$n: release migrate took a backup with other migrations"
-  adm_last | grep -q 'holds the database as it is (or as it was before migrations of t3 that ran already)' || fail "$n: no other-migrations message: $(adm_last)"
+  grep -q 'holds the database as it is (or as it was before migrations of t3 that ran already)' <<<"$(adm_last)" || fail "$n: no other-migrations message: $(adm_last)"
   dx "$n" rm -rf "/var/backups/ubicloud/$ts_pre" "/var/backups/ubicloud/secrets/$ts_pre.age"
   [[ $(psql_q "$n" "SELECT to_regclass('public.harness_release_probe') IS NULL") == t ]] || fail "$n: a refused migrate ran t3's migration"
   say "$n: release migrate exits 2 with a backup older than the stop of web, older than the boot (target disabled across a restart) or with other migrations"
@@ -3031,14 +3031,14 @@ end
 EOR
 EOS
   [[ $(adm_rc "$n" release migrate t5) == 1 ]] || fail "$n: release migrate t5 did not fail: $(adm_last)"
-  adm_last | grep -q "run release migrate t5 again.*restore $ts_pre --db-only" || fail "$n: failed migrate message: $(adm_last)"
+  grep -q "run release migrate t5 again.*restore $ts_pre --db-only" <<<"$(adm_last)" || fail "$n: failed migrate message: $(adm_last)"
   [[ $(psql_q "$n" "SELECT to_regclass('public.harness_release_probe') IS NOT NULL") == t ]] || fail "$n: the first migration of t5 did not stay applied"
   [[ $(adm_rc "$n" release migrate t5) == 1 ]] || fail "$n: the rerun of release migrate t5 was refused: $(adm_last)"
-  adm_last | grep -q "backup $ts_pre holds the database as it was before the 1 migration(s) of t5 that ran already ($PROBE_MIG)" ||
+  grep -q "backup $ts_pre holds the database as it was before the 1 migration(s) of t5 that ran already ($PROBE_MIG)" <<<"$(adm_last)" ||
     fail "$n: the rerun did not go on from $ts_pre: $(adm_last)"
   adm "$n" backup now >/dev/null 2>&1 || fail "$n: backup now of the half-migrated database"
   [[ $(adm_rc "$n" release migrate t5) == 1 ]] || fail "$n: release migrate t5 after a backup of the half-migrated database: $(adm_last)"
-  adm_last | grep -q "restore $ts_pre --db-only" || fail "$n: a newer backup that t1 cannot restore replaced $ts_pre: $(adm_last)"
+  grep -q "restore $ts_pre --db-only" <<<"$(adm_last)" || fail "$n: a newer backup that t1 cannot restore replaced $ts_pre: $(adm_last)"
   [[ $(current_of "$n") == releases/t1 ]] || fail "$n: a failed migrate moved current"
   [[ $(adm_rc "$n" restore "$ts_pre" --db-only) == 0 ]] || fail "$n: restore $ts_pre on t1: $(tail -20 "$LOGS/adm.log")"
   [[ $(psql_q "$n" "SELECT to_regclass('public.harness_release_probe') IS NULL") == t ]] || fail "$n: the restore kept t5's first migration"
@@ -3051,7 +3051,7 @@ EOS
   out=$(adm "$n" backup now 2>&1) || fail "$n: backup now before t3"
   ts_pre=$(grep -oE '[0-9]{8}T[0-9]{6}Z' <<<"$out" | head -1)
   [[ $(adm_rc "$n" release migrate t3) == 0 ]] || fail "$n: release migrate t3: $(tail -20 "$LOGS/adm.log")"
-  adm_last | grep -q "backup $ts_pre holds the database as it is" || fail "$n: release migrate t3 did not name $ts_pre: $(adm_last)"
+  grep -q "backup $ts_pre holds the database as it is" <<<"$(adm_last)" || fail "$n: release migrate t3 did not name $ts_pre: $(adm_last)"
   [[ $(psql_q "$n" "SELECT to_regclass('public.harness_release_probe') IS NOT NULL") == t ]] || fail "$n: t3's migration did not run"
   [[ $(current_of "$n") == releases/t1 ]] || fail "$n: release migrate moved current"
   [[ $(adm_rc "$n" release use t3) == 0 ]] || fail "$n: release use t3"
@@ -3089,9 +3089,9 @@ EOS
     fail "$n: a held service started at boot"
   [[ $(adm_rc "$n" status) == 1 ]] || fail "$n: status passed between use --for-restore and the restore"
   grep -q 'release: the database has 1 migration(s) t2 lacks' "$LOGS/adm.log" || fail "$n: status did not name the downgrade"
-  adm_last | grep -q "held by release use --for-restore until ubicloud-admin restore $ts_pre --db-only" || fail "$n: status did not name the hold"
+  grep -q "held by release use --for-restore until ubicloud-admin restore $ts_pre --db-only" <<<"$(adm_last)" || fail "$n: status did not name the hold"
   [[ $(adm_rc "$n" restore "$ts_pre" --db-only) == 0 ]] || fail "$n: restore $ts_pre --db-only: $(tail -20 "$LOGS/adm.log")"
-  adm_last | grep -q 'the hold of release use --for-restore is lifted' || fail "$n: the restore did not lift the hold"
+  grep -q 'the hold of release use --for-restore is lifted' <<<"$(adm_last)" || fail "$n: the restore did not lift the hold"
   dx "$n" test ! -e /var/lib/ubicloud/release-hold || fail "$n: the hold file outlived the restore"
   [[ -z $(dx "$n" find /etc/systemd/system -name 50-ubicloud-release-hold.conf) ]] || fail "$n: a hold drop-in outlived the restore"
   wait_for 180 web_up "$n" >/dev/null || fail "$n: web down after the restore"
@@ -3107,7 +3107,7 @@ EOS
   # migration and is older than the stop, and is not looked at.
   stop_cp "$n"
   [[ $(adm_rc "$n" release migrate t3 --skip-backup-check) == 0 ]] || fail "$n: release migrate t3 --skip-backup-check: $(adm_last)"
-  adm_last | grep -q 'no backup check (--skip-backup-check)' || fail "$n: --skip-backup-check did not warn"
+  grep -q 'no backup check (--skip-backup-check)' <<<"$(adm_last)" || fail "$n: --skip-backup-check did not warn"
   [[ $(psql_q "$n" "SELECT to_regclass('public.harness_release_probe') IS NOT NULL") == t ]] || fail "$n: t3's migration did not run"
   [[ $(adm_rc "$n" release use t3) == 0 ]] || fail "$n: release use t3 after --skip-backup-check"
   say "$n: release migrate t3 --skip-backup-check warns and migrates over a stale backup"
@@ -3121,20 +3121,20 @@ EOS
     cp -p mise.toml /root/mise.toml.t4' || fail "$n: staging t4"
   dx "$n" chmod g+w /opt/ubicloud/releases/t4/Gemfile
   [[ $(adm_rc "$n" release use t4) == 2 ]] || fail "$n: release use t4 with a group-writable file was not refused"
-  adm_last | grep -q "t4/Gemfile is not root's alone" || fail "$n: no ownership message: $(adm_last)"
+  grep -q "t4/Gemfile is not root's alone" <<<"$(adm_last)" || fail "$n: no ownership message: $(adm_last)"
   dx "$n" chmod g-w /opt/ubicloud/releases/t4/Gemfile
   dx "$n" sed -i 's/^ruby = .*/ruby = "0.0.1"/' /opt/ubicloud/releases/t4/mise.toml
   for rc in check migrate use; do
     [[ $(adm_rc "$n" release "$rc" t4) == 2 ]] || fail "$n: release $rc t4 with another ruby was not refused"
-    adm_last | grep -q 'release t4: wants ruby 0.0.1' || fail "$n: release $rc t4 did not name the ruby: $(adm_last)"
+    grep -q 'release t4: wants ruby 0.0.1' <<<"$(adm_last)" || fail "$n: release $rc t4 did not name the ruby: $(adm_last)"
   done
   dx "$n" cp /root/mise.toml.t4 /opt/ubicloud/releases/t4/mise.toml
   [[ $(adm_rc "$n" release use t4 --for-restore 20000101T000000Z) == 2 ]] || fail "$n: --for-restore with no such backup was not refused"
-  adm_last | grep -q '20000101T000000Z/manifest.json does not exist' || fail "$n: no missing-backup message: $(adm_last)"
+  grep -q '20000101T000000Z/manifest.json does not exist' <<<"$(adm_last)" || fail "$n: no missing-backup message: $(adm_last)"
   [[ $(current_of "$n") == releases/t3 ]] || fail "$n: a refused use t4 moved current"
   sums=$(dx "$n" sha256sum /usr/local/bin/ubicloud-admin)
   [[ $(adm_rc "$n" release use t4) == 0 ]] || fail "$n: release use t4: $(adm_last)"
-  adm_last | grep -q "t4's ubicloud-admin has no release command, so /usr/local/bin/ubicloud-admin stays as it is" || fail "$n: no older-admin warning: $(adm_last)"
+  grep -q "t4's ubicloud-admin has no release command, so /usr/local/bin/ubicloud-admin stays as it is" <<<"$(adm_last)" || fail "$n: no older-admin warning: $(adm_last)"
   [[ $(dx "$n" sha256sum /usr/local/bin/ubicloud-admin) == "$sums" ]] || fail "$n: use t4 replaced ubicloud-admin"
   [[ $(current_of "$n") == releases/t4 && $(previous_of "$n") == releases/t3 ]] || fail "$n: after use t4"
   say "$n: t4 refused with a group-writable file, another ruby (check, migrate, use) and --for-restore of no backup; use t4 warns and keeps the newer ubicloud-admin"
@@ -3149,7 +3149,7 @@ EOS
   [[ $(adm_rc "$n" release prune --keep 1) == 0 ]] || fail "$n: the second release prune"
   [[ $(dx "$n" ls /opt/ubicloud/releases | tr '\n' ' ') == "t3 t4 " ]] ||
     fail "$n: after prune --keep 1 with current t3: $(dx "$n" ls /opt/ubicloud/releases | tr '\n' ' ')"
-  adm_last | grep -q 'kept 2 (current t3, previous t4), removed 0' || fail "$n: second prune: $(adm_last)"
+  grep -q 'kept 2 (current t3, previous t4), removed 0' <<<"$(adm_last)" || fail "$n: second prune: $(adm_last)"
   dx "$n" systemctl start ubicloud.target
   wait_for 180 web_up "$n" >/dev/null || fail "$n: web down on t3 after prune"
   [[ $(adm_rc "$n" status) == 0 ]] || fail "$n: status after prune: $(grep '^fail' "$LOGS/adm.log" | tail -5)"

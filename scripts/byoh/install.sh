@@ -865,7 +865,7 @@ stage_release() {
   report ok "stage release done; current is still $(readlink "$CURRENT")"
   echo
   echo "Release $VERSION (rev $SRC_REV) is staged. To switch to it (docs/byoh/OPERATIONS.md, release switch):"
-  echo "  sudo systemctl stop ubicloud.target"
+  echo "  sudo systemctl stop ubicloud.target ubicloud-web ubicloud-respirate"
   echo "  sudo ubicloud-admin backup now"
   echo "  sudo ubicloud-admin release migrate $VERSION"
   echo "  sudo ubicloud-admin release use $VERSION"

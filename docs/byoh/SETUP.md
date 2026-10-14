@@ -1,6 +1,6 @@
 # Ubicloud BYOH setup (any platform)
 
-This is the full runbook for a BYOH deployment with the current (M2) code: a control plane, one or more data-plane hosts, a BYOH location, address pools and VMs. The steps are the same on every platform. Only the site network work and the way you create the machines differ, and those are in the platform sections at the end.
+This is the full runbook for a BYOH deployment with the current (M3) code: a control plane, one or more data-plane hosts, a BYOH location, address pools and VMs. The steps are the same on every platform. Only the site network work and the way you create the machines differ, and those are in the platform sections at the end.
 
 | Platform | Status | Where |
 |---|---|---|
@@ -10,6 +10,8 @@ This is the full runbook for a BYOH deployment with the current (M2) code: a con
 
 The shortest path is [QUICKSTART.md](QUICKSTART.md). Per-platform guides: [platforms/README.md](platforms/README.md). Problems: [TROUBLESHOOTING.md](TROUBLESHOOTING.md). The design is in [NETWORKING.md](NETWORKING.md); the platform matrix and host requirements are in [PLATFORMS.md](PLATFORMS.md).
 
+**Two control-plane layouts (M3).** A production control plane is installed with `scripts/byoh/install.sh` ([INSTALL.md](INSTALL.md)) and operated with `sudo ubicloud-admin` ([OPERATIONS.md](OPERATIONS.md)): systemd, database `ubicloud`, settings in `/etc/ubicloud/env`. The development bootstrap (`scripts/byoh/bootstrap-dev-ctrl-plane.sh`: tmux, `clover_test`, `trust`) is for development and labs; the live AWS control plane still runs it until its M3 window ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)). The commands below are written for the development layout (`bundle exec bin/...` in `~/ubicloud`); §4.3 gives the packaged equivalent of each. The packaged layout has run only in the container harness (UNVERIFIED on a real machine).
+
 The previous version of this page was an AWS-console walkthrough written before M2. It passed `--provider generic` (which aborts) and created no location. It is in git history if you need it.
 
 ---
@@ -18,7 +20,7 @@ The previous version of this page was an AWS-console walkthrough written before 
 
 | Role | Runs | Needs |
 |---|---|---|
-| Control plane | Postgres, web (`puma`), `respirate`, optionally `bin/monitor`, the operator CLIs | Ubuntu 24.04; SSH to every data-plane host's management IP (contract C0); users reach its port 3000 |
+| Control plane | Postgres, web (`puma`), `respirate`, optionally `bin/monitor`, the operator CLIs | Ubuntu 24.04; SSH to every data-plane host's management IP (contract C0); users reach its HTTPS front (packaged) or port 3000 (development) |
 | Data plane (VmHost) | rhizome, cloud-hypervisor, vhost-block-backend, the VMs | Ubuntu 24.04 with KVM; root SSH from the control plane; outbound internet; a dedicated machine or VM |
 | BYOH location | One per site: network profile, billing rates, who can use it | `bin/byoh-location` |
 | Pools | Addresses VMs get, each with a `delivery` and an `exposure` | `pools.yaml`, `bin/byoh-pool` |
@@ -78,23 +80,56 @@ The driver never changes upstream routing. Making pool addresses reach the host 
 
 ## 4. Control plane
 
-On a fresh Ubuntu 24.04 machine, as a sudo user (not root):
+Choose one layout. Both need a fresh Ubuntu 24.04 machine.
+
+### 4.1 Packaged (`install.sh`)
 
 ```bash
 git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
-bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh
+sudo bash ~/ubicloud/scripts/byoh/install.sh --version v0.1.0 \
+  --source-git ~/ubicloud --ref HEAD \
+  --url https://cloud.example.com --tls acme|provided|tunnel|none \
+  --admin-email ops@example.com --backup-recipient age1...
+sudo ubicloud-admin account create --email ops@example.com
+sudo ubicloud-admin status
+```
+
+`install.sh` reaches `byoh-driver` when M3 is merged; until then it is on the unpushed branch `m3-packaging`. Flags, TLS fronts, settings and the production-mode differences are in [INSTALL.md](INSTALL.md). `--rack-env production` is the default and sets `BOOT_IMAGE_SOURCE=public`; no VM has booted in production mode yet (the E1 canary, [INSTALL.md](INSTALL.md) §7), so `--rack-env development` is the cautious choice for a first site. Onboard users with `ubicloud-admin account create`: with the default logger mail driver, verification mail lands in the journal.
+
+### 4.2 Development (`bootstrap-dev-ctrl-plane.sh`, labs only)
+
+As a sudo user (not root):
+
+```bash
+git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
 export PATH=$HOME/.local/bin:$HOME/.local/share/mise/installs/ruby/4.0.7/bin:$PATH
 cd ~/ubicloud
 ```
 
-- The script does not clone; clone first.
+- The script does not clone; clone first. Its old name, `bootstrap-ctrl-plane.sh`, is a shim that runs it.
 - It installs Postgres 16, Ruby 4.0.7 and Node 24 via mise, runs `bundle install`, builds assets, writes `.env.rb` with random secrets, `BILLING_RATES_EXTRA_DIR=~/ubicloud-billing-rates.d` and `BASE_URL=http://<first address of hostname -I>:3000` (override with `UBI_BASE_URL`), migrates, and starts `puma` and `respirate` in tmux. Logs go to `/tmp/{puma,respirate}.{log,err}`.
 - `~/.local/bin` (mise) must be on PATH for any later `bundle install`. Without it bundler fails with "No such file or directory - mise" (live AWS window, 2026-10-13).
 - Set `UBI_START_MONITOR=1` only when PLATFORMS.md says the monitor suits your hosts' disks.
-- Keep `RACK_ENV=development`. In `production`, boot images come from R2/MinIO, which BYOH does not have. **Never run `RACK_ENV=test` on a control plane**: it disables SSH.
-- Known shortcuts in the script: Postgres `pg_hba` is set to `trust` locally, the database is named `clover_test`, and nothing restarts after a reboot.
+- Keep `RACK_ENV=development`. In `production`, this layout takes boot images from R2/MinIO, which BYOH does not have (the packaged layout sets `BOOT_IMAGE_SOURCE=public` instead). **Never run `RACK_ENV=test` on a control plane**: it disables SSH.
+- Known shortcuts in the script: Postgres `pg_hba` is set to `trust` locally, role `clover` is a superuser, the database is named `clover_test`, puma listens on `0.0.0.0:3000` without TLS, and nothing restarts after a reboot. It refuses to run next to a packaged control plane.
 
-The UI is at `http://<control plane>:3000/create-account`. The verification email goes to `/tmp/puma.log`. Its link starts with `BASE_URL`; with an older `.env.rb` that lacks it, the link says `http://localhost:9292`, so replace that part with the control plane's URL.
+The UI is at `http://<control plane>:3000/create-account`. In development the account works at once; no mail is sent for it. Other mail goes to `/tmp/puma.log`; its links start with `BASE_URL` (with an older `.env.rb` that lacks it, `http://localhost:9292`: replace that part with the control plane's URL).
+
+### 4.3 The same commands on both layouts
+
+| Development (in `~/ubicloud`, mise on PATH) | Packaged |
+|---|---|
+| `bundle exec bin/byoh-location ...`, `bin/byoh-pool ...`, `bin/byoh-host ...`, `bin/register-byoh-host ...` | `sudo ubicloud-admin run byoh-location ...` (and `byoh-pool`, `byoh-host`, `register-byoh-host`). Files such as `--pool-file` and `--ssh-key` are copied for the tool |
+| `RACK_ENV=development bundle exec bin/pry` | `sudo ubicloud-admin console` (not audited, [OPERATIONS.md](OPERATIONS.md) §3) |
+| Restart: kill the tmux sessions, rerun the bootstrap | `sudo systemctl restart ubicloud.target` |
+| `tail -f /tmp/respirate.log` | `sudo ubicloud-admin logs respirate -f` |
+| `psql -U clover -d clover_test` | `sudo -u postgres psql -d ubicloud` |
+| `ENV["X"] \|\|= "..."` in `.env.rb`, restart | `sudo ubicloud-admin env set X` (restarts) |
+| `--bmc-pass-env VAR` with `VAR` in `.env.rb` | `sudo ubicloud-admin env set VAR`, then `--bmc-pass-env VAR` ([OPERATIONS.md](OPERATIONS.md) §4.2) |
+| Billing rates in `~/ubicloud-billing-rates.d` | `/var/lib/ubicloud/billing_rates.d` |
+| Create an account in the UI | `sudo ubicloud-admin account create --email ...` |
+| `scripts/byoh/verify/m2-gate.sh` | Same script; it detects systemd ([VERIFY.md](VERIFY.md) §1.2). Its database steps on a packaged control plane are UNVERIFIED |
 
 ---
 
@@ -143,7 +178,7 @@ bundle exec bin/byoh-location create --name <site> --ui-name "<Name shown to cus
 | `--ula48` | Generated at random. Pass one only to fit an existing host's `net6`. |
 | `--rates-from` | Copies every billing rate of an upstream location into `$BILLING_RATES_EXTRA_DIR`; `--multiplier` scales them |
 
-Restart `puma` and `respirate` (and `bin/monitor`, if it runs) so they load the rates, then check with `bundle exec bin/byoh-location show --location <site>`. The location stays hidden until `set --visible`. Give your project access after you create your account (§9):
+Restart `puma` and `respirate` (and `bin/monitor`, if it runs) so they load the rates (packaged: `sudo systemctl restart ubicloud.target`), then check with `bundle exec bin/byoh-location show --location <site>`. The location stays hidden until `set --visible`. Give your project access after you create your account (§9):
 
 ```bash
 bundle exec bin/byoh-location grant --location <site> --project <project ubid>
@@ -196,6 +231,9 @@ Bring-up takes 15-25 minutes on bare metal and about 4 minutes on a nested-virtu
 ```bash
 tail -f /tmp/respirate.log
 psql -U clover -d clover_test -c "SELECT allocation_state, os_version, total_cores, total_hugepages_1g FROM vm_host"
+# packaged:
+sudo ubicloud-admin logs respirate -f
+sudo -u postgres psql -d ubicloud -c "SELECT allocation_state, os_version, total_cores, total_hugepages_1g FROM vm_host"
 ```
 
 The host is ready at `allocation_state = accepting`. Then check its pools and its NAT table:
@@ -210,7 +248,7 @@ ssh -i ~/.ssh/byoh_data root@<main IP> ip -br -4 addr                         # 
 
 ## 9. Create VMs
 
-1. Create an account in the UI, then `bin/byoh-location grant` its project (§6).
+1. Create an account in the UI (packaged: `sudo ubicloud-admin account create`), then `bin/byoh-location grant` its project (§6).
 2. Add an SSH public key.
 3. Create a VM in the BYOH location (its UI name). With IPv4 enabled, pick **IPv4 Exposure**: `internet` (a `public` or `nat` address) or `internal`.
 
@@ -247,11 +285,12 @@ The VM user is `ubi`.
 | Task | How |
 |---|---|
 | Change pools | `bin/byoh-pool` `add`, `remove`, `remap` or `annotate` (POOL_OPERATIONS.md); no re-registration |
-| Add a boot image | `VmHost["vh..."].download_boot_image("ubuntu-jammy")` in `bin/pry` |
-| Push new rhizome code | `VmHost.all.each(&:install_rhizome)` in `bin/pry` |
+| Add a boot image | `VmHost["vh..."].download_boot_image("ubuntu-jammy")` in `bin/pry` (packaged: `ubicloud-admin console`) |
+| Push new rhizome code | `VmHost.all.each(&:install_rhizome)` in `bin/pry` (packaged: `ubicloud-admin console`) |
+| Back up the control plane | Packaged: nightly timer, `ubicloud-admin backup now`, restore drill ([OPERATIONS.md](OPERATIONS.md) §6). Development: `pg_dump` as postgres plus `.env.rb`, by hand |
 | Remove a host | Destroy its VMs, then `VmHost["vh..."].incr_destroy`. Never delete `location` rows by hand. |
 | Re-register the same machine | Destroy the old VmHost first (`sshable.host`, `address.cidr` and `vm_host.net6` are unique). A reinstalled OS also needs this, as host keys are pinned on first connect. |
-| Upgrade the control plane | CLAUDE.md §8 and VERIFY.md §3.2 L1. A host registered before M1 needs the vhost-block-backend upgrade, or every new VM fails with "No capacity left". |
+| Upgrade the control plane | Packaged: the release switch, [OPERATIONS.md](OPERATIONS.md) §7. Development: CLAUDE.md §8 and VERIFY.md §3.2 L1. A host registered before M1 needs the vhost-block-backend upgrade, or every new VM fails with "No capacity left". |
 | Hardware reset | Only with a BMC. Without one, admin "Hardware Reset" wedges the host strand. |
 
 Troubleshooting for all platforms is in [TROUBLESHOOTING.md](TROUBLESHOOTING.md); the most common causes:

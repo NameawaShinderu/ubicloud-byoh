@@ -65,7 +65,7 @@ Put the control plane **in the same VPC or VNet**, in its own small VM (Ubuntu 2
 - `--cp-reach onhost` works: the control plane dials VMs at their pool address. That covers GCP alias addresses and Azure ipconfig addresses. For GCP variant A, the pool address is the external IP, so the control plane must be able to reach it (§4, row G3).
 - `--cp-source` is the control plane's private /32.
 
-The control plane VM needs **outbound internet** too: `bootstrap-ctrl-plane.sh` downloads Postgres, Ruby, Node and gems, and in GCP variant A the control plane dials the forwarding-rule IPs (row G3). Give it an external IP or Cloud NAT on GCP, and a Public IP or NAT gateway on Azure, where virtual networks created after 2025-09-30 have no default outbound access (provider docs, UNVERIFIED here).
+The control plane VM needs **outbound internet** too: `install.sh` and the development bootstrap download Postgres, Ruby, Node and gems, and in GCP variant A the control plane dials the forwarding-rule IPs (row G3). Give it an external IP or Cloud NAT on GCP, and a Public IP or NAT gateway on Azure, where virtual networks created after 2025-09-30 have no default outbound access (provider docs, UNVERIFIED here).
 
 A control plane outside the VPC (another cloud, an office) needs the host's management IP to be reachable from it. That means a VPN, or SSH to an external IP that the host does not hold on its NIC. Neither has been tried with BYOH, so it is UNVERIFIED and not covered here.
 

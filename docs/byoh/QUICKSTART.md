@@ -26,9 +26,11 @@ When something goes wrong: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## 1. Control plane
 
+This is the development bootstrap (tmux, `clover_test`), which the live environment runs. A packaged control plane (systemd, TLS, backups) is installed with `scripts/byoh/install.sh` instead: [INSTALL.md](INSTALL.md).
+
 ```bash
 git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
-bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
 export PATH=$HOME/.local/bin:$HOME/.local/share/mise/installs/ruby/4.0.7/bin:$PATH
 cd ~/ubicloud
 curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/login     # HTTP 200
@@ -63,7 +65,7 @@ Restart the services so they load the rates:
 
 ```bash
 tmux kill-session -t puma; tmux kill-session -t respirate
-bash scripts/byoh/bootstrap-ctrl-plane.sh        # restarts them; every other step is skipped
+bash scripts/byoh/bootstrap-dev-ctrl-plane.sh    # restarts them; every other step is skipped
 ```
 
 ## 4. Pools and registration

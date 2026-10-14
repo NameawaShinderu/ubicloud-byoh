@@ -151,11 +151,13 @@ Choose the location's `cp_reach` from where it runs:
 
 ### 4.2 Bootstrap
 
+This is the development bootstrap. For a packaged control plane use `scripts/byoh/install.sh` ([INSTALL.md](INSTALL.md)) and run the `bin/...` tools below as `sudo ubicloud-admin run <tool>` ([SETUP.md](SETUP.md) §4.3).
+
 On a fresh Ubuntu 24.04 machine, as a sudo user (not root):
 
 ```bash
 git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
-bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
 export PATH=$HOME/.local/bin:$HOME/.local/share/mise/installs/ruby/4.0.7/bin:$PATH
 ```
 
@@ -315,7 +317,7 @@ Then restart `puma` and `respirate` so they load the rates. They are tmux sessio
 
 ```bash
 tmux kill-session -t puma; tmux kill-session -t respirate
-bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
 bundle exec bin/byoh-location show --location byoh-pve-office
 ```
 

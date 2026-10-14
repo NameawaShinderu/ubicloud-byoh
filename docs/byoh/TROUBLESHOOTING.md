@@ -12,20 +12,20 @@ Platform guides: [AWS](platforms/aws.md) · [rented bare metal](platforms/bare-m
 
 ## 0. First look
 
-Run these on the control plane, from the repository root, with mise and Ruby on PATH ([SETUP.md](SETUP.md) §4).
+Two control-plane layouts exist ([SETUP.md](SETUP.md) §4). The table gives the development layout (`bootstrap-dev-ctrl-plane.sh`: run from the repository root with mise and Ruby on PATH) and the packaged layout (`install.sh`: run as root through `ubicloud-admin`).
 
-| What | Command |
-|---|---|
-| Host strand (the VmHost id is the strand id) | `psql -U clover -d clover_test -c "SELECT prog,label,try,schedule FROM strand WHERE id='<uuid>'"` |
-| Its children (PrepHost, LearnMemory, ...) | `psql -U clover -d clover_test -c "SELECT prog,label,try FROM strand WHERE parent_id='<uuid>'"` |
-| Host state | `psql -U clover -d clover_test -c "SELECT allocation_state,os_version,total_cores,total_hugepages_1g,accepts_slices,net6 FROM vm_host"` |
-| Errors | `/tmp/respirate.log` and `/tmp/respirate.err`: look for "exception terminates strand run". Expired deadlines create `page` rows ("has an expired deadline!") |
-| Pools and addresses | `bundle exec bin/byoh-pool list --host vh...`, `verify --host vh...`, `trace <ip>` |
-| One VM | `bundle exec scripts/byoh/verify/m2-checks info --vm vm...` (prints `private_ip4=` and `inhost=`) |
-| Reach a VM from the host | `ssh -o "ProxyCommand=ssh -i ~/.ssh/byoh_data root@<main IP> ip netns exec <inhost> nc %h %p" ubi@<private_ip4>` ([VERIFY.md](VERIFY.md) §1.4) |
-| REPL | `RACK_ENV=development bundle exec bin/pry`, then `VmHost["vh..."]`, `Vm["vm..."]` |
-| On the host | `ip -br -4 addr` (only the main IP, contract C5), `nft list table inet byoh_egress`, `pgrep -af cloud-hypervisor` (not `pgrep -a`: the name is longer than 15 characters) |
-
+| What | Development | Packaged |
+|---|---|---|
+| Host strand (the VmHost id is the strand id) | `psql -U clover -d clover_test -c "SELECT prog,label,try,schedule FROM strand WHERE id='<uuid>'"` | `sudo -u postgres psql -d ubicloud -c "..."` (same SQL) |
+| Its children (PrepHost, LearnMemory, ...) | `... "SELECT prog,label,try FROM strand WHERE parent_id='<uuid>'"` | as left, through `sudo -u postgres psql -d ubicloud` |
+| Host state | `... "SELECT allocation_state,os_version,total_cores,total_hugepages_1g,accepts_slices,net6 FROM vm_host"` | as left |
+| Errors | `/tmp/respirate.log` and `/tmp/respirate.err`: look for "exception terminates strand run". Expired deadlines create `page` rows ("has an expired deadline!") | `sudo ubicloud-admin logs respirate --since -1h` (journald); same messages |
+| Control plane health | `pgrep -af 'puma\|respirate'` | `sudo ubicloud-admin status` (exits 1 on any fail), `sudo ubicloud-admin smoke` |
+| Pools and addresses | `bundle exec bin/byoh-pool list --host vh...`, `verify --host vh...`, `trace <ip>` | `sudo ubicloud-admin run byoh-pool list --host vh...` |
+| One VM | `bundle exec scripts/byoh/verify/m2-checks info --vm vm...` (prints `private_ip4=` and `inhost=`) | UNVERIFIED on this layout; `ubicloud-admin console` with `Vm["vm..."]` |
+| Reach a VM from the host | `ssh -o "ProxyCommand=ssh -i ~/.ssh/byoh_data root@<main IP> ip netns exec <inhost> nc %h %p" ubi@<private_ip4>` ([VERIFY.md](VERIFY.md) §1.4) | same |
+| REPL | `RACK_ENV=development bundle exec bin/pry`, then `VmHost["vh..."]`, `Vm["vm..."]` | `sudo ubicloud-admin console` (not audited) |
+| On the host | `ip -br -4 addr` (only the main IP, contract C5), `nft list table inet byoh_egress`, `pgrep -af cloud-hypervisor` (not `pgrep -a`: the name is longer than 15 characters) | same |
 ---
 
 ## 1. Control-plane install
@@ -40,14 +40,39 @@ Run these on the control plane, from the repository root, with mise and Ruby on 
 | `register-byoh-host` aborts with `InvalidOption` on `--provider` | There is no such flag | Use `--location` | Older docs pass it |
 | `register-byoh-host`: "--location is required", "no location X", "is not a BYOH location" | No BYOH location yet | `bin/byoh-location create` ([SETUP.md](SETUP.md) §6) | |
 | Strands fail with `NetSsh::MissingMock` | `RACK_ENV=test` on a control plane, which disables SSH | Use `RACK_ENV=development`. Never `test` on a control plane, and never `rake setup_database[test]` there: it drops `clover_test`, the deployment database | |
-| Boot images never download with `RACK_ENV=production` | In production every image comes from R2/MinIO, which BYOH does not have | Keep `RACK_ENV=development` | |
-| No verification email | Mail goes to the logger | Look in `/tmp/puma.log`, not the tmux pane | |
-| Email link starts with `http://localhost:9292` or a private IP | `.env.rb` has no `BASE_URL`, or the bootstrap took the first address of `hostname -I` | Set `ENV["BASE_URL"] ||= "http://<address you browse to>:3000"` in `.env.rb` and restart `puma`. On a new control plane, `export UBI_BASE_URL=...` before the bootstrap, which writes `BASE_URL` only into a new `.env.rb` | AWS: the private IP ([aws.md](platforms/aws.md) §3.4). 17d383a9c does not write `BASE_URL` at all |
+| Boot images never download with `RACK_ENV=production` | In production every image comes from R2/MinIO, which BYOH does not have, unless `BOOT_IMAGE_SOURCE=public` | Development layout: keep `RACK_ENV=development`. Packaged: install.sh sets `BOOT_IMAGE_SOURCE=public` (a production VM boot is UNVERIFIED, [INSTALL.md](INSTALL.md) §7) | |
+| No verification email (development) | Mail goes to the logger | Look in `/tmp/puma.log`, not the tmux pane | |
+| Email link starts with `http://localhost:9292` or a private IP | `.env.rb` has no `BASE_URL`, or the bootstrap took the first address of `hostname -I` | Set `ENV["BASE_URL"] \|\|= "http://<address you browse to>:3000"` in `.env.rb` and restart `puma`. On a new control plane, `export UBI_BASE_URL=...` before the bootstrap, which writes `BASE_URL` only into a new `.env.rb` | AWS: the private IP ([aws.md](platforms/aws.md) §3.4). 17d383a9c does not write `BASE_URL` at all |
 | `byoh-location show` warns "BASE_URL is …; set it to the URL customers use" | `BASE_URL` unset or a localhost address. A private address does not warn | As above | |
-| `byoh-location show` warns "CONTROL_PLANE_OUTBOUND_CIDRS includes 0.0.0.0/0, ::/0, so Postgres and Kubernetes firewalls allow SSH from anywhere" | The `config.rb` default `0.0.0.0/0,::/0` | Security setting: `ENV["CONTROL_PLANE_OUTBOUND_CIDRS"] ||= "<the --cp-source CIDRs>"` in `.env.rb`, then restart the services (NETWORKING §6.6) | LAN sites: the control plane's LAN IP; off-site: its egress IP ([own-hardware.md](platforms/own-hardware.md) §3.3) |
+| `byoh-location show` warns "CONTROL_PLANE_OUTBOUND_CIDRS includes 0.0.0.0/0, ::/0, so Postgres and Kubernetes firewalls allow SSH from anywhere" | The `config.rb` default `0.0.0.0/0,::/0` | Security setting: `ENV["CONTROL_PLANE_OUTBOUND_CIDRS"] \|\|= "<the --cp-source CIDRs>"` in `.env.rb`, then restart the services (NETWORKING §6.6) | LAN sites: the control plane's LAN IP; off-site: its egress IP ([own-hardware.md](platforms/own-hardware.md) §3.3) |
 | Warns "location X: cp_source_cidrs … is not in CONTROL_PLANE_OUTBOUND_CIDRS" | You narrowed the variable and left a `--cp-source` CIDR out | Add that CIDR | |
 | UI on port 3000 unreachable | Firewall in front of the control plane | Open 3000 from your address only | AWS: `web_ui_cidr` ([aws.md](platforms/aws.md) §3.10) |
+| Packaged: install.sh exits 2 "key X differs; edit with 'ubicloud-admin env set X' or pass --update-env X" | A flag would change a setting install.sh wrote earlier | Pass the same flags as before, or add `--update-env X` to change it on purpose ([INSTALL.md](INSTALL.md) §4.1). For `TLS_FRONT`, the message names every `--update-env` the switch needs | |
+| Packaged: install.sh exits 2 "release A is current; switching to B is a release switch" or "release V exists with rev R, not S" | A new `--version` (or a reused one with another commit) | Keep `--version` for reruns; build a new version with `--stage release` and switch ([OPERATIONS.md](OPERATIONS.md) §7) | |
+| Packaged: install.sh exits 2 "the current release runs ruby X ... this source wants ruby Y" | Every release shares `/opt/ubicloud/tools` | A Ruby or Node change needs tools per release (M12) | |
+| Packaged: install.sh exits 2 "/home/U/.ubi-bootstrap exists, so a development control plane lives on this machine" | The development bootstrap ran here | Move it with `migrate-from-dev.sh` ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)); its `install` phase passes `--no-start` | Live AWS control plane |
+| Packaged: install.sh exits 2 "something already listens on port 3000" | Another process (often a tmux puma) holds the web port | Stop it, or install with `--no-start` | |
+| Packaged: install.sh dies "database ubicloud has a schema but /etc/ubicloud/env is missing" | The env file, and with it the column key, is gone | Restore it from the secrets backup: `ubicloud-admin restore TS --key-file F --env-only` ([OPERATIONS.md](OPERATIONS.md) §6.3). A new key would make every encrypted column unreadable | |
+| Packaged: install.sh dies "the clock is not NTP-synchronized" or "needs about 4 GiB of memory" | Step 1 checks | `timedatectl set-ntp true`; or `--skip-check clock` / `mem` | |
+| Packaged: "no caddy package is available" or "something other than caddy listens on port 80 or 443" | `--tls acme\|provided` needs Ubuntu universe and ports 80 and 443 | `add-apt-repository universe`; stop the other web server | |
+| Packaged: "cloudflared.service is running or enabled and forwards its tunnel to puma" | A tunnel next to Caddy would let tunnel clients choose `X-Real-IP` | Switch DNS to this machine, `systemctl disable --now cloudflared.service`, rerun | |
+| Packaged: smoke warns "caddy has no certificate for HOST yet (curl exit 35 ...)" | Let's Encrypt has not issued yet (UNVERIFIED path) | Public DNS for the host and ports 80 and 443 open; `ubicloud-admin logs caddy` | |
+| Packaged: smoke fails "answers HTTP 404 through the tunnel", or warns on 530 / no answer | The tunnel's public hostname does not route to the origin, or no connector is up | In the Cloudflare dashboard route the hostname to `http://127.0.0.1:3000` (not `localhost`, which may be `::1`); `ubicloud-admin logs cloudflared` | Live: the existing `cloudflared.service` is never changed by install.sh |
+| Packaged: smoke fails "port 8081 is taken" or "PORT is 8081" | `bin/production_check` starts its own puma on 8081 | Free 8081; never set `PORT=8081` | |
+| Packaged: smoke or status fails "bin/byoh-config-check reports failures" | A setting (`MAIL_FROM` unset, http `BASE_URL` in production, a superuser role, partitions ending in under 30 days, ...) | The failing line above it names the key; [OPERATIONS.md](OPERATIONS.md) §2 | |
+| Packaged: `psql` or a Ruby tool says "Peer authentication failed for user ..." or "pg_hba.conf rejects connection ... database \"ubicloud\"" | By design: database `ubicloud` takes only peer logins from OS users `ubicloud` (role `ubicloud`), `ubicloud-migrate` (also `ubicloud_password`) and `postgres`; TCP and every other login are rejected | `sudo -u postgres psql -d ubicloud`, or `ubicloud-admin run`/`console`. Never add a trust or password rule for it | |
+| Packaged: `status` fails "pg_hba.conf line(s) N use trust for database ubicloud or all" | The development bootstrap's trust lines are still there | Expected on a control plane moved from development until `migrate-from-dev.sh retire`. Elsewhere remove the trust lines | Live AWS control plane after window A |
+| Packaged: `status` warns "role(s) clover are superusers that can log in" | The development bootstrap's superuser role | `migrate-from-dev.sh retire` makes it NOLOGIN NOSUPERUSER | |
+| Packaged: `bundle exec bin/...` in `~/ubicloud` cannot reach the database | The packaged database takes no logins from your user, and the checkout has no `.env.rb` for it | `sudo ubicloud-admin run <tool> ...` | |
+| Packaged: `env set` exits 2 "env set X is refused: ..." | The key is a secret, a flag key of install.sh, or loads code | The message says where to change it ([OPERATIONS.md](OPERATIONS.md) §4.1) | |
+| Packaged: `env set` says "web does not answer after 120 s ...; putting the old one back" | The new value stops web from booting | Fix the value; `ubicloud-admin logs web` names the error. The old file is back | |
+| Packaged: a service cannot read `BILLING_RATES_EXTRA_DIR` or another path under `/home` | The units run with `ProtectHome=yes` | Keep the rates in `/var/lib/ubicloud/billing_rates.d` | |
+| Packaged: `ubicloud-respirate` shows `failed` (status 1 or 143) after a stop or restart | A strand was still running at the stop, or TERM came before respirate's trap | Harmless: the next start clears it, and the strand resumes when its 120 s lease expires ([OPERATIONS.md](OPERATIONS.md) §1.1) | |
+| Packaged: a stop of `ubicloud.target` takes up to 100 s | respirate waits for running strands (apoptosis bounds a strand at about 91 s) | Wait; never kill it | |
 | `puma` and `respirate` gone after the control plane rebooted | The development bootstrap runs them in tmux; nothing restarts them | `bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh` again: it restarts them and skips finished steps. A packaged control plane (`scripts/byoh/install.sh`) runs them under systemd | |
+| Packaged: nothing runs after a reboot; `status` fails "ubicloud.target is not enabled" | The target was disabled (a `migrate-from-dev.sh rollback` does that) | `systemctl enable --now ubicloud.target`, unless you rolled back on purpose | |
+| Packaged: web, respirate and monitor refuse to start; `status` names a release hold | `release use --for-restore` holds the services until the restore | `ubicloud-admin restore TS --db-only`, or `release use <newer>` to go back ([OPERATIONS.md](OPERATIONS.md) §7) | |
+| No verification email (packaged, production) | `MAIL_DRIVER=logger`: mail goes to the journal | Onboard with `ubicloud-admin account create`; the link is in `ubicloud-admin logs web` ([OPERATIONS.md](OPERATIONS.md) §5, security note) | |
 
 ---
 
@@ -160,7 +185,7 @@ BYOH locations are billed from an overlay directory of rate files (`BILLING_RATE
 
 | Symptom | Cause | Fix | Platform notes |
 |---|---|---|---|
-| `byoh-location show` warns "BILLING_RATES_EXTRA_DIR is unset, so web, respirate and monitor do not load the billing rates of BYOH locations" | `.env.rb` lacks the variable (17d383a9c's bootstrap never writes it) | `ENV["BILLING_RATES_EXTRA_DIR"] ||= "/home/<user>/ubicloud-billing-rates.d"` in `.env.rb` (an absolute path: Ruby does not expand `~`); restart web, respirate and monitor | |
+| `byoh-location show` warns "BILLING_RATES_EXTRA_DIR is unset, so web, respirate and monitor do not load the billing rates of BYOH locations" | `.env.rb` lacks the variable (17d383a9c's bootstrap never writes it) | `ENV["BILLING_RATES_EXTRA_DIR"] \|\|= "/home/<user>/ubicloud-billing-rates.d"` in `.env.rb` (an absolute path: Ruby does not expand `~`); restart web, respirate and monitor | |
 | VM create fails resolving a billing rate, or invoices cannot be built | A process started without the variable, or before the last `create --rates-from`/`rates`: rates are read once at start | Restart web, respirate and monitor after every `create --rates-from` or `rates` | |
 | `show` warns "location X: no billing rate for …"; or reports missing coverage | The rates were written to another directory than the services read | Use the `.env.rb` directory (`show` prints the `Rate file`), rerun `bin/byoh-location rates --location <name> --rates-from hetzner-fsn1`, restart | AWS: terraform prints `/etc/ubicloud/billing_rates.d`; skip it on a bootstrapped control plane ([aws.md](platforms/aws.md) §3.5) |
 | An `internal` VM has no IPv4 billing record | By design: internal addresses are not billed | Expected | |
@@ -172,7 +197,7 @@ BYOH locations are billed from an overlay directory of rate files (`BILLING_RATE
 
 ## 7. Upgrades and migrations
 
-The full procedure is in `CLAUDE.md` §8 (M1) and [VERIFY.md](VERIFY.md) §3.2 L1 (M2). These are the steps that failed or nearly failed.
+The full procedure is in `CLAUDE.md` §8 (M1) and [VERIFY.md](VERIFY.md) §3.2 L1 (M2) for the development layout, and the release switch ([OPERATIONS.md](OPERATIONS.md) §7) for the packaged one. These are the steps that failed or nearly failed.
 
 | Symptom | Cause | Fix | Platform notes |
 |---|---|---|---|
@@ -185,6 +210,10 @@ The full procedure is in `CLAUDE.md` §8 (M1) and [VERIFY.md](VERIFY.md) §3.2 L
 | New rhizome behaviour missing on existing hosts | Rhizome code is pushed only on demand | `VmHost.all.each(&:install_rhizome)` in `bin/pry`; recreate VMs that need new VM-setup behaviour | |
 | Host egress table missing after `move-location` | The strand that installs it did not finish | `bundle exec bin/byoh-host setup-egress-nat --host vh...` | |
 | Migration `down` refuses | M2 data exists (reserved rows, external IPs, non-default delivery or exposure, a profile, an internal VM, or audit rows newer than the export) | `bin/byoh-host export-audit --out backups/audit-<ts>.jsonl` first; follow [VERIFY.md](VERIFY.md) §4 | |
+| Packaged: `release migrate` exits 2 naming the backup check | No backup made after web, respirate and monitor last stopped holds the database's migrations | Stop with `systemctl stop ubicloud.target ubicloud-web ubicloud-respirate` (the target alone can return early), then `backup now`, then `release migrate` | |
+| Packaged: `release use` exits 2 "the database has a migration the release lacks" | The downgrade guard: the schema is newer than that release | Restore a backup made before the migration: `release use V --for-restore TS`, then `restore TS --db-only` ([OPERATIONS.md](OPERATIONS.md) §7, Going back) | |
+| Packaged: `release migrate` or `use` exits 2 while the services run | Both need web, respirate and monitor stopped | Stop them first | |
+| Any layout: `status` or `byoh-config-check` warns "audit_log partitions end 2027-01-01" (fails from 2026-12-02) | Upstream has created audit partitions only to 2027-01-01; inserts fail after that | Merge upstream (which brings 2027 partitions) and deploy it before 2026-12-02 ([OPERATIONS.md](OPERATIONS.md) §8) | |
 | SSH to a reinstalled host fails with a host-key mismatch | Host keys are pinned on first connect | Destroy and re-register the VmHost | |
 
 ---
@@ -193,11 +222,11 @@ The full procedure is in `CLAUDE.md` §8 (M1) and [VERIFY.md](VERIFY.md) §3.2 L
 
 | Symptom | Cause | Fix | Platform notes |
 |---|---|---|---|
-| Host flaps to `unavailable`; pages about SMART or the clocksource | `bin/monitor` health checks need `wwn-`/`nvme-eui` disk links, SMART and the `tsc` clocksource (PLATFORMS F5, OPEN) | Stop the monitor (`tmux kill-session -t monitor`). It is one global process with no per-host switch. Then `VmHost["vh..."].update(allocation_state: "accepting")` in `bin/pry` | AWS EBS, GCP PD, Azure managed disks, virtio, hardware RAID, LVM roots. Start it only if PF12 and PF14 pass and `/var/storage` is not on `/dev/mapper/*` ([own-hardware.md](platforms/own-hardware.md) §3.10) |
+| Host flaps to `unavailable`; pages about SMART or the clocksource | `bin/monitor` health checks need `wwn-`/`nvme-eui` disk links, SMART and the `tsc` clocksource (PLATFORMS F5, OPEN) | Stop the monitor (`tmux kill-session -t monitor`; packaged: `systemctl disable --now ubicloud-monitor`, its default state until M9). It is one global process with no per-host switch. Then `VmHost["vh..."].update(allocation_state: "accepting")` in `bin/pry` | AWS EBS, GCP PD, Azure managed disks, virtio, hardware RAID, LVM roots. Start it only if PF12 and PF14 pass and `/var/storage` is not on `/dev/mapper/*` ([own-hardware.md](platforms/own-hardware.md) §3.10) |
 | `unavailable` never triggers; VMs stay stopped after a power outage | `bin/monitor` is not running (the bootstrap starts it only with `UBI_START_MONITOR=1`), so the out-of-band reboot is not noticed | Admin **Reboot** of the host: it reboots once more and `start_vms` restarts every VM | Own hardware: "Restore on AC power loss" ([own-hardware.md](platforms/own-hardware.md) §3.10) |
 | Host strand stuck at `hardware_reset`; VMs show "rebooting" | Admin "Hardware Reset" on a host without a Redfish BMC raises `CapabilityMissing` and retries forever; or the host had VMs and was not draining ("Host has VMs and is not in draining state") | Never click it without a BMC. A provider-panel or cloud-console reset does not unstick the strand, and no command adds a BMC to a registered host. Recovery (UNVERIFIED): in `bin/pry`, `Strand[VmHost["vh..."].id].update(label: "prep_reboot", try: 0)`. The semaphore was already cleared in `prep_hardware_reset`, so the host reboots over SSH and `start_vms` restarts the VMs. Otherwise destroy and re-register with `--bmc-*` | Cloud hosts never have a BMC |
 | Admin "Power On" returns an error | No BMC configured (OPEN) | Power on through the provider panel or by hand | |
-| Redfish reset or Power Status fails with an auth error after a control-plane restart | The `--bmc-pass-env` variable is not in the environment of respirate (Hardware Reset) or puma (Power On, Power Status), so the call goes out with a nil password | `ENV["VAR"] ||= "..."` in `.env.rb` (mode 600); restart both | |
+| Redfish reset or Power Status fails with an auth error after a control-plane restart | The `--bmc-pass-env` variable is not in the environment of respirate (Hardware Reset) or puma (Power On, Power Status), so the call goes out with a nil password | `ENV["VAR"] \|\|= "..."` in `.env.rb` (mode 600); restart both. Packaged: `sudo ubicloud-admin env set VAR`, which restarts them ([OPERATIONS.md](OPERATIONS.md) §4.2) | |
 | BMC discovery: "returned multiple systems; set bmc.system_id explicitly" | The BMC lists several systems | Register with `--bmc-system-id` | |
 | A BMC cannot be registered | IPMI only; only Redfish is implemented | Manage power by hand (`ipmitool`, provider panel) | Many rented servers give customers no BMC |
 | A reimage is needed | Not supported for generic hosts | Reinstall by hand, then destroy and re-register the VmHost | |

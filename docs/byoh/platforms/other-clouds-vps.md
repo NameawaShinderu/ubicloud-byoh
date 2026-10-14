@@ -176,7 +176,7 @@ Notes for this page's providers:
 
 - `--overlay` must be RFC 1918 and must not overlap the underlay. Pick another /14 if your VPC uses 172.20.0.0/14.
 - `--ula48` is generated at random; pass one only to match an existing host's `net6`.
-- `BILLING_RATES_EXTRA_DIR` must be set in `.env.rb` (`bootstrap-ctrl-plane.sh` writes it; VERIFY.md §1.1). Restart `puma`, `respirate` and, if it runs, `bin/monitor`, so they load the copied rates. Check with `bundle exec bin/byoh-location show --location <site>`, which also prints the `Rate file` it uses. Grant your project in §3.9, once the account exists.
+- `BILLING_RATES_EXTRA_DIR` must be set in `.env.rb` (`bootstrap-dev-ctrl-plane.sh` writes it; VERIFY.md §1.1); a packaged control plane has it in `/etc/ubicloud/env`. Restart `puma`, `respirate` and, if it runs, `bin/monitor` (packaged: `systemctl restart ubicloud.target`), so they load the copied rates. Check with `bundle exec bin/byoh-location show --location <site>`, which also prints the `Rate file` it uses. Grant your project in §3.9, once the account exists.
 
 ### 3.5 pools.yaml for each provider
 

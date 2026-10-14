@@ -48,7 +48,7 @@ Every command below exists on `m2-network` and on the published `byoh-driver` (1
    ```
 
    On `m2-network` (105b6439b) it refuses the guest if `/dev/kvm`, `vmx`/`svm` or `pdpe1gb` is missing, and prints `qm set <vmid> --cpu host` as the fix.
-3. **Control plane.** Bootstrap it with `scripts/byoh/bootstrap-ctrl-plane.sh` ([SETUP.md](../SETUP.md) §4, SETUP_PROXMOX §4.2). Keep `UBI_START_MONITOR=0` (the default): virtio disks have no by-id links or SMART (PLATFORMS F5). Install the control plane's Ed25519 key in the guest's `/root/.ssh/authorized_keys` (SETUP_PROXMOX §5).
+3. **Control plane.** Install it with `scripts/byoh/install.sh` ([INSTALL.md](../INSTALL.md)) or, for a lab, the development bootstrap `scripts/byoh/bootstrap-dev-ctrl-plane.sh` ([SETUP.md](../SETUP.md) §4, SETUP_PROXMOX §4.2). Keep `UBI_START_MONITOR=0` (the default): virtio disks have no by-id links or SMART (PLATFORMS F5). Install the control plane's Ed25519 key in the guest's `/root/.ssh/authorized_keys` (SETUP_PROXMOX §5).
 4. **Location** (once per site, SETUP_PROXMOX §7.1):
 
    ```bash

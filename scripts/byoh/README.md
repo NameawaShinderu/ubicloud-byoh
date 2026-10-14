@@ -2,9 +2,13 @@
 
 Reproducible scripts for standing up the Ubicloud control plane and BYOH
 data plane on any Ubuntu 24.04 LTS host. Nothing in them is specific to
-a platform. They were run on AWS only; on other platforms they are
-UNVERIFIED. The full runbooks are `docs/byoh/SETUP.md` (any platform)
-and `docs/byoh/SETUP_PROXMOX.md` (a Proxmox VM as the data plane).
+a platform. The development bootstrap and the data-plane script were run
+on AWS; `install.sh`, `ubicloud-admin` and `migrate-from-dev.sh` have run
+only in the container harness (`test/`). Everything else is UNVERIFIED.
+The runbooks are `docs/byoh/INSTALL.md` and `docs/byoh/OPERATIONS.md`
+(packaged control plane), `docs/byoh/MIGRATE_FROM_DEV.md` (moving a
+development control plane), `docs/byoh/SETUP.md` (any platform) and
+`docs/byoh/SETUP_PROXMOX.md` (a Proxmox VM as the data plane).
 
 ## The two roles
 
@@ -33,16 +37,17 @@ can `ssh root@<data-plane-host>`.
 - Sudo-capable user account on the target host.
 - Outbound internet for apt + rubygems + npm + ubuntu image downloads.
 
-## Packaged control plane (`install.sh`, M3, in progress)
+## Packaged control plane (`install.sh`, M3)
 
 `install.sh` installs the control plane as root-owned releases under
 `/opt/ubicloud`, run by systemd as user `ubicloud`, with database
 `ubicloud` on peer authentication and settings in `/etc/ubicloud/env`.
 It is safe to re-run and keeps no marker files. `--tls` takes `acme`,
-`provided`, `tunnel` or `none`. The migration from the development
-bootstrap comes later in M3, so the live control plane keeps using
-the development bootstrap for now. It has run only in the container
-harness (`scripts/byoh/test/`); on a real machine it is UNVERIFIED.
+`provided`, `tunnel` or `none`. A development control plane moves to it
+with `migrate-from-dev.sh` (below); the live control plane keeps the
+development bootstrap until its window. It has run only in the container
+harness (`scripts/byoh/test/`); on a real machine it is UNVERIFIED. Every
+flag and setting is in `docs/byoh/INSTALL.md`.
 
 ```bash
 sudo bash scripts/byoh/install.sh --version v0.1.0 --url http://localhost:3000 \
@@ -80,9 +85,10 @@ to `/usr/local/bin`. Run it as root:
 | `ubicloud-admin logs [web\|respirate\|monitor\|backup\|caddy\|cloudflared] [-f]` | journalctl |
 | `ubicloud-admin account create\|list` | `bin/byoh-account` |
 | `ubicloud-admin run TOOL ...` | `byoh-location`, `byoh-pool`, `byoh-host`, `register-byoh-host`, `byoh-config-check`, `production_check`, `create_prod_admin_account` |
+| `ubicloud-admin release list\|check\|migrate\|use\|prune` | the manual release switch (`docs/byoh/OPERATIONS.md` §7); `install.sh --stage release` builds the release |
 | `ubicloud-admin console [-e CODE\|-e -]` | `bin/pry`; audited when the env file sets `PRY_AUDIT_BUCKET` or `OTEL_EXPORTER_OTLP_ENDPOINT`, otherwise unaudited (one system log line). `-e -` reads the code from stdin, so it stays out of sudo's log |
 
-`ubicloud-admin --help` has the details.
+`ubicloud-admin --help` has the details; `docs/byoh/OPERATIONS.md` is the operator's guide.
 
 ### Moving a development control plane (`migrate-from-dev.sh`)
 
@@ -186,13 +192,20 @@ reboot, and it can leak EIPs). Use `terraform/aws-byoh`.
 
 ## Restart playbook
 
-If the ctrl plane or data plane crashes, re-run the bootstrap script.
-It'll detect the existing state and only do the missing steps (reload
-tmux sessions, verify DB is up, etc.).
+A packaged control plane restarts by itself (systemd); recover it with
+`ubicloud-admin restore` from its nightly backups
+(`docs/byoh/OPERATIONS.md` §6). On a development control plane, re-run
+the development bootstrap after a crash or reboot: it detects the
+existing state and only does the missing steps (reload tmux sessions,
+verify the DB is up, etc.). Its only recovery is a `pg_dump` of
+`clover_test` plus `.env.rb`, taken by hand.
 
-Full disaster recovery (fresh machine): start from
-`backups/aws-mumbai-pre-eip/clover_test.dump` per the restore
-instructions in `backups/README.md`.
+## Container harness (`test/`)
+
+`test/run.sh` tests `install.sh`, the units, `ubicloud-admin`, the TLS
+fronts, the development shim and `migrate-from-dev.sh` in throwaway
+`ubi-m3-*` containers that run systemd. Scenarios and results:
+`test/README.md`.
 
 ## Verification (`verify/`)
 

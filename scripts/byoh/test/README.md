@@ -301,3 +301,12 @@ admin backup`, passed in full; `upgrade-manual` took about 3.5 minutes.
 - **UNVERIFIED:** a real reboot (the hold is rehearsed with `docker
   restart`), and the journal fallback on a host whose journal is not
   persistent or has been rotated.
+
+## Final M3 run (2026-10-14, systemd 255.4-1ubuntu8.17)
+
+From scratch: `--prepare-image`, `--prepare-tools` (about 4 minutes),
+`--prepare-release`, then `all`, which passed every scenario in about 45
+minutes (rc 0, no `ubi-m3-*` container left). This run uses the
+`grep -q ... <<<"$(adm_last)"` form in `upgrade-manual`: the newest
+shellcheck (SC2337) flags `cmd | grep -q` under `pipefail`, because
+grep's early exit can fail the pipe with SIGPIPE.

@@ -49,7 +49,7 @@ Readers: operators who run the platform and developers who build it.
 
 | Part | State |
 |---|---|
-| Control plane | t3.large. puma and respirate in tmux. `RACK_ENV=development`, DB `clover_test` (`scripts/byoh/bootstrap-ctrl-plane.sh:28-29`). cloudflared tunnel `https://ubicust.dinanshubiswas.org` → `:3000`. |
+| Control plane | t3.large. puma and respirate in tmux. `RACK_ENV=development`, DB `clover_test` (the development bootstrap, now `scripts/byoh/bootstrap-dev-ctrl-plane.sh`). Moves to the M3 packaged layout in its own window ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)). cloudflared tunnel `https://ubicust.dinanshubiswas.org` → `:3000`. |
 | Data plane | One m8i.2xlarge with nested virtualization (8 threads, 4 cores, 32 GiB). `accepting`. Registered into `hetzner-fsn1` like every BYOH host (`prog/vm/host_nexus.rb:6`). |
 | Addresses | 8 pool IPs 10.98.1.128-135, each with an Elastic IP. Pool IPs are no longer on the host NIC [FIXED 003f2800d]. |
 | VMs | 3 customer VMs running. |
@@ -178,22 +178,24 @@ Not done in M0:
 | Live window | NET L1-L4 as [VERIFY.md](VERIFY.md) §3 runs them: create location `byoh-aws-aps1`; move the host while empty (the 3 VMs are recreated; OPEN §8 D-3); `byoh-pool export --external-map` from `aws ec2 describe-addresses`, then `annotate`. No `terraform apply` in `company-mumbai` before M7. |
 | Customer can | See the real public IPv4 (EIP); choose "Public IP" or "No public IP (outbound only)"; pick a real region per site; get correct bills per location. |
 
-#### M3. Packaged control plane and production mode (E0 + E1) [PLANNED M3]
+#### M3. Packaged control plane and production mode (E0 + E1) [CODE DONE 2026-10-14]
+
+**Status:** built on branch `m3-packaging` (from fc693b1e0, not pushed): `scripts/byoh/install.sh`, `packaging/systemd/*`, `packaging/{caddy,cloudflared}/*`, `packaging/bin/ubicloud-admin` (bash, installed to `/usr/local/bin`), the Ruby CLIs `bin/byoh-account`, `bin/byoh-config-check` and `bin/byoh-smtp-url` (`lib/byoh_*.rb`), the opt-ins in `config.rb`/`puma_config.rb`/`bin/restarter`/`bin/pry`/`prog/download_boot_image.rb`/`prog/deleted_record_archiver.rb` (upstream defaults unchanged), the dev-only bootstrap with its shim, `scripts/byoh/migrate-from-dev.sh`, the manual release switch, and the container harness `scripts/byoh/test/`. Docs: [INSTALL.md](INSTALL.md), [OPERATIONS.md](OPERATIONS.md), [MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md). Full Ruby gate green; every E0 exit test ran in the harness with `docker restart` standing in for a reboot. **Still to do:** a run on a real machine, a real ACME issuance and Cloudflare tunnel, the **E1 canary** (a production-mode VM boot with `ubuntu-noble` on a disposable host the user approves; it blocks window B), and the live windows A and B. Deferred: release tarballs and `ubicloud-admin upgrade` (M12), `--mgmt-endpoint` (M8), `s3://` backups and WAL (E5), the admin UI over HTTPS, `site`/`pool`/`host` subcommands (M4; `ubicloud-admin run` passes through meanwhile). The audit-log partitions end on 2027-01-01: an upstream merge must be deployed before 2026-12-02 ([OPERATIONS.md](OPERATIONS.md) §8).
 
 | Item | Detail |
 |---|---|
 | Scope | `install.sh` (idempotent, no marker files); systemd units under user `ubicloud` (`ubicloud-web`, `ubicloud-respirate` = `bin/restarter bin/respirate`, `ubicloud-monitor` installed **disabled**, backup timer, `ubicloud.target`); DB `ubicloud` with peer/ident auth, non-superuser roles; TLS choice `acme`/`tunnel`/`provided`/`none`; `BIND` in `puma_config.rb`; `ubicloud-admin status/backup/restore/account create/logs`. Production mode: `Config.boot_image_source` replaces `Config.production?` in `prog/download_boot_image.rb:23,34`; SMTP or logger; `BASE_URL`; `bin/production_check`. Rename the old bootstrap to a dev-only script so `clover_test` can never be a production DB. |
-| Docs | §6 of this page; new `docs/byoh/INSTALL.md`, `OPERATIONS.md` |
-| Key files | `scripts/byoh/install.sh`, `packaging/systemd/*`, `packaging/{caddy,cloudflared}/*`, `bin/ubicloud-admin`, `lib/byoh/admin/*.rb`, `puma_config.rb:5`, `prog/download_boot_image.rb`, `config.rb` |
+| Docs | §6 of this page; [INSTALL.md](INSTALL.md), [OPERATIONS.md](OPERATIONS.md), [MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md) |
+| Key files | `scripts/byoh/install.sh`, `scripts/byoh/migrate-from-dev.sh`, `packaging/systemd/*`, `packaging/{caddy,cloudflared}/*`, `packaging/bin/ubicloud-admin`, `lib/byoh_{account_cli,config_check,smtp_url}.rb`, `puma_config.rb`, `bin/restarter`, `bin/pry`, `prog/download_boot_image.rb`, `config.rb`, `scripts/byoh/test/*` |
 | Gates | E0/E1 exit tests (§6.7): fresh Ubuntu 24.04 → UI over HTTPS in one command; `kill -9` respirate → back in 10 s; reboot → all up; backup → wipe → restore → hosts still SSH-able; `RACK_ENV=production` VM boot on a canary with `ubuntu-noble` from the public URL. |
-| Live window | Separate window after the gates (§6.8): dump `clover_test` → `ubicloud`, copy `.env.rb` secrets verbatim, stop tmux, start units, point cloudflared at `127.0.0.1:3000`. Rollback = restart tmux on the untouched old DB. |
+| Live window | Separate window after the gates (§6.8), run with `migrate-from-dev.sh` ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)): window A copies `clover_test` into `ubicloud` and `.env.rb`'s secrets verbatim into `/etc/ubicloud/env`, stops tmux, starts the units, keeps the existing cloudflared unit (origin `127.0.0.1:3000`), behaviour still development. Window B flips to production after the E1 canary. Rollback = restart tmux on the untouched old DB. |
 | Customer can | Nothing new visible; the platform survives restarts and reboots, mail works, and HTTPS cookies are secure. |
 
 #### M4. One-command site and host, with preflight (E2 + F4/F5/F6/F9/F10) [PLANNED M4]
 
 | Item | Detail |
 |---|---|
-| Scope | `ubicloud-admin site add` (NET `byoh-location` logic, billing overlay in `/etc/ubicloud/billing_rates.d/`, visibility and Postgres choice) and `host add --ssh` (form A): preflight PF1-PF21 → register → stream HostNexus labels → `pool verify` (prints UNVERIFIED for pool checks until M7). Register CLI: `--location` resolution, `--uplink-ip`, `--pool-file`, default boot image `ubuntu-noble`, preflight by default. Remaining portability fixes: F4 CPU topology (online CPUs, non-uniform SMT), F5 control-plane device identity and health checks, F6 storage safety (`--storage-disk`, btrfs/ZFS error), F9 GPU `vfio-pci` filter and LearnMemory units, F10 Proxmox recipe rewrite (delete `deploy-scripts/02-05,99`), terraform `host_add_command` output. |
+| Scope | `ubicloud-admin site add` (NET `byoh-location` logic, billing overlay in `/var/lib/ubicloud/billing_rates.d/` (M3-n), visibility and Postgres choice) and `host add --ssh` (form A): preflight PF1-PF21 → register → stream HostNexus labels → `pool verify` (prints UNVERIFIED for pool checks until M7). Register CLI: `--location` resolution, `--uplink-ip`, `--pool-file`, default boot image `ubuntu-noble`, preflight by default. Remaining portability fixes: F4 CPU topology (online CPUs, non-uniform SMT), F5 control-plane device identity and health checks, F6 storage safety (`--storage-disk`, btrfs/ZFS error), F9 GPU `vfio-pci` filter and LearnMemory units, F10 Proxmox recipe rewrite (delete `deploy-scripts/02-05,99`), terraform `host_add_command` output. |
 | Docs | [PLATFORMS.md §5, §6](PLATFORMS.md); §6.2-§6.3 of this page |
 | Key files | `bin/register-byoh-host:60-157`; `lib/byoh_registration.rb`; `lib/billing_rate.rb:14`; `scripts/byoh/host/ubicloud-host` (`preflight`); `prog/learn_cpu.rb`; `prog/learn_pci.rb`; `model/storage_device.rb:24-33`; `model/vm_host.rb:286-296,351-361,383-394`; `model/location.rb:36-38`; `terraform/aws-byoh/*`; `docs/byoh/recipes/*` |
 | Gates | E2 exit test: AWS canary and one Proxmox VM with the **same three commands**. Preflight catches `kvm64` (no `/dev/kvm`), a pool containing the uplink IP, and a hybrid CPU. F5: health checks pass on EBS, virtio and LVM for 24 h with `bin/monitor` run by hand. |
@@ -566,7 +568,7 @@ Detail for M3, M4, M8, M12 (E4) and M9 (E5).
 
 | # | Decision | Why |
 |---|---|---|
-| D1 | One operator CLI, `ubicloud-admin` in `/usr/local/bin`; NET's `byoh-location`/`byoh-pool` become its `site`/`pool` subcommands (old names stay as aliases) | Fixes the Ruby PATH problem (`bootstrap-ctrl-plane.sh:45-49`); one entry point |
+| D1 | One operator CLI, `ubicloud-admin` in `/usr/local/bin`; NET's `byoh-location`/`byoh-pool` become its `site`/`pool` subcommands (old names stay as aliases). M3 ships it with `run <tool>` as the pass-through | Fixes the Ruby PATH problem of the development bootstrap; one entry point |
 | D2 | systemd units under user `ubicloud`, release dirs `/opt/ubicloud/releases/<ver>` + `current` symlink | Replaces tmux (`:217-236`); restart-on-exit; journald; clean upgrades |
 | D3 | DB `ubicloud`, roles `ubicloud` and `ubicloud_password` (not superuser), Unix-socket peer auth with a pg_ident map; no passwords, no `trust` | Replaces `clover_test`, `trust`, `--superuser` (`:28,112,133-138`); the test suite drops `clover_test` (`Rakefile:85-96`) |
 | D4 | TLS chosen at install: `acme` (Caddy), `tunnel` (cloudflared), `provided`, `none` (lab, loopback) | Secure cookies outside development (`clover.rb:163`) |
@@ -577,6 +579,9 @@ Detail for M3, M4, M8, M12 (E4) and M9 (E5).
 | D9 | Backups include the column-encryption key, stored separately | Sshable keys are encrypted columns (`model/sshable.rb:15`) |
 
 ### 6.2 Audit of current deploy paths [TODAY]
+
+Line numbers refer to the bootstrap at fc693b1e0 (`scripts/byoh/bootstrap-ctrl-plane.sh`), now `bootstrap-dev-ctrl-plane.sh`, which M3 keeps for development and labs. The M3 rows are fixed by `install.sh`, not by changing that script; the live control plane keeps them until its window.
+
 
 | Path | file:line | Problem | Sev | Fixed in |
 |---|---|---|---|---|
@@ -634,13 +639,13 @@ sudo ubicloud-admin restore <id> --key-file /secure/ubicloud-keys.age
 
 `--cp-reach mgmt` and `--mgmt wireguard` exist only after M8. Until then `site add` uses NETWORKING's `onhost`/`public` and the operator's own route or VPN.
 
-**What `install.sh` does** (every step checks real state; re-run with the same version is a no-op; a different version points to `upgrade`):
+**What `install.sh` does** (every step checks real state; re-run with the same version is a no-op; a different version points to `upgrade`). As built in M3 ([INSTALL.md](INSTALL.md)): the source is a git checkout or tarball (no release download yet), `--smtp` became `--smtp-file` (no password on argv), `--mgmt-endpoint` and `wireguard-tools` wait for M8, `CONTROL_PLANE_OUTBOUND_CIDRS` is not written (M8), `s3://` waits for E5, a different version exits 2 and points to the manual release switch ([OPERATIONS.md](OPERATIONS.md) §7), and the caches are the committed ones:
 
 | Step | Action |
 |---|---|
 | 1 | Checks: Ubuntu 24.04, ≥ 1 CPU / 4 GiB, clock synced, :80/:443 free for `acme` |
 | 2 | Packages: `postgresql-16`, `wireguard-tools`, Caddy or cloudflared, build deps (no tmux) |
-| 3 | Ruby and Node via mise into `/opt/ubicloud/tools` (versions from upstream `mise.toml` after M1; §8 D-11) |
+| 3 | Ruby and Node via mise into `/opt/ubicloud/tools` (versions from the release's `mise.toml`) |
 | 4 | Release tarball with prebuilt assets, CI-generated `cache/*.cache`, vendored gems → `releases/<ver>`; `bundle install --deployment` |
 | 5 | DB roles, `citext`, `btree_gist`, pg_ident peer map, `listen_addresses='localhost'` |
 | 6 | `/etc/ubicloud/env` (0600): production mode, generated secrets, `BASE_URL`, `BIND=127.0.0.1`, mail, `CONTROL_PLANE_OUTBOUND_CIDRS`; never overwritten |
@@ -718,7 +723,7 @@ Re-running resumes; never registers twice (keyed on WG pubkey or uplink IP).
 | `allow_unspread_servers=false` | `config.rb:119` | Single-host sites cannot run HA Postgres |
 | `BASE_URL` | `config.rb:86` | Installer sets it |
 
-**Backups:** `pg_dump -Fc` **as postgres** (role `ubicloud` cannot read `account_password_hashes`, `migrate/ph/20230315_tables.rb:22`) + `pg_dumpall --globals-only`; secrets (`/etc/ubicloud/env`, `ubimgmt.conf`) age-encrypted to an operator recipient and stored separately; 14 daily by default; `status` warns after 36 h. WAL/PITR later (E5).
+**Backups:** `pg_dump -Fc` **as postgres** (role `ubicloud` cannot read `account_password_hashes`, `migrate/ph/20230315_tables.rb:22`) + `pg_dumpall --globals-only`; secrets (`/etc/ubicloud/env`, `ubimgmt.conf`) age-encrypted to an operator recipient and stored separately; nightly, pruned with `backup prune --keep 14` (by hand or cron in M3); `status` warns after 36 h and fails after 72 h. WAL/PITR later (E5).
 
 ### 6.6 Platform recipes (optional; they only produce a machine and a `pools.yaml`)
 

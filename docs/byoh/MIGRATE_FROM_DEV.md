@@ -18,6 +18,10 @@ exactly as it was at the copy.
 `scripts/byoh/test/README.md`). Every step on the live control plane is
 **UNVERIFIED** until the window.
 
+The packaged layout itself (flags, settings, fronts) is described in
+[INSTALL.md](INSTALL.md); day-2 operation after the move in
+[OPERATIONS.md](OPERATIONS.md).
+
 ## What each phase does
 
 | Phase | Changes | Notes |
@@ -127,6 +131,9 @@ until `retire`.
    - Resolve every `fatal` line.
    - If the pending list holds M1/M2 migrations, the window is also the
      schema upgrade, so add the CLAUDE.md §8 verification list to the checklist.
+   - `status` after the move warns that the audit-log partitions end on
+     2027-01-01, and fails from 2026-12-02 ([OPERATIONS.md](OPERATIONS.md) §8).
+     The development control plane has the same deadline today.
 4. If preflight says cloudflared's origin is not `127.0.0.1:3000`, change
    the ingress in the Cloudflare dashboard now. The tmux puma on 0.0.0.0
    still serves it.
@@ -168,8 +175,12 @@ until `retire`.
    - `sudo ubicloud-admin backup now`
    - `ss -tln 'sport = :3000'` shows only 127.0.0.1 (the security group allows 3000 from one /32)
    - the audit rows show real client IPs (`CF-Connecting-IP`)
-7. From now on, operators use `sudo ubicloud-admin …`. Do not run
-   `bin/pry` or the tmux commands in `~/ubicloud`.
+7. From now on, operators use `sudo ubicloud-admin …`
+   ([OPERATIONS.md](OPERATIONS.md)). Do not run `bin/pry` or the tmux
+   commands in `~/ubicloud`.
+8. Add `ubicloud-admin backup prune --keep N` to root's crontab, or prune
+   by hand: the timer never prunes. Keep at least 14 backups until
+   `retire`.
 
 ## Window B: the production flip (later; blocked on the E1 canary)
 
@@ -225,6 +236,9 @@ disposable canary that the user approves first.
    as `ubicloud_prev_<time>`.
 
 ## Retire (at least 14 days and 14 nightly backups after the copy, plus one passed restore drill)
+
+The drill is [OPERATIONS.md](OPERATIONS.md) §6.4, on a disposable
+machine, never on the live one.
 
 ```
 sudo bash ~/ubicloud-m3/scripts/byoh/migrate-from-dev.sh retire --restore-drill-done

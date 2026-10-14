@@ -172,7 +172,8 @@ Then restart `puma` and `respirate` so they load the rates, and check. Grant you
 
 ```bash
 tmux kill-session -t puma; tmux kill-session -t respirate
-bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh      # restarts them, skips finished steps
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh  # restarts them, skips finished steps
+# packaged control plane (install.sh): sudo systemctl restart ubicloud.target
 bundle exec bin/byoh-location show --location byoh-home
 ```
 
@@ -441,7 +442,7 @@ ssh -o "ProxyCommand=ssh -i ~/.ssh/byoh_data root@<main IP> ip netns exec <inhos
 | Power returns after an outage | VMs are systemd units started by the control plane, not enabled at boot. The control plane notices an out-of-band reboot only through the `checkup` semaphore, which `bin/monitor` sets. Without the monitor, **VMs stay stopped** after an outage. | Set "Restore on AC power loss" (§2.2). After the host is back, use admin **Reboot** for the host (not Hardware Reset): it reboots once more and then restarts every VM (`start_vms`). UNVERIFIED on owned hardware. |
 | `bin/monitor` | Detects reboots and unreachable hosts and restarts VMs | Start it only if all three hold: PF12 passes (a `wwn-`/`nvme-eui` link for the disk under `/var/storage`), PF14 passes (`tsc` clocksource), **and** `findmnt -no SOURCE --target /var/storage` is not `/dev/mapper/*` (no LVM or device-mapper). PF12 walks down to the physical disk, so an LVM root on a disk with a `wwn-` link passes it, yet the control-plane health checks still fail on the device-mapper root and the host flaps to `unavailable` (F5, OPEN). UNVERIFIED on owned hardware. |
 | UPS | Ubicloud has no UPS integration | Use your UPS software (for example NUT) to shut the host down cleanly on low battery. Put the control plane and the router on the UPS too. UNVERIFIED. |
-| Control plane after its own reboot | `puma` and `respirate` run in tmux and do not restart | Run `bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh` again; it restarts them and skips finished steps |
+| Control plane after its own reboot | With the development bootstrap, `puma` and `respirate` run in tmux and do not restart | Run `bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh` again; it restarts them and skips finished steps. A packaged control plane (`install.sh`) starts them at boot under systemd |
 
 ### 3.11 BMC: Redfish only, no IPMI
 
