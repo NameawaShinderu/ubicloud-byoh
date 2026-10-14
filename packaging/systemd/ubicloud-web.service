@@ -15,6 +15,10 @@ WorkingDirectory=/opt/ubicloud/current
 EnvironmentFile=/etc/ubicloud/env
 EnvironmentFile=/opt/ubicloud/current/.release-env
 Environment=PATH=/opt/ubicloud/tools/bin:/usr/bin:/bin HOME=/var/lib/ubicloud
+# puma_config.rb binds 0.0.0.0 when BIND is unset. These defaults keep
+# puma on loopback if the env file lacks BIND; a BIND or PORT in the env
+# file still overrides them, as EnvironmentFile= wins over Environment=.
+Environment=BIND=127.0.0.1 PORT=3000
 ExecStart=/opt/ubicloud/tools/bin/bundle exec puma -C puma_config.rb
 Restart=always
 RestartSec=2

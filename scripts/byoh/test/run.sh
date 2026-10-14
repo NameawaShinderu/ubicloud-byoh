@@ -288,6 +288,20 @@ sc_smoke() {
   # shellcheck disable=SC2016 # expanded by the inner bash
   out=$(dx smoke bash -c 'cat /proc/$(systemctl show -p MainPID --value ubicloud-respirate)/status | grep NoNewPrivs')
   [[ $out == *1 ]] || fail "respirate without NoNewPrivs: $out"
+
+  # Without BIND and PORT in the env file, the unit's defaults keep puma
+  # on loopback (puma_config.rb alone would bind 0.0.0.0).
+  dx smoke cp -p /etc/ubicloud/env /root/env.orig
+  dx smoke sed -i '/^BIND=/d; /^PORT=/d' /etc/ubicloud/env
+  dx smoke systemctl restart ubicloud-web
+  wait_for 120 web_up smoke >/dev/null || fail "smoke: web down without BIND"
+  out=$(dx smoke ss -Htln | grep -E ':3000\b' || true)
+  [[ $out == *"127.0.0.1:3000"* && $out != *"0.0.0.0:3000"* && $out != *"[::]:3000"* ]] ||
+    fail "without BIND, puma listens on: $out"
+  dx smoke cp -p /root/env.orig /etc/ubicloud/env
+  dx smoke systemctl restart ubicloud-web
+  wait_for 120 web_up smoke >/dev/null || fail "smoke: web down after restoring the env"
+  say "smoke: without BIND in the env file, puma listens on 127.0.0.1:3000 only"
   journal_clean smoke "$since"
   say "smoke: ok"
 }
