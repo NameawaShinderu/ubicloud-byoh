@@ -1,6 +1,11 @@
 [Unit]
 Description=Ubicloud backup (database and encrypted secrets)
-PartOf=ubicloud.target
+# Not PartOf=ubicloud.target, unlike the timer: stopping or restarting
+# the target must not kill a backup halfway through its dump, or start
+# it over. ubicloud-admin's lock keeps a backup apart from a restore.
+# Until ubicloud-admin is installed (WP6), a timer run is skipped rather
+# than failed, so the system does not go degraded at 03:15.
+ConditionFileIsExecutable=/usr/local/bin/ubicloud-admin
 Wants=postgresql@16-main.service
 After=postgresql@16-main.service
 

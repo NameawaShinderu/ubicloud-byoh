@@ -1,5 +1,7 @@
 [Unit]
 Description=Daily Ubicloud backup
+# Stopping ubicloud.target stops this timer too, so no backup runs until
+# the target is started again.
 PartOf=ubicloud.target
 
 [Timer]

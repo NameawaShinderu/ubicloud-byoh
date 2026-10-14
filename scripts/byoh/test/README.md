@@ -34,10 +34,10 @@ database, `/etc/ubicloud/env` and the units. `scripts/byoh/install.sh`
 | Scenario | Checks |
 |---|---|
 | `envfmt` | systemd's `EnvironmentFile=` and bash's `set -a; . F` read the `KEY='value'` lines of `/etc/ubicloud/env` the same way. The run fails if the set of differing cases changes. |
-| `verify` | `systemd-analyze verify` is clean. web and respirate are ordered after `postgresql@16-main` and `network-online.target` without `Requires=`. Monitor is installed but disabled. Writes the `systemd-analyze security` report. |
+| `verify` | `systemd-analyze verify` is clean (apart from the missing `ubicloud-admin`, until WP6). web and respirate are ordered after `postgresql@16-main` and `network-online.target` without `Requires=`. Monitor is installed but disabled. Without `ubicloud-admin`, `ubicloud-backup.service` is skipped on its condition, not failed. Writes the `systemd-analyze security` report. |
 | `smoke` | Every unit is active. An account is created and logs in over the two-step login. puma listens only on 127.0.0.1:3000. The release is read-only to `ubicloud`. web has no capabilities and respirate runs with NoNewPrivs. The journal has no Ruby errors. |
 | `kill` | A: SIGKILL to the respirate child; restarter keeps its PID and respawns within 4 s. B: `systemctl kill -s KILL`; a new MainPID within 5 s. Both: a strand runs within 150 s. |
-| `restart` | `systemctl restart ubicloud.target`. A stop while a child runs ends with `Result=success`. A stop while restarter sleeps between children ends quickly, with no ESRCH and no leftover process. |
+| `restart` | `systemctl restart ubicloud.target`. A stop while a child runs ends with `Result=success`. A stop while restarter sleeps between children ends quickly, with no ESRCH and no leftover process. A running backup (a stand-in drop-in) survives a restart and a stop of the target, and the stop pauses the timer. |
 | `reboot` | `docker restart`: the target starts at boot, web answers, and strands run. A real VM reboot is UNVERIFIED. |
 
 ## Results (2026-10-14, systemd 255.4-1ubuntu8.17)
@@ -72,6 +72,12 @@ Ranges cover two full runs.
   strand ran. A real VM reboot is UNVERIFIED.
 - **Hardening:** every directive in the units was kept. `systemd-analyze
   security` rates web and respirate 3.5 ("OK").
+- **Backup:** a running backup is not stopped or restarted with the
+  target, because `ubicloud-backup.service` is not `PartOf` it. Its timer
+  is, so stopping the target pauses scheduled backups until the target
+  starts again. Until WP6 installs `ubicloud-admin`, the service is
+  skipped on `ConditionFileIsExecutable=`, so the 03:15 run does not
+  leave the system degraded.
 
 ## Findings for `install.sh` (WP4)
 

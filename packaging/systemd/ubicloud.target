@@ -1,6 +1,8 @@
 # The BYOH packaged control plane. "systemctl start|stop|restart
 # ubicloud.target" acts on every service below; each of them is PartOf
-# this target. ubicloud-monitor is shipped but not wanted here until M9.
+# this target, except ubicloud-backup.service, which a stop or restart
+# leaves to finish (its timer is PartOf). ubicloud-monitor is shipped
+# but not wanted here until M9.
 [Unit]
 Description=Ubicloud control plane
 Wants=ubicloud-web.service ubicloud-respirate.service ubicloud-backup.timer

@@ -223,6 +223,14 @@ sc_verify() {
     fail "ubicloud-monitor is not disabled"
   [[ $(dx verify systemctl is-active ubicloud-monitor || true) == inactive ]] ||
     fail "ubicloud-monitor is running"
+  # Until WP6 installs ubicloud-admin, a backup run is skipped, not failed.
+  dx verify test ! -e /usr/local/bin/ubicloud-admin || fail "verify: ubicloud-admin exists, update this check"
+  dx verify systemctl start ubicloud-backup.service || fail "verify: starting ubicloud-backup failed"
+  [[ $(dx verify systemctl show -p ConditionResult --value ubicloud-backup.service) == no ]] ||
+    fail "verify: ubicloud-backup did not skip on its condition"
+  [[ $(dx verify systemctl is-failed ubicloud-backup.service || true) != failed ]] ||
+    fail "verify: ubicloud-backup failed"
+  say "verify: ubicloud-backup without ubicloud-admin is skipped, not failed"
   say "verify: ok"
 }
 
@@ -337,10 +345,41 @@ sc_restart() {
   dx restart systemctl start ubicloud-respirate
   poke_strand restart
   wait_for 60 strand_ran restart >/dev/null || fail "restart: no strand after the pause stop"
-  assert_active restart
+
   journal_clean restart "$since"
+
+  sc_restart_backup
+  assert_active restart
   say "restart: ok"
 }
+
+# A backup that runs survives a restart and a stop of the target. A
+# drop-in stands in for ubicloud-admin (WP6) with a sleep.
+sc_restart_backup() {
+  local inv
+  dx restart bash -c 'mkdir -p /run/systemd/system/ubicloud-backup.service.d &&
+    printf "[Unit]\nConditionFileIsExecutable=\n[Service]\nExecStart=\nExecStart=/bin/sleep 300\n" \
+      >/run/systemd/system/ubicloud-backup.service.d/harness.conf && systemctl daemon-reload'
+  dx restart systemctl start --no-block ubicloud-backup.service
+  wait_for 10 backup_active restart >/dev/null || fail "restart: the stand-in backup did not start"
+  inv=$(dx restart systemctl show -p InvocationID --value ubicloud-backup.service)
+  dx restart systemctl restart ubicloud.target
+  backup_active restart || fail "restart: a target restart stopped the running backup"
+  [[ $(dx restart systemctl show -p InvocationID --value ubicloud-backup.service) == "$inv" ]] ||
+    fail "restart: a target restart started the backup over"
+  dx restart systemctl stop ubicloud.target
+  backup_active restart || fail "restart: a target stop stopped the running backup"
+  [[ $(dx restart systemctl is-active ubicloud-backup.timer || true) == inactive ]] ||
+    fail "restart: a target stop left the backup timer running"
+  dx restart systemctl start ubicloud.target
+  # systemctl warns that the timer can trigger the service again.
+  dx restart systemctl stop ubicloud-backup.service 2>/dev/null
+  dx restart bash -c 'rm -r /run/systemd/system/ubicloud-backup.service.d && systemctl daemon-reload'
+  wait_for 120 web_up restart >/dev/null || fail "restart: web down after the backup checks"
+  say "restart: a running backup survived a target restart and stop; the stop paused the timer"
+}
+# A oneshot service is "activating" while its ExecStart runs.
+backup_active() { [[ $(dx "$1" systemctl is-active ubicloud-backup.service) == activating ]]; }
 
 sc_reboot() {
   local t since
