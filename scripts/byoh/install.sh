@@ -30,8 +30,10 @@
 #
 # Exit status: 0 on success, 1 on a failure, 2 on a usage error or when
 # the run would change something it must not change silently (another
-# rev for an existing version, another version than the current one, a
-# setting that differs from the flags).
+# rev for an existing version, another version than the current one,
+# other tools than the current release runs on, a setting that differs
+# from the flags), or would start the units while another process holds
+# the port or a development control plane lives on the machine.
 #
 # Docs: docs/byoh/INSTALL.md (flags, settings), docs/byoh/OPERATIONS.md.
 set -euo pipefail
@@ -61,7 +63,7 @@ readonly MISE_SHA256=d24fe0bf7e613824ad99f7b8dac3f2b381a37b9f75f84dd250855217095
 readonly PACKAGES=(
   postgresql-16 age
   build-essential libssl-dev libyaml-dev zlib1g-dev libffi-dev libpq-dev
-  git curl jq
+  git curl jq iproute2
 )
 readonly BUNDLE_WITHOUT='test:rubocop:aws_kms:gcp_kms:aws_rds_iam:gcp_cloudsql_iam'
 # MemTotal of a machine sold as 4 GiB is a little lower, because the
@@ -86,10 +88,11 @@ usage_die() { die "$1" 2; }
 # --- arguments -------------------------------------------------------------
 
 STAGE=all
-VERSION="" URL="" TLS="" ADMIN_EMAIL="" MAIL_FROM_ARG="" RACK_ENV_ARG=""
+VERSION="" URL="" URL_PORT="" TLS="" ADMIN_EMAIL="" MAIL_FROM_ARG="" RACK_ENV_ARG=""
 SRC_TARBALL="" SRC_REV="" SRC_GIT="" SRC_REF=""
 SMTP_FILE="" BILLING_DIR="" BACKUP_TARGET="" BACKUP_RECIPIENT="" BACKUP_RECIPIENT_FILE=""
 NO_START=0
+EFFECTIVE_PORT=3000
 declare -A SKIP_CHECK=() UPDATE_ENV=()
 
 need_arg() { [[ $# -ge 2 && -n $2 ]] || usage_die "$1 needs a value"; }
@@ -146,10 +149,12 @@ validate_args() {
     [[ -z $SRC_GIT && -z $SRC_REF ]] || usage_die "give --source-tarball or --source-git, not both"
     [[ -f $SRC_TARBALL ]] || usage_die "--source-tarball $SRC_TARBALL is not a file"
     [[ $SRC_REV =~ ^[0-9a-f]{7,64}$ ]] || usage_die "--source-tarball needs --source-rev, a git commit or tree id"
+    SRC_TARBALL=$(absolute "$SRC_TARBALL")
   elif [[ -n $SRC_GIT ]]; then
     [[ -z $SRC_REV ]] || usage_die "--source-rev goes with --source-tarball; use --ref with --source-git"
     [[ -d $SRC_GIT ]] || usage_die "--source-git $SRC_GIT is not a directory"
     [[ -n $SRC_REF ]] || usage_die "--source-git needs --ref"
+    SRC_GIT=$(absolute "$SRC_GIT")
   else
     usage_die "give a source: --source-git DIR --ref REF, or --source-tarball F --source-rev REV"
   fi
@@ -160,8 +165,11 @@ validate_args() {
     usage_die "--version must be letters, digits, '.', '_', '+' or '-' (such as v0.1.0)"
   case $TLS in
     none)
-      [[ $URL =~ ^http://localhost(:[0-9]{1,5})?/?$ ]] ||
-        usage_die "--tls none serves plain http on 127.0.0.1 only, so --url must be http://localhost[:port]"
+      # The port is required: BASE_URL must name the port puma listens
+      # on, which check_settings compares with PORT.
+      [[ $URL =~ ^http://localhost:([1-9][0-9]{0,4})/?$ ]] ||
+        usage_die "--tls none serves plain http on 127.0.0.1 only, so --url must be http://localhost:PORT (such as http://localhost:3000)"
+      URL_PORT=${BASH_REMATCH[1]}
       ;;
     acme | provided | tunnel) usage_die "--tls $TLS is not set up by this build yet; use --tls none" ;;
     "") usage_die "--tls is required (none)" ;;
@@ -177,8 +185,10 @@ validate_args() {
     [[ -f $SMTP_FILE ]] || usage_die "--smtp-file $SMTP_FILE is not a file"
     (($(stat -L -c '%#a' "$SMTP_FILE") & 077)) &&
       usage_die "--smtp-file $SMTP_FILE is readable by group or other; chmod 600 it"
+    SMTP_FILE=$(absolute "$SMTP_FILE")
   fi
   [[ -z $BILLING_DIR || -d $BILLING_DIR ]] || usage_die "--billing-rates-dir $BILLING_DIR is not a directory"
+  [[ -z $BILLING_DIR ]] || BILLING_DIR=$(absolute "$BILLING_DIR")
 
   case $BACKUP_TARGET in
     s3://*) usage_die "s3:// backup targets come with E5; give a directory" ;;
@@ -193,7 +203,12 @@ validate_args() {
     usage_die "--backup-recipient must be an age public key (age1...)"
   [[ -z $BACKUP_RECIPIENT_FILE || -f $BACKUP_RECIPIENT_FILE ]] ||
     usage_die "--backup-recipient-file $BACKUP_RECIPIENT_FILE is not a file"
+  [[ -z $BACKUP_RECIPIENT_FILE ]] || BACKUP_RECIPIENT_FILE=$(absolute "$BACKUP_RECIPIENT_FILE")
 }
+
+# absolute PATH: PATH made absolute, so that it means the same after a
+# later cd (fetch_source runs git from /).
+absolute() { realpath -e -- "$1" 2>/dev/null || usage_die "cannot resolve $1"; }
 
 valid_email() { [[ $1 =~ ^[^@[:space:]\'\\]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; }
 
@@ -341,6 +356,20 @@ tools_current() {
     "$TOOLS/bin/bundle" -v >/dev/null 2>&1
 }
 
+# check_tools: exits 2 before anything changes when this source wants
+# other tools than the current release runs on. Every release runs on
+# /opt/ubicloud/tools/bin, and bin/restarter starts a new respirate
+# through it every hour, so rebuilding the tools changes the interpreter
+# under the running services: that belongs to a release switch.
+check_tools() {
+  [[ -f $CURRENT/mise.toml ]] || return 0
+  local ruby node
+  ruby=$(sed -n 's/^ruby = "\(.*\)"$/\1/p' "$CURRENT/mise.toml")
+  node=$(sed -n 's/^node = "\(.*\)"$/\1/p' "$CURRENT/mise.toml")
+  [[ $ruby == "$RUBY_V" && $node == "$NODE_V" ]] ||
+    usage_die "the current release runs ruby $ruby and node $node, and this source wants ruby $RUBY_V and node $NODE_V; the tools are shared, so changing them is a release switch, see docs/byoh/OPERATIONS.md (release switch)"
+}
+
 step_tools() {
   if tools_current; then
     report ok "tools: ruby $RUBY_V, node $NODE_V"
@@ -416,11 +445,16 @@ plan_env() {
   want MAIL_FROM flag "$MAIL_FROM_ARG"
   if [[ -n $SMTP_FILE ]]; then
     want MAIL_DRIVER flag smtp
-    local line re="^([A-Z_]+)='([^']*)'$"
+    local line re="^([A-Z_]+)='([^']*)'$" k
     while IFS= read -r line; do
       [[ $line =~ $re ]] || die "bin/byoh-smtp-url printed an unexpected line"
       want "${BASH_REMATCH[1]}" flag "${BASH_REMATCH[2]}"
     done <<<"$SMTP_LINES"
+    # A URL without credentials must not leave the old ones in place:
+    # wanted empty, they conflict, or go with --update-env.
+    for k in SMTP_USER SMTP_PASSWORD; do
+      [[ -n ${KIND[$k]+x} ]] || want "$k" flag ""
+    done
   else
     want MAIL_DRIVER default logger
   fi
@@ -474,6 +508,15 @@ check_settings() {
   if [[ ! -e $ENV_FILE ]] && database_has_schema; then
     die "database ubicloud has a schema but $ENV_FILE is missing; restore the env file from the secrets backup (it holds CLOVER_COLUMN_ENCRYPTION_KEY) before running install.sh"
   fi
+  # BASE_URL must name the port puma listens on (PORT, 3000 unless the
+  # env file says otherwise).
+  EFFECTIVE_PORT=3000
+  if [[ -e $ENV_FILE ]]; then
+    kv_read "$ENV_FILE"
+    EFFECTIVE_PORT=${KV[PORT]:-3000}
+  fi
+  [[ -z $URL_PORT || $URL_PORT == "$EFFECTIVE_PORT" ]] ||
+    usage_die "--url names port $URL_PORT, but puma listens on PORT $EFFECTIVE_PORT"
   if [[ -e $BACKUP_CONF ]]; then
     plan_backup
     diff_settings "$BACKUP_CONF"
@@ -490,9 +533,19 @@ check_settings() {
   exit 2
 }
 
+# A stopped server is not an empty one: postgres is started (step 5
+# starts it anyway) and a database that cannot be queried is a refusal,
+# never "no schema". Called in a condition, so set -e is off in here.
 database_has_schema() {
-  systemctl -q is-active "$PG_UNIT" 2>/dev/null &&
-    [[ $(runuser -u postgres -- psql -X -tA -d ubicloud -c "SELECT to_regclass('public.schema_migrations') IS NOT NULL" 2>/dev/null) == t ]]
+  local db schema
+  systemctl start "$PG_UNIT" || die "cannot start $PG_UNIT to check for an existing database ubicloud"
+  wait_postgres
+  db=$(psql_value -c "SELECT 1 FROM pg_database WHERE datname = 'ubicloud'") ||
+    die "cannot query $PG_UNIT for an existing database ubicloud"
+  [[ -n $db ]] || return 1
+  schema=$(psql_value -d ubicloud -c "SELECT to_regclass('public.schema_migrations') IS NOT NULL") ||
+    die "cannot tell whether database ubicloud has a schema; $ENV_FILE is missing, so install.sh stops"
+  [[ $schema == t ]]
 }
 
 # write_settings FILE HEADER: applies ADD/REPLACE/REMOVE to FILE (as
@@ -794,11 +847,28 @@ EOF
     db_changes+=("pg_hba/pg_ident")
   fi
   step_listen db_changes
+  warn_trust
   if ((${#db_changes[@]})); then
     report changed "database: ${db_changes[*]}"
   else
     report ok "database: roles, ubicloud, extensions, peer map"
   fi
+}
+
+# The managed block keeps logins to database ubicloud peer-only, but a
+# trust rule or a login superuser elsewhere (as the development bootstrap
+# leaves them) still lets any local user reach a superuser, and a
+# superuser can reach ubicloud, for example with COPY ... TO PROGRAM as
+# the postgres OS user. That stays until the operator removes them, so
+# install.sh warns on every run (M3-e; migrate-from-dev retires them).
+warn_trust() {
+  local lines supers
+  lines=$(psql_value -c "SELECT string_agg(line_number::text, ',' ORDER BY line_number) FROM pg_hba_file_rules WHERE auth_method = 'trust'")
+  [[ -z $lines ]] ||
+    report warn "database: $PG_CONF/pg_hba.conf line(s) $lines use trust; any local user can log in to the databases they cover, and a superuser there can reach ubicloud"
+  supers=$(psql_value -c "SELECT string_agg(rolname, ',' ORDER BY rolname) FROM pg_roles WHERE rolsuper AND rolcanlogin AND rolname <> 'postgres'")
+  [[ -z $supers ]] ||
+    report warn "database: role(s) $supers are superusers that can log in; a superuser can reach ubicloud"
 }
 
 # put_block FILE BLOCK top|bottom: makes BLOCK the only "# BEGIN
@@ -875,6 +945,25 @@ step_migrate() {
     report ok "migrations: none pending ($after applied)"
   else
     report changed "migrations: $before -> $after applied (schema_migrations/schema_migrations_password)"
+  fi
+}
+
+# check_start: exits 2 before anything changes when this run would start
+# the units while something else serves the port, or while a development
+# control plane (scripts/byoh/bootstrap-ctrl-plane.sh) lives on this
+# machine. Its tmux puma holds 0.0.0.0:3000: the packaged web would loop
+# on EADDRINUSE, then take the port over when the tmux puma stops.
+check_start() {
+  ((NO_START)) && return 0
+  [[ $(systemctl is-active ubicloud.target 2>/dev/null || true) == active ]] && return 0
+  local m
+  for m in /root/.ubi-bootstrap /home/*/.ubi-bootstrap; do
+    [[ ! -d $m ]] ||
+      usage_die "$m exists, so a development control plane lives on this machine; install with --no-start and move it with scripts/byoh/migrate-from-dev.sh"
+  done
+  if [[ $(systemctl is-active ubicloud-web 2>/dev/null || true) != active &&
+    -n $(ss -Htln "sport = :$EFFECTIVE_PORT") ]]; then
+    usage_die "something already listens on port $EFFECTIVE_PORT (ss -tlnp 'sport = :$EFFECTIVE_PORT'); stop it, or install with --no-start"
   fi
 }
 
@@ -996,6 +1085,11 @@ main() {
 
   step_checks
   fetch_source
+  # The release and tools checks need only the source, so they run
+  # before the packages and the tools change anything. With them passed,
+  # step_tools can change the tools only where no release runs on them.
+  [[ $STAGE == tools ]] || check_release
+  check_tools
   step_packages
   step_tools
   [[ $STAGE == tools ]] && {
@@ -1003,9 +1097,11 @@ main() {
     return 0
   }
 
+  # These need postgres and the tools (the SMTP parser) from the steps
+  # above, which are the same as the current release's by now.
   read_smtp
-  check_release
   check_settings
+  check_start
 
   ensure_users
   step_release
