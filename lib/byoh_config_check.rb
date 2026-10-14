@@ -163,7 +163,9 @@ class ByohConfigCheck
       ok("client IP: from the connection (no TLS front)")
     end
   rescue URI::InvalidURIError
-    # base_url reports the invalid URL.
+    # In production, base_url fails on the URL; elsewhere it checks
+    # nothing, so report it here.
+    warning("BASE_URL #{Config.base_url.inspect} is not a valid URL, so the client IP check cannot tell whether a TLS front is in use") unless @production
   end
 
   def loopback?(host)

@@ -159,6 +159,14 @@ RSpec.describe ByohConfigCheck do
         expect(messages(checker.check(production: true), "warn")).to eq ["IP_FROM_HEADER is unset, so behind a TLS front the audit logs record the front's address; set it to X-Real-IP (Caddy) or CF-Connecting-IP (cloudflared)"]
       end
 
+      it "reports an invalid BASE_URL without a header once: through base_url in production, here otherwise" do
+        allow(Config).to receive_messages(ip_from_header: nil, base_url: "https://cloud example.com")
+        expect(messages(checker.check(production: false), "warn")).to eq ["BASE_URL \"https://cloud example.com\" is not a valid URL, so the client IP check cannot tell whether a TLS front is in use"]
+        results = checker.check(production: true)
+        expect(messages(results, "fail")).to eq ["BASE_URL \"https://cloud example.com\" is not a valid URL"]
+        expect(results.map(&:message).grep(/client IP|IP_FROM_HEADER/)).to eq []
+      end
+
       it "takes the address from the connection without a header for http" do
         allow(Config).to receive_messages(ip_from_header: nil, base_url: "http://localhost:3000")
         expect(messages(checker.check(production: true), "ok")).to include "client IP: from the connection (no TLS front)"
