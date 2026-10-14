@@ -1013,7 +1013,8 @@ $procs" 2
     sleep 5
   done
   if [[ $n != 0 ]]; then
-    psql_value -d postgres -c "ALTER DATABASE \"$dev\" ALLOW_CONNECTIONS $allow" >/dev/null
+    # datallowconn reads t or f; ALTER DATABASE takes only true or false.
+    psql_value -d postgres -c "ALTER DATABASE \"$dev\" ALLOW_CONNECTIONS $([[ $allow == t ]] && echo true || echo false)" >/dev/null
     COPY_ARMED=0
     die "$n strand lease(s) in $dev are still held after $LEASE_WAIT s; a respirate may still run somewhere. Investigate; nothing was changed" 2
   fi
