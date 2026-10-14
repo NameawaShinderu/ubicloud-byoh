@@ -1,0 +1,15 @@
+[Unit]
+Description=Ubicloud backup (database and encrypted secrets)
+PartOf=ubicloud.target
+Wants=postgresql@16-main.service
+After=postgresql@16-main.service
+
+[Service]
+Type=oneshot
+# Runs as root: ubicloud-admin takes its lock, dumps as postgres and
+# encrypts /etc/ubicloud with the operator's age recipient.
+ExecStart=/usr/local/bin/ubicloud-admin backup now
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=yes

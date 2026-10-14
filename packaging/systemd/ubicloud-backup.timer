@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Ubicloud backup
+PartOf=ubicloud.target
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=ubicloud.target

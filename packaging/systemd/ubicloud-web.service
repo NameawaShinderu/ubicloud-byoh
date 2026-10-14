@@ -1,0 +1,45 @@
+[Unit]
+Description=Ubicloud web (puma)
+PartOf=ubicloud.target
+# Wants, not Requires: stopping or restarting postgres must not stop
+# or restart the control plane along with it.
+Wants=postgresql@16-main.service network-online.target
+After=postgresql@16-main.service network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ubicloud
+Group=ubicloud
+WorkingDirectory=/opt/ubicloud/current
+EnvironmentFile=/etc/ubicloud/env
+EnvironmentFile=/opt/ubicloud/current/.release-env
+Environment=PATH=/opt/ubicloud/tools/bin:/usr/bin:/bin HOME=/var/lib/ubicloud
+ExecStart=/opt/ubicloud/tools/bin/bundle exec puma -C puma_config.rb
+Restart=always
+RestartSec=2
+# Hardening. Every directive here was kept only after the container
+# harness (scripts/byoh/test/run.sh) booted, logged in and ran strands
+# with it. The release under /opt/ubicloud is read-only to the service;
+# all writable state lives under /var/lib/ubicloud.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ubicloud
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+# 0007, not 0077: ubicloud-migrate (group ubicloud) runs migrations
+# and restores, which rewrite var/ca_bundles under the same lock files.
+UMask=0007
