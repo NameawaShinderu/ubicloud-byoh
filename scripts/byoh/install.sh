@@ -36,7 +36,10 @@
 # The services take the client address from the header the front sets
 # (IP_FROM_HEADER): X-Real-IP for Caddy, CF-Connecting-IP for cloudflared.
 # Changing --tls on an installed control plane needs --update-env
-# TLS_FRONT (and BASE_URL); the old front is then stopped.
+# TLS_FRONT, IP_FROM_HEADER (unless it was unset) and BASE_URL (unless
+# the URL stays); the exit-2 message names them. The new front comes up
+# first, then the old one is stopped. With --no-start the old front is
+# left running and front.conf unchanged.
 #
 # --stage tools stops after the packages and the tools, which only needs
 # a source (for mise.toml). The default stage, all, also needs --version,
@@ -588,12 +591,24 @@ check_settings() {
     conflicts+=(BACKUP_RECIPIENTS)
   fi
   ((${#conflicts[@]} == 0)) && return 0
+  # A front switch changes TLS_FRONT, IP_FROM_HEADER (unless it was
+  # unset) and BASE_URL (unless the URL stays): name each one it needs.
+  local switch=""
   for k in "${conflicts[@]}"; do
-    if [[ $k == TLS_FRONT ]]; then
-      printf "install.sh: key TLS_FRONT differs; the front is --tls %s, and --update-env TLS_FRONT switches it to --tls %s (stopping the old one)\n" "$OLD_FRONT" "$TLS" >&2
-    else
-      printf "install.sh: key %s differs; edit with 'ubicloud-admin env set %s' or pass --update-env %s\n" "$k" "$k" "$k" >&2
-    fi
+    [[ $k != BASE_URL && $k != IP_FROM_HEADER && $k != TLS_FRONT ]] || switch+=" --update-env $k"
+  done
+  for k in "${conflicts[@]}"; do
+    case $k in
+      TLS_FRONT)
+        printf "install.sh: key TLS_FRONT differs; the front is --tls %s; to switch it to --tls %s (the old one stops once the new one runs), pass%s\n" "$OLD_FRONT" "$TLS" "$switch" >&2
+        ;;
+      IP_FROM_HEADER)
+        # Set by hand, the header could name one the front does not set,
+        # which clients could then choose.
+        printf "install.sh: key IP_FROM_HEADER differs; it follows --tls (X-Real-IP for acme and provided, CF-Connecting-IP for tunnel, unset for none), so change it only with the front: pass --update-env IP_FROM_HEADER with --tls\n" >&2
+        ;;
+      *) printf "install.sh: key %s differs; edit with 'ubicloud-admin env set %s' or pass --update-env %s\n" "$k" "$k" "$k" >&2 ;;
+    esac
   done
   exit 2
 }
@@ -1114,40 +1129,88 @@ check_cert() {
 
 has_existing_cloudflared() { [[ ! -e $UNIT_DIR/$CF_UNIT ]] && systemctl cat cloudflared.service >/dev/null 2>&1; }
 
+# A cloudflared.service that install.sh did not write and that runs or
+# starts at boot.
+foreign_cloudflared_live() {
+  systemctl cat cloudflared.service >/dev/null 2>&1 &&
+    [[ $(systemctl is-active cloudflared.service 2>/dev/null || true) == active ||
+      $(systemctl is-enabled cloudflared.service 2>/dev/null || true) == enabled ]]
+}
+
+# What check_front found out for step_front: the caddy version apt
+# would install, and the checked cloudflared package.
+CADDY_CANDIDATE="" CF_DEB=""
+
 # check_front: exits 2 before anything changes when the front cannot be
-# set up as asked.
+# set up as asked. Everything step_front could fail on short of a
+# broken package or service is checked here, so a switch never stops a
+# working front for one that cannot come up.
 check_front() {
   case $TLS in
     acme | provided)
       caddyfile_ours_or_stock ||
         usage_die "$CADDYFILE is neither the caddy package's nor one install.sh wrote; --tls $TLS would replace it, so move it away first or use --tls tunnel"
       [[ $TLS != provided ]] || check_cert
+      # cloudflared passes a client's X-Real-IP through unchanged, so
+      # while it forwards to puma, puma must not trust that header. This
+      # holds with --no-start too: the next restart applies the env file.
+      ! foreign_cloudflared_live ||
+        usage_die "cloudflared.service is running or enabled and forwards its tunnel to puma; with --tls $TLS puma trusts X-Real-IP, which tunnel clients could then set to any address in the audit logs. Stop and disable it (systemctl disable --now cloudflared.service) once $URL_HOST points at this machine, then run install.sh again"
       ((NO_START)) && return 0
       local out
       out=$(ss -Htlnp '( sport = :80 or sport = :443 )')
       if [[ -n $out ]] && grep -qv 'users:(("caddy"' <<<"$out"; then
         usage_die "something other than caddy listens on port 80 or 443 (ss -tlnp '( sport = :80 or sport = :443 )'); --tls $TLS needs both"
       fi
+      if [[ $(dpkg-query -W -f='${db:Status-Status}' caddy 2>/dev/null || true) != installed ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq || die "apt-get update failed"
+        CADDY_CANDIDATE=$(apt-cache policy caddy | sed -n 's/^ *Candidate: //p')
+        [[ -n $CADDY_CANDIDATE && $CADDY_CANDIDATE != "(none)" ]] ||
+          usage_die "no caddy package is available for --tls $TLS; enable the universe component (add-apt-repository universe) and run install.sh again"
+      fi
       ;;
     tunnel)
       [[ -n $CF_TOKEN_FILE ]] || has_existing_cloudflared || [[ -e $UNIT_DIR/$CF_UNIT ]] ||
         usage_die "--tls tunnel needs --cloudflared-token-file F (the tunnel token, mode 0600) on a machine without a cloudflared.service"
       if [[ -n $CF_TOKEN_FILE ]]; then
+        ! has_existing_cloudflared ||
+          usage_die "cloudflared.service exists and install.sh leaves it as it is, so it would never use --cloudflared-token-file; drop the flag, or remove that unit to let install.sh run its own tunnel"
         [[ $(tr -d '\n' <"$CF_TOKEN_FILE") =~ ^[A-Za-z0-9+/=_.-]{20,}$ ]] ||
           usage_die "--cloudflared-token-file $CF_TOKEN_FILE does not hold one tunnel token (the value is not shown)"
+      fi
+      ((NO_START)) && return 0
+      has_existing_cloudflared && return 0
+      if [[ $(dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null || true) != installed ]]; then
+        local arch
+        arch=$(dpkg --print-architecture)
+        [[ $arch == amd64 ]] ||
+          usage_die "install.sh pins cloudflared for amd64 only (this machine is $arch); install cloudflared yourself and run it as cloudflared.service"
+        CF_DEB=$WORK/cloudflared.deb
+        curl -fsSL --retry 3 -o "$CF_DEB" \
+          "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64.deb" ||
+          die "cannot download cloudflared $CLOUDFLARED_VERSION"
+        echo "$CLOUDFLARED_SHA256  $CF_DEB" | sha256sum -c --quiet ||
+          die "cloudflared $CLOUDFLARED_VERSION does not match its pinned sha256"
+      else
+        grep -q -- '--token-file' < <(cloudflared tunnel run --help 2>&1) ||
+          usage_die "the installed cloudflared has no tunnel run --token-file; install $CLOUDFLARED_VERSION or later"
       fi
       ;;
   esac
   return 0
 }
 
+# The new front comes up before the old one stops, and front.conf
+# records the switch last, so a run that dies leaves the old front
+# running and recorded. With --no-start nothing changes here: the old
+# front keeps serving the running services.
 step_front() {
-  plan_front
-  diff_settings "$FRONT_CONF"
-  write_settings "$FRONT_CONF" "# /etc/ubicloud/front.conf: the TLS front install.sh set up (--tls), KEY='value' per line." || true
-  [[ $OLD_FRONT == "$TLS" ]] || retire_front
   if ((NO_START)); then
-    [[ $TLS == none ]] || report skip "front: --tls $TLS not set up (--no-start)"
+    if [[ $OLD_FRONT != "$TLS" ]]; then
+      report skip "front: --tls $TLS not set up and --tls $OLD_FRONT left as it is (--no-start); a run without --no-start, with --update-env TLS_FRONT, switches it"
+    elif [[ $TLS != none ]]; then
+      report skip "front: --tls $TLS not set up (--no-start)"
+    fi
     [[ $TLS != tunnel ]] || ! has_existing_cloudflared || existing_cloudflared
     return 0
   fi
@@ -1156,10 +1219,15 @@ step_front() {
     tunnel) front_tunnel ;;
     none) report ok "front: none; puma serves http on 127.0.0.1:$EFFECTIVE_PORT only" ;;
   esac
+  [[ $OLD_FRONT == "$TLS" ]] || retire_front
+  plan_front
+  diff_settings "$FRONT_CONF"
+  write_settings "$FRONT_CONF" "# /etc/ubicloud/front.conf: the TLS front install.sh set up (--tls), KEY='value' per line." || true
 }
 
 # Stops the front an earlier run set up for another --tls. An existing
-# cloudflared.service was never ours, so it is only mentioned.
+# cloudflared.service was never ours, so install.sh only warns about it
+# (check_front refuses Caddy next to it).
 retire_front() {
   case $OLD_FRONT in
     acme | provided)
@@ -1175,23 +1243,20 @@ retire_front() {
           systemctl disable --now -q "$CF_UNIT"
           report changed "front: stopped and disabled $CF_UNIT (was --tls tunnel); $CF_TOKEN is kept"
         fi
-      elif systemctl cat cloudflared.service >/dev/null 2>&1; then
-        report notice "front: cloudflared.service still runs the old tunnel; stop it yourself once nothing uses it"
+      elif foreign_cloudflared_live; then
+        report warn "front: cloudflared.service still forwards the old tunnel to puma; stop and disable it yourself once nothing uses it"
       fi
       ;;
   esac
 }
 
 front_caddy() {
-  local restart=0 cand
+  local restart=0
+  # check_front found the candidate.
   if [[ $(dpkg-query -W -f='${db:Status-Status}' caddy 2>/dev/null || true) != installed ]]; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    cand=$(apt-cache policy caddy | sed -n 's/^ *Candidate: //p')
-    [[ -n $cand && $cand != "(none)" ]] ||
-      die "no caddy package is available; enable the universe component (add-apt-repository universe) and run install.sh again"
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends caddy >/dev/null
     restart=1
-    report changed "front: installed caddy $cand"
+    report changed "front: installed caddy $CADDY_CANDIDATE"
   fi
   if [[ $TLS == provided ]]; then
     local changed=0
@@ -1280,19 +1345,15 @@ front_tunnel() {
       report ok "front: tunnel token in $CF_TOKEN"
     fi
   fi
+  # check_front refused a token file next to an existing unit.
   if has_existing_cloudflared; then
     existing_cloudflared
     return 0
   fi
-  local arch
-  arch=$(dpkg --print-architecture)
-  [[ $arch == amd64 ]] || die "install.sh pins cloudflared for amd64 only (this machine is $arch); install cloudflared yourself and run it as cloudflared.service"
+  # check_front checked the architecture and downloaded and checked the
+  # package.
   if [[ $(dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null || true) != installed ]]; then
-    curl -fsSL --retry 3 -o "$WORK/cloudflared.deb" \
-      "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64.deb"
-    echo "$CLOUDFLARED_SHA256  $WORK/cloudflared.deb" | sha256sum -c --quiet ||
-      die "cloudflared $CLOUDFLARED_VERSION does not match its pinned sha256"
-    dpkg -i "$WORK/cloudflared.deb" >/dev/null
+    dpkg -i "$CF_DEB" >/dev/null
     restart=1
     report changed "front: installed cloudflared $CLOUDFLARED_VERSION"
   fi
@@ -1331,6 +1392,10 @@ front_tunnel() {
 # line). It is never changed; install.sh only reports on it.
 existing_cloudflared() {
   report ok "front: cloudflared.service exists; install.sh leaves it as it is"
+  [[ $(systemctl is-active cloudflared.service 2>/dev/null || true) == active ]] ||
+    report warn "front: cloudflared.service is not running, so nothing serves $URL; start it (systemctl start cloudflared.service)"
+  [[ $(systemctl is-enabled cloudflared.service 2>/dev/null || true) == enabled ]] ||
+    report warn "front: cloudflared.service is not enabled, so the tunnel stays down after a reboot; enable it (systemctl enable cloudflared.service)"
   if [[ $(systemctl show -p ExecStart --value cloudflared.service) =~ (^|[[:space:]])--token([[:space:]]|=) ]]; then
     report warn "front: cloudflared.service passes the tunnel token on its command line, where every local user can read it (ps); move it to a 0600 file with --token-file"
   fi
@@ -1447,8 +1512,18 @@ main() {
   step_database
   step_env
   step_migrate
-  step_units
-  step_front
+  # The services restart with the new IP_FROM_HEADER in step_units.
+  # Caddy drops CF-Connecting-IP, so it comes up before that restart
+  # and the old tunnel stops before puma trusts X-Real-IP. cloudflared
+  # passes X-Real-IP through, so a tunnel comes up only after puma
+  # stopped trusting it.
+  if [[ $TLS == tunnel ]]; then
+    step_units
+    step_front
+  else
+    step_front
+    step_units
+  fi
   step_backup
 
   echo

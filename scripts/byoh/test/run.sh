@@ -1168,6 +1168,39 @@ sc_tls_provided() {
   [[ $(service_pids tlsp) == "$pids" && $(main_pid tlsp caddy) == "$cpid" ]] || fail "tls-provided: rerun restarted a service"
   say "tls-provided: a rerun changes nothing and restarts nothing"
 
+  # A reissued certificate (same key, 10 days left): the rerun warns,
+  # installs it and restarts caddy for it alone, and caddy serves it.
+  local serial
+  serial=$(dx tlsp bash -c 'cd /root/tls && openssl req -x509 -key key.pem -days 10 -subj /CN=cp.test \
+    -addext subjectAltName=DNS:cp.test -out cert.pem 2>/dev/null && openssl x509 -in cert.pem -noout -serial')
+  install_cp tlsp "${tls[@]}" >"$LOGS/tlsp-rotate.log" 2>&1 || fail "tls-provided: rotation rerun failed, see $LOGS/tlsp-rotate.log"
+  grep -q '^warn    front: --cert /root/tls/cert.pem expires within 30 days' "$LOGS/tlsp-rotate.log" ||
+    fail "tls-provided: no warning for a certificate with 10 days left"
+  out=$(grep '^changed ' "$LOGS/tlsp-rotate.log" | sed 's/ (until .*//' | tr '\n' '|')
+  [[ $out == "changed front: certificate for cp.test in /etc/ubicloud/tls|changed front: restarted caddy|" ]] ||
+    fail "tls-provided: the rotation changed: $out"
+  [[ $(main_pid tlsp caddy) != "$cpid" ]] || fail "tls-provided: caddy was not restarted for the new certificate"
+  [[ $(service_pids tlsp) == "$pids" ]] || fail "tls-provided: the rotation restarted web or respirate"
+  out=$(dx tlsp bash -c "openssl s_client -connect $ip:443 -servername cp.test </dev/null 2>/dev/null | openssl x509 -noout -serial")
+  [[ $out == "$serial" ]] || fail "tls-provided: caddy serves $out, not the reissued $serial"
+  say "tls-provided: a reissued certificate warns at 10 days left, is installed and served, and restarts caddy only"
+
+  # The acme Caddyfile: install.sh's own render_caddyfile with --tls
+  # acme, parsed by the installed caddy. A real acme run is UNVERIFIED
+  # (it needs public DNS and Let's Encrypt).
+  dx tlsp bash -c "set -euo pipefail; CURRENT=/opt/ubicloud/current TLS_DIR=/etc/ubicloud/tls
+    TLS=acme URL_HOST=cp.test EFFECTIVE_PORT=3000 ADMIN_EMAIL=ops@example.test
+    source <(sed -n '/^render_caddyfile() {/,/^}/p' /art/install.sh)
+    render_caddyfile >/root/acme.Caddyfile
+    caddy adapt --adapter caddyfile --config /root/acme.Caddyfile 2>/dev/null" >"$LOGS/tlsp-acme.json" ||
+    fail "tls-provided: the acme Caddyfile does not adapt: $(dx tlsp cat /root/acme.Caddyfile)"
+  out=$(jq -c '[.admin.disabled, ([.. | objects | .email? // empty] | unique),
+    ([.. | objects | .headers?.request? // empty | ((.set // {}) | to_entries[] | "set \(.key)=\(.value[0])"), ((.delete // [])[] | "delete \(.)")] | map(ascii_downcase))]' "$LOGS/tlsp-acme.json" 2>&1)
+  [[ $out == '[true,["ops@example.test"],["set x-real-ip={http.request.remote.host}","delete cf-connecting-ip"]]' ]] ||
+    fail "tls-provided: the acme config is $out"
+  dx tlsp grep -q 'auto_https' /root/acme.Caddyfile && fail "tls-provided: the acme Caddyfile turns off automatic certificates"
+  say "tls-provided: the acme Caddyfile adapts with admin off, the --admin-email ACME account, X-Real-IP set and CF-Connecting-IP dropped"
+
   # Back to --tls none: the changed keys exit 2 by name, and with
   # --update-env caddy stops and IP_FROM_HEADER goes.
   rc=0
@@ -1176,6 +1209,10 @@ sc_tls_provided() {
   out=$(grep -o 'key [A-Z_]* differs' "$LOGS/tlsp-none.log" | sort | tr '\n' ' ')
   [[ $out == "key BASE_URL differs key IP_FROM_HEADER differs key TLS_FRONT differs " ]] ||
     fail "tls-provided: switching to none named: $out"
+  grep -qx 'install.sh: key TLS_FRONT differs; the front is --tls provided; to switch it to --tls none (the old one stops once the new one runs), pass --update-env BASE_URL --update-env IP_FROM_HEADER --update-env TLS_FRONT' "$LOGS/tlsp-none.log" ||
+    fail "tls-provided: the switch message: $(grep TLS_FRONT "$LOGS/tlsp-none.log")"
+  grep -q "^install.sh: key IP_FROM_HEADER differs; it follows --tls" "$LOGS/tlsp-none.log" ||
+    fail "tls-provided: IP_FROM_HEADER is not tied to --tls: $(grep IP_FROM_HEADER "$LOGS/tlsp-none.log")"
   install_cp tlsp --update-env BASE_URL --update-env IP_FROM_HEADER --update-env TLS_FRONT >"$LOGS/tlsp-none.log" 2>&1 ||
     fail "tls-provided: switching to none failed, see $LOGS/tlsp-none.log"
   grep -q '^changed front: stopped and disabled caddy (was --tls provided)$' "$LOGS/tlsp-none.log" ||
@@ -1219,13 +1256,18 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
   sums=$(dx tunnel sha256sum /etc/systemd/system/cloudflared.service)
   pid=$(main_pid tunnel cloudflared)
   local -a tun=(--url https://cp.example.test --tls tunnel)
+  dx tunnel bash -c 'install -d -m 0700 /root/tls && cd /root/tls &&
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 -subj /CN=cp.example.test \
+      -addext subjectAltName=DNS:cp.example.test -keyout key.pem -out cert.pem 2>/dev/null && chmod 600 key.pem &&
+    printf "%s\n" "eyJhIjoiaGFybmVzcy1kdW1teS10b2tlbiJ9-not-a-real-tunnel" >/root/cf.token && chmod 0600 /root/cf.token'
+  local -a prov=(--url https://cp.example.test --tls provided --cert /root/tls/cert.pem --key /root/tls/key.pem)
 
   rc=0
   install_cp tunnel "${tun[@]}" >"$LOGS/tunnel-existing.log" 2>&1 || rc=$?
   if [[ $rc != 2 ]] || ! grep -q 'key BASE_URL differs' "$LOGS/tunnel-existing.log"; then
     fail "tunnel: a new URL without --update-env exited $rc"
   fi
-  grep -q '^install.sh: key TLS_FRONT differs; the front is --tls none, and --update-env TLS_FRONT switches it to --tls tunnel' "$LOGS/tunnel-existing.log" ||
+  grep -qx 'install.sh: key TLS_FRONT differs; the front is --tls none; to switch it to --tls tunnel (the old one stops once the new one runs), pass --update-env BASE_URL --update-env TLS_FRONT' "$LOGS/tunnel-existing.log" ||
     fail "tunnel: the front switch is not named: $(cat "$LOGS/tunnel-existing.log")"
   install_cp tunnel "${tun[@]}" --update-env BASE_URL --update-env TLS_FRONT >"$LOGS/tunnel-existing.log" 2>&1 ||
     fail "tunnel: install.sh failed, see $LOGS/tunnel-existing.log"
@@ -1257,6 +1299,35 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
     fail "tunnel: the rerun touched cloudflared.service"
   say "tunnel: an existing cloudflared.service is left byte for byte and running, its argv token is warned about unprinted, IP_FROM_HEADER is CF-Connecting-IP"
 
+  # Next to that unit, Caddy would make puma trust an X-Real-IP the
+  # tunnel passes through, and a token file would never be used: both
+  # exit 2 and change nothing.
+  local before
+  before=$(settings_sums tunnel; dx tunnel cat /etc/ubicloud/front.conf)
+  rc=0
+  install_cp tunnel "${prov[@]}" --update-env IP_FROM_HEADER --update-env TLS_FRONT >"$LOGS/tunnel-caddy.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q 'cloudflared.service is running or enabled and forwards its tunnel to puma' "$LOGS/tunnel-caddy.log"; then
+    fail "tunnel: --tls provided next to a running cloudflared.service exited $rc: $(cat "$LOGS/tunnel-caddy.log")"
+  fi
+  rc=0
+  install_cp tunnel "${tun[@]}" --cloudflared-token-file /root/cf.token >"$LOGS/tunnel-unused-token.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q 'so it would never use --cloudflared-token-file' "$LOGS/tunnel-unused-token.log"; then
+    fail "tunnel: a token file next to cloudflared.service exited $rc: $(cat "$LOGS/tunnel-unused-token.log")"
+  fi
+  [[ $(settings_sums tunnel; dx tunnel cat /etc/ubicloud/front.conf) == "$before" && $(main_pid tunnel cloudflared) == "$pid" ]] ||
+    fail "tunnel: a refused run changed something"
+  dx tunnel test ! -e /etc/caddy || fail "tunnel: a refused run installed caddy"
+  say "tunnel: Caddy next to a running cloudflared.service, and a token file it would not use, exit 2 and change nothing"
+
+  # A stopped, disabled unit serves nothing: the run warns.
+  dx tunnel systemctl disable -q --now cloudflared
+  install_cp tunnel "${tun[@]}" >"$LOGS/tunnel-stopped.log" 2>&1 || fail "tunnel: rerun with a stopped unit failed"
+  if ! grep -q '^warn    front: cloudflared.service is not running, so nothing serves https://cp.example.test' "$LOGS/tunnel-stopped.log" ||
+    ! grep -q '^warn    front: cloudflared.service is not enabled' "$LOGS/tunnel-stopped.log"; then
+    fail "tunnel: no warning for a stopped, disabled cloudflared.service: $(grep front "$LOGS/tunnel-stopped.log")"
+  fi
+  say "tunnel: a stopped, disabled cloudflared.service is warned about"
+
   # A fresh tunnel.
   dx tunnel bash -c 'systemctl disable -q --now cloudflared && rm /etc/systemd/system/cloudflared.service && systemctl daemon-reload'
   rc=0
@@ -1264,7 +1335,7 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
   if [[ $rc != 2 ]] || ! grep -q 'needs --cloudflared-token-file' "$LOGS/tunnel-notoken.log"; then
     fail "tunnel: no token and no unit exited $rc"
   fi
-  dx tunnel bash -c 'printf "%s\n" "eyJhIjoiaGFybmVzcy1kdW1teS10b2tlbiJ9-not-a-real-tunnel" >/root/cf.token && chmod 0644 /root/cf.token'
+  dx tunnel chmod 0644 /root/cf.token
   rc=0
   install_cp tunnel "${tun[@]}" --cloudflared-token-file /root/cf.token >"$LOGS/tunnel-fresh.log" 2>&1 || rc=$?
   if [[ $rc != 2 ]] || ! grep -q 'chmod 600' "$LOGS/tunnel-fresh.log"; then
@@ -1290,6 +1361,63 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
   [[ $(dx tunnel ps -eo args) != *harness-dummy* ]] || fail "tunnel: the token is on a command line"
   [[ $(dx tunnel systemctl show -p ExecStart --value ubicloud-cloudflared) != *harness-dummy* ]] || fail "tunnel: the token is in the unit"
   say "tunnel: fresh: cloudflared $(dx tunnel cloudflared --version | awk '{ print $3 }') and ubicloud-cloudflared with the token as a credential; cloudflared says: $(grep -i token "$LOGS/tunnel-cloudflared.log" | tail -1 | cut -c1-160)"
+
+  # Reruns over ubicloud-cloudflared, with and without the token file,
+  # change no file. The dummy token keeps the unit from staying active,
+  # so each rerun starts it again; that start is the only change.
+  sums=$(settings_sums tunnel; dx tunnel cat /etc/ubicloud/cloudflared.token /etc/ubicloud/front.conf)
+  local args
+  for args in "--cloudflared-token-file /root/cf.token" ""; do
+    local -a extra=()
+    read -ra extra <<<"$args"
+    install_cp tunnel "${tun[@]}" "${extra[@]}" >"$LOGS/tunnel-fresh-rerun.log" 2>&1 ||
+      fail "tunnel: rerun '$args' failed, see $LOGS/tunnel-fresh-rerun.log"
+    out=$(grep '^changed ' "$LOGS/tunnel-fresh-rerun.log" | grep -vx 'changed front: started ubicloud-cloudflared.service' || true)
+    [[ -z $out ]] || fail "tunnel: rerun '$args' changed: $out"
+    [[ $(settings_sums tunnel; dx tunnel cat /etc/ubicloud/cloudflared.token /etc/ubicloud/front.conf) == "$sums" ]] ||
+      fail "tunnel: rerun '$args' changed a file"
+  done
+  say "tunnel: reruns over ubicloud-cloudflared, with and without the token file, change no file (the dummy token makes each start it again)"
+
+  # A switch to Caddy where no caddy package is available exits 2
+  # before anything changes, and the tunnel keeps running.
+  dx tunnel bash -c 'printf "Package: caddy\nPin: release *\nPin-Priority: -1\n" >/etc/apt/preferences.d/ubi-m3-no-caddy'
+  before=$(settings_sums tunnel; dx tunnel cat /etc/ubicloud/front.conf)
+  rc=0
+  install_cp tunnel "${prov[@]}" --update-env IP_FROM_HEADER --update-env TLS_FRONT >"$LOGS/tunnel-nocaddy.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q 'no caddy package is available for --tls provided' "$LOGS/tunnel-nocaddy.log"; then
+    fail "tunnel: a switch to caddy without a caddy package exited $rc: $(tail -5 "$LOGS/tunnel-nocaddy.log")"
+  fi
+  [[ $(settings_sums tunnel; dx tunnel cat /etc/ubicloud/front.conf) == "$before" ]] || fail "tunnel: the refused caddy switch changed a file"
+  [[ $(dx tunnel systemctl is-enabled ubicloud-cloudflared) == enabled && $(dx tunnel systemctl is-active ubicloud-cloudflared || true) != inactive ]] ||
+    fail "tunnel: the refused caddy switch stopped ubicloud-cloudflared"
+  dx tunnel rm /etc/apt/preferences.d/ubi-m3-no-caddy
+  say "tunnel: a switch to Caddy with no caddy package exits 2 and leaves the tunnel running"
+
+  # --no-start leaves the tunnel running and front.conf as it is; the
+  # real switch then needs only --update-env TLS_FRONT, and stops it.
+  install_cp tunnel --no-start --update-env BASE_URL --update-env IP_FROM_HEADER --update-env TLS_FRONT >"$LOGS/tunnel-nostart.log" 2>&1 ||
+    fail "tunnel: --no-start switch failed, see $LOGS/tunnel-nostart.log"
+  grep -q '^skip    front: --tls none not set up and --tls tunnel left as it is (--no-start)' "$LOGS/tunnel-nostart.log" ||
+    fail "tunnel: --no-start: $(grep front "$LOGS/tunnel-nostart.log")"
+  [[ $(dx tunnel systemctl is-enabled ubicloud-cloudflared) == enabled && $(dx tunnel systemctl is-active ubicloud-cloudflared || true) != inactive ]] ||
+    fail "tunnel: --no-start stopped ubicloud-cloudflared"
+  dx tunnel grep -qx "TLS_FRONT='tunnel'" /etc/ubicloud/front.conf || fail "tunnel: --no-start recorded the new front"
+  rc=0
+  install_cp tunnel >"$LOGS/tunnel-none.log" 2>&1 || rc=$?
+  out=$(grep '^install.sh: key' "$LOGS/tunnel-none.log" || true)
+  [[ $rc == 2 && $out == "install.sh: key TLS_FRONT differs; the front is --tls tunnel; to switch it to --tls none (the old one stops once the new one runs), pass --update-env TLS_FRONT" ]] ||
+    fail "tunnel: the switch to none after --no-start exited $rc: $out"
+  install_cp tunnel --update-env TLS_FRONT >"$LOGS/tunnel-none.log" 2>&1 || fail "tunnel: the switch to none failed, see $LOGS/tunnel-none.log"
+  grep -q '^changed front: stopped and disabled ubicloud-cloudflared.service (was --tls tunnel); /etc/ubicloud/cloudflared.token is kept$' "$LOGS/tunnel-none.log" ||
+    fail "tunnel: ubicloud-cloudflared was not stopped: $(grep front "$LOGS/tunnel-none.log")"
+  [[ $(dx tunnel systemctl is-enabled ubicloud-cloudflared || true) == disabled && $(dx tunnel systemctl is-active ubicloud-cloudflared || true) != active ]] ||
+    fail "tunnel: ubicloud-cloudflared still enabled or active"
+  dx tunnel test -s /etc/ubicloud/cloudflared.token || fail "tunnel: the token copy is gone"
+  dx tunnel grep -qx "TLS_FRONT='none'" /etc/ubicloud/front.conf || fail "tunnel: front.conf after the switch"
+  dx tunnel grep -q '^IP_FROM_HEADER=' /etc/ubicloud/env && fail "tunnel: IP_FROM_HEADER is still set"
+  wait_for 180 web_up tunnel >/dev/null || fail "tunnel: web down after the switch to none"
+  say "tunnel: --no-start leaves the tunnel up; the switch to none then needs --update-env TLS_FRONT only, stops ubicloud-cloudflared and keeps the token"
   journal_clean tunnel "$since"
   say "tunnel: ok (a real tunnel is UNVERIFIED)"
 }

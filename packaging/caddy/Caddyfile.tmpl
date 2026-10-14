@@ -12,7 +12,10 @@
 	@TLS@
 	# puma binds 127.0.0.1 only. X-Real-IP is set, never appended, from
 	# the connection, so a client cannot choose it (IP_FROM_HEADER).
+	# CF-Connecting-IP is dropped: in a switch from --tls tunnel, puma
+	# trusts it until the services restart.
 	reverse_proxy 127.0.0.1:@PORT@ {
 		header_up X-Real-IP {remote_host}
+		header_up -CF-Connecting-IP
 	}
 }
