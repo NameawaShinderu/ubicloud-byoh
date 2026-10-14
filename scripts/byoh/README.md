@@ -84,6 +84,19 @@ to `/usr/local/bin`. Run it as root:
 
 `ubicloud-admin --help` has the details.
 
+### Moving a development control plane (`migrate-from-dev.sh`)
+
+`migrate-from-dev.sh` moves a control plane that the development
+bootstrap set up (tmux, database `clover_test`) to the packaged layout,
+phase by phase: `preflight` (read-only), `install` (`/etc/ubicloud/env`
+from `.env.rb`, then `install.sh --no-start`), `copy-db`, `start`,
+`flip-production`, `rollback` and `retire`. The development database is
+copied, never changed, so a rollback restarts tmux against it as it was.
+Its SQL lives beside it: `migrate-role-map.sql`, `migrate-compare.sql`,
+`migrate-row-counts.sql`, `migrate-rollback-report.sql` and
+`migrate-retire.sql`. The runbook is `docs/byoh/MIGRATE_FROM_DEV.md`;
+`bash scripts/byoh/migrate-from-dev.sh --help` lists every flag.
+
 ## Usage — control plane (development bootstrap, labs only)
 
 ```bash

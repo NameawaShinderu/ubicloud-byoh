@@ -12,7 +12,8 @@
 #   run.sh SCENARIO...         run scenarios, each in a fresh container
 #
 # Scenarios: parity envfmt verify fresh rerun flags smoke kill restart
-# reboot tls-provided tunnel backup admin devshim gate-journal (or "all").
+# reboot tls-provided tunnel backup admin devshim gate-journal migrate
+# migrate-preM1 (or "all").
 # Logs go to $UBI_M3_LOGS (default: a fresh temp dir, printed at the
 # end). UBI_M3_KEEP=1 keeps the containers for inspection.
 set -euo pipefail
@@ -1697,16 +1698,21 @@ sshable_ok() { grep -qx ok <<<"$(adm "$1" console -e 'puts Sshable.first.cmd("ec
 # install.sh's and ubicloud-admin's copies of the env file format must
 # not drift apart.
 sc_parity() {
-  local f a b
+  local f a b c m=$WT/scripts/byoh/migrate-from-dev.sh
   a=$(sed -n '/^kv_read() {/,/^}/p' "$WT/scripts/byoh/install.sh")
   b=$(sed -n '/^kv_read() {/,/^}/p' "$WT/packaging/bin/ubicloud-admin")
-  [[ -n $a && $a == "$b" ]] || fail "parity: kv_read differs between install.sh and ubicloud-admin"
+  c=$(sed -n '/^kv_read() {/,/^}/p' "$m")
+  [[ -n $a && $a == "$b" && $a == "$c" ]] || fail "parity: kv_read differs between install.sh, ubicloud-admin and migrate-from-dev.sh"
   for f in "valid_value() " "readonly KEY_RE=" "readonly DENIED_KEY_RE=" "readonly LOCK="; do
     a=$(grep "^$f" "$WT/scripts/byoh/install.sh")
     b=$(grep "^$f" "$WT/packaging/bin/ubicloud-admin")
-    [[ -n $a && $a == "$b" ]] || fail "parity: $f differs between install.sh and ubicloud-admin"
+    c=$(grep "^$f" "$m")
+    [[ -n $a && $a == "$b" && $a == "$c" ]] || fail "parity: $f differs between install.sh, ubicloud-admin and migrate-from-dev.sh"
   done
-  say "parity: kv_read, valid_value, KEY_RE, DENIED_KEY_RE and LOCK match"
+  a=$(grep '^readonly INTERP_KEY_RE=' "$WT/packaging/bin/ubicloud-admin")
+  c=$(grep '^readonly INTERP_KEY_RE=' "$m")
+  [[ -n $a && $a == "$c" ]] || fail "parity: INTERP_KEY_RE differs between ubicloud-admin and migrate-from-dev.sh"
+  say "parity: kv_read, valid_value, KEY_RE, DENIED_KEY_RE and LOCK match in all three, INTERP_KEY_RE in ubicloud-admin and migrate-from-dev.sh"
 }
 
 sc_backup() {
@@ -2387,6 +2393,359 @@ sc_gate_journal() {
   say "gate-journal: ok"
 }
 
+# --- live migration from the development bootstrap (WP9) ------------------------------
+
+# R0 is the development control plane's revision. The live one is
+# fc693b1e0 unless the operator records another; aca70df27
+# (aws-mumbai-working-v1) is the pre-M1 schema with the 14-digit
+# generic-provider migration and Ruby 4.0.2.
+MIG_R0=${UBI_M3_R0:-fc693b1e0}
+MIG_PREM1=${UBI_M3_PREM1:-aca70df27}
+MIG_URL=https://cp.example.test
+MIG_SCRIPT=/home/ubuntu/ubicloud-m3/scripts/byoh/migrate-from-dev.sh
+MIG_FLAGS=(--dev-user ubuntu --version t1 --source-git /home/ubuntu/ubicloud-m3 --ref HEAD
+  --admin-email ops@example.test --backup-recipient-file /root/backup-recipient --skip-check clock)
+
+# mig NAME LOG PHASE [ARGS...]: migrate-from-dev.sh PHASE as root, output
+# to $LOGS/LOG; prints the exit status.
+mig() {
+  local name=$1 log=$2 rc=0
+  shift 2
+  dx "$name" bash -c 'cd / && bash "$@"' _ "$MIG_SCRIPT" "$@" >"$LOGS/$log" 2>&1 </dev/null || rc=$?
+  echo "$rc"
+}
+
+# dev_sh NAME RUBY CMD: CMD as ubuntu in ~/ubicloud with the development
+# PATH (the bootstrap's mise Ruby) and RACK_ENV=development.
+dev_sh() {
+  as_ubuntu "$1" "export PATH=\$HOME/.local/bin:\$HOME/.local/share/mise/installs/ruby/$2/bin:\$PATH RACK_ENV=development && cd ~/ubicloud && $3"
+}
+
+# The tmux commands of the development bootstrap (the same ones rollback
+# prints), run as ubuntu.
+r0_tmux_start() {
+  local p="/home/ubuntu/.local/bin:/home/ubuntu/.local/share/mise/installs/ruby/$2/bin"
+  as_ubuntu "$1" "tmux new-session -d -s puma \"cd /home/ubuntu/ubicloud && export PATH=$p:\\\$PATH && RACK_ENV=development bundle exec puma -C puma_config.rb > /tmp/puma.log 2> /tmp/puma.err\" &&
+    tmux new-session -d -s respirate \"cd /home/ubuntu/ubicloud && export PATH=$p:\\\$PATH && RACK_ENV=development bundle exec bin/respirate > /tmp/respirate.log 2> /tmp/respirate.err\""
+}
+
+dev_pids() { dx "$1" bash -c "ps -u ubuntu -o pid=,comm=,args= | awk '\$2 !~ /^tmux/ && (\$0 ~ /bin\\/respirate/ || \$0 ~ /puma/) { print \$1 }'"; }
+respirate_gone() { [[ -z $(dx "$1" bash -c "ps -u ubuntu -o comm=,args= | awk '\$1 !~ /^tmux/ && /bin\\/respirate/'") ]]; }
+
+# Stops the development control plane as the runbook says: respirate
+# first with C-c, waiting for it to exit (never a kill), then puma.
+r0_tmux_stop() {
+  local t
+  as_ubuntu "$1" 'tmux send-keys -t respirate C-c' || fail "$1: no tmux session respirate"
+  t=$(wait_for 150 respirate_gone "$1") || fail "$1: respirate did not exit within 150 s of C-c"
+  as_ubuntu "$1" 'tmux kill-session -t puma; tmux kill-session -t respirate 2>/dev/null; true'
+  wait_for 30 bash -c "[[ -z \$(docker exec ubi-m3-$1 ss -Htln 'sport = :3000') ]]" >/dev/null || fail "$1: port 3000 still in use after the tmux stop"
+  say "$1: development respirate exited ${t}s after C-c; puma stopped"
+}
+
+dev_web_up() { [[ $(dx "$1" curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/login) == 200 ]]; }
+
+# A stand-in for the live cloudflared.service: its token is on the
+# command line, and, like a tunnel connector, it keeps a connection open
+# to the origin in /etc/cf-origin, so preflight can see where it points.
+mig_cloudflared() {
+  dx "$1" bash -c "printf '%s\n' '$2' >/etc/cf-origin && cat >/usr/local/bin/cloudflared <<'EOF'
+#!/bin/bash
+# harness stand-in for cloudflared: holds connections to the origin
+while :; do
+  exec 3<>\"/dev/tcp/\$(cat /etc/cf-origin)/3000\" 2>/dev/null || true
+  sleep 2
+  exec 3>&- || true
+done
+EOF
+chmod 0755 /usr/local/bin/cloudflared && cat >/etc/systemd/system/cloudflared.service <<'EOF'
+[Unit]
+Description=cloudflared (harness stand-in)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token dummy-live-token-0123456789
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable -q cloudflared && systemctl restart cloudflared"
+}
+
+# mig_setup NAME R0 RUBY: a development control plane at R0 on
+# ubi-m3-tools, seeded and running in tmux:
+# - ~ubuntu/ubicloud: a git checkout of R0 (one commit), set up by its
+#   own bootstrap, with BASE_URL, BILLING_RATES_EXTRA_DIR, a BMC password
+#   variable, DB_POOL_WEB and IP_FROM_HEADER in .env.rb
+# - ~ubuntu/ubicloud-m3: a clone of it with this working tree committed
+#   on top (the runbook's separate clone)
+# - an account, a host registered by bin/register-byoh-host whose
+#   Sshable reaches ubi-m3-sshd and whose BMC names the password
+#   variable, its strand parked at wait for a day
+# - cloudflared.service (stand-in) pointing at the container's own
+#   address
+mig_setup() {
+  local name=$1 r0=$2 ruby=$3 t
+  stage_art
+  src_tarball
+  git -C "$WT" archive -o "$ART/r0.tgz" "$r0"
+  chmod a+r "$ART/r0.tgz"
+  start_sys "$name" ubi-m3-tools
+  backup_key "$name"
+  dx "$name" bash -c 'echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/90-ubuntu && chmod 0440 /etc/sudoers.d/90-ubuntu'
+  as_ubuntu "$name" "git config --global user.email harness@example.test && git config --global user.name harness &&
+    git config --global init.defaultBranch main && mkdir ubicloud && tar -xzf /art/r0.tgz -C ubicloud &&
+    cd ubicloud && git init -q && git add -A && git commit -qm 'R0 $r0' && cd ~ && git clone -q ubicloud ubicloud-m3 &&
+    cd ubicloud-m3 && git rm -rq . && tar -xzf /art/src.tgz && git add -A && git commit -qm M3" ||
+    fail "$name: cannot build the checkouts"
+  t=$(timed as_ubuntu "$name" "UBI_BASE_URL=$MIG_URL bash ~/ubicloud/scripts/byoh/bootstrap-ctrl-plane.sh >/tmp/dev-boot.log 2>&1") || {
+    dx "$name" cat /tmp/dev-boot.log >"$LOGS/$name-dev-boot.log"
+    fail "$name: the R0 bootstrap failed, see $LOGS/$name-dev-boot.log"
+  }
+  dx "$name" cat /tmp/dev-boot.log >"$LOGS/$name-dev-boot.log"
+  say "$name: R0 $r0 bootstrapped in ${t}s"
+  as_ubuntu "$name" "mkdir -p ~/ubicloud-billing-rates.d && cat >>~/ubicloud/.env.rb <<'EOF'
+ENV[\"BASE_URL\"] ||= \"$MIG_URL\"
+ENV[\"BILLING_RATES_EXTRA_DIR\"] ||= \"/home/ubuntu/ubicloud-billing-rates.d\"
+ENV[\"BYOH_BMC_PASS_TEST\"] ||= \"bmc-pass-harness-0123\"
+ENV[\"DB_POOL_WEB\"] ||= \"20\"
+ENV[\"IP_FROM_HEADER\"] ||= \"CF-Connecting-IP\"
+EOF"
+  start_sshd
+  # ubi-m3-tools has no ssh client; the sshd container makes the key.
+  docker exec ubi-m3-sshd bash -c 'ssh-keygen -q -t ed25519 -N "" -f /root/byoh_key && cat /root/byoh_key.pub >>/root/.ssh/authorized_keys' ||
+    fail "$name: ssh-keygen"
+  docker exec ubi-m3-sshd cat /root/byoh_key | dx "$name" bash -c 'install -m 0600 -o ubuntu -g ubuntu /dev/stdin /home/ubuntu/byoh_key' ||
+    fail "$name: cannot copy the host key"
+  local reg="bin/register-byoh-host --main-ip $SSHD_IP --ssh-key /home/ubuntu/byoh_key --bmc-endpoint https://192.0.2.10 --bmc-user admin --bmc-pass-env BYOH_BMC_PASS_TEST --default-boot-image ubuntu-noble --yes"
+  if [[ $r0 == "$MIG_PREM1" ]]; then
+    reg+=" --location byoh --routed-network 10.250.0.0/30"
+  else
+    dev_sh "$name" "$ruby" "bundle exec bin/byoh-location create --name mig-loc --rates-from hetzner-fsn1" >"$LOGS/$name-seed.log" 2>&1 ||
+      fail "$name: byoh-location create failed, see $LOGS/$name-seed.log"
+    reg+=" --location mig-loc"
+  fi
+  dev_sh "$name" "$ruby" "bundle exec $reg" >>"$LOGS/$name-seed.log" 2>&1 || fail "$name: register-byoh-host failed, see $LOGS/$name-seed.log"
+  # The strand waits instead of bootstrapping the stand-in host, whose
+  # sshd has only root (bootstrap_rhizome would create user rhizome).
+  dx "$name" runuser -u postgres -- psql -XtAq -d clover_test \
+    -c "UPDATE strand SET label = 'wait', schedule = now() + interval '1 day', try = 0 WHERE prog = 'Vm::HostNexus'" \
+    -c "UPDATE sshable SET unix_user = 'root'" >/dev/null || fail "$name: cannot park the host strand"
+  # shellcheck disable=SC2016 # Ruby code
+  dev_sh "$name" "$ruby" "bundle exec ruby --enable-frozen-string-literal -e 'require_relative \"loader\"; require \"argon2\"
+a = Account.create(email: ARGV[0], status_id: 2)
+DB[:account_password_hashes].insert(id: a.id, password_hash: Argon2::Password.new(secret: Config.clover_session_secret).create(ARGV[1]))
+a.create_project_with_default_policy(\"harness\")' $EMAIL $PASSWORD" >>"$LOGS/$name-seed.log" 2>&1 ||
+    fail "$name: account create failed, see $LOGS/$name-seed.log"
+  r0_tmux_start "$name" "$ruby" || fail "$name: the R0 tmux commands failed"
+  t=$(wait_for 180 dev_web_up "$name") || fail "$name: the development puma did not answer within 180 s"
+  local out
+  out=$(login "$name") || fail "$name: development login failed"
+  [[ $out == "302 "*/after-login ]] || fail "$name: development login: $out"
+  # shellcheck disable=SC2016 # Ruby code
+  out=$(dev_sh "$name" "$ruby" "bundle exec ruby --enable-frozen-string-literal -e 'require_relative \"loader\"; puts Sshable.first.cmd(\"echo ok\")'" 2>&1 | tail -1) || true
+  [[ $out == ok ]] || fail "$name: the development Sshable#cmd printed '$out'"
+  mig_cloudflared "$name" "$(dx "$name" hostname -I | awk '{ print $1 }')"
+  say "$name: development control plane at R0 runs in tmux (web after ${t}s); login and Sshable#cmd work; host, account and BMC variable seeded"
+}
+
+# Every key .env.rb sets is in /etc/ubicloud/env with the same value,
+# except the ones the move rewrites or drops. Compared in the container;
+# only key names come out.
+mig_env_matches() {
+  dx "$1" bash -s <<'EOF'
+set -euo pipefail
+envrb=/home/ubuntu/ubicloud/.env.rb
+bad=""
+for k in $(sed -n 's/^ENV\["\([A-Z0-9_]*\)"\] ||= ".*"$/\1/p' "$envrb" | sort -u); do
+  # The first ||= wins.
+  v=$(sed -n "s/^ENV\[\"$k\"\] ||= \"\(.*\)\"\$/\1/p" "$envrb" | head -1)
+  case $k in
+    CLOVER_DATABASE_URL) grep -qx "CLOVER_DATABASE_URL='postgres:///ubicloud?user=ubicloud'" /etc/ubicloud/env || bad+=" $k" ;;
+    RACK_ENV) grep -qx "RACK_ENV='development'" /etc/ubicloud/env || bad+=" $k" ;;
+    BILLING_RATES_EXTRA_DIR) grep -qx "BILLING_RATES_EXTRA_DIR='/var/lib/ubicloud/billing_rates.d'" /etc/ubicloud/env || bad+=" $k" ;;
+    *) grep -qxF "$k='$v'" /etc/ubicloud/env || bad+=" $k" ;;
+  esac
+done
+[[ -z $bad ]] || { echo "differ:$bad"; exit 1; }
+echo "keys: $(sed -n 's/^ENV\["\([A-Z0-9_]*\)"\] ||= ".*"$/\1/p' "$envrb" | sort -u | tr '\n' ' ')"
+EOF
+}
+
+# mig_cutover NAME RUBY PREM1: preflight (a refusal first), install,
+# copy-db (refused while tmux runs), the tmux stop, copy-db, a second
+# copy-db (refused), start, and the checks of a moved control plane.
+mig_cutover() {
+  local name=$1 ruby=$2 prem1=$3 rc out ubid t
+  rc=$(mig "$name" "$name-preflight-origin.log" preflight "${MIG_FLAGS[@]}")
+  { [[ $rc == 1 ]] && grep -q '^fatal   cloudflared: the tunnel reaches puma at 172\.' "$LOGS/$name-preflight-origin.log"; } ||
+    fail "$name: preflight with the tunnel origin on the container address gave $rc, see $LOGS/$name-preflight-origin.log"
+  dx "$name" bash -c 'echo 127.0.0.1 >/etc/cf-origin && systemctl restart cloudflared'
+  rc=$(mig "$name" "$name-preflight.log" preflight "${MIG_FLAGS[@]}")
+  [[ $rc == 0 ]] || fail "$name: preflight gave $rc, see $LOGS/$name-preflight.log"
+  grep -q '^ok      cloudflared: the tunnel.s origin is 127.0.0.1:3000' "$LOGS/$name-preflight.log" || fail "$name: preflight did not see the tunnel origin"
+  grep -q '^notice  cloudflared: token on the command line: yes' "$LOGS/$name-preflight.log" || fail "$name: preflight did not report the argv token"
+  grep -q '^ok      bmc: BYOH_BMC_PASS_TEST comes from .env.rb' "$LOGS/$name-preflight.log" || fail "$name: preflight did not find the BMC variable"
+  grep -q 'dummy-live-token\|bmc-pass-harness' "$LOGS/$name-preflight.log" && fail "$name: preflight printed a secret"
+  if ((prem1)); then
+    grep -q '^notice  schema: clover_test applied 20260412000000_add_generic_provider.rb' "$LOGS/$name-preflight.log" || fail "$name: preflight did not note the renamed migration"
+    grep -q '^notice  schema: copy-db runs [1-9][0-9]* pending migration' "$LOGS/$name-preflight.log" || fail "$name: preflight found no pending migrations"
+    grep -q '^notice  rhizome: rhizome/ changed since R0' "$LOGS/$name-preflight.log" || fail "$name: preflight missed the rhizome changes"
+  else
+    grep -q '^ok      schema: no pending migrations' "$LOGS/$name-preflight.log" || fail "$name: preflight found pending migrations at R0"
+    grep -q '^ok      rhizome: unchanged since R0' "$LOGS/$name-preflight.log" || fail "$name: preflight thinks rhizome changed"
+  fi
+  say "$name: preflight refuses a tunnel origin off loopback, then passes: $(grep -c '^warn' "$LOGS/$name-preflight.log") warn; $(grep '^ok      env: .env.rb sets' "$LOGS/$name-preflight.log")"
+
+  rc=$(mig "$name" "$name-install.log" install)
+  [[ $rc == 0 ]] || fail "$name: install gave $rc, see $LOGS/$name-install.log"
+  grep -q 'dummy-live-token\|bmc-pass-harness' "$LOGS/$name-install.log" && fail "$name: install printed a secret"
+  out=$(mig_env_matches "$name") || fail "$name: /etc/ubicloud/env does not hold .env.rb's keys: $out"
+  say "$name: install: $out are all in /etc/ubicloud/env, with the same values but the rewritten RACK_ENV, BILLING_RATES_EXTRA_DIR and database URL"
+  dx "$name" grep -qx "DB_POOL_WEB='20'" /etc/ubicloud/env || fail "$name: the imported DB_POOL_WEB did not take precedence"
+  dx "$name" grep -qx "IP_FROM_HEADER='CF-Connecting-IP'" /etc/ubicloud/env || fail "$name: IP_FROM_HEADER"
+  [[ $(dx "$name" stat -c '%U:%G %a' /etc/ubicloud/env) == "root:root 600" ]] || fail "$name: the env file is not root 0600"
+  if ((prem1 == 0)); then
+    [[ -n $(dx "$name" find /var/lib/ubicloud/billing_rates.d -name '*.yml') ]] || fail "$name: the billing rates were not copied"
+  fi
+  [[ $(dx "$name" systemctl is-enabled ubicloud.target || true) != enabled && $(dx "$name" systemctl is-active ubicloud-web || true) != active ]] ||
+    fail "$name: install started the packaged control plane"
+  dev_web_up "$name" || fail "$name: the development puma stopped answering during install"
+
+  rc=$(mig "$name" "$name-copy-busy.log" copy-db)
+  { [[ $rc == 2 ]] && grep -q 'the development control plane still runs' "$LOGS/$name-copy-busy.log"; } ||
+    fail "$name: copy-db with tmux running gave $rc, see $LOGS/$name-copy-busy.log"
+  r0_tmux_stop "$name"
+  rc=$(mig "$name" "$name-copy.log" copy-db)
+  [[ $rc == 0 ]] || fail "$name: copy-db gave $rc, see $LOGS/$name-copy.log"
+  for out in '^ok      copy-db: restored as ubicloud_restorer; row counts equal clover_test' \
+    '^ok      copy-db: owners, privileges and SECURITY DEFINER settings equal the reference' \
+    '^ok      copy-db: password hashes isolated' '^ok      copy-db: schema_migrations '; do
+    grep -q "$out" "$LOGS/$name-copy.log" || fail "$name: copy-db did not report: $out"
+  done
+  [[ $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT datallowconn FROM pg_database WHERE datname = 'clover_test'") == f ]] ||
+    fail "$name: clover_test still accepts connections"
+  [[ $(db_names "$name") == ubicloud ]] || fail "$name: databases after copy-db: $(db_names "$name")"
+  if ((prem1)); then
+    grep -q '^changed copy-db: renamed 20260412000000_add_generic_provider.rb' "$LOGS/$name-copy.log" || fail "$name: copy-db did not rename the migration"
+    [[ $(psql_q "$name" "SELECT count(*) FROM schema_migrations WHERE filename LIKE '20260412%generic%'") == 1 &&
+      $(dx "$name" runuser -u postgres -- psql -XtAq -d postgres -c "SELECT 1") == 1 ]] || fail "$name: the renamed migration"
+  fi
+  say "$name: copy-db: $(grep -E '^ok      copy-db: (migrations|owners|schema_migrations)' "$LOGS/$name-copy.log" | cut -c9- | tr '\n' ';')"
+  rc=$(mig "$name" "$name-copy-again.log" copy-db)
+  { [[ $rc == 2 ]] && grep -q 'holds a finished copy' "$LOGS/$name-copy-again.log"; } ||
+    fail "$name: a second copy-db gave $rc, see $LOGS/$name-copy-again.log"
+
+  rc=$(mig "$name" "$name-start.log" start)
+  [[ $rc == 0 ]] || fail "$name: start gave $rc, see $LOGS/$name-start.log"
+  grep -q "^ok      start: Sshable .* ($SSHD_IP) runs a command" "$LOGS/$name-start.log" || fail "$name: start did not run the Sshable"
+  if ((prem1)); then
+    grep -q '^changed start: install_rhizome started for vh' "$LOGS/$name-start.log" || fail "$name: start did not run install_rhizome"
+  else
+    grep -q 'install_rhizome' "$LOGS/$name-start.log" && fail "$name: start ran install_rhizome with rhizome unchanged"
+  fi
+  grep -q '^fail    postgres: pg_hba.conf line(s) .* use trust' "$LOGS/$name-start.log" || fail "$name: status did not report the bootstrap's trust rules"
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  [[ -z $(dx "$name" bash -c 'ss -Htln "sport = :3000" | awk "{ print \$4 }" | grep -v "^127.0.0.1:3000$"') ]] ||
+    fail "$name: something listens on a non-loopback address of port 3000"
+  out=$(login "$name") || fail "$name: login on the packaged web failed"
+  [[ $out == "302 "*/after-login ]] || fail "$name: login on the packaged web: $out"
+  sshable_ok "$name" || fail "$name: Sshable#cmd on the packaged control plane"
+  ubid=$(adm "$name" console -e 'puts VmHost.first.ubid' 2>/dev/null | grep '^vh' | tail -1)
+  adm "$name" console -e 'VmHost.first.incr_configure_metrics' >/dev/null 2>&1 || fail "$name: incr_configure_metrics"
+  # shellcheck disable=SC2016 # expanded by the container's bash
+  t=$(wait_for 60 dx "$name" bash -c "journalctl -u ubicloud-respirate --no-pager -o cat | grep -q '\"strand\":\"$ubid\"'") ||
+    fail "$name: the respirate journal does not show the host strand $ubid"
+  # configure_metrics fails on the stand-in host (no systemd there); its
+  # retries stop for a day, and rollback lists the strand at that label.
+  psql_q "$name" "UPDATE strand SET schedule = now() + interval '1 day', try = 0 WHERE prog = 'Vm::HostNexus'" >/dev/null
+  say "$name: start: login with the development account, Sshable#cmd, and the host strand $ubid in the respirate journal after ${t}s"
+}
+
+sc_migrate() {
+  local name=mig ruby=4.0.7 rc out t cmds
+  mig_setup "$name" "$MIG_R0" "$ruby"
+  mig_cutover "$name" "$ruby" 0
+
+  # Rollback to R0, across a reboot.
+  rc=$(mig "$name" "$name-rollback.log" rollback)
+  [[ $rc == 0 ]] || fail "$name: rollback gave $rc, see $LOGS/$name-rollback.log"
+  grep -q '^> .* Vm::HostNexus configure_metrics' "$LOGS/$name-rollback.log" || fail "$name: rollback did not list the host strand's move"
+  docker restart -t 60 "ubi-m3-$name" >/dev/null
+  wait_booted "$name"
+  [[ $(dx "$name" systemctl is-enabled ubicloud.target || true) == disabled && $(dx "$name" systemctl is-active ubicloud-web || true) == inactive ]] ||
+    fail "$name: ubicloud.target came back after the reboot"
+  cmds=$(sed -n '/^--- R0 commands/,/^--- end ---/p' "$LOGS/$name-rollback.log" | sed '1d;$d')
+  [[ $(wc -l <<<"$cmds") == 2 ]] || fail "$name: rollback printed no R0 commands"
+  printf '%s\n' "$cmds" | dx "$name" runuser -u ubuntu -- env -i HOME=/home/ubuntu USER=ubuntu LANG=C.UTF-8 PATH=/usr/bin:/bin bash -s ||
+    fail "$name: the R0 commands failed"
+  t=$(wait_for 180 dev_web_up "$name") || fail "$name: the development puma did not come back"
+  out=$(login "$name") || fail "$name: development login after rollback failed"
+  [[ $out == "302 "*/after-login ]] || fail "$name: development login after rollback: $out"
+  # shellcheck disable=SC2016 # Ruby code
+  out=$(dev_sh "$name" "$ruby" "bundle exec ruby --enable-frozen-string-literal -e 'require_relative \"loader\"; puts Sshable.first.cmd(\"echo ok\")'" 2>&1 | tail -1) || true
+  [[ $out == ok ]] || fail "$name: the development Sshable#cmd after rollback printed '$out'"
+  say "$name: rollback: target disabled across docker restart; the printed R0 commands serve clover_test again (web after ${t}s), login and Sshable#cmd work"
+
+  # Re-cutover: copy-db over the finished copy needs the flag.
+  r0_tmux_stop "$name"
+  rc=$(mig "$name" "$name-recopy-refused.log" copy-db)
+  { [[ $rc == 2 ]] && grep -q 'i-understand-this-drops-live-data' "$LOGS/$name-recopy-refused.log"; } ||
+    fail "$name: copy-db over a finished copy gave $rc"
+  rc=$(mig "$name" "$name-recopy.log" copy-db --i-understand-this-drops-live-data)
+  [[ $rc == 0 ]] || fail "$name: the second copy-db gave $rc, see $LOGS/$name-recopy.log"
+  [[ $(db_names "$name") == "ubicloud ubicloud_prev_"* ]] || fail "$name: the old copy was not kept: $(db_names "$name")"
+  rc=$(mig "$name" "$name-restart.log" start)
+  [[ $rc == 0 ]] || fail "$name: the second start gave $rc, see $LOGS/$name-restart.log"
+  say "$name: re-cutover: copy-db refuses a finished copy without the flag, keeps it as ubicloud_prev_* with it, and start passes"
+
+  # Window B: flip-production refuses on a simulated-production fail.
+  dx "$name" sed -i '/^MAIL_FROM=/d' /etc/ubicloud/env
+  rc=$(mig "$name" "$name-flip-refused.log" flip-production)
+  { [[ $rc == 2 ]] && grep -q 'MAIL_FROM is unset' "$LOGS/$name-flip-refused.log"; } ||
+    fail "$name: flip-production without MAIL_FROM gave $rc, see $LOGS/$name-flip-refused.log"
+  dx "$name" grep -qx "RACK_ENV='development'" /etc/ubicloud/env || fail "$name: the refused flip changed RACK_ENV"
+  dx "$name" bash -c "echo \"MAIL_FROM='ops@example.test'\" >>/etc/ubicloud/env"
+  rc=$(mig "$name" "$name-flip.log" flip-production)
+  [[ $rc == 0 ]] || fail "$name: flip-production gave $rc, see $LOGS/$name-flip.log"
+  dx "$name" grep -qx "RACK_ENV='production'" /etc/ubicloud/env || fail "$name: RACK_ENV is not production"
+  grep -q '^ok      smoke: bin/production_check (a production puma boots' "$LOGS/$name-flip.log" ||
+    fail "$name: the flip's step 12 did not run production_check: $(grep smoke "$LOGS/$name-flip.log" | tr '\n' ' ')"
+  wait_for 120 web_up "$name" >/dev/null || fail "$name: web down after the flip"
+  out=$(login "$name") || fail "$name: login in production failed"
+  [[ $out == "302 "*/after-login ]] || fail "$name: login in production: $out"
+  adm "$name" smoke >"$LOGS/$name-smoke-prod.log" 2>&1 || fail "$name: smoke after the flip, see $LOGS/$name-smoke-prod.log"
+  say "$name: flip-production refuses without MAIL_FROM (exit 2, RACK_ENV unchanged), then flips; production_check, login and smoke pass"
+
+  # Retire.
+  rc=$(mig "$name" "$name-retire-early.log" retire --restore-drill-done)
+  { [[ $rc == 2 ]] && grep -q 'retire after 14' "$LOGS/$name-retire-early.log"; } || fail "$name: retire without 14 backups gave $rc"
+  rc=$(mig "$name" "$name-retire.log" retire --restore-drill-done --skip-backup-count)
+  [[ $rc == 0 ]] || fail "$name: retire gave $rc, see $LOGS/$name-retire.log"
+  grep -q 'use trust' "$LOGS/$name-retire.log" && fail "$name: status still reports trust after retire"
+  [[ $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT rolsuper || ' ' || rolcanlogin FROM pg_roles WHERE rolname = 'clover'") == "false false" ]] ||
+    fail "$name: role clover can still log in or is a superuser"
+  [[ $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT count(*) FROM pg_database WHERE datname LIKE 'clover_test_retired_%'") == 1 &&
+    $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT count(*) FROM pg_database WHERE datname = 'clover_test'") == 0 ]] ||
+    fail "$name: clover_test was not renamed"
+  [[ -z $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT 1 FROM pg_hba_file_rules WHERE auth_method = 'trust'") ]] || fail "$name: trust rules remain"
+  dx "$name" test -d /home/ubuntu/.ubi-bootstrap && fail "$name: the bootstrap markers were not moved aside"
+  adm "$name" status >"$LOGS/$name-status-retired.log" 2>&1 || fail "$name: status after retire, see $LOGS/$name-status-retired.log"
+  say "$name: retire needs 14 backups (or --skip-backup-count), then restores peer/scram, makes clover NOLOGIN NOSUPERUSER, keeps clover_test as clover_test_retired_*; status passes"
+  say "migrate: ok"
+}
+
+sc_migrate_preM1() {
+  local name=migp ruby
+  ruby=$(git -C "$WT" show "$MIG_PREM1:.tool-versions" | awk '$1 == "ruby" { print $2 }')
+  mig_setup "$name" "$MIG_PREM1" "$ruby"
+  mig_cutover "$name" "$ruby" 1
+  [[ $(dx "$name" runuser -u postgres -- psql -XtAc "SELECT count(*) FROM pg_database WHERE datname = 'clover_test' AND NOT datallowconn") == 1 ]] ||
+    fail "$name: clover_test changed"
+  say "migrate-preM1: ok"
+}
+
 sc_reboot() {
   local t since
   boot_cp reboot
@@ -2413,8 +2772,8 @@ for arg in "$@"; do
     --prepare-image) prepare_image ;;
     --prepare-tools) prepare_tools ;;
     --prepare-release) prepare_release ;;
-    all) for s in parity envfmt verify fresh rerun flags smoke kill restart reboot tls_provided tunnel backup admin devshim gate_journal; do "sc_$s"; cleanup; done ;;
-    parity | envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot | tls-provided | tunnel | backup | admin | devshim | gate-journal)
+    all) for s in parity envfmt verify fresh rerun flags smoke kill restart reboot tls_provided tunnel backup admin devshim gate_journal migrate migrate_preM1; do "sc_$s"; cleanup; done ;;
+    parity | envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot | tls-provided | tunnel | backup | admin | devshim | gate-journal | migrate | migrate-preM1)
       "sc_${arg//-/_}"
       cleanup
       ;;
