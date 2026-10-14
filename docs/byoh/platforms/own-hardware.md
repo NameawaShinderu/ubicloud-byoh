@@ -53,7 +53,7 @@ The data plane must be a **dedicated machine**. Registration logs in as root, re
 | Root filesystem ext4 or xfs | `mkdir -p /var/storage; findmnt -no FSTYPE --target /var/storage` (without the `mkdir`, `findmnt` prints nothing and exits 1 on a fresh host) | btrfs and ZFS make every VM prep fail with `ENOENT` (STOR-5, OPEN) |
 | Extra disks mounted **before** registration | `findmnt /var/storage/devices/<name>` | Mount each at `/var/storage/devices/<name>` with `UUID=` in fstab. Never mount anything over `/var/storage` afterwards (OPS-9). |
 | Wired uplink with a static address | `ip -br -4 addr; ip route show default` | Only the main IP is local (contract C5). DHCP on the host is fine only with a reservation; the main IP must not change. Wi-Fi uplinks are UNVERIFIED. |
-| Outbound HTTPS | `curl -sfI https://github.com && curl -sfI https://cloud-images.ubuntu.com` | PrepHost and boot image downloads |
+| Outbound HTTPS, and HTTP to cloud-images-archive.ubuntu.com | `curl -sfI https://github.com && curl -sfI https://cloud-images.ubuntu.com`, plus the image URL of [PLATFORMS.md](../PLATFORMS.md) PF15 with `-L` | PrepHost and boot image downloads (the pinned Ubuntu releases redirect to the archive host over plain HTTP) |
 | No other firewall manager | `systemctl is-active docker ufw tailscaled k3s libvirtd` | Their rules are wiped on every VM create and destroy (NH-6, OPEN) |
 | No NVIDIA GPU in an IOMMU group (unless you want GPU VMs only) | `lspci -vnmm -d 10de:: \| grep IOMMUGroup` | LearnPci records NVIDIA devices that have an IOMMU group, and the allocator then excludes the host from every non-GPU VM (`scheduling/allocator.rb`, `non_gpu` filter; VR-4, OPEN) |
 

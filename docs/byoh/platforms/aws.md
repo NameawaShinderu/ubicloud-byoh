@@ -49,7 +49,7 @@ Avoid AWS when:
 | 1G hugepages | The `pdpe1gb` CPU flag (present on m8i) | `grep -cw pdpe1gb /proc/cpuinfo` |
 | Memory | Any size. Since a0259a997, LearnMemory accepts every dmidecode unit, so a whole number of GiB is no longer required (unit specs only, UNVERIFIED on a host). m8i sizes are whole GiB anyway. | `sudo dmidecode -t memory \| grep Size:` |
 | Disk | EBS gp3 root (`data_root_size_gb`, default 120). VM disks live under `/var/storage` on the root filesystem. | `df -h /var/storage` |
-| Outbound internet | Public subnet with an internet gateway, and a public IP on the data plane | `curl -sI https://cloud-images.ubuntu.com` |
+| Outbound internet | Public subnet with an internet gateway, and a public IP on the data plane | `curl -sI https://cloud-images.ubuntu.com`; boot images also need HTTP (80) to cloud-images-archive.ubuntu.com ([PLATFORMS.md](../PLATFORMS.md) PF15) |
 | Only the primary IP on the NIC | Handled by the cloud-init fix in `user-data-data.sh` (§3.3) | `ip -br -4 addr` |
 
 **Instance choice:**

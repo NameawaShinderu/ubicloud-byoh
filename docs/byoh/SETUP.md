@@ -38,7 +38,7 @@ The control plane and the data plane can be on different platforms. The only cou
 | 1G hugepages | `grep -c pdpe1gb /proc/cpuinfo` > 0 | Guest: pass the host CPU model |
 | Memory in whole GiB | `sudo dmidecode -t memory \| grep Size:` shows `GB` | On the published `byoh-driver` (17d383a9c), LearnMemory fails "unexpected dmidecode unit". `m2-network` (a0259a997) accepts kB/MB/GB/TB ([platforms/README.md](platforms/README.md) §3) |
 | Not a hybrid (P+E core) CPU, SMT on | `lscpu` | Every VM fails with `BUG` (PLATFORMS.md HW-6, HW-7) |
-| Outbound internet | `curl -sI https://cloud-images.ubuntu.com` | PrepHost and boot image downloads fail |
+| Outbound internet | `curl -sI https://cloud-images.ubuntu.com` and `curl -sfIL https://cloud-images.ubuntu.com/releases/noble/release-20250502.1/ubuntu-24.04-server-cloudimg-amd64.img` (it redirects to `http://cloud-images-archive.ubuntu.com`, so port 80 too) | PrepHost and boot image downloads fail |
 | One uplink address only | `ip -br -4 addr` shows only the main IP | Pool addresses on the NIC steal VM traffic (C5) |
 | Nothing else managing nftables | no Docker, ufw, Tailscale, k3s, libvirt | Their rules are flushed on every VM create and destroy (NH-6) |
 | Disks | VM disks live under `/var/storage` on the root filesystem | Mount extra disks at `/var/storage/devices/<name>` **before** registration; never mount over `/var/storage` afterwards |

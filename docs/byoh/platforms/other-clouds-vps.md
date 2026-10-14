@@ -90,7 +90,7 @@ The same rules as every platform (PLATFORMS.md §1, SETUP.md §2). These matter 
 
 | Item | Requirement |
 |---|---|
-| Outbound internet | HTTPS to github.com and cloud-images.ubuntu.com for PrepHost and boot images. On clouds where egress is not the default (Azure after 2025-09-30, private OCI subnets), add a NAT gateway or a public IP. |
+| Outbound internet | HTTPS to github.com and cloud-images.ubuntu.com, and HTTP (80) to cloud-images-archive.ubuntu.com (the pinned Ubuntu releases redirect there), for PrepHost and boot images. On clouds where egress is not the default (Azure after 2025-09-30, private OCI subnets), add a NAT gateway or a public IP. |
 | Pool addresses | At least one free IPv4 address of the right exposure per VM with IPv4. A VM without IPv4 (`ubi vm … create -6`) needs no pool. |
 | Provider firewall | Allow all traffic to the pool addresses (DigitalOcean Cloud Firewall, Vultr firewall group, OCI security list / NSG, Scaleway security group, OVH network firewall). Allow SSH to the host's main IP only from the control plane and your admin IPs. |
 | Virtual MACs | None on any pool address (Scaleway flexible IP virtual MAC, OVH vMAC). |

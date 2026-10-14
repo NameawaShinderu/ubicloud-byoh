@@ -126,7 +126,8 @@ ls -l /dev/kvm                                  # must exist
 grep -c pdpe1gb /proc/cpuinfo                   # > 0
 sudo dmidecode -t memory | grep -E '^\s+Size:'   # sizes in GB; MB means the memory is not a GiB multiple
 ip -br -4 addr                                  # only lo and 10.80.0.20/24 on the NIC (ens18 or enp6s18)
-curl -sI https://cloud-images.ubuntu.com >/dev/null && echo egress ok
+curl -sI https://cloud-images.ubuntu.com >/dev/null &&
+  curl -sfIL https://cloud-images.ubuntu.com/releases/noble/release-20250502.1/ubuntu-24.04-server-cloudimg-amd64.img >/dev/null && echo egress ok  # ends at http://cloud-images-archive.ubuntu.com
 ```
 
 ---

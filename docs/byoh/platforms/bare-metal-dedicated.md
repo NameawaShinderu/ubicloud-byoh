@@ -51,7 +51,7 @@ Use a rented dedicated server when you want public IPv4 per VM with no NAT and n
 |---|---|
 | Main IPv4 configured by the installer, and nothing else | `ip -br -4 addr` shows only the main IP. **Never put pool IPs on the NIC (C5)**, even when the provider's own docs tell you to add an additional or failover IP to the network config. Since M2, VM setup on a BYOH host fails with "… is a local address of this host" when you do |
 | Pool addresses routed to the main IP | Provider-side. The driver never changes upstream routing |
-| Outbound HTTPS | PrepHost downloads cloud-hypervisor and htcat; boot images come from cloud-images.ubuntu.com |
+| Outbound HTTPS, and HTTP to cloud-images-archive.ubuntu.com | PrepHost downloads cloud-hypervisor and htcat; boot images come from cloud-images.ubuntu.com, which redirects the pinned releases to the archive host over plain HTTP |
 | Provider firewall open for the pools | Hetzner Robot firewall: off, or allow everything to the pool addresses (NETWORKING §9.5). Any other provider-side firewall in front of the server: the same (UNVERIFIED) |
 | IPv6 (optional) | One /64. Hetzner routes the server's /64 to the NIC's link-local address (provider docs, UNVERIFIED here), so declare it without `ndp`. OVH: an on-link /64 needs `,ndp`. OVH High Grade and Scale servers get a /56, so declare one /64 out of it. Kimsufi gets a single /128, so no /64 can be declared (provider docs, UNVERIFIED here) |
 
