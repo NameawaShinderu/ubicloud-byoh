@@ -91,8 +91,13 @@ RSpec.describe ByohAccountCli do
 
     it "refuses an existing email, case-insensitively, but allows reusing a closed account's email" do
       expect(cli("create", "--email", "dup@example.com")[0]).to eq 0
-      expect(cli("create", "--email", "DUP@example.com")).to eq [1, "", "! an account with email DUP@example.com already exists\n"]
+      expect(cli("create", "--email", "DUP@example.com")).to eq [1, "", "! cannot create account DUP@example.com: email is already taken\n"]
       expect(Account.where(email: "dup@example.com").count).to eq 1
+      expect(DB[:byoh_operator_action].count).to eq 1
+      expect(DB[:account_password_hashes].count).to eq 1
+
+      Account.create(email: "pending@example.com", status_id: 1)
+      expect(cli("create", "--email", "pending@example.com")).to eq [1, "", "! cannot create account pending@example.com: email is already taken\n"]
 
       Account.first(email: "dup@example.com").update(status_id: 3)
       expect(cli("create", "--email", "dup@example.com")[0]).to eq 0

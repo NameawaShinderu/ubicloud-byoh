@@ -37,7 +37,6 @@ class ByohAccountCli
 
   # account_statuses: 1 unverified, 2 verified, 3 closed.
   VERIFIED = 2
-  OPEN_STATUSES = [1, 2].freeze
   STATUS_NAMES = {1 => "pending", 2 => "verified"}.freeze
 
   # The account name when --name is not given and the email's local part
@@ -102,11 +101,17 @@ class ByohAccountCli
     end
 
     hash = Argon2::Password.new(**HASH_COST, secret: Config.clover_session_secret).create(password)
-    account = DB.transaction do
-      if Account.where(email:, status_id: OPEN_STATUSES).any?
-        raise Error, "an account with email #{email} already exists"
-      end
+    account = create_account(email:, name:, hash:, opts:)
 
+    @out.puts "Created account #{account.ubid} (#{email}) with project #{account.default_project.ubid} (#{opts[:project]})."
+    @out.puts "Password: #{password}" if generated
+  end
+
+  # The accounts unique index on open accounts' emails (case-insensitive)
+  # refuses a duplicate atomically, so concurrent creates cannot both
+  # win; the model reports it as "email is already taken".
+  def create_account(email:, name:, hash:, opts:)
+    DB.transaction do
       account = Account.create(email:, name:, status_id: VERIFIED)
       DB[:account_password_hashes].insert(id: account.id, password_hash: hash)
       begin
@@ -117,9 +122,8 @@ class ByohAccountCli
       ByohOperatorLog.record(command: "byoh-account create", target_id: account.id, args: {"email" => email, "project" => opts[:project]}, result: "ok")
       account
     end
-
-    @out.puts "Created account #{account.ubid} (#{email}) with project #{account.default_project.ubid} (#{opts[:project]})."
-    @out.puts "Password: #{password}" if generated
+  rescue Sequel::ValidationFailed => e
+    raise Error, "cannot create account #{email}: #{e.message}"
   end
 
   def cmd_list(argv)
