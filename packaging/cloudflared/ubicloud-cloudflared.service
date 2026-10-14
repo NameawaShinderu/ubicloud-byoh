@@ -1,0 +1,33 @@
+# Installed by scripts/byoh/install.sh --tls tunnel when the machine has
+# no cloudflared.service of its own. The tunnel token is a systemd
+# credential: root owns /etc/ubicloud/cloudflared.token (0600), and the
+# token never appears on a command line or in this file.
+[Unit]
+Description=Ubicloud control plane tunnel (cloudflared)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run --token-file %d/token
+LoadCredential=token:/etc/ubicloud/cloudflared.token
+DynamicUser=yes
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

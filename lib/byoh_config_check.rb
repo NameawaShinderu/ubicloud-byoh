@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "find"
+require "ipaddr"
 require "optparse"
 require "time"
 require "uri"
@@ -86,6 +87,7 @@ class ByohConfigCheck
       *preflight,
       pry_opt_in,
       base_url,
+      client_ip,
       *mail,
       boot_images,
       *billing_rates_dir,
@@ -139,6 +141,36 @@ class ByohConfigCheck
     else
       ok("BASE_URL #{Config.base_url}")
     end
+  end
+
+  # M3-m: behind a TLS front, puma sees the front's address, so the
+  # audit logs record 127.0.0.1 unless IP_FROM_HEADER names the header
+  # the front sets. A header is only trustworthy when nothing but the
+  # front can reach puma, so puma must bind a loopback address (BIND,
+  # read the same way as puma_config.rb).
+  def client_ip
+    bind = @env["BIND"] || "0.0.0.0"
+    if (header = Config.ip_from_header)
+      if loopback?(bind)
+        ok("client IP: from the #{header} header; puma binds #{bind}, so only the local TLS front can set it")
+      else
+        message = "IP_FROM_HEADER is #{header} but puma binds #{bind}, so any client that reaches puma directly sets its own audit-log IP; set BIND=127.0.0.1"
+        @production ? failure(message) : warning(message)
+      end
+    elsif URI(Config.base_url).scheme == "https"
+      warning("IP_FROM_HEADER is unset, so behind a TLS front the audit logs record the front's address; set it to X-Real-IP (Caddy) or CF-Connecting-IP (cloudflared)")
+    else
+      ok("client IP: from the connection (no TLS front)")
+    end
+  rescue URI::InvalidURIError
+    # base_url reports the invalid URL.
+  end
+
+  def loopback?(host)
+    host = host.delete_prefix("[").delete_suffix("]")
+    host == "localhost" || IPAddr.new(host).loopback?
+  rescue IPAddr::Error
+    false
   end
 
   def mail

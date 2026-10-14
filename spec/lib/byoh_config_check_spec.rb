@@ -5,7 +5,7 @@ require "tmpdir"
 
 RSpec.describe ByohConfigCheck do
   let(:code_root) { Dir.mktmpdir }
-  let(:check_env) { {"MAIL_DRIVER" => "smtp", "MAIL_FROM" => "ops@example.com"} }
+  let(:check_env) { {"MAIL_DRIVER" => "smtp", "MAIL_FROM" => "ops@example.com", "BIND" => "127.0.0.1"} }
   let(:check_now) { Time.utc(2026, 1, 1) }
   let(:preflight) { class_double(ByohPreflightWarnings, warnings: []) }
   let(:checker) { new_checker }
@@ -43,7 +43,7 @@ RSpec.describe ByohConfigCheck do
   # checks.
   def stub_good_config
     allow(Config).to receive_messages(
-      pry_allow_unaudited: false, base_url: "https://cloud.example.com", mail_driver: :smtp, mail_from: "ops@example.com",
+      pry_allow_unaudited: false, base_url: "https://cloud.example.com", ip_from_header: "X-Real-IP", mail_driver: :smtp, mail_from: "ops@example.com",
       smtp_hostname: "smtp.example.com", boot_image_source: "public", billing_rates_extra_dir: nil, db_pool_web: 16,
       deleted_record_archive_bucket: nil, deleted_record_drop_unarchived: true, clover_runtime_token_secret: "secret",
     )
@@ -137,6 +137,34 @@ RSpec.describe ByohConfigCheck do
       end
     end
 
+    describe "client IP" do
+      it "accepts a header when puma binds a loopback address" do
+        ["127.0.0.1", "127.0.0.2", "::1", "[::1]", "localhost"].each do |bind|
+          check_env["BIND"] = bind
+          expect(messages(checker.check(production: true), "ok")).to include "client IP: from the X-Real-IP header; puma binds #{bind}, so only the local TLS front can set it"
+        end
+      end
+
+      it "warns about a header when puma binds every address, and fails on it in production" do
+        message = "IP_FROM_HEADER is X-Real-IP but puma binds 0.0.0.0, so any client that reaches puma directly sets its own audit-log IP; set BIND=127.0.0.1"
+        check_env.delete("BIND")
+        expect(messages(checker.check(production: false), "warn")).to eq [message]
+        expect(messages(checker.check(production: true), "fail")).to eq [message]
+        check_env["BIND"] = "cp.example.com"
+        expect(messages(checker.check(production: true), "fail")).to eq [message.sub("0.0.0.0", "cp.example.com")]
+      end
+
+      it "warns without a header behind https" do
+        allow(Config).to receive(:ip_from_header).and_return(nil)
+        expect(messages(checker.check(production: true), "warn")).to eq ["IP_FROM_HEADER is unset, so behind a TLS front the audit logs record the front's address; set it to X-Real-IP (Caddy) or CF-Connecting-IP (cloudflared)"]
+      end
+
+      it "takes the address from the connection without a header for http" do
+        allow(Config).to receive_messages(ip_from_header: nil, base_url: "http://localhost:3000")
+        expect(messages(checker.check(production: true), "ok")).to include "client IP: from the connection (no TLS front)"
+      end
+    end
+
     describe "mail" do
       it "only reports the driver outside production" do
         allow(Config).to receive_messages(mail_driver: :logger, mail_from: nil)
@@ -163,7 +191,8 @@ RSpec.describe ByohConfigCheck do
       end
 
       it "uses the production defaults for unset variables when simulating production" do
-        check_env.clear
+        check_env.delete("MAIL_DRIVER")
+        check_env.delete("MAIL_FROM")
         allow(Config).to receive_messages(mail_driver: :logger, mail_from: "dev@example.com", smtp_hostname: nil)
         expect(messages(checker.check(production: true), "fail")).to eq ["MAIL_FROM is unset; production needs a sender address for account and alert mail", "MAIL_DRIVER is smtp but SMTP_HOSTNAME is unset"]
 

@@ -12,7 +12,7 @@
 #   run.sh SCENARIO...         run scenarios, each in a fresh container
 #
 # Scenarios: envfmt verify fresh rerun flags smoke kill restart reboot
-# (or "all").
+# tls-provided tunnel (or "all").
 # Logs go to $UBI_M3_LOGS (default: a fresh temp dir, printed at the
 # end). UBI_M3_KEEP=1 keeps the containers for inspection.
 set -euo pipefail
@@ -177,19 +177,34 @@ journal_clean() {
   }
 }
 
-# Two-step Rodauth login over http://localhost:3000; prints the final
-# location. Production cookies are Secure, and curl sends them to
-# localhost over plain http.
+# login NAME [BASE [CURL_OPTION...] [-- PASSWORD]]: the two-step Rodauth
+# login at BASE (default http://localhost:3000); prints the status and
+# the redirect of the last step. Production cookies are Secure, and curl
+# sends them to localhost over plain http. The curl options go to every
+# request (such as --resolve or extra headers).
 login() {
-  dx "$1" bash -s "$EMAIL" "$PASSWORD" <<'EOF'
+  local name=$1 base=${2:-http://localhost:3000} pass=$PASSWORD
+  shift $(($# < 2 ? $# : 2))
+  local -a opts=()
+  while [[ $# -gt 0 ]]; do
+    if [[ $1 == -- ]]; then
+      pass=$2
+      break
+    fi
+    opts+=("$1")
+    shift
+  done
+  dx "$name" bash -s "$EMAIL" "$pass" "$base" "${opts[@]}" <<'EOF'
 set -euo pipefail
+email=$1 pass=$2 base=$3
+shift 3
 jar=$(mktemp)
 csrf() { grep -o '<input name="_csrf"[^>]*>' | head -1 | sed 's/.*value="\([^"]*\)".*/\1/'; }
-tok=$(curl -sf -c "$jar" -b "$jar" http://localhost:3000/login | csrf)
-tok=$(curl -sf -c "$jar" -b "$jar" --data-urlencode "_csrf=$tok" --data-urlencode "login=$1" http://localhost:3000/login | csrf)
-curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' -c "$jar" -b "$jar" \
-  --data-urlencode "_csrf=$tok" --data-urlencode "login=$1" --data-urlencode "password=$2" \
-  http://localhost:3000/login
+tok=$(curl -sf "$@" -c "$jar" -b "$jar" "$base/login" | csrf)
+tok=$(curl -sf "$@" -c "$jar" -b "$jar" --data-urlencode "_csrf=$tok" --data-urlencode "login=$email" "$base/login" | csrf)
+curl -s "$@" -o /dev/null -w '%{http_code} %{redirect_url}\n' -c "$jar" -b "$jar" \
+  --data-urlencode "_csrf=$tok" --data-urlencode "login=$email" --data-urlencode "password=$pass" \
+  "$base/login"
 rm -f "$jar"
 EOF
 }
@@ -1052,6 +1067,233 @@ sc_restart_saturated() {
   say "restart: strands ran again ${t}s after the restart"
 }
 
+# --tls provided, the E0 HTTPS gate: one install.sh run on ubi-m3-tools
+# with a self-signed certificate for cp.test, then HTTPS through Caddy,
+# the client address through X-Real-IP, the admin API closed, a rerun
+# that changes nothing, and a switch back to --tls none.
+FRONT_FILES="/etc/caddy/Caddyfile /etc/ubicloud/front.conf /etc/ubicloud/tls/cert.pem /etc/ubicloud/tls/key.pem"
+
+sc_tls_provided() {
+  local out rc ip since sums pids cpid
+  stage_art
+  src_tarball
+  start_sys tlsp ubi-m3-tools
+  since=$(dx tlsp date '+%F %T')
+  backup_key tlsp
+  dx tlsp bash -c 'install -d -m 0700 /root/tls && cd /root/tls &&
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 -subj /CN=cp.test \
+      -addext subjectAltName=DNS:cp.test -keyout key.pem -out cert.pem 2>/dev/null &&
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 -subj /CN=cp.test \
+      -addext subjectAltName=DNS:cp.test -keyout other-key.pem -out other.pem 2>/dev/null &&
+    chmod 600 key.pem other-key.pem'
+  local -a tls=(--url https://cp.test --tls provided --cert /root/tls/cert.pem --key /root/tls/key.pem)
+
+  # A certificate for another host, a key of another certificate, a
+  # missing key, --cert with --tls none, an http URL and a URL with a
+  # port: exit 2 before anything changes, without printing key material.
+  local spec bad=()
+  for spec in "--url https://other.test|is not valid for other.test" \
+    "--key /root/tls/other-key.pem|is not the key of --cert" "--key /root/tls/missing.pem|is not a file" \
+    "--tls none --url http://localhost:3000|go with --tls provided" "--url http://cp.test|needs --url https://HOST" \
+    "--url https://cp.test:8443|needs --url https://HOST"; do
+    read -ra bad <<<"${spec%%|*}"
+    rc=0
+    install_cp tlsp "${tls[@]}" "${bad[@]}" >"$LOGS/tlsp-usage.log" 2>&1 || rc=$?
+    if [[ $rc != 2 ]] || ! grep -qF -- "${spec#*|}" "$LOGS/tlsp-usage.log"; then
+      fail "tls-provided: ${bad[*]} exited $rc: $(cat "$LOGS/tlsp-usage.log")"
+    fi
+    grep -q 'PRIVATE KEY' "$LOGS/tlsp-usage.log" && fail "tls-provided: ${bad[*]} printed key material"
+  done
+  dx tlsp test ! -e /etc/ubicloud || fail "tls-provided: a refused run created /etc/ubicloud"
+  dx tlsp test ! -e /etc/caddy || fail "tls-provided: a refused run installed caddy"
+  say "tls-provided: a wrong host, a foreign key, a missing key, --cert with none, http and a port exit 2 and change nothing"
+
+  install_cp tlsp "${tls[@]}" >"$LOGS/tlsp-install.log" 2>&1 || fail "tls-provided: install.sh failed, see $LOGS/tlsp-install.log"
+  grep -E '^(ok|changed|skip|warn|notice) ' "$LOGS/tlsp-install.log" | tee -a "$LOGS/harness.log" >/dev/null
+  grep -q '^changed front: installed caddy' "$LOGS/tlsp-install.log" || fail "tls-provided: caddy was not installed"
+  wait_for 180 web_up tlsp >/dev/null || fail "tls-provided: web did not answer"
+  assert_active tlsp
+  [[ $(dx tlsp systemctl is-active caddy) == active && $(dx tlsp systemctl is-enabled caddy) == enabled ]] ||
+    fail "tls-provided: caddy is not active and enabled"
+  ip=$(dx tlsp hostname -I | awk '{ print $1 }')
+  local -a via=(--cacert /root/tls/cert.pem --resolve "cp.test:443:$ip" --resolve "cp.test:80:$ip")
+
+  # HTTPS with the given certificate (verified, not -k), http redirects.
+  out=$(dx tlsp curl -s -o /dev/null -w '%{http_code}' "${via[@]}" https://cp.test/login) || true
+  [[ $out == 200 ]] || fail "tls-provided: GET https://cp.test/login through caddy: $out"
+  out=$(dx tlsp curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "${via[@]}" http://cp.test/login) || true
+  [[ $out == "308 https://cp.test/login" ]] || fail "tls-provided: http is not redirected: $out"
+  rc=0
+  dx tlsp curl -s --max-time 5 -o /dev/null http://127.0.0.1:2019/config/ || rc=$?
+  [[ $rc == 7 ]] || fail "tls-provided: the caddy admin API answered or hung (curl exit $rc)"
+  out=$(dx tlsp ss -Htln | awk '{ print $4 }' | sort | tr '\n' ' ')
+  [[ $out != *"0.0.0.0:3000"* && $out != *"*:3000"* ]] || fail "tls-provided: puma listens on every address: $out"
+  say "tls-provided: HTTPS with the given certificate, http redirects to https, admin API refused, puma local only"
+
+  # Files and settings.
+  out=$(dx tlsp stat -c '%U:%G %a %n' /etc/ubicloud/tls /etc/ubicloud/tls/cert.pem /etc/ubicloud/tls/key.pem /etc/ubicloud/front.conf | tr '\n' ' ')
+  [[ $out == "root:caddy 750 /etc/ubicloud/tls root:caddy 644 /etc/ubicloud/tls/cert.pem root:caddy 640 /etc/ubicloud/tls/key.pem root:root 600 /etc/ubicloud/front.conf " ]] ||
+    fail "tls-provided: tls files are $out"
+  dx tlsp grep -qx "IP_FROM_HEADER='X-Real-IP'" /etc/ubicloud/env || fail "tls-provided: IP_FROM_HEADER is not X-Real-IP"
+  dx tlsp grep -qx "BASE_URL='https://cp.test'" /etc/ubicloud/env || fail "tls-provided: BASE_URL is not https://cp.test"
+  dx tlsp grep -qx "TLS_FRONT='provided'" /etc/ubicloud/front.conf || fail "tls-provided: front.conf"
+  [[ $(dx tlsp head -1 /etc/caddy/Caddyfile) == "# Written by scripts/byoh/install.sh for --tls provided"* ]] ||
+    fail "tls-provided: the Caddyfile is not install.sh's"
+  dx tlsp grep -q 'admin off' /etc/caddy/Caddyfile || fail "tls-provided: the Caddyfile has no admin off"
+  dx tlsp bash /art/fixture.sh as-service bin/byoh-config-check >"$LOGS/tlsp-config-check.txt" 2>&1 || true
+  grep -q '^ok   client IP: from the X-Real-IP header; puma binds 127.0.0.1' "$LOGS/tlsp-config-check.txt" ||
+    fail "tls-provided: byoh-config-check client IP: $(grep -i 'client IP\|IP_FROM' "$LOGS/tlsp-config-check.txt")"
+  grep -q '^ok   BASE_URL https://cp.test' "$LOGS/tlsp-config-check.txt" || fail "tls-provided: byoh-config-check BASE_URL"
+  grep -q '^fail' "$LOGS/tlsp-config-check.txt" && fail "tls-provided: byoh-config-check fails: $(grep '^fail' "$LOGS/tlsp-config-check.txt")"
+
+  # Login over HTTPS, and the audit log records the client's address
+  # (this container's, as caddy sees it), not caddy's 127.0.0.1 and not
+  # an X-Real-IP the client sends.
+  printf '%s\n' "$PASSWORD" | dx tlsp bash /art/fixture.sh account "$EMAIL" >"$LOGS/tlsp-account.txt" 2>&1 ||
+    fail "tls-provided: account create: $(cat "$LOGS/tlsp-account.txt")"
+  out=$(login tlsp https://cp.test "${via[@]}" -H 'X-Real-IP: 203.0.113.9') || fail "tls-provided: login request failed"
+  [[ $out == "302 https://cp.test/after-login" ]] || fail "tls-provided: login over HTTPS: $out"
+  out=$(login tlsp https://cp.test "${via[@]}" -- wrong-password) || true
+  out=$(psql_q tlsp "SELECT string_agg(DISTINCT metadata->>'ip', ' ') FROM account_authentication_audit_log")
+  [[ $out == "$ip" ]] || fail "tls-provided: the audit log has the addresses '$out', not only $ip"
+  say "tls-provided: login over HTTPS ok; audit rows record $ip (not 127.0.0.1, not a client X-Real-IP)"
+
+  # A rerun with the same arguments changes nothing.
+  sums=$(settings_sums tlsp; dx tlsp bash -c "sha256sum $FRONT_FILES")
+  pids=$(service_pids tlsp)
+  cpid=$(main_pid tlsp caddy)
+  install_cp tlsp "${tls[@]}" >"$LOGS/tlsp-rerun.log" 2>&1 || fail "tls-provided: rerun failed, see $LOGS/tlsp-rerun.log"
+  grep -q '^changed ' "$LOGS/tlsp-rerun.log" && fail "tls-provided: rerun changed: $(grep '^changed ' "$LOGS/tlsp-rerun.log")"
+  [[ $(settings_sums tlsp; dx tlsp bash -c "sha256sum $FRONT_FILES") == "$sums" ]] || fail "tls-provided: rerun changed a file"
+  [[ $(service_pids tlsp) == "$pids" && $(main_pid tlsp caddy) == "$cpid" ]] || fail "tls-provided: rerun restarted a service"
+  say "tls-provided: a rerun changes nothing and restarts nothing"
+
+  # Back to --tls none: the changed keys exit 2 by name, and with
+  # --update-env caddy stops and IP_FROM_HEADER goes.
+  rc=0
+  install_cp tlsp >"$LOGS/tlsp-none.log" 2>&1 || rc=$?
+  [[ $rc == 2 ]] || fail "tls-provided: switching to none without --update-env exited $rc"
+  out=$(grep -o 'key [A-Z_]* differs' "$LOGS/tlsp-none.log" | sort | tr '\n' ' ')
+  [[ $out == "key BASE_URL differs key IP_FROM_HEADER differs key TLS_FRONT differs " ]] ||
+    fail "tls-provided: switching to none named: $out"
+  install_cp tlsp --update-env BASE_URL --update-env IP_FROM_HEADER --update-env TLS_FRONT >"$LOGS/tlsp-none.log" 2>&1 ||
+    fail "tls-provided: switching to none failed, see $LOGS/tlsp-none.log"
+  grep -q '^changed front: stopped and disabled caddy (was --tls provided)$' "$LOGS/tlsp-none.log" ||
+    fail "tls-provided: caddy was not stopped: $(grep front "$LOGS/tlsp-none.log")"
+  [[ $(dx tlsp systemctl is-active caddy || true) != active ]] || fail "tls-provided: caddy still runs"
+  dx tlsp grep -q '^IP_FROM_HEADER=' /etc/ubicloud/env && fail "tls-provided: IP_FROM_HEADER is still set"
+  wait_for 180 web_up tlsp >/dev/null || fail "tls-provided: web down after the switch to none"
+  out=$(login tlsp) || fail "tls-provided: login after the switch failed"
+  [[ $out == "302 http://localhost:3000/after-login" ]] || fail "tls-provided: login after the switch: $out"
+  journal_clean tlsp "$since"
+  say "tls-provided: the switch to --tls none needs --update-env, stops caddy and drops IP_FROM_HEADER"
+  say "tls-provided: ok"
+}
+
+# --tls tunnel. First with a cloudflared.service the machine already has
+# (the live case): install.sh leaves it byte for byte and running, warns
+# about a token on its command line without printing it, and sets
+# IP_FROM_HEADER. Then, with that unit gone, a fresh tunnel: the pinned
+# cloudflared and ubicloud-cloudflared.service with the token as a
+# credential. A real tunnel is UNVERIFIED: the token is a dummy, so
+# cloudflared only proves that it read it.
+sc_tunnel() {
+  local out rc sums pid since
+  boot_cp tunnel
+  since=$(dx tunnel date '+%F %T')
+  src_tarball
+  release_rev_to_art tunnel
+  dx tunnel bash -c "cat >/etc/systemd/system/cloudflared.service <<'EOF'
+[Unit]
+Description=cloudflared (harness stand-in)
+After=network-online.target
+
+[Service]
+ExecStart=/bin/bash -c 'exec sleep infinity' cloudflared --no-autoupdate tunnel run --token dummy-live-token-0123456789
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable -q --now cloudflared"
+  sums=$(dx tunnel sha256sum /etc/systemd/system/cloudflared.service)
+  pid=$(main_pid tunnel cloudflared)
+  local -a tun=(--url https://cp.example.test --tls tunnel)
+
+  rc=0
+  install_cp tunnel "${tun[@]}" >"$LOGS/tunnel-existing.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q 'key BASE_URL differs' "$LOGS/tunnel-existing.log"; then
+    fail "tunnel: a new URL without --update-env exited $rc"
+  fi
+  grep -q '^install.sh: key TLS_FRONT differs; the front is --tls none, and --update-env TLS_FRONT switches it to --tls tunnel' "$LOGS/tunnel-existing.log" ||
+    fail "tunnel: the front switch is not named: $(cat "$LOGS/tunnel-existing.log")"
+  install_cp tunnel "${tun[@]}" --update-env BASE_URL --update-env TLS_FRONT >"$LOGS/tunnel-existing.log" 2>&1 ||
+    fail "tunnel: install.sh failed, see $LOGS/tunnel-existing.log"
+  grep -E '^(ok|changed|skip|warn|notice) ' "$LOGS/tunnel-existing.log" | tee -a "$LOGS/harness.log" >/dev/null
+  grep -q 'dummy-live-token' "$LOGS/tunnel-existing.log" && fail "tunnel: install.sh printed the token"
+  grep -q '^ok      front: cloudflared.service exists; install.sh leaves it as it is$' "$LOGS/tunnel-existing.log" ||
+    fail "tunnel: no report on the existing unit"
+  grep -q '^warn    front: cloudflared.service passes the tunnel token on its command line' "$LOGS/tunnel-existing.log" ||
+    fail "tunnel: no warning about the token on the command line"
+  grep -q '^notice  front: the tunnel.s public hostname cp.example.test must route to http://127.0.0.1:3000' "$LOGS/tunnel-existing.log" ||
+    fail "tunnel: no ingress reminder"
+  [[ $(dx tunnel sha256sum /etc/systemd/system/cloudflared.service) == "$sums" ]] || fail "tunnel: cloudflared.service changed"
+  [[ $(main_pid tunnel cloudflared) == "$pid" ]] || fail "tunnel: cloudflared.service was restarted"
+  dx tunnel test ! -e /etc/systemd/system/ubicloud-cloudflared.service || fail "tunnel: installed its own unit next to the existing one"
+  dx tunnel grep -qx "IP_FROM_HEADER='CF-Connecting-IP'" /etc/ubicloud/env || fail "tunnel: IP_FROM_HEADER is not CF-Connecting-IP"
+  dx tunnel grep -qx "TLS_FRONT='tunnel'" /etc/ubicloud/front.conf || fail "tunnel: front.conf"
+  wait_for 180 web_up tunnel >/dev/null || fail "tunnel: web down"
+  # cloudflared's header reaches the audit log: a request that carries it
+  # is what the edge would send through the tunnel.
+  printf '%s\n' "$PASSWORD" | dx tunnel bash /art/fixture.sh account "$EMAIL" >"$LOGS/tunnel-account.txt" 2>&1 ||
+    fail "tunnel: account create: $(cat "$LOGS/tunnel-account.txt")"
+  out=$(login tunnel http://localhost:3000 -H 'CF-Connecting-IP: 198.51.100.7') || fail "tunnel: login failed"
+  [[ $out == "302 "*/after-login ]] || fail "tunnel: login: $out"
+  out=$(psql_q tunnel "SELECT string_agg(DISTINCT metadata->>'ip', ' ') FROM account_authentication_audit_log")
+  [[ $out == 198.51.100.7 ]] || fail "tunnel: the audit log has '$out', not the CF-Connecting-IP address"
+  install_cp tunnel "${tun[@]}" >"$LOGS/tunnel-rerun.log" 2>&1 || fail "tunnel: rerun failed"
+  grep -q '^changed ' "$LOGS/tunnel-rerun.log" && fail "tunnel: rerun changed: $(grep '^changed ' "$LOGS/tunnel-rerun.log")"
+  [[ $(dx tunnel sha256sum /etc/systemd/system/cloudflared.service) == "$sums" && $(main_pid tunnel cloudflared) == "$pid" ]] ||
+    fail "tunnel: the rerun touched cloudflared.service"
+  say "tunnel: an existing cloudflared.service is left byte for byte and running, its argv token is warned about unprinted, IP_FROM_HEADER is CF-Connecting-IP"
+
+  # A fresh tunnel.
+  dx tunnel bash -c 'systemctl disable -q --now cloudflared && rm /etc/systemd/system/cloudflared.service && systemctl daemon-reload'
+  rc=0
+  install_cp tunnel "${tun[@]}" >"$LOGS/tunnel-notoken.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q 'needs --cloudflared-token-file' "$LOGS/tunnel-notoken.log"; then
+    fail "tunnel: no token and no unit exited $rc"
+  fi
+  dx tunnel bash -c 'printf "%s\n" "eyJhIjoiaGFybmVzcy1kdW1teS10b2tlbiJ9-not-a-real-tunnel" >/root/cf.token && chmod 0644 /root/cf.token'
+  rc=0
+  install_cp tunnel "${tun[@]}" --cloudflared-token-file /root/cf.token >"$LOGS/tunnel-fresh.log" 2>&1 || rc=$?
+  if [[ $rc != 2 ]] || ! grep -q 'chmod 600' "$LOGS/tunnel-fresh.log"; then
+    fail "tunnel: a 0644 token file exited $rc"
+  fi
+  dx tunnel chmod 0600 /root/cf.token
+  install_cp tunnel "${tun[@]}" --cloudflared-token-file /root/cf.token >"$LOGS/tunnel-fresh.log" 2>&1 ||
+    fail "tunnel: fresh tunnel install failed, see $LOGS/tunnel-fresh.log"
+  grep -E '^(ok|changed|skip|warn|notice) ' "$LOGS/tunnel-fresh.log" | tee -a "$LOGS/harness.log" >/dev/null
+  grep -q 'harness-dummy' "$LOGS/tunnel-fresh.log" && fail "tunnel: install.sh printed the token"
+  grep -q '^changed front: installed cloudflared 2026.9.3$' "$LOGS/tunnel-fresh.log" || fail "tunnel: cloudflared was not installed"
+  out=$(dx tunnel stat -c '%U:%G %a' /etc/ubicloud/cloudflared.token)
+  [[ $out == "root:root 600" ]] || fail "tunnel: the token copy is $out"
+  [[ $(dx tunnel systemctl is-enabled ubicloud-cloudflared) == enabled ]] || fail "tunnel: ubicloud-cloudflared is not enabled"
+  dx tunnel systemd-analyze verify /etc/systemd/system/ubicloud-cloudflared.service >"$LOGS/tunnel-verify.log" 2>&1 ||
+    fail "tunnel: systemd-analyze verify: $(cat "$LOGS/tunnel-verify.log")"
+  # The dummy token reached cloudflared through the credential, never argv.
+  wait_for 30 dx tunnel bash -c 'journalctl -u ubicloud-cloudflared --no-pager -o cat | grep -qi "token"' >/dev/null ||
+    fail "tunnel: cloudflared logged nothing about the token"
+  dx tunnel journalctl -u ubicloud-cloudflared --no-pager -o cat >"$LOGS/tunnel-cloudflared.log" 2>&1 || true
+  grep -qiE 'no such file|permission denied|failed to read' "$LOGS/tunnel-cloudflared.log" &&
+    fail "tunnel: cloudflared could not read the token file: $(grep -iE 'no such file|permission denied|failed to read' "$LOGS/tunnel-cloudflared.log" | head -3)"
+  [[ $(dx tunnel ps -eo args) != *harness-dummy* ]] || fail "tunnel: the token is on a command line"
+  [[ $(dx tunnel systemctl show -p ExecStart --value ubicloud-cloudflared) != *harness-dummy* ]] || fail "tunnel: the token is in the unit"
+  say "tunnel: fresh: cloudflared $(dx tunnel cloudflared --version | awk '{ print $3 }') and ubicloud-cloudflared with the token as a credential; cloudflared says: $(grep -i token "$LOGS/tunnel-cloudflared.log" | tail -1 | cut -c1-160)"
+  journal_clean tunnel "$since"
+  say "tunnel: ok (a real tunnel is UNVERIFIED)"
+}
+
 sc_reboot() {
   local t since
   boot_cp reboot
@@ -1078,9 +1320,9 @@ for arg in "$@"; do
     --prepare-image) prepare_image ;;
     --prepare-tools) prepare_tools ;;
     --prepare-release) prepare_release ;;
-    all) for s in envfmt verify fresh rerun flags smoke kill restart reboot; do "sc_$s"; cleanup; done ;;
-    envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot)
-      "sc_$arg"
+    all) for s in envfmt verify fresh rerun flags smoke kill restart reboot tls_provided tunnel; do "sc_$s"; cleanup; done ;;
+    envfmt | verify | fresh | rerun | flags | smoke | kill | restart | reboot | tls-provided | tunnel)
+      "sc_${arg//-/_}"
       cleanup
       ;;
     *) fail "unknown argument $arg" ;;

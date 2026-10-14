@@ -31,6 +31,12 @@ start_sys() {
     --tmpfs /run --tmpfs /run/lock -v "$ART:/art:ro" "$image" /sbin/init >/dev/null
   echo "$name" >>"$STATE/created"
   wait_booted "$1"
+  # On a real machine systemd makes / shared at boot; in a container it
+  # leaves docker's private mounts alone, and systemd's credentials
+  # (LoadCredential=, used by ubicloud-cloudflared) are then mounted
+  # where the service never sees them. This undoes that difference
+  # inside the container's own mount namespace only.
+  docker exec "$name" mount --make-rshared /
   # The login check relies on curl sending Secure cookies to localhost
   # over http, which depends on the curl version.
   say "$1: $(docker exec "$name" systemctl --version | head -1); $(docker exec "$name" curl --version | head -1)"
@@ -89,7 +95,7 @@ src_tarball() {
 stage_art() {
   rm -rf "$ART/packaging"
   mkdir -p "$ART/packaging"
-  cp -r "$WT/packaging/systemd" "$ART/packaging/"
+  cp -R "$WT/packaging/systemd" "$ART/packaging/"
   cp "$HARNESS_DIR/fixture.sh" "$ART/fixture.sh"
   cp "$WT/scripts/byoh/install.sh" "$ART/install.sh"
   cp "$WT/mise.toml" "$ART/mise.toml"

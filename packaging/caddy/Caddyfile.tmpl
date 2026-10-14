@@ -1,0 +1,18 @@
+# Written by scripts/byoh/install.sh for --tls @MODE@ from
+# packaging/caddy/Caddyfile.tmpl. install.sh rewrites it on every run;
+# change the front with install.sh flags, not here.
+{
+	# The admin API would let any local user reconfigure Caddy. Without
+	# it, `caddy reload` and `systemctl reload caddy` fail: restart.
+	admin off
+	@GLOBAL@
+}
+
+@HOST@ {
+	@TLS@
+	# puma binds 127.0.0.1 only. X-Real-IP is set, never appended, from
+	# the connection, so a client cannot choose it (IP_FROM_HEADER).
+	reverse_proxy 127.0.0.1:@PORT@ {
+		header_up X-Real-IP {remote_host}
+	}
+}

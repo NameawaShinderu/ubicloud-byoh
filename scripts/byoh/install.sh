@@ -6,9 +6,10 @@
 # units. Run it as root. It is safe to run again: every step checks the
 # real state and prints ok, changed or skip. It keeps no marker files.
 #
-#   sudo bash install.sh --version v0.1.0 --url http://localhost:3000 \
-#     --tls none --admin-email ops@example.com \
+#   sudo bash install.sh --version v0.1.0 --url https://cloud.example.com \
+#     --tls acme|provided|tunnel|none --admin-email ops@example.com \
 #     --source-git ~/ubicloud --ref <commit> \
+#     [--cert F --key F] [--cloudflared-token-file F] \
 #     [--rack-env production|development] [--mail-from ADDR] \
 #     [--smtp-file F|-] [--billing-rates-dir DIR] \
 #     [--backup-target DIR] [--backup-recipient age1...|--backup-recipient-file F] \
@@ -19,10 +20,23 @@
 # DIR), or --source-tarball F --source-rev REV.
 #
 # A setting in /etc/ubicloud/env or /etc/ubicloud/backup.conf that a
-# flag sets (BASE_URL, MAIL_FROM, RACK_ENV, the SMTP keys, BACKUP_TARGET,
-# BACKUP_RECIPIENTS) is never changed silently: a run whose flags differ
+# flag sets (BASE_URL, MAIL_FROM, RACK_ENV, the SMTP keys, IP_FROM_HEADER,
+# BACKUP_TARGET, BACKUP_RECIPIENTS, TLS_FRONT) is never changed silently: a run whose flags differ
 # exits 2, unless --update-env KEY allows that key to change. Keys that
 # are missing are added; the secrets are generated once and kept.
+#
+# TLS front (--tls), in front of puma on 127.0.0.1:
+#   acme      Caddy from Ubuntu universe gets a certificate for the --url
+#             host (it needs ports 80 and 443 and public DNS; UNVERIFIED).
+#   provided  Caddy with --cert F --key F (PEM, unencrypted key).
+#   tunnel    cloudflared. An existing cloudflared.service is left as it
+#             is; otherwise --cloudflared-token-file F (mode 0600) installs
+#             a pinned cloudflared and ubicloud-cloudflared.service.
+#   none      no front: --url http://localhost:PORT, reached over ssh -L.
+# The services take the client address from the header the front sets
+# (IP_FROM_HEADER): X-Real-IP for Caddy, CF-Connecting-IP for cloudflared.
+# Changing --tls on an installed control plane needs --update-env
+# TLS_FRONT (and BASE_URL); the old front is then stopped.
 #
 # --stage tools stops after the packages and the tools, which only needs
 # a source (for mise.toml). The default stage, all, also needs --version,
@@ -48,6 +62,16 @@ readonly ETC=/etc/ubicloud
 readonly ENV_FILE=$ETC/env
 readonly BACKUP_CONF=$ETC/backup.conf
 readonly BACKUP_RECIPIENTS=$ETC/backup-recipients
+readonly FRONT_CONF=$ETC/front.conf
+readonly TLS_DIR=$ETC/tls
+readonly CF_TOKEN=$ETC/cloudflared.token
+readonly CF_UNIT=ubicloud-cloudflared.service
+readonly CADDYFILE=/etc/caddy/Caddyfile
+readonly CADDYFILE_MARK="# Written by scripts/byoh/install.sh for --tls "
+# A cloudflared release at least two weeks old (2026-09-24) that has
+# tunnel run --token-file; the checksum is the one in its release notes.
+readonly CLOUDFLARED_VERSION=2026.9.3
+readonly CLOUDFLARED_SHA256=bc073ef293d504cf5ac533bd0aa1c824ef6b4f358765ccaa6628a8a95cacb4b7
 readonly LOCK=/run/ubicloud-admin.lock
 readonly PG_VERSION=16
 readonly PG_CONF=/etc/postgresql/$PG_VERSION/main
@@ -63,7 +87,7 @@ readonly MISE_SHA256=d24fe0bf7e613824ad99f7b8dac3f2b381a37b9f75f84dd250855217095
 readonly PACKAGES=(
   postgresql-16 age
   build-essential libssl-dev libyaml-dev zlib1g-dev libffi-dev libpq-dev
-  git curl jq iproute2
+  git curl jq iproute2 openssl
 )
 readonly BUNDLE_WITHOUT='test:rubocop:aws_kms:gcp_kms:aws_rds_iam:gcp_cloudsql_iam'
 # MemTotal of a machine sold as 4 GiB is a little lower, because the
@@ -88,8 +112,9 @@ usage_die() { die "$1" 2; }
 # --- arguments -------------------------------------------------------------
 
 STAGE=all
-VERSION="" URL="" URL_PORT="" TLS="" ADMIN_EMAIL="" MAIL_FROM_ARG="" RACK_ENV_ARG=""
+VERSION="" URL="" URL_PORT="" URL_HOST="" TLS="" ADMIN_EMAIL="" MAIL_FROM_ARG="" RACK_ENV_ARG=""
 SRC_TARBALL="" SRC_REV="" SRC_GIT="" SRC_REF=""
+CERT_FILE="" KEY_FILE="" CF_TOKEN_FILE=""
 SMTP_FILE="" BILLING_DIR="" BACKUP_TARGET="" BACKUP_RECIPIENT="" BACKUP_RECIPIENT_FILE=""
 NO_START=0
 EFFECTIVE_PORT=3000
@@ -111,6 +136,9 @@ parse_args() {
       --source-git) need_arg "$@"; SRC_GIT=$2; shift ;;
       --ref) need_arg "$@"; SRC_REF=$2; shift ;;
       --smtp-file) need_arg "$@"; SMTP_FILE=$2; shift ;;
+      --cert) need_arg "$@"; CERT_FILE=$2; shift ;;
+      --key) need_arg "$@"; KEY_FILE=$2; shift ;;
+      --cloudflared-token-file) need_arg "$@"; CF_TOKEN_FILE=$2; shift ;;
       --billing-rates-dir) need_arg "$@"; BILLING_DIR=$2; shift ;;
       --backup-target) need_arg "$@"; BACKUP_TARGET=$2; shift ;;
       --backup-recipient) need_arg "$@"; BACKUP_RECIPIENT=$2; shift ;;
@@ -121,9 +149,6 @@ parse_args() {
       --no-start) NO_START=1 ;;
       --mgmt-endpoint) usage_die "--mgmt-endpoint is available in M8" ;;
       --import-env-rb) usage_die "--import-env-rb is available with scripts/byoh/migrate-from-dev.sh" ;;
-      --cert | --key | --cloudflared-token-file)
-        usage_die "$1 belongs to --tls provided or tunnel, which this build does not set up yet"
-        ;;
       --smtp) usage_die "--smtp would put a password on the command line; use --smtp-file F (mode 0600) or --smtp-file -" ;;
       -h | --help)
         sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
@@ -171,12 +196,36 @@ validate_args() {
         usage_die "--tls none serves plain http on 127.0.0.1 only, so --url must be http://localhost:PORT (such as http://localhost:3000)"
       URL_PORT=${BASH_REMATCH[1]}
       ;;
-    acme | provided | tunnel) usage_die "--tls $TLS is not set up by this build yet; use --tls none" ;;
-    "") usage_die "--tls is required (none)" ;;
+    acme | provided | tunnel)
+      # The front serves the URL's host on 443; puma's port stays local.
+      [[ $URL =~ ^https://([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)/?$ ]] ||
+        usage_die "--tls $TLS needs --url https://HOST, a DNS name with no port or path (such as https://cloud.example.com)"
+      URL_HOST=${BASH_REMATCH[1],,}
+      ;;
+    "") usage_die "--tls is required (acme, provided, tunnel or none)" ;;
     *) usage_die "--tls must be acme, tunnel, provided or none" ;;
   esac
+  if [[ $TLS == provided ]]; then
+    [[ -n $CERT_FILE && -n $KEY_FILE ]] || usage_die "--tls provided needs --cert F and --key F"
+    [[ -f $CERT_FILE ]] || usage_die "--cert $CERT_FILE is not a file"
+    [[ -f $KEY_FILE ]] || usage_die "--key $KEY_FILE is not a file"
+    CERT_FILE=$(absolute "$CERT_FILE")
+    KEY_FILE=$(absolute "$KEY_FILE")
+  else
+    [[ -z $CERT_FILE && -z $KEY_FILE ]] || usage_die "--cert and --key go with --tls provided"
+  fi
+  if [[ -n $CF_TOKEN_FILE ]]; then
+    [[ $TLS == tunnel ]] || usage_die "--cloudflared-token-file goes with --tls tunnel"
+    [[ -f $CF_TOKEN_FILE ]] || usage_die "--cloudflared-token-file $CF_TOKEN_FILE is not a file"
+    (($(stat -L -c '%#a' "$CF_TOKEN_FILE") & 077)) &&
+      usage_die "--cloudflared-token-file $CF_TOKEN_FILE is readable by group or other; chmod 600 it"
+    CF_TOKEN_FILE=$(absolute "$CF_TOKEN_FILE")
+  fi
   URL=${URL%/}
   valid_email "$ADMIN_EMAIL" || usage_die "--admin-email must be an email address"
+  # acme puts it in the Caddyfile as the ACME account address.
+  [[ $TLS != acme || $ADMIN_EMAIL =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] ||
+    usage_die "--tls acme registers --admin-email with the CA; use an address of letters, digits and ._%+-"
   MAIL_FROM_ARG=${MAIL_FROM_ARG:-$ADMIN_EMAIL}
   valid_email "$MAIL_FROM_ARG" || usage_die "--mail-from must be an email address"
   case ${RACK_ENV_ARG:-production} in production | development) ;; *) usage_die "--rack-env must be production or development" ;; esac
@@ -461,8 +510,14 @@ plan_env() {
   want BOOT_IMAGE_SOURCE default public
   want DELETED_RECORD_DROP_UNARCHIVED default true
   want ALLOW_UNSPREAD_SERVERS default true
-  # M3-m: the header the TLS front sets; none means no proxy.
-  want IP_FROM_HEADER flag ""
+  # M3-m: the header the TLS front sets, which a client cannot choose:
+  # Caddy sets X-Real-IP from the connection, and Cloudflare sets
+  # CF-Connecting-IP at its edge. none means no proxy.
+  case $TLS in
+    acme | provided) want IP_FROM_HEADER flag X-Real-IP ;;
+    tunnel) want IP_FROM_HEADER flag CF-Connecting-IP ;;
+    *) want IP_FROM_HEADER flag "" ;;
+  esac
   want BILLING_RATES_EXTRA_DIR default "$STATE/billing_rates.d"
 }
 
@@ -522,13 +577,23 @@ check_settings() {
     diff_settings "$BACKUP_CONF"
     conflicts+=("${CONFLICTS[@]}")
   fi
+  if [[ -e $FRONT_CONF ]]; then
+    plan_front
+    diff_settings "$FRONT_CONF"
+    OLD_FRONT=${KV[TLS_FRONT]:-none}
+    conflicts+=("${CONFLICTS[@]}")
+  fi
   if [[ -n $(recipients_wanted) && -e $BACKUP_RECIPIENTS ]] &&
     ! recipients_wanted | cmp -s - "$BACKUP_RECIPIENTS" && [[ -z ${UPDATE_ENV[BACKUP_RECIPIENTS]:-} ]]; then
     conflicts+=(BACKUP_RECIPIENTS)
   fi
   ((${#conflicts[@]} == 0)) && return 0
   for k in "${conflicts[@]}"; do
-    printf "install.sh: key %s differs; edit with 'ubicloud-admin env set %s' or pass --update-env %s\n" "$k" "$k" "$k" >&2
+    if [[ $k == TLS_FRONT ]]; then
+      printf "install.sh: key TLS_FRONT differs; the front is --tls %s, and --update-env TLS_FRONT switches it to --tls %s (stopping the old one)\n" "$OLD_FRONT" "$TLS" >&2
+    else
+      printf "install.sh: key %s differs; edit with 'ubicloud-admin env set %s' or pass --update-env %s\n" "$k" "$k" "$k" >&2
+    fi
   done
   exit 2
 }
@@ -1007,6 +1072,278 @@ step_units() {
     report warn "units: ubicloud-monitor is enabled; it is meant to stay disabled until M9"
 }
 
+# --- step 10: TLS front (M3-g) ---------------------------------------------------------------
+
+plan_front() {
+  WANT=() KIND=() WANT_KEYS=()
+  want TLS_FRONT flag "$TLS"
+}
+
+# The front the last run set up; none before front.conf existed.
+OLD_FRONT=none
+
+# Caddy may own /etc/caddy/Caddyfile only when it is absent, the
+# package's own, or one this script wrote.
+caddyfile_ours_or_stock() {
+  [[ -e $CADDYFILE ]] || return 0
+  [[ $(head -1 "$CADDYFILE") == "$CADDYFILE_MARK"* ]] && return 0
+  local want
+  want=$(dpkg-query -W -f='${Conffiles}\n' caddy 2>/dev/null | awk -v f="$CADDYFILE" '$1 == f { print $2 }')
+  [[ -n $want && $(md5sum <"$CADDYFILE" | cut -d' ' -f1) == "$want" ]]
+}
+
+caddyfile_ours() { [[ -e $CADDYFILE && $(head -1 "$CADDYFILE") == "$CADDYFILE_MARK"* ]]; }
+
+# Reads a certificate file as root; errors name the file, never its
+# contents.
+check_cert() {
+  openssl x509 -in "$CERT_FILE" -noout 2>/dev/null </dev/null || usage_die "--cert $CERT_FILE is not a PEM certificate"
+  openssl pkey -in "$KEY_FILE" -passin pass: -noout 2>/dev/null </dev/null ||
+    usage_die "--key $KEY_FILE is not an unencrypted PEM private key"
+  [[ $(openssl x509 -in "$CERT_FILE" -noout -pubkey 2>/dev/null) == "$(openssl pkey -in "$KEY_FILE" -passin pass: -pubout 2>/dev/null </dev/null)" ]] ||
+    usage_die "--key $KEY_FILE is not the key of --cert $CERT_FILE"
+  [[ $(openssl x509 -in "$CERT_FILE" -noout -checkhost "$URL_HOST" 2>/dev/null) == *" does match "* ]] ||
+    usage_die "--cert $CERT_FILE is not valid for $URL_HOST"
+  openssl x509 -in "$CERT_FILE" -noout -checkend 0 >/dev/null 2>&1 || usage_die "--cert $CERT_FILE has expired"
+  openssl x509 -in "$CERT_FILE" -noout -checkend $((30 * 86400)) >/dev/null 2>&1 ||
+    report warn "front: --cert $CERT_FILE expires within 30 days ($(openssl x509 -in "$CERT_FILE" -noout -enddate | cut -d= -f2))"
+  (($(stat -L -c '%#a' "$KEY_FILE") & 077)) &&
+    report warn "front: --key $KEY_FILE is readable by group or other; chmod 600 it (the installed copy is 0640 root:caddy)"
+  return 0
+}
+
+has_existing_cloudflared() { [[ ! -e $UNIT_DIR/$CF_UNIT ]] && systemctl cat cloudflared.service >/dev/null 2>&1; }
+
+# check_front: exits 2 before anything changes when the front cannot be
+# set up as asked.
+check_front() {
+  case $TLS in
+    acme | provided)
+      caddyfile_ours_or_stock ||
+        usage_die "$CADDYFILE is neither the caddy package's nor one install.sh wrote; --tls $TLS would replace it, so move it away first or use --tls tunnel"
+      [[ $TLS != provided ]] || check_cert
+      ((NO_START)) && return 0
+      local out
+      out=$(ss -Htlnp '( sport = :80 or sport = :443 )')
+      if [[ -n $out ]] && grep -qv 'users:(("caddy"' <<<"$out"; then
+        usage_die "something other than caddy listens on port 80 or 443 (ss -tlnp '( sport = :80 or sport = :443 )'); --tls $TLS needs both"
+      fi
+      ;;
+    tunnel)
+      [[ -n $CF_TOKEN_FILE ]] || has_existing_cloudflared || [[ -e $UNIT_DIR/$CF_UNIT ]] ||
+        usage_die "--tls tunnel needs --cloudflared-token-file F (the tunnel token, mode 0600) on a machine without a cloudflared.service"
+      if [[ -n $CF_TOKEN_FILE ]]; then
+        [[ $(tr -d '\n' <"$CF_TOKEN_FILE") =~ ^[A-Za-z0-9+/=_.-]{20,}$ ]] ||
+          usage_die "--cloudflared-token-file $CF_TOKEN_FILE does not hold one tunnel token (the value is not shown)"
+      fi
+      ;;
+  esac
+  return 0
+}
+
+step_front() {
+  plan_front
+  diff_settings "$FRONT_CONF"
+  write_settings "$FRONT_CONF" "# /etc/ubicloud/front.conf: the TLS front install.sh set up (--tls), KEY='value' per line." || true
+  [[ $OLD_FRONT == "$TLS" ]] || retire_front
+  if ((NO_START)); then
+    [[ $TLS == none ]] || report skip "front: --tls $TLS not set up (--no-start)"
+    [[ $TLS != tunnel ]] || ! has_existing_cloudflared || existing_cloudflared
+    return 0
+  fi
+  case $TLS in
+    acme | provided) front_caddy ;;
+    tunnel) front_tunnel ;;
+    none) report ok "front: none; puma serves http on 127.0.0.1:$EFFECTIVE_PORT only" ;;
+  esac
+}
+
+# Stops the front an earlier run set up for another --tls. An existing
+# cloudflared.service was never ours, so it is only mentioned.
+retire_front() {
+  case $OLD_FRONT in
+    acme | provided)
+      if [[ $TLS != acme && $TLS != provided ]] && caddyfile_ours &&
+        [[ $(systemctl is-enabled caddy 2>/dev/null || true) == enabled || $(systemctl is-active caddy 2>/dev/null || true) == active ]]; then
+        systemctl disable --now -q caddy
+        report changed "front: stopped and disabled caddy (was --tls $OLD_FRONT)"
+      fi
+      ;;
+    tunnel)
+      if [[ -e $UNIT_DIR/$CF_UNIT ]]; then
+        if [[ $TLS != tunnel ]]; then
+          systemctl disable --now -q "$CF_UNIT"
+          report changed "front: stopped and disabled $CF_UNIT (was --tls tunnel); $CF_TOKEN is kept"
+        fi
+      elif systemctl cat cloudflared.service >/dev/null 2>&1; then
+        report notice "front: cloudflared.service still runs the old tunnel; stop it yourself once nothing uses it"
+      fi
+      ;;
+  esac
+}
+
+front_caddy() {
+  local restart=0 cand
+  if [[ $(dpkg-query -W -f='${db:Status-Status}' caddy 2>/dev/null || true) != installed ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    cand=$(apt-cache policy caddy | sed -n 's/^ *Candidate: //p')
+    [[ -n $cand && $cand != "(none)" ]] ||
+      die "no caddy package is available; enable the universe component (add-apt-repository universe) and run install.sh again"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends caddy >/dev/null
+    restart=1
+    report changed "front: installed caddy $cand"
+  fi
+  if [[ $TLS == provided ]]; then
+    local changed=0
+    install -d -m 0750 -o root -g caddy "$TLS_DIR"
+    if ! cmp -s "$CERT_FILE" "$TLS_DIR/cert.pem"; then
+      install -m 0644 -o root -g caddy "$CERT_FILE" "$TLS_DIR/cert.pem"
+      changed=1
+    fi
+    if ! cmp -s "$KEY_FILE" "$TLS_DIR/key.pem"; then
+      install -m 0640 -o root -g caddy "$KEY_FILE" "$TLS_DIR/key.pem"
+      changed=1
+    fi
+    if ((changed)); then
+      restart=1
+      report changed "front: certificate for $URL_HOST in $TLS_DIR (until $(openssl x509 -in "$TLS_DIR/cert.pem" -noout -enddate | cut -d= -f2))"
+    else
+      report ok "front: certificate for $URL_HOST in $TLS_DIR"
+    fi
+  fi
+  render_caddyfile >"$WORK/Caddyfile"
+  caddy adapt --adapter caddyfile --config "$WORK/Caddyfile" >/dev/null 2>"$WORK/caddy.err" || {
+    cat "$WORK/caddy.err" >&2
+    die "the rendered Caddyfile does not parse"
+  }
+  if ! cmp -s "$WORK/Caddyfile" "$CADDYFILE"; then
+    install -m 0644 -o root -g root "$WORK/Caddyfile" "$CADDYFILE"
+    restart=1
+    report changed "front: $CADDYFILE for $URL_HOST (--tls $TLS)"
+  else
+    report ok "front: $CADDYFILE for $URL_HOST (--tls $TLS)"
+  fi
+  if [[ $(systemctl is-enabled caddy 2>/dev/null || true) != enabled ]]; then
+    systemctl enable -q caddy
+    report changed "front: enabled caddy"
+  fi
+  # admin off: caddy reload goes through the admin API, so restart.
+  if ((restart)) || [[ $(systemctl is-active caddy 2>/dev/null || true) != active ]]; then
+    systemctl restart caddy
+    wait_for_listener 443 || die "caddy does not listen on 443; see journalctl -u caddy"
+    report changed "front: restarted caddy"
+  else
+    report ok "front: caddy active"
+  fi
+  [[ $TLS != acme ]] ||
+    report notice "front: caddy gets the certificate for $URL_HOST from Let's Encrypt in the background; it needs public DNS for $URL_HOST and ports 80 and 443 open (journalctl -u caddy)"
+}
+
+wait_for_listener() {
+  local _
+  for _ in $(seq 20); do
+    [[ -n $(ss -Htln "sport = :$1") ]] && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
+# Placeholders are replaced as quoted strings, so & and \ in a value
+# stay literal (bash 5.2 patsub_replacement).
+render_caddyfile() {
+  local t global tls
+  t=$(<"$CURRENT/packaging/caddy/Caddyfile.tmpl")
+  if [[ $TLS == provided ]]; then
+    global="auto_https disable_certs"
+    tls="tls $TLS_DIR/cert.pem $TLS_DIR/key.pem"
+  else
+    global="email $ADMIN_EMAIL"
+    tls=""
+  fi
+  t=${t//@MODE@/"$TLS"}
+  t=${t//@HOST@/"$URL_HOST"}
+  t=${t//@PORT@/"$EFFECTIVE_PORT"}
+  t=${t//@GLOBAL@/"$global"}
+  t=${t//@TLS@/"$tls"}
+  # An empty placeholder leaves a line of tabs.
+  printf '%s\n' "$t" | sed '/^[[:space:]]\+$/d'
+}
+
+front_tunnel() {
+  local restart=0
+  if [[ -n $CF_TOKEN_FILE ]]; then
+    if ! cmp -s "$CF_TOKEN_FILE" "$CF_TOKEN"; then
+      install -m 0600 -o root -g root "$CF_TOKEN_FILE" "$CF_TOKEN"
+      restart=1
+      report changed "front: tunnel token in $CF_TOKEN"
+    else
+      report ok "front: tunnel token in $CF_TOKEN"
+    fi
+  fi
+  if has_existing_cloudflared; then
+    existing_cloudflared
+    return 0
+  fi
+  local arch
+  arch=$(dpkg --print-architecture)
+  [[ $arch == amd64 ]] || die "install.sh pins cloudflared for amd64 only (this machine is $arch); install cloudflared yourself and run it as cloudflared.service"
+  if [[ $(dpkg-query -W -f='${db:Status-Status}' cloudflared 2>/dev/null || true) != installed ]]; then
+    curl -fsSL --retry 3 -o "$WORK/cloudflared.deb" \
+      "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64.deb"
+    echo "$CLOUDFLARED_SHA256  $WORK/cloudflared.deb" | sha256sum -c --quiet ||
+      die "cloudflared $CLOUDFLARED_VERSION does not match its pinned sha256"
+    dpkg -i "$WORK/cloudflared.deb" >/dev/null
+    restart=1
+    report changed "front: installed cloudflared $CLOUDFLARED_VERSION"
+  fi
+  grep -q -- '--token-file' < <(cloudflared tunnel run --help 2>&1) ||
+    die "the installed cloudflared has no tunnel run --token-file; install $CLOUDFLARED_VERSION or later"
+  if ! cmp -s "$CURRENT/packaging/cloudflared/$CF_UNIT" "$UNIT_DIR/$CF_UNIT"; then
+    install -m 0644 -o root -g root "$CURRENT/packaging/cloudflared/$CF_UNIT" "$UNIT_DIR/$CF_UNIT"
+    systemctl daemon-reload
+    restart=1
+    report changed "front: installed $CF_UNIT"
+  fi
+  if [[ $(systemctl is-enabled "$CF_UNIT" 2>/dev/null || true) != enabled ]]; then
+    systemctl enable -q "$CF_UNIT"
+    report changed "front: enabled $CF_UNIT"
+  fi
+  if ((restart)) || [[ $(systemctl is-active "$CF_UNIT" 2>/dev/null || true) != active ]]; then
+    # It connects to Cloudflare in the background; a bad token shows in
+    # its journal, not here.
+    systemctl restart --no-block "$CF_UNIT"
+    report changed "front: started $CF_UNIT"
+    local _
+    for _ in $(seq 30); do
+      [[ $(systemctl is-active "$CF_UNIT" 2>/dev/null || true) == active ]] && break
+      sleep 0.5
+    done
+    [[ $(systemctl is-active "$CF_UNIT" 2>/dev/null || true) == active ]] ||
+      report warn "front: $CF_UNIT is not active after 15 s; check the token (journalctl -u $CF_UNIT)"
+  else
+    report ok "front: $CF_UNIT active"
+  fi
+  tunnel_ingress_notice
+}
+
+# The live case: a cloudflared.service someone else installed (often by
+# cloudflared service install, which puts the token on its command
+# line). It is never changed; install.sh only reports on it.
+existing_cloudflared() {
+  report ok "front: cloudflared.service exists; install.sh leaves it as it is"
+  if [[ $(systemctl show -p ExecStart --value cloudflared.service) =~ (^|[[:space:]])--token([[:space:]]|=) ]]; then
+    report warn "front: cloudflared.service passes the tunnel token on its command line, where every local user can read it (ps); move it to a 0600 file with --token-file"
+  fi
+  if [[ $(systemctl show -p Environment --value cloudflared.service) =~ (^|[[:space:]])TUNNEL_TOKEN= ]]; then
+    report warn "front: cloudflared.service sets TUNNEL_TOKEN in its unit, which every local user can read (systemctl show); move it to a 0600 file with --token-file"
+  fi
+  tunnel_ingress_notice
+}
+
+tunnel_ingress_notice() {
+  report notice "front: the tunnel's public hostname $URL_HOST must route to http://127.0.0.1:$EFFECTIVE_PORT (Cloudflare dashboard or ingress rules); puma listens on 127.0.0.1 only, so a route to localhost fails where localhost resolves to ::1"
+}
+
 # --- step 11: backup settings and key custody --------------------------------------------------
 
 step_backup() {
@@ -1102,6 +1439,7 @@ main() {
   read_smtp
   check_settings
   check_start
+  check_front
 
   ensure_users
   step_release
@@ -1110,6 +1448,7 @@ main() {
   step_env
   step_migrate
   step_units
+  step_front
   step_backup
 
   echo
@@ -1123,6 +1462,7 @@ main() {
   else
     echo "  (ubicloud-admin is not installed by this build; see docs/byoh/INSTALL.md)"
   fi
+  echo "  Front:    --tls $TLS"
   [[ $TLS != none ]] || echo "  --tls none serves 127.0.0.1:3000 only; reach it with ssh -L 3000:127.0.0.1:3000 (browser use UNVERIFIED)"
 }
 

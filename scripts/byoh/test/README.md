@@ -19,7 +19,7 @@ docker network create ubi-test-net              # once, if missing
 scripts/byoh/test/run.sh --prepare-image        # ubi-m3-systemd
 scripts/byoh/test/run.sh --prepare-tools        # ubi-m3-tools: install.sh --stage tools (~4-10 min)
 scripts/byoh/test/run.sh --prepare-release      # ubi-m3-release: install.sh of the working tree
-scripts/byoh/test/run.sh all                    # or: envfmt verify fresh rerun flags smoke kill restart reboot
+scripts/byoh/test/run.sh all                    # or: envfmt verify fresh rerun flags smoke kill restart reboot tls-provided tunnel
 ```
 
 `--prepare-tools` runs `scripts/byoh/install.sh --stage tools` (packages,
@@ -50,6 +50,8 @@ release with exactly the units' environment, parsed by systemd).
 | `kill` | A: SIGKILL to the respirate child; restarter keeps its PID and respawns within 4 s. B: `systemctl kill -s KILL`; a new MainPID within 5 s. Both: a strand runs within 150 s. |
 | `restart` | `systemctl restart ubicloud.target`. A stop while an idle child runs ends with `Result=success`. A stop while restarter sleeps between children ends quickly, with no ESRCH and no leftover process. A running backup (a stand-in drop-in) survives a restart and a stop of the target, and the stop pauses the timer. Then, with strands held in a query by a lock on `vm_host`: a stop with one running strand, a stop past a shortened `TimeoutStopSec`, and a stop with every dispatcher thread busy (below). |
 | `reboot` | `docker restart`: the target starts at boot, web answers, and strands run. A real VM reboot is UNVERIFIED. |
+| `tls-provided` | The E0 HTTPS gate: one `install.sh --tls provided` run on `ubi-m3-tools` with a self-signed certificate for `cp.test` and `--url https://cp.test`. Refused first, with exit 2 and nothing created: a certificate for another host, the key of another certificate, a missing key, `--cert` with `--tls none`, an http URL, a URL with a port. Then: caddy (Ubuntu universe) active and enabled; `https://cp.test` answers through caddy with the given certificate (verified with `--cacert`, not `-k`); http redirects to https (308); the caddy admin API on 127.0.0.1:2019 refuses connections; puma listens on 127.0.0.1 only; `/etc/ubicloud/tls` is `root:caddy` 0750 with the key 0640; `IP_FROM_HEADER='X-Real-IP'`; `byoh-config-check` reports the client-IP check ok. An account logs in over HTTPS, and the audit log records the container's address as caddy sees it, not 127.0.0.1 and not the `X-Real-IP` the client sent. A rerun changes no file and restarts nothing (web, respirate, caddy). Switching back to `--tls none` exits 2 naming `BASE_URL`, `IP_FROM_HEADER` and `TLS_FRONT`, and with `--update-env` for those stops and disables caddy and removes `IP_FROM_HEADER`. |
+| `tunnel` | From `ubi-m3-release` with a stand-in `cloudflared.service` that has a token on its command line (the live case): `--tls tunnel --update-env BASE_URL --update-env TLS_FRONT` leaves that unit byte for byte with the same MainPID, warns that its token is on the command line without printing it, prints the `http://127.0.0.1:3000` ingress reminder, installs no unit of its own and sets `IP_FROM_HEADER='CF-Connecting-IP'`; a login carrying that header is recorded with its address; a rerun changes nothing. With the stand-in removed: no token file exits 2, a 0644 token file exits 2, and a 0600 one installs the pinned cloudflared (sha256-checked) and `ubicloud-cloudflared.service` (`systemd-analyze verify` clean) with the token as a `LoadCredential=` credential, copied to `/etc/ubicloud/cloudflared.token` root 0600. The token is a dummy, so cloudflared answers "Provided Tunnel token is not valid.", which proves it read the credential; the token is on no command line and not in the unit. A real tunnel is UNVERIFIED. |
 
 ## Results (2026-10-14, systemd 255.4-1ubuntu8.17, curl 8.5.0)
 
@@ -104,6 +106,26 @@ the review fixes.
   starts again. Until WP6 installs `ubicloud-admin`, the service is
   skipped on `ConditionFileIsExecutable=`, so the 03:15 run does not
   leave the system degraded.
+
+## TLS front results (2026-10-14, caddy 2.6.2-6ubuntu0.24.04.3, cloudflared 2026.9.3)
+
+- `tls-provided` and `tunnel` passed; the one-command `--tls provided`
+  install (release build included) took about a minute on `ubi-m3-tools`.
+- systemd mounts a unit's credentials in a child mount namespace and
+  moves them into `/run/credentials`, which reaches the service only
+  when `/` is a shared mount. systemd makes it shared at boot on a real
+  machine, but not in a container, where `LoadCredential=` therefore
+  failed ("Failed to read token file: open
+  /run/credentials/ubicloud-cloudflared.service/token: no such file or
+  directory"). `start_sys` runs `mount --make-rshared /` inside the
+  container after boot. `ubicloud-cloudflared` on a real machine, where
+  systemd does this itself, is UNVERIFIED: no VM was booted.
+- Caddy's `admin off` also disables `caddy reload`, so `systemctl reload
+  caddy` fails; install.sh restarts caddy when its Caddyfile or
+  certificate changes.
+- With a token that cloudflared rejects, `ubicloud-cloudflared` restarts
+  every 5 s, and install.sh warns after 15 s instead of failing, because
+  the tunnel connects in the background.
 
 ## Findings the installer handles
 
