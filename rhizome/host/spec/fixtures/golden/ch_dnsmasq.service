@@ -1,0 +1,19 @@
+[Unit]
+Description=A lightweight DHCP and caching DNS server
+After=network.target
+
+[Service]
+Slice=standard-gold.slice
+NetworkNamespacePath=/var/run/netns/vmgold01
+Type=simple
+ExecStartPre=/usr/local/sbin/dnsmasq --test
+ExecStart=/usr/local/sbin/dnsmasq -k -h -C /vm/vmgold01/dnsmasq.conf --log-debug -i nc5bn8tz4r0 --user=vmgold01 --group=vmgold01
+ExecReload=/bin/kill -HUP $MAINPID
+ProtectSystem=strict
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+NoNewPrivileges=yes
+ReadOnlyPaths=/

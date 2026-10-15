@@ -1,0 +1,46 @@
+[Unit]
+Description=vmgold01
+After=network.target
+
+After=vmgold01-0-storage.service
+After=vmgold01-dnsmasq.service
+
+Requires=vmgold01-0-storage.service
+Wants=vmgold01-dnsmasq.service
+
+[Service]
+Slice=system.slice
+NetworkNamespacePath=/var/run/netns/vmgold01
+
+ExecStart=qemu-system-x86_64 \
+-bios /opt/fw/QEMU.fd \
+-object memory-backend-memfd,id=mem0,size=8G,hugetlb=on,hugetlbsize=1G,prealloc=on,share=on \
+-numa node,memdev=mem0 \
+-m 8G \
+-smp cpus=4,maxcpus=4,threads=2,cores=2,dies=1,sockets=1 \
+-cpu host \
+-enable-kvm \
+-machine accel=kvm,type=q35 \
+-chardev socket,id=vhostblk0,path=/var/storage/vmgold01/0/vhost.sock,server=off \
+-device vhost-user-blk-pci,chardev=vhostblk0,num-queues=2,queue-size=64,romfile= \
+-drive if=none,file=/vm/vmgold01/cloudinit.img,format=raw,readonly=on,id=cidrive \
+-device virtio-blk-pci,drive=cidrive,romfile= \
+-netdev tap,id=net0,ifname=nc5bn8tz4r0,script=no,downscript=no,queues=9,vhost=on \
+-device virtio-net-pci,mac=52:54:00:12:34:56,netdev=net0,mq=on,romfile= \
+-device pcie-root-port,id=rp1,slot=1,chassis=1,bus=pcie.0,hotplug=off \
+-device vfio-pci,host=0000:c1:00.0,bus=rp1,addr=0x0 \
+-serial file:/vm/vmgold01/serial.log \
+-display none \
+-vga none
+
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+Restart=no
+User=vmgold01
+Group=vmgold01
+
+LimitNOFILE=500000
+LimitMEMLOCK=10737418240
+
+
