@@ -245,6 +245,12 @@ end
 
 `Prog::DownloadCloudHypervisor` and `Prog::DownloadFirmware`, together with their `VmHost` helpers (`model/vm_host.rb:269-289`), refuse emulated hosts with "emulated hosts run QEMU, not cloud-hypervisor".
 
+`prep_host.rb` (WP4) runs the steps `EmulatedHost.prep_steps(accel)` lists, by name; the accel is its optional third argument and defaults to `kvm`. Facts behind its checks:
+- The `kvm` list is the script's original statement order. A spec loads the script with every command and file write recorded and pins the whole trace; the same spec passed against the 9e22d71ec script, so KVM hosts run the same commands, with the same file contents, in the same order (VERIFIED in the rhizome specs).
+- The package check reads `dpkg-query -W -f='${Package} ${db:Status-Abbrev}'` and accepts only `ii`. Listing alone is not enough: after `apt-get remove ovmf`, dpkg still lists `ovmf`, with status `un`. VERIFIED in an ubuntu:24.04 container without `/dev/kvm`: before the install both packages are reported missing and `-accel help` fails; after `apt-get install --no-install-recommends qemu-system-x86 ovmf` (8.2.2, ovmf 2024.02) the check passes and `/usr/share/ovmf/OVMF.fd` exists; after removing `ovmf` it is reported missing again.
+- `EmulatedHost::BACKEND_RSS_MIB` (ubiblk plus dnsmasq per VM) is a provisional 64 MiB (UNVERIFIED). WP10 measures it, and the WP5/WP7 cross-spec checks `EMULATED_VM_OVERHEAD_MIB` against it.
+- The tcg path still writes the global forwarding sysctls, the irdma blacklist and `update-initramfs`, as the kvm path does. The WP10 container harness therefore never runs `prep_host.rb`; it calls `EmulatedHost` directly.
+
 ### 6.4 Memory and CPU: no hugepages, a budget in the existing columns
 
 Emulated hosts use **no 1G hugepages**:
