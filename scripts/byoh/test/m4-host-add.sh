@@ -30,8 +30,9 @@
 #      to the lines that were there, the HostNexus frame that makes
 #      BootstrapRhizome verify those keys, no drop-in (sshd already allowed
 #      root key login), PF2 passed, and the kept key deleted; a re-run
-#      resumes without a second host, and a re-run with --storage-disk is
-#      refused (2)
+#      resumes without a second host, a re-run with --storage-disk is
+#      refused (2), and `watch` through a pipe delivers its lines as
+#      they happen, not in one block at exit
 #   D2 on a second fakehost that denies root login, with an sshd shim
 #      whose `sshd -t` fails: the drop-in is rolled back, exit 1, sshd
 #      still serves, no host row
@@ -261,6 +262,20 @@ add --ssh "ubuntu@$ip" --routed-network 10.77.9.0/29 --storage-disk ata-M4_DISK 
 expect_rc 2 "D re-run with --storage-disk"
 has "D re-run with --storage-disk" "is registered already, and add formats storage disks only before it registers"
 say "PASS D re-run: resumes without a second host; --storage-disk refused (2)"
+
+# The watch's label lines must reach a pipe as they happen (tee, a CI
+# log, m4-e2.sh's timestamper), not in one block at exit. Respirate is
+# not running, so the strand stays at start: the first poll prints its
+# label at once and --timeout ends the watch about 10 s later.
+vh=$(rb 'puts VmHost[Sshable.first(host: ARGV[0]).id].ubid' "$ip")
+# shellcheck disable=SC2016
+docker exec "$CP" sh -c 'bundle exec bin/byoh-host watch "$1" --timeout 8 2>&1 | while IFS= read -r l; do echo "$(date +%s) $l"; done' \
+  sh "$vh" >"$LOGS/d-pipe.out" || true
+first=$(grep -m1 " host Vm::HostNexus.start" "$LOGS/d-pipe.out" | cut -d' ' -f1)
+last=$(grep -m1 "is not accepting VMs after 8 s" "$LOGS/d-pipe.out" | cut -d' ' -f1)
+[[ -n $first && -n $last ]] || fail "D pipe: watch output: $(cat "$LOGS/d-pipe.out")"
+((last - first >= 5)) || fail "D pipe: the watch's lines reached the pipe together (at $first and $last): stdout is buffered"
+say "PASS D pipe: watch lines reach a pipe as they happen ($((last - first)) s apart)"
 
 # --- D2: sshd -t fails with the drop-in ---------------------------------------
 
