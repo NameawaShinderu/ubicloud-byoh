@@ -76,8 +76,12 @@ class ByohHostCli
     if rollback
       raise Error, "host #{host.ubid} is not in a BYOH location; nothing to roll back" unless host.location.byoh?
       raise Error, "location #{target.name} is a BYOH location; --rollback-to moves a host out of BYOH (use --location)" if target.byoh?
+      # Only BYOH locations have lower virtualization tiers.
+      raise Error, "host #{host.ubid} is a #{host.virt_tier} host, which only BYOH locations can hold; destroy and register it again instead" if ByohVirtTiers.lower?(host.virt_tier)
     else
       raise Error, "location #{target.name} is not a BYOH location" unless target.byoh?
+      # The byoh_virt CHECK makes a listed lower tier an acknowledged one.
+      raise Error, "location #{target.name} does not offer #{host.virt_tier} hosts; see bin/byoh-location set --virt-tiers" unless ByohVirtTiers.allows?(target, host.virt_tier)
     end
     raise Error, "host #{host.ubid} is already in location #{target.name}" if host.location_id == target.id
 

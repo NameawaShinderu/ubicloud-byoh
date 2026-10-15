@@ -200,6 +200,7 @@ RSpec.describe ByohLocationCli do
           Granted to    #{project.ubid}
           Rate file     (BILLING_RATES_EXTRA_DIR is unset)
           Rates         missing VmVCpu/standard, VmVCpu/burstable, VmStorage/standard, VmStorage/burstable, IPAddress/IPv4, MachineImageStorage/standard
+          Virt tiers    kvm
           Profile
           {
             "ula48": "fd00:1:2::/48",
@@ -485,6 +486,118 @@ RSpec.describe ByohLocationCli do
       LocationAz.create(location_id: location.id, az: "a")
       expect(cli("delete", "--location", location.name)[2]).to end_with "! location byoh-1 is still used by 1 vm_host\n"
       expect(Semaphore.where(strand_id: location.id).count).to eq 0
+    end
+  end
+
+  describe "virtualization tiers" do
+    let(:location) { byoh_location("byoh-1") }
+    let(:path) { File.join(dir, "byoh-1.yml") }
+
+    before { allow(Config).to receive(:billing_rates_extra_dir).and_return(dir) }
+
+    def tier_rates(family = "container")
+      %w[VmVCpu VmStorage].map { rate("byoh-1", it, family) }
+    end
+
+    def project_granted(name)
+      Project.create(name:).tap { it.set_ff_visible_locations(["byoh-1"]) }
+    end
+
+    it "refuses a tier this control plane cannot run yet" do
+      expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,container", "--accept", "container")[2])
+        .to eq "! container is not available yet: this control plane's rhizome cannot run container hosts (docs/byoh/NO_KVM.md section 11)\n"
+      expect(location.reload.byoh_virt).to be_nil
+    end
+
+    context "with shipped tiers" do
+      before { ship_virt_tiers("container", "emulated") }
+
+      it "offers a tier only with its acknowledgement and rates" do
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,container")[2]).to start_with "! container must be acknowledged: add --accept container (System container"
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,container", "--accept", "container")[2])
+          .to start_with "! container has no VmVCpu and VmStorage rate in byoh-1; run: bin/byoh-location rates --location byoh-1 --family container --from standard --multiplier X"
+
+        write_rates(dir, "byoh-1", full_rates("byoh-1") + tier_rates)
+        status, output, = cli("set", "--location", location.name, "--virt-tiers", "kvm,container", "--accept", "container")
+        expect(status).to eq 0
+        expect(output).to start_with "Updated location byoh-1.\n"
+        expect(location.reload.byoh_virt.to_h).to eq("tiers" => %w[kvm container], "acks" => {"container" => []})
+        expect(audit_rows.last[:args]["byoh_virt"]).to eq("tiers" => %w[kvm container], "acks" => {"container" => []})
+        expect(cli("show", "--location", location.name)[1]).to include "Virt tiers    kvm, container (L3, experimental)\n"
+        expect(cli("set", "--location", location.name, "--unaccept", "emulated:multitenant")[0]).to eq 0
+        expect(location.reload.byoh_virt["acks"]).to eq("container" => [])
+
+        expect(cli("set", "--location", location.name, "--accept", "container:multitenant", "--accept", "container:guest-firewall")[0]).to eq 0
+        expect(cli("show", "--location", location.name)[1]).to include "Virt tiers    kvm, container (L3, experimental) [multitenant, guest-firewall]\n"
+        expect(cli("set", "--location", location.name, "--unaccept", "container:guest-firewall")[0]).to eq 0
+        expect(location.reload.byoh_virt["acks"]).to eq("container" => ["multitenant"])
+        expect(cli("set", "--location", location.name, "--unaccept", "container")[2]).to start_with "! container must be acknowledged"
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm", "--unaccept", "container")[0]).to eq 0
+        expect(location.reload.byoh_virt.to_h).to eq("tiers" => ["kvm"], "acks" => {})
+      end
+
+      it "refuses unknown tiers and options" do
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,tcg")[2]).to eq "! unknown tier tcg; expected kvm, container, pvm, emulated\n"
+        expect(cli("set", "--location", location.name, "--virt-tiers", "")[2]).to eq "! --virt-tiers needs at least one tier\n"
+        expect(cli("set", "--location", location.name, "--accept", "kvm")[2]).to eq "! cannot acknowledge kvm: expected one of container, pvm, emulated\n"
+        expect(cli("set", "--location", location.name, "--accept", "emulated:guest-firewall")[2]).to eq "! emulated has no option guest-firewall; expected one of multitenant\n"
+      end
+
+      it "keeps a tier while hosts are registered on it" do
+        write_rates(dir, "byoh-1", full_rates("byoh-1") + tier_rates("emulated"))
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,emulated", "--accept", "emulated")[0]).to eq 0
+        create_byoh_vm_host(location, virt_tier: "emulated", family: "emulated")
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm")[2]).to eq "! emulated has 1 hosts in byoh-1; destroy them before dropping the tier\n"
+      end
+
+      it "keeps single-project tiers to one project" do
+        write_rates(dir, "byoh-1", full_rates("byoh-1") + tier_rates)
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,container", "--accept", "container")[0]).to eq 0
+        expect(cli("set", "--location", location.name, "--visible")[2])
+          .to start_with "! location byoh-1 offers container to one project only, so it cannot be visible"
+        first = Project.create(name: "first")
+        second = Project.create(name: "second")
+        expect(cli("grant", "--location", location.name, "--project", first.ubid)[0]).to eq 0
+        expect(cli("grant", "--location", location.name, "--project", first.ubid)[0]).to eq 0
+        expect(cli("grant", "--location", location.name, "--project", second.ubid)[2])
+          .to start_with "! location byoh-1 offers container to one project only, and is granted to #{first.ubid}; revoke first"
+
+        expect(cli("set", "--location", location.name, "--accept", "container:multitenant")[0]).to eq 0
+        expect(cli("grant", "--location", location.name, "--project", second.ubid)[0]).to eq 0
+        expect(cli("set", "--location", location.name, "--unaccept", "container:multitenant")[2])
+          .to eq "! location byoh-1 offers container to one project only, but is granted to #{[first, second].sort_by(&:id).map(&:ubid).join(", ")}\n"
+        expect(cli("set", "--location", location.name, "--visible")[0]).to eq 0
+        expect(cli("set", "--location", location.name, "--no-visible")[0]).to eq 0
+      end
+
+      it "refuses a grant on a visible location with a single-project tier" do
+        write_rates(dir, "byoh-1", full_rates("byoh-1") + tier_rates)
+        location.update(visible: true, byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container], "acks" => {"container" => []}}))
+        expect(cli("grant", "--location", location.name, "--project", Project.create(name: "p").ubid)[2])
+          .to start_with "! location byoh-1 offers container to one project only, and is visible to every project"
+      end
+    end
+
+    describe "rates --family" do
+      it "prices a tier from the location's own rates" do
+        write_rates(dir, "byoh-1", full_rates("byoh-1"))
+        status, output, = cli("rates", "--location", location.name, "--family", "container", "--from", "standard", "--multiplier", "0.5")
+        expect(status).to eq 0
+        expect(output).to start_with "Wrote 2 rates copied from byoh-1/standard (x0.5) to #{path}."
+        rows = YAML.load_file(path, permitted_classes: [Time]).select { it["resource_family"] == "container" }
+        expect(rows.map { it.values_at("resource_type", "unit_price", "location") }).to contain_exactly(["VmVCpu", 0.0005, "byoh-1"], ["VmStorage", 0.0005, "byoh-1"])
+        expect(cli("rates", "--location", location.name, "--family", "container", "--from", "standard", "--multiplier", "0.5")[1]).to start_with "#{path} already has every rate of byoh-1/standard."
+      end
+
+      it "refuses what it cannot price" do
+        expect(cli("rates", "--location", location.name, "--family", "container")[2]).to eq "! --family and --from go together, without --rates-from\n"
+        expect(cli("rates", "--location", location.name, "--from", "standard", "--family", "container", "--rates-from", "hetzner-fsn1")[2]).to eq "! --family and --from go together, without --rates-from\n"
+        expect(cli("rates", "--location", location.name, "--family", "gpu", "--from", "standard", "--multiplier", "1")[2]).to eq "! --family must be one of container, pvm, emulated\n"
+        expect(cli("rates", "--location", location.name, "--family", "container", "--from", "standard")[2]).to eq "! --multiplier is required with --family: price the tier deliberately\n"
+        write_rates(dir, "byoh-1", [rate("byoh-1", "IPAddress", "IPv4")])
+        expect(cli("rates", "--location", location.name, "--family", "container", "--from", "standard", "--multiplier", "1")[2])
+          .to eq "! location byoh-1 has no standard rates to copy; copy them first with --rates-from\n"
+      end
     end
   end
 end

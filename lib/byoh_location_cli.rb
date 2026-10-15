@@ -22,7 +22,9 @@ class ByohLocationCli
       list
       show     --location NAME
       set      --location NAME [--ui-name TEXT] [--[no-]visible] [--unset KEY] [profile options]
+               [--virt-tiers LIST] [--accept TIER[:OPTION]] [--unaccept TIER[:OPTION]]
       rates    --location NAME --rates-from LOCATION [--multiplier X]
+      rates    --location NAME --family FAMILY --from FAMILY --multiplier X
       grant    --location NAME --project UBID
       revoke   --location NAME --project UBID
       delete   --location NAME
@@ -170,6 +172,7 @@ class ByohLocationCli
     @out.puts "Granted to    #{granted_projects(location).map(&:ubid).join(", ")}"
     @out.puts "Rate file     #{rate_file(location) || "(BILLING_RATES_EXTRA_DIR is unset)"}"
     @out.puts "Rates         #{missing.empty? ? "complete" : "missing #{missing.map { it.join("/") }.join(", ")}"}"
+    @out.puts "Virt tiers    #{virt_summary(location)}"
     @out.puts "Profile"
     @out.puts JSON.pretty_generate(location.byoh_network.to_h)
     print_warnings
@@ -183,9 +186,11 @@ class ByohLocationCli
       o.on("--ui-name TEXT", "Name shown to customers") { opts[:ui_name] = it }
       o.on("--[no-]visible", "Show the location to every project (needs complete billing rates)") { opts[:visible] = it }
       o.on("--unset KEY", "Remove a profile key, restoring its default (repeatable)") { opts[:unset] << it }
+      virt_options(o, opts)
       profile_options(o, profile)
     end
     location = find_location(opts)
+    new_virt = virt_policy(location, opts)
 
     unknown = opts[:unset] - (ByohNetworkProfile::KEYS - ["ula48"])
     raise Error, "--unset cannot remove #{unknown.join(", ")}" unless unknown.empty?
@@ -201,17 +206,19 @@ class ByohLocationCli
     end
     check_profile!(new_profile, location)
     require_rates!(location.name, "stays hidden") if opts[:visible]
+    check_tenancy!(location, new_virt || ByohVirtTiers.policy(location), visible: opts[:visible].nil? ? location.visible : opts[:visible])
 
     changes = {}
     changes[:ui_name] = opts[:ui_name] if opts[:ui_name]
     changes[:byoh_network] = Sequel.pg_jsonb(new_profile) if new_profile != old_profile
+    changes[:byoh_virt] = Sequel.pg_jsonb(new_virt) if new_virt
     # The egress table holds the location's deny lists, so a change must
     # reach every host now: VM setup keeps a table that is already loaded.
     # A host before prep gets the new settings from prep.
     egress_changed = ByohNetworkProfile.new(old_profile).egress_nat4_params != ByohNetworkProfile.new(new_profile).egress_nat4_params
     strands = DB.transaction do
       location.update(changes) unless changes.empty?
-      audit("set", location, {ui_name: opts[:ui_name], byoh_network: new_profile}.compact)
+      audit("set", location, {ui_name: opts[:ui_name], byoh_network: new_profile, byoh_virt: new_virt}.compact)
       next [] unless egress_changed
 
       VmHost.where(location_id: location.id).order(:id).all.select { ByohHostCli.past_prep?(it) }.map do |host|
@@ -226,21 +233,42 @@ class ByohLocationCli
 
   def cmd_rates(argv)
     opts = {}
-    parse(argv, "rates --location NAME --rates-from LOCATION [--multiplier X]") do |o|
+    parse(argv, "rates --location NAME (--rates-from LOCATION [--multiplier X] | --family FAMILY --from FAMILY --multiplier X)") do |o|
       location_option(o, opts)
       o.on("--rates-from LOCATION", "Location whose rates are copied, of every resource type and family") { opts[:rates_from] = it }
-      o.on("--multiplier X", Float, "Price multiplier (default 1.0)") { opts[:multiplier] = it }
+      o.on("--multiplier X", Float, "Price multiplier (default 1.0 with --rates-from; required with --family)") { opts[:multiplier] = it }
+      o.on("--family FAMILY", "Lower-tier family to price (#{ByohVirtTiers::TIERS.keys.join(", ")}) from this location's own rates") { opts[:family] = it }
+      o.on("--from FAMILY", "Family of this location whose rates --family copies, e.g. standard") { opts[:from] = it }
     end
     location = find_location(opts)
-    raise Error, "--rates-from is required" unless opts[:rates_from]
 
-    copy_rates(location, opts[:rates_from], opts[:multiplier] || 1.0)
+    if opts[:family] || opts[:from]
+      raise Error, "--family and --from go together, without --rates-from" if opts[:rates_from] || !(opts[:family] && opts[:from])
+      raise Error, "--family must be one of #{ByohVirtTiers::TIERS.keys.join(", ")}" unless ByohVirtTiers::TIERS.key?(opts[:family])
+      raise Error, "--multiplier is required with --family: price the tier deliberately" unless opts[:multiplier]
+
+      # Only what a VM of the family is charged by (ByohVirtTiers::RATE_TYPES).
+      rows = source_rates(location.name, opts[:multiplier]).select { it["resource_family"] == opts[:from] && ByohVirtTiers::RATE_TYPES.include?(it["resource_type"]) }
+      raise Error, "location #{location.name} has no #{opts[:from]} rates to copy; copy them first with --rates-from" if rows.empty?
+
+      copy_rates(location, "#{location.name}/#{opts[:from]}", opts[:multiplier],
+        rows: rows.map { it.merge("resource_family" => opts[:family]) }, id_extra: [opts[:family]])
+    else
+      raise Error, "--rates-from is required" unless opts[:rates_from]
+
+      copy_rates(location, opts[:rates_from], opts[:multiplier] || 1.0)
+    end
     @out.puts RESTART_NOTE
   end
 
   def cmd_grant(argv)
     location, project = location_and_project(argv, "grant")
     require_rates!(location.name, "cannot be granted (run the rates command)")
+    others = granted_projects(location).reject { it.id == project.id }
+    single = single_project_tiers(ByohVirtTiers.policy(location))
+    if !single.empty? && (location.visible || !others.empty?)
+      raise Error, "location #{location.name} offers #{single.join(", ")} to one project only, and #{location.visible ? "is visible to every project" : "is granted to #{others.map(&:ubid).join(", ")}"}; revoke first, or acknowledge sharing with set --accept <tier>:multitenant"
+    end
 
     DB.transaction do
       project.set_ff_visible_locations(((project.get_ff_visible_locations || []) + [location.name]).uniq)
@@ -285,6 +313,89 @@ class ByohLocationCli
     @out.puts "Location #{location.name} will be deleted by its strand."
     path = rate_file(location)
     @out.puts "The rate file #{path} is kept: old invoices may refer to its rates." if path && File.exist?(path)
+  end
+
+  def virt_options(o, opts)
+    o.separator ""
+    o.separator "Virtualization tiers (location.byoh_virt; docs/byoh/NO_KVM.md):"
+    o.on("--virt-tiers LIST", Array, "Tiers hosts and VMs of the location may use: #{ByohVirtTiers::IDS.join(", ")} (default kvm)") { opts[:virt_tiers] = it }
+    o.on("--accept TIER[:OPTION]", "Acknowledge a lower tier, or one of its options such as container:multitenant (repeatable)") { (opts[:accept] ||= []) << it }
+    o.on("--unaccept TIER[:OPTION]", "Withdraw an acknowledgement (repeatable)") { (opts[:unaccept] ||= []) << it }
+  end
+
+  # The location's new byoh_virt policy, or nil when the options do not
+  # change it. Refuses a policy that offers a tier without its
+  # acknowledgement, its rates or its rhizome support, or that drops a
+  # tier hosts are registered on.
+  def virt_policy(location, opts)
+    return unless opts[:virt_tiers] || opts[:accept] || opts[:unaccept]
+
+    old = ByohVirtTiers.policy(location)
+    tiers = opts[:virt_tiers]&.uniq || old["tiers"]
+    unknown = tiers - ByohVirtTiers::IDS
+    raise Error, "unknown tier #{unknown.join(", ")}; expected #{ByohVirtTiers::IDS.join(", ")}" unless unknown.empty?
+    raise Error, "--virt-tiers needs at least one tier" if tiers.empty?
+
+    acks = old["acks"].transform_values(&:dup)
+    Array(opts[:accept]).each do |item|
+      tier, option = parse_ack(item)
+      acks[tier] ||= []
+      acks[tier] |= [option] if option
+    end
+    Array(opts[:unaccept]).each do |item|
+      tier, option = parse_ack(item)
+      option ? acks[tier]&.delete(option) : acks.delete(tier)
+    end
+
+    tiers.each do |tier|
+      next unless ByohVirtTiers.lower?(tier)
+
+      raise Error, "#{tier} is not available yet: this control plane's rhizome cannot run #{tier} hosts (docs/byoh/NO_KVM.md section 11)" unless ByohVirtTiers.shipped?(tier)
+      raise Error, "#{tier} must be acknowledged: add --accept #{tier} (#{ByohVirtTiers.fetch(tier).description})" unless acks.key?(tier)
+      family = ByohVirtTiers.fetch(tier).family
+      missing = ByohVirtTiers::RATE_TYPES.reject { |type| BillingRate.load_rates(BillingRate.rate_globs).any? { it["resource_type"] == type && it["resource_family"] == family && it["location"] == location.name } }
+      raise Error, "#{tier} has no #{missing.join(" and ")} rate in #{location.name}; run: bin/byoh-location rates --location #{location.name} --family #{family} --from standard --multiplier X" unless missing.empty?
+    end
+    (old["tiers"] - tiers).each do |tier|
+      hosts = VmHost.where(location_id: location.id, virt_tier: tier).count
+      raise Error, "#{tier} has #{hosts} hosts in #{location.name}; destroy them before dropping the tier" unless hosts.zero?
+    end
+
+    {"tiers" => tiers, "acks" => acks}
+  end
+
+  def parse_ack(item)
+    tier, option = item.split(":", 2)
+    spec = ByohVirtTiers::TIERS[tier] || raise(Error, "cannot acknowledge #{tier}: expected one of #{ByohVirtTiers::TIERS.keys.join(", ")}")
+    raise Error, "#{tier} has no option #{option}; expected one of #{spec.options.join(", ")}" if option && !spec.options.include?(option)
+    [tier, option]
+  end
+
+  # The lower tiers of a policy that are single-project.
+  def single_project_tiers(policy)
+    policy["tiers"].select { ByohVirtTiers.lower?(it) && !Array(policy["acks"][it]).include?("multitenant") }
+  end
+
+  # Refuses a policy whose single-project tiers would be shared: a
+  # visible location, or one granted to more than one project.
+  def check_tenancy!(location, policy, visible:)
+    single = single_project_tiers(policy)
+    return if single.empty?
+
+    raise Error, "location #{location.name} offers #{single.join(", ")} to one project only, so it cannot be visible; grant it to one project, or add --accept <tier>:multitenant" if visible
+
+    grants = granted_projects(location)
+    raise Error, "location #{location.name} offers #{single.join(", ")} to one project only, but is granted to #{grants.map(&:ubid).join(", ")}" if grants.size > 1
+  end
+
+  def virt_summary(location)
+    policy = ByohVirtTiers.policy(location)
+    policy["tiers"].map { |tier|
+      next tier unless ByohVirtTiers.lower?(tier)
+
+      options = Array(policy["acks"][tier])
+      "#{ByohVirtTiers.fetch(tier).label}#{" [#{options.join(", ")}]" unless options.empty?}"
+    }.join(", ")
   end
 
   def parse(argv, banner)
@@ -381,6 +492,7 @@ class ByohLocationCli
 
   def update_visibility(location, visible)
     require_rates!(location.name, "stays hidden") if visible
+    check_tenancy!(location, ByohVirtTiers.policy(location), visible:) if visible
     DB.transaction do
       location.update(visible:)
       audit(visible ? "set-visible" : "set-hidden", location, {})
@@ -399,8 +511,8 @@ class ByohLocationCli
   # each active from now or its own later date, unless the file already
   # charges that price then. So a price upstream schedules ahead starts
   # on its date, and running the same command again adds nothing.
-  def copy_rates(location, source, multiplier)
-    source_rows = source_rates(source, multiplier)
+  def copy_rates(location, source, multiplier, rows: nil, id_extra: [])
+    source_rows = rows || source_rates(source, multiplier)
     path = rate_file(location)
     existing = File.exist?(path) ? (YAML.load_file(path, permitted_classes: [Time]) || []) : []
     now = Time.now.utc.floor
@@ -409,7 +521,7 @@ class ByohLocationCli
     source_rows.group_by { it.values_at(*RATE_KEY) }.each do |key, rows|
       mine = existing.select { it.values_at(*RATE_KEY) == key }
       if mine.empty?
-        added.concat(rows.map { copied_rate(location, it, multiplier, it["active_from"], rate_id(location, it, multiplier)) })
+        added.concat(rows.map { copied_rate(location, it, multiplier, it["active_from"], rate_id(location, it, multiplier, *id_extra)) })
         next
       end
 
@@ -424,7 +536,7 @@ class ByohLocationCli
         # so it is replaced instead of left to tie with the copy.
         stale = mine.select { it["active_from"] == at }
         replaced.concat(stale)
-        copy = copied_rate(location, row, multiplier, at, rate_id(location, row, multiplier, at.iso8601))
+        copy = copied_rate(location, row, multiplier, at, rate_id(location, row, multiplier, *id_extra, at.iso8601))
         mine = mine - stale + [copy]
         added << copy
       end

@@ -68,6 +68,20 @@ RSpec.describe ByohHostCli do
       expect(audit_rows.first[:args].to_h).to eq("from" => "hetzner-fsn1", "to" => "byoh-2")
     end
 
+    it "keeps a host in locations that offer its virtualization tier" do
+      ship_virt_tiers("emulated")
+      [byoh_1, byoh_2].each { it.update(byoh_virt: Sequel.pg_jsonb({"tiers" => ["emulated"], "acks" => {"emulated" => []}})) }
+      host = Prog::Vm::HostNexus.assemble("203.0.113.42", location_id: byoh_1.id, provider_name: HostProvider::GENERIC_PROVIDER_NAME, virt_tier: "emulated",
+        provider_config: {"main_ip4" => "203.0.113.42", "location_label" => "byoh-1", "routed_networks" => [{"cidr" => "fd00:feed::/64"}]}).subject
+      host.update(allocation_state: "draining")
+      expect(cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-fsn1", "--empty-only")[2])
+        .to eq "! host #{host.ubid} is a emulated host, which only BYOH locations can hold; destroy and register it again instead\n"
+      byoh_2.update(byoh_virt: nil)
+      expect(cli("move-location", "--host", host.ubid, "--location", "byoh-2", "--empty-only")[2])
+        .to eq "! location byoh-2 does not offer emulated hosts; see bin/byoh-location set --virt-tiers\n"
+      expect(host.reload.location_id).to eq byoh_1.id
+    end
+
     it "moves a host between BYOH locations" do
       host = generic_host(byoh_1)
       expect(cli("move-location", "--host", host.ubid, "--location", byoh_2.ubid, "--empty-only")[0]).to eq 0
