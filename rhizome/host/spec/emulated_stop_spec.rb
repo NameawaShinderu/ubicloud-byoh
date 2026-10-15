@@ -82,6 +82,42 @@ RSpec.describe EmulatedStop do
     end
   end
 
+  describe ".run" do
+    it "exits 0 silently once QEMU accepted the power button" do
+      expect(described_class).to receive(:powerdown).with(vm_name).and_return(:requested)
+      expect { expect(described_class.run(vm_name)).to eq(0) }.not_to output.to_stdout
+    end
+
+    it "exits 0 and says so for a VM that is already stopped" do
+      expect(described_class).to receive(:powerdown).with(vm_name).and_return(:already_stopped)
+      expect { expect(described_class.run(vm_name)).to eq(0) }.to output("vmq00001 is already stopped\n").to_stdout
+    end
+
+    # A nonzero exit would roll back the strand's `stopping` semaphore, so
+    # the stop window could never end in hard_stop.
+    it "exits 0 with a warning when the soft stop fails, leaving the stop to hard_stop" do
+      expect(described_class).to receive(:powerdown).with(vm_name).and_raise(RuntimeError, "#{vp.qmp_sock} is not a socket")
+      expect {
+        expect(described_class.run(vm_name)).to eq(0)
+      }.to output("stop-vm: #{vp.qmp_sock} is not a socket; leaving the stop to the hard-stop fallback\n").to_stderr
+    end
+
+    it "exits 0 with a warning when QMP times out" do
+      stub_user
+      stub_privilege_drop
+      allow(described_class).to receive(:socket_present?).with(vp, vm_uid).and_return(true)
+      make_run_dir
+      # A listener that never sends the QMP greeting.
+      server = UNIXServer.new(vp.qmp_sock)
+      expect(described_class).to receive(:powerdown).with(vm_name).and_wrap_original { |m, name| m.call(name, timeout: 0.3) }
+      expect {
+        expect(described_class.run(vm_name)).to eq(0)
+      }.to output(/stop-vm: QmpClient::Timeout: QMP timed out\n.*stop-vm: QMP powerdown of vmq00001 failed \(pid \d+ exit 1\); leaving the stop to the hard-stop fallback\n/m).to_stderr_from_any_process
+    ensure
+      server&.close
+    end
+  end
+
   describe ".powerdown" do
     it "presses the power button from a child with the VM user's ids" do
       stub_user

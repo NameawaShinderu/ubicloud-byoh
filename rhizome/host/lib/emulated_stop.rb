@@ -38,6 +38,25 @@ module EmulatedStop
     params["hypervisor"] == "qemu" && params["accel"] == "tcg"
   end
 
+  # stop-vm's branch for emulated VMs. Returns stop-vm's exit status,
+  # which is always 0.
+  #
+  # The soft stop is best effort. The control plane runs stop-vm inside
+  # the strand's transaction (Metal::Nexus#soft_stop), and a nonzero exit
+  # raises there and rolls back the `stopping` semaphore, so the strand
+  # would retry the soft stop forever and never reach its hard_stop
+  # (systemctl stop) fallback. An escaped guest controls run/ and the
+  # QEMU process, so it could force such a failure at will (a refused
+  # socket, a silent QMP, a stopped child). Any failure is therefore only
+  # reported, and the stop window ends in hard_stop as usual.
+  def self.run(vm_name)
+    puts "#{vm_name} is already stopped" if powerdown(vm_name) == :already_stopped
+    0
+  rescue => e
+    warn "stop-vm: #{e.message}; leaving the stop to the hard-stop fallback"
+    0
+  end
+
   # Returns :requested once QEMU accepted system_powerdown, or
   # :already_stopped when no QEMU listens on the socket (it is missing,
   # or stale after QEMU exited). Raises on anything else.
