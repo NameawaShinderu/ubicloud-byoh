@@ -111,6 +111,13 @@ RSpec.describe ByohVirtTiers, "pvm" do
       end
     end
 
+    it "calls a login prompt GO for the boot and user space GO with the measurements" do
+      results = [["12", "10"], ["", "10"], ["", ""]].map { |up, login| run_functions(%w[guest_result], "guest_result '#{up}' '#{login}'")[0].chomp }
+      expect(results).to eq %w[GO GO-boot NO-GO]
+      verdicts = [" NO-GO GO-boot", " GO-boot GO", " NO-GO NO-GO"].map { run_functions(%w[verdict], "verdict '#{it}'")[0].chomp }
+      expect(verdicts).to eq %w[GO-boot GO NO-GO]
+    end
+
     describe "the release pins" do
       let(:defaults) { script.scan(/^(DEFAULT_\w+)=(\S+)$/).to_h }
       let(:release) { {PVM_RELEASE_URL: defaults["DEFAULT_RELEASE_URL"], PVM_HOST_DEB: defaults["DEFAULT_HOST_DEB"], PVM_GUEST_KERNEL: defaults["DEFAULT_GUEST_KERNEL"], PVM_GUEST_CONFIG: defaults["DEFAULT_GUEST_CONFIG"]} }

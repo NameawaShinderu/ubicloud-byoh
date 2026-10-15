@@ -23,7 +23,8 @@
 #   sudo BYOH_REAL_HOST=1 ./pvm-go-no-go.sh recovery-check
 #   sudo BYOH_REAL_HOST=1 ./pvm-go-no-go.sh uninstall   # optional
 #
-# Exit codes: 0 pass (boot-test: GO), 1 fail (boot-test: NO-GO),
+# Exit codes: 0 pass (boot-test: GO, or GO boot-only: a login prompt
+# but no measurements), 1 fail (boot-test: NO-GO),
 # 2 refused or usage error.
 #
 # The boot is one-shot: install pins the running stock kernel as GRUB's
@@ -592,22 +593,49 @@ boot_test_phase() {
   report "host bench:"
   BENCH_DIR=$PVM_WORK "$PVM_WORK/bench.sh" | tee "$PVM_WORK/bench-host.txt" | tee -a "$REPORT"
 
-  local go=0
+  local results="" final
   for v in $CH_VERSIONS; do
-    boot_guest "$v" && go=1
+    boot_guest "$v"
+    results="$results $RESULT"
   done
 
-  if [ "$go" = 1 ]; then
-    report "VERDICT: GO (at least one Cloud Hypervisor version reached guest user space)"
-  else
-    report "VERDICT: NO-GO (no guest reached user space)"
-  fi
+  final=$(verdict "$results")
+  case $final in
+    GO) report "VERDICT: GO (at least one Cloud Hypervisor version reached guest user space; measurements above)" ;;
+    GO-boot) report "VERDICT: GO, boot only (a guest reached a login prompt, so the PVM guest boots; cloud-init's runcmd never ran, so there are no measurements: see the serial log for why the CIDATA seed was not read)" ;;
+    *) report "VERDICT: NO-GO (no guest reached a login prompt)" ;;
+  esac
   report "Next: sudo reboot (expect $(state_get stock_kver)), then: sudo BYOH_REAL_HOST=1 $0 recovery-check"
   echo "report: $REPORT"
-  [ "$go" = 1 ]
+  [ "$final" != NO-GO ]
 }
 
-# One guest under Cloud Hypervisor $1: direct kernel boot of the PVM
+# A guest's result from its seconds to user space and to a login prompt
+# (empty: never). GO: cloud-init's runcmd ran, with the measurements.
+# GO-boot: the kernel and init came up to a login prompt, which answers
+# the boot question, but the NoCloud seed was not read (vfat or NLS
+# trouble, or cloud-final still waiting on the network past the
+# timeout). NO-GO: neither.
+guest_result() {
+  if [ -n "$1" ]; then
+    echo GO
+  elif [ -n "$2" ]; then
+    echo GO-boot
+  else
+    echo NO-GO
+  fi
+}
+
+# The verdict over every guest's result: the best one.
+verdict() {
+  case " $* " in
+    *" GO "*) echo GO ;;
+    *" GO-boot "*) echo GO-boot ;;
+    *) echo NO-GO ;;
+  esac
+}
+
+# One guest under Cloud Hypervisor $1, its result in RESULT: direct kernel boot of the PVM
 # vmlinux, the root on virtio-blk, a vfat CIDATA seed like rhizome's.
 boot_guest() {
   local v=$1 dir=$PVM_WORK/guest-$1
@@ -643,7 +671,7 @@ boot_guest() {
   local up="" login=""
   while kill -0 "$pid" 2>/dev/null; do
     if [ -z "$up" ] && grep -q BYOH_PVM_GUEST_UP "$dir/serial.log" 2>/dev/null; then up=$(($(date +%s) - t0)); fi
-    if [ -z "$login" ] && grep -q 'login:' "$dir/serial.log" 2>/dev/null; then login=$(($(date +%s) - t0)); fi
+    if [ -z "$login" ] && grep -q ' login:' "$dir/serial.log" 2>/dev/null; then login=$(($(date +%s) - t0)); fi
     if grep -q BYOH_PVM_DONE "$dir/serial.log" 2>/dev/null; then
       sleep 30
       break
@@ -657,6 +685,8 @@ boot_guest() {
   kill -KILL "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   grep -q BYOH_PVM_GUEST_UP "$dir/serial.log" 2>/dev/null && [ -z "$up" ] && up=$(($(date +%s) - t0))
+  grep -q ' login:' "$dir/serial.log" 2>/dev/null && [ -z "$login" ] && login=$(($(date +%s) - t0))
+  RESULT=$(guest_result "$up" "$login")
 
   # Keep only the logs: the next guest needs the disk.
   local log=$PVM_WORK/guest-$v
@@ -671,11 +701,11 @@ boot_guest() {
     report "  CH $v: GO"
     return 0
   fi
-  report "  CH $v: NO-GO. Last serial lines:"
+  report "  CH $v: $RESULT. Last serial lines:"
   tail -n 30 "$log.serial.log" | sed 's/^/    /' | tee -a "$REPORT" || true
   report "  CH log tail:"
   tail -n 15 "$log.ch.log" | sed 's/^/    /' | tee -a "$REPORT"
-  return 1
+  return 0
 }
 
 recovery_check_phase() {

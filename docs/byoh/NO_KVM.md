@@ -764,7 +764,8 @@ a GO, and nothing below this paragraph is built. What that means today:
   NO-GO. On GO, the build follows this section; on NO-GO, L4 stays as it is.
 
 **Go/no-go.** Run L4-T1 (section 14) once on a throwaway non-nested GCP e2 or AWS m6i VM, with Cloud
-Hypervisor v46 **and** v53. If neither reaches a login prompt, WP7 delivers detection and docs only:
+Hypervisor v46 **and** v53. GO means a guest reaches a login prompt (the script reports "GO, boot only"
+when cloud-init then did not run, and plain GO with measurements when it did). If neither reaches a login prompt, WP7 delivers detection and docs only:
 `pvm` stays a recorded fact, and L4 is "detected, not offered". If GO:
 
 - **Artifacts.** No default third-party pin. The operator supplies the host `.deb` URL and sha256 and the
@@ -1438,9 +1439,12 @@ What each phase checks (the script's header lists the environment overrides):
   1 GiB, an 8 GiB `dd` to `/dev/null`, 200k one-byte reads and writes, 2000 fork+exec, 512 MiB of
   direct writes), then powers off. boot-test checks free disk again first (6 GiB in `PVM_WORK`, 3 GiB
   when the raw disk is kept from an earlier run) and deletes each guest's disk once its result is
-  recorded, keeping `guest-<version>.serial.log` and `.ch.log`. **GO** = `BYOH_PVM_GUEST_UP` with at least one CH version; the
-  report gives seconds to the login prompt and to user space, and each measurement as a percentage of
-  the host's. A NO-GO keeps the last serial and CH log lines.
+  recorded, keeping `guest-<version>.serial.log` and `.ch.log`. The verdict has three outcomes, the best over both CH
+  versions: **GO** = `BYOH_PVM_GUEST_UP` (cloud-init's runcmd ran; the report gives each measurement as
+  a percentage of the host's); **GO, boot only** = a login prompt but no `BYOH_PVM_GUEST_UP` (the PVM
+  guest boots, which is the go/no-go question of section 6.7, but the CIDATA seed was not read, so
+  there are no measurements; the serial log says why); **NO-GO** = neither. Both GOs exit 0. The
+  report gives seconds to the login prompt and to user space. A NO-GO keeps the last serial and CH log lines.
 - **recovery-check** (after the second reboot): the stock kernel, no `pti=off`, no `next_entry`.
 
 If the instance does not come back after the first reboot, power-cycle it from the provider console:
