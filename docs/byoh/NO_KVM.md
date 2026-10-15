@@ -33,7 +33,7 @@ When none of them is possible, the last resort is QEMU's emulator (L5).
 | Rung | Tier id | The machine | What runs the guests | Speed vs native | Isolation | State |
 |---|---|---|---|---|---|---|
 | **L1** | `kvm` | `/dev/kvm` works and has the capabilities Cloud Hypervisor needs | Cloud Hypervisor exactly as today (QEMU-KVM for B200/B300 GPUs, unchanged) | ~native on bare metal; nested: CPU-bound ≥90%, page-fault-heavy work much less (section 3; own measurement planned, L1-T2) | Hardware VM | Today's product, SHIPPED; detection v2 SHIPPED (WP3) |
-| **L2** | — | The hardware can virtualize, but KVM is off or hidden (firmware, module, hypervisor CPU model, cloud option) | Nothing until it is fixed | — | — | Detection and per-platform fix SHIPPED; refusal at registration with a recommended plan PLANNED (WP4) |
+| **L2** | — | The hardware can virtualize, but KVM is off or hidden (firmware, module, hypervisor CPU model, cloud option) | Nothing until it is fixed | — | — | Detection, per-platform fix, and refusal at registration with a recommended plan SHIPPED (WP4) |
 | **L3** | `container` | Any x86_64 Linux ≥ 5.12 with cgroup v2 | Unprivileged LXC system container in rhizome's per-VM network namespace | **CPU 95-99%, memory bandwidth 91-98%, 3.6-5.4 s to SSH** (VERIFIED, `dir` disk driver only) | Shared kernel: weaker than a VM | Feasibility VERIFIED (section 5); backend PLANNED (WP5), experimental |
 | **L4** | `pvm` | No hardware virtualization; a PVM host kernel (`kvm_pvm`) | Cloud Hypervisor with direct kernel boot of a PVM guest kernel | SOURCE only: near single-level KVM (paper); 57% of native for a kernel build on m6a (third party). No own number | VM, with a software world switch | Detection SHIPPED; host side VERIFIED under emulation, guest boot UNVERIFIED; build gated on a go/no-go test (WP7) |
 | **L5** | `emulated` | Anything x86_64 | QEMU TCG (software CPU) | CPU 26-29%, memory bandwidth ~2.5%, 64-96 s to SSH (VERIFIED) | Not a security boundary | Rhizome side on this branch; control-plane hookup PLANNED (WP6), experimental ([EMULATED_HOSTS.md](EMULATED_HOSTS.md)) |
@@ -184,8 +184,9 @@ and `emulated` (the plan's "allowed with ack" row) while its fix asks for the CP
 installed or not. The text says what to install. This deviates from the plan's "fastest ready" so that
 an installed QEMU never outranks system containers: in the lab, containers ran about 3.5 times
 faster than the emulator for CPU work and about 40 times faster for memory bandwidth (VERIFIED, section 5.1).
-`kvm_blocked` and `unknown_permission` recommend fixing KVM and name no fallback. No fallback can
-be registered yet (WP4), so the text says so instead of printing registration commands.
+`kvm_blocked` and `unknown_permission` recommend fixing KVM and name no fallback. A fallback whose
+tier is not in `ByohVirtTiers::SHIPPED` cannot be registered, so the text says so; for a shipped one
+it points to `--virt-tier auto --accept-fallback` (WP4).
 
 **Sanitising:** the control plane runs every host-supplied value through `VirtProbe.sanitize` (control
 characters removed, invalid UTF-8 replaced, strings capped at 128 characters, arrays and hashes at 64
@@ -235,9 +236,9 @@ Detection v2 shipped in WP3 as planned (section 15), with these differences:
   probe file to pipe it to hosts, like `lib/net_ssh.rb` loads rhizome code) on sanitised facts. So
   parity holds by construction, and the parity spec still runs every fixture through both.
 - **`recommended` is the fastest possible fallback**, not the fastest ready one (section 2.1, Fallbacks).
-- **No registration commands in the plan output yet.** The `--virt-tier` and `--accept-fallback`
-  flags and `bin/byoh-location set --virt-tiers` arrive with WP4. Until then the text names the
-  fallback, what to install, and that it cannot be registered yet.
+- **Registration commands only at registration.** The `--virt-tier` and `--accept-fallback` flags and
+  `bin/byoh-location set --virt-tiers` are SHIPPED (WP4). `bin/byoh-virt probe` names the fallback and
+  what to install; `bin/register-byoh-host` prints the exact commands when it refuses (section 11.2).
 - **`pdpe1gb` is a control-plane refusal**, not a probe tier: the probe reports `kvm`, and
   `Verdict#standard_vms?` is false with its own fix.
 - The harness checks the **bounding** capability set (`CapBnd`) rather than `CapEff`. This is stricter:
@@ -293,7 +294,7 @@ contract between them:
     `info` when it is `unchecked` or the KVM tier is `unknown`. It fails, with a reason, on an L1 host
     ("register it as kvm"), on a PVM host for another tier, in a container, without permission, or
     when the kernel cannot run that tier. PF4 (hugepages) should be skipped for those tiers.
-    Registering them arrives with WP4.
+    Registration uses this check (ByohVirtRegistration, SHIPPED in WP4).
   - Where `KvmCheck` and the ladder still differ: `KvmCheck` checks only the character device and the
     CPU flag, so it passes a host that the ladder refuses for a generic CPU model, a missing
     capability, a refused `KVM_CREATE_VM` or a missing `pdpe1gb`. On a PVM host, `KvmCheck` refuses for
@@ -801,10 +802,10 @@ real-infrastructure tests pass.
 | Record | Where | Written by | Meaning | State |
 |---|---|---|---|---|
 | Probe report | `vm_host.virt_probe jsonb` (`migrate/20261015_vm_host_virt_probe.rb`) | `Prog::LearnVirt`, `bin/byoh-virt refresh` | The facts, the detected tier, the rung, the platform key, the fix and the caveats. Refreshable; **never changes behaviour** | SHIPPED |
-| Declared tier | `vm_host.virt_tier text NOT NULL DEFAULT 'kvm'`, CHECK `IN ('kvm','pvm','container','emulated')` | `HostNexus.assemble(virt_tier:)` at registration only | Which backend the host runs. A `BEFORE UPDATE OF virt_tier` trigger raises when it changes: changing it means re-registering | PLANNED (WP4) |
-| Tier/family coupling | CHECK `(virt_tier = 'kvm') = (family NOT IN ('pvm','container','emulated'))` on `vm_host` | the migration | A KVM host never carries a lower-tier family, and vice versa; with the trigger, family changes across the boundary are blocked too | PLANNED (WP4) |
-| Location policy | `location.byoh_virt jsonb`: `{"tiers": ["kvm", ...], "acks": [...], "container_disk": "crypt-loop" or "dir"}`, NULL meaning `{"tiers": ["kvm"]}`. CHECK: every non-kvm tier in `tiers` has its base ack | `bin/byoh-location create/set` (each change writes a `byoh_operator_action` row) | Which lower tiers may be offered in this location | PLANNED (WP4) |
-| Tier table | `lib/byoh_virt_tiers.rb` (data, like `ByohVirtPlatforms`) | code | Per lower-tier family: tier, accepted probe tiers, hypervisor, PrepHost argument, label, required acks, experimental, uses hugepages, storage | PLANNED (WP4) |
+| Declared tier | `vm_host.virt_tier text NOT NULL DEFAULT 'kvm'`, CHECK `IN ('kvm','pvm','container','emulated')` | `HostNexus.assemble(virt_tier:)` at registration only | Which backend the host runs. A `BEFORE UPDATE OF virt_tier` trigger raises when it changes: changing it means re-registering | SHIPPED (WP4) |
+| Tier/family coupling | CHECK `(virt_tier = 'kvm') = (family NOT IN ('pvm','container','emulated'))` on `vm_host` | the migration | A KVM host never carries a lower-tier family, and vice versa; with the trigger, family changes across the boundary are blocked too | SHIPPED (WP4) |
+| Location policy | `location.byoh_virt jsonb`: `{"tiers": ["kvm", ...], "acks": {"<tier>": [option, ...]}}` (`container_disk` arrives with WP5), NULL meaning `{"tiers": ["kvm"]}`. CHECK: every non-kvm tier in `tiers` has its base ack | `bin/byoh-location create/set` (each change writes a `byoh_operator_action` row) | Which lower tiers may be offered in this location | SHIPPED (WP4) |
+| Tier table | `lib/byoh_virt_tiers.rb` (data, like `ByohVirtPlatforms`) | code | Per lower-tier family: tier, accepted probe tiers, hypervisor, PrepHost argument, label, required acks, experimental, uses hugepages, storage | SHIPPED (WP4) |
 
 The migration (`migrate/20261016_byoh_virt_tier.rb`) has a `down` that refuses while any non-kvm host
 or any non-NULL `byoh_virt` exists; run `bin/byoh-host export-audit` first (CLAUDE.md §8a).
@@ -830,7 +831,7 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
 | `kvm` | `kvm` | `standard`, `premium`, `burstable` and every upstream family (as today) | CH, or QEMU-KVM for B200/B300 GPUs (`model/metal/vm.rb`, unchanged) | none (golden-pinned command) | yes | no |
 | `container` | `none`, `kvm_blocked`, `pvm_blocked`; `kvm` with a failing capability/`pdpe1gb`/CPU-model check | `container` | LXC | `container` | no | yes |
 | `pvm` | `pvm`; or `none`/`kvm_blocked`/`pvm_blocked` with `--install-pvm-kernel` (re-checked after the reboot) | `pvm` | CH with direct kernel boot | `pvm` | no | yes |
-| `emulated` | `none`, `kvm_blocked`, `pvm_blocked`; `kvm` with a failing check | `emulated` | QEMU TCG | `tcg` (the existing third argument of `rhizome/host/bin/prep_host.rb`) | no | yes |
+| `emulated` | `none`, `kvm_blocked`, `pvm_blocked`; `kvm` with a failing check | `emulated` | QEMU TCG | `emulated` (the third argument of `rhizome/host/bin/prep_host.rb`, renamed from `tcg` in WP4) | no | yes |
 
 ### 10.3 Sizes and the policy gate
 
@@ -878,16 +879,47 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
 - Internal services stay on L1: they create VMs with kvm families and pass `allowed_tiers: ["kvm"]`. A
   spec pins this for each service's `assemble`.
 
-### 10.5 LearnVirt: fail-open (SHIPPED, WP3) and tier-aware (PLANNED, WP4)
+### 10.5 LearnVirt: fail-open (SHIPPED, WP3) and tier-aware (SHIPPED, WP4)
 
-- PLANNED (WP4): it compares the probe with `virt_tier`, pages `ByohVirtTier` only on disagreement, and
-  resolves the page on agreement. Agreement is a safety check, not an authorisation. Until then it
-  compares every host with L1, as before.
+- SHIPPED (WP4): it compares the probe with `virt_tier` (`ByohVirtTiers.accepts_probe?`: a kvm host
+  must take today's VMs, a lower-tier host must list its tier as `ready`), pages `ByohVirtTier` only on
+  disagreement, and resolves the page on agreement. Agreement is a safety check, not an authorisation.
 - SHIPPED: any exception (a parse error, an SSH failure, a probe crash) records `{"error": ...}`
   (sanitised), pages once under the same `ByohVirtTier` tag, and pops with "virt probe failed". It never
   retries forever and never blocks `wait_prep`; a later probe that finds L1 resolves the page.
   `bin/byoh-virt show` prints "the last probe failed: ..." and exits 3.
-- It pages `ByohKernelReboot` per section 5.3. Page text is sanitised.
+- It will page `ByohKernelReboot` per section 5.3 (PLANNED, WP5: it only matters for container and PVM hosts). Page text is sanitised.
+
+### 10.6 What WP4 shipped, and where it differs from this plan
+
+SHIPPED (spec-gated, never run on a real host): the migration, `ByohVirtTiers`, `Option::TierVmSizes`,
+the policy gate, R2, the storage tier branch, the HostNexus labels `verify_virt_tier` and
+`verify_tier_capacity`, the PrepHost argument, `HostTier` (rhizome), LearnVirt's tier comparison,
+the `MoveVm` and `move-location` refusals, the location CLI (`--virt-tiers`, `--accept`, `--unaccept`,
+`rates --family`), `ByohVirtRegistration` and its wiring, `bootstrap-data-plane.sh --tier`.
+
+**No lower tier can be used yet.** `ByohVirtTiers::SHIPPED` is empty: `bin/byoh-location set` refuses
+to offer a tier, and registration refuses one, until the WP that ships its rhizome support adds it
+(container: WP5; emulated: WP6; pvm: WP7 on a GO). Every lower-tier path is exercised in specs with
+the constant stubbed.
+
+Differences from sections 10.3, 10.4 and 11.2, each stricter or equal:
+- `Prog::Vm::Nexus.assemble(allowed_tiers:)` **defaults to `["kvm"]`**. Service callers (Kubernetes,
+  Postgres, runners, VM pools, inference, MoveVm) pass nothing and so never get a lower tier; only
+  the VM create API passes the tier of a size the customer picked. The web form offers none.
+- **Tenancy is per location for every lower tier**, emulated included (the plan had per host for L5):
+  the target host is unknown when `assemble` runs, and per location is the stricter rule.
+  `<tier>:multitenant` lifts it.
+- `pvm` declared on a `pvm_blocked` probe is refused with the `modprobe kvm_pvm` fix (the plan said
+  "ack with advice"): prep would refuse that host anyway.
+- `auto` picks the fastest *possible* fallback; when that tier is not offered or not installed it
+  refuses with the commands that fix it, rather than falling further down the ladder.
+- The gate also requires a `VmStorage` rate for the family: billing charges VM storage by family
+  (`Prog::Vm::Metal::Nexus`), and a missing rate would fail after the VM exists.
+- `RolloutRhizome` is unchanged: it only selects hosts in the four upstream locations, never a BYOH
+  location, so it never meets a lower-tier host.
+- `bin/byoh-virt show` prints the registered tier and judges a lower-tier host by its tier's
+  prerequisites.
 
 ## 11. Operator experience
 
@@ -961,7 +993,7 @@ recommended:
   bin/register-byoh-host --location fsn-cloud --main-ip 203.0.113.10 ... --virt-tier auto --accept-fallback
 ```
 
-### 11.2 At registration (PLANNED, WP4)
+### 11.2 At registration (SHIPPED, WP4)
 
 Flags on `bin/register-byoh-host`:
 - `--virt-tier kvm|auto|container|pvm|emulated`. The default is `kvm`, so today's commands behave as
@@ -990,21 +1022,33 @@ The registration matrix (probe × declared tier). "ack" means allowed with `--ac
 `auto` never picks `pvm` unless `kvm_pvm` is already loaded: no automatic kernel swap. Every outcome
 (probe tier, declared tier, acks) is recorded in the `byoh_operator_action` args.
 
-### 11.3 Data-plane bootstrap (PLANNED, WP4)
+### 11.3 Data-plane bootstrap (SHIPPED, WP4)
 
 `scripts/byoh/bootstrap-data-plane.sh`: the default path stays byte-identical, KVM refusal included.
 `--tier auto|container|emulated|pvm` runs the probe, prints the chosen tier, installs only that tier's
 userspace packages (`lxc lxcfs uidmap`; `qemu-system-x86 ovmf`; nothing for pvm), and skips only the
 checks that tier does not need. It never changes kernels, sysctls or GRUB.
+VERIFIED in a throwaway container without `/dev/kvm` (privileged commands stubbed): the default path
+refuses as before; `--tier emulated` and `--tier container` skip the KVM checks and print the
+registration command with `--virt-tier <tier> --accept-fallback`; `--tier pvm` refuses without
+`kvm_pvm`; `--tier auto` refuses in a container; bad arguments exit 2. `--tier auto` on a real VM
+without KVM is UNVERIFIED.
 
 ### 11.4 Where the registration code lives (M4 collision)
 
-All logic goes into a new `lib/byoh_virt_registration.rb` (`add_options(parser)`,
-`check!(facts, declared:, acks:)`, `recommended_commands`). `lib/byoh_registration_cli.rb` and
-`lib/byoh_registration.rb` get one isolated commit with the minimum hunks: register the options, call
-`check!`, pass `virt_tier:` to `assemble`. On the M4 merge that commit is re-applied on top of M4's
-`#preflight`, and the facts come from M4's pinned session (no second SSH session). Until then it uses
-the existing registration SSH path.
+SHIPPED (WP4). All logic is in `lib/byoh_virt_registration.rb`: `add_options(parser, options)`,
+`probe(main_ip, private_key)` (the probe piped to `ruby - --json` over `Util.rootish_ssh` as root with
+the registration key, after the operator confirmed the key is installed), `decide!(verdict, location:,
+main_ip:, unprobed_reason:)` (the matrix of section 11.2, built on `ByohVirtLadder.preflight_check`) and
+`recommended_commands`. `lib/byoh_registration_cli.rb` and `lib/byoh_registration.rb` got one isolated
+commit with the minimum hunks: register the options, probe and decide, pass `virt_tier:` to
+`assemble` and the decision to the operator log. On the M4 merge that commit is re-applied on top of
+M4's `#preflight`, which passes its pinned session's facts (`ByohVirtLadder.from_facts`) to `decide!`
+instead of a second SSH session.
+
+A probe that fails (no ruby, SSH refused) does not block a `kvm` registration: it is printed as a note,
+and LearnVirt checks the host at prep, as before WP4. `auto` refuses without a probe; a declared lower
+tier is registered and then held at `verify_virt_tier` until a probe agrees.
 
 ### 11.5 After registration
 
