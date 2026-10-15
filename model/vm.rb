@@ -242,12 +242,15 @@ class Vm < Sequel::Model
   # catalog (e.g. created with a custom shape) get a descriptive name
   # instead, so the pages and API listing them keep working.
   def display_size
-    vm_size = Option::VmSizes.find {
+    # Lower-tier families (ByohVirtTiers) never match an Option::VmSizes
+    # entry, so searching their sizes after it changes no other VM.
+    match = lambda {
       it.family == family &&
         it.arch == arch &&
         it.vcpus == vcpus &&
         (cpu_percent_limit.nil? || it.cpu_percent_limit == cpu_percent_limit)
     }
+    vm_size = Option::VmSizes.find(&match) || Option::TierVmSizes.find(&match)
     vm_size&.name || "#{family}-#{vcpus}c-#{memory_gib}g"
   end
 

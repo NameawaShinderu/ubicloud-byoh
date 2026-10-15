@@ -26,7 +26,9 @@ RSpec.describe Clover, "vm tier sizes" do
   it "creates a VM of an offered tier" do
     create(location.display_name, size: "emulated-2", storage_size: 80)
     expect(last_response.status).to eq 200
+    expect(JSON.parse(last_response.body)["size"]).to eq "emulated-2"
     vm = Vm.first(name: "tiered")
+    expect(vm.display_size).to eq "emulated-2"
     expect(vm.family).to eq "emulated"
     expect(vm.vm_storage_volumes.map(&:size_gib)).to eq [80]
   end
