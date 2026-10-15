@@ -198,6 +198,20 @@ RSpec.describe Prog::Vm::HostNexus do
         expect(st.subject.net6.to_s).to eq("fd00:feed::/64")
       end
 
+      # format-storage-disks runs wipefs -fa on every disk but the boot
+      # disk. BYOH disks are the operator's: they reach VM storage only
+      # through `ubicloud-host storage-disk`, which never wipes.
+      it "never formats the disks of a host that BYOH registration assembles" do
+        st = ByohRegistration.new(location: byoh_location, main_ip: "203.0.113.42", routed_networks: ["10.99.0.0/29"]).register!
+        expect(st.stack.first["install_os"]).to be false
+
+        nx = described_class.new(st)
+        expect { nx.start }.to hop("setup_ssh_keys")
+        expect { nx.prep }.to hop("wait_prep")
+        learn_storage = Strand.where(parent_id: st.id, prog: "LearnStorage").first
+        expect(learn_storage.stack.first["format_storage"]).to be false
+      end
+
       it "creates Address rows for declared v4 networks and auto-prepends the management /32" do
         st = described_class.assemble("203.0.113.42",
           location_id: byoh_location.id,
