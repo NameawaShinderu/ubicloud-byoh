@@ -5,7 +5,8 @@ require_relative "../lib/emulated_host"
 RSpec.describe EmulatedHost do
   let(:x64) { ArchClass.new(:x64) }
   let(:arm64) { ArchClass.new(:arm64) }
-  let(:dpkg_query) { ["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", "qemu-system-x86", "ovmf", {expect: [0, 1]}] }
+  let(:dpkg_query) { ["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", "qemu-system-x86", "ovmf"] }
+  let(:accel_help) { ["qemu-system-x86_64", "-accel", "help"] }
 
   describe ".prep_steps" do
     # The order bin/prep_host.rb ran its steps in before emulated hosts
@@ -58,44 +59,69 @@ RSpec.describe EmulatedHost do
 
   describe ".missing_packages" do
     it "is empty when dpkg lists every package as installed" do
-      expect(described_class).to receive(:r).with(*dpkg_query).and_return("qemu-system-x86 ii \novmf ii \n")
+      expect(described_class).to receive(:_run_command).with(*dpkg_query, expect: [0, 1]).and_return("qemu-system-x86 ii \novmf ii \n")
       expect(described_class.missing_packages).to eq([])
     end
 
     it "lists a package dpkg does not know" do
-      expect(described_class).to receive(:r).with(*dpkg_query).and_return("qemu-system-x86 ii \n")
+      expect(described_class).to receive(:_run_command).with(*dpkg_query, expect: [0, 1]).and_return("qemu-system-x86 ii \n")
       expect(described_class.missing_packages).to eq(["ovmf"])
     end
 
     it "lists a package that was removed with its configuration kept" do
-      expect(described_class).to receive(:r).with(*dpkg_query).and_return("qemu-system-x86 rc \novmf ii \n")
+      expect(described_class).to receive(:_run_command).with(*dpkg_query, expect: [0, 1]).and_return("qemu-system-x86 rc \novmf ii \n")
       expect(described_class.missing_packages).to eq(["qemu-system-x86"])
     end
 
+    it "takes a package the operator holds" do
+      expect(described_class).to receive(:_run_command).with(*dpkg_query, expect: [0, 1]).and_return("qemu-system-x86 hi \novmf ui \n")
+      expect(described_class.missing_packages).to eq([])
+    end
+
+    it "lists a package marked for removal or purge" do
+      expect(described_class).to receive(:_run_command).with(*dpkg_query, expect: [0, 1]).and_return("qemu-system-x86 ri \novmf pi \n")
+      expect(described_class.missing_packages).to eq(["qemu-system-x86", "ovmf"])
+    end
+
+    it "lists a package that is not fully installed or needs reinstalling" do
+      expect(described_class).to receive(:_run_command).with(*dpkg_query, expect: [0, 1]).and_return("qemu-system-x86 iU \novmf iiR\n")
+      expect(described_class.missing_packages).to eq(["qemu-system-x86", "ovmf"])
+    end
+
+    it "reports a dpkg-query failure as unsupported" do
+      expect(described_class).to receive(:_run_command).with(*dpkg_query, expect: [0, 1]).and_raise(CommandFail.new("command failed: dpkg-query", "", "dpkg: error: database is locked"))
+      expect { described_class.missing_packages }.to raise_error(EmulatedHost::Unsupported, /\Adpkg-query failed: command failed: dpkg-query\n.*database is locked; run scripts\/byoh\/bootstrap-data-plane.sh --emulated/m)
+    end
+
+    it "reports a missing dpkg-query as unsupported" do
+      expect(described_class).to receive(:_run_command).with(*dpkg_query, expect: [0, 1]).and_raise(Errno::ENOENT, "dpkg-query")
+      expect { described_class.missing_packages }.to raise_error(EmulatedHost::Unsupported, "dpkg-query failed: No such file or directory - dpkg-query; #{EmulatedHost::INSTALL_HINT}")
+    end
+
     it "does not take a package whose name only starts with a wanted one" do
-      expect(described_class).to receive(:r).with(*dpkg_query).and_return("ovmf-ia32 ii \n")
+      expect(described_class).to receive(:_run_command).with(*dpkg_query, expect: [0, 1]).and_return("ovmf-ia32 ii \n")
       expect(described_class.missing_packages).to eq(["qemu-system-x86", "ovmf"])
     end
   end
 
   describe ".accel_help_ok?" do
     it "is true when QEMU lists tcg" do
-      expect(described_class).to receive(:r).with("qemu-system-x86_64", "-accel", "help").and_return("Accelerators supported in QEMU binary:\ntcg\nkvm\n")
+      expect(described_class).to receive(:_run_command).with(*accel_help).and_return("Accelerators supported in QEMU binary:\ntcg\nkvm\n")
       expect(described_class.accel_help_ok?).to be(true)
     end
 
     it "is false when QEMU does not list tcg" do
-      expect(described_class).to receive(:r).with("qemu-system-x86_64", "-accel", "help").and_return("Accelerators supported in QEMU binary:\nkvm\n")
+      expect(described_class).to receive(:_run_command).with(*accel_help).and_return("Accelerators supported in QEMU binary:\nkvm\n")
       expect(described_class.accel_help_ok?).to be(false)
     end
 
     it "is false when QEMU fails" do
-      expect(described_class).to receive(:r).and_raise(CommandFail.new("command failed", "", "boom"))
+      expect(described_class).to receive(:_run_command).with(*accel_help).and_raise(CommandFail.new("command failed", "", "boom"))
       expect(described_class.accel_help_ok?).to be(false)
     end
 
     it "is false when QEMU is not installed" do
-      expect(described_class).to receive(:r).and_raise(Errno::ENOENT)
+      expect(described_class).to receive(:_run_command).with(*accel_help).and_raise(Errno::ENOENT)
       expect(described_class.accel_help_ok?).to be(false)
     end
   end

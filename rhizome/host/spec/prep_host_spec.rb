@@ -153,11 +153,10 @@ RSpec.describe "bin/prep_host.rb" do
   it "prints the KVM hint on an emulated host that has KVM, and carries on" do
     expect(EmulatedHost).to receive(:check_arch!)
     expect(EmulatedHost).to receive(:check_emulator!)
-    expect(KvmCheck).to receive(:problem).and_return(nil)
+    expect(KvmCheck).to receive(:problem).once { events << [:kvm_hint_probe] && nil }
     expect { expect(prep_host("vhtest", "production", "tcg")).to be_nil }
       .to output("KVM is available; register without --accel tcg to use cloud-hypervisor\nuplink mac pinned\n").to_stdout
-    expect(events).not_to include([:kvm_check])
-    expect(events.last).to eq(run("systemctl start cron"))
+    expect(events).to eq([[:kvm_hint_probe]] + kvm_trace - [[:kvm_check], [:download_ch], [:download_firmware], run("modprobe -r irdma")])
   end
 
   it "aborts an emulated host without the emulator before changing anything" do
@@ -166,6 +165,15 @@ RSpec.describe "bin/prep_host.rb" do
     expect {
       expect(prep_host("vhtest", "production", "tcg")).to eq(1)
     }.to output("missing packages: ovmf; run scripts/byoh/bootstrap-data-plane.sh --emulated (or apt-get install qemu-system-x86 ovmf)\n").to_stderr
+    expect(events).to eq([])
+  end
+
+  it "aborts an emulated host whose dpkg database fails before changing anything" do
+    expect(EmulatedHost).to receive(:check_arch!)
+    expect(EmulatedHost).to receive(:_run_command).with("dpkg-query", any_args).and_raise(CommandFail.new("command failed: dpkg-query", "", "dpkg: error: database is locked"))
+    expect {
+      expect(prep_host("vhtest", "production", "tcg")).to eq(1)
+    }.to output(/\Adpkg-query failed: .*database is locked; run scripts\/byoh\/bootstrap-data-plane.sh --emulated/m).to_stderr
     expect(events).to eq([])
   end
 

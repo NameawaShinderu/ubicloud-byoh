@@ -102,12 +102,27 @@ module EmulatedHost
   end
 
   # The PACKAGES that dpkg does not list as installed. dpkg-query exits 1
-  # when it does not know one of the names, and prints nothing for it; a
-  # package that was removed but left its configuration behind is listed
-  # with a status other than "ii".
+  # when it does not know one of the names, and prints nothing for it.
+  #
+  # ${db:Status-Abbrev} is three characters: the desired action, the
+  # current state and the error flag. A package counts when its state is
+  # "i" (installed) and its error flag is blank, and its desired action
+  # is unknown, install or hold. Hold matters: operators may pin QEMU
+  # with apt-mark hold so upgrades never change the emulator under
+  # running guests, and installing again would not help. A package marked
+  # for removal or purge is refused, since the next apt run removes it;
+  # so is one that was removed with its configuration kept ("rc").
+  #
+  # Any other dpkg-query failure, such as a locked or broken dpkg
+  # database, is reported as Unsupported so prep_host.rb aborts with the
+  # error instead of a backtrace.
   def self.missing_packages
-    out = r("dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", *PACKAGES, expect: [0, 1])
-    PACKAGES - out.scan(/^(\S+) ii/).flatten
+    out = begin
+      r("dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", *PACKAGES, expect: [0, 1])
+    rescue CommandFail, SystemCallError => e
+      raise Unsupported, "dpkg-query failed: #{e.message.strip}; #{INSTALL_HINT}"
+    end
+    PACKAGES - out.scan(/^(\S+) [uih]i $/).flatten
   end
 
   # Whether QEMU runs and was built with the TCG accelerator.
