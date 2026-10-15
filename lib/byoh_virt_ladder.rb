@@ -43,6 +43,7 @@ module ByohVirtLadder
     "kvm" => "L1",
     "kvm_blocked" => "L2",
     "unknown_permission" => "unknown",
+    "unknown" => "unknown",
     "pvm" => "L4",
     "pvm_blocked" => "L3-L5",
     "none" => "L3-L5",
@@ -87,7 +88,7 @@ module ByohVirtLadder
 
   DECLARED_TIERS = %w[kvm container pvm emulated].freeze
 
-  Verdict = Data.define(:tier, :cause, :rung, :nested, :reasons, :platform, :fix, :cost_hint, :caveats, :possible, :ready, :recommended, :checks, :report) do
+  Verdict = Data.define(:tier, :cause, :rung, :nested, :reasons, :platform, :fix, :cost_hint, :caveats, :possible, :ready, :unchecked, :recommended, :checks, :report) do
     # Whether the host can take today's VMs: KVM that cloud-hypervisor
     # can use, and 1G pages for their hugepages.
     def standard_vms? = tier == "kvm" && checks["pdpe1gb"] != "fail"
@@ -102,7 +103,7 @@ module ByohVirtLadder
     def record
       report.merge("tier" => tier, "cause" => cause, "reasons" => reasons, "nested" => nested, "rung" => rung,
         "platform" => platform&.key, "fix" => fix, "caveats" => caveats, "possible" => possible, "ready" => ready,
-        "recommended" => recommended)
+        "unchecked" => unchecked, "recommended" => recommended)
     end
 
     def text
@@ -111,9 +112,10 @@ module ByohVirtLadder
       lines << "fix: #{fix}" if fix
       lines << "cost: #{cost_hint}" if cost_hint && !standard_vms?
       caveats.each { lines << "caveat: #{it}" }
-      unless possible.empty?
+      unless (possible + unchecked).empty?
         lines << "fallbacks ready: #{ready.empty? ? "none" : ready.join(", ")}"
         lines << "fallbacks possible after installing their packages: #{(possible - ready).join(", ")}" unless (possible - ready).empty?
+        lines << "fallbacks not checked (the kernel facts were not gathered): #{unchecked.join(", ")}" unless unchecked.empty?
       end
       lines << "recommended: #{recommendation}"
       lines.join("\n")
@@ -127,6 +129,7 @@ module ByohVirtLadder
       else
         label = FALLBACK_LABELS.fetch(recommended)
         install = ready.include?(recommended) ? "" : " after #{FALLBACK_PACKAGES.fetch(recommended)}"
+        install += ", if the host has #{FALLBACK_NEEDS.fetch(recommended)} (not checked)" if unchecked.include?(recommended)
         "#{label}#{install}; fallbacks cannot be registered yet (docs/byoh/NO_KVM.md section 11)"
       end
     end
@@ -187,6 +190,7 @@ module ByohVirtLadder
       caveats: caveats(tier, nested, facts, checks),
       possible: fallbacks["possible"],
       ready: fallbacks["ready"],
+      unchecked: fallbacks["unchecked"],
       recommended: recommended(tier, fallbacks),
       checks:,
       report:,
@@ -195,13 +199,16 @@ module ByohVirtLadder
 
   # The fallback "auto" would pick: pvm on a PVM host; otherwise the
   # fastest fallback the kernel and CPU allow, installed or not (speed
-  # first; the text says what to install), never pvm unless kvm_pvm is
-  # loaded; nil when KVM should be fixed instead.
+  # first; the text says what to install), or whose needs were not
+  # checked, so a missing fact never puts the emulator ahead of
+  # containers; never pvm unless kvm_pvm is loaded; nil when KVM should be
+  # fixed instead.
   def self.recommended(tier, fallbacks)
     return "pvm" if tier == "pvm"
     return nil unless %w[none pvm_blocked].include?(tier)
 
-    (fallbacks["possible"] - ["pvm"]).first
+    candidates = fallbacks["possible"] + fallbacks["unchecked"]
+    (VirtProbe::FALLBACKS - ["pvm"]).find { candidates.include?(it) }
   end
 
   # Each KVM check: "pass", "fail", "unknown" (the fact was not gathered)
@@ -248,6 +255,8 @@ module ByohVirtLadder
       else
         "Make /dev/kvm usable: check that the KVM module loaded cleanly (kernel log) and that udev created /dev/kvm. #{platform_fix}"
       end
+    when "unknown"
+      "Gather what is missing (#{%w[dev_kvm cpu_flags arch].select { facts[it].nil? }.join(", ")}), for example with bin/byoh-virt probe --main-ip <host>; Prog::LearnVirt probes again at prep."
     when "unknown_permission"
       "Probe as root: bin/byoh-virt probe --user root, or a --user with passwordless sudo (the probe runs sudo -n)."
     when "pvm_blocked"
@@ -291,7 +300,8 @@ module ByohVirtLadder
     v = from_facts(facts)
     result = {tier: v.tier, rung: v.rung, checks: v.checks, platform: v.platform&.key}
     if declared_tier == "kvm"
-      status = if !v.standard_vms? then "fail"
+      status = if v.tier == "unknown" then "info"
+      elsif !v.standard_vms? then "fail"
       elsif v.checks.value?("unknown") then "info"
       else "pass"
       end
@@ -299,7 +309,8 @@ module ByohVirtLadder
     end
 
     status, fix = fallback_readiness(v, declared_tier)
-    result.merge(status:, fix:, caveats: ["KVM: #{v.summary}"] + v.caveats)
+    advice = v.fix && "KVM fix, if you would rather run today's VMs: #{v.fix}"
+    result.merge(status:, fix:, caveats: ["KVM: #{v.summary}", *advice] + v.caveats)
   end
 
   def self.fallback_readiness(v, declared)
@@ -307,12 +318,16 @@ module ByohVirtLadder
       ["fail", "This host runs KVM (L1); register it as kvm."]
     elsif %w[container unknown_permission].include?(v.tier)
       ["fail", v.fix]
+    elsif v.tier == "unknown"
+      ["info", "Whether KVM works here is unknown, so #{declared} cannot be checked yet. #{v.fix}"]
     elsif v.tier == "pvm" && declared != "pvm"
       ["fail", "This is a PVM host; register it as pvm."]
     elsif v.ready.include?(declared)
       ["pass", nil]
     elsif v.possible.include?(declared)
       ["fail", "Prepare #{declared} first: #{FALLBACK_PACKAGES.fetch(declared)}."]
+    elsif v.unchecked.include?(declared)
+      ["info", "Could not check that this host has #{FALLBACK_NEEDS.fetch(declared)} (the facts were not gathered); check it before registering it as #{declared}."]
     else
       ["fail", "This host cannot run #{declared}: #{FALLBACK_LABELS.fetch(declared)} needs #{FALLBACK_NEEDS.fetch(declared)}."]
     end

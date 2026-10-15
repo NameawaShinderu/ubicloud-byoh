@@ -1,0 +1,23 @@
+{
+  "files": {
+    ".virt-probe/uname": "x86_64 6.8.0-45-generic\n",
+    ".virt-probe/detect-virt-vm": "none\n",
+    ".virt-probe/detect-virt-container": "none\n",
+    "proc/cpuinfo": "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7763 64-Core Processor\nflags\t\t: fpu lm svm pdpe1gb\n\n",
+    "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
+    "sys/class/dmi/id/sys_vendor": "ASUSTeK COMPUTER INC.\n",
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+  },
+  "dirs": [],
+  "execs": [],
+  "expect": {
+    "tier": "kvm_blocked",
+    "cause": "module",
+    "platform": null,
+    "standard": false,
+    "fix": "check the kernel log for \"disabled by bios\"",
+    "nested": false,
+    "ready": [],
+    "recommended": null
+  }
+}

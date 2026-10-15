@@ -65,10 +65,12 @@ RSpec.describe VirtProbe do
       expect(described_class).to receive(:kernel_log).and_return(nil)
       expect(described_class).to receive(:container_marker).with("/").and_return(nil)
       f = described_class.facts(uname: uname)
-      expect(f.slice("arch", "kernel", "virt_vm", "virt_container", "dev_kvm", "bios_log", "cpu_flags")).to eq(
+      expect(f.slice("arch", "kernel", "virt_vm", "virt_container", "dev_kvm", "cpu_flags")).to eq(
         "arch" => "x86_64", "kernel" => "6.8.0-1-generic", "virt_vm" => "kvm", "virt_container" => nil,
-        "dev_kvm" => false, "bios_log" => nil, "cpu_flags" => [],
+        "dev_kvm" => false, "cpu_flags" => [],
       )
+      # An unreadable kernel log leaves the BIOS evidence unknown, not clean.
+      expect(f).not_to have_key("bios_log")
       expect(f["euid"]).to eq Process.euid
     end
 
@@ -80,9 +82,8 @@ RSpec.describe VirtProbe do
         write(root, ".virt-probe/kernel-log", "booting\n")
         write(root, ".virt-probe/kvm.json", JSON.generate("dev_kvm" => true, "kvm_api" => 12, "kvm_create_vm" => true, "kvm_caps_missing" => []))
         write(root, "proc/cpuinfo", "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel Xeon\nflags\t\t: fpu vmx lm pdpe1gb hypervisor\n\nprocessor\t: 1\nflags\t\t: fpu\n")
-        write(root, "proc/mounts", "/dev/vda1 / ext4 rw 0 0\n/dev/vdb /vm xfs rw,prjquota 0 0\n")
+        write(root, "proc/mounts", "/dev/vda1 / ext4 rw 0 0\n/dev/vdb /var/storage xfs rw,prjquota 0 0\n")
         write(root, "proc/sys/kernel/apparmor_restrict_unprivileged_userns", "1\n")
-        FileUtils.mkdir_p(File.join(root, "vm"))
         FileUtils.mkdir_p(File.join(root, "sys/module/kvm"))
         write(root, "sys/module/kvm_intel/parameters/nested", "Y\n")
         write(root, "sys/module/apparmor/parameters/enabled", "Y\n")
@@ -288,16 +289,32 @@ RSpec.describe VirtProbe do
     end
   end
 
-  describe ".bios_log" do
-    it "finds the firmware line in this machine's log" do
-      expect(described_class).to receive(:kernel_log).and_return("x\nkvm: disabled by bios\ny\n")
-      expect(described_class.bios_log("/")).to eq "kvm: disabled by bios"
+  describe ".bios_line" do
+    it "finds the firmware line of every kernel that prints one" do
+      expect(described_class.bios_line("x\nkvm: disabled by bios\ny\n")).to eq "kvm: disabled by bios"
+      [
+        "x86/cpu: VMX (outside TXT) disabled by BIOS",
+        "x86/cpu: VMX (inside TXT) disabled by BIOS",
+        "kvm_intel: VMX not enabled (disabled by BIOS) in MSR_IA32_FEAT_CTL on CPU 0",
+        "kvm_amd: SVM disabled (by BIOS) in MSR_VM_CR on CPU 0",
+        "kvm_intel: disabled by bios",
+      ].each { |line| expect(described_class.bios_line("#{line}\n")).to eq line }
     end
 
-    it "is nil without a log or without the line" do
-      expect(described_class).to receive(:kernel_log).and_return(nil, "nothing\n")
-      expect(described_class.bios_log("/")).to be_nil
-      expect(described_class.bios_log("/")).to be_nil
+    it "is nil without the line, and ignores other features the firmware disabled" do
+      expect(described_class.bios_line("nothing\n")).to be_nil
+      expect(described_class.bios_line("x86/cpu: SGX disabled by BIOS.\nsome_driver: feature disabled (by BIOS)\n")).to be_nil
+    end
+  end
+
+  it "takes an SGX firmware line on an Intel host without kvm_intel as the module, not the firmware" do
+    Dir.mktmpdir do |root|
+      fixture = VirtProbeFixtures.all.fetch("intel_module_not_loaded")
+      VirtProbeFixtures.materialize(fixture, root)
+      write(root, ".virt-probe/kernel-log", "x86/cpu: SGX disabled by BIOS.\n")
+      f = described_class.facts(root: root)
+      expect(f["bios_log"]).to be_nil
+      expect(described_class.classify(f).last).to eq "module"
     end
   end
 
@@ -340,18 +357,19 @@ RSpec.describe VirtProbe do
   end
 
   describe ".prjquota" do
-    it "takes the mount of / without /vm, and skips short lines" do
+    it "takes the mount of / when nothing is mounted on /var/storage, and skips short lines" do
       Dir.mktmpdir do |root|
-        write(root, "proc/mounts", "junk\n/dev/sda1 / ext4 rw,prjquota 0 0\n/dev/sdb /data xfs rw 0 0\n")
+        write(root, "proc/mounts", "junk\n/dev/sda1 / ext4 rw,prjquota 0 0\n/dev/sdb /data xfs rw 0 0\n/dev/sdc /vm xfs rw 0 0\n")
         expect(described_class.prjquota(root)).to be(true)
       end
     end
 
-    it "takes the longest mount holding /vm" do
+    it "takes the longest mount holding /var/storage, where VM disks live, even before it exists" do
       Dir.mktmpdir do |root|
-        FileUtils.mkdir_p(File.join(root, "vm"))
-        write(root, "proc/mounts", "/dev/sda1 / ext4 rw,prjquota 0 0\n/dev/sdb /vm ext4 rw 0 0\n/dev/sdc /vmx ext4 rw,prjquota 0 0\n")
+        write(root, "proc/mounts", "/dev/sda1 / ext4 rw,prjquota 0 0\n/dev/sdb /var ext4 rw 0 0\n/dev/sdc /var/storagex ext4 rw,prjquota 0 0\n")
         expect(described_class.prjquota(root)).to be(false)
+        write(root, "proc/mounts", "/dev/sda1 / ext4 rw 0 0\n/dev/sdb /var ext4 rw 0 0\n/dev/nvme0n1 /var/storage xfs rw,prjquota 0 0\n")
+        expect(described_class.prjquota(root)).to be(true)
       end
     end
   end
@@ -524,7 +542,21 @@ RSpec.describe VirtProbe do
 
     it "takes missing facts as unknown" do
       expect(described_class.classify({"dev_kvm" => true}).first).to eq("kvm")
-      expect(described_class.classify({}).first).to eq("none")
+      expect(described_class.classify({})).to eq(["unknown", ["dev_kvm, cpu_flags, arch not gathered, so whether KVM can work here is unknown"], "not_gathered"])
+    end
+
+    it "never makes a host L2 from a fact that was not gathered" do
+      # A shell preflight that skipped /dev/kvm, on a working L1 host.
+      expect(described_class.classify(facts.except("dev_kvm", "kvm_api", "kvm_create_vm", "kvm_caps_missing"))).to eq(["unknown", ["dev_kvm not gathered, so whether KVM can work here is unknown"], "not_gathered"])
+      expect(described_class.classify(facts(dev_kvm: nil, modules: nil)).last).to eq("not_gathered")
+      # Without the CPU flags, "no vmx" is not evidence of firmware.
+      expect(described_class.classify(facts(dev_kvm: false, cpu_flags: nil)).first).to eq("unknown")
+      expect(described_class.classify(facts(dev_kvm: false, arch: nil)).first).to eq("unknown")
+    end
+
+    it "says which facts behind an L2 cause were not gathered" do
+      expect(described_class.classify(facts(dev_kvm: false, modules: nil).except("bios_log"))).to eq(["kvm_blocked", ["the CPU has vmx but kvm_intel was not seen loaded (the loaded modules were not gathered); the kernel log was not read, so the firmware may have disabled it"], "module"])
+      expect(described_class.classify(facts(cpu_flags: %w[svm], dev_kvm: false, modules: %w[kvm_amd]).except("bios_log"))).to eq(["kvm_blocked", ["kvm_amd is loaded but there is no /dev/kvm; the kernel log was not read, so the firmware may have disabled it"], "no_device"])
     end
   end
 
@@ -542,24 +574,39 @@ RSpec.describe VirtProbe do
   end
 
   describe ".fallbacks" do
-    it "offers none on L1, in a container and without permission, and only pvm on a PVM host" do
-      %w[kvm container unknown_permission].each { |tier| expect(described_class.fallbacks(facts, tier)).to eq("possible" => [], "ready" => []) }
-      expect(described_class.fallbacks(facts, "pvm")).to eq("possible" => ["pvm"], "ready" => ["pvm"])
+    none = {"possible" => [], "ready" => [], "unchecked" => []}
+
+    it "offers none on L1, in a container, without permission or facts, and only pvm on a PVM host" do
+      %w[kvm container unknown_permission unknown].each { |tier| expect(described_class.fallbacks(facts, tier)).to eq(none) }
+      expect(described_class.fallbacks(facts, "pvm")).to eq("possible" => ["pvm"], "ready" => ["pvm"], "unchecked" => [])
+    end
+
+    it "offers container and emulated on a KVM host without 1G pages, which cannot take today's VMs" do
+      installed = {"lxc-start" => true, "lxcfs" => true, "qemu-system-x86_64" => false}
+      expect(described_class.fallbacks(facts(cpu_flags: %w[vmx], commands: installed), "kvm")).to eq("possible" => %w[container emulated], "ready" => %w[container], "unchecked" => [])
+      expect(described_class.fallbacks(facts(arch: "aarch64", cpu_flags: []), "kvm")).to eq(none)
+      expect(described_class.fallbacks(facts(cpu_flags: nil), "kvm")).to eq(none)
     end
 
     it "lists what the kernel allows and what is installed, fastest first" do
       installed = {"lxc-start" => true, "lxcfs" => true, "qemu-system-x86_64" => true}
-      expect(described_class.fallbacks(facts(commands: installed, ovmf: true), "pvm_blocked")).to eq("possible" => %w[container pvm emulated], "ready" => %w[container emulated])
-      expect(described_class.fallbacks(facts(commands: installed.merge("lxcfs" => false)), "none")).to eq("possible" => %w[container emulated], "ready" => [])
-      expect(described_class.fallbacks(facts(kernel: "5.4.0-1", commands: nil), "none")).to eq("possible" => %w[emulated], "ready" => [])
-      expect(described_class.fallbacks(facts(kernel: "5.12.0", cgroup2: false), "none")).to eq("possible" => %w[emulated], "ready" => [])
-      expect(described_class.fallbacks(facts(arch: "aarch64", kernel: nil), "kvm_blocked")).to eq("possible" => [], "ready" => [])
+      expect(described_class.fallbacks(facts(commands: installed, ovmf: true), "pvm_blocked")).to eq("possible" => %w[container pvm emulated], "ready" => %w[container emulated], "unchecked" => [])
+      expect(described_class.fallbacks(facts(commands: installed.merge("lxcfs" => false)), "none")).to eq("possible" => %w[container emulated], "ready" => [], "unchecked" => [])
+      expect(described_class.fallbacks(facts(kernel: "5.4.0-1", commands: nil), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => [])
+      expect(described_class.fallbacks(facts(kernel: "5.12.0", cgroup2: false), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => [])
+      expect(described_class.fallbacks(facts(arch: "aarch64", kernel: "6.8.0"), "kvm_blocked")).to eq("possible" => %w[container], "ready" => [], "unchecked" => [])
+    end
+
+    it "lists a fallback whose kernel needs were not gathered as unchecked, never as impossible" do
+      expect(described_class.fallbacks(facts.except("cgroup2"), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => %w[container])
+      expect(described_class.fallbacks(facts(kernel: nil), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => %w[container])
+      expect(described_class.fallbacks(facts(arch: nil, kernel: nil), "kvm_blocked")).to eq("possible" => [], "ready" => [], "unchecked" => %w[container emulated])
     end
   end
 
   describe ".report" do
     it "carries the classification, the fallbacks and the facts" do
-      expect(described_class.report(facts(cpu_flags: %w[vmx hypervisor], virt_vm: nil))).to include("version" => 2, "tier" => "kvm", "cause" => nil, "nested" => true, "possible" => [], "ready" => [])
+      expect(described_class.report(facts(cpu_flags: %w[vmx hypervisor pdpe1gb], virt_vm: nil))).to include("version" => 2, "tier" => "kvm", "cause" => nil, "nested" => true, "possible" => [], "ready" => [], "unchecked" => [])
     end
   end
 
@@ -568,7 +615,7 @@ RSpec.describe VirtProbe do
     let(:err) { StringIO.new }
 
     before do
-      allow(described_class).to receive(:facts).with(root: "/").and_return(facts(cpu_flags: %w[vmx hypervisor]))
+      allow(described_class).to receive(:facts).with(root: "/").and_return(facts(cpu_flags: %w[vmx hypervisor pdpe1gb]))
     end
 
     it "prints the report as JSON" do
@@ -581,7 +628,7 @@ RSpec.describe VirtProbe do
       expect(out.string).to eq(<<~TEXT)
         tier: kvm (nested: this machine is itself a VM)
         why: /dev/kvm answers KVM_GET_API_VERSION 12
-        cpu: x86_64 Intel Xeon flags=vmx,hypervisor
+        cpu: x86_64 Intel Xeon flags=vmx,hypervisor,pdpe1gb
         kvm: /dev/kvm=true api=12 create_vm=true caps_missing=[] modules=kvm,kvm_intel nested_param=true
         virt: vm="none" container="none" dmi=Dell Inc. / PowerEdge R650
         fallbacks: possible= ready=
@@ -593,6 +640,9 @@ RSpec.describe VirtProbe do
       allow(described_class).to receive(:facts).with(root: "/x").and_return(facts(dmi: {"sys_vendor" => "x\ey"}, cpu_flags: [], dev_kvm: false, virt_vm: "kvm", commands: {"qemu-system-x86_64" => true}, ovmf: true))
       expect(described_class.main(["--root", "/x"], out: out, err: err)).to eq(0)
       expect(out.string).to start_with("tier: none\n").and include("kvm: /dev/kvm=false modules=").and include("dmi=xy\n").and include("fallbacks: possible=container,emulated ready=emulated\n")
+      allow(described_class).to receive(:facts).with(root: "/z").and_return(facts(cpu_flags: [], dev_kvm: false, virt_vm: "kvm", cgroup2: nil))
+      described_class.main(["--root", "/z"], out: out, err: err)
+      expect(out.string).to include("fallbacks: possible=emulated ready= unchecked=container\n")
       allow(described_class).to receive(:facts).with(root: "/y").and_return(facts(dmi: {}))
       described_class.main(["--root", "/y"], out: out, err: err)
       expect(out.string).to include("dmi=unknown")

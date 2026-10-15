@@ -28,12 +28,18 @@ require "open3"
 #                       bare metal.
 #   unknown_permission  /dev/kvm refused to open (EACCES/EPERM): run the
 #                       probe as root before concluding anything.
+#   unknown             The facts do not say whether /dev/kvm exists, or
+#                       which CPU flags or architecture the machine has
+#                       (facts gathered another way, such as a shell
+#                       preflight that skipped them). This probe always
+#                       gathers them.
 #
 # classify is a pure function of the facts. The control plane runs it
 # again on the facts a host reports (ByohVirtLadder.classify), so an old
 # probe on a host never decides for a newer control plane, and facts
 # gathered another way (M4's shell preflight) classify the same way.
-# A fact that is missing (nil) is unknown and never makes a host L2.
+# A fact that is missing (nil) is unknown and never makes a host L2: the
+# tier is then "unknown", or the reason says what was not gathered.
 #
 # It never changes the machine and needs no gems, and it runs on the
 # distribution's Ruby (3.0 on Ubuntu 22.04: no "it" block parameter, no
@@ -51,7 +57,7 @@ require "open3"
 module VirtProbe
   VERSION = 2
 
-  TIERS = %w[kvm pvm kvm_blocked pvm_blocked none container unknown_permission].freeze
+  TIERS = %w[kvm pvm kvm_blocked pvm_blocked none container unknown_permission unknown].freeze
 
   # Lower tiers a host without usable KVM can fall back to, fastest first
   # (docs/byoh/NO_KVM.md section 1).
@@ -117,7 +123,13 @@ module VirtProbe
     "bios_vendor" => /\A(?:SeaBIOS|Xen|innotek GmbH|Bochs|Parallels)\b/,
   }.freeze
 
-  BIOS_DISABLED = /disabled by bios|disabled \(by bios\)/i
+  # The kernel's lines for VT-x/AMD-V locked off by the firmware: the
+  # x86 feature setup ("VMX (outside TXT) disabled by BIOS"), kvm_intel
+  # ("VMX not enabled (disabled by BIOS) in MSR_IA32_FEAT_CTL"), kvm_amd
+  # ("SVM disabled (by BIOS) in MSR_VM_CR") and older kernels' "kvm:
+  # disabled by bios". Other features print the phrase too ("SGX disabled
+  # by BIOS"), so it is anchored to virtualization.
+  BIOS_DISABLED = /VMX \((?:outside|inside) TXT\) disabled by BIOS|VMX not enabled \((?:disabled )?by BIOS\)|SVM disabled \(by BIOS\)|\bkvm(?:_intel|_amd)?: disabled by bios/i
 
   MIN_CONTAINER_KERNEL = [5, 12].freeze
 
@@ -134,6 +146,7 @@ module VirtProbe
     flags = cpuinfo[/^flags\s*:(.*)$/, 1].to_s.split
     modules = MODULES.select { |mod| File.directory?(File.join(root, "sys/module", mod)) }
     kvm = kvm_facts(root)
+    log = command_fact(root, "kernel-log") { kernel_log }
     {
       "arch" => uname[:machine],
       "kernel" => uname[:release],
@@ -146,7 +159,8 @@ module VirtProbe
       "modules" => modules,
       "nested_param" => nested_param(root),
       "pvm_module_available" => read(root, "lib/modules/#{uname[:release]}/modules.dep").to_s.match?(%r{(?:\A|/)kvm-pvm\.ko}),
-      "bios_log" => bios_log(root),
+      # Left out when the log could not be read, so it stays unknown.
+      **(log ? {"bios_log" => bios_line(log)} : {}),
       "virt_vm" => command_fact(root, "detect-virt-vm") { detect_virt("--vm") },
       "virt_container" => command_fact(root, "detect-virt-container") { detect_virt("--container") } || container_marker(root),
       "dmi" => DMI_FIELDS.to_h { |field| [field, read(root, "sys/class/dmi/id/#{field}")&.strip] },
@@ -250,13 +264,12 @@ module VirtProbe
     vmx_flags&.split&.include?("ept")
   end
 
-  # The kernel log line that says the firmware switched virtualization
-  # off, or nil. The kernel prints it when KVM (or the VMX feature setup)
-  # finds VT-x/AMD-V locked off, also on AMD machines whose cpuinfo still
-  # lists svm.
-  def self.bios_log(root)
-    log = command_fact(root, "kernel-log") { kernel_log }
-    log&.each_line&.find { |line| BIOS_DISABLED.match?(line) }&.strip
+  # The line of the kernel log that says the firmware switched
+  # virtualization off, or nil. The kernel prints it when KVM (or the VMX
+  # feature setup) finds VT-x/AMD-V locked off, also on AMD machines whose
+  # cpuinfo still lists svm.
+  def self.bios_line(log)
+    log.each_line.find { |line| BIOS_DISABLED.match?(line) }&.strip
   end
 
   # This boot's kernel log from journald, else from dmesg, or nil when
@@ -280,11 +293,12 @@ module VirtProbe
     nil
   end
 
-  # Whether the filesystem holding /vm (VM disks; / when it does not
-  # exist) is mounted with project quotas, which the container tier's
-  # "dir" disks need.
+  # Whether the filesystem holding /var/storage, where rhizome keeps VM
+  # disks and boot images, is mounted with project quotas, which the
+  # container tier's "dir" disks need. The mount table decides, so it
+  # works before the directory exists.
   def self.prjquota(root)
-    target = File.directory?(File.join(root, "vm")) ? "/vm" : "/"
+    target = "/var/storage"
     mounts = read(root, "proc/mounts").to_s.lines.map(&:split).select { |m| m.size >= 4 }
     mount = mounts.select { |m| target == m[1] || target.start_with?(m[1].chomp("/") + "/") }.max_by { |m| m[1].size }
     mount && mount[3].split(",").include?("prjquota")
@@ -404,10 +418,17 @@ module VirtProbe
       return ["kvm_blocked", ["/dev/kvm exists but does not answer KVM_GET_API_VERSION (#{facts["kvm_api"]})"], "unresponsive"]
     end
 
+    missing = %w[dev_kvm cpu_flags arch].select { |key| facts[key].nil? }
+    unless missing.empty?
+      return ["unknown", ["#{missing.join(", ")} not gathered, so whether KVM can work here is unknown"], "not_gathered"]
+    end
+
     if x64 && hw_virt
       mod = flags.include?("vmx") ? "kvm_intel" : "kvm_amd"
-      return ["kvm_blocked", ["#{mod} is loaded but there is no /dev/kvm"], "no_device"] if modules.include?(mod)
-      return ["kvm_blocked", ["the CPU has #{(flags & %w[vmx svm]).join(" and ")} but #{mod} is not loaded"], "module"]
+      unread = facts.key?("bios_log") ? "" : "; the kernel log was not read, so the firmware may have disabled it"
+      return ["kvm_blocked", ["#{mod} is loaded but there is no /dev/kvm#{unread}"], "no_device"] if modules.include?(mod)
+      loaded = facts["modules"].nil? ? "was not seen loaded (the loaded modules were not gathered)" : "is not loaded"
+      return ["kvm_blocked", ["the CPU has #{(flags & %w[vmx svm]).join(" and ")} but #{mod} #{loaded}#{unread}"], "module"]
     end
 
     if vm == "none" && !flags.include?("hypervisor") && !vm_dmi?(facts)
@@ -432,19 +453,31 @@ module VirtProbe
     (tier == "kvm") && (Array(facts["cpu_flags"]).include?("hypervisor") || ![nil, "none"].include?(facts["virt_vm"]) || vm_dmi?(facts))
   end
 
+  # Whether an x86_64 CPU lacks 1G pages, which today's VMs need for
+  # their hugepages; nil-safe, so missing flags never count.
+  def self.no_1g_pages?(facts)
+    facts["arch"] == "x86_64" && facts["cpu_flags"].is_a?(Array) && !facts["cpu_flags"].include?("pdpe1gb")
+  end
+
   # The fallback tiers this machine could run ("possible": the kernel and
-  # CPU allow it) and those whose userspace is already installed
-  # ("ready"), fastest first. A PVM host offers only pvm, a container
-  # nothing, and an L1 host no fallback.
+  # CPU allow it), those whose userspace is already installed ("ready"),
+  # and those whose kernel needs were not gathered ("unchecked"), fastest
+  # first. A PVM host offers only pvm, a container nothing, and an L1 host
+  # nothing unless it lacks 1G pages (it cannot take today's VMs).
   def self.fallbacks(facts, tier)
-    return {"possible" => [], "ready" => []} if %w[kvm container unknown_permission].include?(tier)
-    return {"possible" => ["pvm"], "ready" => ["pvm"]} if tier == "pvm"
+    none = {"possible" => [], "ready" => [], "unchecked" => []}
+    return none if %w[container unknown_permission unknown].include?(tier)
+    return none if tier == "kvm" && !no_1g_pages?(facts)
+    return {"possible" => ["pvm"], "ready" => ["pvm"], "unchecked" => []} if tier == "pvm"
 
     commands = facts["commands"].is_a?(Hash) ? facts["commands"] : {}
     version = facts["kernel"].to_s.scan(/\d+/).first(2).map(&:to_i)
     possible = []
     ready = []
-    if facts["cgroup2"] && (version <=> MIN_CONTAINER_KERNEL) >= 0
+    unchecked = []
+    if facts["cgroup2"].nil? || version.empty?
+      unchecked << "container"
+    elsif facts["cgroup2"] && (version <=> MIN_CONTAINER_KERNEL) >= 0
       possible << "container"
       ready << "container" if commands["lxc-start"] && commands["lxcfs"]
     end
@@ -452,8 +485,10 @@ module VirtProbe
     if facts["arch"] == "x86_64"
       possible << "emulated"
       ready << "emulated" if commands["qemu-system-x86_64"] && facts["ovmf"]
+    elsif facts["arch"].nil?
+      unchecked << "emulated"
     end
-    {"possible" => possible, "ready" => ready}
+    {"possible" => possible, "ready" => ready, "unchecked" => unchecked}
   end
 
   def self.report(facts)
@@ -480,7 +515,7 @@ module VirtProbe
       cpu: #{facts["arch"]} #{facts["cpu_model"]} flags=#{facts["cpu_flags"].join(",")}
       kvm: #{kvm} modules=#{facts["modules"].join(",")} nested_param=#{facts["nested_param"].inspect}
       virt: vm=#{facts["virt_vm"].inspect} container=#{facts["virt_container"].inspect} dmi=#{dmi.empty? ? "unknown" : dmi}
-      fallbacks: possible=#{report["possible"].join(",")} ready=#{report["ready"].join(",")}
+      fallbacks: possible=#{report["possible"].join(",")} ready=#{report["ready"].join(",")}#{" unchecked=#{report["unchecked"].join(",")}" unless report["unchecked"].empty?}
       For the fix on this platform run bin/byoh-virt probe --main-ip <this host> on the control plane; see docs/byoh/NO_KVM.md.
     TEXT
   end

@@ -81,7 +81,7 @@ What the user gets on each kind of machine, fastest option first:
 | Automatic probe | `prog/learn_virt.rb`; `prog/vm/host_nexus.rb` `prep` | BYOH hosts (`VmHost#byoh?`) probe at prep. A host off L1 gets a page (`ByohVirtTier`) carrying the fix; the page resolves when a later probe finds L1. **Fail-open:** any error is recorded, paged once, and the strand pops (section 10.5). |
 | Operator CLI | `bin/byoh-virt` (`lib/byoh_virt_cli.rb`) | `probe --main-ip` (before registration, over SSH, under `sudo -n` for a non-root `--user`), `explain` (saved JSON), `script`, `show --host`, `refresh --host` or `refresh --all` (every generic host past prep, to back-fill v2 records). `probe`, `explain` and `show` exit 0 on L1 and 3 otherwise. |
 | Installer | `scripts/byoh/bootstrap-data-plane.sh` step 1b | Prints the probe report, then applies the same KVM checks as before. |
-| Fixtures | `rhizome/host/spec/fixtures/virt_probe/*.json`, `rhizome/host/spec/virt_probe_fixtures.rb` | 23 machines (every tier, every platform case below). The rhizome spec, the ladder spec and the lab harness all read them. |
+| Fixtures | `rhizome/host/spec/fixtures/virt_probe/*.json`, `rhizome/host/spec/virt_probe_fixtures.rb` | 25 machines (every tier, every platform case below). The rhizome spec, the ladder spec and the lab harness all read them. |
 | Lab harness | `scripts/byoh/test/nokvm/run.sh`, `inside.sh` | `run.sh probe`: the real probe in Ubuntu 24.04 and Alpine containers, and every fixture tree, under the rules of section 15 (VERIFIED, below). |
 
 What did **not** change: `KvmCheck`, PrepHost, the allocator, VM creation, and every L1 code path.
@@ -111,8 +111,13 @@ fixture through both):
    - a generic CPU model: **`kvm_blocked`**, cause `cpu_model` (Proxmox's default has no `vmx`, and
      v1 called it `none`)
    - `/dev/kvm` exists but does not answer: **`kvm_blocked`**, cause `unresponsive`
+   - the facts do not say whether `/dev/kvm` exists, or lack the CPU flags or the architecture (facts
+     from a shell preflight that skipped them; the probe always gathers them): **`unknown`**, cause
+     `not_gathered`. Nothing below is decided from missing data.
    - x86 with `vmx` or `svm`: **`kvm_blocked`**, cause `module` (not loaded) or `no_device` (loaded
-     without `/dev/kvm`)
+     without `/dev/kvm`). When the loaded modules or the kernel log were not gathered, the reason says
+     so ("the kernel log was not read, so the firmware may have disabled it"): on AMD with SVM
+     disabled in the firmware, `svm` stays in `/proc/cpuinfo` and only the log tells.
    - bare metal with neither flag: **`kvm_blocked`**, cause `firmware`. Bare metal means systemd says
      `none`, the `hypervisor` flag is absent, **and** no DMI string names a hypervisor (QEMU, VMware,
      VirtualBox, Xen, Bochs, Parallels, bhyve, OpenStack, Hyper-V's "Virtual Machine", SeaBIOS, and
@@ -122,8 +127,12 @@ fixture through both):
    - the running kernel's `modules.dep` lists `kvm-pvm.ko`: **`pvm_blocked`**
    - otherwise: **`none`**
 
-A fact that is missing (`nil`, or a v1 report) is unknown: it never makes a host L2. On an L1 verdict
-the ladder lists the unknown checks as a caveat, and LearnVirt checks again at prep.
+A fact that is missing (`nil`, or a v1 report) is unknown: it never makes a host L2. Without
+`dev_kvm`, `cpu_flags` or `arch` the tier is `unknown` (rung "unknown"), which `preflight_check`
+reports as `info`, never `fail`. On an L1 verdict the ladder lists the unknown checks as a caveat, and
+LearnVirt checks again at prep. The probe leaves `bios_log` out when it could not read the kernel log
+(`journalctl -k` and `dmesg` both failed, for example `dmesg_restrict` without root), so the
+`firmware` check is `unknown`, not `pass`.
 
 The control plane adds two refusals of its own on top of the tier: **`pdpe1gb`** missing on x86_64
 means `standard_vms?` is false (fix: "give this VM the host's CPU model, or an instance type whose CPU
@@ -137,15 +146,19 @@ platform table (section 4).
   VM fd has no memory and no vCPU and is closed at once); the missing capabilities of Cloud Hypervisor
   v46's list; the errno name of the step that failed
 - the loaded modules `kvm kvm_intel kvm_amd kvm_pvm`, the `nested` module parameter, `kvm-pvm.ko` availability
-- BIOS evidence: the first kernel-log line (`journalctl -k -b`, else `dmesg`) matching "disabled by bios"
-  or "disabled (by BIOS)"
+- BIOS evidence: the first kernel-log line (`journalctl -k -b`, else `dmesg`) saying VT-x/AMD-V is
+  locked off: "VMX (outside|inside TXT) disabled by BIOS", "VMX not enabled (disabled by BIOS)", "SVM
+  disabled (by BIOS)" or "kvm: disabled by bios". Other features print the same phrase ("SGX disabled
+  by BIOS"), so the pattern is anchored to virtualization. The key is left out when the log could not
+  be read.
 - `systemd-detect-virt --vm/--container`, and the DMI fields `sys_vendor product_name product_version
   bios_vendor board_vendor chassis_vendor chassis_asset_tag`. Never `*_serial` or `product_uuid` (a
   spec pins this).
 - Secure Boot (efivars), `lockdown`, `/sys/devices/system/cpu/vulnerabilities/{meltdown,l1tf,mds,retbleed,spec_rstack_overflow}`,
   SMT control, `/var/run/reboot-required`
 - container readiness: cgroup v2, AppArmor enabled, `kernel.apparmor_restrict_unprivileged_userns`
-  (INFO only; Ubicloud never asks to change it), `prjquota` on the filesystem holding `/vm`,
+  (INFO only; Ubicloud never asks to change it), `prjquota` on the filesystem holding `/var/storage`
+  (where rhizome keeps VM disks and boot images; `/vm/<name>` holds only configuration), and
   `lxc-start` and `lxcfs` installed
 - emulation readiness: `qemu-system-x86_64` and OVMF installed
 
@@ -158,10 +171,15 @@ on the host: API 12, `KVM_CREATE_VM` returns an fd, and all 18 capabilities answ
 ioctl path itself ran only against fakes and non-KVM nodes (rhizome spec): UNVERIFIED on a real
 `/dev/kvm`.
 
-**Fallbacks** (`possible` and `ready` in the report): `container` is possible with cgroup v2 and Linux
-≥ 5.12, `emulated` on any x86_64 host, and `pvm` only on a `pvm_blocked` host; a fallback is ready when
-its packages are installed. A `pvm` host offers only `pvm`; an L1 host, a container and an
-`unknown_permission` host offer none. **`recommended`** is `pvm` on a PVM host, otherwise the fastest
+**Fallbacks** (`possible`, `ready` and `unchecked` in the report): `container` is possible with cgroup
+v2 and Linux ≥ 5.12, `emulated` on any x86_64 host, and `pvm` only on a `pvm_blocked` host; a fallback
+is ready when its packages are installed. A fallback whose kernel facts were not gathered (no
+`cgroup2` or `kernel`, as in a v1 report or shell facts; no `arch` for `emulated`) is `unchecked`,
+never dropped: it still counts for `recommended`, and `preflight_check` answers `info` for it. A `pvm`
+host offers only `pvm`; a container, an `unknown` and an `unknown_permission` host offer none. A `kvm`
+host offers none, except one without `pdpe1gb`: it cannot take today's VMs, so it lists `container`
+and `emulated` (the plan's "allowed with ack" row) while its fix asks for the CPU model first.
+**`recommended`** is `pvm` on a PVM host, otherwise the fastest
 *possible* fallback (container before emulated; `pvm` is never recommended unless `kvm_pvm` is loaded),
 installed or not. The text says what to install. This deviates from the plan's "fastest ready" so that
 an installed QEMU never outranks system containers: in the lab, containers ran about 3.5 times
@@ -243,7 +261,7 @@ Platform table changes (`lib/byoh_virt_platforms.rb`, SHIPPED):
   (L2 probably fixable)`).
 
 Rungs as printed: `kvm` L1, `kvm_blocked` L2, `container` (the data plane) refused, `unknown_permission`
-unknown, `none` and `pvm_blocked` L3-L5, `pvm` L4.
+and `unknown` unknown, `none` and `pvm_blocked` L3-L5, `pvm` L4.
 
 ### 2.3 Hook for M4's host preflight
 
@@ -270,8 +288,9 @@ contract between them:
     ladder never disagree. The same function also refuses a missing `pdpe1gb`, which PF4 (hugepages)
     would otherwise catch later.
   - `declared_tier` other than `kvm` (`container`, `pvm`, `emulated`): the KVM verdict becomes an INFO
-    line (`"KVM: ..."`), and the tier's own readiness decides. That means `pass` when it is `ready`, and
-    `fail` with what to install when it is only `possible`. It fails, with a reason, on an L1 host
+    line (`"KVM: ..."`, followed by the KVM fix as advice), and the tier's own readiness decides. That
+    means `pass` when it is `ready`, `fail` with what to install when it is only `possible`, and
+    `info` when it is `unchecked` or the KVM tier is `unknown`. It fails, with a reason, on an L1 host
     ("register it as kvm"), on a PVM host for another tier, in a container, without permission, or
     when the kernel cannot run that tier. PF4 (hugepages) should be skipped for those tiers.
     Registering them arrives with WP4.
