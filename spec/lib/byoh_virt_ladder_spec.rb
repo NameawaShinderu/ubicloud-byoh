@@ -183,6 +183,12 @@ RSpec.describe ByohVirtLadder do
         .and end_with("recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap; fallbacks cannot be registered yet (docs/byoh/NO_KVM.md section 11)")
     end
 
+    it "says how to register a shipped fallback" do
+      ship_virt_tiers("container")
+      expect(verdict(**no_virt).text).to end_with "recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap; " \
+        "register it with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers it (bin/byoh-location set --virt-tiers)"
+    end
+
     it "says when no fallback is installed, and when the recommended one is" do
       v = verdict(**no_virt, commands: {"lxc-start" => true, "lxcfs" => true})
       expect(v.text).to include("fallbacks ready: container\nfallbacks possible after installing their packages: emulated\n")

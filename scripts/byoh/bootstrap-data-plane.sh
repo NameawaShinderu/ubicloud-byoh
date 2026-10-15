@@ -30,9 +30,59 @@
 # m8i.2xlarge); other platforms are UNVERIFIED.
 #
 # Usage:
-#   ./scripts/byoh/bootstrap-data-plane.sh
+#   ./scripts/byoh/bootstrap-data-plane.sh [--tier kvm|auto|container|pvm|emulated]
+#
+# --tier picks the rung of the virtualization ladder (docs/byoh/NO_KVM.md)
+# the host will be registered on. The default, kvm, refuses a host
+# without usable KVM, as this script always did. auto runs the
+# virtualization probe and picks kvm when the machine has hardware
+# virtualization, pvm on a PVM host, and otherwise the fastest fallback
+# its kernel allows (container, then emulated); never silently: it prints
+# the choice, and registration still needs --accept-fallback. A lower tier
+# skips only the KVM checks and installs only that tier's userspace
+# packages. This script never changes kernels, sysctls or GRUB.
 #
 set -euo pipefail
+
+usage() {
+  echo "usage: $0 [--tier kvm|auto|container|pvm|emulated]"
+}
+
+TIER=kvm
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tier)
+      if [ $# -lt 2 ]; then
+        echo "ERROR: --tier needs a value" >&2
+        usage >&2
+        exit 2
+      fi
+      TIER="$2"
+      shift 2
+      ;;
+    --tier=*)
+      TIER="${1#--tier=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown argument $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+case "$TIER" in
+  kvm|auto|container|pvm|emulated) ;;
+  *)
+    echo "ERROR: unknown tier $TIER" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
 
 MARKERS_DIR="$HOME/.ubi-data-plane-bootstrap"
 mkdir -p "$MARKERS_DIR"
@@ -68,25 +118,91 @@ if [ -f "$probe" ]; then
   fi
   sudo ruby "$probe" | sed 's/^/  /'
 fi
-virt_hint="For the fix on this platform run, on the control plane: bin/byoh-virt probe --main-ip <this host>. Enable VT-x/AMD-V in the firmware on bare metal. On a cloud VM, use an instance type with nested virtualization enabled (AWS m8i/c8i/r8i with nested virtualization, GCP --enable-nested-virtualization, an Azure size that supports nested virtualization) or a bare-metal type. On Proxmox: qm set <vmid> --cpu host. A VPS without nested virtualization cannot be a data plane."
-if [ ! -c /dev/kvm ]; then
-  echo "ERROR: /dev/kvm is missing, so KVM is unavailable." >&2
-  echo "  $virt_hint" >&2
-  exit 1
+if [ "$TIER" = auto ]; then
+  if [ ! -f "$probe" ]; then
+    echo "ERROR: --tier auto needs the virtualization probe; run this script from a checkout, or pass --tier explicitly." >&2
+    exit 1
+  fi
+  # The same choice as bin/register-byoh-host --virt-tier auto: KVM when
+  # the machine has hardware virtualization (the checks below then say
+  # whether it is usable), pvm on a PVM host, else the fastest fallback.
+  TIER=$(sudo ruby "$probe" --json | ruby -rjson -e '
+    r = JSON.parse(STDIN.read)
+    case r["tier"]
+    when "kvm", "kvm_blocked" then puts "kvm"
+    when "pvm" then puts "pvm"
+    when "none", "pvm_blocked"
+      pick = %w[container emulated].find { |t| (r["possible"] + r["unchecked"]).include?(t) }
+      puts(pick || "refuse:#{r["tier"]}")
+    else puts "refuse:#{r["tier"]}"
+    end')
+  case "$TIER" in
+    refuse:*)
+      echo "ERROR: the probe found tier ${TIER#refuse:}, for which there is no automatic choice; see the report above and docs/byoh/NO_KVM.md." >&2
+      exit 1
+      ;;
+  esac
+  echo "  --tier auto chose: $TIER"
 fi
-if [ "$(uname -m)" = "x86_64" ]; then
-  if ! grep -Eqw 'vmx|svm' /proc/cpuinfo; then
-    echo "ERROR: the CPU has neither the vmx nor the svm flag." >&2
+virt_hint="For the fix on this platform run, on the control plane: bin/byoh-virt probe --main-ip <this host>. Enable VT-x/AMD-V in the firmware on bare metal. On a cloud VM, use an instance type with nested virtualization enabled (AWS m8i/c8i/r8i with nested virtualization, GCP --enable-nested-virtualization, an Azure size that supports nested virtualization) or a bare-metal type. On Proxmox: qm set <vmid> --cpu host. A VPS without nested virtualization cannot be a data plane."
+if [ "$TIER" = kvm ]; then
+  if [ ! -c /dev/kvm ]; then
+    echo "ERROR: /dev/kvm is missing, so KVM is unavailable." >&2
     echo "  $virt_hint" >&2
     exit 1
   fi
-  if ! grep -qw pdpe1gb /proc/cpuinfo; then
-    echo "ERROR: the CPU lacks the pdpe1gb flag, so it cannot use 1G hugepages (Prog::SetupHugepages)." >&2
-    echo "  On Proxmox use CPU type host; on a cloud VM pick a newer instance family." >&2
-    exit 1
+  if [ "$(uname -m)" = "x86_64" ]; then
+    if ! grep -Eqw 'vmx|svm' /proc/cpuinfo; then
+      echo "ERROR: the CPU has neither the vmx nor the svm flag." >&2
+      echo "  $virt_hint" >&2
+      exit 1
+    fi
+    if ! grep -qw pdpe1gb /proc/cpuinfo; then
+      echo "ERROR: the CPU lacks the pdpe1gb flag, so it cannot use 1G hugepages (Prog::SetupHugepages)." >&2
+      echo "  On Proxmox use CPU type host; on a cloud VM pick a newer instance family." >&2
+      exit 1
+    fi
+  fi
+  echo "  /dev/kvm present$( [ "$(uname -m)" = "x86_64" ] && echo ", vmx/svm and pdpe1gb flags present")"
+else
+  # A lower tier needs no KVM. Install only that tier's userspace; its
+  # prep (prep_host.rb) checks the rest after registration.
+  echo "  tier $TIER: skipping the KVM checks (docs/byoh/NO_KVM.md)"
+  case "$TIER" in
+    container)
+      if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        echo "ERROR: containers need the unified cgroup hierarchy (cgroup v2)." >&2
+        exit 1
+      fi
+      kver=$(uname -r | cut -d- -f1)
+      if [ "$(printf '%s\n' 5.12 "$kver" | sort -V | head -n1)" != 5.12 ]; then
+        echo "ERROR: containers need Linux 5.12 or newer (idmapped mounts); this is $kver." >&2
+        exit 1
+      fi
+      tier_packages="lxc lxcfs uidmap"
+      ;;
+    emulated)
+      if [ "$(uname -m)" != x86_64 ]; then
+        echo "ERROR: emulated hosts must be x86_64; this is $(uname -m)." >&2
+        exit 1
+      fi
+      tier_packages="qemu-system-x86 ovmf"
+      ;;
+    pvm)
+      if [ ! -d /sys/module/kvm_pvm ]; then
+        echo "ERROR: kvm_pvm is not loaded. This script never changes kernels: boot a PVM host kernel and modprobe kvm_pvm first (docs/byoh/NO_KVM.md)." >&2
+        exit 1
+      fi
+      tier_packages=""
+      ;;
+  esac
+  if [ -n "$tier_packages" ]; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    # shellcheck disable=SC2086 # the package list is meant to split
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $tier_packages >/dev/null
+    echo "  installed: $tier_packages"
   fi
 fi
-echo "  /dev/kvm present$( [ "$(uname -m)" = "x86_64" ] && echo ", vmx/svm and pdpe1gb flags present")"
 
 # --- Step 2: openssh-server ------------------------------------------
 step "2. openssh-server"
@@ -167,6 +283,9 @@ echo "    --main-ip ${MY_IP:-<this-host-primary-ip>} \\"
 echo "    --pool-file pools.yaml \\"
 echo "    --ssh-key /path/to/ctrl-plane/privkey \\"
 echo "    --default-boot-image ubuntu-noble \\"
+if [ "$TIER" != kvm ]; then
+  echo "    --virt-tier $TIER --accept-fallback \\"
+fi
 echo "    --yes"
 echo ""
 echo "How the pool addresses reach this host depends on the site"

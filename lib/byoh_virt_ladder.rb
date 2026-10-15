@@ -15,8 +15,9 @@ require_relative "../rhizome/host/lib/virt_probe"
 #   L4 pvm          KVM without hardware support (out-of-tree kvm_pvm)
 #   L5 emulated     the QEMU emulator: slow, compatibility only
 #
-# L3-L5 are fallbacks, opt-in and separately labelled; none of them can
-# be registered yet, so only L1 hosts take VMs. The probe never refuses
+# L3-L5 are fallbacks, opt-in and separately labelled; a host is
+# registered on one only as ByohVirtRegistration allows, and only tiers
+# in ByohVirtTiers::SHIPPED can be registered at all. The probe never refuses
 # anything itself; PrepHost refuses a host without KVM as before, and
 # Prog::LearnVirt records the verdict and pages with the fix.
 #
@@ -130,7 +131,12 @@ module ByohVirtLadder
         label = FALLBACK_LABELS.fetch(recommended)
         install = ready.include?(recommended) ? "" : " after #{FALLBACK_PACKAGES.fetch(recommended)}"
         install += ", if the host has #{FALLBACK_NEEDS.fetch(recommended)} (not checked)" if unchecked.include?(recommended)
-        "#{label}#{install}; fallbacks cannot be registered yet (docs/byoh/NO_KVM.md section 11)"
+        register = if ByohVirtTiers.shipped?(recommended)
+          "register it with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers it (bin/byoh-location set --virt-tiers)"
+        else
+          "fallbacks cannot be registered yet (docs/byoh/NO_KVM.md section 11)"
+        end
+        "#{label}#{install}; #{register}"
       end
     end
   end
@@ -293,7 +299,7 @@ module ByohVirtLadder
   #   checks         each KVM check (see .checks)
   #   fix, caveats   the operator's fix text and INFO lines
   # For a declared fallback tier the KVM checks are INFO and the tier's
-  # own readiness decides; fallback tiers cannot be registered yet.
+  # own readiness decides.
   def self.preflight_check(facts, declared_tier: "kvm")
     raise ArgumentError, "unknown tier #{declared_tier.inspect}; expected one of #{DECLARED_TIERS.join(", ")}" unless DECLARED_TIERS.include?(declared_tier)
 
