@@ -231,9 +231,25 @@ JSON
       )
     end
 
-    it "fails when an online cpu has no socket or core" do
-      expect(lc.sshable).to receive(:_cmd).and_return("0,0,0,0,Y\n1,0,-,,Y\n")
-      expect { lc.get_byoh_topology }.to raise_error RuntimeError, "lscpu reported no socket or core for online cpu 1"
+    it "counts one socket on an arm64 host in cluster mode, where lscpu leaves every socket empty" do
+      expect(topology_of("arm64-cluster-mode")).to eq(
+        {total_cpus: 8, total_cores: 8, total_sockets: 1, cpu_numa_nodes: [0] * 8, cpu_numbers: (0..7).to_a},
+      )
+    end
+
+    it "fails when an online cpu has no core" do
+      expect(lc.sshable).to receive(:_cmd).and_return("0,0,0,0,Y\n1,0,0,,Y\n")
+      expect { lc.get_byoh_topology }.to raise_error RuntimeError, "lscpu reported no core for online cpu 1"
+    end
+
+    it "fails when an online cpu has a socket that is not a number" do
+      expect(lc.sshable).to receive(:_cmd).and_return("0,0,0,0,Y\n1,0,-,1,Y\n")
+      expect { lc.get_byoh_topology }.to raise_error RuntimeError, 'lscpu reported socket "-" for online cpu 1'
+    end
+
+    it "fails when only some online cpus have a socket" do
+      expect(lc.sshable).to receive(:_cmd).and_return("0,0,0,0,Y\n1,0,,1,Y\n")
+      expect { lc.get_byoh_topology }.to raise_error RuntimeError, "lscpu reported a socket for only some online cpus"
     end
 
     it "fails when no cpu is online" do
@@ -272,6 +288,12 @@ JSON
       expect(lc.sshable).to receive(:_cmd).with("/usr/bin/lscpu -a -p=CPU,NODE,SOCKET,CORE,ONLINE").and_return("0,0,0,0,Y\n1,0,0,0,N\n2,0,0,1,Y\n")
       expect(lc.sshable).to receive(:_cmd).with("cat /sys/devices/system/cpu/cpu0/topology/die_id /sys/devices/system/cpu/cpu2/topology/die_id").and_return("0\n0\n")
       expect { lc.start }.to exit(arch: "x64", total_cpus: 2, total_cores: 2, total_sockets: 1, cpu_numa_nodes: [0, 0], cpu_numbers: [0, 2], total_dies: 1)
+    end
+
+    it "pops one socket for an arm64 host whose lscpu leaves every socket empty" do
+      expect(lc.sshable).to receive(:_cmd).with("common/bin/arch").and_return("arm64")
+      expect(lc.sshable).to receive(:_cmd).with("/usr/bin/lscpu -a -p=CPU,NODE,SOCKET,CORE,ONLINE").and_return("0,0,,0,Y\n1,0,,1,Y\n")
+      expect { lc.start }.to exit(arch: "arm64", total_cpus: 2, total_cores: 2, total_sockets: 1, cpu_numa_nodes: [0, 0], cpu_numbers: [0, 1], total_dies: 1)
     end
 
     it "takes the upstream path for a generic host outside a BYOH location" do

@@ -25,7 +25,10 @@ class Prog::LearnCpu < Prog::Base
   # parsable format prints unknown values as empty fields, where the JSON
   # format of util-linux 2.39 prints a bare "-" for offline rows, which is
   # not JSON. Logical core IDs come from the thread sibling masks, so they
-  # stay distinct where a kernel restarts core_id in each cluster.
+  # stay distinct where a kernel restarts core_id in each cluster. On
+  # arm64 without an ACPI PPTT table (device-tree boards, some VMs) lscpu
+  # works in cluster mode and leaves the socket empty for every CPU,
+  # which counts as one socket.
   def get_byoh_topology
     rows = sshable.cmd("/usr/bin/lscpu -a -p=CPU,NODE,SOCKET,CORE,ONLINE").each_line.filter_map do |line|
       next if line.start_with?("#")
@@ -33,10 +36,13 @@ class Prog::LearnCpu < Prog::Base
       cpu, node, socket, core, online = line.chomp.split(",", -1)
       next unless online == "Y"
 
-      fail "lscpu reported no socket or core for online cpu #{cpu}" unless [socket, core].all? { /\A\d+\z/.match?(it) }
+      fail "lscpu reported no core for online cpu #{cpu}" unless /\A\d+\z/.match?(core)
+      fail "lscpu reported socket #{socket.inspect} for online cpu #{cpu}" unless /\A\d*\z/.match?(socket)
       [Integer(cpu, 10), /\A\d+\z/.match?(node) ? Integer(node, 10) : nil, socket, core]
     end.sort_by!(&:first)
     fail "lscpu reported no online cpus" if rows.empty?
+    sockets = rows.map { it[2] }.uniq
+    fail "lscpu reported a socket for only some online cpus" if sockets.include?("") && sockets.size > 1
 
     threads_per_core = rows.group_by { |_, _, socket, core| [socket, core] }.values.map(&:size)
     total_cpus = rows.size
@@ -47,7 +53,7 @@ class Prog::LearnCpu < Prog::Base
     {
       total_cpus:,
       total_cores:,
-      total_sockets: rows.map { it[2] }.uniq.count,
+      total_sockets: sockets.size,
       cpu_numa_nodes: rows.map { it[1] },
       cpu_numbers: rows.map(&:first),
     }
