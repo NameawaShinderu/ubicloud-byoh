@@ -29,7 +29,8 @@ class ByohHostPreflight
   STANDALONE_CHECKS = %w[default-route main-ip-local].freeze
 
   # The facts the script prints, and the JSON type each must have. nil
-  # is allowed where a command can print nothing.
+  # is allowed where a command can print nothing, and for sshd when
+  # sshd -T failed, so that a failure never reads as the defaults.
   FACTS = {
     "arch" => [String],
     "os_version" => [String],
@@ -40,7 +41,7 @@ class ByohHostPreflight
     "ip_route" => [Array, NilClass],
     "netplan" => [String],
     "host_keys" => [Array],
-    "sshd" => [Hash],
+    "sshd" => [Hash, NilClass],
   }.freeze
 
   # The fails an operator may accept, and what accepting one means.

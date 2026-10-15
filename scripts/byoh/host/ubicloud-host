@@ -647,10 +647,19 @@ facts_network() {
     echo "${keys[*]}"
   )]"
 
-  local sshd
-  sshd=$(run_root sshd-T sshd -T -C "user=root,addr=${CP_IP:-127.0.0.1}")
-  fact sshd "{$(grep -Ei '^(permitrootlogin|authenticationmethods|allowusers|denyusers|pubkeyauthentication) ' <<<"$sshd" |
-    while read -r k v; do printf '%s:%s,' "$(json_str "${k,,}")" "$(json_str "$v")"; done | sed 's/,$//')}"
+  # The settings a root login from the control plane gets. host= is the
+  # address too, as sshd sees it with the default UseDNS no; without it
+  # `Match Host` blocks are skipped. null when sshd -T fails (no sudo, a
+  # broken config), so that it never reads as the defaults.
+  local sshd rc
+  sshd=$(run_root sshd-T sshd -T -C "user=root,host=${CP_IP:-127.0.0.1},addr=${CP_IP:-127.0.0.1}")
+  rc=$?
+  if ((rc != 0)); then
+    fact sshd null
+  else
+    fact sshd "{$(grep -Ei '^(permitrootlogin|authenticationmethods|allowusers|denyusers|pubkeyauthentication) ' <<<"$sshd" |
+      while read -r k v; do printf '%s:%s,' "$(json_str "${k,,}")" "$(json_str "$v")"; done | sed 's/,$//')}"
+  fi
 
   if ((STANDALONE)); then
     local count

@@ -16,7 +16,8 @@
 # with the nonce that is not a check or a fact.
 #
 # Then one live run in the ubi-m4-fakehost image (no fixtures, no
-# /dev/kvm) must fail PF3 with "no /dev/kvm".
+# /dev/kvm) must fail PF3 with "no /dev/kvm", and its sshd fact must
+# honour a `Match Host` block for --cp-ip.
 #
 # --update-spec writes each case's raw output to
 # spec/fixtures/byoh/preflight/<case>.txt for spec/lib/byoh_host_preflight_spec.rb.
@@ -131,11 +132,17 @@ say "pass fixture guard"
 # A live run on the fakehost image: real commands, no /dev/kvm.
 prepare_fakehost_image
 echo "$PREFIX-pf-live" >>"$STATE/created"
+# A `Match Host` block for the control plane's address must reach the
+# sshd fact, which needs host= in sshd -T -C.
 out=$(docker run --rm --name "$PREFIX-pf-live" --network "$NET" -i --entrypoint bash "$FAKEHOST_IMAGE" \
-  -c 'ssh-keygen -A >/dev/null && bash -s preflight --json --nonce '"$NONCE"' --standalone' <"$HOST_DIR/ubicloud-host")
+  -c 'ssh-keygen -A >/dev/null && mkdir -p /run/sshd &&
+    printf "Match Host 192.0.2.7\n  PermitRootLogin no\n" >/etc/ssh/sshd_config.d/99-pf-live.conf &&
+    bash -s preflight --json --nonce '"$NONCE"' --standalone --cp-ip 192.0.2.7' <"$HOST_DIR/ubicloud-host")
+grep -q "UBIPF:$NONCE {\"kind\":\"fact\",\"id\":\"sshd\",\"value\":{\"permitrootlogin\":\"no\"" <<<"$out" ||
+  fail "live: the sshd fact misses the Match Host block ($(grep -o "UBIPF:$NONCE {\"kind\":\"fact\",\"id\":\"sshd\".*" <<<"$out"))"
 [[ $(pairs <<<"$out" | grep '^PF3 ') == "PF3 fail" ]] || fail "live: PF3 is not fail"
 [[ $(detail_of PF3 <<<"$out") == "no /dev/kvm" ]] || fail "live: PF3 detail is '$(detail_of PF3 <<<"$out")'"
 n=$(pairs <<<"$out" | wc -l)
 ((n == ${#CHECK_IDS[@]})) || fail "live: $n checks, expected ${#CHECK_IDS[@]}"
-say "pass live fakehost (PF3: no /dev/kvm)"
+say "pass live fakehost (PF3: no /dev/kvm; sshd Match Host)"
 say "PASS preflight fixtures: ${#cases[@]} cases + base, guard, live"

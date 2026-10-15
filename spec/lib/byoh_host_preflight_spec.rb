@@ -59,7 +59,7 @@ RSpec.describe ByohHostPreflight do
   describe ".parse" do
     it "reads every fixture host's real output" do
       %w[base amd-uniform arm-biglittle btrfs ebs-nvme gpu-nouveau intel-hybrid kvm64-model kvm64-vmx lvm no-kvm noisy-bashrc
-        offline-cpus one-cpu pve-node rhizome-user smt-offline two-default-routes ufw-off ufw-on virtio-vda zfs].each do |name|
+        offline-cpus one-cpu pve-node rhizome-user smt-offline sshd-broken two-default-routes ufw-off ufw-on virtio-vda zfs].each do |name|
         preflight = from_fixture(name)
         expect(preflight).to be_readable, name
         expect(preflight.checks.map(&:id)).to include(*described_class::HOST_CHECKS, *described_class::STANDALONE_CHECKS)
@@ -123,6 +123,13 @@ RSpec.describe ByohHostPreflight do
 
     it "accepts a null ip_addr or ip_route" do
       expect(parse({}, "ip_addr" => nil, "ip_route" => nil)).to be_readable
+    end
+
+    it "reads the sshd settings, and null when sshd -T failed" do
+      expect(from_fixture("base").facts["sshd"]).to eq("permitrootlogin" => "without-password", "pubkeyauthentication" => "yes", "authenticationmethods" => "any")
+      preflight = from_fixture("sshd-broken")
+      expect(preflight).to be_readable
+      expect(preflight.facts).to include("sshd" => nil)
     end
   end
 
