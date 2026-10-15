@@ -38,6 +38,43 @@ and `ubicloud-admin`, so a change to either needs no re-prepare),
 `account EMAIL` and `as-service`/`as-migrate CMD` (a command in the
 release with exactly the units' environment, parsed by systemd).
 
+## M4 harness (`ubi-m4-*`)
+
+`lib.sh` takes its container prefix from `UBI_TEST_PREFIX` (default
+`ubi-m3`) and the systemd image from `UBI_TEST_SYSTEMD_IMAGE` (default
+`ubi-m3-systemd`). `cleanup` removes only the recorded containers that
+carry the run's prefix. `m4-lib.sh` sources it with prefix `ubi-m4`
+(`UBI_M4_STATE`, `UBI_M4_LOGS` and `UBI_M4_KEEP` override the M3 names)
+and adds a fake data-plane host:
+
+- `Dockerfile.fakehost` (context `fakehost/`) is ubuntu:24.04 with
+  openssh-server, sudo, iproute2, util-linux, pciutils and curl, and no
+  systemd and no `/dev/kvm`. `/usr/sbin/sshd -D -e` runs as PID 1, so
+  every auth event is in `docker logs`. Host keys are generated when each
+  container starts, never in the image.
+- User `ubuntu` has passwordless sudo. Its RSA login key is generated per
+  run in `$STATE` (`fakehost_key`) and never committed.
+- `/usr/local/bin/systemctl` is a shim: `reload`/`restart` of
+  `ssh`/`sshd` sends SIGHUP to the listener (sshd re-execs and rereads its
+  config); `is-active` answers from `/etc/fakehost-active`, which the
+  entrypoint writes from `docker run -e FAKEHOST_ACTIVE="docker ufw"`
+  (an ssh session does not see the container's env); every other verb
+  exits 0. Calls are logged to `/var/log/fakehost-systemctl.log`.
+- `start_fakehost NAME [docker run args]` runs `ubi-m4-NAME` on
+  `ubi-test-net` with no published ports, records it, installs the key
+  and waits for port 22; `fakehost_ip NAME` gives its address.
+
+```
+scripts/byoh/test/m4-fakehost-check.sh   # builds ubi-m4-fakehost, checks it, cleans up
+```
+
+The check logs in from a second fakehost as `ubuntu`, and checks sudo,
+the auth line in `docker logs`, no `/dev/kvm`, per-container host keys,
+`is-active`, and that `systemctl reload ssh.service` makes sshd reread
+a drop-in (`sshd -T`) and keep serving. It fails if any `ubi-m4-*`
+container is left. Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20):
+pass in about 5 s after the image build, nothing left behind.
+
 ## Scenarios
 
 | Scenario | Checks |
