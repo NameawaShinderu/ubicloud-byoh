@@ -829,7 +829,7 @@ sd_already_ours() {
   n=${BASH_REMATCH[1]}
   target=$STORAGE_DEVICES/disk$n
   if ! awk -v u="UUID=$uuid" -v t="$target" '$1 == u && $2 == t { f = 1 } END { exit !f }' "$R/etc/fstab"; then
-    refuse "$SD_LINK carries the label $label but /etc/fstab does not mount UUID=$uuid at $target; to start over, wipefs -a /dev/$SD_NAME"
+    refuse "$SD_LINK carries the label $label but /etc/fstab does not mount UUID=$uuid at $target; either a run stopped before its fstab write, or the disk came from another host or lost its fstab line and may hold VM data. Mount it read-only to check before any wipefs -a /dev/$SD_NAME"
   fi
   mounts=$(lsblk -nro MOUNTPOINTS "/dev/$SD_NAME")
   if [[ -z ${mounts//[[:space:]]/} ]]; then
