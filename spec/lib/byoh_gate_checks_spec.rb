@@ -364,8 +364,8 @@ RSpec.describe ByohGateChecks do
   end
 
   describe "health" do
-    def page(summary, severity: "error", resource_id: host.id)
-      Page.create(summary:, tag: "Test-#{summary}", severity:, resource_id:, details: {})
+    def page(summary, severity: "error", resource_id: host.id, created_at: Time.now)
+      Page.create(summary:, tag: "Test-#{summary}", severity:, resource_id:, details: {}, created_at:)
     end
 
     it "passes an accepting host with no pages, checkup or unavailable label" do
@@ -411,11 +411,53 @@ RSpec.describe ByohGateChecks do
         "PASS host strand is at (none), not unavailable\n"
     end
 
+    it "fails on a page raised after --since even when it is resolved again" do
+      host.update(allocation_state: "accepting")
+      host.strand.update(label: "wait")
+      since = Time.utc(2026, 10, 15, 8)
+      page("before the soak", created_at: since - 60).update(resolved_at: since - 30)
+      page("info in the soak", severity: "info", created_at: since + 60).update(resolved_at: since + 90)
+      page("#{host.ubid} has an expired deadline!", created_at: since + 120).update(resolved_at: since + 150)
+      status, out, _ = cli("health", "--host", host.ubid, "--since", "2026-10-15T08:00:00Z")
+      expect(status).to eq 1
+      expect(out).to include "PASS no open page for #{host.ubid}\n",
+        "FAIL error page raised at 2026-10-15T08:02:00Z, resolved since: #{host.ubid} has an expired deadline!\n", "1 failed\n"
+      expect(out).not_to include "before the soak", "info in the soak", "was raised and resolved"
+    end
+
+    it "passes --since when no page was raised and resolved after it" do
+      host.update(allocation_state: "accepting")
+      host.strand.update(label: "wait")
+      page("before the soak", created_at: Time.utc(2026, 10, 15, 7)).update(resolved_at: Time.utc(2026, 10, 15, 7, 30))
+      status, out, _ = cli("health", "--host", host.ubid, "--since", "2026-10-15T10:00:00+02:00")
+      expect(status).to eq 0
+      expect(out).to include "PASS no page for #{host.ubid} was raised and resolved since 2026-10-15T08:00:00Z\n"
+    end
+
+    it "rejects a --since that is no ISO 8601 time" do
+      status, _, err = cli("health", "--host", host.ubid, "--since", "yesterday")
+      expect(status).to eq 1
+      expect(err).to eq "! --since takes an ISO 8601 time such as 2026-10-15T08:00:00Z, not yesterday\n"
+    end
+
+    it "refuses --probe while the host keys are not pinned, as the session would pin them" do
+      host.update(allocation_state: "accepting")
+      host.strand.update(label: "wait")
+      expect(host.sshable.host_keys).to be_nil
+      expect(Net::SSH).not_to receive(:start)
+      status, out, _ = cli("health", "--host", host.ubid, "--probe")
+      expect(status).to eq 1
+      expect(out).to include "FAIL health checks not run: the SSH host keys of #{host.ubid} are not pinned yet, " \
+        "and the probe would pin the keys it meets; respirate pins them on its next SSH session to the host\n", "1 failed\n"
+      expect(host.sshable.reload.host_keys).to be_nil
+    end
+
     # The host find_host loads, with its sshable loaded, so the stubs on
     # both reach the command (frozen specs cannot stub any instance).
     def probed_host
       h = VmHost[host.id]
       h.update(allocation_state: "accepting")
+      h.sshable.update(host_keys: Sequel.pg_array(["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"], :text))
       expect(VmHost).to receive(:[]).with(host.ubid).and_return(h)
       h.sshable
       h

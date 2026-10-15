@@ -2,6 +2,7 @@
 
 require "json"
 require "optparse"
+require "time"
 
 # The database side of the M2 canary gate (scripts/byoh/verify/m2-gate.sh,
 # docs/byoh/VERIFY.md). Every check prints PASS, FAIL, WARN or INFO lines;
@@ -20,7 +21,7 @@ class ByohGateChecks
       info      --vm UBID
       snapshot  --host UBID
       compare   --host UBID --snapshot FILE
-      health    --host UBID [--probe]
+      health    --host UBID [--since TIME] [--probe]
   USAGE
 
   COMMANDS = %w[location host vm info snapshot compare health].freeze
@@ -267,17 +268,27 @@ class ByohGateChecks
 
   # One sample of the M4 F5 soak (scripts/byoh/verify/m4-f5-soak.sh):
   # what bin/monitor and HostNexus have decided about the host. With
-  # --probe it also runs the health checks the monitor runs, over a fresh
-  # SSH session, as HostNexus#available? does; the only write is the
-  # read/write check's 1 MiB test file in each storage path, which it
-  # deletes again.
+  # --since TIME (the soak's start) a non-info page for the host raised
+  # after TIME fails too when it is resolved already, so a mark-down that
+  # recovered between two samples is not lost. With --probe it also runs
+  # the health checks the monitor runs, over a fresh SSH session, as
+  # HostNexus#available? does; the only write is the read/write check's
+  # 1 MiB test file in each storage path, which it deletes again. The
+  # probe refuses a host whose SSH host keys are not pinned yet, as the
+  # session would pin the keys it meets in the database.
   def cmd_health(argv)
     opts = {}
-    parse(argv, "health --host UBID [--probe]") do |o|
+    parse(argv, "health --host UBID [--since TIME] [--probe]") do |o|
       host_option(o, opts)
+      o.on("--since TIME", "Also fail on pages for the host raised after TIME (ISO 8601), resolved or not") { opts[:since] = it }
       o.on("--probe", "Also run the host's health checks over SSH") { opts[:probe] = true }
     end
     host = find_host(opts)
+    since = opts[:since] && begin
+      Time.iso8601(opts[:since])
+    rescue ArgumentError
+      raise Error, "--since takes an ISO 8601 time such as 2026-10-15T08:00:00Z, not #{opts[:since]}"
+    end
     label = host.strand&.label
 
     report do |r|
@@ -290,7 +301,15 @@ class ByohGateChecks
       raised = pages.reject { it.severity == "info" }
       r.check(raised.empty?, "no open page for #{host.ubid}") if raised.empty?
       raised.each { r.fail("open #{it.severity} page: #{it.summary}") }
-      if opts[:probe]
+      if since
+        past = Page.for_resource(host.id).non_info.exclude(resolved_at: nil).where { created_at > since }.order(:created_at).all
+        r.check(true, "no page for #{host.ubid} was raised and resolved since #{since.utc.iso8601}") if past.empty?
+        past.each { r.fail("#{it.severity} page raised at #{it.created_at.utc.iso8601}, resolved since: #{it.summary}") }
+      end
+      if opts[:probe] && Array(host.sshable.host_keys).empty?
+        r.fail("health checks not run: the SSH host keys of #{host.ubid} are not pinned yet, and the probe would pin the keys it meets; " \
+          "respirate pins them on its next SSH session to the host")
+      elsif opts[:probe]
         healthy = begin
           host.sshable.start_fresh_session { host.perform_health_checks(it, test_file_suffix: "soak") }
         rescue => ex

@@ -6,7 +6,11 @@
 # with --help for the commands. Read-only: nothing here changes the
 # database. `health --probe` (the M4 F5 soak, m4-f5-soak.sh) logs in to
 # the host and runs its health checks, whose read/write check writes and
-# deletes a 1 MiB test file in each storage path.
+# deletes a 1 MiB test file in each storage path. It refuses a host whose
+# SSH host keys are not pinned yet, as its session would pin them.
+#
+# On a packaged control plane, run it through the release and its env
+# file: sudo ubicloud-admin run m2-checks COMMAND [options]
 #
 # Run from the repository root on the control plane:
 #
