@@ -9,9 +9,9 @@ require_relative "net_ssh"
 # way the control plane later will (Net::SSH with Sshable's arguments,
 # but with no session cache and no Sshable row), and runs a single echo.
 #
-# With pinned_host_keys (from ByohOperatorSsh#verified_host_keys), the
-# host must present one of them, so the operator's session and the
-# control plane's reach the same machine. Without them (a plain
+# With pinned_host_keys (ByohOperatorSsh#verified_host_keys, or
+# "<type> <base64>" lines), the host must present one of them, so the
+# operator's session and the control plane's reach the same machine. Without them (a plain
 # register-byoh-host run) the first key the host presents is accepted
 # and returned, to be pinned at registration: the control plane then
 # trusts one key from its first connection on, as it does for every
@@ -31,7 +31,7 @@ class ByohRootProbe
 
     @main_ip = main_ip
     @private_key = private_key
-    @pinned = pinned_host_keys
+    @pinned = pinned_host_keys && ByohOperatorSsh::HostKey.lines(pinned_host_keys)
     @starter = starter
     @nonce = nonce
   end

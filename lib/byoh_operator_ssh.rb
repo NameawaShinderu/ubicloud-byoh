@@ -45,6 +45,15 @@ class ByohOperatorSsh
       nil
     end
 
+    # keys (HostKeys, or "<type> <base64> [comment]" lines) as the
+    # "<type> <base64>" strings that Sshable::KnownHosts reads and
+    # sshable.host_keys stores. Raises on anything else, so that a
+    # malformed pin fails before it is stored rather than on every later
+    # connection.
+    def self.lines(keys)
+      Array(keys).map { parse(it.to_s)&.to_s || raise(ArgumentError, "not an SSH host public key: #{it.to_s[0, 60].inspect}") }.uniq
+    end
+
     def to_s = "#{type} #{blob}"
 
     # As ssh-keygen -l and the ssh client print it.
@@ -129,8 +138,9 @@ class ByohOperatorSsh
   end
 
   # Every host key the host reports (preflight's host_keys fact, the
-  # content of its ssh_host_*_key.pub files), once the key ssh met in
-  # this session is shown to be one of them. Anything else means the
+  # content of its ssh_host_*_key.pub files), as HostKeys, once the key
+  # ssh met in this session is shown to be one of them. ByohRootProbe
+  # and HostNexus.assemble take them as they are. Anything else means the
   # session reached a different machine than the one that reported the
   # keys.
   def verified_host_keys(reported)

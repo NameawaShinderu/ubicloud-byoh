@@ -236,6 +236,30 @@ RSpec.describe Prog::Vm::HostNexus do
         }
       end
 
+      it "stores the keys ByohOperatorSsh#verified_host_keys returns as \"<type> <base64>\" lines" do
+        key = SshKey.generate.public_key
+        verified = ["#{key} root@h", "#{key} dup"].map { ByohOperatorSsh::HostKey.parse(it) }
+        st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config:,
+          pinned_host_keys: [*verified, "#{key} comment"])
+
+        expect(st.subject.sshable.host_keys).to eq([key])
+        expect(Sshable::KnownHosts.new(st.subject.sshable.host_keys, []).search_for("203.0.113.42", {}).map(&:ssh_type)).to eq(["ssh-ed25519"])
+      end
+
+      it "refuses a malformed pinned host key before storing anything" do
+        expect {
+          described_class.assemble("203.0.113.42",
+            location_id: byoh_location.id,
+            provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+            provider_config:,
+            pinned_host_keys: [SshKey.generate.public_key, "ssh-ed25519 AAAA"])
+        }.to raise_error(ArgumentError, 'not an SSH host public key: "ssh-ed25519 AAAA"')
+        expect(Sshable.where(host: "203.0.113.42").count).to eq(0)
+      end
+
       it "leaves host keys unset and the frame unflagged without pinned host keys" do
         st = described_class.assemble("203.0.113.42",
           location_id: byoh_location.id,

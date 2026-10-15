@@ -93,6 +93,27 @@ RSpec.describe ByohRootProbe do
     end
   end
 
+  it "takes the keys ByohOperatorSsh#verified_host_keys returns, and returns them as lines" do
+    other = SshKey.generate.public_key
+    verified = ByohOperatorSsh.open("ubuntu@203.0.113.42", runner: lambda { |argv, _stdin|
+      File.write(argv.find { it.start_with?("UserKnownHostsFile=") }.delete_prefix("UserKnownHostsFile="), "203.0.113.42 #{host_pub}\n")
+      ["", "", 0]
+    }) do |ssh|
+      ssh.run("true")
+      ssh.verified_host_keys(["#{other} root@h", "#{host_pub} root@h"])
+    end
+    expect(verified).to all(be_a(ByohOperatorSsh::HostKey))
+
+    result = probe(pinned: verified).call
+    expect(result.ok).to be true
+    expect(result.host_keys).to eq([other, host_pub])
+  end
+
+  it "refuses a pin that is not a host public key" do
+    expect { described_class.new("203.0.113.42", reg_key.private_key, pinned_host_keys: [host_pub, "ssh-ed25519"]) }
+      .to raise_error(ArgumentError, 'not an SSH host public key: "ssh-ed25519"')
+  end
+
   it "refuses an empty pin" do
     expect { described_class.new("203.0.113.42", reg_key.private_key, pinned_host_keys: []) }.to raise_error(ArgumentError, "pinned_host_keys is empty")
   end

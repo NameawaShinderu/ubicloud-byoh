@@ -32,6 +32,8 @@ class Prog::Vm::HostNexus < Prog::Base
       if pinned_host_keys
         raise "Only a generic provider host takes pinned host keys" unless provider_name == HostProvider::GENERIC_PROVIDER_NAME
         raise "pinned_host_keys is empty" if pinned_host_keys.empty?
+
+        pinned_host_keys = ByohOperatorSsh::HostKey.lines(pinned_host_keys)
       end
 
       id = VmHost.generate_uuid
