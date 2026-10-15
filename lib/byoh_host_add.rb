@@ -52,7 +52,7 @@ require "shellwords"
 # prepare, finished); 1 a validation, preflight, host-key or SSH
 # failure; 2 a usage error; 3 a timeout, respirate is not running, or
 # the host is outside a bring-up and not accepting; 4 `pool verify`
-# failed; 130 interrupted.
+# failed; 130 interrupted (after the key install, with the undo line).
 class ByohHostAdd
   class Failure < StandardError
     attr_reader :status
@@ -206,6 +206,9 @@ class ByohHostAdd
   rescue ByohRegistration::ValidationError => ex
     @err.puts "! validation failed: #{ex.message}"
     1
+  rescue Interrupt
+    @err.puts "! interrupted"
+    130
   end
 
   private
@@ -352,6 +355,8 @@ class ByohHostAdd
           o[:storage_disks].each { storage_disk(ssh, it, o[:allow_shared]) }
         rescue Failure, ByohOperatorSsh::TransportError => ex
           raise Failure, "#{ex.message}\n  #{undo_hint(site, o[:main_ip])}"
+        rescue Interrupt
+          raise Failure.new("interrupted\n  #{undo_hint(site, o[:main_ip])}", 130)
         end
         write_state(site, o[:main_ip], requested, host_keys: keys.map(&:to_s), uplink_ip: reg.uplink_ip, gateway: reg.gateway)
       end

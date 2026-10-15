@@ -352,6 +352,17 @@ RSpec.describe ByohHostAdd do
       expect(Dir.exist?(key_dir)).to be false
     end
 
+    it "exits 130 on Ctrl-C, with the undo line once the key may be installed" do
+      replies["sudo -n true"] = -> { raise Interrupt }
+      expect(cli(*base, "--yes")).to eq [130, "Checking ubuntu@203.0.113.10 (preflight, read-only)\n", "! interrupted\n"]
+
+      replies.clear
+      replies["sudo -n bash -s -- storage-disk"] = -> { raise Interrupt }
+      status, _, err = cli(*base, "--yes", "--storage-disk", "virtio-data")
+      expect(status).to eq 130
+      expect(err).to start_with "! interrupted\n  To undo the key install on the host: sudo sed -i"
+    end
+
     it "asks on a terminal, and needs --yes without one" do
       status, _, err = cli(*base)
       expect([status, err]).to eq [1, "! nothing was changed: pass --yes (or --expect-host-key) to confirm without a terminal\n"]
