@@ -7,7 +7,8 @@
 #   inside.sh probe-apt   the same after apt-get install ruby (Ubuntu
 #                         images without Ruby)
 #   inside.sh l3          LXC and rhizome's gems, then l3.sh in a private
-#                         mount namespace with a fresh /proc
+#                         mount namespace with a fresh /proc whose
+#                         /proc/sys is read-only but for /proc/sys/net
 set -eu
 
 RHIZOME=/w/rhizome
@@ -80,7 +81,15 @@ case "${1:-}" in
     apt-get -qq install -y --no-install-recommends lxc-utils uidmap xz-utils dnsmasq-base nftables iproute2 ruby ruby-bundler \
       curl ca-certificates openssh-client adduser perl procps e2fsprogs >/dev/null
     (cd /w/rhizome && BUNDLE_FROZEN=true bundle install --quiet 2>&1 | grep -v "as root" || true)
-    unshare -m --propagation private sh -c 'mount -t proc proc /proc && exec bash /w/nokvm/l3.sh'
+    # A fresh proc shows a writable /proc/sys, whose kernel.* and vm.*
+    # settings are the host's own. Rhizome needs only the per-netns
+    # net.* ones, so the rest is made read-only again before l3.sh runs,
+    # and l3.sh checks it there (kernel_guard).
+    unshare -m --propagation private sh -c '
+      mount -t proc proc /proc &&
+        mount --bind /proc/sys /proc/sys && mount -o remount,bind,ro /proc/sys &&
+        mount --bind /proc/sys/net /proc/sys/net && mount -o remount,bind,rw /proc/sys/net &&
+        exec bash /w/nokvm/l3.sh'
     ;;
   *) fail "unknown mode ${1:-}" ;;
 esac

@@ -15,23 +15,34 @@
 #                  symlink and cgroup probes, delete twice
 #
 # l3 nests LXC, which mounts proc, sysfs and cgroup2 and loads seccomp
-# filters; docker-default AppArmor denies those mounts. It therefore runs
-# only with NOKVM_L3_UNCONFINED=1, which allows exactly
-# apparmor=unconfined and seccomp=unconfined for that one container (the
-# limits of the shared-machine rules), or under an admin-loaded
-# ubi-q-nokvm profile. Without AppArmor's mount denial, the guard of
-# inside.sh (read-only /sys and /proc/sys, checked at start and
-# teardown) and the host-state comparison are what show that no host
-# kernel state changed. l3.sh installs the nft drop toward the test
-# network before any guest starts and stops if it is missing. The l5
+# filters; docker-default AppArmor denies those mounts. The l3 container
+# is root in the host's user namespace with CAP_SYS_ADMIN, so without
+# AppArmor's mount denial it could mount a writable proc or sysfs and
+# change host-global kernel state; no check inside it can prevent that
+# (docs/byoh/NO_KVM.md section 15). l3 therefore runs only where one of
+# these holds:
+#   - BYOH_NOKVM_THROWAWAY_VM=1: this machine is a throwaway VM, so
+#     apparmor=unconfined and seccomp=unconfined are accepted for
+#     ubi-q-nokvm-l3 (never on the shared lab machine);
+#   - NOKVM_L3_PROFILE=1: a machine administrator loaded the AppArmor
+#     profile ubi-q-nokvm, which l3 then runs under, with docker's
+#     default seccomp profile. The harness never loads a profile, and
+#     none is shipped yet.
+# inside.sh still mounts /proc/sys read-only but for /proc/sys/net in
+# l3's mount namespace, and l3.sh checks there, at start and at the end,
+# that host kernel settings are not writable; the host-state comparison
+# runs before and after. These detect, they do not confine. l3.sh
+# installs the nft drop toward the test network and every private
+# address before any guest starts and stops if it is missing. The l5
 # guest mode comes with WP6.
 #
 # Rules for every container (checked with docker inspect before start):
 #   - named ubi-q-nokvm-*, network ubi-test-net, no published ports
 #   - not privileged; no device but /dev/net/tun; capabilities added only
 #     from NET_ADMIN SYS_ADMIN NET_RAW; security options only
-#     no-new-privileges and apparmor=ubi-q-nokvm (no seccomp profile, no
-#     unconfined anything); no host PID/IPC/UTS/user namespace
+#     no-new-privileges and apparmor=ubi-q-nokvm (no seccomp profile, and
+#     nothing unconfined but l3's on a throwaway VM); no host
+#     PID/IPC/UTS/user namespace
 #   - AppArmor docker-default (or ubi-q-nokvm) and the daemon's default
 #     seccomp profile: the daemon must have both enabled (docker info,
 #     checked before any container is created), and the profile is
@@ -46,7 +57,7 @@
 #
 # Environment: NOKVM_UBUNTU_IMAGE (ubuntu:24.04), NOKVM_ALPINE_IMAGE
 # (ruby:4.0.2-alpine3.23), NOKVM_KEEP=1 keeps containers,
-# NOKVM_L3_UNCONFINED=1 (see l3).
+# BYOH_NOKVM_THROWAWAY_VM=1 or NOKVM_L3_PROFILE=1 (see l3).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -128,10 +139,13 @@ apparmor_ok() {
   profile=$(field "$1" '{{.AppArmorProfile}}')
   case "$profile" in
     docker-default | ubi-q-nokvm) ;;
-    unconfined) [ "$1" = ubi-q-nokvm-l3 ] && [ "${NOKVM_L3_UNCONFINED:-0}" = 1 ] || fail "$1: AppArmor profile '$profile', not docker-default" ;;
+    unconfined) unconfined_ok "$1" || fail "$1: AppArmor profile '$profile', not docker-default" ;;
     *) fail "$1: AppArmor profile '$profile', not docker-default" ;;
   esac
 }
+
+# unconfined_ok NAME: only l3's container, and only on a throwaway VM.
+unconfined_ok() { [ "$1" = ubi-q-nokvm-l3 ] && [ "${BYOH_NOKVM_THROWAWAY_VM:-0}" = 1 ]; }
 
 # field NAME TEMPLATE: what docker inspect says about the container.
 field() { docker inspect --format "$2" "$1"; }
@@ -151,7 +165,7 @@ assert_safe() {
   for item in $(field "$name" '{{range .HostConfig.SecurityOpt}}{{.}} {{end}}'); do
     case "$item" in
       no-new-privileges | no-new-privileges:true | no-new-privileges=true | apparmor=ubi-q-nokvm) ;;
-      apparmor=unconfined | seccomp=unconfined) [ "$name" = ubi-q-nokvm-l3 ] && [ "${NOKVM_L3_UNCONFINED:-0}" = 1 ] || fail "$name: security option $item" ;;
+      apparmor=unconfined | seccomp=unconfined) unconfined_ok "$name" || fail "$name: security option $item" ;;
       *) fail "$name: security option $item" ;;
     esac
   done
@@ -159,7 +173,7 @@ assert_safe() {
   # which daemon_check proved is AppArmor's docker-default.
   case "$(field "$name" '{{.AppArmorProfile}}')" in
     "" | docker-default | ubi-q-nokvm) ;;
-    unconfined) [ "$name" = ubi-q-nokvm-l3 ] && [ "${NOKVM_L3_UNCONFINED:-0}" = 1 ] || fail "$name: AppArmor profile is not docker-default" ;;
+    unconfined) unconfined_ok "$name" || fail "$name: AppArmor profile is not docker-default" ;;
     *) fail "$name: AppArmor profile is not docker-default" ;;
   esac
   [ "$(field "$name" '{{len .HostConfig.PortBindings}}{{.HostConfig.PublishAllPorts}}')" = 0false ] || fail "$name: published ports"
@@ -220,16 +234,20 @@ probe() {
 # l3: see the header. The scratch tmpfs holds the image and both root
 # file systems (about 2.5 GB of this container's memory, no disk).
 l3() {
-  local before
-  if [ "${NOKVM_L3_UNCONFINED:-0}" != 1 ]; then
-    fail "l3 nests LXC and needs NOKVM_L3_UNCONFINED=1 (AppArmor and seccomp unconfined for ubi-q-nokvm-l3 only); see the header"
+  local before confine
+  if [ "${BYOH_NOKVM_THROWAWAY_VM:-0}" = 1 ]; then
+    confine=(--security-opt apparmor=unconfined --security-opt seccomp=unconfined)
+  elif [ "${NOKVM_L3_PROFILE:-0}" = 1 ]; then
+    confine=(--security-opt apparmor=ubi-q-nokvm)
+  else
+    fail "l3 nests LXC: run it on a throwaway VM (BYOH_NOKVM_THROWAWAY_VM=1) or under an admin-loaded ubi-q-nokvm AppArmor profile (NOKVM_L3_PROFILE=1), never unconfined on a shared machine; see the header"
   fi
   image_check "$UBUNTU_IMAGE"
   daemon_check
   disk_check
   before=$(host_state)
   run_in l3 "$UBUNTU_IMAGE" l3 --cap-add NET_ADMIN --cap-add SYS_ADMIN --cap-add NET_RAW --device /dev/net/tun \
-    --security-opt apparmor=unconfined --security-opt seccomp=unconfined --sysctl net.ipv4.ip_forward=1
+    "${confine[@]}" --sysctl net.ipv4.ip_forward=1
   [ "$before" = "$(host_state)" ] ||
     fail "host kernel state changed during the run (another workload on this machine may have done it): $(diff <(echo "$before") <(host_state) || true)"
   disk_check

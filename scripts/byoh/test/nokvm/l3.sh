@@ -4,8 +4,12 @@
 # inside an ubi-q-nokvm-l3 container that run.sh created and checked.
 # inside.sh runs it in a private mount namespace with a fresh /proc
 # (docker's /proc/sys is read-only, and rhizome sets net.* sysctls of the
-# VMs' network namespaces); it touches only this container's own network
-# namespaces, its delegated cgroup subtree and tmpfs.
+# VMs' network namespaces) whose /proc/sys is read-only again but for
+# /proc/sys/net; kernel_guard checks that at start and at the end. It
+# touches only this container's own network namespaces, its delegated
+# cgroup subtree and tmpfs. Guests reach only the internet: forwarding
+# toward the test network, the gateway (the docker host) and every
+# private or link-local address is dropped.
 #
 # What it cannot do, and fakes (each says so in the log): systemd
 # (fake-systemctl), project quotas and AppArmor (lab-setup-vm.rb),
@@ -53,6 +57,25 @@ ssh_vm() { # ssh_vm IP CMD...
 }
 
 # --- the lab "host" ----------------------------------------------------
+# kernel_guard: host-global kernel settings stay read-only in this mount
+# namespace, and the per-netns net.* ones writable, as inside.sh made
+# them. test -w sees a read-only mount even as root.
+kernel_guard() {
+  local f
+  for f in /proc/sys/kernel/dmesg_restrict /proc/sys/kernel/core_pattern /proc/sys/vm/nr_hugepages /proc/sys/fs/file-max \
+    /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages /sys/kernel/mm/transparent_hugepage/enabled; do
+    if [ -e "$f" ] && [ -w "$f" ]; then
+      echo "FAIL $f is writable; host kernel state is exposed" >&2
+      exit 1
+    fi
+  done
+  [ -w /proc/sys/net/ipv4/ip_forward ] || {
+    echo "FAIL /proc/sys/net is not writable; inside.sh did not set up /proc" >&2
+    exit 1
+  }
+  ok "host kernel settings are read-only here; only /proc/sys/net is writable"
+}
+
 host_setup() {
   say "host: cgroup delegation, rhizome paths, fake systemd, egress, guard toward the test network"
   # This container's own cgroup namespace: make it writable and move its
@@ -86,7 +109,14 @@ NFT
 }
 
 # No guest may reach another host of the test network (ubi-pg-test and
-# the like); only the gateway, for egress. Installed before any guest.
+# the like), the gateway (the docker host itself, with every port other
+# projects publish) or any other private or link-local address out of
+# eth0, such as the host's other bridges. Egress needs none of them: the
+# VMs' dnsmasq forwards to public resolvers, and the internet's
+# addresses are public. Traffic between the VMs never leaves through
+# eth0, so the isolation checks still test rhizome. The host's public
+# addresses stay reachable (unknown from here). Installed before any
+# guest.
 guard_test_network() {
   local subnet gw
   subnet=$(ip -4 -o addr show dev eth0 | awk '{ print $4 }')
@@ -94,14 +124,21 @@ guard_test_network() {
   subnet=$(ruby -ripaddr -e 'puts "#{IPAddr.new(ARGV[0])}/#{ARGV[0].split("/")[1]}"' "$subnet")
   nft -f - <<NFT
 table inet l3guard {
-  chain guard { type filter hook forward priority -10; ip daddr $gw accept; ip daddr $subnet drop; }
+  chain guard {
+    type filter hook forward priority -10;
+    ip daddr $subnet drop;
+    ip daddr $gw drop;
+    oifname "eth0" ip daddr { 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16 } drop;
+  }
 }
 NFT
-  grep -q "ip daddr $subnet drop" <<<"$(nft list table inet l3guard)" || {
-    echo "FAIL the guard toward $subnet is missing" >&2
+  local rules
+  rules=$(nft list table inet l3guard)
+  if ! grep -q "ip daddr $subnet drop" <<<"$rules" || ! grep -q "ip daddr $gw drop" <<<"$rules" || grep -q accept <<<"$rules"; then
+    echo "FAIL the guard toward $subnet and $gw is missing" >&2
     exit 1
-  }
-  ok "forward drop toward the test network $subnet (gateway $gw allowed)"
+  fi
+  ok "forward drop toward the test network $subnet, the gateway $gw and private addresses"
   echo "$subnet $gw" >/tmp/l3.testnet
 }
 
@@ -213,6 +250,10 @@ vm_checks() {
   read -r subnet gw </tmp/l3.testnet
   check_not "$vm: cannot reach another host of the test network ($subnet)" \
     ssh_vm "$ip" "timeout 4 bash -c 'echo > /dev/tcp/${subnet%.*/*}.2/5432'"
+  local port
+  for port in 5432 22; do
+    check_not "$vm: cannot reach the docker host at $gw:$port" ssh_vm "$ip" "timeout 4 bash -c 'echo > /dev/tcp/$gw/$port'"
+  done
   check "$vm: the guest's processes are in the unit's lxc.payload cgroup" \
     grep -q . "/sys/fs/cgroup/system.slice/$vm.service/lxc.payload/init.scope/cgroup.procs"
   check "$vm: vm-stats reads the payload cgroup" bash -c "cd /home/rhizome && ruby /w/rhizome/host/bin/vm-stats $vm | ruby -rjson -e 'v = JSON.parse(\$stdin.read)[\"vm\"]; exit(v[\"cpu_stats\"][\"total_time_ms\"] > 0 && v[\"memory_current_bytes\"] > 0 ? 0 : 1)'"
@@ -271,6 +312,7 @@ vm_delete() {
     test ! -e /var/storage/$vm && test ! -e /var/lib/ubicloud/idmap/$vm && test ! -e /vm/$vm && ! id $vm 2>/dev/null"
 }
 
+kernel_guard
 host_setup
 mkdir -p /root/.ssh
 [ -f /root/.ssh/id_l3 ] || ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_l3
@@ -291,6 +333,7 @@ vm_delete vml3aaa2
 check "no process of any container id is left" bash -c "! ps -eo uid= | awk '\$1 >= 1000000000' | grep -q ."
 check "no LXC monitor is left" bash -c "! pgrep -x lxc-start"
 say "scratch used: $(du -sh $SCRATCH | cut -f1)"
+kernel_guard
 if [ "$fails" -eq 0 ]; then say "l3 ok"; else
   say "l3: $fails failures"
   exit 1
