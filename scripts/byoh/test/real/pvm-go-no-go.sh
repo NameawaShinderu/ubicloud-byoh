@@ -167,10 +167,15 @@ state_set() {
   echo "$1=$2" >>"$STATE"
 }
 
+# Reuses dest only when it came from the same URL ($2.src), so a rerun
+# with another PVM_RELEASE_URL never checks the old files.
 fetch() { # url dest
-  [ -s "$2" ] || curl -fL --retry 3 -o "$2.part" "$1"
-  [ -s "$2.part" ] && mv "$2.part" "$2"
-  [ -s "$2" ] || die "download failed: $1"
+  if [ -s "$2" ] && [ "$(cat "$2.src" 2>/dev/null)" = "$1" ]; then return 0; fi
+  rm -f "$2" "$2.src" "$2.part"
+  curl -fL --retry 3 -o "$2.part" "$1" || die "download failed: $1"
+  [ -s "$2.part" ] || die "download failed: $1 is empty"
+  mv "$2.part" "$2"
+  echo "$1" >"$2.src"
 }
 
 # Every file must be listed in SHA256SUMS: `sha256sum -c --ignore-missing`
@@ -523,7 +528,7 @@ boot_test_phase() {
   fetch "$PVM_IMAGE_URL" "$ART/$img"
   fetch "$img_dir/SHA256SUMS" "$ART/image-SHA256SUMS"
   check_listed_sum "$ART/image-SHA256SUMS" "$img"
-  [ -s "$ART/base.raw" ] || qemu-img convert -O raw "$ART/$img" "$ART/base.raw"
+  [ "$ART/base.raw" -nt "$ART/$img" ] || qemu-img convert -O raw "$ART/$img" "$ART/base.raw"
   qemu-img resize -f raw "$ART/base.raw" 8G >/dev/null
 
   write_bench "$PVM_WORK/bench.sh"

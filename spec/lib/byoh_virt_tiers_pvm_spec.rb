@@ -45,7 +45,7 @@ RSpec.describe ByohVirtTiers, "pvm" do
 
     # Runs the script's own shell functions, under its set -euo pipefail.
     def run_functions(names, call, vars = {})
-      defs = names.map { script[/^#{it}\(\) \{\n.*?^\}\n/m] || raise("no function #{it}") }
+      defs = names.map { script[/^#{it}\(\) \{[^\n]*\n.*?^\}\n/m] || raise("no function #{it}") }
       env = vars.map { |k, v| "#{k}=#{Shellwords.escape(v)}\n" }.join
       Open3.capture2e(bash, "-c", "set -euo pipefail\n#{env}#{defs.join}#{call}")
     end
@@ -56,6 +56,26 @@ RSpec.describe ByohVirtTiers, "pvm" do
       end
       expect(allowed).to eq %w[pcieport vmbus]
       expect(run_functions(%w[driver_unchecked_ok], "driver_unchecked_ok vmbus")[1].success?).to be false
+    end
+
+    it "fetches again when a cached file came from another URL" do
+      Dir.mktmpdir do |dir|
+        curl = <<~SH
+          curl() {
+            local o="" u=""
+            while [ $# -gt 0 ]; do
+              case $1 in -o) o=$2; shift ;; --retry) shift ;; -*) ;; *) u=$1 ;; esac
+              shift
+            done
+            echo "$u" >>"$DIR/calls"
+            echo "from $u" >"$o"
+          }
+        SH
+        call = "#{curl}fetch https://a/f \"$DIR/f\"\nfetch https://a/f \"$DIR/f\"\nfetch https://b/f \"$DIR/f\"\ncat \"$DIR/f\""
+        out, status = run_functions(%w[die fetch], call, DIR: dir)
+        expect([out, status.success?]).to eq ["from https://b/f\n", true]
+        expect(File.read("#{dir}/calls")).to eq "https://a/f\nhttps://b/f\n"
+      end
     end
 
     describe "the release pins" do
