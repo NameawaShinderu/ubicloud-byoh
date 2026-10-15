@@ -120,7 +120,7 @@ module ThawedMock
 
   # Other Classes
   allow_mocking(BillingRate, :from_resource_properties)
-  allow_mocking(ByohVirtTiers, :shipped?)
+  allow_mocking(ByohVirtTiers, :shipped?, :multitenant_checked?)
   allow_mocking(Clog, :emit, :write)
   allow_mocking(CloudflareClient, :new)
   allow_mocking(Clover, :ips_v4, :call, :authorized_project)
