@@ -128,6 +128,11 @@ RSpec.describe ByohVirtCli do
       other = create_vm_host
       expect(cli("show", "--host", other.ubid)).to eq [1, "", "! host #{other.ubid} is not a generic (BYOH) host\n"]
     end
+
+    it "refuses a generic host still in a non-BYOH location, which keeps its M1 behaviour" do
+      host.update(location_id: Location::HETZNER_FSN1_ID)
+      expect(cli("show", "--host", host.ubid)).to eq [1, "", "! host #{host.ubid} is #{described_class::NOT_BYOH}\n"]
+    end
   end
 
   describe "refresh" do
@@ -159,6 +164,15 @@ RSpec.describe ByohVirtCli do
       expect(status).to eq 0
       expect(Strand.where(prog: "LearnVirt").all.map { it.stack.first["subject_id"] }).to eq [host.id]
       expect(out).to include("Started ").and include("Skipped host #{fresh.ubid}: no rhizome yet")
+    end
+
+    it "never probes a generic host still in a non-BYOH location" do
+      host.strand.update(label: "wait")
+      host.update(location_id: Location::HETZNER_FSN1_ID)
+      expect(cli("refresh", "--host", host.ubid)).to eq [1, "", "! host #{host.ubid} is #{described_class::NOT_BYOH}\n"]
+      expect(cli("refresh", "--all")).to eq [0, "Skipped host #{host.ubid}: #{described_class::NOT_BYOH}.\n", ""]
+      expect(Strand.where(prog: "LearnVirt").count).to eq 0
+      expect(DB[:byoh_operator_action].count).to eq 0
     end
 
     it "starts a probe for a host without a strand" do

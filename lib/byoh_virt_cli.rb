@@ -21,14 +21,18 @@ class ByohVirtCli
       script            Print the probe as a script for "ruby -" on a host
       show     --host UBID   Show what the last probe of a host found
       refresh  --host UBID | --all
-               Probe a registered host again, or every generic (BYOH)
-               host whose rhizome is installed
+               Probe a registered host again, or every BYOH host (generic
+               provider in a BYOH location) whose rhizome is installed
 
     probe, explain and show exit 0 when the host can run VMs (L1), 3 when
     not. show exits 0 for a host that was never probed.
   USAGE
 
   NOT_L1 = 3
+
+  # A generic host still in a non-BYOH location keeps its M1 behaviour
+  # (VmHost#byoh?), so it is never probed.
+  NOT_BYOH = "not in a BYOH location; move it with bin/byoh-host move-location first"
 
   def initialize(out: $stdout, err: $stderr, stdin: $stdin)
     @out = out
@@ -118,7 +122,7 @@ class ByohVirtCli
     all = false
     parse(argv, "refresh --host UBID | --all") do |o|
       o.on("--host UBID", "VmHost ubid") { key = it }
-      o.on("--all", "Every generic (BYOH) host whose rhizome is installed") { all = true }
+      o.on("--all", "Every BYOH host whose rhizome is installed") { all = true }
     end
     raise Error, "give either --host or --all" unless all ^ !key.nil?
 
@@ -128,8 +132,10 @@ class ByohVirtCli
       return start_probe(host)
     end
 
-    VmHost.where(id: HostProvider.where(provider_name: HostProvider::GENERIC_PROVIDER_NAME).select(:id)).order(:id).eager(:strand).all.each do |h|
-      if rhizome_installed?(h)
+    VmHost.where(id: HostProvider.where(provider_name: HostProvider::GENERIC_PROVIDER_NAME).select(:id)).order(:id).eager(:strand, :location, :provider).all.each do |h|
+      if !h.byoh?
+        @out.puts "Skipped host #{h.ubid}: #{NOT_BYOH}."
+      elsif rhizome_installed?(h)
         start_probe(h)
       else
         @out.puts "Skipped host #{h.ubid}: no rhizome yet; its prep probes it."
@@ -177,6 +183,7 @@ class ByohVirtCli
   def lookup_host(key)
     host = (VmHost[key] if key.match?(/\Avh[0-9a-z]{24}\z/)) || raise(Error, "no host #{key}")
     raise Error, "host #{host.ubid} is not a generic (BYOH) host" unless host.provider_name == HostProvider::GENERIC_PROVIDER_NAME
+    raise Error, "host #{host.ubid} is #{NOT_BYOH}" unless host.byoh?
     host
   end
 end
