@@ -175,6 +175,12 @@ RSpec.describe ByohOperatorSsh do
       expect(described_class.parse("ssh-ed25519 AAAA")).to be_nil
       expect(described_class.parse("foo-bar #{[Net::SSH::Buffer.from(:string, "foo-bar").to_s].pack("m0")}")).to be_nil
       expect(described_class.parse("ecdsa-sha2-nistp256 #{[Net::SSH::Buffer.from(:string, "ecdsa-sha2-nistp256", :string, "nistp256", :string, "ab").to_s].pack("m0")}")).to be_nil
+      expect(described_class.parse("ssh-rsa #{[Net::SSH::Buffer.from(:string, "ssh-rsa", :string, "x").to_s].pack("m0")}")).to be_nil
+    end
+
+    it "lets an error that no malformed key raises surface" do
+      expect(Net::SSH::Buffer).to receive(:new).and_raise(NameError, "uninitialized constant")
+      expect { described_class.parse(fixed_key) }.to raise_error(NameError, "uninitialized constant")
     end
   end
 

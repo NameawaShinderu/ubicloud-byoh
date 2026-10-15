@@ -38,10 +38,10 @@ class ByohOperatorSsh
       return unless type && blob
 
       # A blob that is not strict base64, is cut short, or holds an
-      # unknown or malformed key raises any of several errors, or reads
-      # as nil.
+      # unknown or malformed key raises one of these, or reads as nil.
+      # Anything else is a bug, and surfaces.
       new(type:, blob:) if Net::SSH::Buffer.new(blob.unpack1("m0")).read_key&.ssh_type == type
-    rescue NotImplementedError, StandardError
+    rescue NotImplementedError, ArgumentError, TypeError, Net::SSH::Exception, OpenSSL::OpenSSLError
       nil
     end
 
