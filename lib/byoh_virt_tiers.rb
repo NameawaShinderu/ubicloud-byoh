@@ -1,0 +1,204 @@
+# frozen_string_literal: true
+
+# The lower rungs of the virtualization ladder (docs/byoh/NO_KVM.md) as
+# data, and the one policy every lower-rung VM and host passes.
+#
+# A host is registered on one tier and keeps it (vm_host.virt_tier, a DB
+# trigger refuses changes). "kvm" is every host as it was before tiers
+# existed: cloud-hypervisor, or QEMU-KVM for some GPUs, with every
+# upstream family. The other tiers each own exactly one family, so their
+# hosts and VMs never mix with KVM ones (a CHECK on vm_host ties tier and
+# family). tier_for_family therefore says "kvm" for any family not listed
+# here, including AWS, GCP and GPU families.
+#
+# A lower-tier VM is created only when all of these hold (check_vm!):
+# - the caller of Prog::Vm::Nexus.assemble allowed the tier (the default
+#   is kvm only, so services, runners, Kubernetes and VM pools never get
+#   one);
+# - the tier is shipped (SHIPPED: its rhizome support exists);
+# - the location is a BYOH location whose byoh_virt policy lists the
+#   tier, which requires the operator's acknowledgement of it;
+# - the project may use the location, and no other project has a
+#   lower-tier VM there unless the tier's "multitenant" option is
+#   acknowledged (check_tenancy!, under a lock on the location row);
+# - it uses no GPU, no machine image, no remote storage and no explicit
+#   hypervisor, and one of the tier's boot images.
+module ByohVirtTiers
+  KVM = "kvm"
+
+  # Per tier:
+  #   rung             the ladder rung, for display only
+  #   prep_arg         the tier argument of rhizome's prep_host.rb
+  #   description      what customers and operators are told
+  #   storage          "vhost" (ubiblk volumes, as on KVM hosts) or "none"
+  #                    (the tier keeps its own disks; no vhost backend)
+  #   options          what the operator can acknowledge beyond the tier
+  #   boot_images      the boot images its VMs may use
+  #   host_reserve_mib memory kept for the host itself
+  #   vm_overhead_mib  memory each VM needs beyond its own RAM
+  #   min_vcpus        vCPUs of the smallest size, to bound the VM count
+  # None of the tiers uses 1G hugepages; verify_tier_capacity keeps a
+  # memory budget in the hugepage columns instead.
+  Tier = Data.define(:id, :rung, :prep_arg, :description, :storage, :options, :boot_images,
+    :host_reserve_mib, :vm_overhead_mib, :min_vcpus) do
+    def family = id
+
+    def label = "#{id} (#{rung}, experimental)"
+  end
+
+  TIERS = {
+    "container" => Tier.new(
+      id: "container", rung: "L3", prep_arg: "container",
+      description: "System container: shared host kernel, near-native speed. Not a VM.",
+      storage: "none", options: %w[multitenant unencrypted-disk nested-userns guest-firewall],
+      boot_images: %w[ubuntu-noble-container],
+      # Provisional (UNVERIFIED): lxc monitor, lxcfs share and dnsmasq.
+      host_reserve_mib: 2048, vm_overhead_mib: 128, min_vcpus: 2,
+    ),
+    "pvm" => Tier.new(
+      id: "pvm", rung: "L4", prep_arg: "pvm",
+      description: "PVM: software virtualization (experimental). Weaker isolation than standard VMs; Ubicloud-supplied guest kernel without AppArmor. Linux only.",
+      storage: "vhost", options: %w[multitenant],
+      boot_images: %w[ubuntu-noble],
+      # Provisional (UNVERIFIED): cloud-hypervisor, ubiblk, dnsmasq and
+      # shadow page tables.
+      host_reserve_mib: 2048, vm_overhead_mib: 384, min_vcpus: 2,
+    ),
+    "emulated" => Tier.new(
+      id: "emulated", rung: "L5", prep_arg: "emulated",
+      description: "Emulated: slow, compatibility only. Not a security boundary.",
+      storage: "vhost", options: %w[multitenant],
+      boot_images: %w[ubuntu-noble ubuntu-jammy],
+      # docs/byoh/EMULATED_HOSTS.md section 6.4 (provisional 512).
+      host_reserve_mib: 2048, vm_overhead_mib: 512, min_vcpus: 2,
+    ),
+  }.freeze
+
+  IDS = [KVM, *TIERS.keys].freeze
+
+  # The lower tiers whose rhizome support exists, so that a location can
+  # offer them and hosts can be registered on them. A tier joins this
+  # list in the commit that ships it (docs/byoh/NO_KVM.md section 11).
+  SHIPPED = [].freeze
+
+  # The acknowledgement of a tier itself, stored as the tier's key in
+  # byoh_virt["acks"].
+  DEFAULT_POLICY = {"tiers" => [KVM], "acks" => {}}.freeze
+
+  class Refused < StandardError; end
+
+  # The billing rates a lower-tier VM is charged by, per family.
+  RATE_TYPES = %w[VmVCpu VmStorage].freeze
+
+  def self.fetch(id)
+    TIERS.fetch(id) { raise Refused, "unknown tier #{id.inspect}; expected one of #{IDS.join(", ")}" }
+  end
+
+  def self.tier_for_family(family)
+    TIERS.key?(family) ? family : KVM
+  end
+
+  def self.lower?(tier) = tier != KVM
+
+  def self.shipped?(tier) = tier == KVM || SHIPPED.include?(tier)
+
+  def self.family_for(tier) = lower?(tier) ? fetch(tier).family : "standard"
+
+  # The location's policy. Only BYOH locations have one; every other
+  # location is KVM only.
+  def self.policy(location)
+    return DEFAULT_POLICY unless location.byoh? && location.byoh_virt
+
+    DEFAULT_POLICY.merge(location.byoh_virt.to_h)
+  end
+
+  def self.tiers(location) = policy(location)["tiers"]
+
+  def self.allows?(location, tier) = tiers(location).include?(tier)
+
+  # Whether the operator acknowledged the tier, or one of its options.
+  def self.acked?(location, tier, option = nil)
+    acks = policy(location)["acks"]
+    return false unless acks.key?(tier)
+
+    option.nil? || Array(acks[tier]).include?(option)
+  end
+
+  # The lower-tier families a customer may pick in the location: shipped
+  # tiers that the location offers. Empty for every non-BYOH location.
+  def self.offered_families(location)
+    tiers(location).select { lower?(it) && shipped?(it) }.map { fetch(it).family }
+  end
+
+  # The families of allowed_tiers that Validation.validate_vm_size may
+  # accept for a VM in the location.
+  def self.size_families(location, allowed_tiers)
+    lower = allowed_tiers.select { lower?(it) }
+    return [] if lower.empty?
+
+    offered_families(location) & lower.map { fetch(it).family }
+  end
+
+  # Whether a host's probe verdict matches the tier it was registered on:
+  # a KVM host must run today's VMs; a lower-tier host must have that
+  # tier's prerequisites in place (VirtProbe.fallbacks "ready"). Agreement
+  # is a safety check, never an authorization.
+  def self.accepts_probe?(tier, verdict)
+    return verdict.standard_vms? if tier == KVM
+
+    verdict.ready.include?(tier)
+  end
+
+  def self.refuse(message)
+    raise Validation::ValidationFailed.new({size: message})
+  end
+
+  # The policy of section 5.3 of docs/byoh/NO_KVM.md for a lower-tier VM,
+  # except tenancy (check_tenancy!). Raises Validation::ValidationFailed.
+  def self.check_vm!(tier, location:, project:, allowed_tiers:, gpu_count:, boot_image:, storage_volumes:, hypervisor:, ch_version:, remote_storage_server_id:)
+    spec = fetch(tier)
+    refuse "#{tier} VMs are not available to this caller" unless allowed_tiers.include?(tier)
+    refuse "#{tier} VMs are not available yet" unless shipped?(tier)
+    refuse "#{tier} VMs are only available in BYOH locations" unless location.byoh?
+    refuse "location #{location.display_name} does not offer #{tier} VMs" unless allows?(location, tier) && acked?(location, tier)
+    unless location.visible_or_for_project?(project.id, project.get_ff_visible_locations)
+      refuse "location #{location.display_name} is not available to this project"
+    end
+    # Billing records charge the VM's family (Prog::Vm::Metal::Nexus).
+    RATE_TYPES.each { Validation.validate_billing_rate(it, spec.family, location.name) }
+    refuse "#{tier} VMs cannot have GPUs" if gpu_count.to_i > 0
+    refuse "#{tier} VMs choose their hypervisor from the host" if hypervisor || ch_version
+    refuse "#{tier} VMs can only boot #{spec.boot_images.join(", ")}" unless spec.boot_images.include?(boot_image)
+    if remote_storage_server_id || storage_volumes.any? { it[:machine_image_version_id] || it[:remote_storage_server_id] }
+      refuse "#{tier} VMs cannot use machine images or remote storage"
+    end
+    if spec.storage == "none" && storage_volumes.any? { it[:track_written] }
+      refuse "#{tier} VMs cannot track written blocks"
+    end
+    nil
+  end
+
+  # One project per location for every lower tier, unless the operator
+  # acknowledged the tier's "multitenant" option. Takes a lock on the
+  # location row, so two creates for different projects cannot both pass;
+  # call it inside the create transaction.
+  def self.check_tenancy!(tier, location, project_id)
+    Location.dataset.for_update.where(id: location.id).get(:id)
+    return if acked?(location, tier, "multitenant")
+
+    others = Vm.where(location_id: location.id, family: TIERS.values.map(&:family)).exclude(project_id:)
+    refuse "location #{location.display_name} already runs lower-tier VMs of another project, and its #{tier} tier is single-project" unless others.empty?
+  end
+
+  # The guest memory budget in GiB of a lower-tier host
+  # (docs/byoh/EMULATED_HOSTS.md section 6.4, for every tier): MemTotal
+  # without hugepages and the kernel's 1/43 share for page tables and the
+  # like, less the host reserve and the overhead of as many VMs of the
+  # smallest size as the host has CPUs for. Never below 0.
+  def self.memory_budget_gib(tier, mem_total_mib:, hugepages_mib:, total_cpus:)
+    spec = fetch(tier)
+    usable_mib = (mem_total_mib - hugepages_mib) * 42 / 43
+    max_vms = total_cpus / spec.min_vcpus
+    [(usable_mib - spec.host_reserve_mib - spec.vm_overhead_mib * max_vms) / 1024, 0].max
+  end
+end

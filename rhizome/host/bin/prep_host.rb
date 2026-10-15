@@ -4,7 +4,7 @@
 require_relative "../../common/lib/util"
 require_relative "../lib/cloud_hypervisor"
 require_relative "../lib/crypt_swap_setup"
-require_relative "../lib/emulated_host"
+require_relative "../lib/host_tier"
 require_relative "../lib/htcat_setup"
 require_relative "../lib/kvm_check"
 require_relative "../lib/spdk_setup"
@@ -22,14 +22,15 @@ unless (env_type = ARGV.shift)
   exit 1
 end
 
-# The CPU virtualization accelerator the host was registered with: kvm
-# (cloud-hypervisor VMs; the default) or tcg (QEMU VMs on an emulated
-# host). EmulatedHost.prep_steps lists the steps below that each one runs.
-accel = ARGV.shift || "kvm"
+# The virtualization tier the host was registered on: kvm
+# (cloud-hypervisor VMs; the default) or a lower tier of
+# docs/byoh/NO_KVM.md. HostTier.prep_steps lists the steps below that each
+# one runs.
+tier = ARGV.shift || "kvm"
 
 begin
-  steps = EmulatedHost.prep_steps(accel)
-rescue EmulatedHost::Unsupported => e
+  steps = HostTier.prep_steps(tier)
+rescue HostTier::Unsupported => e
   abort e.message
 end
 
@@ -52,10 +53,10 @@ step_actions = {
   },
 
   # The same, for an emulated host: x86_64, with QEMU and OVMF installed.
-  check_arch: -> { EmulatedHost.check_arch! },
-  check_emulator: -> { EmulatedHost.check_emulator! },
+  check_arch: -> { HostTier.check_arch! },
+  check_emulator: -> { HostTier.check_emulator! },
   kvm_hint: -> {
-    if (hint = EmulatedHost.kvm_hint)
+    if (hint = HostTier.kvm_hint)
       puts hint
     end
   },
@@ -176,6 +177,6 @@ CRON
 
 steps.each do |step|
   step_actions.fetch(step).call
-rescue EmulatedHost::Unsupported => e
+rescue HostTier::Unsupported => e
   abort e.message
 end

@@ -14,7 +14,7 @@ class Prog::Vm::Nexus < Prog::Base
     exclude_availability_zones: [], availability_zone: nil, availability_zone_required: false, alternative_families: [],
     allow_private_subnet_in_other_project: false, init_script: nil, exclude_data_centers: [],
     use_separate_management_nic: false, use_eip: true, management_nic_use_eip: true, remote_storage_server_id: nil,
-    waiting_strand_id: nil, allocated_waiting_strand_id: nil, ip4_exposure: "internet")
+    waiting_strand_id: nil, allocated_waiting_strand_id: nil, ip4_exposure: "internet", allowed_tiers: [ByohVirtTiers::KVM])
 
     unless (project = Project[project_id])
       fail "No existing project"
@@ -36,7 +36,11 @@ class Prog::Vm::Nexus < Prog::Base
       fail "Internal IPv4 is only available in BYOH locations"
     end
 
-    vm_size = Validation.validate_vm_size(size, arch)
+    # Lower virtualization tiers (ByohVirtTiers) only when the caller
+    # allows them; for the default kvm-only callers there are no extra
+    # families, and nothing changes.
+    vm_size = Validation.validate_vm_size(size, arch, extra_families: ByohVirtTiers.size_families(location, allowed_tiers))
+    tier = ByohVirtTiers.tier_for_family(vm_size.family)
     Validation.validate_billing_rate("VmVCpu", vm_size.family, location.name)
 
     storage_volumes ||= [{}]
@@ -49,7 +53,7 @@ class Prog::Vm::Nexus < Prog::Base
       volume[:vring_workers] ||= vm_size.vring_workers
       volume[:encrypted] = true if !volume.has_key? :encrypted
       if !volume.has_key? :track_written
-        volume[:track_written] = !volume[:read_only]
+        volume[:track_written] = !volume[:read_only] && (tier == ByohVirtTiers::KVM || ByohVirtTiers.fetch(tier).storage != "none")
       end
       volume[:boot] = disk_index == boot_disk_index
 
@@ -61,6 +65,13 @@ class Prog::Vm::Nexus < Prog::Base
     end
 
     Validation.validate_storage_volumes(storage_volumes, boot_disk_index)
+
+    if ByohVirtTiers.lower?(tier)
+      ByohVirtTiers.check_vm!(tier, location:, project:, allowed_tiers:, gpu_count:, boot_image:, storage_volumes:,
+        hypervisor:, ch_version:, remote_storage_server_id:)
+      # No lower tier uses 1G hugepages (ByohVirtTiers).
+      hugepages = false
+    end
 
     metal_vm = location.provider_dispatcher_group_name == "metal"
     boot_volume = storage_volumes[boot_disk_index]
@@ -94,6 +105,7 @@ class Prog::Vm::Nexus < Prog::Base
     create_network_interface = use_eip
 
     DB.transaction do
+      ByohVirtTiers.check_tenancy!(tier, location, project_id) if ByohVirtTiers.lower?(tier)
       subnet = nil
       # Here the logic is the following;
       # - If the user provided nic_id, that nic has to exist and we fetch private_subnet

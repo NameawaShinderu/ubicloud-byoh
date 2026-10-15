@@ -258,6 +258,18 @@ module Option
     }
   }).freeze
 
+  # Sizes of the lower virtualization tiers (ByohVirtTiers), kept out of
+  # VmSizes so that no existing caller can see them: only
+  # Validation.validate_vm_size with extra_families: returns one, and
+  # only Prog::Vm::Nexus.assemble and the VM create API pass it. The
+  # shapes follow standard (4 GiB per vCPU); emulated stays small because
+  # every vCPU is a host thread running flat out.
+  TierVmSizes = {"container" => [2, 4, 8, 16], "pvm" => [2, 4, 8, 16], "emulated" => [2, 4]}.flat_map { |family, vcpus|
+    vcpus.map {
+      VmSize.new("#{family}-#{it}", family, it, it * 100, 0, it * 4, [it * 20, it * 40], NO_IO_LIMITS, vring_workers(it), false, "x64")
+    }
+  }.freeze
+
   # Postgres Global Options
   PostgresFlavorOption = Data.define(:name, :title)
   POSTGRES_FLAVOR_OPTIONS = [

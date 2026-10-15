@@ -5,7 +5,7 @@ class Prog::Vm::HostNexus < Prog::Base
   frame_reader :vhost_block_backend_version, :default_boot_images, :install_os
   frame_accessor :accepting_before_patch
 
-  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false, ipv6_mode: "gua")
+  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false, ipv6_mode: "gua", virt_tier: ByohVirtTiers::KVM)
     DB.transaction do
       unless (location = Location[location_id])
         raise "No existing Location"
@@ -26,6 +26,22 @@ class Prog::Vm::HostNexus < Prog::Base
         net6 = declared["cidr"] if declared
       end
 
+      # A lower virtualization tier (docs/byoh/NO_KVM.md) only for BYOH
+      # hosts in a location that offers it; such a host gets its tier's
+      # family, which keeps its VMs apart from KVM ones.
+      host_args = {location_id:, family:, net6:, ndp_needed:, ipv6_mode:}
+      if ByohVirtTiers.lower?(virt_tier)
+        ByohVirtTiers.fetch(virt_tier)
+        raise "A #{virt_tier} host must be a generic provider host in a BYOH location" unless provider_name == HostProvider::GENERIC_PROVIDER_NAME && location.byoh?
+        raise "#{virt_tier} hosts are not available yet" unless ByohVirtTiers.shipped?(virt_tier)
+        raise "Location #{location.name} does not offer #{virt_tier} hosts" unless ByohVirtTiers.allows?(location, virt_tier) && ByohVirtTiers.acked?(location, virt_tier)
+        raise "A #{virt_tier} host has family #{virt_tier}, not #{family}" unless family == "standard"
+        host_args[:family] = ByohVirtTiers.family_for(virt_tier)
+        host_args[:virt_tier] = virt_tier
+      elsif provider_name == HostProvider::GENERIC_PROVIDER_NAME && !ByohVirtTiers.allows?(location, virt_tier)
+        raise "Location #{location.name} does not offer kvm hosts"
+      end
+
       id = VmHost.generate_uuid
       # Preloading raw_private_key_1 at creation time is the supported path
       # for BYOH hosts: the operator installs the matching public key on the
@@ -36,7 +52,7 @@ class Prog::Vm::HostNexus < Prog::Base
       sshable_args = {host: sshable_hostname}
       sshable_args[:raw_private_key_1] = ssh_private_key if ssh_private_key
       Sshable.create_with_id(id, **sshable_args)
-      vmh = VmHost.create_with_id(id, location_id:, family:, net6:, ndp_needed:, ipv6_mode:)
+      vmh = VmHost.create_with_id(id, **host_args)
 
       if [HostProvider::HETZNER_PROVIDER_NAME, *HostProvider::LEASEWEB_PROVIDER_NAMES, HostProvider::GENERIC_PROVIDER_NAME].include?(provider_name)
         effective_server_identifier = server_identifier
@@ -156,7 +172,9 @@ class Prog::Vm::HostNexus < Prog::Base
       case st.prog
       when "LearnOs"
         os_version = st.exitval.fetch("os_version")
-        vm_host.update(os_version:, accepts_slices: os_supports_slices?(os_version))
+        # Slices are cgroups for cloud-hypervisor's dedicated CPUs; lower
+        # tiers run their VMs without them.
+        vm_host.update(os_version:, accepts_slices: os_supports_slices?(os_version) && !ByohVirtTiers.lower?(vm_host.virt_tier))
       when "LearnMemory"
         mem_gib = st.exitval.fetch("mem_gib")
         vm_host.update(total_mem_gib: mem_gib)
@@ -177,6 +195,10 @@ class Prog::Vm::HostNexus < Prog::Base
         # set no CPUs aside for IO. Decide once, so the reserved CPUs and
         # used_cores agree.
         io_cpu_count = (vm_host.provider_name == HostProvider::GENERIC_PROVIDER_NAME) ? 0 : vm_host.io_cpu_count
+        # A lower-tier host keeps one core for the host itself: its VMs'
+        # vCPUs are host threads that may use all of their cores
+        # (docs/byoh/EMULATED_HOSTS.md section 6.4).
+        reserved_cores = ByohVirtTiers.lower?(vm_host.virt_tier) ? 1 : 0
         (0..total_cpus - 1).each do |cpu|
           VmHostCpu.create(
             vm_host_id: vm_host.id,
@@ -185,11 +207,28 @@ class Prog::Vm::HostNexus < Prog::Base
             numa_node: cpu_numa_nodes[cpu],
           )
         end
-        vm_host.update(used_cores: io_cpu_count * total_cores / total_cpus)
+        vm_host.update(used_cores: io_cpu_count * total_cores / total_cpus + reserved_cores)
       end
     end
 
-    reap(:setup_hugepages, reaper:)
+    reap(ByohVirtTiers.lower?(vm_host.virt_tier) ? :verify_virt_tier : :setup_hugepages, reaper:)
+  end
+
+  # A lower-tier host goes on only once Prog::LearnVirt found the tier's
+  # prerequisites on it; it pages with the fix otherwise. The check is
+  # repeated (with the strand's backoff) until bin/byoh-virt refresh
+  # records a probe that agrees. Lower tiers use no 1G hugepages.
+  label def verify_virt_tier
+    probe = vm_host.virt_probe&.to_h
+    fail "#{vm_host.virt_tier} host has no virtualization probe yet; run bin/byoh-virt refresh --host #{vm_host.ubid}" if probe.nil? || probe["error"]
+
+    verdict = ByohVirtLadder.verdict(probe)
+    unless ByohVirtTiers.accepts_probe?(vm_host.virt_tier, verdict)
+      fail "#{vm_host.virt_tier} host does not have the tier's prerequisites (probe: #{verdict.summary}); fix it, then run bin/byoh-virt refresh --host #{vm_host.ubid}"
+    end
+
+    hop_download_boot_images if ByohVirtTiers.fetch(vm_host.virt_tier).storage == "none"
+    hop_setup_storage_backend
   end
 
   label def setup_hugepages
@@ -250,6 +289,7 @@ class Prog::Vm::HostNexus < Prog::Base
 
     vm_host.update(last_boot_id: new_boot_id)
     hop_verify_spdk unless vm_host.spdk_installations_dataset.empty?
+    hop_verify_tier_capacity if ByohVirtTiers.lower?(vm_host.virt_tier)
     hop_verify_hugepages
   end
 
@@ -333,6 +373,33 @@ class Prog::Vm::HostNexus < Prog::Base
       used_hugepages_1g: spdk_hugepages + total_vm_mem_gib,
     )
 
+    hop_start_slices
+  end
+
+  # verify_hugepages for lower-tier hosts, which have no hugepages: the
+  # guest memory budget (ByohVirtTiers.memory_budget_gib) goes into the
+  # hugepage columns, so the allocator books VM memory against it
+  # unchanged. On such a host the columns mean "guest RAM budget in GiB"
+  # (docs/byoh/EMULATED_HOSTS.md section 6.4).
+  label def verify_tier_capacity
+    host_meminfo = sshable.cmd("cat /proc/meminfo")
+    mem_total = host_meminfo[/^MemTotal:\s+(\d+) kB$/, 1]
+    available = host_meminfo[/^MemAvailable:\s+(\d+) kB$/, 1]
+    hugepages = host_meminfo[/^HugePages_Total:\s+(\d+)$/, 1]
+    hugepage_kib = host_meminfo[/^Hugepagesize:\s+(\d+) kB$/, 1]
+    fail "Couldn't parse /proc/meminfo" unless mem_total && available && hugepages && hugepage_kib
+    fail "Insufficient memory left for the host OS" if Integer(available) < 2 * 1024 * 1024
+    fail "#{vm_host.virt_tier} hosts need at least 2 physical cores" if vm_host.total_cores < 2
+
+    hugepages_mib = Integer(hugepages) * Integer(hugepage_kib) / 1024
+    Clog.emit("lower-tier host keeps hugepages", {tier_capacity: {vm_host_id: vm_host.id, hugepages_mib:}}) if hugepages_mib > 0
+    budget = ByohVirtTiers.memory_budget_gib(vm_host.virt_tier, mem_total_mib: Integer(mem_total) / 1024, hugepages_mib:, total_cpus: vm_host.total_cpus)
+
+    vm_host.lock!
+    used = vm_host.active_vms_dataset.sum(:memory_gib) || 0
+    fail "Not enough memory budget for VMs (#{budget} GiB for #{used} GiB of VMs)" if used > budget
+
+    vm_host.update(total_hugepages_1g: budget, used_hugepages_1g: used)
     hop_start_slices
   end
 

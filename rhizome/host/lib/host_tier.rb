@@ -5,13 +5,16 @@ require_relative "../../common/lib/util"
 require_relative "kvm_check"
 require_relative "qemu_tcg"
 
-# Host preparation for emulated hosts (accel=tcg): hosts without KVM,
-# whose VMs run under QEMU's software translator. See
-# docs/byoh/EMULATED_HOSTS.md section 6.3.
+# Host preparation per virtualization tier (docs/byoh/NO_KVM.md; the
+# control plane's ByohVirtTiers). bin/prep_host.rb runs the steps
+# prep_steps lists for the tier the host was registered on. The kvm list
+# is the order prep_host.rb ran its steps in before tiers existed, so KVM
+# hosts are prepared exactly as before.
 #
-# bin/prep_host.rb runs the steps prep_steps lists for the host's accel.
-# The kvm list is the order prep_host.rb ran its steps in before emulated
-# hosts existed, so KVM hosts are prepared exactly as before.
+# The emulated tier runs VMs under QEMU's software translator on hosts
+# without KVM (docs/byoh/EMULATED_HOSTS.md section 6.3). The container and
+# pvm tiers have no host support in this rhizome yet, so prep refuses
+# them before changing anything.
 #
 # An emulated host differs in three ways:
 # - It is not refused for lacking KVM.
@@ -22,7 +25,7 @@ require_relative "qemu_tcg"
 #   so prep_host.rb must not depend on how long apt takes to fetch QEMU.
 #   The operator installs them beforehand with
 #   scripts/byoh/bootstrap-data-plane.sh --emulated.
-module EmulatedHost
+module HostTier
   class Unsupported < RuntimeError
   end
 
@@ -32,9 +35,11 @@ module EmulatedHost
 
   QEMU_BIN = "qemu-system-x86_64"
 
-  INSTALL_HINT = "run scripts/byoh/bootstrap-data-plane.sh --emulated (or apt-get install qemu-system-x86 ovmf)"
+  INSTALL_HINT = "run scripts/byoh/bootstrap-data-plane.sh --tier emulated (or apt-get install qemu-system-x86 ovmf)"
 
-  KVM_AVAILABLE_HINT = "KVM is available; register without --accel tcg to use cloud-hypervisor"
+  KVM_AVAILABLE_HINT = "KVM is available; register the host again as kvm (bin/register-byoh-host --virt-tier kvm) to use cloud-hypervisor"
+
+  TIERS = %w[kvm container pvm emulated].freeze
 
   # Resident memory of one VM's vhost-user block backend (ubiblk) plus its
   # dnsmasq, in MiB. The control plane's per-VM overhead on emulated hosts
@@ -44,7 +49,8 @@ module EmulatedHost
   # emulated-2 and emulated-4 VMs and sets the final value.
   BACKEND_RSS_MIB = 64
 
-  # Steps shared by both accels, in prep_host.rb's original order.
+  # Steps shared by kvm and emulated hosts, in prep_host.rb's original
+  # order.
   COMMON_STEPS = %i[
     hostname
     prompt
@@ -77,7 +83,7 @@ module EmulatedHost
 
   # The checks come first, so a host that cannot run emulated VMs is
   # refused before prep changes anything, as kvm_check does for KVM hosts.
-  TCG_STEPS = [
+  EMULATED_STEPS = [
     :check_arch,
     :check_emulator,
     :kvm_hint,
@@ -85,11 +91,12 @@ module EmulatedHost
     *LATE_STEPS,
   ].freeze
 
-  def self.prep_steps(accel)
-    case accel
+  def self.prep_steps(tier)
+    case tier
     when "kvm" then KVM_STEPS
-    when "tcg" then TCG_STEPS
-    else raise Unsupported, "unknown accel #{accel.inspect}, expected kvm or tcg"
+    when "emulated" then EMULATED_STEPS
+    when *TIERS then raise Unsupported, "#{tier} hosts are not supported by this rhizome yet (docs/byoh/NO_KVM.md section 11)"
+    else raise Unsupported, "unknown tier #{tier.inspect}, expected one of #{TIERS.join(", ")}"
     end
   end
 
@@ -151,7 +158,7 @@ module EmulatedHost
   end
 
   # A hint for an emulated host that could run cloud-hypervisor after all,
-  # or nil. It never changes the host's accel: switching needs
+  # or nil. It never changes the host's tier: switching needs
   # re-registration.
   def self.kvm_hint(kvm_problem: KvmCheck.problem)
     KVM_AVAILABLE_HINT unless kvm_problem

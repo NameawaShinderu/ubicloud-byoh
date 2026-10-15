@@ -25,7 +25,8 @@ class ByohVirtCli
                provider in a BYOH location) whose rhizome is installed
 
     probe, explain and show exit 0 when the host can run VMs (L1), 3 when
-    not. show exits 0 for a host that was never probed.
+    not; show judges a host registered on a lower tier by that tier's
+    prerequisites instead. show exits 0 for a host that was never probed.
   USAGE
 
   NOT_L1 = 3
@@ -109,12 +110,19 @@ class ByohVirtCli
       @out.puts "host #{host.ubid} was never probed; run bin/byoh-virt refresh --host #{host.ubid}"
       return
     end
-    @out.puts "host #{host.ubid}"
+    @out.puts "host #{host.ubid}#{", registered as #{ByohVirtTiers.fetch(host.virt_tier).label}" if ByohVirtTiers.lower?(host.virt_tier)}"
     if (error = host.virt_probe["error"])
       @out.puts "the last probe failed: #{error}"
       return NOT_L1
     end
-    show_verdict(ByohVirtLadder.verdict(host.virt_probe.to_h))
+    verdict = ByohVirtLadder.verdict(host.virt_probe.to_h)
+    return show_verdict(verdict) unless ByohVirtTiers.lower?(host.virt_tier)
+
+    # A lower-tier host is judged by its own tier's prerequisites.
+    @out.puts verdict.text
+    agrees = ByohVirtTiers.accepts_probe?(host.virt_tier, verdict)
+    @out.puts "registered tier: #{host.virt_tier}, #{agrees ? "the probe agrees" : "the probe disagrees; see the ByohVirtTier page"}"
+    agrees ? 0 : NOT_L1
   end
 
   def cmd_refresh(argv)

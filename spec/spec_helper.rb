@@ -327,6 +327,12 @@ RSpec.configure do |config|
       LOGGER.level = level
     end
 
+    # Lets the given lower virtualization tiers be offered and registered,
+    # as the WP that ships each one will (ByohVirtTiers::SHIPPED).
+    def ship_virt_tiers(*tiers)
+      allow(ByohVirtTiers).to receive(:shipped?) { |tier| tier == ByohVirtTiers::KVM || tiers.include?(tier) }
+    end
+
     def create_vm_host(**args)
       args = {location_id: Location::HETZNER_FSN1_ID, allocation_state: "accepting", arch: "x64", family: "standard", total_cores: 48, used_cores: 2, total_hugepages_1g: 375, used_hugepages_1g: 16}.merge(args)
       ubid = VmHost.generate_ubid

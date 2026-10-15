@@ -71,6 +71,14 @@ RSpec.describe Prog::Vm::Metal::MoveVm do
       expect { described_class.assemble(vm, vm_host) }.to raise_error(RuntimeError, "VmHost does not accept slices and Vm is burstable")
     end
 
+    it "fails for a VM or host of a lower virtualization tier" do
+      vm.update(family: "emulated")
+      expect { described_class.assemble(vm, vm_host) }.to raise_error(RuntimeError, "Only kvm VMs and hosts can move")
+      vm.update(family: "standard")
+      tier_host = create_vm_host(location_id: Location::HETZNER_FSN1_ID, virt_tier: "emulated", family: "emulated")
+      expect { described_class.assemble(vm, tier_host) }.to raise_error(RuntimeError, "Only kvm VMs and hosts can move")
+    end
+
     it "fails if the vm has more than one storage volume" do
       sd = StorageDevice.create(name: "vdb", total_storage_gib: 100, available_storage_gib: 100, vm_host_id: source_host.id)
       VmStorageVolume.create(vm_id: vm.id, boot: false, size_gib: 5, disk_index: 1, storage_device_id: sd.id)

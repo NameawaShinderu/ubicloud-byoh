@@ -13,6 +13,9 @@ class Prog::Vm::Metal::MoveVm < Prog::Base
     fail "VmHost arch does not match Vm arch" unless vm_host.arch == vm.arch
     fail "Vm must have a single storage volume" unless vm.vm_storage_volumes.count == 1
     fail "VmHost does not accept slices and Vm is burstable" if vm.family == "burstable" && !vm_host.accepts_slices
+    # A move needs remote storage, which lower virtualization tiers do not
+    # have (docs/byoh/NO_KVM.md section 5.4).
+    fail "Only kvm VMs and hosts can move" if ByohVirtTiers.lower?(ByohVirtTiers.tier_for_family(vm.family)) || ByohVirtTiers.lower?(vm_host.virt_tier)
 
     volume = vm.vm_storage_volumes.first
     fail "VmHost does not have sufficient space for the Vm" unless sufficient_space?(vm_host, vm, volume)

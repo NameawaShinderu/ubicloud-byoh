@@ -117,6 +117,19 @@ RSpec.describe ByohVirtCli do
       expect(cli("show", "--host", host.ubid)[0]).to eq 0
     end
 
+    it "judges a lower-tier host by its tier" do
+      tier_host = create_byoh_vm_host(host.location, virt_tier: "emulated", family: "emulated", net6: "fd00:9:9:9::/64")
+      tier_host.update(virt_probe: Sequel.pg_jsonb(ByohVirtLadder.parse(no_virt).record))
+      status, out, = cli("show", "--host", tier_host.ubid)
+      expect(status).to eq 3
+      expect(out).to start_with("host #{tier_host.ubid}, registered as emulated (L5, experimental)\ntier: none (L3-L5)")
+        .and end_with("registered tier: emulated, the probe disagrees; see the ByohVirtTier page\n")
+      ready = JSON.parse(no_virt).tap { it["facts"].merge!("commands" => {"qemu-system-x86_64" => true}, "ovmf" => true) }
+      tier_host.update(virt_probe: Sequel.pg_jsonb(ByohVirtLadder.verdict(ready).record))
+      status, out, = cli("show", "--host", tier_host.ubid)
+      expect([status, out.lines.last]).to eq [0, "registered tier: emulated, the probe agrees\n"]
+    end
+
     it "shows a failed probe" do
       host.update(virt_probe: Sequel.pg_jsonb({"error" => "RuntimeError: boom"}))
       expect(cli("show", "--host", host.ubid)).to eq [3, "host #{host.ubid}\nthe last probe failed: RuntimeError: boom\n", ""]

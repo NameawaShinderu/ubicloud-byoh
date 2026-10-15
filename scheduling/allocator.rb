@@ -387,6 +387,12 @@ module Scheduling::Allocator
     end
 
     def self.update_vm(vm_host, vm)
+      # A host takes only VMs of its own virtualization tier. Family
+      # filtering keeps them apart already, but force_host_id and admin
+      # creates pass no family filter (docs/byoh/NO_KVM.md section 5.4).
+      vm_tier = ByohVirtTiers.tier_for_family(vm.family)
+      fail NoSpaceLeft, "#{vm_tier} VM cannot run on #{vm_host.virt_tier} host #{vm_host.ubid}" unless vm_tier == vm_host.virt_tier
+
       ip4, address, external_ip = vm_host.ip4_random_vm_network(exposure: vm.ip4_exposure) if vm.ip4_enabled
       fail NoSpaceLeft, "no ip4 addresses left" if vm.ip4_enabled && !ip4
 
@@ -900,7 +906,12 @@ module Scheduling::Allocator
       params_by_disk_index = @request.storage_volumes.to_h
       vm.vm_storage_volumes.each do |volume|
         params = params_by_disk_index[volume.disk_index]
-        if vm_host.vhost_block_backends_dataset.exclude(allocation_weight: 0).empty?
+        if ByohVirtTiers.lower?(vm_host.virt_tier) && ByohVirtTiers.fetch(vm_host.virt_tier).storage == "none"
+          # The tier keeps its own disks on the storage device
+          # (docs/byoh/NO_KVM.md section 4.2): no SPDK, no vhost backend.
+          spdk_installation_id = vhost_block_backend_id = nil
+          use_bdev_ubi = false
+        elsif vm_host.vhost_block_backends_dataset.exclude(allocation_weight: 0).empty?
           spdk_installation_id = StorageAllocation.allocate_spdk_installation(vm_host.spdk_installations)
           use_bdev_ubi = SpdkInstallation[spdk_installation_id].supports_bdev_ubi? && volume.boot
         else

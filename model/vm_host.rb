@@ -583,16 +583,19 @@ end
 #  ipv6_mode          | text                     | NOT NULL DEFAULT 'gua'::text
 #  network_check      | jsonb                    |
 #  virt_probe         | jsonb                    |
+#  virt_tier          | text                     | NOT NULL DEFAULT 'kvm'::text
 # Indexes:
 #  vm_host_pkey     | PRIMARY KEY btree (id)
 #  vm_host_ip6_key  | UNIQUE btree (ip6)
 #  vm_host_net6_key | UNIQUE btree (net6)
 # Check constraints:
-#  core_allocation_limit       | (used_cores <= total_cores)
-#  hugepages_allocation_limit  | (used_hugepages_1g <= total_hugepages_1g)
-#  used_cores_above_zero       | (used_cores >= 0)
-#  used_hugepages_non_negative | (used_hugepages_1g >= 0)
-#  vm_host_ipv6_mode_check     | (ipv6_mode = ANY (ARRAY['gua'::text, 'ula'::text]))
+#  core_allocation_limit          | (used_cores <= total_cores)
+#  hugepages_allocation_limit     | (used_hugepages_1g <= total_hugepages_1g)
+#  used_cores_above_zero          | (used_cores >= 0)
+#  used_hugepages_non_negative    | (used_hugepages_1g >= 0)
+#  vm_host_ipv6_mode_check        | (ipv6_mode = ANY (ARRAY['gua'::text, 'ula'::text]))
+#  vm_host_virt_tier_check        | (virt_tier = ANY (ARRAY['kvm'::text, 'container'::text, 'pvm'::text, 'emulated'::text]))
+#  vm_host_virt_tier_family_check | ((virt_tier = 'kvm'::text) = (family <> ALL (ARRAY['container'::text, 'pvm'::text, 'emulated'::text])))
 # Foreign key constraints:
 #  vm_host_id_fkey          | (id) REFERENCES sshable(id)
 #  vm_host_location_id_fkey | (location_id) REFERENCES location(id)
@@ -611,3 +614,5 @@ end
 #  vm_host_cpu           | vm_host_cpu_vm_host_id_fkey           | (vm_host_id) REFERENCES vm_host(id)
 #  vm_host_inventory     | vm_host_inventory_id_fkey             | (id) REFERENCES vm_host(id) ON DELETE CASCADE
 #  vm_host_slice         | vm_host_slice_vm_host_id_fkey         | (vm_host_id) REFERENCES vm_host(id)
+# Triggers:
+#  vm_host_virt_tier_immutable | BEFORE UPDATE OF virt_tier ON vm_host FOR EACH ROW EXECUTE FUNCTION vm_host_virt_tier_immutable()

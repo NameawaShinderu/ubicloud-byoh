@@ -130,10 +130,13 @@ end
 #  dns_suffix   | text    |
 #  byoc         | boolean | NOT NULL DEFAULT false
 #  byoh_network | jsonb   |
+#  byoh_virt    | jsonb   |
 # Indexes:
 #  location_pkey                         | PRIMARY KEY btree (id)
 #  location_project_id_display_name_uidx | UNIQUE btree (project_id, display_name)
 #  location_project_id_ui_name_uidx      | UNIQUE btree (project_id, ui_name)
+# Check constraints:
+#  location_byoh_virt_check | (byoh_virt IS NULL OR COALESCE(jsonb_typeof(byoh_virt -> 'tiers'::text) = 'array'::text, false) AND (byoh_virt -> 'tiers'::text) <@ '["kvm", "container", "pvm", "emulated"]'::jsonb AND COALESCE(jsonb_typeof(byoh_virt -> 'acks'::text) = 'object'::text, false) AND (NOT (byoh_virt -> 'tiers'::text) ? 'container'::text OR (byoh_virt -> 'acks'::text) ? 'container'::text) AND (NOT (byoh_virt -> 'tiers'::text) ? 'pvm'::text OR (byoh_virt -> 'acks'::text) ? 'pvm'::text) AND (NOT (byoh_virt -> 'tiers'::text) ? 'emulated'::text OR (byoh_virt -> 'acks'::text) ? 'emulated'::text))
 # Foreign key constraints:
 #  location_project_id_fkey | (project_id) REFERENCES project(id)
 #  location_provider_fkey   | (provider) REFERENCES provider(name)

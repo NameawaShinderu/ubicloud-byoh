@@ -42,6 +42,31 @@ RSpec.describe Prog::LearnVirt do
     expect(page.details.to_h).to include("tier" => "none", "rung" => "L3-L5", "fix" => start_with("Hetzner Cloud servers do not expose"))
   end
 
+  describe "on a lower-tier host" do
+    let(:vm_host) { create_byoh_vm_host(create_byoh_location, virt_tier: "emulated", family: "emulated") }
+    let(:no_virt) { {cpu_flags: %w[hypervisor pdpe1gb], dev_kvm: false, kvm_api: nil, modules: [], virt_vm: "kvm"} }
+
+    it "agrees when the tier's prerequisites are in place" do
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**no_virt, commands: {"qemu-system-x86_64" => true}, ovmf: true))
+      expect { lv.start }.to exit({"msg" => "virt tier none"})
+      expect(Page.count).to eq 0
+    end
+
+    it "pages with what to install when they are missing" do
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**no_virt))
+      expect { lv.start }.to exit({"msg" => "virt tier none"})
+      page = Page.from_tag_parts("ByohVirtTier", vm_host.ubid)
+      expect(page.summary).to start_with "#{vm_host.ubid} is registered as emulated but the probe disagrees: none (L3-L5)"
+      expect(page.details.to_h).to include("virt_tier" => "emulated", "fix" => "Prepare the host for emulated (apt-get install qemu-system-x86 ovmf), then bin/byoh-virt refresh --host #{vm_host.ubid}.")
+    end
+
+    it "pages to register again as kvm when the host runs KVM" do
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output)
+      expect { lv.start }.to exit({"msg" => "virt tier kvm"})
+      expect(Page.from_tag_parts("ByohVirtTier", vm_host.ubid).details["fix"]).to start_with "The host runs KVM (L1) now; destroy it and register it again as kvm"
+    end
+  end
+
   it "fails open on output it cannot read: records it, pages once and pops" do
     expect(lv.sshable).to receive(:_cmd).and_return("ruby: not found")
     expect { lv.start }.to exit({"msg" => "virt probe failed"})

@@ -3,7 +3,7 @@
 require_relative "../../common/lib/util"
 require_relative "../lib/cloud_hypervisor"
 require_relative "../lib/crypt_swap_setup"
-require_relative "../lib/emulated_host"
+require_relative "../lib/host_tier"
 require_relative "../lib/htcat_setup"
 require_relative "../lib/kvm_check"
 require_relative "../lib/spdk_setup"
@@ -12,7 +12,7 @@ require "fileutils"
 require "socket"
 
 # The bin/prep_host.rb command line: every command and file write it makes,
-# in order, for each accel. The kvm trace is what the script did before
+# in order, for each tier. The kvm trace is what the script did before
 # emulated hosts existed (9e22d71ec), so it pins that every
 # cloud-hypervisor host is still prepared the same way.
 # rubocop:disable RSpec/DescribeClass
@@ -120,7 +120,7 @@ RSpec.describe "bin/prep_host.rb" do
       expect(events).to eq(kvm_trace)
     end
 
-    it "defaults to kvm when no accel is given" do
+    it "defaults to kvm when no tier is given" do
       expect { expect(prep_host("vhtest", "production")).to be_nil }.to output("uplink mac pinned\n").to_stdout
       expect(events).to eq(kvm_trace)
     end
@@ -142,50 +142,55 @@ RSpec.describe "bin/prep_host.rb" do
   end
 
   it "prepares an emulated host without the KVM check and the cloud-hypervisor downloads" do
-    expect(EmulatedHost).to receive(:check_arch!) { events << [:check_arch] }
-    expect(EmulatedHost).to receive(:check_emulator!) { events << [:check_emulator] }
-    expect(EmulatedHost).to receive(:kvm_hint).and_return(nil)
-    expect { expect(prep_host("vhtest", "production", "tcg")).to be_nil }.to output("uplink mac pinned\n").to_stdout
+    expect(HostTier).to receive(:check_arch!) { events << [:check_arch] }
+    expect(HostTier).to receive(:check_emulator!) { events << [:check_emulator] }
+    expect(HostTier).to receive(:kvm_hint).and_return(nil)
+    expect { expect(prep_host("vhtest", "production", "emulated")).to be_nil }.to output("uplink mac pinned\n").to_stdout
     expect(events).to eq([[:check_arch], [:check_emulator]] + kvm_trace - [[:kvm_check], [:download_ch], [:download_firmware], run("modprobe -r irdma")])
     expect(events.flatten.grep(/qemu-system|ovmf/)).to eq([])
   end
 
   it "prints the KVM hint on an emulated host that has KVM, and carries on" do
-    expect(EmulatedHost).to receive(:check_arch!)
-    expect(EmulatedHost).to receive(:check_emulator!)
+    expect(HostTier).to receive(:check_arch!)
+    expect(HostTier).to receive(:check_emulator!)
     expect(KvmCheck).to receive(:problem).once { events << [:kvm_hint_probe] && nil }
-    expect { expect(prep_host("vhtest", "production", "tcg")).to be_nil }
-      .to output("KVM is available; register without --accel tcg to use cloud-hypervisor\nuplink mac pinned\n").to_stdout
+    expect { expect(prep_host("vhtest", "production", "emulated")).to be_nil }
+      .to output("#{HostTier::KVM_AVAILABLE_HINT}\nuplink mac pinned\n").to_stdout
     expect(events).to eq([[:kvm_hint_probe]] + kvm_trace - [[:kvm_check], [:download_ch], [:download_firmware], run("modprobe -r irdma")])
   end
 
   it "aborts an emulated host without the emulator before changing anything" do
-    expect(EmulatedHost).to receive(:check_arch!)
-    expect(EmulatedHost).to receive(:missing_packages).and_return(["ovmf"])
+    expect(HostTier).to receive(:check_arch!)
+    expect(HostTier).to receive(:missing_packages).and_return(["ovmf"])
     expect {
-      expect(prep_host("vhtest", "production", "tcg")).to eq(1)
-    }.to output("missing packages: ovmf; run scripts/byoh/bootstrap-data-plane.sh --emulated (or apt-get install qemu-system-x86 ovmf)\n").to_stderr
+      expect(prep_host("vhtest", "production", "emulated")).to eq(1)
+    }.to output("missing packages: ovmf; run scripts/byoh/bootstrap-data-plane.sh --tier emulated (or apt-get install qemu-system-x86 ovmf)\n").to_stderr
     expect(events).to eq([])
   end
 
   it "aborts an emulated host whose dpkg database fails before changing anything" do
-    expect(EmulatedHost).to receive(:check_arch!)
-    expect(EmulatedHost).to receive(:_run_command).with("dpkg-query", any_args).and_raise(CommandFail.new("command failed: dpkg-query", "", "dpkg: error: database is locked"))
+    expect(HostTier).to receive(:check_arch!)
+    expect(HostTier).to receive(:_run_command).with("dpkg-query", any_args).and_raise(CommandFail.new("command failed: dpkg-query", "", "dpkg: error: database is locked"))
     expect {
-      expect(prep_host("vhtest", "production", "tcg")).to eq(1)
-    }.to output(/\Adpkg-query failed: .*database is locked; run scripts\/byoh\/bootstrap-data-plane.sh --emulated/m).to_stderr
+      expect(prep_host("vhtest", "production", "emulated")).to eq(1)
+    }.to output(/\Adpkg-query failed: .*database is locked; run scripts\/byoh\/bootstrap-data-plane.sh --tier emulated/m).to_stderr
     expect(events).to eq([])
   end
 
   it "aborts an arm64 emulated host before changing anything" do
-    expect(EmulatedHost).to receive(:check_arch!).and_raise(EmulatedHost::Unsupported, "emulated hosts must be x86_64; this host is arm64")
-    expect(EmulatedHost).not_to receive(:check_emulator!)
-    expect { expect(prep_host("vhtest", "production", "tcg")).to eq(1) }.to output("emulated hosts must be x86_64; this host is arm64\n").to_stderr
+    expect(HostTier).to receive(:check_arch!).and_raise(HostTier::Unsupported, "emulated hosts must be x86_64; this host is arm64")
+    expect(HostTier).not_to receive(:check_emulator!)
+    expect { expect(prep_host("vhtest", "production", "emulated")).to eq(1) }.to output("emulated hosts must be x86_64; this host is arm64\n").to_stderr
     expect(events).to eq([])
   end
 
-  it "aborts an unknown accel before changing anything" do
-    expect { expect(prep_host("vhtest", "production", "hvf")).to eq(1) }.to output("unknown accel \"hvf\", expected kvm or tcg\n").to_stderr
+  it "aborts an unknown tier before changing anything" do
+    expect { expect(prep_host("vhtest", "production", "hvf")).to eq(1) }.to output("unknown tier \"hvf\", expected one of kvm, container, pvm, emulated\n").to_stderr
+    expect(events).to eq([])
+  end
+
+  it "aborts a tier this rhizome cannot prepare yet before changing anything" do
+    expect { expect(prep_host("vhtest", "production", "container")).to eq(1) }.to output(/\Acontainer hosts are not supported by this rhizome yet/).to_stderr
     expect(events).to eq([])
   end
 

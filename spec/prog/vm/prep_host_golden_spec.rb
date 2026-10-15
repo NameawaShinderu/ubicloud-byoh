@@ -13,4 +13,11 @@ RSpec.describe Prog::Vm::PrepHost do
       expect { ph.start }.to exit({"msg" => "host prepared"})
     end
   end
+
+  it "names the tier of a lower-tier host" do
+    vm_host = create_byoh_vm_host(create_byoh_location, virt_tier: "emulated", family: "emulated")
+    ph = described_class.new(Strand.create(prog: "Vm::PrepHost", label: "start", stack: [{"subject_id" => vm_host.id}]))
+    expect(ph.sshable).to receive(:_cmd).with("sudo host/bin/prep_host.rb #{vm_host.ubid} test emulated")
+    expect { ph.start }.to exit({"msg" => "host prepared"})
+  end
 end

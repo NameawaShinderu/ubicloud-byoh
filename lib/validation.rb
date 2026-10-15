@@ -102,8 +102,11 @@ module Validation
     [per_pool_server_count, per_pool_drive_count, per_pool_storage_size]
   end
 
-  def self.validate_vm_size(size, arch, only_visible: false)
+  # extra_families: lower-tier families (Option::TierVmSizes) that may
+  # also match; the caller decides which (ByohVirtTiers.size_families).
+  def self.validate_vm_size(size, arch, only_visible: false, extra_families: [])
     available_vm_sizes = Option::VmSizes.select { !only_visible || it.visible }
+    available_vm_sizes += Option::TierVmSizes.select { extra_families.include?(it.family) } unless extra_families.empty?
     unless (vm_size = available_vm_sizes.find { it.name == size && it.arch == arch })
       fail ValidationFailed.new({size: "\"#{size}\" is not a valid virtual machine size. Available sizes: #{available_vm_sizes.map(&:name)}"})
     end
@@ -111,9 +114,9 @@ module Validation
     vm_size
   end
 
-  def self.validate_vm_storage_size(size, arch, storage_size)
+  def self.validate_vm_storage_size(size, arch, storage_size, extra_families: [])
     storage_size = storage_size.to_i
-    vm_size = validate_vm_size(size, arch)
+    vm_size = validate_vm_size(size, arch, extra_families:)
     fail ValidationFailed.new({storage_size: "Storage size must be one of the following: #{vm_size.storage_size_options.join(", ")}"}) unless vm_size.storage_size_options.include?(storage_size)
 
     storage_size

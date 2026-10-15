@@ -35,6 +35,17 @@ RSpec.describe Validation do
     end
   end
 
+  it "refuses every lower-tier size to callers that do not ask for it" do
+    Option::TierVmSizes.each do |size|
+      expect(size_error { described_class.validate_vm_size(size.name, "x64") }).to eq expected_error(size.name)
+      expect(size_error { described_class.validate_vm_size(size.name, "x64", only_visible: true) }).to eq expected_error(size.name, only_visible: true)
+      expect(size_error { described_class.validate_vm_storage_size(size.name, "x64", 40) }).to eq expected_error(size.name)
+      expect(size_error { Prog::Vm::Nexus.assemble("a a", Project.create(name: "golden").id, size: size.name) }).to eq expected_error(size.name)
+    end
+    expect(described_class.validate_vm_size("emulated-2", "x64", extra_families: ["emulated"]).family).to eq "emulated"
+    expect(size_error { described_class.validate_vm_size("container-2", "x64", extra_families: ["emulated"]) }).to include "\"emulated-2\", \"emulated-4\"]"
+  end
+
   it "keeps the error Vm::Nexus.assemble gives every VM" do
     error = size_error { Prog::Vm::Nexus.assemble("a a", Project.create(name: "golden").id, size: "emulated-2") }
     expect(error).to eq expected_error("emulated-2")
