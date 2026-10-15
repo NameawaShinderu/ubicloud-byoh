@@ -83,4 +83,11 @@ RSpec.describe "bin/stop-vm" do
     expect(Process).to receive(:exec).with("/opt/cloud-hypervisor/v46.0/ch-remote", "--api-socket", "/vm/#{vm_name}/ch-api.sock", "power-button")
     expect(stop_vm(vm_name)).to be_nil
   end
+
+  it "asks LXC for a clean shutdown of a container, in the VM's network namespace" do
+    prep({"hypervisor" => "lxc"})
+    expect(EmulatedStop).not_to receive(:run)
+    expect(Process).to receive(:exec).with("/usr/bin/nsenter", "--net=/var/run/netns/#{vm_name}", "/usr/bin/lxc-stop", "-n", vm_name, "-P", "/var/lib/ubicloud/lxc", "--nowait") { exit 0 }
+    expect(stop_vm(vm_name)).to eq(0)
+  end
 end

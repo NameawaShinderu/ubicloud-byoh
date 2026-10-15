@@ -16,6 +16,10 @@ require_relative "cloud_hypervisor"
 require_relative "storage_volume"
 require_relative "byoh_egress_nat"
 require_relative "qemu_tcg"
+require_relative "container_setup"
+require_relative "container_disk"
+require_relative "container_idmap"
+require_relative "boot_image"
 
 class VmSetup
   Nic = Struct.new(:net6, :net4, :tap, :mac, :private_ipv4_gateway)
@@ -25,9 +29,14 @@ class VmSetup
   # accel is "tcg" only for VMs on emulated hosts (hosts without KVM), which
   # run under QEMU's software translator. nil and "kvm" both mean hardware
   # virtualization, as on every other host.
-  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false, accel: nil)
+  #
+  # hypervisor "lxc" is a system container on a container host
+  # (ContainerSetup); container holds its options ("nested_userns",
+  # "guest_firewall").
+  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false, accel: nil, container: nil)
     fail "unsupported accel #{accel.inspect}" unless ACCELS.include?(accel)
     fail "accel tcg needs hypervisor qemu, not #{hypervisor}" if accel == "tcg" && hypervisor != "qemu"
+    fail "container VMs need hypervisor lxc, not #{hypervisor}" if container && hypervisor != "lxc"
 
     @vm_name = vm_name
     @hugepages = hugepages
@@ -38,6 +47,7 @@ class VmSetup
     @egress_nat4 = egress_nat4&.transform_keys(&:to_sym)
     @byoh_host = byoh_host
     @accel = accel
+    @container = container
   end
 
   # Whether the host masquerades the VM's IPv4 egress (ByohEgressNat). Only
@@ -64,11 +74,41 @@ class VmSetup
       append_serial_console: params.fetch("append_serial_console", false),
       egress_nat4: params.fetch("egress_nat4", nil),
       byoh_host: params.fetch("byoh_host", false),
-      accel: params["accel"])
+      accel: params["accel"],
+      container: params["container"])
   end
 
   # Whether the VM runs under QEMU's software translator (an emulated host).
   def emulated? = @accel == "tcg"
+
+  # Whether the VM is a system container (a container host).
+  def container? = @hypervisor == "lxc"
+
+  def container_setup
+    @container_setup ||= ContainerSetup.new(@vm_name,
+      nested_userns: @container&.fetch("nested_userns", false) || false,
+      guest_firewall: @container&.fetch("guest_firewall", false) || false)
+  end
+
+  # The container's id slot (ContainerIdmap): allocated by prep, read back
+  # by every later action.
+  def container_slot
+    @container_slot ||= ContainerIdmap.slot(@vm_name) || fail("#{@vm_name} has no container id slot; prep it first")
+  end
+
+  # The container's disk: its only writable volume.
+  def container_disk(storage_params)
+    volumes = storage_params.reject { _1["read_only"] }
+    fail "container VMs have exactly one disk, not #{volumes.size}" unless volumes.size == 1
+    ContainerDisk.new(@vm_name, volumes.first, container_slot)
+  end
+
+  # What a container VM cannot have, refused before the host changes.
+  def check_container(nics, swap_size_bytes, pci_devices)
+    fail "container VMs have exactly one network interface, not #{nics.size}" unless nics.size == 1
+    fail "container VMs cannot have swap" if swap_size_bytes
+    fail "container VMs cannot have PCI devices" unless pci_devices.empty?
+  end
 
   # The cloud-hypervisor binary and firmware are looked up only when a
   # cloud-hypervisor unit is written, so the actions that never start
@@ -110,6 +150,10 @@ class VmSetup
 
     check_ch_installed
     check_emulated_home if emulated?
+    if container?
+      check_container(nics, swap_size_bytes, pci_devices)
+      @container_slot = ContainerIdmap.allocate(@vm_name)
+    end
     cloudinit(unix_user, public_keys, gua, nics, swap_size_bytes, boot_image, dns_ipv4, ipv6_disabled: ipv6_disabled, ip4: ip4, init_script: init_script)
     network_thread = Thread.new do
       setup_networking(false, gua, ip4, local_ip4, nics, ndp_needed, dns_ipv4, multiqueue: max_vcpus > 1)
@@ -123,7 +167,9 @@ class VmSetup
     emulated_layout if emulated?
     install_systemd_unit(max_vcpus, cpu_topology, mem_gib, storage_params, nics, pci_devices, slice_name, cpu_percent_limit, boot_image)
     start_systemd_unit
-    update_via_routes(nics)
+    # A container's tap exists only once LXC created it; its network hook
+    # sets the routes (container_net_up).
+    update_via_routes(nics) unless container?
 
     enable_bursting(slice_name, cpu_burst_percent_limit) unless cpu_burst_percent_limit == 0
   end
@@ -180,7 +226,7 @@ class VmSetup
     storage(storage_params, storage_secrets, false)
     prepare_gpus(pci_devices, gpu_partition_id)
     start_systemd_unit
-    update_via_routes(nics)
+    update_via_routes(nics) unless container?
 
     enable_bursting(slice_name, cpu_burst_percent_limit) unless cpu_burst_percent_limit == 0
   end
@@ -203,7 +249,7 @@ class VmSetup
     storage(storage_params, storage_secrets, false)
     install_systemd_unit(max_vcpus, cpu_topology, mem_gib, storage_params, nics, pci_devices, slice_name, cpu_percent_limit, boot_image)
     start_systemd_unit
-    update_via_routes(nics)
+    update_via_routes(nics) unless container?
     enable_bursting(slice_name, cpu_burst_percent_limit) unless cpu_burst_percent_limit == 0
   end
 
@@ -228,7 +274,7 @@ class VmSetup
 
     interfaces(nics, multiqueue)
     setup_veths_6(guest_ephemeral, clover_ephemeral, gua, ndp_needed)
-    setup_taps_6(gua, nics, dns_ipv4)
+    setup_taps_6(gua, nics, dns_ipv4) unless container?
     routes4(ip4, local_ip4, nics)
     ByohEgressNat.ensure_installed(**@egress_nat4, keep_existing: skip_persisted) if host_nat?
     write_nftables_conf(ip4, local_ip4, gua, nics)
@@ -345,6 +391,7 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
     storage_roots = []
 
     params = JSON.parse(File.read(vp.prep_json))
+    return purge_container(params) if container?
 
     if params["gpu_partition_id"]
       pci_devices = params.fetch("pci_devices", [])
@@ -361,6 +408,15 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
     storage_roots.each { |path|
       rm_if_exists(path)
     }
+  end
+
+  # Removes the container's disk and LXC files, then frees its id slot,
+  # which ContainerDisk#purge keeps when files of the slot's ids remain.
+  def purge_container(params)
+    slot = ContainerIdmap.slot(@vm_name)
+    params["storage_volumes"].reject { _1["read_only"] }.each { ContainerDisk.new(@vm_name, _1, slot || 0).purge }
+    container_setup.purge
+    ContainerIdmap.release(@vm_name)
   end
 
   def unmount_hugepages
@@ -431,6 +487,9 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
     # /sys/class/net/vethi#{@vm_name}/address at two points in time.  The
     # result is a race condition that *sometimes* worked.
     r "ip", "link", "add", "vetho#{@vm_name}", "addr", gen_mac, "type", "veth", "peer", "name", "vethi#{@vm_name}", "addr", gen_mac, "netns", @vm_name
+    # LXC creates a container's tap when the container starts.
+    return if container?
+
     nics.each do |nic|
       cmd = ["ip", "-n", @vm_name, "tuntap", "add", "dev", nic.tap, "mode", "tap", "user", @vm_name]
       cmd.push("multi_queue", "vnet_hdr") if multiqueue
@@ -516,13 +575,33 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
     r "ip", "-n", @vm_name, "route", "replace", vetho, "dev", "vethi#{@vm_name}"
 
     nics.each do |nic|
-      r "ip", "-n", @vm_name, "route", "replace", vm, "dev", nic.tap if ip4
+      r "ip", "-n", @vm_name, "route", "replace", vm, "dev", nic.tap if ip4 && !container?
       r "ip", "-n", @vm_name, "route", "replace", "default", "via", vetho, "dev", "vethi#{@vm_name}"
 
       inner = cmd("echo 1 > :path", path: "/proc/sys/net/ipv4/conf/vethi#{@vm_name}/proxy_arp")
       r "ip netns exec :vm bash -c :inner", vm: @vm_name, inner: inner
-      inner = cmd("echo 1 > :path", path: "/proc/sys/net/ipv4/conf/#{nic.tap}/proxy_arp")
-      r "ip netns exec :vm bash -c :inner", vm: @vm_name, inner: inner
+      tap_proxy_arp(nic) unless container?
+    end
+  end
+
+  def tap_proxy_arp(nic)
+    inner = cmd("echo 1 > :path", path: "/proc/sys/net/ipv4/conf/#{nic.tap}/proxy_arp")
+    r "ip netns exec :vm bash -c :inner", vm: @vm_name, inner: inner
+  end
+
+  # The network hook of a container (setup-vm net-up), run by LXC once it
+  # created the host end of the guest's veth pair, the tap: what
+  # interfaces, setup_taps_6, routes4 and update_via_routes do for a
+  # cloud-hypervisor VM's tap.
+  def container_net_up(gua, ip4, nics, dns_ipv4)
+    ip4 = nil if ip4.empty?
+    nics.each { |nic| r "ip", "-n", @vm_name, "addr", "replace", nic.private_ipv4_gateway, "dev", nic.tap }
+    setup_taps_6(gua, nics, dns_ipv4)
+    nics.each do |nic|
+      r "ip", "-n", @vm_name, "route", "replace", NetAddr::IPv4Net.parse(ip4).to_s, "dev", nic.tap if ip4
+      tap_proxy_arp(nic)
+      local_ip4 = NetAddr::IPv4Net.parse(nic.net4)
+      r "ip", "-n", @vm_name, "route", "replace", local_ip4.to_s, "via", local_ip4.nth(1).to_s, "dev", nic.tap unless local_ip4.netmask.prefix_len == 32
     end
   end
 
@@ -755,7 +834,7 @@ domain-needed
 bogus-priv
 no-resolv
 #{runner_config}
-bind-interfaces
+#{container? ? "bind-dynamic" : "bind-interfaces"}
 dhcp-option=26,1400
 dns-forward-max=10000
 #{raparams}
@@ -765,9 +844,16 @@ dns-forward-max=10000
 #{ip_config}
 DNSMASQ_CONF
 
-    ethernets = nics.to_h do |nic|
-      ["enx" + nic.mac.tr(":", "").downcase,
-        {"match" => {"macaddress" => nic.mac}, "dhcp6" => true, "dhcp4" => true}]
+    ethernets = if container?
+      # Netplan matches a MAC address as the permanent one, which a veth
+      # lacks (verified in the l3 lab), so a container's interfaces go by
+      # the names LXC gives them (ContainerSetup#lxc_config).
+      nics.each_index.to_h { ["eth#{_1}", {"dhcp6" => true, "dhcp4" => true}] }
+    else
+      nics.to_h do |nic|
+        ["enx" + nic.mac.tr(":", "").downcase,
+          {"match" => {"macaddress" => nic.mac}, "dhcp6" => true, "dhcp4" => true}]
+      end
     end
     # Cloud-init uses Python's PyYAML which defaults to YAML 1.1, where
     # all-numeric colon-separated values like "12:40:37:27:57:41" are
@@ -779,6 +865,12 @@ DNSMASQ_CONF
     vp.write_network_config(nc)
 
     write_user_data(unix_user, public_keys, swap_size_bytes, boot_image, init_script: init_script)
+
+    # A container reads the same data from a seed directory.
+    if container?
+      container_setup.write_seed(meta_data: File.read(vp.meta_data), user_data: File.read(vp.user_data), network_config: File.read(vp.network_config))
+      return
+    end
 
     rm_if_exists(vp.cloudinit_img)
     r "mkdosfs", "-n", "CIDATA", "-C", vp.cloudinit_img, "128"
@@ -795,6 +887,9 @@ DNSMASQ_CONF
 
     bootcmd = nft_bootcmd
     bootcmd = bootcmd.map { "command -v nft > /dev/null && #{_1}" } if installs_nftables?(boot_image)
+    # A container's seccomp policy refuses nftables unless the location
+    # acknowledged guest firewalls (ContainerSetup).
+    bootcmd = [] if container? && !container_setup.guest_firewall?
 
     config = {
       "users" => [{
@@ -813,6 +908,13 @@ DNSMASQ_CONF
     if swap_size_bytes
       fail "BUG: swap_size_bytes must be an integer" unless swap_size_bytes.instance_of?(Integer)
       config["swap"] = {"filename" => "/swapfile", "size" => swap_size_bytes}
+    end
+
+    # A container's root is a directory or a file system of its own size,
+    # with no partition to grow.
+    if container?
+      config["growpart"] = {"mode" => "off"}
+      config["resize_rootfs"] = false
     end
 
     vp.write_yaml_user_data(config, prefix: "#cloud-config")
@@ -841,6 +943,8 @@ DNSMASQ_CONF
   end
 
   def storage(storage_params, storage_secrets, prep)
+    return container_storage(storage_params, storage_secrets, prep) if container?
+
     storage_params.reject { _1["read_only"] }.map { |params|
       device_id = params["device_id"]
       key_wrapping_secrets = storage_secrets[device_id]
@@ -848,6 +952,17 @@ DNSMASQ_CONF
       storage_volume.prep(key_wrapping_secrets) if prep
       storage_volume.start(key_wrapping_secrets)
     }
+  end
+
+  def container_storage(storage_params, storage_secrets, prep)
+    disk = container_disk(storage_params)
+    volume = storage_params.find { !_1["read_only"] }
+    kek = storage_secrets[volume["device_id"]]
+    if prep
+      disk.prep(kek, BootImage.new(volume.fetch("image"), volume.fetch("image_version")).image_path)
+    else
+      disk.start(kek)
+    end
   end
 
   # Unnecessary if host has this set before creating the netns, but
@@ -898,6 +1013,8 @@ ProtectHome=yes
 NoNewPrivileges=yes
 ReadOnlyPaths=/
 DNSMASQ_SERVICE
+
+    return install_container_unit(max_vcpus, mem_gib, storage_params, nics, slice_name) if container?
 
     storage_volumes = storage_params.map { |params| StorageVolume.new(@vm_name, params) }
     writable_volumes = storage_volumes.reject(&:read_only)
@@ -962,6 +1079,13 @@ DNSMASQ_SERVICE
 
     vp.write_systemd_service(vm_service)
 
+    r "systemctl daemon-reload"
+  end
+
+  # The container's LXC configuration and its unit (ContainerSetup).
+  def install_container_unit(max_vcpus, mem_gib, storage_params, nics, slice_name)
+    container_setup.write_config(rootfs: container_disk(storage_params).rootfs, slot: container_slot, nics: nics, mem_gib: mem_gib, max_vcpus: max_vcpus, slice_name: slice_name)
+    vp.write_systemd_service(container_setup.unit(slice_name: slice_name))
     r "systemctl daemon-reload"
   end
 

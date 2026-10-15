@@ -1,0 +1,21 @@
+2
+denylist
+reject_force_umount
+[all]
+kexec_load errno 1
+open_by_handle_at errno 1
+init_module errno 1
+finit_module errno 1
+delete_module errno 1
+kexec_file_load errno 1
+keyctl errno 38
+bpf errno 1
+userfaultfd errno 1
+perf_event_open errno 1
+io_uring_setup errno 1
+io_uring_enter errno 1
+io_uring_register errno 1
+clone3 errno 38
+clone errno 1 [0,268435456,SCMP_CMP_MASKED_EQ,268435456]
+unshare errno 1 [0,268435456,SCMP_CMP_MASKED_EQ,268435456]
+socket errno 97 [0,16,SCMP_CMP_EQ][2,12,SCMP_CMP_EQ]

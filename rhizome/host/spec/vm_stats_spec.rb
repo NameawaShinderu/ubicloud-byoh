@@ -255,4 +255,33 @@ RSpec.describe VmStats do
       server.close
     end
   end
+
+  describe "#collect for a container" do
+    it "reads the guest's CPU time and memory from the payload cgroup" do
+      vm_stats = described_class.new("vmcont01")
+      allow(vm_stats).to receive(:_run_command).with("systemctl", "show", "vmcont01", "--property", "MainPID").and_return("MainPID=4242\n")
+      allow(vm_stats).to receive(:_run_command).with("systemctl", "show", "vmcont01", "--property", "ActiveEnterTimestampMonotonic").and_return("ActiveEnterTimestampMonotonic=1000000\n")
+      expect(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC).and_return(5.0)
+      expect(File).to receive(:read).with("/vm/vmcont01/prep.json").and_return(JSON.generate({
+        "hypervisor" => "lxc", "max_vcpus" => 2,
+        "storage_volumes" => [{"disk_index" => 0, "encrypted" => true, "size_gib" => 20}],
+      }))
+      cgroup = "/sys/fs/cgroup/system.slice/vmcont01.service/lxc.payload"
+      expect(File).to receive(:readlines).with("#{cgroup}/cpu.stat", chomp: true).and_return(["usage_usec 3500000", "user_usec 2000000", "system_usec 1500000", "nr_periods 0"])
+      expect(File).to receive(:read).with("#{cgroup}/memory.current").and_return("41943040\n")
+      expect(File).to receive(:read).with("#{cgroup}/memory.peak").and_return("83886080\n")
+      expect(File).to receive(:read).with("#{cgroup}/pids.current").and_return("12\n")
+      expect(vm_stats.collect).to eq({
+        "vm" => {
+          "main_pid" => "4242",
+          "cpu_stats" => {"user_time_ms" => 2000, "system_time_ms" => 1500, "total_time_ms" => 3500},
+          "active_age_ms" => 4000,
+          "memory_current_bytes" => 41943040,
+          "memory_peak_bytes" => 83886080,
+          "pids_current" => 12,
+          "vcpus" => 2,
+        },
+      })
+    end
+  end
 end

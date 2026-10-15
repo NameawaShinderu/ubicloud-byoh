@@ -190,7 +190,27 @@ RSpec.describe "bin/prep_host.rb" do
   end
 
   it "aborts a tier this rhizome cannot prepare yet before changing anything" do
-    expect { expect(prep_host("vhtest", "production", "container")).to eq(1) }.to output(/\Acontainer hosts are not supported by this rhizome yet/).to_stderr
+    expect { expect(prep_host("vhtest", "production", "pvm")).to eq(1) }.to output(/\Apvm hosts are not supported by this rhizome yet/).to_stderr
+    expect(events).to eq([])
+  end
+
+  it "prepares a container host: checks first, then the common steps, the container setup and the late steps" do
+    expect(HostTier).to receive(:check_arch!).with(tier: "container") { events << [:check_arch] }
+    expect(HostTier).to receive(:check_container_runtime!) { events << [:check_runtime] }
+    expect(HostTier).to receive(:check_container_sysctls!) { events << [:check_sysctls] }
+    expect(HostTier).to receive(:check_idmap_range!) { events << [:check_idmap] }
+    expect(HostTier).to receive(:kvm_hint).and_return(nil)
+    expect(HostTier).to receive(:container_host_setup) { events << [:container_host_setup] }
+    expect { expect(prep_host("vhtest", "production", "container")).to be_nil }.to output("uplink mac pinned\n").to_stdout
+    common = kvm_trace[1, 6]
+    expect(events).to eq([[:check_arch], [:check_runtime], [:check_sysctls], [:check_idmap]] + common + [[:container_host_setup]] +
+      (kvm_trace - [[:kvm_check], [:download_ch], [:download_firmware], run("modprobe -r irdma")] - common))
+  end
+
+  it "aborts a container host that fails a check before changing anything" do
+    expect(HostTier).to receive(:check_arch!).with(tier: "container")
+    expect(HostTier).to receive(:check_container_runtime!).and_raise(HostTier::Unsupported, "containers need the unified cgroup hierarchy (cgroup v2)")
+    expect { expect(prep_host("vhtest", "production", "container")).to eq(1) }.to output("containers need the unified cgroup hierarchy (cgroup v2)\n").to_stderr
     expect(events).to eq([])
   end
 

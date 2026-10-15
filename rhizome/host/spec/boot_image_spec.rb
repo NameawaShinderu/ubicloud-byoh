@@ -168,4 +168,22 @@ RSpec.describe BootImage do
       bi.convert_image("/var/storage/images/ubuntu-jammy-20240110.img.tmp", "raw")
     end
   end
+
+  describe "container root tarballs" do
+    let(:container) { described_class.new("ubuntu-noble-container", "20260926") }
+
+    it "keeps the tarball as downloaded" do
+      expect(container.container?).to be true
+      expect(bi.container?).to be false
+      expect(container.image_path).to eq "/var/storage/images/ubuntu-noble-container-20260926.tar.xz"
+      expect(container.initial_format(".xz")).to eq "tar.xz"
+      expect(File).to receive(:rename).with("/tmp/x.tar.xz.tmp", "/var/storage/images/ubuntu-noble-container-20260926.tar.xz")
+      container.convert_image("/tmp/x.tar.xz.tmp", "tar.xz")
+    end
+
+    it "refuses other formats and unversioned container images" do
+      expect { container.initial_format(".img") }.to raise_error(RuntimeError, "Unsupported container image format: .img")
+      expect { described_class.new("ubuntu-noble-container", nil).image_path }.to raise_error(RuntimeError, "container images need a version")
+    end
+  end
 end

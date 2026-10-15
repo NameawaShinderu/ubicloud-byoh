@@ -5,6 +5,7 @@ require "socket"
 require_relative "vm_path"
 require_relative "storage_path"
 require_relative "vhost_block_backend"
+require_relative "container_setup"
 require_relative "../../common/lib/util"
 
 class VmStats
@@ -18,13 +19,17 @@ class VmStats
     # hugepages, and its anonymous memory is QEMU's own overhead, mostly the
     # translation cache, which capacity planning needs.
     emulated = vm_params["accel"] == "tcg"
-    result = {
-      "vm" => unit_stats(
-        @vm_name,
-        with_io: false,    # Actual IO is done by the vhost block backend of each disk
-        with_memory: emulated,
-      ),
-    }
+    result = if vm_params["hypervisor"] == "lxc"
+      {"vm" => container_stats}
+    else
+      {
+        "vm" => unit_stats(
+          @vm_name,
+          with_io: false,    # Actual IO is done by the vhost block backend of each disk
+          with_memory: emulated,
+        ),
+      }
+    end
     result["vm"]["vcpus"] = vm_params.fetch("max_vcpus")
     result["vm"]["rss_anon_bytes"] = rss_anon_bytes(result["vm"]["main_pid"]) if emulated
 
@@ -38,6 +43,28 @@ class VmStats
     end
 
     result
+  end
+
+  # A system container (ContainerSetup) runs the guest's processes in the
+  # unit's lxc.payload cgroup; the unit's main process is LXC's monitor,
+  # so the guest's CPU time and memory come from that cgroup.
+  def container_stats
+    cgroup = File.join("/sys/fs/cgroup", ContainerSetup.new(@vm_name).payload_cgroup(vm_params.fetch("slice_name", "system.slice")))
+    cpu = File.readlines(File.join(cgroup, "cpu.stat"), chomp: true).to_h { _1.split(" ", 2) }
+    user_time_ms = Integer(cpu.fetch("user_usec"), 10) / 1000
+    system_time_ms = Integer(cpu.fetch("system_usec"), 10) / 1000
+    {
+      "main_pid" => unit_property(@vm_name, "MainPID"),
+      "cpu_stats" => {
+        "user_time_ms" => user_time_ms,
+        "system_time_ms" => system_time_ms,
+        "total_time_ms" => Integer(cpu.fetch("usage_usec"), 10) / 1000,
+      },
+      "active_age_ms" => unit_active_age_ms(@vm_name),
+      "memory_current_bytes" => Integer(File.read(File.join(cgroup, "memory.current")), 10),
+      "memory_peak_bytes" => Integer(File.read(File.join(cgroup, "memory.peak")), 10),
+      "pids_current" => Integer(File.read(File.join(cgroup, "pids.current")), 10),
+    }
   end
 
   def ubiblk_stats(disk)

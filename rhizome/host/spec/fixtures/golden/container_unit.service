@@ -1,0 +1,16 @@
+[Unit]
+Description=vmcont01
+After=network.target
+After=vmcont01-dnsmasq.service
+Wants=vmcont01-dnsmasq.service
+
+[Service]
+Slice=system.slice
+NetworkNamespacePath=/var/run/netns/vmcont01
+Delegate=yes
+DelegateSubgroup=supervisor
+ExecStart=/usr/bin/lxc-start -F -n vmcont01 -P /var/lib/ubicloud/lxc -o /var/lib/ubicloud/lxc/vmcont01/lxc.log -l WARN
+ExecStop=/usr/bin/lxc-stop -n vmcont01 -P /var/lib/ubicloud/lxc -t 60
+TimeoutStopSec=90s
+Restart=no
+LimitNOFILE=500000

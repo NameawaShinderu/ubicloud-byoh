@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "tmpdir"
 require_relative "../lib/host_tier"
 
 RSpec.describe HostTier do
@@ -41,10 +42,13 @@ RSpec.describe HostTier do
         described_class.prep_steps("kvm") - %i[kvm_check download_ch download_firmware])
     end
 
+    it "checks first, then runs the kvm steps without the KVM check and the cloud-hypervisor downloads, plus the container setup, for container" do
+      expect(described_class.prep_steps("container")).to eq(%i[check_container_arch check_container_runtime check_container_sysctls check_idmap_range kvm_hint hostname prompt motd timezone container_host_setup] +
+        (described_class.prep_steps("kvm") - %i[kvm_check hostname prompt motd timezone download_ch download_firmware]))
+    end
+
     it "refuses the tiers it cannot prepare yet" do
-      %w[container pvm].each do |tier|
-        expect { described_class.prep_steps(tier) }.to raise_error(HostTier::Unsupported, "#{tier} hosts are not supported by this rhizome yet (docs/byoh/NO_KVM.md section 11)")
-      end
+      expect { described_class.prep_steps("pvm") }.to raise_error(HostTier::Unsupported, "pvm hosts are not supported by this rhizome yet (docs/byoh/NO_KVM.md section 11)")
     end
 
     it "refuses an unknown tier" do
@@ -174,6 +178,120 @@ RSpec.describe HostTier do
     it "asks KvmCheck by default" do
       expect(KvmCheck).to receive(:problem).and_return(nil)
       expect(described_class.kvm_hint).to eq(HostTier::KVM_AVAILABLE_HINT)
+    end
+  end
+
+  describe "container hosts" do
+    around do |example|
+      Dir.mktmpdir("tier") do |root|
+        @root = root
+        example.run
+      end
+    end
+
+    let(:container_dpkg) { ["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", *HostTier::CONTAINER_PACKAGES] }
+
+    def put(path, content)
+      full = File.join(@root, path)
+      FileUtils.mkdir_p(File.dirname(full))
+      File.write(full, content)
+    end
+
+    def ready_root
+      put("sys/fs/cgroup/cgroup.controllers", "cpu memory pids\n")
+      put("sys/module/apparmor/parameters/enabled", "Y\n")
+      put("sys/kernel/security/apparmor/profiles", "lxc-container-default-cgns (enforce)\nlsb_release (enforce)\n")
+    end
+
+    def installed
+      HostTier::CONTAINER_PACKAGES.map { "#{_1} ii \n" }.join
+    end
+
+    it "names the tier when refusing another architecture" do
+      expect { described_class.check_arch!(arch: arm64, tier: "container") }.to raise_error(HostTier::Unsupported, "container hosts must be x86_64; this host is arm64")
+    end
+
+    it "accepts a host with cgroup v2, a recent kernel and systemd, the packages and LXC's AppArmor profile" do
+      ready_root
+      expect(described_class).to receive(:_run_command).with("systemctl", "--version").and_return("systemd 255 (255.4-1ubuntu8)\n+PAM\n")
+      expect(described_class).to receive(:_run_command).with(*container_dpkg, expect: [0, 1]).and_return(installed)
+      expect(described_class.check_container_runtime!(root: @root, release: "6.8.0-134-generic")).to be_nil
+    end
+
+    it "refuses a host without cgroup v2" do
+      expect { described_class.check_container_runtime!(root: @root, release: "6.8.0") }.to raise_error(HostTier::Unsupported, "containers need the unified cgroup hierarchy (cgroup v2)")
+    end
+
+    it "refuses an old or unreadable kernel release" do
+      ready_root
+      expect { described_class.check_container_runtime!(root: @root, release: "5.4.0-200-generic") }.to raise_error(HostTier::Unsupported, "containers need Linux 5.12 or newer; this host runs 5.4.0-200-generic")
+      expect { described_class.check_container_runtime!(root: @root, release: "weird") }.to raise_error(HostTier::Unsupported, /Linux 5.12 or newer/)
+    end
+
+    it "refuses an old systemd" do
+      ready_root
+      expect(described_class).to receive(:_run_command).with("systemctl", "--version").and_return("systemd 249 (249.11)\n")
+      expect { described_class.check_container_runtime!(root: @root, release: "6.8.0") }.to raise_error(HostTier::Unsupported, "containers need systemd 254 or newer (DelegateSubgroup=); this host has 249")
+    end
+
+    it "refuses missing packages with the install hint" do
+      ready_root
+      expect(described_class).to receive(:_run_command).with("systemctl", "--version").and_return("systemd 255\n")
+      expect(described_class).to receive(:_run_command).with(*container_dpkg, expect: [0, 1]).and_return("lxc-utils ii \n")
+      expect { described_class.check_container_runtime!(root: @root, release: "6.8.0") }.to raise_error(HostTier::Unsupported, /\Amissing packages: lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs; run scripts\/byoh\/bootstrap-data-plane.sh --tier container/)
+    end
+
+    it "refuses a host without AppArmor or without LXC's profile" do
+      ready_root
+      allow(described_class).to receive(:_run_command).with("systemctl", "--version").and_return("systemd 255\n")
+      allow(described_class).to receive(:_run_command).with(*container_dpkg, expect: [0, 1]).and_return(installed)
+      put("sys/kernel/security/apparmor/profiles", "lsb_release (enforce)\n")
+      expect { described_class.check_container_runtime!(root: @root, release: "6.8.0") }.to raise_error(HostTier::Unsupported, "AppArmor profile lxc-container-default-cgns is not loaded; install lxc and run systemctl reload apparmor")
+      put("sys/module/apparmor/parameters/enabled", "N\n")
+      expect { described_class.check_container_runtime!(root: @root, release: "6.8.0") }.to raise_error(HostTier::Unsupported, "containers need AppArmor enabled")
+      File.unlink(File.join(@root, "sys/module/apparmor/parameters/enabled"))
+      expect { described_class.check_container_runtime!(root: @root, release: "6.8.0") }.to raise_error(HostTier::Unsupported, /\Acannot check AppArmor: No such file or directory/)
+    end
+
+    it "accepts Ubuntu's kernel settings and lists every one that is too low or missing" do
+      {"dmesg_restrict" => "1", "kptr_restrict" => "1", "unprivileged_bpf_disabled" => "2", "perf_event_paranoid" => "4"}.each { |key, value| put("proc/sys/kernel/#{key}", "#{value}\n") }
+      expect(described_class.check_container_sysctls!(root: @root)).to be_nil
+      put("proc/sys/kernel/kptr_restrict", "0\n")
+      put("proc/sys/kernel/perf_event_paranoid", "junk\n")
+      File.unlink(File.join(@root, "proc/sys/kernel/dmesg_restrict"))
+      expect { described_class.check_container_sysctls!(root: @root) }.to raise_error(HostTier::Unsupported,
+        "a container host needs these kernel settings; add them to /etc/sysctl.d/60-ubicloud-containers.conf and run sysctl --system: kernel.dmesg_restrict = 1, kernel.kptr_restrict = 1, kernel.perf_event_paranoid = 2")
+    end
+
+    it "refuses subordinate id ranges that reach the container slots" do
+      put("subuid", "ubuntu:100000:65536\n")
+      expect(described_class.check_idmap_range!(files: [File.join(@root, "subuid")])).to be_nil
+      put("subuid", "big:999999999:5\n")
+      expect { described_class.check_idmap_range!(files: [File.join(@root, "subuid")]) }.to raise_error(HostTier::Unsupported, /\Asubordinate id ranges overlap the container id range 1000000000\+: .*big:999999999:5/)
+    end
+
+    it "sets up root's id range, no subordinate ids for new users, the kvm group, no lxc-net and LXC's directories" do
+      put("login.defs", "UMASK 022\nSUB_UID_COUNT\t\t65536\n")
+      expect(ContainerIdmap).to receive(:ensure_root_entries)
+      expect(described_class).to receive(:safe_write_to_file).with(File.join(@root, "login.defs"), "UMASK 022\nSUB_UID_COUNT\t\t0\nSUB_GID_COUNT\t\t0\n", perm: 0o644)
+      expect(described_class).to receive(:_run_command).with("groupadd", "-f", "-r", "kvm")
+      expect(described_class).to receive(:safe_write_to_file).with("/etc/default/lxc-net", "# Written by rhizome: rhizome sets up container networking.\nUSE_LXC_BRIDGE=\"false\"\n", perm: 0o644)
+      expect(File).to receive(:exist?).with("/usr/lib/systemd/system/lxc-net.service").and_return(true)
+      expect(described_class).to receive(:_run_command).with("systemctl", "disable", "--now", "lxc-net.service")
+      expect(described_class).to receive(:_run_command).with("install", "-d", "-m", "0711", "/var/lib/ubicloud/lxc")
+      expect(described_class).to receive(:_run_command).with("install", "-d", "-m", "0700", "/var/lib/ubicloud/idmap")
+      described_class.container_host_setup(login_defs: File.join(@root, "login.defs"))
+    end
+
+    it "leaves an absent lxc-net alone" do
+      put("login.defs", "SUB_UID_COUNT 1\nSUB_GID_COUNT 1\n")
+      allow(ContainerIdmap).to receive(:ensure_root_entries)
+      expect(described_class).to receive(:safe_write_to_file).with(File.join(@root, "login.defs"), "SUB_UID_COUNT\t\t0\nSUB_GID_COUNT\t\t0\n", perm: 0o644)
+      allow(described_class).to receive(:safe_write_to_file).with("/etc/default/lxc-net", anything, perm: 0o644)
+      expect(File).to receive(:exist?).with("/usr/lib/systemd/system/lxc-net.service").and_return(false)
+      expect(described_class).to receive(:_run_command).with("groupadd", "-f", "-r", "kvm")
+      expect(described_class).to receive(:_run_command).with("install", any_args).twice
+      described_class.container_host_setup(login_defs: File.join(@root, "login.defs"))
     end
   end
 end

@@ -112,6 +112,9 @@ when "reassign-ip6"
     slice_name, cpu_percent_limit, cpu_burst_percent_limit, ipv6_disabled, init_script)
 when "restart"
   vm_setup.restart(slice_name, cpu_burst_percent_limit)
+when "net-up"
+  # LXC's network hook for a container VM (ContainerSetup#net_up_script).
+  vm_setup.container_net_up(gua, ip4, nics, dns_ipv4)
 else
   puts "Invalid action #{action}"
   exit 1

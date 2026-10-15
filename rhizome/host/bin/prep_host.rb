@@ -55,6 +55,12 @@ step_actions = {
   # The same, for an emulated host: x86_64, with QEMU and OVMF installed.
   check_arch: -> { HostTier.check_arch! },
   check_emulator: -> { HostTier.check_emulator! },
+  # The same, for a container host (HostTier::CONTAINER_STEPS).
+  check_container_arch: -> { HostTier.check_arch!(tier: "container") },
+  check_container_runtime: -> { HostTier.check_container_runtime! },
+  check_container_sysctls: -> { HostTier.check_container_sysctls! },
+  check_idmap_range: -> { HostTier.check_idmap_range! },
+  container_host_setup: -> { HostTier.container_host_setup },
   kvm_hint: -> {
     if (hint = HostTier.kvm_hint)
       puts hint

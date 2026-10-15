@@ -12,11 +12,21 @@ class BootImage
     @image_root = image_root
   end
 
+  # Root file system tarballs for system containers (ContainerDisk), such
+  # as ubuntu-noble-container, are kept as downloaded: a container has no
+  # block device to boot from.
+  CONTAINER_SUFFIX = "-container"
+
+  def container? = @name.end_with?(CONTAINER_SUFFIX)
+
   def image_path
     # YYY: Support for unversioned images is still required in StorageVolume
     # code when we want to recreate storage. We can remove this check once we
     # have removed all unversioned images from production.
-    @image_path ||= if @version.nil?
+    @image_path ||= if container?
+      fail "container images need a version" if @version.nil?
+      "#{@image_root}/#{@name}-#{@version}.tar.xz"
+    elsif @version.nil?
       "#{@image_root}/#{@name}.raw"
     else
       "#{@image_root}/#{@name}-#{@version}.raw"
@@ -56,6 +66,11 @@ class BootImage
   end
 
   def initial_format(ext)
+    if container?
+      fail "Unsupported container image format: #{ext}" unless ext == ".xz"
+      return "tar.xz"
+    end
+
     case ext
     when ".qcow2", ".img"
       "qcow2"
@@ -97,7 +112,7 @@ class BootImage
   end
 
   def convert_image(temp_path, initial_format)
-    if initial_format == "raw"
+    if initial_format == "raw" || initial_format == "tar.xz"
       File.rename(temp_path, image_path)
     else
       # Images are presumed to be atomically renamed into the path,

@@ -4,6 +4,9 @@ require_relative "../../common/lib/arch"
 require_relative "../../common/lib/util"
 require_relative "kvm_check"
 require_relative "qemu_tcg"
+require_relative "container_idmap"
+require_relative "container_setup"
+require "etc"
 
 # Host preparation per virtualization tier (docs/byoh/NO_KVM.md; the
 # control plane's ByohVirtTiers). bin/prep_host.rb runs the steps
@@ -12,9 +15,10 @@ require_relative "qemu_tcg"
 # hosts are prepared exactly as before.
 #
 # The emulated tier runs VMs under QEMU's software translator on hosts
-# without KVM (docs/byoh/EMULATED_HOSTS.md section 6.3). The container and
-# pvm tiers have no host support in this rhizome yet, so prep refuses
-# them before changing anything.
+# without KVM (docs/byoh/EMULATED_HOSTS.md section 6.3). The container
+# tier runs system containers (ContainerSetup). The pvm tier has no host
+# support in this rhizome yet, so prep refuses it before changing
+# anything.
 #
 # An emulated host differs in three ways:
 # - It is not refused for lacking KVM.
@@ -91,10 +95,46 @@ module HostTier
     *LATE_STEPS,
   ].freeze
 
+  # A container host is checked first as well: x86_64, the container
+  # userspace, the kernel settings a shared kernel needs and the id range.
+  # Then it gets what containers need beyond the kvm steps.
+  CONTAINER_STEPS = [
+    :check_container_arch,
+    :check_container_runtime,
+    :check_container_sysctls,
+    :check_idmap_range,
+    :kvm_hint,
+    *COMMON_STEPS,
+    :container_host_setup,
+    *LATE_STEPS,
+  ].freeze
+
+  # The packages a container host needs (scripts/byoh/bootstrap-data-plane.sh
+  # --tier container installs them): LXC, lxcfs, newuidmap, xz for the root
+  # tarballs, setquota for unencrypted disks, cryptsetup and mkfs.ext4 for
+  # encrypted ones.
+  CONTAINER_PACKAGES = %w[lxc-utils lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs].freeze
+
+  CONTAINER_INSTALL_HINT = "run scripts/byoh/bootstrap-data-plane.sh --tier container (or apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs)"
+
+  # Kernel settings a shared kernel needs before untrusted guests run on
+  # it, with the least value each needs (docs/byoh/NO_KVM.md section 4.2).
+  # Ubuntu 24.04 ships all of them; prep checks and never sets them.
+  CONTAINER_SYSCTLS = {
+    "kernel.dmesg_restrict" => 1,
+    "kernel.kptr_restrict" => 1,
+    "kernel.unprivileged_bpf_disabled" => 1,
+    "kernel.perf_event_paranoid" => 2,
+  }.freeze
+
+  # DelegateSubgroup= in the container unit (ContainerSetup#unit).
+  MIN_SYSTEMD = 254
+
   def self.prep_steps(tier)
     case tier
     when "kvm" then KVM_STEPS
     when "emulated" then EMULATED_STEPS
+    when "container" then CONTAINER_STEPS
     when *TIERS then raise Unsupported, "#{tier} hosts are not supported by this rhizome yet (docs/byoh/NO_KVM.md section 11)"
     else raise Unsupported, "unknown tier #{tier.inspect}, expected one of #{TIERS.join(", ")}"
     end
@@ -102,10 +142,10 @@ module HostTier
 
   # Emulated hosts run x86_64 guests only, and the TCG unit
   # (VmSetup#build_qemu_service) refuses arm64.
-  def self.check_arch!(arch: Arch)
+  def self.check_arch!(arch: Arch, tier: "emulated")
     return if arch.x64?
 
-    raise Unsupported, "emulated hosts must be x86_64; this host is #{arch.sym}"
+    raise Unsupported, "#{tier} hosts must be x86_64; this host is #{arch.sym}"
   end
 
   # The PACKAGES that dpkg does not list as installed. dpkg-query exits 1
@@ -123,13 +163,13 @@ module HostTier
   # Any other dpkg-query failure, such as a locked or broken dpkg
   # database, is reported as Unsupported so prep_host.rb aborts with the
   # error instead of a backtrace.
-  def self.missing_packages
+  def self.missing_packages(packages = PACKAGES, hint = INSTALL_HINT)
     out = begin
-      r("dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", *PACKAGES, expect: [0, 1])
+      r("dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", *packages, expect: [0, 1])
     rescue CommandFail, SystemCallError => e
-      raise Unsupported, "dpkg-query failed: #{e.message.strip}; #{INSTALL_HINT}"
+      raise Unsupported, "dpkg-query failed: #{e.message.strip}; #{hint}"
     end
-    PACKAGES - out.scan(/^(\S+) [uih]i $/).flatten
+    packages - out.scan(/^(\S+) [uih]i $/).flatten
   end
 
   # Whether QEMU runs and was built with the TCG accelerator.
@@ -162,5 +202,89 @@ module HostTier
   # re-registration.
   def self.kvm_hint(kvm_problem: KvmCheck.problem)
     KVM_AVAILABLE_HINT unless kvm_problem
+  end
+
+  # Raises Unsupported, with what to do, unless the host can run system
+  # containers: cgroup v2, Linux 5.12 or newer, systemd with
+  # DelegateSubgroup=, the CONTAINER_PACKAGES, and AppArmor with LXC's
+  # container profile loaded.
+  def self.check_container_runtime!(root: "/", release: Etc.uname[:release])
+    unless File.exist?(File.join(root, "sys/fs/cgroup/cgroup.controllers"))
+      raise Unsupported, "containers need the unified cgroup hierarchy (cgroup v2)"
+    end
+
+    if Gem::Version.new(release[/\A\d+\.\d+/] || "0") < Gem::Version.new("5.12")
+      raise Unsupported, "containers need Linux 5.12 or newer; this host runs #{release}"
+    end
+
+    systemd = r("systemctl", "--version")[/\Asystemd (\d+)/, 1].to_i
+    raise Unsupported, "containers need systemd #{MIN_SYSTEMD} or newer (DelegateSubgroup=); this host has #{systemd}" if systemd < MIN_SYSTEMD
+
+    unless (missing = missing_packages(CONTAINER_PACKAGES, CONTAINER_INSTALL_HINT)).empty?
+      raise Unsupported, "missing packages: #{missing.join(" ")}; #{CONTAINER_INSTALL_HINT}"
+    end
+
+    unless File.read(File.join(root, "sys/module/apparmor/parameters/enabled")).strip == "Y"
+      raise Unsupported, "containers need AppArmor enabled"
+    end
+
+    profile = ContainerSetup::APPARMOR_PROFILE
+    unless File.foreach(File.join(root, "sys/kernel/security/apparmor/profiles")).any? { _1.start_with?("#{profile} ") }
+      raise Unsupported, "AppArmor profile #{profile} is not loaded; install lxc and run systemctl reload apparmor"
+    end
+
+    nil
+  rescue Errno::ENOENT, Errno::EACCES => e
+    raise Unsupported, "cannot check AppArmor: #{e.message}"
+  end
+
+  # Raises Unsupported, with the settings to add, unless every
+  # CONTAINER_SYSCTLS value is at least its minimum.
+  def self.check_container_sysctls!(root: "/")
+    low = CONTAINER_SYSCTLS.filter_map do |key, min|
+      path = File.join(root, "proc/sys", key.tr(".", "/"))
+      value = begin
+        Integer(File.read(path).strip, 10)
+      rescue Errno::ENOENT, ArgumentError
+        nil
+      end
+      "#{key} = #{min}" if value.nil? || value < min
+    end
+    return if low.empty?
+
+    raise Unsupported, "a container host needs these kernel settings; add them to /etc/sysctl.d/60-ubicloud-containers.conf and run sysctl --system: #{low.join(", ")}"
+  end
+
+  # Raises Unsupported unless no subordinate id range of another user
+  # reaches the container id slots (ContainerIdmap).
+  def self.check_idmap_range!(files: ContainerIdmap::SUBID_FILES)
+    overlaps = ContainerIdmap.overlaps(files: files)
+    return if overlaps.empty?
+
+    raise Unsupported, "subordinate id ranges overlap the container id range #{ContainerIdmap::BASE}+: #{overlaps.join("; ")}"
+  end
+
+  # What a container host needs: newuidmap may map root's container
+  # slots; useradd gives no new user subordinate ids (none can then reach
+  # the slots); the kvm group exists for create_unix_user's usermod;
+  # Ubuntu's lxc-net bridge, which would add its own dnsmasq and NAT next
+  # to rhizome's, is off; LXC's directories exist.
+  def self.container_host_setup(login_defs: "/etc/login.defs")
+    ContainerIdmap.ensure_root_entries
+    content = File.read(login_defs)
+    %w[SUB_UID_COUNT SUB_GID_COUNT].each do |key|
+      line = "#{key}\t\t0"
+      content = if content.match?(/^#{key}\s/)
+        content.gsub(/^#{key}\s.*$/, line)
+      else
+        "#{content.chomp}\n#{line}\n"
+      end
+    end
+    safe_write_to_file(login_defs, content, perm: 0o644)
+    r "groupadd", "-f", "-r", "kvm"
+    safe_write_to_file("/etc/default/lxc-net", "# Written by rhizome: rhizome sets up container networking.\nUSE_LXC_BRIDGE=\"false\"\n", perm: 0o644)
+    r "systemctl", "disable", "--now", "lxc-net.service" if File.exist?("/usr/lib/systemd/system/lxc-net.service")
+    r "install", "-d", "-m", "0711", ContainerSetup::LXC_PATH
+    r "install", "-d", "-m", "0700", ContainerIdmap::DIR
   end
 end

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Written by rhizome (ContainerSetup): addresses and routes for the tap.
+cd /home/rhizome
+exec /home/rhizome/host/bin/setup-vm net-up vmcont01

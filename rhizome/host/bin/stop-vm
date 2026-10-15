@@ -25,6 +25,13 @@ params = JSON.parse(File.read(vm_path.prep_json))
 require_relative "../lib/emulated_stop"
 exit EmulatedStop.run(vm_name) if EmulatedStop.handles?(params)
 
+# System containers (docs/byoh/NO_KVM.md section 4.2): a clean shutdown
+# through LXC, without waiting for it.
+if params["hypervisor"] == "lxc"
+  require_relative "../lib/container_setup"
+  Process.exec(*ContainerSetup.new(vm_name).stop_command)
+end
+
 unless params.fetch("hypervisor", "ch") == "ch"
   warn "stop-vm is only supported for VMs using cloud-hypervisor"
   exit 1
