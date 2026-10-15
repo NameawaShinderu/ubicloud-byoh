@@ -1,0 +1,3 @@
+NAME="vg0-storage" TYPE="lvm"
+NAME="sdb" TYPE="disk"
+NAME="sdc" TYPE="disk"

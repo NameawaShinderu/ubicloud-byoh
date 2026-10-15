@@ -1,0 +1,10 @@
+processor	: 0
+vendor_id	: AuthenticAMD
+model name	: AMD EPYC 9454P 48-Core Processor
+flags		: fpu vme de pse tsc msr pae pdpe1gb rdtscp lm svm avx2
+
+processor	: 1
+vendor_id	: AuthenticAMD
+model name	: AMD EPYC 9454P 48-Core Processor
+flags		: fpu vme de pse tsc msr pae pdpe1gb rdtscp lm svm avx2
+

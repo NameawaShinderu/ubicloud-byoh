@@ -1,0 +1,27 @@
+Slot:	0000:00:00.0
+Class:	0600
+Vendor:	8086
+Device:	09a2
+IOMMUGroup:	0
+
+Slot:	0000:17:00.0
+Class:	0300
+Vendor:	10de
+Device:	2204
+Driver:	nouveau
+IOMMUGroup:	30
+
+Slot:	0000:17:00.1
+Class:	0403
+Vendor:	10de
+Device:	1aef
+Driver:	snd_hda_intel
+IOMMUGroup:	30
+
+Slot:	0000:65:00.0
+Class:	0302
+Vendor:	10de
+Device:	20b5
+Driver:	vfio-pci
+IOMMUGroup:	40
+

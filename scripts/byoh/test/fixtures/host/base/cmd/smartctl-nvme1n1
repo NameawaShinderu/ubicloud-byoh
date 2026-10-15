@@ -1,0 +1,7 @@
+{
+  "json_format_version": [1, 0],
+  "smart_status": {
+    "passed": true,
+    "nvme": {"value": 0}
+  }
+}

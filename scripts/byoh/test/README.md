@@ -87,6 +87,47 @@ Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): pass in about
 6 s after the image build, nothing left behind; with `UBI_M4_KEEP=1` it
 passes and keeps both containers.
 
+### Host preflight fixtures (WP5)
+
+```
+scripts/byoh/test/preflight-fixtures.sh [--update-spec] [CASE...]
+```
+
+Runs `scripts/byoh/host/ubicloud-host preflight --json` once per case in
+`fixtures/host/` (a throwaway `ubi-m4-pf-<case>` container from
+ubuntu:24.04, `--rm`, no ports). It feeds the script on stdin, as
+`bash -s`, the way the control plane runs it over ssh. A case is
+`fixtures/host/base` (a sound x86 host) with the case's own files laid
+over it; `.remove` lists base files the case deletes. The script reads
+every file under the fixture root and every command's output from
+`cmd/<key>` (exit status in `cmd/<key>.rc`); `bin/<tool>` marks a tool
+as installed and `dev/kvm.chardev` stands for the `/dev/kvm` character
+device. Test mode needs both `--fixture-root` and
+`UBICLOUD_HOST_TEST_ROOT`, set to the same directory; the run checks that
+the flag alone exits 2.
+
+Each case asserts its `expect` (`ID STATUS`) and `detail` (`ID DETAIL`)
+lines. Every case must also exit 0, print each check exactly once, print
+every fact, and print nothing else under its nonce. `noisy-bashrc` runs
+with a `BASH_ENV` that prints banners, a `UBIPF:` line under another
+nonce and output with no trailing newline. The last run uses the
+`ubi-m4-fakehost` image with real commands and no fixtures, and must
+fail PF3 with `no /dev/kvm`.
+
+The fixture outputs are synthesised. In particular, `arm-biglittle`,
+`intel-hybrid`, `amd-uniform`, `ebs-nvme`, `lvm` and `gpu-nouveau` were
+not captured on such hardware, so they are UNVERIFIED as real outputs.
+The PF15 network calls are shimmed (`cmd/curl`, `cmd/apt-get`).
+
+`--update-spec` writes each raw output to
+`spec/fixtures/byoh/preflight/<case>.txt`. Two specs read those files:
+`spec/lib/byoh_host_preflight_spec.rb` parses them, and
+`rhizome/host/spec/kvm_check_parity_spec.rb` checks that `KvmCheck`, which
+PrepHost runs, gives each fixture host the same PF3 verdict as the
+script. Rerun the script with `--update-spec` after changing it or the
+fixtures. Result (2026-10-15): 17 cases plus base, the guard and the
+live run pass in about 25 s, with nothing left behind.
+
 ## Scenarios
 
 | Scenario | Checks |

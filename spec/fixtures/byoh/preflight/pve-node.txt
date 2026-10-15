@@ -1,0 +1,39 @@
+UBIPF:f1x7ure {"kind":"fact","id":"arch","value":"x86_64"}
+UBIPF:f1x7ure {"kind":"fact","id":"os_version","value":"ubuntu 24.04"}
+UBIPF:f1x7ure {"kind":"check","id":"PF1","status":"pass","detail":"Ubuntu 24.04 on x86_64","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF3","status":"pass","detail":"/dev/kvm present (Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz)","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF4","status":"pass","detail":"pdpe1gb flag present","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF5","status":"pass","detail":"/etc/default/grub and update-grub present","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF6","status":"pass","detail":"dmidecode: 64 GiB installed","fix":""}
+UBIPF:f1x7ure {"kind":"fact","id":"mem_gib","value":64}
+UBIPF:f1x7ure {"kind":"check","id":"PF7","status":"pass","detail":"64 GiB of memory gives 57 1G hugepages","fix":""}
+UBIPF:f1x7ure {"kind":"fact","id":"cpus_online","value":8}
+UBIPF:f1x7ure {"kind":"check","id":"PF-min-cpu","status":"pass","detail":"8 online CPUs","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF8","status":"pass","detail":"all CPUs online","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF8-hybrid","status":"pass","detail":"uniform cores","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF9","status":"pass","detail":"cgroup v2 with cpuset","fix":""}
+UBIPF:f1x7ure {"kind":"fact","id":"storage_fstype","value":"ext4"}
+UBIPF:f1x7ure {"kind":"check","id":"PF10-zfs","status":"pass","detail":"not ZFS","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF10-btrfs","status":"pass","detail":"not btrfs","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF10","status":"pass","detail":"/dev/nvme1n1 (ext4), 870G free","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF11","status":"pass","detail":"no blank unused disk","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF12","status":"pass","detail":"storage disk(s) nvme1n1 have by-id links","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF13","status":"pass","detail":"no failing disk","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF14","status":"pass","detail":"tsc available","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF15-apt","status":"pass","detail":"the archive serves the PrepHost packages","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF15-egress","status":"pass","detail":"reached 2 URL(s)","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF16-docker","status":"pass","detail":"docker not active","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF16-ufw","status":"pass","detail":"ufw not active","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF16-tailscaled","status":"pass","detail":"tailscaled not active","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF16-k3s","status":"pass","detail":"k3s not active","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF16-libvirtd","status":"fail","detail":"libvirtd is active; its firewall rules can conflict with the host's nftables rules","fix":"stop and disable libvirtd, or pass --accept-check PF16-libvirtd"}
+UBIPF:f1x7ure {"kind":"check","id":"PF16-pve","status":"fail","detail":"this looks like a Proxmox node; point --ssh at the data-plane VM","fix":"run the data plane in a VM on the node (docs/byoh/platforms/proxmox.md)"}
+UBIPF:f1x7ure {"kind":"check","id":"PF16-rhizome-user","status":"pass","detail":"no rhizome user","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF19","status":"pass","detail":"no NVIDIA device held by a host driver","fix":""}
+UBIPF:f1x7ure {"kind":"fact","id":"ip_addr","value":[{"ifindex":1,"ifname":"lo","flags":["LOOPBACK","UP","LOWER_UP"],"addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8,"scope":"host","label":"lo"},{"family":"inet6","local":"::1","prefixlen":128,"scope":"host"}]},{"ifindex":2,"ifname":"eno1","flags":["BROADCAST","MULTICAST","UP","LOWER_UP"],"addr_info":[{"family":"inet","local":"203.0.113.10","prefixlen":26,"broadcast":"203.0.113.63","scope":"global","label":"eno1"},{"family":"inet6","local":"2001:db8:1::2","prefixlen":64,"scope":"global"}]}]}
+UBIPF:f1x7ure {"kind":"fact","id":"ip_route","value":[{"dst":"default","gateway":"203.0.113.1","dev":"eno1","protocol":"static","flags":["onlink"]}]}
+UBIPF:f1x7ure {"kind":"fact","id":"netplan","value":"network:\n  version: 2\n  ethernets:\n    eno1:\n      addresses: [203.0.113.10/26]\n      routes: [{to: default, via: 203.0.113.1}]"}
+UBIPF:f1x7ure {"kind":"fact","id":"host_keys","value":["ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrrDWvL5/K5DtJ+/qsLsFmM7v5/gaOxYyQhI= root@fixture","ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl root@fixture"]}
+UBIPF:f1x7ure {"kind":"fact","id":"sshd","value":{"permitrootlogin":"without-password","pubkeyauthentication":"yes","authenticationmethods":"any"}}
+UBIPF:f1x7ure {"kind":"check","id":"default-route","status":"pass","detail":"one IPv4 default route","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"main-ip-local","status":"pass","detail":"203.0.113.10 is on this host","fix":""}

@@ -97,6 +97,25 @@ Two control-plane layouts exist ([SETUP.md](SETUP.md) §4). The table gives the 
 | Registration fails on a unique index (`sshable.host`, `address.cidr`, `vm_host.net6`) | The same machine or block is registered already | Destroy the old VmHost first (delete its VMs, then `VmHost["vh..."].incr_destroy`). Never delete `location` rows | A reinstalled OS needs this too: host keys are pinned on first connect |
 | "WARNING: env var X is not set; BMC reset will fail at runtime" | `--bmc-pass-env` names a variable this shell lacks | Put it in `.env.rb` and restart `puma` and `respirate` **before** registering (§8) | |
 
+#### PF3
+
+Host preflight (`ubicloud-host preflight`, PLATFORMS.md PF3) fails PF3 for any of three reasons. Each reason needs its own fix, and accepting the failure is not possible (`--accept-check PF3` is refused). PrepHost applies the same rules after registration (`rhizome/host/lib/kvm_check.rb`). A spec runs both on the same fixture hosts.
+
+| PF3 detail | Meaning |
+|---|---|
+| `no /dev/kvm` | The KVM module is not loaded. Either the firmware has VT-x/AMD-V off, or the machine is a VM without nested virtualization |
+| `kvm64-class CPU model (…)` | The VM has a generic CPU model (`kvm64`, `qemu64`, "Common KVM processor", "QEMU Virtual CPU"). That model hides `vmx`/`svm` and the CPU features that x86-64-v2 guests need. The script fails it even when the model adds `vmx` (PrepHost alone would pass it then) |
+| `the CPU has neither the vmx nor the svm flag` | `/dev/kvm` exists, but the CPU does not expose hardware virtualization |
+
+Fixes by platform, from the platform guides:
+
+- **Bare metal:** turn on VT-x/AMD-V (and VT-d/AMD-Vi for GPUs) in the firmware, then power the machine off and on.
+- **QEMU/KVM, Proxmox, libvirt:** use `qm set <vmid> --cpu host` or libvirt `host-passthrough`, and turn on nested virtualization on the hypervisor host (`kvm_intel nested=1` / `kvm_amd nested=1`). See [proxmox.md](platforms/proxmox.md).
+- **Amazon EC2:** use a `.metal` instance, or m8i/c8i/r8i with nested virtualization (`data_plane_nested_virtualization = true` in `terraform/aws-byoh`).
+- **Google Cloud:** `--enable-nested-virtualization` on N2/C3 (UNVERIFIED).
+- **Microsoft Azure:** a size that supports nested virtualization, with security type Standard (UNVERIFIED).
+- **VPS without KVM:** not possible ([other-clouds-vps.md](platforms/other-clouds-vps.md) §1.3).
+
 ### 2.2 During bring-up
 
 | Label | Symptom | Cause | Fix | Platform notes |

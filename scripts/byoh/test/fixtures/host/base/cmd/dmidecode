@@ -1,0 +1,13 @@
+# dmidecode 3.5
+Handle 0x0011, DMI type 17, 92 bytes
+Memory Device
+	Size: 32 GB
+	Locator: DIMM_A1
+
+Handle 0x0012, DMI type 17, 92 bytes
+Memory Device
+	Size: No Module Installed
+
+Handle 0x0013, DMI type 17, 92 bytes
+Memory Device
+	Size: 32 GB

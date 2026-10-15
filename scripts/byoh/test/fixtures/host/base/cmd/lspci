@@ -1,0 +1,13 @@
+Slot:	0000:00:00.0
+Class:	0600
+Vendor:	8086
+Device:	09a2
+IOMMUGroup:	0
+
+Slot:	0000:3b:00.0
+Class:	0200
+Vendor:	8086
+Device:	1593
+Driver:	ice
+IOMMUGroup:	12
+
