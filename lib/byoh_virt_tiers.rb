@@ -161,10 +161,12 @@ module ByohVirtTiers
 
   # Whether a host's probe verdict matches the tier it was registered on:
   # a KVM host must run today's VMs; a lower-tier host must have that
-  # tier's prerequisites in place (VirtProbe.fallbacks "ready"). Agreement
-  # is a safety check, never an authorization.
+  # tier's prerequisites in place (VirtProbe.fallbacks "ready"), and a PVM
+  # host none of PVM's hard refusals (ByohVirtLadder.pvm_refusal).
+  # Agreement is a safety check, never an authorization.
   def self.accepts_probe?(tier, verdict)
     return verdict.standard_vms? if tier == KVM
+    return false if tier == "pvm" && ByohVirtLadder.pvm_refusal(verdict.report["facts"])
 
     verdict.ready.include?(tier)
   end

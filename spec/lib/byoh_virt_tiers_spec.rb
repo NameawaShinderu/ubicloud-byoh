@@ -92,6 +92,14 @@ RSpec.describe ByohVirtTiers do
       expect(described_class.accepts_probe?("emulated", verdict)).to be false
       expect(described_class.accepts_probe?("emulated", verdict(commands: {"qemu-system-x86_64" => true}, ovmf: true))).to be true
     end
+
+    it "refuses a PVM host on a Meltdown-affected CPU or with Secure Boot on" do
+      pvm = {cpu_flags: %w[hypervisor], dev_kvm: true, kvm_api: 12, kvm_create_vm: true, kvm_caps_missing: [], modules: %w[kvm kvm_pvm]}
+      expect(described_class.accepts_probe?("pvm", verdict(**pvm, vulnerabilities: {"meltdown" => "Not affected"}))).to be true
+      expect(described_class.accepts_probe?("pvm", verdict(**pvm, vulnerabilities: {"meltdown" => "Mitigation: PTI"}))).to be false
+      expect(described_class.accepts_probe?("pvm", verdict(**pvm))).to be false
+      expect(described_class.accepts_probe?("pvm", verdict(**pvm, vulnerabilities: {"meltdown" => "Not affected"}, secure_boot: true))).to be false
+    end
   end
 
   describe ".check_vm!" do

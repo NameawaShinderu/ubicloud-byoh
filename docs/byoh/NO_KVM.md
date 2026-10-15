@@ -916,6 +916,11 @@ Differences from sections 10.3, 10.4 and 11.2, each stricter or equal:
   --accept <tier>:multitenant` is refused and a stored ack has no effect; the WP that ships a tier
   adds that tier's host check (at registration, `verify_virt_tier` and LearnVirt) and lists it there.
   `emulated` has no `multitenant` option at all: it is not a security boundary.
+- **PVM's hard refusals are enforced already** (section 6.5): `ByohVirtLadder.pvm_refusal` fails a
+  `pvm` registration (`preflight_check`, `auto` included) and a `pvm` host's probe
+  (`ByohVirtTiers.accepts_probe?`, so `verify_virt_tier` holds it and LearnVirt pages) when Secure
+  Boot is on, or when the CPU's `vulnerabilities/meltdown` is not "Not affected". It fails closed: a
+  Meltdown status that was not gathered (a version 1 probe) is refused too.
 - `pvm` declared on a `pvm_blocked` probe is refused with the `modprobe kvm_pvm` fix (the plan said
   "ack with advice"): prep would refuse that host anyway.
 - `auto` picks the fastest *possible* fallback; when that tier is not offered or not installed it

@@ -283,9 +283,23 @@ fallbacks not checked (the kernel facts were not gathered): container
       expect(described_class.preflight_check(facts, declared_tier: "container")).to include(status: "fail", fix: "This host runs KVM (L1); register it as kvm.")
       expect(described_class.preflight_check(facts(virt_container: "docker"), declared_tier: "emulated")[:fix]).to start_with "Run the data plane on a VM"
       expect(described_class.preflight_check(facts(kvm_errno: "EPERM", kvm_api: "Operation not permitted"), declared_tier: "container")[:fix]).to start_with "Probe as root"
-      pvm = facts(cpu_flags: %w[hypervisor], modules: %w[kvm kvm_pvm], virt_vm: "kvm")
+      pvm = facts(cpu_flags: %w[hypervisor], modules: %w[kvm kvm_pvm], virt_vm: "kvm", vulnerabilities: {"meltdown" => "Not affected"})
       expect(described_class.preflight_check(pvm, declared_tier: "container")).to include(status: "fail", fix: "This is a PVM host; register it as pvm.")
       expect(described_class.preflight_check(pvm, declared_tier: "pvm")).to include(status: "pass")
+    end
+
+    it "refuses PVM on a Meltdown-affected CPU and with Secure Boot on, with no override" do
+      pvm = {cpu_flags: %w[hypervisor], modules: %w[kvm kvm_pvm], virt_vm: "kvm"}
+      expect(described_class.preflight_check(facts(**pvm, vulnerabilities: {"meltdown" => "Mitigation: PTI"}), declared_tier: "pvm"))
+        .to include(status: "fail", fix: "This CPU's Meltdown status is \"Mitigation: PTI\", not \"Not affected\": PVM's host kernel runs with pti=off, so a guest could read host memory. PVM is refused on such a CPU in every location.")
+      expect(described_class.preflight_check(facts(**pvm), declared_tier: "pvm")[:fix]).to start_with "This CPU's Meltdown status was not gathered"
+      expect(described_class.preflight_check(facts(**pvm, vulnerabilities: "garbage"), declared_tier: "pvm")[:fix]).to start_with "This CPU's Meltdown status was not gathered"
+      expect(described_class.preflight_check(facts(**pvm, vulnerabilities: {"meltdown" => "Not affected"}, secure_boot: true), declared_tier: "pvm"))
+        .to include(status: "fail", fix: "Secure Boot is on, and PVM's host kernel module is not signed; turn Secure Boot off to use PVM.")
+      # On a host that could load kvm_pvm, before it is loaded.
+      blocked = facts(**no_virt, pvm_module_available: true, vulnerabilities: {"meltdown" => "Vulnerable"})
+      expect(described_class.preflight_check(blocked, declared_tier: "pvm")[:fix]).to start_with "This CPU's Meltdown status is \"Vulnerable\""
+      expect(described_class.pvm_refusal({"vulnerabilities" => {"meltdown" => "Not affected"}, "secure_boot" => false})).to be_nil
     end
   end
 

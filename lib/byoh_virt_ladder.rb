@@ -319,6 +319,23 @@ module ByohVirtLadder
     result.merge(status:, fix:, caveats: ["KVM: #{v.summary}", *advice] + v.caveats)
   end
 
+  # The hard refusals of a PVM host, in every location and with no
+  # override (docs/byoh/NO_KVM.md section 6.5): PVM's host kernel runs
+  # with pti=off, so on a CPU that needs Meltdown mitigation any guest
+  # could read host memory; and kvm_pvm is an unsigned out-of-tree
+  # module. Fails closed: a CPU whose Meltdown status was not gathered is
+  # refused too. nil when neither applies.
+  def self.pvm_refusal(facts)
+    return "Secure Boot is on, and PVM's host kernel module is not signed; turn Secure Boot off to use PVM." if facts["secure_boot"] == true
+
+    vulnerabilities = facts["vulnerabilities"]
+    meltdown = vulnerabilities["meltdown"] if vulnerabilities.is_a?(Hash)
+    return nil if meltdown == "Not affected"
+
+    status = meltdown ? "is \"#{meltdown}\"" : "was not gathered"
+    "This CPU's Meltdown status #{status}, not \"Not affected\": PVM's host kernel runs with pti=off, so a guest could read host memory. PVM is refused on such a CPU in every location."
+  end
+
   def self.fallback_readiness(v, declared)
     if v.standard_vms?
       ["fail", "This host runs KVM (L1); register it as kvm."]
@@ -328,6 +345,8 @@ module ByohVirtLadder
       ["info", "Whether KVM works here is unknown, so #{declared} cannot be checked yet. #{v.fix}"]
     elsif v.tier == "pvm" && declared != "pvm"
       ["fail", "This is a PVM host; register it as pvm."]
+    elsif declared == "pvm" && v.possible.include?("pvm") && (refusal = pvm_refusal(v.report["facts"]))
+      ["fail", refusal]
     elsif v.ready.include?(declared)
       ["pass", nil]
     elsif v.possible.include?(declared)

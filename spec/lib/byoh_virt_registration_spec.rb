@@ -24,8 +24,8 @@ RSpec.describe ByohVirtRegistration do
     "kvm_blocked" => {dev_kvm: false, kvm_api: nil, kvm_create_vm: nil, kvm_caps_missing: nil, modules: []},
     "unknown_permission" => {kvm_api: "Permission denied", kvm_errno: "EACCES", kvm_create_vm: nil, kvm_caps_missing: nil},
     "none" => no_virt,
-    "pvm_blocked" => no_virt.merge(pvm_module_available: true),
-    "pvm" => no_virt.merge(dev_kvm: true, kvm_api: 12, kvm_create_vm: true, kvm_caps_missing: [], modules: %w[kvm kvm_pvm]),
+    "pvm_blocked" => no_virt.merge(pvm_module_available: true, vulnerabilities: {"meltdown" => "Not affected"}),
+    "pvm" => no_virt.merge(dev_kvm: true, kvm_api: 12, kvm_create_vm: true, kvm_caps_missing: [], modules: %w[kvm kvm_pvm], vulnerabilities: {"meltdown" => "Not affected"}),
     "container" => {virt_container: "docker"},
     "unknown" => {dev_kvm: nil, kvm_api: nil, kvm_create_vm: nil, kvm_caps_missing: nil},
     "not probed" => nil,
@@ -71,6 +71,14 @@ RSpec.describe ByohVirtRegistration do
           expect { decide.call }.to raise_error(described_class::Refused, expected)
         end
       end
+    end
+  end
+
+  it "refuses a PVM host whose CPU needs Meltdown mitigation, even with auto" do
+    affected = ByohVirtLadder.from_facts(facts(**probe_table["pvm"], vulnerabilities: {"meltdown" => "Mitigation: PTI"}))
+    %w[pvm auto].each do |declared|
+      expect { described_class.new(declared:, accept_fallback: true).decide!(affected, location:, main_ip: "x") }
+        .to raise_error(described_class::Refused, /refused: This CPU's Meltdown status is "Mitigation: PTI"/)
     end
   end
 
