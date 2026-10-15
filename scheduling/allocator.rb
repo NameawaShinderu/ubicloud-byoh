@@ -74,6 +74,10 @@ module Scheduling::Allocator
     Clog.emit("vm allocated", {allocation: allocation.to_s, duration: Time.now - vm.created_at})
   end
 
+  # Locations whose GPU hosts also take non-GPU VMs: Ubicloud's own,
+  # and BYOH locations, where an operator's few hosts may all have GPUs.
+  GPU_SHARING_PROVIDERS = ["ubicloud", HostProvider::GENERIC_PROVIDER_NAME].freeze
+
   Request = Struct.new(
     :vm_id,
     :vcpus,
@@ -141,7 +145,7 @@ module Scheduling::Allocator
 
     def single_ubicloud_location?
       return false unless location_filter.one?
-      Location[location_filter.first].provider == "ubicloud"
+      GPU_SHARING_PROVIDERS.include?(Location[location_filter.first].provider)
     end
 
     def needs_large_storage_device?

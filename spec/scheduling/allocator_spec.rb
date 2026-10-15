@@ -572,6 +572,33 @@ RSpec.describe Scheduling::Allocator do
       expect(req).to be_single_ubicloud_location
       expect(cand.size).to eq(1)
     end
+
+    it "retrieves candidates with gpu if gpu_count is zero but host is in a BYOH location" do
+      loc = create_byoh_location
+      vmh = create_byoh_vm_host(loc, total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+      StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
+      PciDevice.create(vm_host_id: vmh.id, slot: "01:00.0", device_class: "0300", vendor: "10de", device: "27b0", numa_node: 0, iommu_group: 3)
+      BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+      req.location_filter = [loc.id]
+      cand = Al::Allocation.candidate_hosts(req)
+      expect(req).to be_single_ubicloud_location
+      expect(cand.map { it[:vm_host_id] }).to eq([vmh.id])
+    end
+
+    it "still skips GPU hosts for non-GPU VMs in a single location of another provider" do
+      loc = Location[Location::HETZNER_FSN1_ID]
+      expect(loc.provider).to eq("hetzner")
+      vmh = create_vm_host(location_id: loc.id, total_cpus: 14, total_cores: 7, used_cores: 4, total_hugepages_1g: 10, used_hugepages_1g: 2)
+      StorageDevice.create(vm_host_id: vmh.id, name: "stor1", available_storage_gib: 100, total_storage_gib: 100)
+      Address.create(cidr: "1.1.1.0/30", routed_to_host_id: vmh.id).populate_ipv4_addresses
+      PciDevice.create(vm_host_id: vmh.id, slot: "01:00.0", device_class: "0300", vendor: "10de", device: "27b0", numa_node: 0, iommu_group: 3)
+      BootImage.create(name: "ubuntu-jammy", version: "20220202", vm_host_id: vmh.id, activated_at: Time.now, size_gib: 3)
+      req.location_filter = [loc.id]
+      cand = Al::Allocation.candidate_hosts(req)
+      expect(req).not_to be_single_ubicloud_location
+      expect(cand).to be_empty
+    end
   end
 
   describe "Allocation" do
