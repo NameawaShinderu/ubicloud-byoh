@@ -69,6 +69,9 @@ class ByohOperatorSsh
     -o LogLevel=ERROR
   ].freeze
 
+  # Ends run_script's stdin, after the script's subshell.
+  SCRIPT_STATUS = "s=$?; [ \"$s\" -ne 255 ] || s=254; exit \"$s\"\n"
+
   TARGET = /\A[A-Za-z_][A-Za-z0-9_.-]*@[A-Za-z0-9_][A-Za-z0-9_.:-]*\z/
 
   # Runs argv with stdin; returns [stdout, stderr, exit status]. A
@@ -109,8 +112,10 @@ class ByohOperatorSsh
   end
 
   # Runs remote_command (one shell string) on the host. ssh exits 255
-  # only for its own failures: no route, refused, auth, a changed host
-  # key.
+  # for its own failures (no route, refused, auth, a changed host key),
+  # and those raise TransportError. ssh also passes a remote command's
+  # own status through, so a command that can itself exit 255 reads as a
+  # transport failure here; run_script rules that out for scripts.
   def run(remote_command, stdin: "")
     out, err, status = @runner.call(argv(remote_command), stdin)
     raise TransportError, "ssh #{@target} failed: #{err.to_s.strip.lines.last(3).join.strip}" if status == 255
@@ -119,9 +124,11 @@ class ByohOperatorSsh
   end
 
   # Runs script as root through passwordless sudo, with the script on
-  # stdin so that nothing is copied to the host.
+  # stdin so that nothing is copied to the host. The script runs in a
+  # subshell whose status 255 becomes 254, so that 255 always means ssh
+  # itself failed and a failing script keeps its output.
   def run_script(script, args = [])
-    run("sudo -n bash -s -- #{args.shelljoin}".strip, stdin: script)
+    run("sudo -n bash -s -- #{args.shelljoin}".strip, stdin: "(\n#{script.chomp}\n)\n#{SCRIPT_STATUS}")
   end
 
   def sudo? = run("sudo -n true").success?

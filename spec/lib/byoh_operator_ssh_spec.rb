@@ -85,7 +85,26 @@ RSpec.describe ByohOperatorSsh do
     it "feeds the script to root bash on stdin with escaped arguments" do
       session { it.run_script("echo hi\n", ["preflight", "--json", "a b;c"]) }
       expect(calls.dig(0, 0).last).to eq("sudo -n bash -s -- preflight --json a\\ b\\;c")
-      expect(calls.dig(0, 1)).to eq("echo hi\n")
+      expect(calls.dig(0, 1)).to eq("(\necho hi\n)\n#{ByohOperatorSsh::SCRIPT_STATUS}")
+    end
+
+    # The remote end, played by a local bash reading stdin as
+    # `bash -s -- ARGS` does on the host.
+    def local_bash
+      lambda do |argv, stdin|
+        calls << [argv, stdin]
+        args = Shellwords.split(argv.last.delete_prefix("sudo -n bash -s --"))
+        ByohOperatorSsh::OPEN3_RUNNER.call(["bash", "-s", "--", *args], stdin)
+      end
+    end
+
+    it "keeps a script's own exit 255 apart from an ssh failure" do
+      session(local_bash) do |ssh|
+        result = ssh.run_script("echo \"out $1\"\necho err >&2\nexit 255", ["a b"])
+        expect(result).to eq(ByohOperatorSsh::Result.new(stdout: "out a b\n", stderr: "err\n", status: 254))
+        expect(ssh.run_script("case $1 in x) exit 3;; esac\ncat <<'E'\n)\nE\n", ["y"]).to_h).to eq(stdout: ")\n", stderr: "", status: 0)
+        expect(ssh.run_script("exit 3").status).to eq(3)
+      end
     end
 
     it "runs with no arguments" do
