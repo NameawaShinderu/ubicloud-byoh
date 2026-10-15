@@ -55,7 +55,7 @@ The data plane must be a **dedicated machine**. Registration logs in as root, re
 | Wired uplink with a static address | `ip -br -4 addr; ip route show default` | Only the main IP is local (contract C5). DHCP on the host is fine only with a reservation; the main IP must not change. Wi-Fi uplinks are UNVERIFIED. |
 | Outbound HTTPS, and HTTP to cloud-images-archive.ubuntu.com | `curl -sfI https://github.com && curl -sfI https://cloud-images.ubuntu.com`, plus the image URL of [PLATFORMS.md](../PLATFORMS.md) PF15 with `-L` | PrepHost and boot image downloads (the pinned Ubuntu releases redirect to the archive host over plain HTTP) |
 | No other firewall manager | `systemctl is-active docker ufw tailscaled k3s libvirtd` | Their rules are wiped on every VM create and destroy (NH-6, OPEN) |
-| No NVIDIA GPU in an IOMMU group (unless you want GPU VMs only) | `lspci -vnmm -d 10de:: \| grep IOMMUGroup` | LearnPci records NVIDIA devices that have an IOMMU group, and the allocator then excludes the host from every non-GPU VM (`scheduling/allocator.rb`, `non_gpu` filter; VR-4, OPEN) |
+| An NVIDIA GPU is passed through only from `vfio-pci` | `lspci -nnk -d 10de::` shows `Kernel driver in use: vfio-pci` for every function | From M4, LearnPci on a BYOH host records an NVIDIA device only when every endpoint in its IOMMU group is on `vfio-pci` (bridges and unbound functions are allowed). A GPU host in a BYOH location still takes non-GPU VMs created in that location (`scheduling/allocator.rb`, `non_gpu` filter; VR-4 fixed for BYOH locations). UNVERIFIED on real GPU hardware |
 
 The full read-only check list is PLATFORMS §6.3 (PF1-PF21).
 
@@ -66,7 +66,7 @@ Menu names differ by vendor; these are the usual ones. UNVERIFIED on any specifi
 | Setting | Value | Why |
 |---|---|---|
 | Intel Virtualization Technology (VT-x) / AMD SVM Mode | **Enabled** | Without it there is no `/dev/kvm`, and the bootstrap stops with "/dev/kvm is missing" or "the CPU has neither the vmx nor the svm flag" |
-| VT-d / AMD-Vi / IOMMU | Not needed for normal VMs. Leave it at the default unless the host has an NVIDIA GPU. | With an NVIDIA GPU, an IOMMU group removes the host from non-GPU placement (§2.1). To use such a host for normal VMs, remove the GPU or turn the IOMMU off (firmware, or a GRUB drop-in with `intel_iommu=off` / `amd_iommu=off`), then confirm `lspci -vnmm -d 10de::` shows no `IOMMUGroup` line before registration. UNVERIFIED. |
+| VT-d / AMD-Vi / IOMMU | Not needed for normal VMs. Turn it on only to pass an NVIDIA GPU through. | For GPU VMs, turn the IOMMU on and bind every function of the GPU's IOMMU group to `vfio-pci` before registration (§2.1). A GPU left on `nouveau` or `nvidia` is not recorded, and the host serves only normal VMs. UNVERIFIED on real GPU hardware. |
 | Hyper-Threading / SMT | **Enabled** | §2.1 |
 | E-cores (hybrid Intel) | Disabled, if the board offers it | §2.1 |
 | Restore on AC power loss | **Power On** or **Last State** | The host comes back by itself after an outage (§3.10) |
@@ -468,7 +468,7 @@ ssh -o "ProxyCommand=ssh -i ~/.ssh/byoh_data root@<main IP> ip netns exec <inhos
 | `bootstrap-data-plane.sh`: "/dev/kvm is missing" or "neither the vmx nor the svm flag" | VT-x / AMD SVM disabled in the firmware | Enable it (§2.2), power-cycle, rerun the bootstrap |
 | Bootstrap: "the CPU lacks the pdpe1gb flag" | Very old CPU | Use another machine; a `flexible` profile without hugepages is PLANNED ([COMPUTE.md](../COMPUTE.md)) |
 | Every VM fails with `RuntimeError BUG` in `write_params_json` | Hybrid Intel CPU (P+E cores), or SMT off / CPUs offline | Disable E-cores in the firmware, enable SMT, remove `nosmt`; then re-register (PLATFORMS HW-6, HW-7) |
-| Internet and internal VMs wait for capacity on a host with an NVIDIA GPU | GPU in an IOMMU group; the allocator excludes the host from non-GPU VMs | Remove the GPU or turn the IOMMU off, then re-register (§2.2); UNVERIFIED |
+| Internet and internal VMs wait for capacity on a host with an NVIDIA GPU | The host is a legacy generic host outside a BYOH location; the allocator excludes GPU hosts from non-GPU VMs there | `bin/byoh-host move-location`; a host in a BYOH location takes non-GPU VMs (M4) |
 | VM prep fails with `Errno::ENOENT` | `/var/storage` on btrfs or ZFS | Reinstall with ext4 or xfs (STOR-5) |
 | A second data disk is never used | Mounted after registration, or not under `/var/storage/devices/<name>` | Mount it there and re-register (STOR-3); never mount over `/var/storage` |
 | Host flaps to `unavailable` and pages | `bin/monitor` running with an LVM root or a disk without `wwn-`/`nvme-eui` links | Stop the monitor (§3.10) |
@@ -501,7 +501,7 @@ Common problems on every platform (stuck at `bootstrap_rhizome`, PrepHost downlo
 
 Known gaps that matter on owned hardware:
 
-- Hybrid Intel CPUs, SMT off, NVIDIA + IOMMU, btrfs/ZFS and Docker/ufw/Tailscale on the host are OPEN (PLATFORMS §4).
+- Hybrid Intel CPUs, SMT off, NVIDIA GPUs not on `vfio-pci` (skipped since M4), btrfs/ZFS and Docker/ufw/Tailscale on the host are OPEN (PLATFORMS §4).
 - `bin/monitor` health checks fail on LVM roots and some disks (F5), so outage recovery is manual (§3.10).
 - Only Redfish BMCs; no IPMI. Hardware Reset without a BMC wedges the host strand, and no command adds a BMC to a registered host (recover with the `bin/pry` strand reset in §4, UNVERIFIED, or re-register).
 - The pools file `uplink` is never used; pools on a second interface (`wg0`, a VLAN) need your own policy routing.
