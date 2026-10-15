@@ -52,8 +52,8 @@ RSpec.describe Prog::Vm::HostNexus do
       ship_virt_tiers("emulated")
       expect { assemble(virt_tier: "emulated") }.to raise_error(RuntimeError, "Location byoh-test does not offer emulated hosts")
       offer(%w[emulated])
-      expect { assemble(virt_tier: "emulated", family: "premium") }.to raise_error(RuntimeError, "A emulated host has family emulated, not premium")
-      expect { described_class.assemble("203.0.113.43", virt_tier: "emulated") }.to raise_error(RuntimeError, "A emulated host must be a generic provider host in a BYOH location")
+      expect { assemble(virt_tier: "emulated", family: "premium") }.to raise_error(RuntimeError, "A host of virt tier emulated has family emulated, not premium")
+      expect { described_class.assemble("203.0.113.43", virt_tier: "emulated") }.to raise_error(RuntimeError, "A host of virt tier emulated must be a generic provider host in a BYOH location")
       expect(VmHost.count).to eq 0
     end
 

@@ -75,7 +75,7 @@ RSpec.describe ByohHostCli do
         provider_config: {"main_ip4" => "203.0.113.42", "location_label" => "byoh-1", "routed_networks" => [{"cidr" => "fd00:feed::/64"}]}).subject
       host.update(allocation_state: "draining")
       expect(cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-fsn1", "--empty-only")[2])
-        .to eq "! host #{host.ubid} is a emulated host, which only BYOH locations can hold; destroy and register it again instead\n"
+        .to eq "! host #{host.ubid} has virt tier emulated, which only BYOH locations can hold; destroy and register it again instead\n"
       byoh_2.update(byoh_virt: nil)
       expect(cli("move-location", "--host", host.ubid, "--location", "byoh-2", "--empty-only")[2])
         .to eq "! location byoh-2 does not offer emulated hosts; see bin/byoh-location set --virt-tiers\n"

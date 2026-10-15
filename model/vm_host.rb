@@ -268,7 +268,7 @@ class VmHost < Sequel::Model
   # Introduced for downloading firmware via REPL.
   # Refuses hosts of a tier that runs no cloud-hypervisor (ByohVirtTiers).
   def check_runs_cloud_hypervisor!
-    fail ArgumentError, "#{self} is a #{virt_tier} host, which runs no cloud-hypervisor" unless ByohVirtTiers.runs_cloud_hypervisor?(virt_tier)
+    fail ArgumentError, "#{self} runs no cloud-hypervisor (virt tier #{virt_tier})" unless ByohVirtTiers.runs_cloud_hypervisor?(virt_tier)
   end
 
   def download_firmware(version_x64: nil, version_arm64: nil, sha256_x64: nil, sha256_arm64: nil)

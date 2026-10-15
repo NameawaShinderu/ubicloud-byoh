@@ -184,13 +184,13 @@ RSpec.describe ByohVirtTiers do
     describe "cloud-hypervisor downloads" do
       it "are refused, as on container hosts, and allowed on KVM hosts" do
         [vm_host, create_byoh_vm_host(location, virt_tier: "container", family: "container", net6: "fd00:9:9:9::/64")].each do |host|
-          message = "#{host} is a #{host.virt_tier} host, which runs no cloud-hypervisor"
+          message = "#{host} runs no cloud-hypervisor (virt tier #{host.virt_tier})"
           expect { host.download_cloud_hypervisor(version_x64: "46.0") }.to raise_error(ArgumentError, message)
           expect { host.download_firmware(version_x64: "202311", sha256_x64: "x") }.to raise_error(ArgumentError, message)
           ch = Prog::DownloadCloudHypervisor.new(Strand.create(prog: "DownloadCloudHypervisor", label: "start", stack: [{"subject_id" => host.id, "version" => "46.0"}]))
           expect { ch.start }.to exit({"msg" => message})
           fw = Prog::DownloadFirmware.new(Strand.create(prog: "DownloadFirmware", label: "start", stack: [{"subject_id" => host.id, "version" => "202311", "sha256" => "x"}]))
-          expect { fw.start }.to exit({"msg" => "#{message} firmware"})
+          expect { fw.start }.to exit({"msg" => "#{host} runs no cloud-hypervisor firmware (virt tier #{host.virt_tier})"})
         end
         kvm_host = create_vm_host
         expect(kvm_host.download_firmware(version_x64: "202311", sha256_x64: "x").prog).to eq "DownloadFirmware"
@@ -209,7 +209,7 @@ RSpec.describe ByohVirtTiers do
     it "downloads ubuntu-noble unless registration names other images of the tier" do
       offer
       expect { assemble(default_boot_images: %w[ubuntu-noble-container]) }
-        .to raise_error(RuntimeError, "A emulated host cannot boot ubuntu-noble-container; its images are ubuntu-noble, ubuntu-jammy")
+        .to raise_error(RuntimeError, "A host of virt tier emulated cannot boot ubuntu-noble-container; its images are ubuntu-noble, ubuntu-jammy")
       expect(assemble.stack.first["default_boot_images"]).to eq %w[ubuntu-noble]
     end
 

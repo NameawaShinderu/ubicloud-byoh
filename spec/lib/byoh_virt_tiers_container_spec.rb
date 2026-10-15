@@ -103,7 +103,7 @@ RSpec.describe ByohVirtTiers do
     it "downloads the tier's boot images unless registration names some of them, and refuses others" do
       offer([])
       expect { assemble(default_boot_images: %w[ubuntu-noble-container ubuntu-noble]) }
-        .to raise_error(RuntimeError, "A container host cannot boot ubuntu-noble; its images are ubuntu-noble-container")
+        .to raise_error(RuntimeError, "A host of virt tier container cannot boot ubuntu-noble; its images are ubuntu-noble-container")
       expect(assemble.stack.first["default_boot_images"]).to eq %w[ubuntu-noble-container]
     end
   end
