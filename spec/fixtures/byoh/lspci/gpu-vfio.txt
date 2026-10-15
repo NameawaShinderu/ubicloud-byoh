@@ -1,0 +1,65 @@
+# fixture: two RTX 4000 SFF Ada on vfio-pci; the second shares its IOMMU group with its root port; synthesised in the pciutils 3.10.0 lspci -vnmmk -D format (UNVERIFIED against this hardware)
+Slot:	0000:00:01.0
+Class:	0604
+Vendor:	8086
+Device:	352a
+Rev:	04
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	2
+
+Slot:	0000:01:00.0
+Class:	0300
+Vendor:	10de
+Device:	27b0
+SVendor:	10de
+SDevice:	16fa
+Rev:	a1
+ProgIf:	00
+Driver:	vfio-pci
+NUMANode:	0
+IOMMUGroup:	13
+
+Slot:	0000:01:00.1
+Class:	0403
+Vendor:	10de
+Device:	22bc
+SVendor:	10de
+SDevice:	16fa
+Rev:	a1
+ProgIf:	00
+Driver:	vfio-pci
+IOMMUGroup:	13
+
+Slot:	0000:40:03.1
+Class:	0604
+Vendor:	8086
+Device:	352a
+Rev:	04
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	14
+
+Slot:	0000:41:00.0
+Class:	0300
+Vendor:	10de
+Device:	27b0
+SVendor:	10de
+SDevice:	16fa
+Rev:	a1
+ProgIf:	00
+Driver:	vfio-pci
+NUMANode:	1
+IOMMUGroup:	14
+
+Slot:	0000:41:00.1
+Class:	0403
+Vendor:	10de
+Device:	22bc
+SVendor:	10de
+SDevice:	16fa
+Rev:	a1
+ProgIf:	00
+Driver:	vfio-pci
+NUMANode:	1
+IOMMUGroup:	14
