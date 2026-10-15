@@ -644,12 +644,33 @@ from the repository there.
 ## 9. Monitor
 
 `ubicloud-monitor` is installed but not enabled, and `ubicloud.target`
-does not want it. Upstream's health checks misjudge hosts without
-`wwn-`/`nvme-eui` disk links and SMART (AWS EBS, virtio; PLATFORMS F5)
-and can mark them `unavailable`. It is enabled in M9, after F5. `status`
-warns when it is enabled. Without it, an out-of-band host reboot is not
-noticed: use the admin Reboot, as [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
-§8 says.
+does not want it. It is enabled in M9. `status` warns when it is enabled.
+Without it, an out-of-band host reboot is not noticed: use the admin
+Reboot, as [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §8 says.
+
+Upstream's health checks misjudge hosts without `wwn-`/`nvme-eui` disk
+links and SMART (AWS EBS, virtio, LVM roots; PLATFORMS F5) and can mark
+them `unavailable`. Since M4, BYOH hosts (a generic host in a BYOH
+location) get their own checks: disks are identified from the mount
+point down (`findmnt`, `lsblk -s`, the best `/dev/disk/by-id` link or
+the kernel name), virtual and SMART-less disks are not SMART-checked,
+`kvm-clock` passes on a virtual host, and the read/write check always
+writes into `/var/storage`. The 24-hour monitor soak on EBS, virtio and
+LVM hosts has not been run (UNVERIFIED).
+
+Hosts registered before M4 keep the disk ids learned then, which can be
+`""` or a partition name. Before enabling the monitor, refresh them on
+each such host:
+
+```
+bin/byoh-host relearn-device-ids --host vh...         # shows old -> new
+bin/byoh-host relearn-device-ids --host vh... --yes   # stores them
+```
+
+(packaged: `sudo ubicloud-admin run byoh-host relearn-device-ids ...`).
+It changes only `storage_device.unix_device_list`, writes a
+`byoh_operator_action` row, and needs SSH to the host. A host with a
+blank id reads as down until then.
 
 ---
 

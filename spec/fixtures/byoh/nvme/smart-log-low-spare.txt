@@ -1,0 +1,2 @@
+# fixture: smart-log with spare at its threshold; synthesised in the nvme-cli 2.8 -o json format (UNVERIFIED)
+{"critical_warning":0,"temperature":307,"avail_spare":10,"spare_thresh":10,"percent_used":90}

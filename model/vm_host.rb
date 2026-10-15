@@ -383,6 +383,11 @@ class VmHost < Sequel::Model
         all_mount_points.concat(mount_points)
       end
     end
+    # On a BYOH host /var/storage is often a directory on the root
+    # filesystem, not a mount point, and lsblk finds no mount point for a
+    # disk id stored before ByohDeviceIdentity, which made all? pass with
+    # nothing checked. The storage paths themselves are always written.
+    all_mount_points.concat(storage_devices.map { it.path.chomp("/") }) if byoh?
 
     all_mount_points.uniq.all? do |mount_point|
       file_name = File.join(mount_point, "test-file-#{test_file_suffix}")
@@ -446,15 +451,56 @@ class VmHost < Sequel::Model
   end
 
   def disk_device_names(ssh_session)
+    return byoh_disk_device_names(ssh_session) if byoh?
+
     disk_device_ids.map { |id| ssh_session.exec!("readlink -f /dev/disk/by-id/:id", id:).delete_prefix("/dev/").strip }
+  end
+
+  # ByohDeviceIdentity names a disk without a by-id link by its kernel
+  # name, which readlink under /dev/disk/by-id would turn into a path that
+  # names no device.
+  def byoh_disk_device_names(ssh_session)
+    disk_device_ids.map do |id|
+      if id.to_s.empty?
+        raise ByohDeviceIdentity::Error, "VmHost #{ubid} has a blank storage device id; run bin/byoh-host relearn-device-ids --host #{ubid}"
+      end
+
+      if ByohDeviceIdentity.kernel_name?(id)
+        id
+      else
+        ssh_session.exec!("readlink -f /dev/disk/by-id/:id", id:).delete_prefix("/dev/").strip
+      end
+    end
   end
 
   def perform_health_checks(ssh_session, test_file_suffix: "monitor")
     device_names = disk_device_names(ssh_session)
-    check_storage_smart(ssh_session, device_names) &&
-      check_storage_read_write(ssh_session, device_names, test_file_suffix:) &&
-      check_storage_kernel_logs(ssh_session, device_names) &&
-      check_clock_source(ssh_session)
+    if byoh?
+      probe = ByohHealthProbe.run(ssh_session, device_names)
+      check_byoh_storage_smart(probe, device_names) &&
+        check_storage_read_write(ssh_session, device_names, test_file_suffix:) &&
+        check_storage_kernel_logs(ssh_session, device_names) &&
+        check_byoh_clock_source(probe)
+    else
+      check_storage_smart(ssh_session, device_names) &&
+        check_storage_read_write(ssh_session, device_names, test_file_suffix:) &&
+        check_storage_kernel_logs(ssh_session, device_names) &&
+        check_clock_source(ssh_session)
+    end
+  end
+
+  def check_byoh_storage_smart(probe, device_names)
+    device_names.map { |device_name|
+      verdict = ByohHealthProbe.device_verdict(probe, device_name)
+      Clog.emit("Device #{device_name} failed its health check on VmHost #{ubid}", {byoh_device_health: {device: device_name, reason: verdict.reason}}) unless verdict.ok
+      verdict.ok
+    }.all?(true)
+  end
+
+  def check_byoh_clock_source(probe)
+    clock_status = ByohHealthProbe.clock_ok?(probe, arch)
+    Clog.emit("unexpected clock source", {unexpected_clock_source: {vm_host_ubid: ubid, clock_source: probe["clocksource"].strip, virt: probe["virt"].strip}}) unless clock_status
+    clock_status
   end
 
   # The same upstream resolvers the per-VM dnsmasq forwards to (see

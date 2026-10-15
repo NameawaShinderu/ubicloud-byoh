@@ -1,0 +1,2 @@
+# fixture: KVM guest with a stable TSC (UNVERIFIED)
+kvm-clock tsc acpi_pm 

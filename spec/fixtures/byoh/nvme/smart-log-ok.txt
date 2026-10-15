@@ -1,0 +1,2 @@
+# fixture: healthy smart-log; synthesised in the nvme-cli 2.8 -o json format (UNVERIFIED)
+{"critical_warning":0,"temperature":307,"avail_spare":100,"spare_thresh":10,"percent_used":2,"endurance_grp_critical_warning_summary":0,"data_units_read":123456789,"data_units_written":98765432,"power_cycles":42,"power_on_hours":18000,"unsafe_shutdowns":12,"media_errors":0,"num_err_log_entries":0}

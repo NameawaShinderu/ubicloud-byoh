@@ -1,0 +1,2 @@
+# fixture: nvme id-ctrl of an EBS volume; synthesised in the nvme-cli 2.8 -o json format (UNVERIFIED) on EC2
+{"vid":7439,"ssvid":7439,"sn":"vol0a1b2c3d4e5f60718","mn":"Amazon Elastic Block Store","fr":"2.0","rab":32,"ieee":56430,"cmic":0,"mdts":6,"cntlid":0,"ver":66048,"nn":1}

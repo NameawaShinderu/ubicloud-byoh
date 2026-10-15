@@ -1191,6 +1191,38 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(sshable).to receive(:connect).and_raise Sshable::SshError.new("ssh failed", "", "", nil, nil)
       expect(nx.available?).to be false
     end
+
+    it "brings a healthy BYOH virtual host back from unavailable to wait" do
+      location = Location.create(name: "byoh-avail", display_name: "byoh-avail", ui_name: "byoh-avail", visible: false, provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {})
+      st = described_class.assemble("203.0.113.42", location_id: location.id, provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+        provider_config: {"main_ip4" => "203.0.113.42", "location_label" => location.name, "routed_networks" => [{"cidr" => "fd00:feed::/64"}]})
+      st.update(label: "unavailable")
+      byoh_nx = described_class.new(st)
+      host = byoh_nx.vm_host
+      expect(host.byoh?).to be true
+      StorageDevice.create(vm_host_id: host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100, unix_device_list: ["vda"])
+      host.update(last_boot_id: "boot-id")
+      byoh_nx.incr_checkup
+
+      session = Net::SSH::Connection::Session.allocate
+      expect(byoh_nx.sshable).to receive(:connect).and_return(session)
+      ok = ->(text = "") { Net::SSH::Connection::Session::StringWithExitstatus.new(text, 0) }
+      smartctl = File.read(File.expand_path("../../fixtures/byoh/smartctl/virtio-unavailable.txt", __dir__)).lines.drop(1).join
+      expect(session).to receive(:_exec!).with(NetSsh.command(ByohHealthProbe::SCRIPT, shelljoin_devices: ["vda"]))
+        .and_return(ok.call("==ubicloud-probe virt\nkvm\n==ubicloud-probe clocksource\nkvm-clock acpi_pm\n==ubicloud-probe smartctl vda\n#{smartctl}"))
+      expect(session).to receive(:_exec!).with("lsblk --json").and_return(ok.call('{"blockdevices":[{"name":"vda","mountpoints":[null],"children":[{"name":"vda1","mountpoints":["/"]}]}]}'))
+      ["/", "/var/storage"].each do |path|
+        file_name = File.join(path, "test-file-respirate")
+        expect(session).to receive(:_exec!).with(NetSsh.command("sudo bash -c :command", command: NetSsh.command("head -c 1M </dev/zero > :file_name", file_name:))).and_return(ok.call)
+        expect(session).to receive(:_exec!).with("sha256sum #{file_name}").and_return(ok.call("30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58  #{file_name}\n"))
+        expect(session).to receive(:_exec!).with("sudo rm #{file_name}").and_return(ok.call)
+      end
+      expect(session).to receive(:_exec!).with("journalctl -kS -1min --no-pager").and_return(ok.call)
+      expect(byoh_nx.sshable).to receive(:_cmd).with("cat /proc/sys/kernel/random/boot_id").and_return("boot-id\n")
+
+      expect { byoh_nx.unavailable }.to hop("wait")
+      expect(byoh_nx.checkup_set?).to be false
+    end
   end
 
   describe "#check_boot_id" do

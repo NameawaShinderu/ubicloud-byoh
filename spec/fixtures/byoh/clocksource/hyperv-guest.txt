@@ -1,0 +1,2 @@
+# fixture: Hyper-V or Azure guest (UNVERIFIED)
+hyperv_clocksource_tsc_page acpi_pm 

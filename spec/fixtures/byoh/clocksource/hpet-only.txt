@@ -1,0 +1,2 @@
+# fixture: x86 host with an unstable TSC
+hpet acpi_pm 

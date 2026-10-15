@@ -1,0 +1,2 @@
+# fixture: Samsung datacenter NVMe; synthesised in the smartmontools 7.4 -j -i -H format (UNVERIFIED)
+{"json_format_version":[1,0],"smartctl":{"version":[7,4],"svn_revision":"5530","platform_info":"x86_64-linux-6.8.0-45-generic","build_info":"(local build)","argv":["smartctl","-j","-i","-H","/dev/nvme0n1"],"exit_status":0},"device":{"name":"/dev/nvme0n1","info_name":"/dev/nvme0n1","type":"nvme","protocol":"NVMe"},"model_name":"SAMSUNG MZQLB960HAJR-00007","serial_number":"S437NA0N000001","smart_status":{"passed":true}}

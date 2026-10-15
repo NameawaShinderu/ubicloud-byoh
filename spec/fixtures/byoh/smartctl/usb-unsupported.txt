@@ -1,0 +1,2 @@
+# fixture: USB bridge without SMART passthrough; synthesised in the smartmontools 7.4 -j -i -H format (UNVERIFIED)
+{"json_format_version":[1,0],"smartctl":{"version":[7,4],"svn_revision":"5530","platform_info":"x86_64-linux-6.8.0-45-generic","build_info":"(local build)","argv":["smartctl","-j","-i","-H","/dev/sdc"],"exit_status":4},"device":{"name":"/dev/sdc","info_name":"/dev/sdc","type":"scsi","protocol":"SCSI"},"scsi_vendor":"JMicron","scsi_product":"Tech","scsi_model_name":"JMicron Tech","smart_support":{"available":false}}
