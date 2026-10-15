@@ -132,6 +132,7 @@ ART=$PVM_WORK/artifacts
 STATE=$PVM_WORK/state
 REPORT=$PVM_WORK/report.txt
 MODULES_DIR=/lib/modules
+BOOT_DIR=/boot
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 VIRT_PROBE=${PVM_VIRT_PROBE:-$SCRIPT_DIR/../../../../rhizome/host/lib/virt_probe.rb}
 
@@ -287,6 +288,13 @@ stock_entry() {
   fi
 }
 
+# Does saved_entry $1 still boot stock kernel $2? It names a menu title,
+# so if the kernel went away GRUB would fall back to entry 0, which is
+# the PVM kernel once it is installed.
+stock_entry_resolves() {
+  grep -qF "menuentry '${1##*>}'" "$BOOT_DIR/grub/grub.cfg" && [ -f "$BOOT_DIR/vmlinuz-$2" ]
+}
+
 # The drivers between each disk/NIC and the root of /sys/devices.
 drivers_in_use() {
   local dev d
@@ -381,6 +389,10 @@ install_phase() {
   done
   [ -z "$unmapped" ] || die "cannot check the PVM kernel for drivers this instance's disks and NICs use:$unmapped (no module of that name in $(uname -r)). Check by hand that $PVM_HOST_DEB has them (dpkg-deb -c), then rerun with PVM_UNCHECKED_DRIVERS=\"${unmapped# }\". Nothing was changed."
 
+  local stock_pkg
+  stock_pkg="linux-image-$(uname -r)"
+  dpkg -s "$stock_pkg" >/dev/null 2>&1 || die "the running kernel is not from package $stock_pkg, so it cannot be held. Nothing was changed."
+
   # 1. Pin the running stock kernel before the .deb's update-grub runs:
   #    6.12-pvm sorts above noble's 6.8 and would become the top entry,
   #    which GRUB_DEFAULT=0 (or saved with no saved_entry) boots forever.
@@ -398,7 +410,17 @@ install_phase() {
   state_set kver "$kver"
   state_set pkg "$pkg"
 
-  # 2. The kernel, held so an apt upgrade never replaces it.
+  # 2. Keep the stock kernel installed while saved_entry names it: under
+  #    the PVM kernel, apt's running-kernel protection covers the PVM one,
+  #    and an autoremove could take the stock kernel. Held and marked
+  #    manual; uninstall restores both marks.
+  state_set stock_pkg "$stock_pkg"
+  state_set stock_pkg_held "$(apt-mark showhold "$stock_pkg")"
+  state_set stock_pkg_auto "$(apt-mark showauto "$stock_pkg")"
+  apt-mark hold "$stock_pkg"
+  apt-mark manual "$stock_pkg"
+
+  #    The PVM kernel, held so an apt upgrade never replaces it.
   apt-get install -y "$ART/$PVM_HOST_DEB"
   apt-mark hold "$pkg"
   [ -f "/boot/vmlinuz-$kver" ] || die "/boot/vmlinuz-$kver is missing after the install"
@@ -492,7 +514,8 @@ boot_test_phase() {
   grep -qw 'pti=off' /proc/cmdline || die "pti=off is missing from /proc/cmdline"
   [ -z "$(grubenv_get next_entry)" ] || die "next_entry is still set; the boot was not one-shot"
   [ "$(grubenv_get saved_entry)" = "$stock" ] || die "saved_entry is no longer the stock kernel; a power cycle would not recover"
-  report "one-shot: next_entry cleared, saved_entry still '$stock'"
+  stock_entry_resolves "$stock" "$(state_get stock_kver)" || die "saved_entry '$stock' no longer matches an entry with its kernel in $BOOT_DIR; a power cycle would boot entry 0. Reinstall $(state_get stock_pkg) before rebooting."
+  report "one-shot: next_entry cleared, saved_entry still '$stock' and still in grub.cfg"
   report "platform: $(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) / $(cat /sys/class/dmi/id/product_name 2>/dev/null); cpu: $(sed -n 's/^model name\t*: //p' /proc/cpuinfo | head -1); vmx/svm: $(grep -cwE 'vmx|svm' /proc/cpuinfo || true)"
 
   modprobe -r kvm_intel kvm_amd 2>/dev/null || true
@@ -639,6 +662,12 @@ uninstall_phase() {
   [ "$(uname -r)" != "$kver" ] || die "running the PVM kernel; reboot to the stock kernel first"
   rm -f "$GRUB_SCRIPT" "$GRUB_DROPIN"
   grub-editenv - unset next_entry
+  local stock_pkg
+  stock_pkg=$(state_get stock_pkg)
+  if [ -n "$stock_pkg" ] && dpkg -s "$stock_pkg" >/dev/null 2>&1; then
+    [ -n "$(state_get stock_pkg_held)" ] || apt-mark unhold "$stock_pkg"
+    [ -z "$(state_get stock_pkg_auto)" ] || apt-mark auto "$stock_pkg"
+  fi
   if [ -n "$pkg" ] && dpkg -s "$pkg" >/dev/null 2>&1; then
     apt-mark unhold "$pkg"
     apt-get purge -y "$pkg"

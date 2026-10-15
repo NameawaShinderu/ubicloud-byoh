@@ -1414,8 +1414,10 @@ What each phase checks (the script's header lists the environment overrides):
   config without `=y` for VFAT, NLS 437 and ISO8859-1, PVM_GUEST, X86_PIE, virtio-blk/net/pci, ext4
   and the 8250 console. Then, in the order of section 6.7: `GRUB_DEFAULT=saved` in a `grub.d` drop-in,
   `grub-set-default` the running stock kernel, and checks that `grub.cfg` boots `${saved_entry}` and
-  can clear `next_entry` (`save_env`), all **before** the `.deb`'s own `update-grub`; installs and
-  `apt-mark hold`s the `.deb`; refuses unless the PVM kernel has a module or built-in for every driver
+  can clear `next_entry` (`save_env`), all **before** the `.deb`'s own `update-grub`; holds the stock
+  `linux-image-$(uname -r)` and marks it manual (under the PVM kernel apt protects the running PVM
+  kernel instead, so an autoremove could take the stock one and leave `saved_entry` naming nothing;
+  `uninstall` restores both marks); installs and `apt-mark hold`s the `.deb`; refuses unless the PVM kernel has a module or built-in for every driver
   between this instance's disks and NICs and `/sys/devices` (ENA, NVMe, virtio, gVNIC...) and for the
   root file system. A driver on those paths that names no module or built-in of the running kernel is
   refused before anything changes (Xen's `vif` and `vbd` map to `xen_netfront` and `xen_blkfront`,
@@ -1424,7 +1426,7 @@ What each phase checks (the script's header lists the environment overrides):
   on that entry only) and checks `pti=off` appears exactly once in `grub.cfg`, inside that entry;
   then `grub-reboot ubicloud-pvm` and checks `next_entry` **and** the stock `saved_entry`.
 - **boot-test** (on the PVM kernel): one-shot proven (`next_entry` cleared, `saved_entry` still
-  stock); `modprobe kvm_pvm`; `/dev/kvm` mode and owner recorded; `virt_probe.rb --json` must say
+  stock and still a `grub.cfg` entry whose kernel is in `/boot`); `modprobe kvm_pvm`; `/dev/kvm` mode and owner recorded; `virt_probe.rb --json` must say
   `pvm` (a "DETECTION MISMATCH" line otherwise); Cloud Hypervisor v46.0 **and** v53.0
   (`cloud-hypervisor-static`, sha256 equal to rhizome's pins; the spec keeps them equal); the noble
   cloud image (listed in its `SHA256SUMS`) as raw, a vfat `CIDATA` seed like rhizome's, direct kernel

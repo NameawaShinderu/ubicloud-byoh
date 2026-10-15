@@ -78,6 +78,19 @@ RSpec.describe ByohVirtTiers, "pvm" do
       end
     end
 
+    it "checks that saved_entry still names the stock kernel" do
+      Dir.mktmpdir do |boot|
+        FileUtils.mkdir_p("#{boot}/grub")
+        File.write("#{boot}/grub/grub.cfg", "submenu 'Advanced options for Ubuntu' {\n\tmenuentry 'Ubuntu, with Linux 6.8.0-1-aws' --class ubuntu {\n")
+        resolves = ->(entry, kver) { run_functions(%w[stock_entry_resolves], "stock_entry_resolves '#{entry}' #{kver}", BOOT_DIR: boot)[1].success? }
+        expect(resolves.call("Advanced options for Ubuntu>Ubuntu, with Linux 6.8.0-1-aws", "6.8.0-1-aws")).to be false
+        File.write("#{boot}/vmlinuz-6.8.0-1-aws", "")
+        expect(resolves.call("Advanced options for Ubuntu>Ubuntu, with Linux 6.8.0-1-aws", "6.8.0-1-aws")).to be true
+        expect(resolves.call("Ubuntu, with Linux 6.8.0-1-aws", "6.8.0-1-aws")).to be true
+        expect(resolves.call("Advanced options for Ubuntu>Ubuntu, with Linux 6.8.0-2-aws", "6.8.0-1-aws")).to be false
+      end
+    end
+
     describe "the release pins" do
       let(:defaults) { script.scan(/^(DEFAULT_\w+)=(\S+)$/).to_h }
       let(:release) { {PVM_RELEASE_URL: defaults["DEFAULT_RELEASE_URL"], PVM_HOST_DEB: defaults["DEFAULT_HOST_DEB"], PVM_GUEST_KERNEL: defaults["DEFAULT_GUEST_KERNEL"], PVM_GUEST_CONFIG: defaults["DEFAULT_GUEST_CONFIG"]} }
