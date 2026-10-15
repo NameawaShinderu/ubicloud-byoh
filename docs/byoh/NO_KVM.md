@@ -1152,8 +1152,10 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 - Done: `git diff 9e22d71ec -- '*golden*'` shows only added files; the full gate.
 - Status: SHIPPED. Every WP2 golden was generated in a worktree of 9e22d71ec (which also needed
   this branch's `virt_probe` migration, only to share the test databases), and the pre-existing
-  goldens regenerate byte for byte there. Families with no VmVCpu rate in hetzner-fsn1, us-west-2 or
-  gcp-us-central1 (for example `premium`, `m6a`) are pinned as "no location", not assembled.
+  goldens regenerate byte for byte there. The assemble golden tries hetzner-fsn1, us-west-2,
+  gcp-us-central1, github-runners and eu-central-1, so every family and architecture (including
+  `premium` and the AWS m-families) is assembled in a location that bills it; a family that none
+  of them bills fails the spec instead of going unpinned.
 
 ### WP3: detection v2 and the harness skeleton
 

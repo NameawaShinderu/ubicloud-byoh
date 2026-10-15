@@ -196,7 +196,99 @@
   {
     "size": "premium-2",
     "arch": "x64",
-    "location": null
+    "location": "github-runners",
+    "vm": {
+      "ephemeral_net6": null,
+      "vm_host_id": null,
+      "unix_user": "ubi",
+      "public_key": "ssh-ed25519 AAAAgolden",
+      "display_state": "creating",
+      "name": "golden-premium-x64",
+      "boot_image": "ubuntu-noble",
+      "local_vetho_ip": null,
+      "ip4_enabled": false,
+      "family": "premium",
+      "cores": 0,
+      "pool_id": null,
+      "arch": "x64",
+      "allocated_at": null,
+      "provisioned_at": null,
+      "vcpus": 2,
+      "memory_gib": 8,
+      "vm_host_slice_id": null,
+      "cpu_percent_limit": 200,
+      "cpu_burst_percent_limit": 0,
+      "hypervisor_id": null,
+      "maintenance_window_start_at": null,
+      "ip4_exposure": "internet"
+    },
+    "nics": [
+      {
+        "name": "golden-premium-x64-nic",
+        "state": "initializing",
+        "vm_id": "<uuid>"
+      }
+    ],
+    "storage_volumes": [
+      {
+        "boot": true,
+        "size_gib": 40,
+        "disk_index": 0,
+        "spdk_installation_id": null,
+        "use_bdev_ubi": false,
+        "storage_device_id": null,
+        "boot_image_id": null,
+        "max_read_mbytes_per_sec": null,
+        "max_write_mbytes_per_sec": null,
+        "vhost_block_backend_id": null,
+        "vring_workers": null,
+        "machine_image_version_id": null,
+        "track_written": true,
+        "remote_storage_server_id": null,
+        "network_volume_id": null,
+        "encrypted": true
+      }
+    ],
+    "strand": {
+      "prog": "Vm::Metal::Nexus",
+      "label": "start",
+      "stack": [
+        {
+          "use_eip": true,
+          "gpu_count": 0,
+          "hugepages": true,
+          "ch_version": null,
+          "gpu_device": null,
+          "hypervisor": null,
+          "force_host_id": null,
+          "storage_volumes": [
+            {
+              "boot": true,
+              "size_gib": 40,
+              "encrypted": true,
+              "track_written": true,
+              "vring_workers": 1,
+              "max_read_mbytes_per_sec": null,
+              "max_write_mbytes_per_sec": null
+            }
+          ],
+          "swap_size_bytes": null,
+          "unsupported_azs": [],
+          "exclude_host_ids": [],
+          "firmware_version": null,
+          "private_subnet_id": "<uuid>",
+          "waiting_strand_id": null,
+          "alternative_families": [],
+          "exclude_data_centers": [],
+          "create_network_interface": true,
+          "distinct_storage_devices": false,
+          "exclude_availability_zones": [],
+          "required_availability_zone": null,
+          "allocated_waiting_strand_id": null,
+          "use_separate_management_nic": false
+        }
+      ]
+    }
   },
   {
     "size": "burstable-1",
@@ -880,42 +972,778 @@
   {
     "size": "m6a.large",
     "arch": "x64",
-    "location": null
+    "location": "eu-central-1",
+    "vm": {
+      "ephemeral_net6": null,
+      "vm_host_id": null,
+      "unix_user": "ubi",
+      "public_key": "ssh-ed25519 AAAAgolden",
+      "display_state": "creating",
+      "name": "golden-m6a-x64",
+      "boot_image": "ubuntu-noble",
+      "local_vetho_ip": null,
+      "ip4_enabled": false,
+      "family": "m6a",
+      "cores": 0,
+      "pool_id": null,
+      "arch": "x64",
+      "allocated_at": null,
+      "provisioned_at": null,
+      "vcpus": 2,
+      "memory_gib": 8,
+      "vm_host_slice_id": null,
+      "cpu_percent_limit": 200,
+      "cpu_burst_percent_limit": 0,
+      "hypervisor_id": null,
+      "maintenance_window_start_at": null,
+      "ip4_exposure": "internet"
+    },
+    "nics": [
+      {
+        "name": "golden-m6a-x64-nic",
+        "state": "active",
+        "vm_id": "<uuid>"
+      }
+    ],
+    "storage_volumes": [
+      {
+        "boot": true,
+        "size_gib": 118,
+        "disk_index": 0,
+        "spdk_installation_id": null,
+        "use_bdev_ubi": false,
+        "storage_device_id": null,
+        "boot_image_id": null,
+        "max_read_mbytes_per_sec": null,
+        "max_write_mbytes_per_sec": null,
+        "vhost_block_backend_id": null,
+        "vring_workers": null,
+        "machine_image_version_id": null,
+        "track_written": false,
+        "remote_storage_server_id": null,
+        "network_volume_id": null,
+        "encrypted": false
+      }
+    ],
+    "strand": {
+      "prog": "Vm::Aws::Nexus",
+      "label": "start",
+      "stack": [
+        {
+          "use_eip": true,
+          "gpu_count": 0,
+          "hugepages": true,
+          "ch_version": null,
+          "gpu_device": null,
+          "hypervisor": null,
+          "force_host_id": null,
+          "storage_volumes": [
+            {
+              "boot": true,
+              "size_gib": 118,
+              "encrypted": true,
+              "track_written": true,
+              "vring_workers": null,
+              "max_read_mbytes_per_sec": null,
+              "max_write_mbytes_per_sec": null
+            }
+          ],
+          "swap_size_bytes": null,
+          "unsupported_azs": [],
+          "exclude_host_ids": [],
+          "firmware_version": null,
+          "private_subnet_id": "<uuid>",
+          "waiting_strand_id": null,
+          "alternative_families": [],
+          "exclude_data_centers": [],
+          "create_network_interface": true,
+          "distinct_storage_devices": false,
+          "exclude_availability_zones": [],
+          "required_availability_zone": null,
+          "allocated_waiting_strand_id": null,
+          "use_separate_management_nic": false
+        }
+      ]
+    }
   },
   {
     "size": "m7a.large",
     "arch": "x64",
-    "location": null
+    "location": "eu-central-1",
+    "vm": {
+      "ephemeral_net6": null,
+      "vm_host_id": null,
+      "unix_user": "ubi",
+      "public_key": "ssh-ed25519 AAAAgolden",
+      "display_state": "creating",
+      "name": "golden-m7a-x64",
+      "boot_image": "ubuntu-noble",
+      "local_vetho_ip": null,
+      "ip4_enabled": false,
+      "family": "m7a",
+      "cores": 0,
+      "pool_id": null,
+      "arch": "x64",
+      "allocated_at": null,
+      "provisioned_at": null,
+      "vcpus": 2,
+      "memory_gib": 8,
+      "vm_host_slice_id": null,
+      "cpu_percent_limit": 200,
+      "cpu_burst_percent_limit": 0,
+      "hypervisor_id": null,
+      "maintenance_window_start_at": null,
+      "ip4_exposure": "internet"
+    },
+    "nics": [
+      {
+        "name": "golden-m7a-x64-nic",
+        "state": "active",
+        "vm_id": "<uuid>"
+      }
+    ],
+    "storage_volumes": [
+      {
+        "boot": true,
+        "size_gib": 118,
+        "disk_index": 0,
+        "spdk_installation_id": null,
+        "use_bdev_ubi": false,
+        "storage_device_id": null,
+        "boot_image_id": null,
+        "max_read_mbytes_per_sec": null,
+        "max_write_mbytes_per_sec": null,
+        "vhost_block_backend_id": null,
+        "vring_workers": null,
+        "machine_image_version_id": null,
+        "track_written": false,
+        "remote_storage_server_id": null,
+        "network_volume_id": null,
+        "encrypted": false
+      }
+    ],
+    "strand": {
+      "prog": "Vm::Aws::Nexus",
+      "label": "start",
+      "stack": [
+        {
+          "use_eip": true,
+          "gpu_count": 0,
+          "hugepages": true,
+          "ch_version": null,
+          "gpu_device": null,
+          "hypervisor": null,
+          "force_host_id": null,
+          "storage_volumes": [
+            {
+              "boot": true,
+              "size_gib": 118,
+              "encrypted": true,
+              "track_written": true,
+              "vring_workers": null,
+              "max_read_mbytes_per_sec": null,
+              "max_write_mbytes_per_sec": null
+            }
+          ],
+          "swap_size_bytes": null,
+          "unsupported_azs": [],
+          "exclude_host_ids": [],
+          "firmware_version": null,
+          "private_subnet_id": "<uuid>",
+          "waiting_strand_id": null,
+          "alternative_families": [],
+          "exclude_data_centers": [],
+          "create_network_interface": true,
+          "distinct_storage_devices": false,
+          "exclude_availability_zones": [],
+          "required_availability_zone": null,
+          "allocated_waiting_strand_id": null,
+          "use_separate_management_nic": false
+        }
+      ]
+    }
   },
   {
     "size": "m7i.large",
     "arch": "x64",
-    "location": null
+    "location": "eu-central-1",
+    "vm": {
+      "ephemeral_net6": null,
+      "vm_host_id": null,
+      "unix_user": "ubi",
+      "public_key": "ssh-ed25519 AAAAgolden",
+      "display_state": "creating",
+      "name": "golden-m7i-x64",
+      "boot_image": "ubuntu-noble",
+      "local_vetho_ip": null,
+      "ip4_enabled": false,
+      "family": "m7i",
+      "cores": 0,
+      "pool_id": null,
+      "arch": "x64",
+      "allocated_at": null,
+      "provisioned_at": null,
+      "vcpus": 2,
+      "memory_gib": 8,
+      "vm_host_slice_id": null,
+      "cpu_percent_limit": 200,
+      "cpu_burst_percent_limit": 0,
+      "hypervisor_id": null,
+      "maintenance_window_start_at": null,
+      "ip4_exposure": "internet"
+    },
+    "nics": [
+      {
+        "name": "golden-m7i-x64-nic",
+        "state": "active",
+        "vm_id": "<uuid>"
+      }
+    ],
+    "storage_volumes": [
+      {
+        "boot": true,
+        "size_gib": 118,
+        "disk_index": 0,
+        "spdk_installation_id": null,
+        "use_bdev_ubi": false,
+        "storage_device_id": null,
+        "boot_image_id": null,
+        "max_read_mbytes_per_sec": null,
+        "max_write_mbytes_per_sec": null,
+        "vhost_block_backend_id": null,
+        "vring_workers": null,
+        "machine_image_version_id": null,
+        "track_written": false,
+        "remote_storage_server_id": null,
+        "network_volume_id": null,
+        "encrypted": false
+      }
+    ],
+    "strand": {
+      "prog": "Vm::Aws::Nexus",
+      "label": "start",
+      "stack": [
+        {
+          "use_eip": true,
+          "gpu_count": 0,
+          "hugepages": true,
+          "ch_version": null,
+          "gpu_device": null,
+          "hypervisor": null,
+          "force_host_id": null,
+          "storage_volumes": [
+            {
+              "boot": true,
+              "size_gib": 118,
+              "encrypted": true,
+              "track_written": true,
+              "vring_workers": null,
+              "max_read_mbytes_per_sec": null,
+              "max_write_mbytes_per_sec": null
+            }
+          ],
+          "swap_size_bytes": null,
+          "unsupported_azs": [],
+          "exclude_host_ids": [],
+          "firmware_version": null,
+          "private_subnet_id": "<uuid>",
+          "waiting_strand_id": null,
+          "alternative_families": [],
+          "exclude_data_centers": [],
+          "create_network_interface": true,
+          "distinct_storage_devices": false,
+          "exclude_availability_zones": [],
+          "required_availability_zone": null,
+          "allocated_waiting_strand_id": null,
+          "use_separate_management_nic": false
+        }
+      ]
+    }
   },
   {
     "size": "m8a.large",
     "arch": "x64",
-    "location": null
+    "location": "eu-central-1",
+    "vm": {
+      "ephemeral_net6": null,
+      "vm_host_id": null,
+      "unix_user": "ubi",
+      "public_key": "ssh-ed25519 AAAAgolden",
+      "display_state": "creating",
+      "name": "golden-m8a-x64",
+      "boot_image": "ubuntu-noble",
+      "local_vetho_ip": null,
+      "ip4_enabled": false,
+      "family": "m8a",
+      "cores": 0,
+      "pool_id": null,
+      "arch": "x64",
+      "allocated_at": null,
+      "provisioned_at": null,
+      "vcpus": 2,
+      "memory_gib": 8,
+      "vm_host_slice_id": null,
+      "cpu_percent_limit": 200,
+      "cpu_burst_percent_limit": 0,
+      "hypervisor_id": null,
+      "maintenance_window_start_at": null,
+      "ip4_exposure": "internet"
+    },
+    "nics": [
+      {
+        "name": "golden-m8a-x64-nic",
+        "state": "active",
+        "vm_id": "<uuid>"
+      }
+    ],
+    "storage_volumes": [
+      {
+        "boot": true,
+        "size_gib": 118,
+        "disk_index": 0,
+        "spdk_installation_id": null,
+        "use_bdev_ubi": false,
+        "storage_device_id": null,
+        "boot_image_id": null,
+        "max_read_mbytes_per_sec": null,
+        "max_write_mbytes_per_sec": null,
+        "vhost_block_backend_id": null,
+        "vring_workers": null,
+        "machine_image_version_id": null,
+        "track_written": false,
+        "remote_storage_server_id": null,
+        "network_volume_id": null,
+        "encrypted": false
+      }
+    ],
+    "strand": {
+      "prog": "Vm::Aws::Nexus",
+      "label": "start",
+      "stack": [
+        {
+          "use_eip": true,
+          "gpu_count": 0,
+          "hugepages": true,
+          "ch_version": null,
+          "gpu_device": null,
+          "hypervisor": null,
+          "force_host_id": null,
+          "storage_volumes": [
+            {
+              "boot": true,
+              "size_gib": 118,
+              "encrypted": true,
+              "track_written": true,
+              "vring_workers": null,
+              "max_read_mbytes_per_sec": null,
+              "max_write_mbytes_per_sec": null
+            }
+          ],
+          "swap_size_bytes": null,
+          "unsupported_azs": [],
+          "exclude_host_ids": [],
+          "firmware_version": null,
+          "private_subnet_id": "<uuid>",
+          "waiting_strand_id": null,
+          "alternative_families": [],
+          "exclude_data_centers": [],
+          "create_network_interface": true,
+          "distinct_storage_devices": false,
+          "exclude_availability_zones": [],
+          "required_availability_zone": null,
+          "allocated_waiting_strand_id": null,
+          "use_separate_management_nic": false
+        }
+      ]
+    }
   },
   {
     "size": "m8i.large",
     "arch": "x64",
-    "location": null
+    "location": "eu-central-1",
+    "vm": {
+      "ephemeral_net6": null,
+      "vm_host_id": null,
+      "unix_user": "ubi",
+      "public_key": "ssh-ed25519 AAAAgolden",
+      "display_state": "creating",
+      "name": "golden-m8i-x64",
+      "boot_image": "ubuntu-noble",
+      "local_vetho_ip": null,
+      "ip4_enabled": false,
+      "family": "m8i",
+      "cores": 0,
+      "pool_id": null,
+      "arch": "x64",
+      "allocated_at": null,
+      "provisioned_at": null,
+      "vcpus": 2,
+      "memory_gib": 8,
+      "vm_host_slice_id": null,
+      "cpu_percent_limit": 200,
+      "cpu_burst_percent_limit": 0,
+      "hypervisor_id": null,
+      "maintenance_window_start_at": null,
+      "ip4_exposure": "internet"
+    },
+    "nics": [
+      {
+        "name": "golden-m8i-x64-nic",
+        "state": "active",
+        "vm_id": "<uuid>"
+      }
+    ],
+    "storage_volumes": [
+      {
+        "boot": true,
+        "size_gib": 118,
+        "disk_index": 0,
+        "spdk_installation_id": null,
+        "use_bdev_ubi": false,
+        "storage_device_id": null,
+        "boot_image_id": null,
+        "max_read_mbytes_per_sec": null,
+        "max_write_mbytes_per_sec": null,
+        "vhost_block_backend_id": null,
+        "vring_workers": null,
+        "machine_image_version_id": null,
+        "track_written": false,
+        "remote_storage_server_id": null,
+        "network_volume_id": null,
+        "encrypted": false
+      }
+    ],
+    "strand": {
+      "prog": "Vm::Aws::Nexus",
+      "label": "start",
+      "stack": [
+        {
+          "use_eip": true,
+          "gpu_count": 0,
+          "hugepages": true,
+          "ch_version": null,
+          "gpu_device": null,
+          "hypervisor": null,
+          "force_host_id": null,
+          "storage_volumes": [
+            {
+              "boot": true,
+              "size_gib": 118,
+              "encrypted": true,
+              "track_written": true,
+              "vring_workers": null,
+              "max_read_mbytes_per_sec": null,
+              "max_write_mbytes_per_sec": null
+            }
+          ],
+          "swap_size_bytes": null,
+          "unsupported_azs": [],
+          "exclude_host_ids": [],
+          "firmware_version": null,
+          "private_subnet_id": "<uuid>",
+          "waiting_strand_id": null,
+          "alternative_families": [],
+          "exclude_data_centers": [],
+          "create_network_interface": true,
+          "distinct_storage_devices": false,
+          "exclude_availability_zones": [],
+          "required_availability_zone": null,
+          "allocated_waiting_strand_id": null,
+          "use_separate_management_nic": false
+        }
+      ]
+    }
   },
   {
     "size": "m7g.large",
     "arch": "arm64",
-    "location": null
+    "location": "eu-central-1",
+    "vm": {
+      "ephemeral_net6": null,
+      "vm_host_id": null,
+      "unix_user": "ubi",
+      "public_key": "ssh-ed25519 AAAAgolden",
+      "display_state": "creating",
+      "name": "golden-m7g-arm64",
+      "boot_image": "ubuntu-noble",
+      "local_vetho_ip": null,
+      "ip4_enabled": false,
+      "family": "m7g",
+      "cores": 0,
+      "pool_id": null,
+      "arch": "arm64",
+      "allocated_at": null,
+      "provisioned_at": null,
+      "vcpus": 2,
+      "memory_gib": 8,
+      "vm_host_slice_id": null,
+      "cpu_percent_limit": 200,
+      "cpu_burst_percent_limit": 0,
+      "hypervisor_id": null,
+      "maintenance_window_start_at": null,
+      "ip4_exposure": "internet"
+    },
+    "nics": [
+      {
+        "name": "golden-m7g-arm64-nic",
+        "state": "active",
+        "vm_id": "<uuid>"
+      }
+    ],
+    "storage_volumes": [
+      {
+        "boot": true,
+        "size_gib": 118,
+        "disk_index": 0,
+        "spdk_installation_id": null,
+        "use_bdev_ubi": false,
+        "storage_device_id": null,
+        "boot_image_id": null,
+        "max_read_mbytes_per_sec": null,
+        "max_write_mbytes_per_sec": null,
+        "vhost_block_backend_id": null,
+        "vring_workers": null,
+        "machine_image_version_id": null,
+        "track_written": false,
+        "remote_storage_server_id": null,
+        "network_volume_id": null,
+        "encrypted": false
+      }
+    ],
+    "strand": {
+      "prog": "Vm::Aws::Nexus",
+      "label": "start",
+      "stack": [
+        {
+          "use_eip": true,
+          "gpu_count": 0,
+          "hugepages": true,
+          "ch_version": null,
+          "gpu_device": null,
+          "hypervisor": null,
+          "force_host_id": null,
+          "storage_volumes": [
+            {
+              "boot": true,
+              "size_gib": 118,
+              "encrypted": true,
+              "track_written": true,
+              "vring_workers": null,
+              "max_read_mbytes_per_sec": null,
+              "max_write_mbytes_per_sec": null
+            }
+          ],
+          "swap_size_bytes": null,
+          "unsupported_azs": [],
+          "exclude_host_ids": [],
+          "firmware_version": null,
+          "private_subnet_id": "<uuid>",
+          "waiting_strand_id": null,
+          "alternative_families": [],
+          "exclude_data_centers": [],
+          "create_network_interface": true,
+          "distinct_storage_devices": false,
+          "exclude_availability_zones": [],
+          "required_availability_zone": null,
+          "allocated_waiting_strand_id": null,
+          "use_separate_management_nic": false
+        }
+      ]
+    }
   },
   {
     "size": "m8g.large",
     "arch": "arm64",
-    "location": null
+    "location": "eu-central-1",
+    "vm": {
+      "ephemeral_net6": null,
+      "vm_host_id": null,
+      "unix_user": "ubi",
+      "public_key": "ssh-ed25519 AAAAgolden",
+      "display_state": "creating",
+      "name": "golden-m8g-arm64",
+      "boot_image": "ubuntu-noble",
+      "local_vetho_ip": null,
+      "ip4_enabled": false,
+      "family": "m8g",
+      "cores": 0,
+      "pool_id": null,
+      "arch": "arm64",
+      "allocated_at": null,
+      "provisioned_at": null,
+      "vcpus": 2,
+      "memory_gib": 8,
+      "vm_host_slice_id": null,
+      "cpu_percent_limit": 200,
+      "cpu_burst_percent_limit": 0,
+      "hypervisor_id": null,
+      "maintenance_window_start_at": null,
+      "ip4_exposure": "internet"
+    },
+    "nics": [
+      {
+        "name": "golden-m8g-arm64-nic",
+        "state": "active",
+        "vm_id": "<uuid>"
+      }
+    ],
+    "storage_volumes": [
+      {
+        "boot": true,
+        "size_gib": 118,
+        "disk_index": 0,
+        "spdk_installation_id": null,
+        "use_bdev_ubi": false,
+        "storage_device_id": null,
+        "boot_image_id": null,
+        "max_read_mbytes_per_sec": null,
+        "max_write_mbytes_per_sec": null,
+        "vhost_block_backend_id": null,
+        "vring_workers": null,
+        "machine_image_version_id": null,
+        "track_written": false,
+        "remote_storage_server_id": null,
+        "network_volume_id": null,
+        "encrypted": false
+      }
+    ],
+    "strand": {
+      "prog": "Vm::Aws::Nexus",
+      "label": "start",
+      "stack": [
+        {
+          "use_eip": true,
+          "gpu_count": 0,
+          "hugepages": true,
+          "ch_version": null,
+          "gpu_device": null,
+          "hypervisor": null,
+          "force_host_id": null,
+          "storage_volumes": [
+            {
+              "boot": true,
+              "size_gib": 118,
+              "encrypted": true,
+              "track_written": true,
+              "vring_workers": null,
+              "max_read_mbytes_per_sec": null,
+              "max_write_mbytes_per_sec": null
+            }
+          ],
+          "swap_size_bytes": null,
+          "unsupported_azs": [],
+          "exclude_host_ids": [],
+          "firmware_version": null,
+          "private_subnet_id": "<uuid>",
+          "waiting_strand_id": null,
+          "alternative_families": [],
+          "exclude_data_centers": [],
+          "create_network_interface": true,
+          "distinct_storage_devices": false,
+          "exclude_availability_zones": [],
+          "required_availability_zone": null,
+          "allocated_waiting_strand_id": null,
+          "use_separate_management_nic": false
+        }
+      ]
+    }
   },
   {
     "size": "m9g.large",
     "arch": "arm64",
-    "location": null
+    "location": "eu-central-1",
+    "vm": {
+      "ephemeral_net6": null,
+      "vm_host_id": null,
+      "unix_user": "ubi",
+      "public_key": "ssh-ed25519 AAAAgolden",
+      "display_state": "creating",
+      "name": "golden-m9g-arm64",
+      "boot_image": "ubuntu-noble",
+      "local_vetho_ip": null,
+      "ip4_enabled": false,
+      "family": "m9g",
+      "cores": 0,
+      "pool_id": null,
+      "arch": "arm64",
+      "allocated_at": null,
+      "provisioned_at": null,
+      "vcpus": 2,
+      "memory_gib": 8,
+      "vm_host_slice_id": null,
+      "cpu_percent_limit": 200,
+      "cpu_burst_percent_limit": 0,
+      "hypervisor_id": null,
+      "maintenance_window_start_at": null,
+      "ip4_exposure": "internet"
+    },
+    "nics": [
+      {
+        "name": "golden-m9g-arm64-nic",
+        "state": "active",
+        "vm_id": "<uuid>"
+      }
+    ],
+    "storage_volumes": [
+      {
+        "boot": true,
+        "size_gib": 118,
+        "disk_index": 0,
+        "spdk_installation_id": null,
+        "use_bdev_ubi": false,
+        "storage_device_id": null,
+        "boot_image_id": null,
+        "max_read_mbytes_per_sec": null,
+        "max_write_mbytes_per_sec": null,
+        "vhost_block_backend_id": null,
+        "vring_workers": null,
+        "machine_image_version_id": null,
+        "track_written": false,
+        "remote_storage_server_id": null,
+        "network_volume_id": null,
+        "encrypted": false
+      }
+    ],
+    "strand": {
+      "prog": "Vm::Aws::Nexus",
+      "label": "start",
+      "stack": [
+        {
+          "use_eip": true,
+          "gpu_count": 0,
+          "hugepages": true,
+          "ch_version": null,
+          "gpu_device": null,
+          "hypervisor": null,
+          "force_host_id": null,
+          "storage_volumes": [
+            {
+              "boot": true,
+              "size_gib": 118,
+              "encrypted": true,
+              "track_written": true,
+              "vring_workers": null,
+              "max_read_mbytes_per_sec": null,
+              "max_write_mbytes_per_sec": null
+            }
+          ],
+          "swap_size_bytes": null,
+          "unsupported_azs": [],
+          "exclude_host_ids": [],
+          "firmware_version": null,
+          "private_subnet_id": "<uuid>",
+          "waiting_strand_id": null,
+          "alternative_families": [],
+          "exclude_data_centers": [],
+          "create_network_interface": true,
+          "distinct_storage_devices": false,
+          "exclude_availability_zones": [],
+          "required_availability_zone": null,
+          "allocated_waiting_strand_id": null,
+          "use_separate_management_nic": false
+        }
+      ]
+    }
   },
   {
     "size": "m6gd.large",
