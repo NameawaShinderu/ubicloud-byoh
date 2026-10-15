@@ -87,6 +87,31 @@ Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): pass in about
 6 s after the image build, nothing left behind; with `UBI_M4_KEEP=1` it
 passes and keeps both containers.
 
+### Root key install cases (WP9)
+
+```
+scripts/byoh/test/m4-install-key-cases.sh
+```
+
+Runs `ByohHostAdd::INSTALL_SCRIPT`, the script `byoh-host add` runs as
+root to install the registration key, on a fakehost. The remote command
+and stdin come from `ByohOperatorSsh#run_script` itself, rendered in a
+`ubi-m4-render` container from `ubi-bundler-m1` (`UBI_M4_RUBY_IMAGE`),
+and each case sends them over ssh from a second fakehost as `ubuntu`.
+The cases: sshd already allows root key login (only `authorized_keys`
+changes; cloud-init's forced-command line, another site's line and a
+comment stay, a stale line with the same tag is replaced, and a re-run
+leaves the file as it was); `PermitRootLogin no` after the `Include`
+(the drop-in is written, sshd reloads and root logs in with the key);
+and the failures 11 (an earlier drop-in wins, named on stderr), 12
+(`sshd -T` fails), 13 (no `Include`), 10 (`sshd -t` fails) and 14 (no
+reload). 10 and 14 use per-case shims in `/usr/local/sbin`, which sudo's
+secure_path puts first. Each failure must leave no drop-in and sshd
+serving. A socket-activated `ssh.socket` is not covered (no systemd in
+the fakehost): UNVERIFIED.
+Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): all 7 cases pass
+in about 10 s after the image build, nothing left behind.
+
 ### Host preflight fixtures (WP5)
 
 ```
