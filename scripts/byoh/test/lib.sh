@@ -69,7 +69,7 @@ dx() {
 }
 
 # Removes only the containers this run created, and only those that
-# carry this run's prefix.
+# carry this run's prefix; other prefixes' records stay in the file.
 cleanup() {
   local name
   if [[ ${UBI_M3_KEEP:-0} == 1 ]]; then
@@ -79,7 +79,10 @@ cleanup() {
   while read -r name; do
     [[ $name == "$PREFIX"-* ]] && docker rm -f "$name" >/dev/null 2>&1
   done <"$STATE/created"
-  : >"$STATE/created"
+  # Keeps the records of another prefix sharing this state dir, so that
+  # run's own cleanup still removes them.
+  grep -v "^$PREFIX-" "$STATE/created" >"$STATE/created.tmp" || true
+  mv "$STATE/created.tmp" "$STATE/created"
 }
 
 # Archives the working tree, untracked but not ignored files included,

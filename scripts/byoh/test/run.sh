@@ -17,6 +17,10 @@
 # Logs go to $UBI_M3_LOGS (default: a fresh temp dir, printed at the
 # end). UBI_M3_KEEP=1 keeps the containers for inspection.
 set -euo pipefail
+# This script names ubi-m3-* containers directly, so the prefix and image
+# are pinned whatever the caller's environment says.
+UBI_TEST_PREFIX=ubi-m3
+UBI_TEST_SYSTEMD_IMAGE=ubi-m3-systemd
 # shellcheck source=scripts/byoh/test/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 trap cleanup EXIT

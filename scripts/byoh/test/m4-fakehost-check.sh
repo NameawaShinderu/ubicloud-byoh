@@ -3,7 +3,7 @@
 # two containers on ubi-test-net, logs in from one to the other with
 # the per-run RSA key, and checks sudo, the systemctl shim and that
 # auth events reach `docker logs`. Removes what it created, and fails
-# if any ubi-m4-* container is left.
+# if any ubi-m4-* container is left (not checked with UBI_M4_KEEP=1).
 set -euo pipefail
 # shellcheck source=scripts/byoh/test/m4-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/m4-lib.sh"
@@ -62,7 +62,15 @@ if rssh 'sudo systemctl restart sshd' 2>/dev/null; then fail "restart with a bad
 rssh true || fail "login after a failed reload"
 rssh 'sudo rm /etc/ssh/sshd_config.d/60-bad.conf' || fail "remove bad drop-in"
 
+# cleanup keeps another prefix's records in a shared state file.
+echo ubi-m3-not-ours >>"$STATE/created"
 cleanup
-left=$(docker ps -aq --filter "name=^$PREFIX-")
-[[ -z $left ]] || fail "left behind: $(docker ps -a --filter "name=^$PREFIX-" --format '{{.Names}}' | tr '\n' ' ')"
+grep -qx ubi-m3-not-ours "$STATE/created" || fail "cleanup dropped another prefix's record"
+if [[ ${UBI_M3_KEEP:-0} == 1 ]]; then
+  say "UBI_M4_KEEP=1: containers kept, left-behind check skipped"
+else
+  grep -q "^$PREFIX-" "$STATE/created" && fail "cleanup kept its own records"
+  left=$(docker ps -aq --filter "name=^$PREFIX-")
+  [[ -z $left ]] || fail "left behind: $(docker ps -a --filter "name=^$PREFIX-" --format '{{.Names}}' | tr '\n' ' ')"
+fi
 say "PASS m4 fakehost (logs: $LOGS)"

@@ -42,10 +42,14 @@ release with exactly the units' environment, parsed by systemd).
 
 `lib.sh` takes its container prefix from `UBI_TEST_PREFIX` (default
 `ubi-m3`) and the systemd image from `UBI_TEST_SYSTEMD_IMAGE` (default
-`ubi-m3-systemd`). `cleanup` removes only the recorded containers that
-carry the run's prefix. `m4-lib.sh` sources it with prefix `ubi-m4`
-(`UBI_M4_STATE`, `UBI_M4_LOGS` and `UBI_M4_KEEP` override the M3 names)
-and adds a fake data-plane host:
+`ubi-m3-systemd`). These are set by the wrapper that sources it, not a
+user override: `run.sh` pins both to the M3 values, because its
+scenarios name `ubi-m3-*` containers directly. `cleanup` removes only the
+recorded containers that carry the run's prefix and keeps the other
+records in `created`. `m4-lib.sh` sources it with prefix `ubi-m4` and
+its own state dir; only `UBI_M4_STATE`, `UBI_M4_LOGS` and `UBI_M4_KEEP`
+change that (an inherited `UBI_M3_*` is ignored). It adds a fake
+data-plane host:
 
 - `Dockerfile.fakehost` (context `fakehost/`) is ubuntu:24.04 with
   openssh-server, sudo, iproute2, util-linux, pciutils and curl, and no
@@ -75,11 +79,13 @@ The check logs in from a second fakehost as `ubuntu`, and checks sudo,
 the auth line in `docker logs`, no `/dev/kvm`, per-container host keys,
 `is-active`, that `systemctl reload ssh.service` makes sshd reread a
 drop-in (`Received SIGHUP` in `docker logs`, then `sshd -T`) and keep
-serving, and that a reload without sudo or with an invalid drop-in
-exits non-zero without signalling sshd while logins still work. It fails
-if any `ubi-m4-*` container is left. Result (2026-10-15, OpenSSH 9.6p1
-Ubuntu-3ubuntu13.20): pass in about 6 s after the image build, nothing
-left behind.
+serving, that a reload without sudo or with an invalid drop-in exits
+non-zero without signalling sshd while logins still work, and that
+cleanup keeps another prefix's records in a shared state file. It fails
+if any `ubi-m4-*` container is left (not checked with `UBI_M4_KEEP=1`).
+Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): pass in about
+6 s after the image build, nothing left behind; with `UBI_M4_KEEP=1` it
+passes and keeps both containers.
 
 ## Scenarios
 

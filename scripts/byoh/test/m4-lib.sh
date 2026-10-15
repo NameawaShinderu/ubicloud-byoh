@@ -13,13 +13,14 @@
 # The login key is generated per run in $STATE and never committed.
 # Never `set -x` here.
 
-# lib.sh reads these; UBI_M4_STATE/UBI_M4_LOGS/UBI_M4_KEEP take
-# precedence over the M3 names (empty means unset there).
+# lib.sh reads these. They come only from UBI_M4_STATE/UBI_M4_LOGS/
+# UBI_M4_KEEP, never from an inherited UBI_M3_*, so an M4 run gets its
+# own state dir unless asked otherwise (empty means unset in lib.sh).
 # shellcheck disable=SC2034
 UBI_TEST_PREFIX=ubi-m4
-UBI_M3_STATE=${UBI_M4_STATE:-${UBI_M3_STATE:-}}
-UBI_M3_LOGS=${UBI_M4_LOGS:-${UBI_M3_LOGS:-}}
-UBI_M3_KEEP=${UBI_M4_KEEP:-${UBI_M3_KEEP:-0}}
+UBI_M3_STATE=${UBI_M4_STATE:-}
+UBI_M3_LOGS=${UBI_M4_LOGS:-}
+UBI_M3_KEEP=${UBI_M4_KEEP:-0}
 # shellcheck source=scripts/byoh/test/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
