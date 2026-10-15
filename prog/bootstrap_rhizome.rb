@@ -6,7 +6,7 @@ class Prog::BootstrapRhizome < Prog::Base
   subject_is :sshable
   semaphore :destroy
 
-  frame_reader :target_folder, :no_bundler_install
+  frame_reader :target_folder, :no_bundler_install, :pin_host_keys
 
   def user
     @user ||= frame.fetch("user", "root")
@@ -58,7 +58,7 @@ LOGIND
 
     key_data = sshable.keys.map(&:private_key)
     no_bundler_install = (self.no_bundler_install == true).to_s
-    Util.rootish_ssh(sshable.host, user, key_data, <<SH, LOGIND_CONFIG:, SSHD_CONFIG:, public_keys: sshable.keys.map(&:public_key).join("\n"), no_bundler_install:)
+    Util.rootish_ssh(sshable.host, user, key_data, <<SH, **pinned_known_hosts, LOGIND_CONFIG:, SSHD_CONFIG:, public_keys: sshable.keys.map(&:public_key).join("\n"), no_bundler_install:)
 set -ueo pipefail
 if [ :no_bundler_install = false ]; then
   sudo apt-get update
@@ -87,5 +87,16 @@ sync
 SH
 
     push Prog::InstallRhizome, {"target_folder" => target_folder}
+  end
+
+  # A BYOH registration pins the host keys the operator confirmed, so
+  # that this first root login already verifies them; every other caller
+  # accepts whatever key the host presents, as before.
+  def pinned_known_hosts
+    return {} unless pin_host_keys
+
+    fail "host keys are to be pinned, but #{sshable.ubid} has none" if sshable.host_keys.nil? || sshable.host_keys.empty?
+
+    {known_hosts: Sshable::KnownHosts.new(sshable.host_keys, [])}
   end
 end

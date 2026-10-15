@@ -161,6 +161,13 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(st.stack.first["vhost_block_backend_version"]).to eq(Config.vhost_block_backend_version)
     end
 
+    it "takes pinned host keys only for a generic provider host" do
+      expect {
+        described_class.assemble("1.2.3.4", provider_name: HostProvider::HETZNER_PROVIDER_NAME, pinned_host_keys: [SshKey.generate.public_key])
+      }.to raise_error(RuntimeError, "Only a generic provider host takes pinned host keys")
+      expect(Sshable.where(host: "1.2.3.4").count).to eq(0)
+    end
+
     describe "generic (BYOH) provider" do
       let(:byoh_location) do
         Prog::LocationNexus.assemble(name: "byoh-test", display_name: "byoh-test", ui_name: "BYOH test", visible: false,
@@ -210,6 +217,44 @@ RSpec.describe Prog::Vm::HostNexus do
         expect { nx.prep }.to hop("wait_prep")
         learn_storage = Strand.where(parent_id: st.id, prog: "LearnStorage").first
         expect(learn_storage.stack.first["format_storage"]).to be false
+      end
+
+      it "stores pinned host keys and flags the frame so that BootstrapRhizome verifies them" do
+        keys = [SshKey.generate.public_key, SshKey.generate.public_key]
+        st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config:,
+          pinned_host_keys: keys)
+
+        expect(st.subject.sshable.host_keys).to eq(keys)
+        expect(st.stack.first["pin_host_keys"]).to be true
+
+        nx = described_class.new(st)
+        expect { nx.bootstrap_rhizome }.to hop("start", "BootstrapRhizome") { |hop|
+          expect(hop.strand_update_args[:stack].first).to include("target_folder" => "host", "pin_host_keys" => true)
+        }
+      end
+
+      it "leaves host keys unset and the frame unflagged without pinned host keys" do
+        st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config:)
+
+        expect(st.subject.sshable.host_keys).to be_nil
+        expect(st.stack.first).not_to have_key("pin_host_keys")
+      end
+
+      it "refuses an empty pinned host key list" do
+        expect {
+          described_class.assemble("203.0.113.42",
+            location_id: byoh_location.id,
+            provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+            provider_config:,
+            pinned_host_keys: [])
+        }.to raise_error(RuntimeError, "pinned_host_keys is empty")
+        expect(Sshable.where(host: "203.0.113.42").count).to eq(0)
       end
 
       it "creates Address rows for declared v4 networks and auto-prepends the management /32" do
@@ -455,6 +500,7 @@ RSpec.describe Prog::Vm::HostNexus do
     it "pushes a bootstrap rhizome process" do
       expect { nx.bootstrap_rhizome }.to hop("start", "BootstrapRhizome") { |hop|
         expect(hop.strand_update_args[:stack].first).to include("target_folder" => "host")
+        expect(hop.strand_update_args[:stack].first).not_to have_key("pin_host_keys")
       }
     end
 
