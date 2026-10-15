@@ -19,13 +19,19 @@ require_relative "net_ssh"
 #
 # A block given to #call runs in the same connection once PF2 passes,
 # with a Session that runs further commands as root; its value is the
-# result's output. register-byoh-host runs host preflight this way.
+# result's output. register-byoh-host runs host preflight this way. A
+# connection error after PF2 passed (a disconnect, a refused command, a
+# command that timed out) leaves PF2 passing and becomes the result's
+# error instead, since the login itself worked.
 class ByohRootProbe
-  Result = Data.define(:ok, :detail, :fix, :host_keys, :output) do
-    def initialize(ok:, detail:, fix:, host_keys:, output: nil) = super
+  Result = Data.define(:ok, :detail, :fix, :host_keys, :output, :error) do
+    def initialize(ok:, detail:, fix:, host_keys:, output: nil, error: nil) = super
 
     def check = ByohHostPreflight::Check.new(id: "PF2", status: ok ? "pass" : "fail", detail:, fix:, accepted: false)
   end
+
+  # Raised by Session#exec for a command that outlives its timeout.
+  class CommandTimeout < StandardError; end
 
   # Runs commands in the probe's connection.
   class Session
@@ -35,8 +41,10 @@ class ByohRootProbe
 
     # Runs command (built with NetSsh.command) with stdin; returns
     # [stdout, stderr, exit status], the status nil when a signal ended
-    # the command.
-    def exec(command, stdin: "")
+    # the command. Closes the channel and raises CommandTimeout once the
+    # command has run for timeout seconds: keepalive notices a dead host,
+    # but not a live one whose command hangs.
+    def exec(command, stdin: "", timeout: 60)
       out = +""
       err = +""
       status = nil
@@ -51,7 +59,12 @@ class ByohRootProbe
           ch.eof!
         end
       end
-      channel.wait
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      @ssh.loop(0.1) { channel.active? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline }
+      if channel.active?
+        channel.close
+        raise CommandTimeout, "#{command[0, 60].inspect} did not finish within #{timeout} s"
+      end
       [out, err, status]
     end
   end
@@ -74,6 +87,7 @@ class ByohRootProbe
   def call
     collected = []
     output = nil
+    logged_in = false
     expected = "ubi-pf2-#{@nonce}"
     args = Sshable::COMMON_SSH_ARGS.merge(
       key_data: [@private_key],
@@ -83,34 +97,44 @@ class ByohRootProbe
     )
     out = @starter.call(@main_ip, "root", **args) do |ssh|
       echo = ssh.exec!("echo :expected", expected:)
-      output = yield(Session.new(ssh)) if block_given? && echoed?(echo, expected)
+      if echoed?(echo, expected)
+        logged_in = true
+        output = yield(Session.new(ssh)) if block_given?
+      end
       echo
     end
     keys = @pinned || collected
 
     if echoed?(out, expected)
-      result(true, "root@#{@main_ip} logs in with the registration key and runs commands", "", keys, output)
+      passed(keys, output)
     else
-      result(false, "root@#{@main_ip} logs in but does not run commands (exit #{out.exitstatus}: #{out.strip.lines.first.to_s.strip[0, 120].inspect}); " \
+      failed("root@#{@main_ip} logs in but does not run commands (exit #{out.exitstatus}: #{out.strip.lines.first.to_s.strip[0, 120].inspect}); " \
         "a command= option on the key or a ForceCommand runs instead",
         "remove the command= option from root's authorized_keys line for the registration key, or the ForceCommand for root", keys)
     end
   rescue Net::SSH::HostKeyMismatch, Net::SSH::HostKeyUnknown
-    result(false, "#{@main_ip} presented a host key that is not pinned for this host",
+    failed("#{@main_ip} presented a host key that is not pinned for this host",
       "the address reaches a different machine than the operator's session did, or the host was reinstalled; check the address and the host's /etc/ssh/ssh_host_*_key.pub")
   rescue Net::SSH::AuthenticationFailed
-    result(false, "root@#{@main_ip} refused the registration key",
+    failed("root@#{@main_ip} refused the registration key",
       "install the registration public key in /root/.ssh/authorized_keys and allow root publickey login (PermitRootLogin prohibit-password)")
-  rescue Net::SSH::Exception, SystemCallError, SocketError, IOError => e
-    result(false, "the control plane cannot reach #{@main_ip}:22 (#{e.class}: #{e.message.strip[0, 160]})",
+  rescue Net::SSH::Exception, SystemCallError, SocketError, IOError, CommandTimeout => e
+    reason = "#{e.class}: #{e.message.strip[0, 160]}"
+    return passed(@pinned || collected, nil, reason) if logged_in
+
+    failed("the control plane cannot reach #{@main_ip}:22 (#{reason})",
       "open TCP 22 from the control plane to the host's main IP, and check that sshd runs")
   end
 
   private
 
+  def passed(keys, output, error = nil)
+    Result.new(ok: true, detail: "root@#{@main_ip} logs in with the registration key and runs commands", fix: "", host_keys: keys, output:, error:)
+  end
+
   def echoed?(out, expected) = out.exitstatus&.zero? && out.strip == expected
 
-  def result(ok, detail, fix, keys = [], output = nil)
-    Result.new(ok:, detail:, fix:, host_keys: keys, output:)
+  def failed(detail, fix, keys = [])
+    Result.new(ok: false, detail:, fix:, host_keys: keys)
   end
 end

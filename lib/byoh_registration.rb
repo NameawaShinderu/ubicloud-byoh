@@ -21,6 +21,9 @@ class ByohRegistration
   DEFAULT_BOOT_IMAGES = ["ubuntu-noble"].freeze
 
   HOST_SCRIPT = File.expand_path("../scripts/byoh/host/ubicloud-host", __dir__)
+  # Seconds ubicloud-host preflight may run before register-byoh-host
+  # gives up on it.
+  PREFLIGHT_TIMEOUT = 300
 
   # Serialises the final checks and the inserts of concurrent
   # registrations. One key for every host, since a pool or a /64 can
@@ -173,24 +176,36 @@ class ByohRegistration
   # pin of #register!, and the detected uplink IP and gateway are stored
   # and checked again there.
   #
+  # host_script and timeout (seconds the script may run) stand in for
+  # HOST_SCRIPT and PREFLIGHT_TIMEOUT in specs.
+  #
   # Raises ByohHostPreflight::UsageError for an --accept-check id that
   # names no overridable check, and refuses to log in to a host in the
   # test environment, where only an injected starter may stand in.
-  def preflight(accept_checks: [], starter: nil, services: ByohHostPreflight.service_states, nonce: ByohHostPreflight.nonce)
+  def preflight(accept_checks: [], starter: nil, services: ByohHostPreflight.service_states, nonce: ByohHostPreflight.nonce,
+    host_script: HOST_SCRIPT, timeout: PREFLIGHT_TIMEOUT)
     validate!
     ByohHostPreflight.validate_accept!(accept_checks)
     raise ValidationError, "refusing to log in to #{@main_ip} under RACK_ENV=test; inject a starter" if starter.nil? && Config.test?
 
+    begin
+      script = File.read(host_script)
+    rescue SystemCallError => ex
+      return script_failure("cannot read #{host_script} on the control plane (#{ex.class}: #{ex.message})",
+        "reinstall the control plane, whose checkout or package lacks scripts/byoh/host/ubicloud-host")
+    end
+
     probe = ByohRootProbe.new(@main_ip, SshKey.from_binary(keypair).private_key, starter: starter || ByohRootProbe::NET_SSH_START, nonce:)
-    result = probe.call { run_host_script(it, nonce) }
+    result = probe.call { run_host_script(it, nonce, script, timeout) }
     return ByohHostPreflight.new([result.check], {}) unless result.ok
 
     out, err, status = result.output
-    report = ByohHostPreflight.parse(out, nonce)
-    if status != 0
-      report = ByohHostPreflight.new([ByohHostPreflight::Check.new(id: "preflight", status: "fail",
-        detail: "ubicloud-host exited #{status.inspect}: #{err.to_s.strip.lines.last(3).join(" ").strip[0, 300]}",
-        fix: "run scripts/byoh/host/ubicloud-host preflight on the host to see why", accepted: false)], {})
+    report = if result.error
+      script_failure("ubicloud-host did not run to the end over the root login: #{result.error}")
+    elsif status != 0
+      script_failure("ubicloud-host exited #{status.inspect}: #{err.to_s.strip.lines.last(3).join(" ").strip[0, 300]}")
+    else
+      ByohHostPreflight.parse(out, nonce)
     end
     report.checks.unshift(result.check)
     report.evaluate(main_ip: @main_ip, pools: entries, uplink: @uplink, uplink_ip: @explicit_uplink_ip, location:,
@@ -302,9 +317,15 @@ class ByohRegistration
     errors
   end
 
+  # A report whose only check is a failed "preflight": the host script
+  # could not be judged.
+  def script_failure(detail, fix = "run scripts/byoh/host/ubicloud-host preflight on the host to see why")
+    ByohHostPreflight.new([ByohHostPreflight::Check.new(id: "preflight", status: "fail", detail:, fix:, accepted: false)], {})
+  end
+
   # The facts preflight needs before the script runs, then the script.
   # Returns [stdout, stderr, exit status] of the script.
-  def run_host_script(session, nonce)
+  def run_host_script(session, nonce, script, timeout)
     facts, _, = session.exec(NetSsh.command("uname -m && echo \"$SSH_CONNECTION\""))
     arch, connection = facts.lines.map(&:strip)
     urls = ByohHostPreflight.new([], {"arch" => arch}).boot_image_urls(@default_boot_images)
@@ -312,7 +333,7 @@ class ByohRegistration
     cp_ip = connection.to_s.split(" ").first
     args.push("--cp-ip", cp_ip) if cp_ip
     urls.each { args.push("--boot-image-url", it) }
-    session.exec(NetSsh.command("bash -s -- preflight :shelljoin_args", shelljoin_args: args), stdin: File.read(HOST_SCRIPT))
+    session.exec(NetSsh.command("bash -s -- preflight :shelljoin_args", shelljoin_args: args), stdin: script, timeout:)
   end
 
   def resolve_location(input)

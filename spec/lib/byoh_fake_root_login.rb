@@ -13,11 +13,14 @@ module ByohFakeRootLogin
   class Channel
     attr_reader :command, :stdin
 
-    def initialize(out: "", err: "", status: 0, success: true)
+    # A channel with hang: true never finishes, like a command that hangs
+    # on a live host.
+    def initialize(out: "", err: "", status: 0, success: true, hang: false)
       @out = out
       @err = err
       @status = status
       @success = success
+      @hang = hang
       @requests = {}
     end
 
@@ -38,11 +41,21 @@ module ByohFakeRootLogin
 
     def eof? = @eof
 
-    def wait
-      @on_data.call(self, @out)
-      @on_extended_data.call(self, 1, @err)
-      @requests.fetch("exit-status").call(self, Net::SSH::Buffer.from(:long, @status)) if @status
-      self
+    def close = (@closed = true)
+
+    def closed? = @closed
+
+    # Delivers the output and the exit status on the first poll, then
+    # reports the channel closed, unless it hangs.
+    def active?
+      return true if @hang
+      unless @delivered
+        @delivered = true
+        @on_data.call(self, @out)
+        @on_extended_data.call(self, 1, @err)
+        @requests.fetch("exit-status").call(self, Net::SSH::Buffer.from(:long, @status)) if @status
+      end
+      false
     end
   end
 
@@ -63,6 +76,12 @@ module ByohFakeRootLogin
       channel = @channels.shift or raise "no channel left for this session"
       yield channel
       channel
+    end
+
+    # Net::SSH::Connection::Session#loop: processes until the block is
+    # false.
+    def loop(_wait)
+      nil while yield
     end
   end
 

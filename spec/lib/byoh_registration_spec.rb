@@ -613,6 +613,35 @@ RSpec.describe ByohRegistration do
       expect(report.checks.last.detail).to eq "ubicloud-host exited 3: ubicloud-host: internal error"
     end
 
+    it "keeps PF2 passing and fails preflight when the host refuses to run the script" do
+      channels = preflight_channels("")
+      channels[1] = ByohFakeRootLogin::Channel.new(success: false)
+      reg = registration
+      report = reg.preflight(starter: fake_root_starter(channels:), nonce: "f1x7ure", services: nil)
+      expect(report.checks.map { [it.id, it.status] }).to eq [["PF2", "pass"], ["preflight", "fail"]]
+      expect(report.checks.last.detail).to start_with "ubicloud-host did not run to the end over the root login: Net::SSH::Exception: the host refused to run \"bash -s -- preflight"
+      expect(report.checks.last.fix).to eq "run scripts/byoh/host/ubicloud-host preflight on the host to see why"
+      expect([reg.pinned_host_keys, reg.uplink_ip]).to eq [nil, nil]
+    end
+
+    it "fails preflight when the script outlives its timeout" do
+      channels = preflight_channels("")
+      channels[1] = ByohFakeRootLogin::Channel.new(hang: true)
+      report = registration.preflight(starter: fake_root_starter(channels: channels.dup), nonce: "f1x7ure", services: nil, timeout: 0.01)
+      expect(report.checks.map { [it.id, it.status] }).to eq [["PF2", "pass"], ["preflight", "fail"]]
+      expect(report.checks.last.detail).to match(/: ByohRootProbe::CommandTimeout: "bash -s -- preflight .*" did not finish within 0\.01 s\z/)
+      expect(channels.last).to be_closed
+    end
+
+    it "fails preflight without logging in when the control plane lacks the host script" do
+      report = registration.preflight(starter: fake_root_starter(starts:), nonce: "f1x7ure", services: nil, host_script: File.join(dir, "missing-ubicloud-host"))
+      expect(report.checks.map { [it.id, it.status] }).to eq [["preflight", "fail"]]
+      expect(report.checks.first.detail).to start_with "cannot read #{dir}/missing-ubicloud-host on the control plane (Errno::ENOENT: "
+      expect(report.checks.first.fix).to include "reinstall the control plane"
+      expect(report).to be_blocking
+      expect(starts).to be_empty
+    end
+
     it "stops at PF2 when root refuses the key" do
       reg = registration
       report = reg.preflight(starter: fake_root_starter(raises: Net::SSH::AuthenticationFailed.new("root")), nonce: "f1x7ure", services: nil)

@@ -139,11 +139,33 @@ RSpec.describe ByohRootProbe do
       expect([result.ok, result.output, ran]).to eq [false, nil, false]
     end
 
-    it "fails when the host refuses to run the command" do
+    # PF2 passed: the login works, so an error in the block is not a
+    # reachability failure.
+    it "keeps PF2 passing and returns the error when the host refuses to run the command" do
       starter = fake_root_starter(channels: [ByohFakeRootLogin::Channel.new(success: false)])
       result = described_class.new("203.0.113.42", reg_key.private_key, starter:, nonce: "n0nce").call { it.exec(NetSsh.command("true")) }
-      expect(result.ok).to be false
-      expect(result.detail).to include('Net::SSH::Exception: the host refused to run "true"')
+      expect([result.ok, result.check.status, result.output]).to eq [true, "pass", nil]
+      expect(result.error).to eq 'Net::SSH::Exception: the host refused to run "true"'
+      expect(result.host_keys).to eq [ByohFakeRootLogin::FIXTURE_HOST_KEY]
+    end
+
+    it "keeps PF2 passing and returns the error when the host disconnects during the block" do
+      result = described_class.new("203.0.113.42", reg_key.private_key, starter: fake_root_starter, nonce: "n0nce").call { raise Net::SSH::Disconnect, "connection closed by remote host" }
+      expect([result.ok, result.error]).to eq [true, "Net::SSH::Disconnect: connection closed by remote host"]
+    end
+
+    it "closes a command that outlives its timeout and returns the timeout as the error" do
+      channel = ByohFakeRootLogin::Channel.new(hang: true)
+      result = described_class.new("203.0.113.42", reg_key.private_key, starter: fake_root_starter(channels: [channel]), nonce: "n0nce")
+        .call { it.exec(NetSsh.command("sleep infinity"), timeout: 0.01) }
+      expect([result.ok, result.check.status]).to eq [true, "pass"]
+      expect(result.error).to eq 'ByohRootProbe::CommandTimeout: "sleep infinity" did not finish within 0.01 s'
+      expect(channel).to be_closed
+    end
+
+    it "lets an error outside the connection classes through" do
+      probe = described_class.new("203.0.113.42", reg_key.private_key, starter: fake_root_starter, nonce: "n0nce")
+      expect { probe.call { raise ArgumentError, "bug" } }.to raise_error(ArgumentError, "bug")
     end
   end
 
