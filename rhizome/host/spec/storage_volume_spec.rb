@@ -714,6 +714,28 @@ RSpec.describe StorageVolume do
       expect(File).to receive(:read).with("/sys/block/nvme1n1/queue/write_cache").and_return("write through\n")
       expect(encrypted_vhost_sv.write_through_device?).to be true
     end
+
+    it "assumes a write-back cache when sysfs has no block device for the file" do
+      expect(File).to receive(:stat).with(disk_file).and_return(instance_double(File::Stat, dev_major: 0, dev_minor: 45))
+      expect(File).to receive(:realpath).with("/sys/dev/block/0:45").and_raise(Errno::ENOENT)
+      expect(encrypted_vhost_sv).to receive(:warn).with("#{disk_file}: no write cache setting at /sys/dev/block/0:45; assuming a write-back cache")
+      expect(encrypted_vhost_sv.write_through_device?).to be false
+    end
+
+    it "assumes a write-back cache when the device has no write_cache file" do
+      expect(File).to receive(:stat).with(disk_file).and_return(instance_double(File::Stat, dev_major: 230, dev_minor: 1))
+      expect(File).to receive(:realpath).with("/sys/dev/block/230:1").and_return("/sys/devices/virtual/block/zd0")
+      expect(File).to receive(:exist?).with("/sys/block/zd0").and_return(true)
+      expect(File).to receive(:read).with("/sys/block/zd0/queue/write_cache").and_raise(Errno::ENOENT)
+      expect(encrypted_vhost_sv).to receive(:warn)
+      expect(encrypted_vhost_sv.write_through_device?).to be false
+    end
+
+    it "still raises when the disk file itself is missing" do
+      expect(File).to receive(:stat).with(disk_file).and_raise(Errno::ENOENT)
+      expect(File).not_to receive(:realpath)
+      expect { encrypted_vhost_sv.write_through_device? }.to raise_error(Errno::ENOENT)
+    end
   end
 
   describe "#vhost_backend_create_metadata" do
