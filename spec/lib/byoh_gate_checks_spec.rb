@@ -362,4 +362,84 @@ RSpec.describe ByohGateChecks do
       expect(cli("compare", "--host", host.ubid, "--snapshot", missing)[2]).to start_with "! cannot read snapshot #{missing}:"
     end
   end
+
+  describe "health" do
+    def page(summary, severity: "error", resource_id: host.id)
+      Page.create(summary:, tag: "Test-#{summary}", severity:, resource_id:, details: {})
+    end
+
+    it "passes an accepting host with no pages, checkup or unavailable label" do
+      host.update(allocation_state: "accepting")
+      host.strand.update(label: "wait")
+      page("other host", resource_id: create_vm_host.id)
+      page("boot id", severity: "info")
+      page("resolved").update(resolved_at: Time.now)
+      status, out, _ = cli("health", "--host", host.ubid)
+      expect(status).to eq 0
+      expect(out).to eq <<~OUT
+        PASS host #{host.ubid} is a BYOH host, so the M4 health checks apply (location byoh-gate)
+        PASS host strand is at wait, not unavailable
+        PASS host #{host.ubid} is accepting (accepting)
+        PASS checkup is not set (the monitor has not read the host as down)
+        INFO open info page: boot id
+        PASS no open page for #{host.ubid}
+        ok
+      OUT
+    end
+
+    it "fails an unavailable host the monitor read as down, with its pages" do
+      host.update(allocation_state: "unprepared")
+      host.strand.update(label: "unavailable")
+      host.incr_checkup
+      page("#{host.ubid} has an expired deadline!")
+      page("#{host.ubid} sshable unreachable", severity: "warning")
+      status, out, _ = cli("health", "--host", host.ubid)
+      expect(status).to eq 1
+      expect(out).to include "FAIL host strand is at unavailable, not unavailable\n",
+        "FAIL host #{host.ubid} is accepting (unprepared)\n",
+        "FAIL checkup is not set (the monitor has not read the host as down)\n",
+        "FAIL open error page: #{host.ubid} has an expired deadline!\n",
+        "FAIL open warning page: #{host.ubid} sshable unreachable\n", "5 failed\n"
+      expect(out).not_to include "no open page"
+    end
+
+    it "fails a generic host outside a BYOH location and one without a strand" do
+      host.update(location_id: Location::HETZNER_FSN1_ID, allocation_state: "accepting")
+      host.strand.destroy
+      out = cli("health", "--host", host.ubid)[1]
+      expect(out).to include "FAIL host #{host.ubid} is a BYOH host, so the M4 health checks apply (location hetzner-fsn1)\n",
+        "PASS host strand is at (none), not unavailable\n"
+    end
+
+    # The host find_host loads, with its sshable loaded, so the stubs on
+    # both reach the command (frozen specs cannot stub any instance).
+    def probed_host
+      h = VmHost[host.id]
+      h.update(allocation_state: "accepting")
+      expect(VmHost).to receive(:[]).with(host.ubid).and_return(h)
+      h.sshable
+      h
+    end
+
+    [[true, 0, "PASS"], [false, 1, "FAIL"]].each do |healthy, code, word|
+      it "runs the health checks over a fresh session with --probe (#{healthy})" do
+        h = probed_host
+        session = instance_double(Net::SSH::Connection::Session)
+        expect(h.sshable).to receive(:start_fresh_session).and_yield(session)
+        expect(h).to receive(:perform_health_checks).with(session, test_file_suffix: "soak").and_return(healthy)
+        status, out, _ = cli("health", "--host", host.ubid, "--probe")
+        expect(status).to eq code
+        expect(out).to include "#{word} health checks pass (SMART, read/write, kernel log, clock source)\n"
+      end
+    end
+
+    it "fails when the probe cannot connect" do
+      h = probed_host
+      expect(h.sshable).to receive(:start_fresh_session).and_raise(Errno::ECONNREFUSED)
+      status, out, _ = cli("health", "--host", host.ubid, "--probe")
+      expect(status).to eq 1
+      expect(out).to include "FAIL health checks raised Errno::ECONNREFUSED: Connection refused\n", "1 failed\n"
+      expect(out).not_to include "health checks pass"
+    end
+  end
 end

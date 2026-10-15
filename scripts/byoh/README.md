@@ -224,3 +224,11 @@ fronts, the development shim and `migrate-from-dev.sh` in throwaway
 - `verify/m2-checks` is the read-only database half of the gate
   (`lib/byoh_gate_checks.rb`), usable on its own:
   `bundle exec scripts/byoh/verify/m2-checks host --host vh...`.
+- `verify/m4-e2.sh` runs the M4 E2 gate (G-M4-1 AWS, G-M4-2 Proxmox):
+  `ubicloud-admin site add` and `host add --ssh` exactly as an operator
+  types them, with a timed transcript in `var/`, then the no-VM steps
+  of `m2-gate.sh`. `verify/m4-f5-soak.sh --host vh... --hours 24`
+  samples hosts while `bin/monitor` runs (G-M4-3 to 5) through
+  `m2-checks health --probe`. Both are UNVERIFIED on real
+  infrastructure; `docs/byoh/VERIFY.md` §6 has the settings and pass
+  rules, and `test/m4-gate-scripts.sh` tests them against stubs.

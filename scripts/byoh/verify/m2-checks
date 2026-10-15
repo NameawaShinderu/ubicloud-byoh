@@ -4,7 +4,9 @@
 # The database checks of the M2 canary gate (m2-gate.sh next to this file,
 # docs/byoh/VERIFY.md). The logic lives in lib/byoh_gate_checks.rb; run
 # with --help for the commands. Read-only: nothing here changes the
-# database.
+# database. `health --probe` (the M4 F5 soak, m4-f5-soak.sh) logs in to
+# the host and runs its health checks, whose read/write check writes and
+# deletes a 1 MiB test file in each storage path.
 #
 # Run from the repository root on the control plane:
 #

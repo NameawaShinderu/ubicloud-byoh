@@ -265,6 +265,28 @@ Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): every run passes
 in about 70 s, the database is restored (35 rows deleted), and nothing
 is left behind.
 
+### Real-infrastructure gate scripts (WP13)
+
+```
+scripts/byoh/test/m4-gate-scripts.sh
+```
+
+Runs `scripts/byoh/verify/m4-e2.sh` and `m4-f5-soak.sh` as root in one
+`ubi-m4-gates` container of the `ubi-m4-fakehost` image, with the
+worktree mounted read-only, against stubs: a stub `ubicloud-admin`
+(`ADMIN`) and `m2-gate.sh` (`E2_GATE`), a stub `m2-checks`
+(`SOAK_CHECKS`) and `sleep` (`SOAK_SLEEP`), and a process named
+`ruby bin/monitor` for the monitor check. The cases pin the argument
+passing (a quoted `site add` option, fingerprints, the generated
+registration key that the gate then logs in with, `HOST_ADD_ARGS`),
+the skip of an existing site, stopping at the first failed phase, the
+timestamped transcript and verdicts, the soak's per-sample monitor check,
+per-host failure counts, the sample count from `--hours`/`--interval`,
+and the usage errors. `m2-checks health` itself is covered by
+`spec/lib/byoh_gate_checks_spec.rb`. Result (2026-10-15): 54 checks pass
+in a few seconds. Neither script has run against real infrastructure
+(UNVERIFIED; [VERIFY.md](../../../docs/byoh/VERIFY.md) section 6).
+
 ## Scenarios
 
 | Scenario | Checks |

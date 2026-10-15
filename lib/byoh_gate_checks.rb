@@ -20,9 +20,10 @@ class ByohGateChecks
       info      --vm UBID
       snapshot  --host UBID
       compare   --host UBID --snapshot FILE
+      health    --host UBID [--probe]
   USAGE
 
-  COMMANDS = %w[location host vm info snapshot compare].freeze
+  COMMANDS = %w[location host vm info snapshot compare health].freeze
   EXPECTATIONS = %w[public nat none internal waiting].freeze
 
   # The rate types a VM is billed under; a snapshot counts the open
@@ -260,6 +261,43 @@ class ByohGateChecks
         else
           r.check(value == was, "#{key} is back to #{was} (#{value})")
         end
+      end
+    end
+  end
+
+  # One sample of the M4 F5 soak (scripts/byoh/verify/m4-f5-soak.sh):
+  # what bin/monitor and HostNexus have decided about the host. With
+  # --probe it also runs the health checks the monitor runs, over a fresh
+  # SSH session, as HostNexus#available? does; the only write is the
+  # read/write check's 1 MiB test file in each storage path, which it
+  # deletes again.
+  def cmd_health(argv)
+    opts = {}
+    parse(argv, "health --host UBID [--probe]") do |o|
+      host_option(o, opts)
+      o.on("--probe", "Also run the host's health checks over SSH") { opts[:probe] = true }
+    end
+    host = find_host(opts)
+    label = host.strand&.label
+
+    report do |r|
+      r.check(host.byoh?, "host #{host.ubid} is a BYOH host, so the M4 health checks apply (location #{host.location.name})")
+      r.check(label != "unavailable", "host strand is at #{label || "(none)"}, not unavailable")
+      r.check(host.allocation_state == "accepting", "host #{host.ubid} is accepting (#{host.allocation_state})")
+      r.check(!host.checkup_set?(cached: false), "checkup is not set (the monitor has not read the host as down)")
+      pages = Page.active.for_resource(host.id).order(:created_at).all
+      pages.select { it.severity == "info" }.each { r.info("open info page: #{it.summary}") }
+      raised = pages.reject { it.severity == "info" }
+      r.check(raised.empty?, "no open page for #{host.ubid}") if raised.empty?
+      raised.each { r.fail("open #{it.severity} page: #{it.summary}") }
+      if opts[:probe]
+        healthy = begin
+          host.sshable.start_fresh_session { host.perform_health_checks(it, test_file_suffix: "soak") }
+        rescue => ex
+          r.fail("health checks raised #{ex.class}: #{ex.message}")
+          nil
+        end
+        r.check(healthy, "health checks pass (SMART, read/write, kernel log, clock source)") unless healthy.nil?
       end
     end
   end
