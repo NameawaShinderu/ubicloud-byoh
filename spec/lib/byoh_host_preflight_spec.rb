@@ -158,6 +158,7 @@ RSpec.describe ByohHostPreflight do
         ["PF21", "pass", "ubicloud-web and ubicloud-respirate are active"],
       ]
       expect(preflight.uplink_ip).to eq "10.0.0.5"
+      expect(preflight.gateway).to eq "10.0.0.1"
       expect(preflight).not_to be_blocking
     end
 
@@ -415,6 +416,11 @@ RSpec.describe ByohHostPreflight do
         expect { parse.accept([id]) }.to raise_error(described_class::UsageError, /\A--accept-check #{id}: this check cannot be accepted; only PF8-hybrid, /)
       end
       expect { parse.accept(["PF99"]) }.to raise_error(described_class::UsageError, /\A--accept-check PF99: no such check/)
+    end
+
+    it "validates ids before there is any output to accept them on" do
+      expect(described_class.validate_accept!(%w[PF8-hybrid PF16])).to eq %w[PF8-hybrid PF16]
+      expect { described_class.validate_accept!(%w[PF8-hybrid PF3]) }.to raise_error(described_class::UsageError, /\A--accept-check PF3: this check cannot be accepted/)
     end
   end
 

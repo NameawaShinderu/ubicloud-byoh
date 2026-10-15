@@ -2,8 +2,11 @@
 
 require "tmpdir"
 require "fileutils"
+require_relative "byoh_fake_root_login"
 
 RSpec.describe ByohRegistration do
+  include ByohFakeRootLogin
+
   let(:location) {
     Location.create(name: "byoh-test", display_name: "byoh-test-dn", ui_name: "BYOH test", visible: false,
       provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"ula48" => "fd00:1:2::/48"})
@@ -93,6 +96,32 @@ RSpec.describe ByohRegistration do
 
     it "accepts main_ip declared as its own /32" do
       expect { described_class.new(**base_args.merge(routed_networks: ["203.0.113.42/32", "10.99.0.0/29"])).validate! }.not_to raise_error
+    end
+
+    it "rejects a main IP another host has" do
+      vm_host = VmHost[described_class.new(**base_args).register!.id]
+      expect {
+        described_class.new(**base_args, routed_networks: ["10.98.0.0/29"]).validate!
+      }.to raise_error(described_class::ValidationError, "main_ip 203.0.113.42 is already registered (#{vm_host.ubid}); destroy that host first")
+    end
+
+    it "rejects a server identifier another host has" do
+      described_class.new(**base_args, server_identifier: "rack-1").register!
+      expect {
+        described_class.new(**base_args, main_ip: "203.0.113.43", routed_networks: ["10.98.0.0/29"], server_identifier: "rack-1").validate!
+      }.to raise_error(described_class::ValidationError, "server identifier rack-1 is already registered")
+    end
+
+    it "rejects an uplink IP that is not IPv4" do
+      expect {
+        described_class.new(**base_args, uplink_ip: "fd00::1").validate!
+      }.to raise_error(described_class::ValidationError, "uplink_ip must be an IPv4 address: fd00::1")
+    end
+
+    it "rejects a pool that hands VMs the uplink IP" do
+      expect {
+        described_class.new(**base_args, main_ip: "198.51.100.7", uplink_ip: "10.99.0.3").validate!
+      }.to raise_error(described_class::ValidationError, "10.99.0.0/29 hands the uplink IP 10.99.0.3 to VMs; declare pools without it, or reserve it")
     end
 
     it "rejects a non-/64 IPv6 pool" do
@@ -314,6 +343,11 @@ RSpec.describe ByohRegistration do
       expect { reg.provider_config }.to raise_error(described_class::ValidationError, /location byoh-test has no ula48/)
     end
 
+    it "stores the uplink IP" do
+      expect(described_class.new(**base_args, uplink_ip: "203.0.113.42").provider_config["uplink_ip"]).to eq "203.0.113.42"
+      expect(described_class.new(**base_args).provider_config).not_to have_key "uplink_ip"
+    end
+
     it "includes bmc section when configured" do
       cfg = described_class.new(**base_args, bmc_config: {
         "protocol" => "redfish", "endpoint" => "https://192.168.1.11",
@@ -425,16 +459,176 @@ RSpec.describe ByohRegistration do
       expect(strand.stack.first["default_boot_images"]).to eq(["ubuntu-noble", "ubuntu-jammy"])
     end
 
+    it "downloads ubuntu-noble unless told otherwise" do
+      strand = described_class.new(**base_args).register!
+      expect(strand.stack.first["default_boot_images"]).to eq(["ubuntu-noble"])
+    end
+
     it "omits default_boot_images from the stack when the kwarg is empty" do
-      reg = described_class.new(**base_args)
+      reg = described_class.new(**base_args, default_boot_images: [])
       strand = reg.register!
       expect(strand.stack.first["default_boot_images"]).to eq([])
+    end
+
+    it "checks again under a transaction-scoped advisory lock" do
+      locks = []
+      expect(Prog::Vm::HostNexus).to receive(:assemble).and_wrap_original do |original, *args, **kwargs|
+        locks << DB[:pg_locks].where(locktype: "advisory", pid: Sequel.function(:pg_backend_pid)).count
+        original.call(*args, **kwargs)
+      end
+      described_class.new(**base_args).register!
+      expect(locks).to eq [1]
+    end
+
+    it "refuses a pool registered by another host since validate!" do
+      reg = described_class.new(**base_args).validate!
+      described_class.new(**base_args, main_ip: "203.0.113.43", routed_networks: ["10.99.0.4/30"]).register!
+      expect { reg.register! }.to raise_error(described_class::ValidationError, "10.99.0.0/29 overlaps 10.99.0.4/30, already registered")
+      expect(VmHost.count).to eq 1
+      expect(audit_rows.last).to include(target_id: nil, result: "error: 10.99.0.0/29 overlaps 10.99.0.4/30, already registered")
+    end
+
+    it "refuses a main IP that something took since validate!" do
+      reg = described_class.new(**base_args).validate!
+      sshable = Sshable.create(host: "203.0.113.42")
+      expect { reg.register! }.to raise_error(described_class::ValidationError, "main_ip 203.0.113.42 is already registered (#{sshable.ubid}); destroy that host first")
+    end
+
+    it "refuses a derived /64 another host took since it was drawn" do
+      reg = described_class.new(**base_args, routed_networks: ["10.99.0.0/29"], random: Random.new(7))
+      net6 = reg.provider_config["routed_networks"].last["cidr"]
+      described_class.new(**base_args, main_ip: "203.0.113.43", routed_networks: [net6]).register!
+      expect { reg.register! }.to raise_error(described_class::ValidationError, "the derived IPv6 network #{net6} is now used by another host; run the registration again")
+    end
+
+    it "refuses a location that stopped being a BYOH location" do
+      reg = described_class.new(**base_args).validate!
+      location.update(byoh_network: nil)
+      expect { reg.register! }.to raise_error(described_class::ValidationError, "location byoh-test no longer exists, or is no longer a BYOH location")
+    end
+
+    it "refuses a location deleted since validate!" do
+      reg = described_class.new(**base_args).validate!
+      DB[:location].where(id: location.id).delete
+      expect { reg.register! }.to raise_error(described_class::ValidationError, "location byoh-test no longer exists, or is no longer a BYOH location")
     end
 
     it "honors an operator-supplied server_identifier" do
       reg = described_class.new(**base_args.merge(server_identifier: "homelab-r1-01"))
       strand = reg.register!
       expect(VmHost[strand.id].provider.server_identifier).to eq("homelab-r1-01")
+    end
+  end
+
+  describe "#preflight" do
+    let(:key_path) {
+      path = File.join(dir, "byoh_key")
+      File.write(path, SshKey.generate.private_key)
+      path
+    }
+    let(:starts) { [] }
+
+    def registration(**) = described_class.new(**base_args, main_ip: "203.0.113.10", ssh_key_source: key_path, **)
+
+    def preflight(reg, fixture = "base", accept_checks: [], **)
+      reg.preflight(accept_checks:, starter: fake_root_starter(channels: preflight_channels(preflight_fixture(fixture), **), starts:), nonce: "f1x7ure", services: nil)
+    end
+
+    def statuses(report) = report.checks.to_h { [it.id, it.status] }
+
+    it "logs in as root with the registration key, runs ubicloud-host on stdin and evaluates its output" do
+      reg = registration
+      channels = preflight_channels(preflight_fixture("base"))
+      report = reg.preflight(starter: fake_root_starter(channels: channels.dup, starts:), nonce: "f1x7ure", services: nil)
+      expect(report).not_to be_blocking
+      expect(report.checks.first.to_h).to include(id: "PF2", status: "pass")
+      expect(statuses(report)).to include("PF3" => "pass", "PF17" => "pass", "PF17-route" => "pass", "PF20" => "pass", "PF21" => "info")
+
+      host, user, opts = starts.first
+      expect([host, user, opts[:verify_host_key]]).to eq ["203.0.113.10", "root", :accept_new]
+      expect(opts[:key_data].map { Net::SSH::Authentication::ED25519::PrivKey.read(it, nil).sign_key.keypair }).to eq [reg.keypair]
+      expect(channels.first.command).to eq "uname -m && echo \"$SSH_CONNECTION\""
+      expect(channels.last.command).to start_with "bash -s -- preflight --json --nonce f1x7ure --main-ip 203.0.113.10 --images 1 --cp-ip 203.0.113.200 --boot-image-url https://cloud-images.ubuntu.com/"
+      expect(channels.last.stdin).to eq File.read(described_class::HOST_SCRIPT)
+
+      expect(reg.pinned_host_keys).to eq [ByohFakeRootLogin::FIXTURE_HOST_KEY]
+      expect(reg.uplink_ip).to eq "203.0.113.10"
+      expect(reg.provider_config["uplink_ip"]).to eq "203.0.113.10"
+    end
+
+    it "pins the keys it met and stores the uplink IP at registration" do
+      reg = registration
+      preflight(reg)
+      vm_host = VmHost[reg.register!.id]
+      expect(vm_host.sshable.host_keys).to eq [ByohFakeRootLogin::FIXTURE_HOST_KEY]
+      expect(Strand[vm_host.id].stack.first["pin_host_keys"]).to be true
+      expect(vm_host.provider.config["uplink_ip"]).to eq "203.0.113.10"
+    end
+
+    it "sends no --cp-ip or image URL when the host reports no connection or architecture" do
+      reg = registration
+      channels = [ByohFakeRootLogin::Channel.new(out: ""), ByohFakeRootLogin::Channel.new(out: preflight_fixture("base"))]
+      reg.preflight(starter: fake_root_starter(channels: channels.dup), nonce: "f1x7ure", services: nil)
+      expect(channels.last.command).to eq "bash -s -- preflight --json --nonce f1x7ure --main-ip 203.0.113.10 --images 1"
+    end
+
+    it "blocks a host without /dev/kvm, and pins nothing" do
+      reg = registration
+      report = preflight(reg, "no-kvm")
+      expect(report).to be_blocking
+      expect(report.checks.find { it.id == "PF3" }.detail).to eq "no /dev/kvm"
+      expect([reg.pinned_host_keys, reg.uplink_ip]).to eq [nil, nil]
+      expect(reg.provider_config).not_to have_key "uplink_ip"
+    end
+
+    it "blocks a kvm64-class CPU model, which no --accept-check can pass" do
+      expect { preflight(registration, "kvm64-model", accept_checks: ["PF3"]) }.to raise_error(ByohHostPreflight::UsageError, /PF3: this check cannot be accepted/)
+      expect(starts).to be_empty
+      expect(statuses(preflight(registration, "kvm64-model"))["PF3"]).to eq "fail"
+    end
+
+    it "blocks a hybrid CPU unless the operator accepts it" do
+      expect(preflight(registration, "intel-hybrid")).to be_blocking
+      report = preflight(registration, "intel-hybrid", accept_checks: ["PF8-hybrid"])
+      expect(report).not_to be_blocking
+      expect(report.checks.find { it.id == "PF8-hybrid" }).to have_attributes(status: "warn", accepted: true)
+    end
+
+    it "blocks a pool that holds the uplink IP it detects" do
+      reg = registration(main_ip: "198.51.100.7", routed_networks: ["203.0.113.8/29"])
+      report = preflight(reg)
+      expect(report).to be_blocking
+      expect(report.checks.find { it.id == "PF17" }.detail).to eq "203.0.113.8/29 hands the uplink IP 203.0.113.10 to VMs; declare pools without it, or reserve it"
+      expect(statuses(report)["PF17-main-ip"]).to eq "warn"
+    end
+
+    it "blocks a pool that holds the default gateway" do
+      report = preflight(registration(routed_networks: ["203.0.113.0/30"]))
+      expect(report.checks.find { it.id == "PF17" }.detail).to include "203.0.113.0/30 hands the default gateway 203.0.113.1 to VMs"
+    end
+
+    it "fails when the script does not run to the end" do
+      report = preflight(registration, status: 3, err: "ubicloud-host: internal error\n")
+      expect(report.checks.map { [it.id, it.status] }).to eq [["PF2", "pass"], ["preflight", "fail"]]
+      expect(report.checks.last.detail).to eq "ubicloud-host exited 3: ubicloud-host: internal error"
+    end
+
+    it "stops at PF2 when root refuses the key" do
+      reg = registration
+      report = reg.preflight(starter: fake_root_starter(raises: Net::SSH::AuthenticationFailed.new("root")), nonce: "f1x7ure", services: nil)
+      expect(report.checks.map { [it.id, it.status] }).to eq [["PF2", "fail"]]
+      expect(report).to be_blocking
+      expect(reg.pinned_host_keys).to be_nil
+    end
+
+    it "takes the uplink IP the operator gives" do
+      reg = registration(uplink_ip: "203.0.113.10")
+      expect(statuses(preflight(reg))["PF17-route"]).to eq "pass"
+      expect(reg.uplink_ip).to eq "203.0.113.10"
+    end
+
+    it "refuses to log in to a host in the test environment" do
+      expect { registration.preflight(services: nil) }.to raise_error(described_class::ValidationError, "refusing to log in to 203.0.113.10 under RACK_ENV=test; inject a starter")
     end
   end
 end

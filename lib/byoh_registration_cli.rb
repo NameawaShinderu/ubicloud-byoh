@@ -4,14 +4,18 @@ require "optparse"
 
 # bin/register-byoh-host: registers a bring-your-own host in a BYOH
 # location. Parses the options, shows the SSH key the operator installs
-# on the host, and hands the rest to ByohRegistration.
+# on the host, runs host preflight when that key is already installed
+# (--ssh-key), and hands the rest to ByohRegistration.
 class ByohRegistrationCli
   class Error < StandardError; end
 
-  def initialize(out: $stdout, err: $stderr, input: $stdin)
+  # preflight holds keywords for ByohRegistration#preflight: specs pass
+  # starter, which stands in for Net::SSH.start, and nonce.
+  def initialize(out: $stdout, err: $stderr, input: $stdin, **preflight)
     @out = out
     @err = err
     @input = input
+    @preflight = preflight
   end
 
   # Returns the process exit status.
@@ -29,15 +33,17 @@ class ByohRegistrationCli
       server_identifier: options[:server_identifier],
       bmc_config: options[:bmc],
       default_boot_images: options[:default_boot_images],
+      uplink_ip: options[:uplink_ip],
     )
     registration.validate!
-    cfg = registration.provider_config
+    ByohHostPreflight.validate_accept!(options[:accept_checks])
+    registration.provider_config
     registration.notes.each { @err.puts "note: #{it}" }
 
     @out.puts "ubicloud byoh host registration"
     @out.puts "────────────────────────────────"
     @out.puts
-    @out.puts "Step 1/2 — Install the control-plane SSH public key on the host"
+    @out.puts "Step 1/3 — Install the control-plane SSH public key on the host"
     @out.puts "────────────────────────────────"
     @out.puts registration.install_instructions
     unless options[:assume_yes]
@@ -46,9 +52,14 @@ class ByohRegistrationCli
     end
 
     @out.puts
-    @out.puts "Step 2/2 — Registering host with control plane"
+    @out.puts "Step 2/3 — Host preflight"
     @out.puts "────────────────────────────────"
-    print_summary(registration, cfg)
+    return 1 unless preflight(registration, options)
+
+    @out.puts
+    @out.puts "Step 3/3 — Registering host with control plane"
+    @out.puts "────────────────────────────────"
+    print_summary(registration, registration.provider_config)
 
     strand = registration.register!
     vm_host = VmHost[strand.id]
@@ -64,6 +75,9 @@ class ByohRegistrationCli
   rescue ByohRegistration::ValidationError => ex
     @err.puts "! validation failed: #{ex.message}"
     1
+  rescue ByohHostPreflight::UsageError => ex
+    @err.puts "! #{ex.message}"
+    2
   rescue Error, OptionParser::ParseError => ex
     @err.puts "! #{ex.message}"
     1
@@ -76,7 +90,7 @@ class ByohRegistrationCli
 
   # Returns the options, or nil after printing the help.
   def parse(argv)
-    options = {pools: [], ssh_key_source: :generate, assume_yes: false, bmc: nil, default_boot_images: []}
+    options = {pools: [], ssh_key_source: :generate, assume_yes: false, bmc: nil, default_boot_images: [], accept_checks: [], skip_preflight: false}
     help = false
     parser = OptionParser.new do |o|
       o.banner = "Usage: bin/register-byoh-host --main-ip IP --location NAME [options]"
@@ -94,12 +108,17 @@ class ByohRegistrationCli
       o.on("--ipv6-mode MODE", "gua or ula (default: derived from the IPv6 pool)") { options[:ipv6_mode] = it }
       o.separator ""
       o.separator "SSH key:"
-      o.on("--ssh-key PATH", "Use an existing Ed25519 private key file (default: generate a new one)") { options[:ssh_key_source] = it }
+      o.on("--ssh-key PATH", "Use an existing Ed25519 private key file, already in root's authorized_keys on the host (default: generate a new one)") { options[:ssh_key_source] = it }
+      o.separator ""
+      o.separator "Preflight (docs/byoh/PLATFORMS.md PF1-PF21; runs with --ssh-key, as root over the control plane's own login):"
+      o.on("--skip-preflight", "Register without checking the host first") { options[:skip_preflight] = true }
+      o.on("--accept-check ID", "Accept an overridable failed check, such as PF8-hybrid or PF16-docker (repeatable)") { options[:accept_checks] << it }
+      o.on("--uplink-ip IP", "The address the host's default route leaves from (default: what preflight detects); no pool may hand it to VMs") { options[:uplink_ip] = it }
       o.separator ""
       o.separator "Optional:"
       o.on("--server-identifier ID", "Operator-assigned identifier (default: byoh-<vm_host uuid>)") { options[:server_identifier] = it }
       o.on("--yes", "Skip interactive confirmation") { options[:assume_yes] = true }
-      o.on("--default-boot-image NAME", "Boot image name to download on this host at registration time (repeatable; e.g. 'ubuntu-noble', 'ubuntu-jammy'). Without this the boot_image table stays empty and the VM allocator will fail with 'no space left on any eligible host' when a user tries to create a VM.") do
+      o.on("--default-boot-image NAME", "Boot image to download on this host at registration time (repeatable; default: #{ByohRegistration::DEFAULT_BOOT_IMAGES.join(", ")})") do
         options[:default_boot_images] << it
       end
       o.separator ""
@@ -124,7 +143,28 @@ class ByohRegistrationCli
     raise Error, "--location is required\n#{parser}" unless options[:location]
 
     options[:bmc]["verify_ssl"] = false if options[:bmc] && !options[:bmc]["verify_ssl"]
+    options[:default_boot_images] = ByohRegistration::DEFAULT_BOOT_IMAGES if options[:default_boot_images].empty?
     options
+  end
+
+  # Runs preflight when it can work; returns whether to register.
+  def preflight(registration, options)
+    if options[:skip_preflight]
+      @err.puts "warning: preflight skipped (--skip-preflight); the host was not checked"
+      return true
+    end
+    if options[:ssh_key_source] == :generate
+      @err.puts "warning: preflight skipped: it logs in with the registration key, which this run generated; " \
+        "once the key is installed, check the host with `ubicloud-admin host preflight`, or pass --ssh-key next time"
+      return true
+    end
+
+    report = registration.preflight(accept_checks: options[:accept_checks], **@preflight)
+    @out.print report.to_table
+    return true unless report.blocking?
+
+    @err.puts "! preflight failed: fix the checks marked fail, or accept an overridable one with --accept-check; nothing was registered"
+    false
   end
 
   def bmc(options)
@@ -139,6 +179,8 @@ class ByohRegistrationCli
     @out.puts "IPv6 mode        #{registration.ipv6_mode}"
     @out.puts "Pools            " + cfg["routed_networks"].map { pool_line(it) }.join("\n                 ")
     @out.puts "Uplink           #{cfg["uplink"]}" if cfg["uplink"]
+    @out.puts "Uplink IP        #{cfg["uplink_ip"]}" if cfg["uplink_ip"]
+    @out.puts "Pinned host keys #{registration.pinned_host_keys.map { ByohOperatorSsh::HostKey.parse(it).fingerprint }.join(", ")}" if registration.pinned_host_keys
     if (bmc = cfg["bmc"])
       @out.puts "BMC              #{bmc["endpoint"]} (protocol=#{bmc["protocol"]}, system_id=#{bmc["system_id"] || "auto"})"
     end

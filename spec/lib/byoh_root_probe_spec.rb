@@ -1,6 +1,10 @@
 # frozen_string_literal: true
 
+require_relative "byoh_fake_root_login"
+
 RSpec.describe ByohRootProbe do
+  include ByohFakeRootLogin
+
   let(:reg_key) { SshKey.generate }
   let(:host_pub) { SshKey.generate.public_key }
   let(:starts) { [] }
@@ -107,6 +111,40 @@ RSpec.describe ByohRootProbe do
     result = probe(pinned: verified).call
     expect(result.ok).to be true
     expect(result.host_keys).to eq([other, host_pub])
+  end
+
+  describe "with a block" do
+    it "runs it in the same connection once PF2 passes, and returns its value as the output" do
+      channel = ByohFakeRootLogin::Channel.new(out: "out\n", err: "err\n", status: 3)
+      starter = fake_root_starter(channels: [channel])
+      result = described_class.new("203.0.113.42", reg_key.private_key, starter:, nonce: "n0nce").call do |session|
+        session.exec(NetSsh.command("cat"), stdin: "data")
+      end
+      expect(result.ok).to be true
+      expect(result.output).to eq ["out\n", "err\n", 3]
+      expect([channel.command, channel.stdin, channel.eof?]).to eq ["cat", "data", true]
+      expect(result.host_keys).to eq [ByohFakeRootLogin::FIXTURE_HOST_KEY]
+    end
+
+    it "gives a nil status when a signal ends the command" do
+      starter = fake_root_starter(channels: [ByohFakeRootLogin::Channel.new(status: nil)])
+      result = described_class.new("203.0.113.42", reg_key.private_key, starter:, nonce: "n0nce").call { it.exec(NetSsh.command("true")) }
+      expect(result.output).to eq ["", "", nil]
+    end
+
+    it "does not run it when PF2 fails" do
+      starter = fake_root_starter(echo_output: "Please login as the user \"ubuntu\"\n", echo_status: 142)
+      ran = false
+      result = described_class.new("203.0.113.42", reg_key.private_key, starter:, nonce: "n0nce").call { ran = true }
+      expect([result.ok, result.output, ran]).to eq [false, nil, false]
+    end
+
+    it "fails when the host refuses to run the command" do
+      starter = fake_root_starter(channels: [ByohFakeRootLogin::Channel.new(success: false)])
+      result = described_class.new("203.0.113.42", reg_key.private_key, starter:, nonce: "n0nce").call { it.exec(NetSsh.command("true")) }
+      expect(result.ok).to be false
+      expect(result.detail).to include('Net::SSH::Exception: the host refused to run "true"')
+    end
   end
 
   it "refuses a pin that is not a host public key" do

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "../model/spec_helper"
+require_relative "byoh_fake_root_login"
 
 # Phase 6 end-to-end integration. Each example registers a BYOH host via
 # the real CLI entry point (ByohRegistration), then exercises a full
@@ -15,6 +16,8 @@ require_relative "../model/spec_helper"
 #     → Hosting::GenericApis#hardware_reset → Hosting::RedfishClient#power_reset → wire.
 #     Excon stubs stand in for a real BMC but the code path is 100% production.
 RSpec.describe ByohRegistration, "end_to_end" do
+  include ByohFakeRootLogin
+
   let(:location) {
     Location.create(name: "byoh-e2e", display_name: "byoh-e2e", ui_name: "BYOH e2e", visible: false,
       provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"ula48" => "fd00:1:2::/48"})
@@ -181,6 +184,24 @@ RSpec.describe ByohRegistration, "end_to_end" do
       expect(vm_host.net6.netmask.prefix_len).to eq 64
       expect(ByohNetworkProfile.covers?(NetAddr::IPv6Net.parse("fd00:1:2::/48"), vm_host.net6)).to be true
       expect(vm_host.ipv6_mode).to eq "ula"
+    end
+  end
+
+  describe "preflight, then registration" do
+    it "downloads ubuntu-noble, and pins the host keys the preflight login met for the first root login" do
+      key_path = File.join(Dir.mktmpdir, "byoh_key")
+      File.write(key_path, SshKey.generate.private_key)
+      reg = described_class.new(location:, main_ip: "203.0.113.10", routed_networks: ["fd00:feed::/64"], ssh_key_source: key_path)
+      report = reg.preflight(starter: fake_root_starter(channels: preflight_channels(preflight_fixture("base"))), nonce: "f1x7ure", services: nil)
+      expect(report).not_to be_blocking
+
+      strand = reg.register!
+      vm_host = VmHost[strand.id]
+      expect(strand.stack.first).to include("default_boot_images" => ["ubuntu-noble"], "pin_host_keys" => true)
+      expect(vm_host.sshable.host_keys).to eq [ByohFakeRootLogin::FIXTURE_HOST_KEY]
+      expect(vm_host.provider.config["uplink_ip"]).to eq "203.0.113.10"
+    ensure
+      FileUtils.rm_rf(File.dirname(key_path))
     end
   end
 end

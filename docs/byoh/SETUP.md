@@ -220,11 +220,21 @@ bundle exec bin/register-byoh-host \
   --main-ip <host management IPv4> \
   --pool-file pools.yaml \
   --ssh-key ~/.ssh/byoh_data \
-  --default-boot-image ubuntu-noble \
   --yes
 ```
 
-Other options: `--routed-network CIDR[,key=value...]` (inline pools, repeatable), `--ipv6-mode gua|ula`, `--server-identifier`, a second `--default-boot-image ubuntu-jammy` (only if customers will pick it; the default image for VMs that name none is `ubuntu-noble`), and the Redfish BMC flags (`--bmc-endpoint`, `--bmc-user`, `--bmc-pass-env`, …). There is no `--provider` flag.
+Other options: `--routed-network CIDR[,key=value...]` (inline pools, repeatable), `--ipv6-mode gua|ula`, `--server-identifier`, `--default-boot-image` (repeatable; `ubuntu-noble` when none is given, which is also the image of a VM that names none; add `ubuntu-jammy` only if customers will pick it), and the Redfish BMC flags (`--bmc-endpoint`, `--bmc-user`, `--bmc-pass-env`, …). There is no `--provider` flag.
+
+**Preflight.** With `--ssh-key`, the key is already in root's `authorized_keys`, so the command first logs in as root with it and runs host preflight (`scripts/byoh/host/ubicloud-host`, checks PF1-PF21 in `docs/byoh/PLATFORMS.md`):
+
+- PF2 (root login runs commands) comes first. The script then runs over the same connection, sent on stdin, so nothing is copied to the host and nothing on it changes.
+- Any `fail` stops the command before anything is registered, for example no `/dev/kvm`, a kvm64-class CPU model, or a pool that holds the host's uplink IP or default gateway.
+- `--accept-check ID` (repeatable) accepts one of the few fails that are a choice rather than a defect: `PF8-hybrid`, `PF10-btrfs` and the `PF16-*` firewall services other than `PF16-pve` and `PF16-rhizome-user`. Any other ID is a usage error (exit 2).
+- `--skip-preflight` registers without checking.
+- The host keys this login met are pinned, so the control plane's first root login during bring-up must meet the same key.
+- The uplink IP (the source address of the default route) is stored as `uplink_ip` in the host's provider config. `--uplink-ip IP` sets it instead, for a host with more than one default route. No pool may hand it to VMs.
+
+Without `--ssh-key` the command generates the key, so preflight cannot log in yet: it warns and registers without it.
 
 Bring-up takes 15-25 minutes on bare metal and about 4 minutes on a nested-virtualization cloud VM. It **reboots the host once**. Watch it:
 

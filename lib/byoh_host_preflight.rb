@@ -60,7 +60,7 @@ class ByohHostPreflight
   # The services that must run for a registered host to be set up.
   SERVICES = %w[ubicloud-web ubicloud-respirate].freeze
 
-  attr_reader :checks, :facts, :uplink_ip
+  attr_reader :checks, :facts, :uplink_ip, :gateway
 
   def self.nonce = SecureRandom.hex(8)
 
@@ -131,6 +131,19 @@ class ByohHostPreflight
     SERVICES.to_h { [it, runner.call(it)] } if File.exist?(env_file)
   end
 
+  # The overridable checks an --accept-check id names; raises UsageError
+  # for any other id, so that a typo fails before the host is touched.
+  def self.accept_targets(id)
+    targets = OVERRIDABLE.keys.select { it == id || it.start_with?("#{id}-") }
+    if targets.empty?
+      known = (HOST_CHECKS + %w[PF2 PF17 PF20 PF21]).any? { it == id || it.start_with?("#{id}-") }
+      raise UsageError, "--accept-check #{id}: #{known ? "this check cannot be accepted" : "no such check"}; only #{OVERRIDABLE.keys.join(", ")} can"
+    end
+    targets
+  end
+
+  def self.validate_accept!(ids) = ids.each { accept_targets(it) }
+
   def initialize(checks, facts)
     @checks = checks
     @facts = facts
@@ -160,12 +173,7 @@ class ByohHostPreflight
   # usage error.
   def accept(ids)
     ids.each do |id|
-      targets = OVERRIDABLE.keys.select { it == id || it.start_with?("#{id}-") }
-      if targets.empty?
-        known = (HOST_CHECKS + %w[PF2 PF17 PF20 PF21]).any? { it == id || it.start_with?("#{id}-") }
-        raise UsageError, "--accept-check #{id}: #{known ? "this check cannot be accepted" : "no such check"}; only #{OVERRIDABLE.keys.join(", ")} can"
-      end
-
+      targets = self.class.accept_targets(id)
       @checks.map! do |check|
         next check unless targets.include?(check.id) && check.status == "fail"
 
@@ -242,6 +250,7 @@ class ByohHostPreflight
     local = ipv4_addresses
     local_ips = local.map(&:last)
     @uplink_ip = explicit_uplink_ip || (route && (route["prefsrc"] || local.find { |dev, _| dev == route["dev"] }&.last))
+    @gateway = route && route["gateway"]
     devs = routes.map { it["dev"] }.join(", ")
 
     if routes.empty?
@@ -277,7 +286,7 @@ class ByohHostPreflight
       add("PF17-main-ip", "warn", "main IP #{main_ip} is not on the host; that is right only for a NAT address in front of it")
     end
 
-    pool_check(pools, main_ip:, gateway: route && route["gateway"], local_ips:, location:)
+    pool_check(pools, main_ip:, gateway: @gateway, local_ips:, location:)
     netplan_check(route)
   end
 
