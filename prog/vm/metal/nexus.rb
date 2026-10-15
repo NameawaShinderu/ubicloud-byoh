@@ -507,7 +507,13 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   label def start_after_stop
     when_start_set? do
       decr_start
-      host.sshable.cmd("sudo systemctl start :vm_name", vm_name:)
+      if emulated_host?
+        # Through rhizome, which refuses a unit that lost its hardening
+        # (VmSetup#check_emulated_unit) before it starts QEMU.
+        host.sshable.cmd("sudo host/bin/setup-vm start :vm_name", vm_name:)
+      else
+        host.sshable.cmd("sudo systemctl start :vm_name", vm_name:)
+      end
       nap 5
     end
 

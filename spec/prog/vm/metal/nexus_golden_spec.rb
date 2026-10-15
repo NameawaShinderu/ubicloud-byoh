@@ -42,6 +42,12 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         expect(command).to eq GoldenFixture.read("create_unix_user.sh", command)
       end
 
+      it "starts a stopped VM with systemctl start" do
+        vm.incr_start
+        expect(sshable).to receive(:_cmd).with("sudo systemctl start #{vm.inhost_name}")
+        expect { nx.start_after_stop }.to nap(5)
+      end
+
       it "gives a newly allocated VM 10 minutes to reach wait" do
         st.stack = [{"storage_volumes" => [{"use_bdev_ubi" => false, "size_gib" => 11, "boot" => true}]}]
         allow(Config).to receive(:machine_images_service_project_id).and_return(Project.create(name: "machine-images").id)

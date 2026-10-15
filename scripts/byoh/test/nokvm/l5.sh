@@ -298,6 +298,11 @@ vm_delete() {
   systemctl stop "$VM-dnsmasq"
   for round in 1 2; do
     check "$VM: setup-vm delete, round $round" setup_vm delete "$VM"
+  # A customer stop, then start: the control plane's start_after_stop runs
+  # setup-vm start on emulated hosts.
+  systemctl stop "$VM"
+  check "$VM: start through setup-vm after a stop" setup_vm start "$VM"
+  if wait_ssh "$SSH_LIMIT_S"; then ok "$VM: SSH again after setup-vm start"; else bad "$VM: no SSH after setup-vm start"; fi
   done
   check "$VM: nothing left (netns, units, disk, home, user, processes)" bash -c "
     ! ip netns list | grep -qw $VM && test ! -e /etc/systemd/system/$VM.service && test ! -e /etc/systemd/system/$VM-0-storage.service &&

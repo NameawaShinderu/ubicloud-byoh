@@ -131,6 +131,13 @@ RSpec.describe ByohVirtTiers do
         nx.write_params_json
       end
 
+      it "starts a stopped VM through rhizome, which checks the hardening before systemctl runs" do
+        vm.incr_start
+        expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm start #{vm.inhost_name}")
+        expect { nx.start_after_stop }.to nap(5)
+          .and change { vm.start_set?(cached: false) }.from(true).to(false)
+      end
+
       it "gives a newly allocated VM 30 minutes to reach wait" do
         st.stack = [{"storage_volumes" => [{"use_bdev_ubi" => false, "size_gib" => 11, "boot" => true}]}]
         allow(Config).to receive(:machine_images_service_project_id).and_return(Project.create(name: "machine-images").id)
