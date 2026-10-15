@@ -540,7 +540,15 @@ pf16_coexistence() {
   local i=0 states=()
   mapfile -t states <<<"$active"
   for unit in "${CONFLICTING_UNITS[@]}"; do
-    if [[ ${states[$i]:-} == active ]]; then
+    if [[ $unit == ufw ]]; then
+      # ufw.service is a oneshot that stays active even when it skipped
+      # loading rules; ENABLED in ufw.conf decides whether it loads them.
+      if grep -Eqi '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*"?yes"?[[:space:]]*$' <<<"$(rd /etc/ufw/ufw.conf)"; then
+        check PF16-ufw fail "ufw is enabled (ENABLED=yes in /etc/ufw/ufw.conf); its firewall rules can conflict with the host's nftables rules" "ufw disable, or pass --accept-check PF16-ufw"
+      else
+        check PF16-ufw pass "ufw not enabled"
+      fi
+    elif [[ ${states[$i]:-} == active ]]; then
       check "PF16-$unit" fail "$unit is active; its firewall rules can conflict with the host's nftables rules" "stop and disable $unit, or pass --accept-check PF16-$unit"
     else
       check "PF16-$unit" pass "$unit not active"

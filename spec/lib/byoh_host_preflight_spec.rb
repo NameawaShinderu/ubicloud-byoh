@@ -57,7 +57,7 @@ RSpec.describe ByohHostPreflight do
   describe ".parse" do
     it "reads every fixture host's real output" do
       %w[base amd-uniform arm-biglittle btrfs ebs-nvme gpu-nouveau intel-hybrid kvm64-model lvm no-kvm noisy-bashrc
-        offline-cpus one-cpu pve-node rhizome-user two-default-routes virtio-vda zfs].each do |name|
+        offline-cpus one-cpu pve-node rhizome-user two-default-routes ufw-off ufw-on virtio-vda zfs].each do |name|
         preflight = from_fixture(name)
         expect(preflight).to be_readable, name
         expect(preflight.checks.map(&:id)).to include(*described_class::HOST_CHECKS, *described_class::STANDALONE_CHECKS)
@@ -72,6 +72,9 @@ RSpec.describe ByohHostPreflight do
       expect(status(from_fixture("arm-biglittle"), "PF8-hybrid")).to eq "fail"
       expect(status(from_fixture("amd-uniform"), "PF8-hybrid")).to eq "pass"
       expect(status(from_fixture("base"), "PF3")).to eq "pass"
+      # ufw.service is active even with ENABLED=no; only ufw.conf counts.
+      expect(check(from_fixture("ufw-off"), "PF16-ufw")).to have_attributes(status: "pass", detail: "ufw not enabled")
+      expect(status(from_fixture("ufw-on"), "PF16-ufw")).to eq "fail"
       expect(from_fixture("base").facts).to include("arch" => "x86_64", "cpus_online" => 8, "mem_gib" => 64)
       expect(from_fixture("base").host_keys.map { it.split.first }).to eq %w[ecdsa-sha2-nistp256 ssh-ed25519]
     end

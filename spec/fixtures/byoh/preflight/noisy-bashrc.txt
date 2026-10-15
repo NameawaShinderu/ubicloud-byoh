@@ -25,7 +25,7 @@ UBIPF:f1x7ure {"kind":"check","id":"PF14","status":"pass","detail":"tsc availabl
 UBIPF:f1x7ure {"kind":"check","id":"PF15-apt","status":"pass","detail":"the archive serves the PrepHost packages","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF15-egress","status":"pass","detail":"reached 2 URL(s)","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF16-docker","status":"fail","detail":"docker is active; its firewall rules can conflict with the host's nftables rules","fix":"stop and disable docker, or pass --accept-check PF16-docker"}
-UBIPF:f1x7ure {"kind":"check","id":"PF16-ufw","status":"pass","detail":"ufw not active","fix":""}
+UBIPF:f1x7ure {"kind":"check","id":"PF16-ufw","status":"pass","detail":"ufw not enabled","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF16-tailscaled","status":"pass","detail":"tailscaled not active","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF16-k3s","status":"pass","detail":"k3s not active","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF16-libvirtd","status":"pass","detail":"libvirtd not active","fix":""}
