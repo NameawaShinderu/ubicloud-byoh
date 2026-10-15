@@ -14,8 +14,9 @@
 # machine without vmx or svm; the VM user cannot replace anything in its
 # root-owned home, and a socket swapped for a symlink in run/ only makes
 # stop-vm fall back; a unit that lost its hardening is refused before it
-# starts; stop-vm powers the guest down over QMP; recreate-unpersisted
-# and restart bring it back; delete twice leaves nothing.
+# starts, as is a drop-in that overrides it; stop-vm powers the guest
+# down over QMP; recreate-unpersisted, restart and start after a stop
+# bring it back; delete twice leaves nothing.
 #
 # What it cannot do, and fakes (each says so in the log): systemd
 # (fake-systemctl applies User=, Group= and the network namespace, none
@@ -267,6 +268,14 @@ hardening_probe() {
   if [ "$rc" != 0 ] && grep -q "lacks ProtectSystem=strict; refusing to start it" <<<"$out"; then ok "$VM: setup-vm restart refuses a unit without ProtectSystem=strict"; else bad "$VM: restart of a weakened unit: rc $rc: $out"; fi
   check "$VM: the refused restart left the VM running" systemctl is-active "$VM"
   check "$VM: reinstall-systemd-units writes the hardened unit back" bash -c "cd /home/rhizome && ruby /w/rhizome/host/bin/setup-vm reinstall-systemd-units $VM && cmp $unit /tmp/l5.unit"
+  # A drop-in that overrides a key with spaces around '=', which systemd
+  # strips, is refused by setup-vm start (the control plane's
+  # start_after_stop on emulated hosts) as well.
+  mkdir -p "$unit.d"
+  printf '[Service]\nUser = root\n' >"$unit.d/l5-override.conf"
+  out=$(setup_vm start "$VM" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" != 0 ] && grep -q "overrides User=root; refusing to start it" <<<"$out"; then ok "$VM: setup-vm start refuses a drop-in that sets User = root"; else bad "$VM: start with a User = root drop-in: rc $rc: $out"; fi
+  rm -r "$unit.d"
 }
 
 lifecycle() {
@@ -289,6 +298,11 @@ lifecycle() {
   check "$VM: the disk kept the first boot's data" ssh_vm "test -f /var/lib/cloud/instance/boot-finished"
   check "$VM: restart through setup-vm" setup_vm restart "$VM"
   if wait_ssh "$SSH_LIMIT_S"; then ok "$VM: SSH again after setup-vm restart"; else bad "$VM: no SSH after setup-vm restart"; fi
+  # A customer stop, then start: the control plane's start_after_stop runs
+  # setup-vm start on emulated hosts.
+  systemctl stop "$VM"
+  check "$VM: start through setup-vm after a stop" setup_vm start "$VM"
+  if wait_ssh "$SSH_LIMIT_S"; then ok "$VM: SSH again after setup-vm start"; else bad "$VM: no SSH after setup-vm start"; fi
 }
 
 vm_delete() {
@@ -298,11 +312,6 @@ vm_delete() {
   systemctl stop "$VM-dnsmasq"
   for round in 1 2; do
     check "$VM: setup-vm delete, round $round" setup_vm delete "$VM"
-  # A customer stop, then start: the control plane's start_after_stop runs
-  # setup-vm start on emulated hosts.
-  systemctl stop "$VM"
-  check "$VM: start through setup-vm after a stop" setup_vm start "$VM"
-  if wait_ssh "$SSH_LIMIT_S"; then ok "$VM: SSH again after setup-vm start"; else bad "$VM: no SSH after setup-vm start"; fi
   done
   check "$VM: nothing left (netns, units, disk, home, user, processes)" bash -c "
     ! ip netns list | grep -qw $VM && test ! -e /etc/systemd/system/$VM.service && test ! -e /etc/systemd/system/$VM-0-storage.service &&

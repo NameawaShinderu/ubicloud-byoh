@@ -26,8 +26,9 @@
 #   restart UNIT     stop, then start
 #   is-active UNIT…  "active" while the main process lives
 #   show UNIT --property P   MainPID and ActiveEnterTimestampMonotonic
-#   cat UNIT         the unit file, as systemctl cat shows a unit without
-#                    drop-ins
+#   cat UNIT         the unit file, then each UNIT.d/*.conf drop-in under
+#                    /etc/systemd/system, as systemctl cat shows them (the
+#                    other drop-in directories are not read)
 #   anything else    does nothing (daemon-reload, reload nftables, ...)
 set -euo pipefail
 
@@ -183,6 +184,11 @@ case ${1:-} in
     u=${!#}
     echo "# $(unit_file "$u")"
     cat "$(unit_file "$u")"
+    for dropin in "$UNITS/$(unit_name "$u").service.d"/*.conf; do
+      [ -f "$dropin" ] || continue
+      printf '\n# %s\n' "$dropin"
+      cat "$dropin"
+    done
     ;;
   *) exit 0 ;;
 esac

@@ -1115,12 +1115,16 @@ DNSMASQ_SERVICE
   # rhizome, overridden by a drop-in) is refused rather than started, as
   # is a home the VM user could write. systemctl cat shows the unit with
   # every drop-in systemd applies to it, so an override anywhere is seen.
+  # It reads the files on disk, so daemon-reload first makes systemd load
+  # exactly what is checked: a weakened definition loaded earlier and put
+  # back on disk without a reload would otherwise be the one started.
   def check_emulated_unit
     check_emulated_home
     stat = lstat_or_nil(vp.systemd_service)
     unless stat&.file? && stat.uid == 0 && stat.mode & 0o022 == 0
       fail "#{vp.systemd_service} must be a regular file only root can write; refusing to start #{@vm_name}"
     end
+    r "systemctl", "daemon-reload"
     QemuTcg.check_unit!(r("systemctl", "cat", "--", "#{@vm_name}.service"), @vm_name)
   end
 

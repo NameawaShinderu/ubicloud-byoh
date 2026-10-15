@@ -886,12 +886,22 @@ SHIPPED (spec-gated; nothing of it run on a real host, UNVERIFIED there):
   `ByohVirtTiers.runs_cloud_hypervisor?`). A tier host downloads only the first of its tier's images
   (`ubuntu-noble`) unless registration names others (`--default-boot-image ubuntu-jammy`).
 - **Refuse to start.** Before every `systemctl start` or `restart` of an emulated VM, rhizome checks
-  that the home is root-owned, that the unit file is a regular file only root can write, and that
-  `systemctl cat` (the unit with every drop-in) still carries every line of `QemuTcg.hardening`
+  that the home is root-owned and that the unit file is a regular file only root can write, runs
+  `systemctl daemon-reload` (so systemd loads exactly the files it checks), and reads `systemctl cat`
+  (the unit with every drop-in) the way systemd's parser does: comments skipped, continuation lines
+  joined, whitespace around key and value stripped (`QemuTcg.check_unit!`). Only the `[Unit]` and
+  `[Service]` keys the generated unit has may appear. Every line of `QemuTcg.hardening`
   (`ProtectSystem=strict`, `ReadWritePaths=/vm/<vm>`, `CapabilityBoundingSet=`, the syscall filter and
-  the rest), `User=`/`Group=` of the VM, a `MemoryMax=`, `-accel tcg,...` and QEMU's `-sandbox`, and
-  that no line or drop-in sets one of those keys to anything else (`QemuTcg.check_unit!`). The golden
-  units in `rhizome/host/spec/fixtures/qemu_tcg/` pin the text, and a spec removes each line in turn.
+  the rest), `User=`/`Group=` of the VM, its `NetworkNamespacePath=` and the one `ExecStartPre=` (the
+  QMP socket's `rm`) appear exactly once with their values; `Slice=`, `MemoryMax=<n>M` and a single
+  `ExecStart=qemu-system-x86_64 ...` exactly once, with one `-accel tcg,...`, no `accel=` and one
+  `-sandbox` with QEMU's filter; no other key repeats. A drop-in can therefore not reset `ExecStart=`,
+  add an `ExecStartPre=+...` that runs outside the confinement, add `BindPaths=` or
+  `AmbientCapabilities=`, or lift `MemoryMax=`. The checked paths are prep, recreate-unpersisted,
+  `setup-vm restart`, and `setup-vm start`, which `Prog::Vm::Metal::Nexus#start_after_stop` runs on
+  emulated hosts after a customer stop (KVM hosts keep `systemctl start`, pinned by
+  `nexus_golden_spec.rb`). The golden units in `rhizome/host/spec/fixtures/qemu_tcg/` pin the text,
+  and specs remove each line in turn and add each kind of drop-in.
 - **Bootstrap.** `bootstrap-data-plane.sh --tier emulated` prints what the tier costs (speed, no
   security boundary, burstable credits), notes swap and a present `/dev/kvm`, installs `qemu-system-x86
   ovmf`, and checks that `qemu-system-x86_64 -accel help` lists `tcg` and that OVMF exists.
@@ -899,10 +909,11 @@ SHIPPED (spec-gated; nothing of it run on a real host, UNVERIFIED there):
   `stop-vm` and `vm-stats`, with SSH within 420 s, QMP `query-kvm` false, no `/dev/kvm` among QEMU's
   descriptors, guest `systemd-detect-virt` = `qemu` without `vmx`/`svm`, the VM user unable to replace
   anything in its home, a swapped QMP socket that only makes `stop-vm` fall back, the hardening refusal
-  on a weakened unit, QMP power-down, recreate-unpersisted, restart, and delete twice. It needs mounts
+  on a weakened unit and on a `User = root` drop-in, QMP power-down, recreate-unpersisted, restart,
+  `setup-vm start` after a stop, and delete twice. It needs mounts
   (`ip netns add`), so it runs only where `l3` may (a throwaway VM or the admin-loaded profile, section
   15) and **has not been run** (UNVERIFIED). `fake-systemctl` now runs units with `User=`, without a
-  network namespace and with continuation lines, and answers `systemctl cat`; checked in a plain
+  network namespace and with continuation lines, and answers `systemctl cat` with the `/etc/systemd/system/<unit>.d/*.conf` drop-ins; checked in a plain
   container, the l3 lab was not re-run.
 
 Not shipped (deferred, as planned): the exit-reason diagnosis of EMULATED_HOSTS.md section 6.5, the

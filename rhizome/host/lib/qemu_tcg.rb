@@ -78,35 +78,117 @@ module QemuTcg
   end
 
   # The [Service] settings an emulated VM's unit must carry before it may
-  # start (check_unit!): every hardening line, the VM user, the QEMU
-  # sandbox and the software accelerator. MemoryMax= varies with the VM's
-  # memory, so only its presence is required.
+  # start (check_unit!), each exactly once and with this value: every
+  # hardening line, the VM user, its network namespace and the removal of
+  # a stale QMP socket. MemoryMax= varies with the VM's memory, so it is
+  # checked on its own.
   def self.required_settings(vm_name)
     hardening(vm_name, 0).lines.map(&:chomp).reject { |line| line.start_with?("MemoryMax=") } +
-      ["User=#{vm_name}", "Group=#{vm_name}"]
+      ["User=#{vm_name}", "Group=#{vm_name}", "NetworkNamespacePath=/var/run/netns/#{vm_name}", "ExecStartPre=/usr/bin/rm -f /vm/#{vm_name}/run/qmp.sock"]
+  end
+
+  # The [Unit] keys VmSetup#install_systemd_unit writes. They only order
+  # the unit after its storage and dnsmasq units, so any value may repeat.
+  UNIT_KEYS = %w[Description After Requires Wants].freeze
+
+  # [Service] keys that carry no confinement: at most once, any value.
+  OPTIONAL_SERVICE_KEYS = %w[KillSignal TimeoutStopSec Restart LimitNOFILE LimitMEMLOCK CPUQuota].freeze
+
+  # [Service] keys that must appear exactly once, with a value of this form.
+  SHAPED_SERVICE_KEYS = {
+    "Slice" => /\A[\w@.-]+\.slice\z/,
+    "MemoryMax" => /\A\d+M\z/,
+    "ExecStart" => /\Aqemu-system-x86_64\s/,
+  }.freeze
+
+  ACCEL = "tcg,thread=multi,tb-size=#{TB_SIZE_MIB}"
+
+  # The unit's assignments as [section, key, value], read the way
+  # systemd's parser reads them: comment lines are skipped (also inside a
+  # continuation), a line ending in an unescaped backslash continues on the
+  # next one with the backslash turned into a space, and key and value lose
+  # the whitespace around them. A line that is neither a section header nor
+  # an assignment raises.
+  def self.assignments(unit, vm_name)
+    section = nil
+    pending = nil
+    result = []
+    parse = lambda do |text|
+      line = text.strip
+      return if line.empty?
+      if (header = line[/\A\[(.*)\]\z/, 1])
+        section = header
+        return
+      end
+      key, value = line.split("=", 2)
+      refuse!(vm_name, "has a line systemd cannot assign, #{line}") unless value
+      result << [section, key.strip, value.strip]
+    end
+
+    unit.each_line(chomp: true) do |raw|
+      next if raw.lstrip.start_with?("#", ";")
+      text = pending ? pending + raw : raw
+      if text[/\\+\z/].to_s.size.odd?
+        pending = text.delete_suffix("\\") + " "
+      else
+        pending = nil
+        parse.call(text)
+      end
+    end
+    parse.call(pending) if pending
+    result
   end
 
   # Raises unless the unit text keeps the confinement QEMU's TCG needs,
-  # because TCG is no security boundary (docs/byoh/EMULATED_HOSTS.md
-  # section 4.2): each required setting is present, no other line sets
-  # one of its keys to something else (systemd takes the last value of
-  # most keys, and adds up others), and the command line runs QEMU under
-  # tcg with its sandbox. The caller passes the unit together with its
-  # drop-ins (VmSetup#check_emulated_unit), which could override any of it.
+  # because TCG is no security boundary (docs/byoh/NO_KVM.md section
+  # 8.1). The caller passes `systemctl cat`, the unit together with every
+  # drop-in (VmSetup#check_emulated_unit). Only the sections and keys the
+  # generated unit has may appear; each required setting appears exactly
+  # once with its value, so no drop-in can reset, add to or override one
+  # (systemd takes the last value of most keys, and adds up others); a
+  # single ExecStart runs QEMU under tcg with its sandbox; and the only
+  # ExecStartPre is the generated one, so nothing runs before QEMU outside
+  # the confinement.
   def self.check_unit!(unit, vm_name)
-    lines = unit.lines.map(&:strip)
-    required = required_settings(vm_name)
-    missing = required - lines
-    fail "emulated unit of #{vm_name} lacks #{missing.join(", ")}; refusing to start it" unless missing.empty?
+    assignments = assignments(unit, vm_name)
+    required = required_settings(vm_name).to_h { |line| line.split("=", 2) }
+    service_keys = required.keys + SHAPED_SERVICE_KEYS.keys + OPTIONAL_SERVICE_KEYS
 
-    keys = required.map { |line| line.split("=", 2).first }.uniq
-    conflicting = lines.select { |line| keys.include?(line.split("=", 2).first) && !required.include?(line) }
-    fail "emulated unit of #{vm_name} overrides #{conflicting.join(", ")}; refusing to start it" unless conflicting.empty?
-    fail "emulated unit of #{vm_name} sets no MemoryMax; refusing to start it" unless lines.any? { |line| line.match?(/\AMemoryMax=\d+M\z/) }
+    stray = assignments.reject { |section, key, _|
+      (section == "Unit" && UNIT_KEYS.include?(key)) || (section == "Service" && service_keys.include?(key))
+    }
+    refuse!(vm_name, "sets #{stray.map { |section, key, value| "[#{section}] #{key}=#{value}" }.join(", ")}, which it may not carry") unless stray.empty?
 
-    ["ExecStart=qemu-system-x86_64 \\", "-accel tcg,thread=multi,tb-size=#{TB_SIZE_MIB} \\", "-sandbox #{SANDBOX}"].each do |arg|
-      fail "emulated unit of #{vm_name} lacks #{arg.delete_suffix(" \\")}; refusing to start it" unless lines.include?(arg)
+    service = assignments.filter_map { |section, key, value| [key, value] if section == "Service" }
+    values = service.group_by(&:first).transform_values { |pairs| pairs.map(&:last) }
+
+    missing = required.reject { |key, _| values.key?(key) }
+    refuse!(vm_name, "lacks #{pairs(missing)}") unless missing.empty?
+    conflicting = service.select { |key, value| required.key?(key) && value != required[key] }
+    refuse!(vm_name, "overrides #{pairs(conflicting)}") unless conflicting.empty?
+    repeated = values.select { |_, list| list.size > 1 }.keys
+    refuse!(vm_name, "repeats #{repeated.join(", ")}") unless repeated.empty?
+
+    SHAPED_SERVICE_KEYS.each do |key, shape|
+      refuse!(vm_name, "sets no #{key}") unless values.key?(key)
+      refuse!(vm_name, "sets #{key}=#{values[key].first}") unless shape.match?(values[key].first)
     end
+
+    args = values["ExecStart"].first.split
+    refuse!(vm_name, "lacks -accel #{ACCEL}") unless once?(args, "-accel", ACCEL) && args.none? { |arg| arg.include?("accel=") }
+    refuse!(vm_name, "lacks -sandbox #{SANDBOX}") unless once?(args, "-sandbox", SANDBOX)
     nil
+  end
+
+  def self.refuse!(vm_name, why)
+    fail "emulated unit of #{vm_name} #{why}; refusing to start it"
+  end
+
+  def self.pairs(pairs) = pairs.map { |key, value| "#{key}=#{value}" }.join(", ")
+
+  # Whether flag appears exactly once in the QEMU arguments, followed by value.
+  def self.once?(args, flag, value)
+    at = args.each_index.select { |i| args[i] == flag }
+    at.size == 1 && args[at.first + 1] == value
   end
 end

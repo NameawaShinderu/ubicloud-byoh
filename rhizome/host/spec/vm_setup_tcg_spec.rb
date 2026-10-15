@@ -274,7 +274,54 @@ RSpec.describe VmSetup do
       expect { QemuTcg.check_unit!(golden.sub(/^MemoryMax=.*\n/, ""), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 sets no MemoryMax; refusing to start it")
       expect { QemuTcg.check_unit!(golden.sub("-accel tcg,", "-accel kvm,"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks -accel tcg,thread=multi,tb-size=256; refusing to start it")
       expect { QemuTcg.check_unit!(golden.sub(/^-sandbox .*\n/, ""), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks -sandbox #{QemuTcg::SANDBOX}; refusing to start it")
-      expect { QemuTcg.check_unit!(golden.sub("ExecStart=qemu-system-x86_64", "ExecStart=/tmp/qemu"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks ExecStart=qemu-system-x86_64; refusing to start it")
+      expect { QemuTcg.check_unit!(golden.sub("ExecStart=qemu-system-x86_64", "ExecStart=/tmp/qemu"), "vmtcg001") }.to raise_error(/\Aemulated unit of vmtcg001 sets ExecStart=\/tmp\/qemu  -name vmtcg001 .* -sandbox on,\S+; refusing to start it\z/)
+      expect { QemuTcg.check_unit!(golden.sub("-machine q35", "-machine q35,accel=kvm"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks -accel tcg,thread=multi,tb-size=256; refusing to start it")
+      expect { QemuTcg.check_unit!(golden.sub("-machine q35 \\\n", "-machine q35 \\\n-accel kvm \\\n"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks -accel tcg,thread=multi,tb-size=256; refusing to start it")
+      expect { QemuTcg.check_unit!(golden.sub("-machine q35 \\\n", "-machine q35 \\\n-sandbox off \\\n"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks -sandbox #{QemuTcg::SANDBOX}; refusing to start it")
+    end
+
+    it "refuses a unit without its Slice or ExecStart, or with a MemoryMax or Slice of another shape" do
+      expect { QemuTcg.check_unit!(golden.sub(/^Slice=.*\n/, ""), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 sets no Slice; refusing to start it")
+      expect { QemuTcg.check_unit!(golden.sub(/^ExecStart=.*?\n\n/m, "\n"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 sets no ExecStart; refusing to start it")
+      expect { QemuTcg.check_unit!(golden.sub("MemoryMax=2560M", "MemoryMax=infinity"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 sets MemoryMax=infinity; refusing to start it")
+      expect { QemuTcg.check_unit!(golden.sub("Slice=system.slice", "Slice=-"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 sets Slice=-; refusing to start it")
+    end
+
+    it "refuses a drop-in that sets a key again, as systemd would apply its last value or add it up" do
+      {
+        "MemoryMax=infinity" => "MemoryMax",
+        "MemoryMax=" => "MemoryMax",
+        "ExecStart=\nExecStart=qemu-system-x86_64 -accel tcg,thread=multi,tb-size=256 -sandbox #{QemuTcg::SANDBOX}" => "ExecStart",
+        "CPUQuota=100%" => "CPUQuota",
+        "NoNewPrivileges=yes" => "NoNewPrivileges",
+      }.each do |dropin, key|
+        unit = golden + "\n# /etc/systemd/system/vmtcg001.service.d/override.conf\n[Service]\n#{dropin}\n"
+        expect { QemuTcg.check_unit!(unit, "vmtcg001") }.to raise_error("emulated unit of vmtcg001 repeats #{key}; refusing to start it")
+      end
+    end
+
+    it "reads keys and values with the whitespace systemd strips" do
+      unit = golden + "[Service]\n  User = root\nProtectSystem =false\n\tCapabilityBoundingSet= CAP_SYS_ADMIN \n"
+      expect { QemuTcg.check_unit!(unit, "vmtcg001") }.to raise_error("emulated unit of vmtcg001 overrides User=root, ProtectSystem=false, CapabilityBoundingSet=CAP_SYS_ADMIN; refusing to start it")
+    end
+
+    it "refuses any other command before QEMU, such as one run outside the confinement" do
+      unit = golden + "[Service]\nExecStartPre=+/bin/sh -c id\n"
+      expect { QemuTcg.check_unit!(unit, "vmtcg001") }.to raise_error("emulated unit of vmtcg001 overrides ExecStartPre=+/bin/sh -c id; refusing to start it")
+    end
+
+    it "refuses keys and sections the generated unit does not have" do
+      unit = golden + "[Service]\nExecStartPost=+/bin/sh\nBindPaths=/\nAmbientCapabilities=CAP_SYS_ADMIN\n[Unit]\nJoinsNamespaceOf=other.service\n[Install]\nWantedBy=multi-user.target\n"
+      expect { QemuTcg.check_unit!(unit, "vmtcg001") }.to raise_error("emulated unit of vmtcg001 sets [Service] ExecStartPost=+/bin/sh, [Service] BindPaths=/, [Service] AmbientCapabilities=CAP_SYS_ADMIN, [Unit] JoinsNamespaceOf=other.service, [Install] WantedBy=multi-user.target, which it may not carry; refusing to start it")
+      expect { QemuTcg.check_unit!("User=root\n" + golden, "vmtcg001") }.to raise_error("emulated unit of vmtcg001 sets [] User=root, which it may not carry; refusing to start it")
+      expect { QemuTcg.check_unit!(golden + "[Service]\nUser\n", "vmtcg001") }.to raise_error("emulated unit of vmtcg001 has a line systemd cannot assign, User; refusing to start it")
+    end
+
+    it "joins continuation lines and skips comments as systemd does" do
+      unit = "[Service]\nA=b \\\n# a comment\n; another\nc\nD=e\\\\\n\nF=g \\"
+      expect(QemuTcg.assignments(unit, "vmtcg001")).to eq [["Service", "A", "b  c"], ["Service", "D", "e\\\\"], ["Service", "F", "g"]]
+      unit = golden + "[Service]\nKillSignal=SIGKILL \\\n# hidden?\nUser=root\n"
+      expect { QemuTcg.check_unit!(unit, "vmtcg001") }.to raise_error("emulated unit of vmtcg001 repeats KillSignal; refusing to start it")
     end
 
     describe "#start_systemd_unit and #restart_systemd_unit" do
@@ -284,10 +331,11 @@ RSpec.describe VmSetup do
         instance_double(File::Stat, file?: file, uid: uid, mode: mode)
       end
 
-      it "start or restart the unit as systemd shows it, drop-ins included, once it passes" do
+      it "start or restart the unit as systemd loaded it, drop-ins included, once it passes" do
         %w[start restart].each do |action|
           expect(vm_setup).to receive(:check_emulated_home).ordered
           expect(File).to receive(:lstat).with(service).and_return(unit_stat).ordered
+          expect(vm_setup).to receive(:_run_command).with("systemctl", "daemon-reload").ordered
           expect(vm_setup).to receive(:_run_command).with("systemctl", "cat", "--", "vmtcg001.service").and_return(golden).ordered
           expect(vm_setup).to receive(:_run_command).with("systemctl", action, "vmtcg001").ordered
           vm_setup.public_send(:"#{action}_systemd_unit")
@@ -310,6 +358,7 @@ RSpec.describe VmSetup do
       it "never starts a unit that lost its hardening" do
         expect(vm_setup).to receive(:check_emulated_home)
         expect(File).to receive(:lstat).with(service).and_return(unit_stat)
+        expect(vm_setup).to receive(:_run_command).with("systemctl", "daemon-reload")
         expect(vm_setup).to receive(:_run_command).with("systemctl", "cat", "--", "vmtcg001.service").and_return(golden.sub("ProtectSystem=strict\n", ""))
         expect(vm_setup).not_to receive(:_run_command).with("systemctl", "restart", "vmtcg001")
         expect { vm_setup.restart_systemd_unit }.to raise_error("emulated unit of vmtcg001 lacks ProtectSystem=strict; refusing to start it")
