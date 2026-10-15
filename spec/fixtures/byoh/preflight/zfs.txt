@@ -13,7 +13,7 @@ UBIPF:f1x7ure {"kind":"check","id":"PF8","status":"pass","detail":"all CPUs onli
 UBIPF:f1x7ure {"kind":"check","id":"PF8-hybrid","status":"pass","detail":"uniform cores","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF9","status":"pass","detail":"cgroup v2 with cpuset","fix":""}
 UBIPF:f1x7ure {"kind":"fact","id":"storage_fstype","value":"zfs"}
-UBIPF:f1x7ure {"kind":"check","id":"PF10-zfs","status":"fail","detail":"/var/storage would be on ZFS (rpool/var/storage), which BYOH storage does not support","fix":"mount an ext4 or xfs filesystem at /var/storage, or pass a blank disk with ubicloud-host storage-disk"}
+UBIPF:f1x7ure {"kind":"check","id":"PF10-zfs","status":"fail","detail":"/var/storage would be on ZFS (rpool/var/storage), which BYOH storage does not support","fix":"mount an ext4 or xfs filesystem at /var/storage, or give host add a blank disk with --storage-disk <by-id>"}
 UBIPF:f1x7ure {"kind":"check","id":"PF10-btrfs","status":"pass","detail":"not btrfs","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF10","status":"pass","detail":"rpool/var/storage (zfs), 870G free","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF11","status":"pass","detail":"no blank unused disk","fix":""}

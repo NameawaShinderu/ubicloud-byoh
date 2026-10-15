@@ -16,7 +16,7 @@ UBIPF:f1x7ure {"kind":"fact","id":"storage_fstype","value":"ext4"}
 UBIPF:f1x7ure {"kind":"check","id":"PF10-zfs","status":"pass","detail":"not ZFS","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF10-btrfs","status":"pass","detail":"not btrfs","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF10","status":"warn","detail":"/var/storage shares the root filesystem (/dev/vda1, 870G free); a full disk stops the host","fix":""}
-UBIPF:f1x7ure {"kind":"check","id":"PF11","status":"info","detail":"blank disk(s) not used for VM storage: vdb","fix":"to use one, prepare it with: ubicloud-host storage-disk /dev/<disk>"}
+UBIPF:f1x7ure {"kind":"check","id":"PF11","status":"info","detail":"blank disk(s) not used for VM storage: vdb (no by-id link)","fix":"host add --storage-disk takes a disk by its /dev/disk/by-id name; these disks have none (give the virtual disk a serial)"}
 UBIPF:f1x7ure {"kind":"check","id":"PF12","status":"info","detail":"no /dev/disk/by-id link for vda; the host records the kernel name, which can change across reboots","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF13","status":"info","detail":"smartctl is not installed yet (PrepHost installs it)","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF14","status":"pass","detail":"paravirtual clocksource on a kvm guest","fix":""}

@@ -1,0 +1,6 @@
+NAME="nvme0n1" TYPE="disk" FSTYPE="" MOUNTPOINTS="" PKNAME=""
+NAME="nvme0n1p1" TYPE="part" FSTYPE="ext4" MOUNTPOINTS="/" PKNAME="nvme0n1"
+NAME="nvme0n1p15" TYPE="part" FSTYPE="vfat" MOUNTPOINTS="/boot/efi" PKNAME="nvme0n1"
+NAME="nvme1n1" TYPE="disk" FSTYPE="ext4" MOUNTPOINTS="/var/storage" PKNAME=""
+NAME="nvme2n1" TYPE="disk" FSTYPE="" MOUNTPOINTS="" PKNAME=""
+NAME="sdb" TYPE="disk" FSTYPE="" MOUNTPOINTS="" PKNAME=""

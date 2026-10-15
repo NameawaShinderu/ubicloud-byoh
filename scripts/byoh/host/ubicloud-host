@@ -404,7 +404,7 @@ pf10_storage() {
   fact_str storage_fstype "${fstype:-}"
 
   if [[ $fstype == zfs ]]; then
-    check PF10-zfs fail "/var/storage would be on ZFS ($src), which BYOH storage does not support" "mount an ext4 or xfs filesystem at /var/storage, or pass a blank disk with ubicloud-host storage-disk"
+    check PF10-zfs fail "/var/storage would be on ZFS ($src), which BYOH storage does not support" "mount an ext4 or xfs filesystem at /var/storage, or give host add a blank disk with --storage-disk <by-id>"
   else
     check PF10-zfs pass "not ZFS"
   fi
@@ -441,8 +441,33 @@ pf10_storage() {
   done <<<"$(run_cmd lsblk-storage lsblk -nPso NAME,TYPE "$dev")"
 }
 
+BYID=""
+
+# The /dev/disk/by-id name of disk $1 that ByohDeviceIdentity.pick
+# (lib/byoh_device_identity.rb) gives: the first by PREFERENCE, the
+# bytewise smallest within one; nothing when it has none.
+byid_name() {
+  local disk=$1 name target rank best="" best_rank=9 LC_ALL=C
+  while read -r name target; do
+    [[ ${target##*/} == "$disk" ]] || continue
+    case $name in
+      wwn-*) rank=0 ;;
+      nvme-eui.*) rank=1 ;;
+      nvme-nvme.*) continue ;;
+      nvme-*) rank=2 ;;
+      ata-* | scsi-* | virtio-*) rank=3 ;;
+      *) continue ;;
+    esac
+    if ((rank < best_rank)) || { ((rank == best_rank)) && [[ $name < $best ]]; }; then
+      best=$name
+      best_rank=$rank
+    fi
+  done <<<"$BYID"
+  echo "$best"
+}
+
 pf11_blank_disks() {
-  local out line name type fstype mounts pkname blank=()
+  local out line name type fstype mounts pkname blank=() id named="" example=""
   local -A parents=()
   out=$(run_cmd lsblk lsblk -nPo NAME,TYPE,FSTYPE,MOUNTPOINTS,PKNAME)
   while read -r line; do
@@ -457,7 +482,17 @@ pf11_blank_disks() {
     [[ $type == disk && -z $fstype && -z $mounts && -z ${parents[$name]:-} ]] && blank+=("$name")
   done <<<"$out"
   if ((${#blank[@]})); then
-    check PF11 info "blank disk(s) not used for VM storage: ${blank[*]}" "to use one, prepare it with: ubicloud-host storage-disk /dev/<disk>"
+    BYID=$(run_cmd byid find /dev/disk/by-id -mindepth 1 -maxdepth 1 -type l -printf '%f %l\n')
+    for name in "${blank[@]}"; do
+      id=$(byid_name "$name")
+      named+="${named:+, }$name (${id:-no by-id link})"
+      [[ -z $example && -n $id ]] && example=$id
+    done
+    if [[ -n $example ]]; then
+      check PF11 info "blank disk(s) not used for VM storage: $named" "to use one, pass its by-id name to host add, e.g. --storage-disk $example"
+    else
+      check PF11 info "blank disk(s) not used for VM storage: $named" "host add --storage-disk takes a disk by its /dev/disk/by-id name; these disks have none (give the virtual disk a serial)"
+    fi
   else
     check PF11 pass "no blank unused disk"
   fi
@@ -465,7 +500,7 @@ pf11_blank_disks() {
 
 pf12_pf13_disks() {
   local links d missing=() smart rc failing=() unknown=()
-  links=$(run_cmd byid find /dev/disk/by-id -mindepth 1 -maxdepth 1 -type l -printf '%f %l\n')
+  links=${BYID:-$(run_cmd byid find /dev/disk/by-id -mindepth 1 -maxdepth 1 -type l -printf '%f %l\n')}
   for d in "${STORAGE_DISKS[@]}"; do
     grep -Eq "^(wwn-|nvme-eui\.|nvme-|ata-|scsi-|virtio-)[^ ]* (\.\./)*$d\$" <<<"$links" || missing+=("$d")
   done

@@ -59,7 +59,7 @@ RSpec.describe ByohHostPreflight do
   describe ".parse" do
     it "reads every fixture host's real output" do
       %w[base amd-uniform arm-biglittle btrfs ebs-nvme gpu-nouveau intel-hybrid kvm64-model kvm64-vmx lvm no-kvm noisy-bashrc
-        offline-cpus one-cpu pve-node rhizome-user smt-offline sshd-broken two-default-routes ufw-off ufw-on virtio-vda zfs].each do |name|
+        offline-cpus one-cpu pve-node blank-disk rhizome-user smt-offline sshd-broken two-default-routes ufw-off ufw-on virtio-vda zfs].each do |name|
         preflight = from_fixture(name)
         expect(preflight).to be_readable, name
         expect(preflight.checks.map(&:id)).to include(*described_class::HOST_CHECKS, *described_class::STANDALONE_CHECKS)
@@ -123,6 +123,15 @@ RSpec.describe ByohHostPreflight do
 
     it "accepts a null ip_addr or ip_route" do
       expect(parse({}, "ip_addr" => nil, "ip_route" => nil)).to be_readable
+    end
+
+    it "names blank disks as ByohDeviceIdentity does, for --storage-disk" do
+      links = ByohDeviceIdentity.byid_links(File.read(File.join(__dir__, "../../scripts/byoh/test/fixtures/host/blank-disk/cmd/byid")))
+      pf11 = check(from_fixture("blank-disk"), "PF11")
+      expect(pf11.detail).to eq "blank disk(s) not used for VM storage: " + %w[nvme2n1 sdb].map { "#{it} (#{ByohDeviceIdentity.pick(it, links[it])})" }.join(", ")
+      expect(pf11.fix).to eq "to use one, pass its by-id name to host add, e.g. --storage-disk nvme-eui.002538b921b0c3d4"
+      expect(check(from_fixture("virtio-vda"), "PF11")).to have_attributes(detail: "blank disk(s) not used for VM storage: vdb (no by-id link)",
+        fix: "host add --storage-disk takes a disk by its /dev/disk/by-id name; these disks have none (give the virtual disk a serial)")
     end
 
     it "reads the sshd settings, and null when sshd -T failed" do

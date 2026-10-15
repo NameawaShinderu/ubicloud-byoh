@@ -126,7 +126,7 @@ The PF15 network calls are shimmed (`cmd/curl`, `cmd/apt-get`).
 PrepHost runs, gives each fixture host the same PF3 verdict as the
 script, except on kvm64-class CPU models, which only the script refuses
 (`kvm64-vmx` has /dev/kvm and vmx, so KvmCheck passes it). Rerun the script with `--update-spec` after changing it or the
-fixtures. Result (2026-10-15): 22 cases plus base, the guard and the
+fixtures. Result (2026-10-15): 23 cases plus base, the guard and the
 live run pass in about 25 s, with nothing left behind.
 
 ## Scenarios
