@@ -158,6 +158,10 @@ EOS
       expect(learned("gpu-vfio-shared-group")).to eq([])
     end
 
+    it "accepts an NVIDIA bridge in a GPU's group and does not record it" do
+      expect(learned("gpu-vfio-nvidia-bridge")).to eq([["01:00.0", "0302", "20b5", 0, 7]])
+    end
+
     it "learns nothing on a host without a GPU" do
       expect(learned("no-gpu")).to eq([])
     end

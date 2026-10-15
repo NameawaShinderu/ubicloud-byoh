@@ -44,12 +44,13 @@ class Prog::LearnPci < Prog::Base
   # cannot open it, so keep an NVIDIA device only when its whole IOMMU group
   # can be handed to a VM: every NVIDIA function is on vfio-pci, and every
   # other member is one the kernel's vfio viability rule accepts (vfio-pci,
-  # pci-stub, no driver, or a PCI bridge).
+  # pci-stub, no driver, or a PCI bridge of any vendor). Bridges are never
+  # passed through, so an NVIDIA bridge is not recorded.
   def byoh_records
     all = PciDeviceRecord.parse_all(sshable.cmd(BYOH_LSPCI))
     groups = all.group_by(&:iommu_group)
     all.filter_map do |rec|
-      next unless rec.vendor == NVIDIA_VENDOR
+      next unless rec.vendor == NVIDIA_VENDOR && rec.device_class != PCI_BRIDGE_CLASS
 
       unless (short_slot = rec.slot[BYOH_SLOT, 1])
         Clog.emit("PCI device outside PCI domain 0000 skipped on VmHost #{vm_host.ubid}", {slot: rec.slot})
@@ -67,10 +68,10 @@ class Prog::LearnPci < Prog::Base
   end
 
   def vfio_viable?(rec)
-    return true if rec.driver == "vfio-pci"
+    return true if rec.driver == "vfio-pci" || rec.device_class == PCI_BRIDGE_CLASS
     return false if rec.vendor == NVIDIA_VENDOR
 
-    rec.driver.nil? || rec.driver == "pci-stub" || rec.device_class == PCI_BRIDGE_CLASS
+    rec.driver.nil? || rec.driver == "pci-stub"
   end
 
   label def start

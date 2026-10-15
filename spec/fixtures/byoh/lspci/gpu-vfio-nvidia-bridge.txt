@@ -1,0 +1,21 @@
+# fixture: a vfio-pci GPU behind an NVIDIA-vendor PCI bridge on pcieport in the same IOMMU group; synthesised in the pciutils 3.10.0 lspci -vnmmk -D format (UNVERIFIED against real hardware)
+Slot:	0000:00:01.0
+Class:	0604
+Vendor:	10de
+Device:	1ad0
+Rev:	a1
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	7
+
+Slot:	0000:01:00.0
+Class:	0302
+Vendor:	10de
+Device:	20b5
+SVendor:	10de
+SDevice:	1533
+Rev:	a1
+ProgIf:	00
+Driver:	vfio-pci
+NUMANode:	0
+IOMMUGroup:	7
