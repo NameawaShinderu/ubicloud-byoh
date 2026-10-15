@@ -31,7 +31,7 @@ class ByohRegistration
   LOCK_KEY = "byoh-host-register"
 
   # uplink_ip is --uplink-ip, or what #preflight detected.
-  attr_reader :main_ip, :server_identifier, :bmc_config, :ssh_key_source, :default_boot_images, :pinned_host_keys, :uplink_ip
+  attr_reader :main_ip, :server_identifier, :bmc_config, :ssh_key_source, :default_boot_images, :pinned_host_keys, :uplink_ip, :gateway
 
   # @param main_ip [String] management IPv4 address of the host (what the
   #   control plane will SSH to; becomes the sshable.host).
@@ -208,15 +208,52 @@ class ByohRegistration
       ByohHostPreflight.parse(out, nonce)
     end
     report.checks.unshift(result.check)
+    evaluate_preflight(report, accept_checks:, services:, host_keys: result.host_keys)
+  end
+
+  # Adds the control-plane checks to report, the output of
+  # ubicloud-host preflight, and downgrades the accepted fails. Unless it
+  # then blocks, host_keys become the pin of #register!, and the
+  # detected uplink IP and gateway are stored and checked again there.
+  # Returns report.
+  def evaluate_preflight(report, accept_checks:, services:, host_keys:)
     report.evaluate(main_ip: @main_ip, pools: entries, uplink: @uplink, uplink_ip: @explicit_uplink_ip, location:,
       location_name: location.name, boot_images: @default_boot_images, services:)
     report.accept(accept_checks)
-    unless report.blocking?
-      @pinned_host_keys = result.host_keys
-      @uplink_ip = report.uplink_ip
-      @gateway = report.gateway
-    end
+    adopt_preflight(host_keys:, uplink_ip: report.uplink_ip, gateway: report.gateway) unless report.blocking?
     report
+  end
+
+  # What a passing preflight learned, for #register!: byoh-host add
+  # keeps it between its prepare and register phases, which may run in
+  # different processes.
+  def adopt_preflight(host_keys:, uplink_ip:, gateway:)
+    @pinned_host_keys = host_keys
+    @uplink_ip = @explicit_uplink_ip || uplink_ip
+    @gateway = gateway
+  end
+
+  # The arguments of ubicloud-host preflight for a host whose `uname -m`
+  # is arch and whose $SSH_CONNECTION, as the control plane's login sees
+  # it, is connection.
+  def host_script_args(nonce, arch, connection)
+    urls = ByohHostPreflight.new([], {"arch" => arch}).boot_image_urls(@default_boot_images)
+    args = ["--json", "--nonce", nonce, "--main-ip", @main_ip, "--images", @default_boot_images.size.to_s]
+    cp_ip = connection.to_s.split(" ").first
+    args.push("--cp-ip", cp_ip) if cp_ip
+    urls.each { args.push("--boot-image-url", it) }
+    args
+  end
+
+  # The pools and settings as given, parsed but not checked against the
+  # database, to compare with those of a host already registered.
+  def requested_config
+    location = resolve_location(@location_input)
+    entries, uplink, = parse_pools
+    {location:, routed_networks: entries.map(&:to_config), uplink:, bmc: @bmc_config, uplink_ip: @explicit_uplink_ip,
+     default_boot_images: @default_boot_images, server_identifier: @server_identifier}
+  rescue ByohPoolDeclaration::ValidationError => ex
+    raise ValidationError, ex.message
   end
 
   # Call Prog::Vm::HostNexus.assemble with validated input + pre-generated
@@ -328,11 +365,7 @@ class ByohRegistration
   def run_host_script(session, nonce, script, timeout)
     facts, _, = session.exec(NetSsh.command("uname -m && echo \"$SSH_CONNECTION\""))
     arch, connection = facts.lines.map(&:strip)
-    urls = ByohHostPreflight.new([], {"arch" => arch}).boot_image_urls(@default_boot_images)
-    args = ["--json", "--nonce", nonce, "--main-ip", @main_ip, "--images", @default_boot_images.size.to_s]
-    cp_ip = connection.to_s.split(" ").first
-    args.push("--cp-ip", cp_ip) if cp_ip
-    urls.each { args.push("--boot-image-url", it) }
+    args = host_script_args(nonce, arch, connection)
     session.exec(NetSsh.command("bash -s -- preflight :shelljoin_args", shelljoin_args: args), stdin: script, timeout:)
   end
 

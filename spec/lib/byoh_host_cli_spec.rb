@@ -41,6 +41,13 @@ RSpec.describe ByohHostCli do
       expect(cli("help")[0]).to eq 0
     end
 
+    it "hands add, preflight and watch to ByohHostAdd with its stand-ins" do
+      status, out, = cli("add", "--help", runner: :fake)
+      expect(status).to eq 0
+      expect(out).to start_with "Usage: bin/byoh-host add"
+      expect(cli("watch")).to eq [2, "", "! invalid argument: watch takes one host\n"]
+    end
+
     it "refuses an unknown command" do
       status, _, err = cli("frobnicate")
       expect(status).to eq 1

@@ -12,6 +12,9 @@ class ByohHostCli
     Usage: bin/byoh-host COMMAND [options]
 
     Commands:
+      add                 --site NAME --ssh USER@HOST (--pool-file FILE | --routed-network CIDR ...) [--yes]
+      preflight           --site NAME --ssh USER@HOST [--pool-file FILE | --routed-network CIDR ...]
+      watch               HOST [--timeout SECONDS]
       move-location       --host UBID --location NAME --empty-only
       move-location       --host UBID --rollback-to LOCATION --empty-only
       setup-egress-nat    --host UBID
@@ -23,10 +26,12 @@ class ByohHostCli
   USAGE
 
   # device_ids is ByohDeviceIdentity.device_ids; specs pass a stand-in.
-  def initialize(out: $stdout, err: $stderr, device_ids: ByohDeviceIdentity.method(:device_ids))
+  # host_add holds keywords for ByohHostAdd (add, preflight, watch).
+  def initialize(out: $stdout, err: $stderr, device_ids: ByohDeviceIdentity.method(:device_ids), **host_add)
     @out = out
     @err = err
     @device_ids = device_ids
+    @host_add = host_add
   end
 
   # Returns the process exit status.
@@ -34,6 +39,8 @@ class ByohHostCli
     argv = argv.dup
     command = argv.shift
     case command
+    when "add", "preflight", "watch"
+      return ByohHostAdd.new(out: @out, err: @err, **@host_add).run(command, argv)
     when "move-location", "setup-egress-nat", "relearn-device-ids", "relearn-pci", "export-audit"
       send(:"cmd_#{command.tr("-", "_")}", argv)
     when nil, "help", "-h", "--help"
