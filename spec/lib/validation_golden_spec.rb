@@ -59,4 +59,20 @@ RSpec.describe Validation do
     expect(error).to eq expected_error("emulated-2")
     expect(offered(error)).not_to include("\"emulated-")
   end
+
+  it "refuses every lower-tier size to a VM pool" do
+    Option::TierVmSizes.each do |size|
+      pool = VmPool.create(size: 1, vm_size: size.name, boot_image: "ubuntu-noble", location_id: Location::HETZNER_FSN1_ID, storage_size_gib: 40, arch: "x64")
+      nx = Prog::Vm::VmPool.new(Strand.create_with_id(pool, prog: "Vm::VmPool", label: "wait"))
+      expect(size_error { nx.wait }).to eq expected_error(size.name)
+    end
+  end
+
+  it "gives no GitHub runner label a lower-tier size" do
+    tier_sizes = Option::TierVmSizes.map(&:name)
+    labels = Github.runner_labels.values
+    expect(labels).not_to be_empty
+    expect(labels.map { it["vm_size"] } & tier_sizes).to eq []
+    expect(labels.map { it["family"] } & ByohVirtTiers::TIERS.keys).to eq []
+  end
 end

@@ -65,13 +65,19 @@ RSpec.describe Prog::Vm::HostNexus do
   end
 
   describe "#wait_prep" do
-    it "takes no slices, keeps a core for the host and checks the tier next" do
-      Strand.create(parent_id: st.id, prog: "LearnOs", label: "start", exitval: {"os_version" => "ubuntu-24.04"})
-      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "x64", "total_sockets" => 1, "total_dies" => 1, "total_cores" => 4, "total_cpus" => 8, "cpu_numa_nodes" => [0] * 8})
-      expect { nx.wait_prep }.to hop("verify_virt_tier")
-      vm_host.reload
-      expect(vm_host.accepts_slices).to be false
-      expect(vm_host.used_cores).to eq 1
+    ByohVirtTiers::TIERS.each_key do |each_tier|
+      context "with a #{each_tier} host" do
+        let(:tier) { each_tier }
+
+        it "takes no slices, keeps a core for the host and checks the tier next" do
+          Strand.create(parent_id: st.id, prog: "LearnOs", label: "start", exitval: {"os_version" => "ubuntu-24.04"})
+          Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "x64", "total_sockets" => 1, "total_dies" => 1, "total_cores" => 4, "total_cpus" => 8, "cpu_numa_nodes" => [0] * 8})
+          expect { nx.wait_prep }.to hop("verify_virt_tier")
+          vm_host.reload
+          expect(vm_host.accepts_slices).to be false
+          expect(vm_host.used_cores).to eq 1
+        end
+      end
     end
 
     it "keeps a kvm BYOH host's walk when its probe crashed" do
@@ -125,11 +131,28 @@ RSpec.describe Prog::Vm::HostNexus do
       "MemTotal:       #{total} kB\nMemAvailable:   #{available} kB\nHugePages_Total:    #{hugepages}\nHugePages_Free:     #{hugepages}\nHugepagesize:    1048576 kB\n"
     end
 
-    it "writes the memory budget into the hugepage columns" do
-      create_vm(vm_host_id: vm_host.id, family: "emulated", memory_gib: 4, location_id: location.id)
-      expect(nx.sshable).to receive(:_cmd).with("cat /proc/meminfo").and_return(meminfo)
-      expect { nx.verify_tier_capacity }.to hop("start_slices")
-      expect(vm_host.reload.values.slice(:total_hugepages_1g, :used_hugepages_1g)).to eq(total_hugepages_1g: 27, used_hugepages_1g: 4)
+    # 32 GiB and 8 CPUs: (32768 * 42 / 43) - 2048 MiB, less the tier's
+    # per-VM overhead for 4 VMs of 2 vCPUs.
+    {"container" => 28, "pvm" => 27, "emulated" => 27}.each do |each_tier, budget|
+      context "with a #{each_tier} host" do
+        let(:tier) { each_tier }
+
+        it "writes the memory budget into the hugepage columns" do
+          create_vm(vm_host_id: vm_host.id, family: tier, memory_gib: 4, location_id: location.id)
+          expect(nx.sshable).to receive(:_cmd).with("cat /proc/meminfo").and_return(meminfo)
+          expect { nx.verify_tier_capacity }.to hop("start_slices")
+          expect(vm_host.reload.values.slice(:total_hugepages_1g, :used_hugepages_1g)).to eq(total_hugepages_1g: budget, used_hugepages_1g: 4)
+        end
+
+        it "fails without the cores or the memory budget for its VMs" do
+          expect(nx.sshable).to receive(:_cmd).and_return(meminfo, meminfo(total: 4194304))
+          nx.vm_host.update(total_cores: 1, used_cores: 0)
+          expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "#{tier} hosts need at least 2 physical cores")
+          nx.vm_host.update(total_cores: 4)
+          create_vm(vm_host_id: vm_host.id, family: tier, memory_gib: 4, location_id: location.id)
+          expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, /\ANot enough memory budget for VMs \([01] GiB for 4 GiB of VMs\)\z/)
+        end
+      end
     end
 
     it "logs hugepages the host still keeps" do

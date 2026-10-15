@@ -166,6 +166,20 @@ RSpec.describe ByohVirtTiers do
       expect(described_class::TIERS.values.select { it.options.include?("multitenant") }.map(&:id)).to eq %w[container pvm]
       expect(described_class.shared?({"acks" => {"pvm" => ["multitenant"]}}, "pvm")).to be false
     end
+
+    it "locks the location row until the create transaction ends" do
+      # A committed row, so a second connection can try to lock it.
+      fsn1 = Location[Location::HETZNER_FSN1_ID]
+      try_lock = lambda do
+        Thread.new {
+          Thread.current.report_on_exception = false
+          DB.transaction { DB[:location].where(id: fsn1.id).for_update.nowait.get(:id) }
+        }.value
+      end
+      expect(try_lock.call).to eq fsn1.id
+      described_class.check_tenancy!("container", fsn1, project.id)
+      expect { try_lock.call }.to raise_error(Sequel::DatabaseError, /could not obtain lock/)
+    end
   end
 
   describe ".memory_budget_gib" do
