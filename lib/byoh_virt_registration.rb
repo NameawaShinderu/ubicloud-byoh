@@ -64,7 +64,13 @@ class ByohVirtRegistration
     tier = if verdict.nil?
       raise Refused, "--virt-tier auto needs the probe, which failed: #{unprobed_reason}" if @declared == "auto"
 
-      notes << "the host was not probed (#{unprobed_reason}); Prog::LearnVirt checks it at prep, and a #{@declared} host waits there until the probe agrees"
+      # LearnVirt fails open: only a lower tier is held at verify_virt_tier.
+      after = if ByohVirtTiers.lower?(@declared)
+        "Prog::LearnVirt checks it at prep, and the #{@declared} host waits there until the probe agrees"
+      else
+        "prep goes on, and Prog::LearnVirt pages there if the host cannot run VMs"
+      end
+      notes << "the host was not probed (#{unprobed_reason}); #{after}"
       @declared
     else
       decide_from_verdict(verdict, location:, main_ip:, notes:)
@@ -80,9 +86,11 @@ class ByohVirtRegistration
 
   # The commands that register the host on its fastest option: the
   # location policy and rates for a fallback, then the registration.
+  # None for a fallback that is not shipped: no command could register
+  # it, and the verdict's text already says so.
   def self.recommended_commands(verdict, location:, main_ip:)
     tier = verdict.standard_vms? ? ByohVirtTiers::KVM : verdict.recommended
-    return [] unless tier
+    return [] unless tier && ByohVirtTiers.shipped?(tier)
 
     commands = []
     if ByohVirtTiers.lower?(tier) && !ByohVirtTiers.allows?(location, tier)

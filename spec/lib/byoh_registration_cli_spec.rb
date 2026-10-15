@@ -172,7 +172,7 @@ RSpec.describe ByohRegistrationCli do
       expect(Util).not_to receive(:rootish_ssh)
       status, _, err = cli(*required, "--routed-network", "fd00:feed::/64", "--no-virt-probe", "--yes")
       expect(status).to eq 0
-      expect(err).to eq "note: the host was not probed (the probe was skipped (--no-virt-probe)); Prog::LearnVirt checks it at prep, and a kvm host waits there until the probe agrees\n"
+      expect(err).to eq "note: the host was not probed (the probe was skipped (--no-virt-probe)); prep goes on, and Prog::LearnVirt pages there if the host cannot run VMs\n"
     end
 
     it "refuses an unknown tier before anything else" do

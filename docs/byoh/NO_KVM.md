@@ -1000,10 +1000,15 @@ Flags on `bin/register-byoh-host`:
   today on an L1 host; a non-L1 host is refused, now with the fix and a recommended command line.
 - `--accept-fallback`: required whenever the resulting tier is not `kvm`, including through `auto`.
 - `--install-pvm-kernel`: only if WP7 goes ahead.
-- `--no-virt-probe`: skip the pre-registration probe; LearnVirt checks at prep, and `wait_prep` fails
-  with the fix when the probe disagrees with the declared tier.
+- `--no-virt-probe`: skip the pre-registration probe; LearnVirt checks at prep. A lower-tier host
+  waits at `verify_virt_tier` until a probe agrees with its tier. A `kvm` host is not held: LearnVirt
+  fails open, prep goes on, and LearnVirt pages with the fix if the host cannot run VMs (PrepHost
+  then refuses a host without KVM as before).
 - The location must already allow the tier. Otherwise the message prints the exact
   `bin/byoh-location set <loc> --virt-tiers kvm,<tier> --accept <tier>` command.
+- A refusal prints the commands that would register the host on its fastest option only when that
+  option can be registered: never for a tier missing from `ByohVirtTiers::SHIPPED`, whose text
+  says instead that fallbacks cannot be registered yet.
 
 The registration matrix (probe × declared tier). "ack" means allowed with `--accept-fallback`:
 

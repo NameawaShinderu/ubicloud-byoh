@@ -76,7 +76,9 @@ RSpec.describe ByohVirtRegistration do
 
   it "notes what the probe could not check" do
     expect(described_class.new.decide!(nil, location:, main_ip: "203.0.113.42", unprobed_reason: "SSH refused").notes)
-      .to eq ["the host was not probed (SSH refused); Prog::LearnVirt checks it at prep, and a kvm host waits there until the probe agrees"]
+      .to eq ["the host was not probed (SSH refused); prep goes on, and Prog::LearnVirt pages there if the host cannot run VMs"]
+    expect(described_class.new(declared: "emulated", accept_fallback: true).decide!(nil, location:, main_ip: "x", unprobed_reason: "SSH refused").notes)
+      .to eq ["the host was not probed (SSH refused); Prog::LearnVirt checks it at prep, and the emulated host waits there until the probe agrees"]
     expect(described_class.new(declared: "emulated", accept_fallback: true).decide!(verdict_for("unknown"), location:, main_ip: "x").notes.first)
       .to start_with "emulated: Whether KVM works here is unknown"
     nested = ByohVirtLadder.from_facts(facts(cpu_flags: %w[vmx pdpe1gb hypervisor], virt_vm: "kvm"))
@@ -130,6 +132,25 @@ RSpec.describe ByohVirtRegistration do
     location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container], "acks" => {"container" => []}}))
     expect(described_class.recommended_commands(verdict_for("none"), location:, main_ip: "x"))
       .to eq ["bin/register-byoh-host --location byoh-test --main-ip x ... --virt-tier auto --accept-fallback"]
+  end
+
+  it "prints no commands for a fallback that is not shipped" do
+    ship_virt_tiers
+    location.update(byoh_virt: nil)
+    %w[none pvm_blocked].each do |probe|
+      refusal = begin
+        described_class.new.decide!(verdict_for(probe), location:, main_ip: "203.0.113.42")
+      rescue described_class::Refused => e
+        e.message
+      end
+      expect(refusal).to include("fallbacks cannot be registered yet").and include("refused: ")
+      expect(refusal).not_to include "fastest option"
+      expect(refusal).not_to include "bin/byoh-location set"
+      expect(refusal).not_to include "--virt-tier auto"
+    end
+    expect(described_class.recommended_commands(verdict_for("pvm"), location:, main_ip: "x")).to eq []
+    expect(described_class.recommended_commands(verdict_for("kvm"), location:, main_ip: "x"))
+      .to eq ["bin/register-byoh-host --location byoh-test --main-ip x ..."]
   end
 
   describe "#probe" do
