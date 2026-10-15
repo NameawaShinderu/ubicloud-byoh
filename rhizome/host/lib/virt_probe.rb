@@ -486,7 +486,7 @@ module VirtProbe
     container_needs = [facts["arch"].nil? ? nil : facts["arch"] == "x86_64", facts["cgroup2"], facts["apparmor"], version.empty? ? nil : (version <=> MIN_CONTAINER_KERNEL) >= 0]
     if container_needs.all?
       possible << "container"
-      ready << "container" if CONTAINER_COMMANDS.all? { commands[it] }
+      ready << "container" if CONTAINER_COMMANDS.all? { commands[_1] }
     elsif !container_needs.include?(false)
       unchecked << "container"
     end

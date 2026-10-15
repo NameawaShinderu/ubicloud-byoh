@@ -37,7 +37,7 @@ RSpec.describe VirtProbe do
   end
 
   def container_commands(installed)
-    described_class::CONTAINER_COMMANDS.to_h { [it, installed] }
+    described_class::CONTAINER_COMMANDS.to_h { [_1, installed] }
   end
 
   def write(root, path, content)
