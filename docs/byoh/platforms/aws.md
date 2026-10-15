@@ -242,14 +242,22 @@ sudo ubicloud-admin site add byoh-aws-mysite \
 - With `operator_ssh_cidr = 0.0.0.0/0`, the output warns and leaves the operator out of `--mgmt-allow`. VMs behind the host NAT are denied every `mgmt_allow` network, so a world-open CIDR there would cut VMs off from the internet.
 - `--ula48` is random by default. Pass one only to fit an existing host's `net6`, as the live window did (`--ula48 fd1b:3821:6123::/48`).
 
-Then restart the services so they load the rates, check the location, and grant your project once the account exists (§3.8):
+Then restart the services so they load the rates, check the location, and grant your project once the account exists (§3.8).
+
+Packaged control plane (`site add` already restarted the services):
 
 ```bash
-# development only; site add already restarted a packaged control plane
-tmux kill-session -t puma; tmux kill-session -t respirate
-bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
 sudo ubicloud-admin site show byoh-aws-mysite
 sudo ubicloud-admin site grant byoh-aws-mysite --project pj...
+```
+
+Development control plane, from `~/ubicloud`, without `sudo`:
+
+```bash
+tmux kill-session -t puma; tmux kill-session -t respirate
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
+packaging/bin/ubicloud-admin --dev site show byoh-aws-mysite        # or: bundle exec bin/byoh-location show ...
+packaging/bin/ubicloud-admin --dev site grant byoh-aws-mysite --project pj...
 ```
 
 `create` and `show` print preflight warnings. On a default control plane, expect:
