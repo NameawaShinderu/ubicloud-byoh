@@ -56,7 +56,8 @@ What `host add` does, in order ([OPERATIONS.md](../OPERATIONS.md) §4.2a,
 7. Registers the host and follows the bring-up (one reboot) until it accepts VMs, then runs `pool verify`.
 
 Exit status: 0 when the host accepts VMs and `pool verify` has no FAIL;
-1 a validation, preflight, host-key or SSH failure; 2 a usage error; 3 a
+1 a validation, preflight, host-key or SSH failure, or the host was
+destroyed while it was being watched; 2 a usage error; 3 a
 timeout, respirate not running, or a host outside its bring-up; 4 `pool
 verify` failed; 130 interrupted. Running the same command again resumes;
 it never registers a host twice ([TROUBLESHOOTING.md](../TROUBLESHOOTING.md) §2.3).

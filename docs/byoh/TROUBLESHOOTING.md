@@ -224,7 +224,7 @@ The site is not a BYOH location, or a boot image cannot be downloaded for the ho
 | Exit | Meaning | What to do |
 |---|---|---|
 | 0 | The host accepts VMs and `pool verify` has no FAIL (or `--no-wait` / `--phase prepare` finished) | Nothing |
-| 1 | Validation, preflight, host-key or SSH failure | Read the `!` line or the `fail` checks (§2.1a). Nothing was registered if it stopped before "Registered host" |
+| 1 | Validation, preflight, host-key or SSH failure, or the host was destroyed while it was being watched ("no longer exists") | Read the `!` line or the `fail` checks (§2.1a). Nothing was registered if it stopped before "Registered host"; a destroyed host is added again with the same command |
 | 2 | Usage error: an unknown option, `--accept-check` of a check that cannot be accepted, `--bmc-password`, `--storage-disk` on a host already registered | Fix the command |
 | 3 | The watch gave up: a phase took longer than its deadline (bootstrap 10 min, boot image download 4 h, reboot 15 min), respirate is not running, `--timeout` passed, or the host sits outside its bring-up without accepting | The bring-up is not undone. Check §2.2 for the label it stopped at; start respirate if it is down; then resume |
 | 4 | `pool verify` failed after the host started accepting | `ubicloud-admin pool verify --host vh...` names the FAIL lines ([POOL_OPERATIONS.md](POOL_OPERATIONS.md)) |
