@@ -9,6 +9,8 @@
 #   inside.sh l3          LXC and rhizome's gems, then l3.sh in a private
 #                         mount namespace with a fresh /proc whose
 #                         /proc/sys is read-only but for /proc/sys/net
+#   inside.sh l5          QEMU, OVMF and rhizome's gems, then l5.sh the
+#                         same way
 set -eu
 
 RHIZOME=/w/rhizome
@@ -75,21 +77,31 @@ case "${1:-}" in
     fi
     probe
     ;;
-  l3)
+  l3 | l5)
     export DEBIAN_FRONTEND=noninteractive
+    if [ "$1" = l3 ]; then
+      packages="lxc-utils uidmap xz-utils perl e2fsprogs"
+    else
+      # QEMU and its firmware (HostTier::PACKAGES), qemu-img for the
+      # image, mkdosfs and mcopy for the cloud-init seed, sudo for the
+      # storage backend's metadata, socat for QMP.
+      packages="qemu-system-x86 ovmf qemu-utils dosfstools mtools sudo socat"
+    fi
     apt-get -qq update >/dev/null
-    apt-get -qq install -y --no-install-recommends lxc-utils uidmap xz-utils dnsmasq-base nftables iproute2 ruby ruby-bundler \
-      curl ca-certificates openssh-client adduser perl procps e2fsprogs >/dev/null
+    # shellcheck disable=SC2086 # the package list is meant to split
+    apt-get -qq install -y --no-install-recommends $packages dnsmasq-base nftables iproute2 ruby ruby-bundler \
+      curl ca-certificates openssh-client adduser procps >/dev/null
     (cd /w/rhizome && BUNDLE_FROZEN=true bundle install --quiet 2>&1 | grep -v "as root" || true)
     # A fresh proc shows a writable /proc/sys, whose kernel.* and vm.*
     # settings are the host's own. Rhizome needs only the per-netns
-    # net.* ones, so the rest is made read-only again before l3.sh runs,
-    # and l3.sh checks it there (kernel_guard).
+    # net.* ones, so the rest is made read-only again before the lab
+    # runs, and it checks that there (kernel_guard).
+    # shellcheck disable=SC2016 # $0 is the inner shell's
     unshare -m --propagation private sh -c '
       mount -t proc proc /proc &&
         mount --bind /proc/sys /proc/sys && mount -o remount,bind,ro /proc/sys &&
         mount --bind /proc/sys/net /proc/sys/net && mount -o remount,bind,rw /proc/sys/net &&
-        exec bash /w/nokvm/l3.sh'
+        exec bash "/w/nokvm/$0.sh"' "$1"
     ;;
   *) fail "unknown mode ${1:-}" ;;
 esac

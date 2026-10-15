@@ -13,6 +13,11 @@
 #                  network hook, stop-vm and vm-stats (l3.sh), in
 #                  ubuntu:24.04 with LXC: SSH, DHCP, DNS, apt, isolation,
 #                  symlink and cgroup probes, delete twice
+#   run.sh l5      one emulated VM under QEMU TCG through the real
+#                  bin/setup-vm, ubiblk, stop-vm and vm-stats (l5.sh), in
+#                  ubuntu:24.04 with QEMU: SSH within 420 s, query-kvm
+#                  false, symlink and chown-race probes, the hardening
+#                  refusal, QMP stop, restart, delete twice
 #
 # l3 nests LXC, which mounts proc, sysfs and cgroup2 and loads seccomp
 # filters; docker-default AppArmor denies those mounts. The l3 container
@@ -33,15 +38,19 @@
 # that host kernel settings are not writable; the host-state comparison
 # runs before and after. These detect, they do not confine. l3.sh
 # installs the nft drop toward the test network and every private
-# address before any guest starts and stops if it is missing. The l5
-# guest mode comes with WP6.
+# address before any guest starts and stops if it is missing.
+#
+# l5 needs the same: rhizome creates network namespaces (ip netns add
+# mounts) and l5.sh mounts a fresh proc, which docker-default denies, so
+# it runs under the same two conditions as l3, never unconfined on a
+# shared machine.
 #
 # Rules for every container (checked with docker inspect before start):
 #   - named ubi-q-nokvm-*, network ubi-test-net, no published ports
 #   - not privileged; no device but /dev/net/tun; capabilities added only
 #     from NET_ADMIN SYS_ADMIN NET_RAW; security options only
 #     no-new-privileges and apparmor=ubi-q-nokvm (no seccomp profile, and
-#     nothing unconfined but l3's on a throwaway VM); no host
+#     nothing unconfined but l3's and l5's on a throwaway VM); no host
 #     PID/IPC/UTS/user namespace
 #   - AppArmor docker-default (or ubi-q-nokvm) and the daemon's default
 #     seccomp profile: the daemon must have both enabled (docker info,
@@ -144,8 +153,12 @@ apparmor_ok() {
   esac
 }
 
-# unconfined_ok NAME: only l3's container, and only on a throwaway VM.
-unconfined_ok() { [ "$1" = ubi-q-nokvm-l3 ] && [ "${BYOH_NOKVM_THROWAWAY_VM:-0}" = 1 ]; }
+# unconfined_ok NAME: only l3's and l5's containers, and only on a
+# throwaway VM.
+unconfined_ok() {
+  case "$1" in ubi-q-nokvm-l3 | ubi-q-nokvm-l5) ;; *) return 1 ;; esac
+  [ "${BYOH_NOKVM_THROWAWAY_VM:-0}" = 1 ]
+}
 
 # field NAME TEMPLATE: what docker inspect says about the container.
 field() { docker inspect --format "$2" "$1"; }
@@ -206,6 +219,9 @@ run_in() {
     scratch=suid,dev,size=3500m
     nnp=()
   fi
+  # l5: the raw image (about 3.5 GB apparent, 2 GB written), the VM's
+  # disk as ubiblk writes it, and nothing setuid.
+  [ "$mode" != l5 ] || scratch=nosuid,nodev,size=3500m
   ! docker container inspect "$name" >/dev/null 2>&1 || fail "$name exists; remove it by hand if it is yours"
   docker create --name "$name" --network "$NET" --cpuset-cpus="$CPUSET" --cpus=4 --memory=6g \
     "${nnp[@]}" --tmpfs "/scratch:rw,exec,$scratch" \
@@ -231,34 +247,35 @@ probe() {
   say "probe ok"
 }
 
-# l3: see the header. The scratch tmpfs holds the image and both root
-# file systems (about 2.5 GB of this container's memory, no disk).
-l3() {
-  local before confine
+# guest_lab MODE: l3 or l5; see the header. The scratch tmpfs holds the
+# images and the guests' disks (up to 3.5 GB of this container's memory,
+# no disk).
+guest_lab() {
+  local mode=$1 before confine
   if [ "${BYOH_NOKVM_THROWAWAY_VM:-0}" = 1 ]; then
     confine=(--security-opt apparmor=unconfined --security-opt seccomp=unconfined)
   elif [ "${NOKVM_L3_PROFILE:-0}" = 1 ]; then
     confine=(--security-opt apparmor=ubi-q-nokvm)
   else
-    fail "l3 nests LXC: run it on a throwaway VM (BYOH_NOKVM_THROWAWAY_VM=1) or under an admin-loaded ubi-q-nokvm AppArmor profile (NOKVM_L3_PROFILE=1), never unconfined on a shared machine; see the header"
+    fail "$mode mounts inside its container: run it on a throwaway VM (BYOH_NOKVM_THROWAWAY_VM=1) or under an admin-loaded ubi-q-nokvm AppArmor profile (NOKVM_L3_PROFILE=1), never unconfined on a shared machine; see the header"
   fi
   image_check "$UBUNTU_IMAGE"
   daemon_check
   disk_check
   before=$(host_state)
-  run_in l3 "$UBUNTU_IMAGE" l3 --cap-add NET_ADMIN --cap-add SYS_ADMIN --cap-add NET_RAW --device /dev/net/tun \
+  run_in "$mode" "$UBUNTU_IMAGE" "$mode" --cap-add NET_ADMIN --cap-add SYS_ADMIN --cap-add NET_RAW --device /dev/net/tun \
     "${confine[@]}" --sysctl net.ipv4.ip_forward=1
   [ "$before" = "$(host_state)" ] ||
     fail "host kernel state changed during the run (another workload on this machine may have done it): $(diff <(echo "$before") <(host_state) || true)"
   disk_check
-  say "l3 ok"
+  say "$mode ok"
 }
 
 case "${1:-}" in
   lint) lint ;;
-  l3)
+  l3 | l5)
     lint
-    l3
+    guest_lab "$1"
     ;;
   probe)
     lint
