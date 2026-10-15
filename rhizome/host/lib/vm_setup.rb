@@ -86,6 +86,7 @@ class VmSetup
     init_script, ipv6_disabled, gpu_partition_id)
 
     check_ch_installed
+    check_emulated_home if emulated?
     cloudinit(unix_user, public_keys, gua, nics, swap_size_bytes, boot_image, dns_ipv4, ipv6_disabled: ipv6_disabled, ip4: ip4, init_script: init_script)
     network_thread = Thread.new do
       setup_networking(false, gua, ip4, local_ip4, nics, ndp_needed, dns_ipv4, multiqueue: max_vcpus > 1)
@@ -107,16 +108,50 @@ class VmSetup
   # Files QEMU writes on an emulated host. The QMP socket lives in run/,
   # which only the VM user can enter, so another VM's user cannot reach
   # it. serial.log is owned by root and only group-writable by the VM
-  # user, so QEMU can write it but cannot replace it.
+  # user, so QEMU can write it. QEMU cannot unlink, rename or replace
+  # serial.log or run/ only because the home is root-owned, which
+  # check_emulated_home enforces rather than assumes.
+  #
+  # Both are kept when they already exist: prep re-runs after a failure
+  # that may come after QEMU started, and replacing serial.log then would
+  # leave QEMU writing to an unlinked file.
   def emulated_layout
+    check_emulated_home
+    run_stat = lstat_or_nil(vp.run_dir)
+    fail "#{vp.run_dir} is not a directory" if run_stat && !run_stat.directory?
     r "install", "-d", "-o", @vm_name, "-g", @vm_name, "-m", "0700", vp.run_dir
-    r "install", "-o", "root", "-g", @vm_name, "-m", "0660", File::NULL, vp.serial_log
+
+    if (log_stat = lstat_or_nil(vp.serial_log))
+      fail "#{vp.serial_log} is not a regular file" unless log_stat.file?
+      r "chown", "root:#{@vm_name}", vp.serial_log
+      r "chmod", "0660", vp.serial_log
+    else
+      r "install", "-o", "root", "-g", @vm_name, "-m", "0660", File::NULL, vp.serial_log
+    end
+  end
+
+  # QEMU's TCG is no security boundary, so an emulated VM's home must be a
+  # real directory owned by root and not writable by the VM user
+  # (root:<vm> 0750). Otherwise the VM uid could swap serial.log, run/,
+  # prep.json or dnsmasq.conf for symlinks that root later follows.
+  def check_emulated_home
+    stat = lstat_or_nil(vp.home_dir)
+    unless stat&.directory? && stat.uid == 0 && stat.mode & 0o022 == 0
+      fail "emulated VMs need #{vp.home_dir} to be a root-owned directory the VM user cannot write"
+    end
+  end
+
+  private def lstat_or_nil(path)
+    File.lstat(path)
+  rescue Errno::ENOENT
+    nil
   end
 
   def recreate_unpersisted(gua, ip4, local_ip4, nics, mem_gib, ndp_needed, storage_params,
     storage_secrets, dns_ipv4, pci_devices, slice_name, cpu_burst_percent_limit, gpu_partition_id, multiqueue:)
 
     check_ch_installed
+    check_emulated_home if emulated?
     setup_networking(true, gua, ip4, local_ip4, nics, ndp_needed, dns_ipv4, multiqueue: multiqueue)
     hugepages(mem_gib)
     storage(storage_params, storage_secrets, false)
@@ -138,6 +173,7 @@ class VmSetup
     dns_ipv4, slice_name, cpu_percent_limit, cpu_burst_percent_limit, ipv6_disabled, init_script)
 
     check_ch_installed
+    check_emulated_home if emulated?
     cloudinit(unix_user, public_keys, gua, nics, swap_size_bytes, boot_image, dns_ipv4, ipv6_disabled: ipv6_disabled, ip4: ip4, init_script: init_script)
     setup_networking(false, gua, ip4, local_ip4, nics, ndp_needed, dns_ipv4, multiqueue: max_vcpus > 1)
     hugepages(mem_gib)
@@ -254,9 +290,10 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
   end
 
   def purge_user
-    # A root-owned home is the emulated-host layout. deluser is not relied
-    # on to remove it, so it is removed explicitly. Cloud-hypervisor hosts
-    # have homes owned by the VM user, so this never runs there.
+    # Emulated VMs need a root-owned home (check_emulated_home). deluser is
+    # not relied on to remove one, so it is removed explicitly.
+    # Cloud-hypervisor hosts have homes owned by the VM user, so this never
+    # runs there.
     remove_home = emulated? || root_owned_home?
     begin
       r "deluser", "--remove-home", @vm_name
@@ -267,10 +304,8 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
   end
 
   def root_owned_home?
-    stat = File.lstat(vp.home_dir)
-    stat.directory? && stat.uid == 0
-  rescue Errno::ENOENT
-    false
+    stat = lstat_or_nil(vp.home_dir)
+    !!stat&.directory? && stat.uid == 0
   end
 
   # GNU rm walks the tree relative to open directory handles and never
