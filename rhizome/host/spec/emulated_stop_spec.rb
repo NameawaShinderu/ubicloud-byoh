@@ -27,9 +27,11 @@ RSpec.describe EmulatedStop do
     Dir.mkdir(vp.run_dir, 0o700)
   end
 
-  # A QMP server on vp.qmp_sock that answers every command with reply
-  # (or with an empty return) and records the commands it got.
-  def serve_qmp(reply: nil)
+  # A QMP server on vp.qmp_sock that records the commands it got. It
+  # answers every command with an empty return, except that fail_command
+  # gets an error reply with the request's id, and reply, when given, is
+  # sent as is to every command.
+  def serve_qmp(reply: nil, fail_command: nil)
     make_run_dir
     commands = Queue.new
     server = UNIXServer.new(vp.qmp_sock)
@@ -39,7 +41,14 @@ RSpec.describe EmulatedStop do
       while (line = conn.gets)
         req = JSON.parse(line)
         commands << req["execute"]
-        conn.write(JSON.generate(reply || {"return" => {}, "id" => req["id"]}) + "\n")
+        answer = if reply
+          reply
+        elsif req["execute"] == fail_command
+          {"error" => {"class" => "GenericError", "desc" => "no"}, "id" => req["id"]}
+        else
+          {"return" => {}, "id" => req["id"]}
+        end
+        conn.write(JSON.generate(answer) + "\n")
       end
     ensure
       conn&.close
@@ -99,7 +108,19 @@ RSpec.describe EmulatedStop do
       expect(described_class.powerdown(vm_name)).to eq(:already_stopped)
     end
 
-    it "raises when QEMU refuses the command" do
+    it "raises when QEMU refuses system_powerdown" do
+      stub_user
+      stub_privilege_drop
+      allow(described_class).to receive(:socket_present?).with(vp, vm_uid).and_return(true)
+      thread, commands = serve_qmp(fail_command: "system_powerdown")
+      expect {
+        expect { described_class.powerdown(vm_name) }.to raise_error(RuntimeError, /\AQMP powerdown of vmq00001 failed \(pid \d+ exit 1\)\z/)
+      }.to output(/stop-vm: QmpClient::CommandError: QMP system_powerdown failed: \{"class":"GenericError","desc":"no"\}/).to_stderr_from_any_process
+      thread.join(5)
+      expect(Array.new(commands.size) { commands.pop }).to eq(["qmp_capabilities", "system_powerdown"])
+    end
+
+    it "raises when QEMU sends a reply without the request's id" do
       stub_user
       stub_privilege_drop
       allow(described_class).to receive(:socket_present?).with(vp, vm_uid).and_return(true)
@@ -198,7 +219,16 @@ RSpec.describe EmulatedStop do
       expect(described_class.child(vm_uid, vm_gid, vp.qmp_sock, 5)).to eq(EmulatedStop::ALREADY_STOPPED)
     end
 
-    it "returns FAILED when QEMU refuses the command" do
+    it "returns FAILED when QEMU refuses system_powerdown" do
+      stub_privilege_drop
+      thread, _ = serve_qmp(fail_command: "system_powerdown")
+      expect {
+        expect(described_class.child(vm_uid, vm_gid, vp.qmp_sock, 5)).to eq(EmulatedStop::FAILED)
+      }.to output("stop-vm: QmpClient::CommandError: QMP system_powerdown failed: {\"class\":\"GenericError\",\"desc\":\"no\"}\n").to_stderr
+      thread.join(5)
+    end
+
+    it "returns FAILED when QEMU sends a reply without the request's id" do
       stub_privilege_drop
       thread, _ = serve_qmp(reply: {"error" => {}})
       expect {
