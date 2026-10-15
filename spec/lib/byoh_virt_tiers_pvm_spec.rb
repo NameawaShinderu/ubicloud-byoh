@@ -44,6 +44,14 @@ RSpec.describe ByohVirtTiers, "pvm" do
       Open3.capture2e(bash, "-c", "set -euo pipefail\n#{env}#{defs.join}#{call}")
     end
 
+    it "lets only pcieport and the operator's PVM_UNCHECKED_DRIVERS go unchecked" do
+      allowed = %w[pcieport vmbus vif].select do |drv|
+        run_functions(%w[driver_unchecked_ok], "driver_unchecked_ok #{drv}", PVM_UNCHECKED_DRIVERS: "hv_x vmbus")[1].success?
+      end
+      expect(allowed).to eq %w[pcieport vmbus]
+      expect(run_functions(%w[driver_unchecked_ok], "driver_unchecked_ok vmbus")[1].success?).to be false
+    end
+
     describe "kernel_has_driver" do
       let(:modules) { Dir.mktmpdir }
 
@@ -70,6 +78,11 @@ RSpec.describe ByohVirtTiers, "pvm" do
 
       it "finds built-in drivers and the sysfs names that differ" do
         expect(%w[ext4 virtio-pci].map { lookup(it) }).to all be true
+      end
+
+      it "maps the Xen and USB core sysfs names to their modules" do
+        File.write("#{modules}/6.12-pvm/modules.builtin", "kernel/drivers/usb/core/usbcore.ko\nkernel/drivers/net/xen-netfront.ko\nkernel/drivers/block/xen-blkfront.ko\n")
+        expect(%w[vif vbd usb hub].map { lookup(it) }).to all be true
       end
 
       it "reports missing drivers and kernels" do

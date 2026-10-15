@@ -1413,7 +1413,10 @@ What each phase checks (the script's header lists the environment overrides):
   can clear `next_entry` (`save_env`), all **before** the `.deb`'s own `update-grub`; installs and
   `apt-mark hold`s the `.deb`; refuses unless the PVM kernel has a module or built-in for every driver
   between this instance's disks and NICs and `/sys/devices` (ENA, NVMe, virtio, gVNIC...) and for the
-  root file system; writes `/etc/grub.d/42_byoh_pvm_test` (one `--id ubicloud-pvm` entry, `pti=off`
+  root file system. A driver on those paths that names no module or built-in of the running kernel is
+  refused before anything changes (Xen's `vif` and `vbd` map to `xen_netfront` and `xen_blkfront`,
+  USB's `usb` and `hub` to `usbcore`), except `pcieport` (built into every x86_64 kernel) and the sysfs
+  names in `PVM_UNCHECKED_DRIVERS`, which you checked in the PVM kernel by hand; the report lists those; writes `/etc/grub.d/42_byoh_pvm_test` (one `--id ubicloud-pvm` entry, `pti=off`
   on that entry only) and checks `pti=off` appears exactly once in `grub.cfg`, inside that entry;
   then `grub-reboot ubicloud-pvm` and checks `next_entry` **and** the stock `saved_entry`.
 - **boot-test** (on the PVM kernel): one-shot proven (`next_entry` cleared, `saved_entry` still

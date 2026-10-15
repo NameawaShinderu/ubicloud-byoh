@@ -50,6 +50,9 @@
 #   PVM_IMAGE_URL      guest disk image (with SHA256SUMS beside it)
 #                      [https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img]
 #   PVM_BOOT_TIMEOUT   seconds per Cloud Hypervisor run [900]
+#   PVM_UNCHECKED_DRIVERS  sysfs driver names on a disk/NIC path that have
+#                      no module name to check, which you checked in the
+#                      PVM kernel by hand; install refuses others [none]
 #   PVM_ALLOW_HW_VIRT  1 = run although the CPU shows vmx/svm (the result
 #                      then says nothing about the no-hardware case) [0]
 #
@@ -258,13 +261,17 @@ drivers_in_use() {
 }
 
 # Does kernel $1 have driver $2, built in or as a module? The name is
-# the sysfs driver name; a few differ from their module's name.
+# the sysfs driver name; a few differ from their module's name (Xen's
+# netfront and blkfront register as vif and vbd, usbcore as usb and hub).
 kernel_has_driver() {
   local kver=$1 drv m
   drv=$(echo "$2" | tr - _)
   case "$drv" in
     sd) drv=sd_mod ;;
     sr) drv=sr_mod ;;
+    vbd) drv=xen_blkfront ;;
+    vif) drv=xen_netfront ;;
+    usb | hub) drv=usbcore ;;
   esac
   for m in "$MODULES_DIR/$kver/modules.builtin" "$MODULES_DIR/$kver/modules.dep"; do
     [ -f "$m" ] || continue
@@ -273,6 +280,17 @@ kernel_has_driver() {
     # modules.dep read as missing.
     awk -v d="$drv" '{n = $1; sub(/:.*/, "", n); sub(/.*\//, "", n); sub(/\.ko.*/, "", n); gsub(/-/, "_", n); if (n == d) {f = 1; exit}} END {exit !f}' "$m" && return 0
   done
+  return 1
+}
+
+# Drivers that may sit on a disk or NIC path without a module name to
+# check: pcieport is a bool option, built into every x86_64 kernel with
+# PCIe, so it is never in modules.builtin. PVM_UNCHECKED_DRIVERS adds
+# sysfs names the operator has checked in the PVM kernel by hand.
+driver_unchecked_ok() {
+  case " pcieport ${PVM_UNCHECKED_DRIVERS:-} " in
+    *" $1 "*) return 0 ;;
+  esac
   return 1
 }
 
@@ -307,6 +325,20 @@ install_phase() {
   [ -n "$kver" ] && [ "$kver" != "$pkg" ] || die "$PVM_HOST_DEB is not a linux-image package ($pkg)"
   [ "$kver" != "$(uname -r)" ] || die "the running kernel is already $kver"
 
+  # 0. Before changing anything: every driver between this instance's
+  #    disks/NICs and /sys/devices must name a module or built-in of the
+  #    running kernel, or step 3 cannot check the PVM kernel for it.
+  local drv unmapped="" unchecked=""
+  for drv in $(drivers_in_use); do
+    kernel_has_driver "$(uname -r)" "$drv" && continue
+    if driver_unchecked_ok "$drv"; then
+      unchecked="$unchecked $drv"
+    else
+      unmapped="$unmapped $drv"
+    fi
+  done
+  [ -z "$unmapped" ] || die "cannot check the PVM kernel for drivers this instance's disks and NICs use:$unmapped (no module of that name in $(uname -r)). Check by hand that $PVM_HOST_DEB has them (dpkg-deb -c), then rerun with PVM_UNCHECKED_DRIVERS=\"${unmapped# }\". Nothing was changed."
+
   # 1. Pin the running stock kernel before the .deb's update-grub runs:
   #    6.12-pvm sorts above noble's 6.8 and would become the top entry,
   #    which GRUB_DEFAULT=0 (or saved with no saved_entry) boots forever.
@@ -331,19 +363,15 @@ install_phase() {
   [ -f "/boot/initrd.img-$kver" ] || die "/boot/initrd.img-$kver is missing after the install"
   [ "$(grubenv_get saved_entry)" = "$stock" ] || die "the .deb changed saved_entry; do not reboot"
 
-  # 3. The PVM kernel must drive this instance's disks and NICs.
-  #    A driver whose name maps to no module even in the running kernel
-  #    (bus cores such as usb or pcieport) cannot be judged this way.
-  local drv nodrv="" unmapped=""
+  # 3. The PVM kernel must drive this instance's disks and NICs. Step 0
+  #    refused every driver it cannot check here but the allowed ones.
+  local nodrv=""
   for drv in $(drivers_in_use); do
-    if ! kernel_has_driver "$(uname -r)" "$drv"; then
-      unmapped="$unmapped $drv"
-    elif ! kernel_has_driver "$kver" "$drv"; then
-      nodrv="$nodrv $drv"
-    fi
+    kernel_has_driver "$(uname -r)" "$drv" || continue
+    kernel_has_driver "$kver" "$drv" || nodrv="$nodrv $drv"
   done
   [ -z "$nodrv" ] || die "kernel $kver lacks drivers this instance uses:$nodrv. Do not reboot into it; run uninstall."
-  [ -z "$unmapped" ] || report "drivers not checked (no module of that name in either kernel):$unmapped"
+  [ -z "$unchecked" ] || report "drivers not checked (allowed, no module name):$unchecked"
   local rootfs
   rootfs=$(findmnt -no FSTYPE /)
   kernel_has_driver "$kver" "$rootfs" || die "kernel $kver lacks the root file system driver $rootfs"
