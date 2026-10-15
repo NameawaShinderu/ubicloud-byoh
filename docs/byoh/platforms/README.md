@@ -32,6 +32,8 @@ Problems on any platform: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
 | DigitalOcean Droplet | `onlink` + `nat` for one VM (theory), or single IP | Nested on Intel, not officially supported | One reserved IP per Droplet | UNVERIFIED, lab only | [other-clouds-vps.md](other-clouds-vps.md) |
 | Hetzner Cloud, Linode/Akamai, any VPS without `/dev/kvm` | — | None | — | **Not possible** as a data plane; fine as control plane or tunnel endpoint | [other-clouds-vps.md](other-clouds-vps.md) §1.3 |
 
+Not sure whether a machine has usable KVM? Run `bin/byoh-virt probe --main-ip <IP>` from the control plane before registering. It prints the machine's rung on the virtualization ladder and the fix for its platform. Machines without hardware virtualization have slower, opt-in fallbacks: [NO_KVM.md](../NO_KVM.md).
+
 Rules of thumb:
 - Public IPv4 per VM without NAT or a cloud SDN: rented bare metal or a colo with a routed block.
 - No public addresses at all: a LAN site with an `internal` pool, or VMs without IPv4.

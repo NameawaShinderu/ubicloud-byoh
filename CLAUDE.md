@@ -29,6 +29,7 @@ Anything marked UNVERIFIED was never executed.
 | `docs/byoh/POOL_OPERATIONS.md` | pools.yaml v2, `bin/byoh-pool`, billing `resource_name` rule, location egress keys |
 | `docs/byoh/platforms/` | Operator guides per platform (AWS, rented bare metal, own hardware/colo, Proxmox and other hypervisors, GCP/Azure, other clouds/VPS); `README.md` has the chooser table, the common 6-step flow and which branch carries which fix. Only AWS is tested |
 | `docs/byoh/TROUBLESHOOTING.md` | One Symptom/Cause/Fix catalogue by phase (install, bring-up labels, allocation, VM networking, DNS, billing, upgrades, monitor/BMC), with platform pointers; covers both control-plane layouts |
+| `docs/byoh/NO_KVM.md` | The virtualization ladder (L1 KVM, L2 fix KVM, L3 PVM, L4 system containers, L5 QEMU TCG): detection (`bin/byoh-virt`, `Prog::LearnVirt`, `vm_host.virt_probe`), the per-platform fix table, research and the decision matrix |
 | `docs/byoh/INSTALL.md`, `OPERATIONS.md`, `MIGRATE_FROM_DEV.md` | M3: the packaged control plane (`install.sh` flags, env reference, TLS fronts, production differences), day-2 operation (`ubicloud-admin`, backups, restore, release switch, the 2027-01-01 partition deadline), and the live move from tmux/`clover_test` |
 
 Product direction from the user:

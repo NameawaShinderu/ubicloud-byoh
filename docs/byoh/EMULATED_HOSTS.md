@@ -1,5 +1,8 @@
 # Emulated hosts (MQ): BYOH VMs on machines without KVM
 
+> This is rung L5, the last resort, of the virtualization ladder in [NO_KVM.md](NO_KVM.md).
+> Faster rungs come first: switch KVM on (L2), PVM (L3) and system containers (L4).
+
 Status: DESIGN (revision 2), 2026-10-15. Branch `qemu-tcg`, starting from `byoh-driver` 9e22d71ec (M0-M3).
 File:line references are to 9e22d71ec. Re-read a file before relying on a line number.
 
