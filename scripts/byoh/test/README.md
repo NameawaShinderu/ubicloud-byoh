@@ -55,7 +55,10 @@ and adds a fake data-plane host:
 - User `ubuntu` has passwordless sudo. Its RSA login key is generated per
   run in `$STATE` (`fakehost_key`) and never committed.
 - `/usr/local/bin/systemctl` is a shim: `reload`/`restart` of
-  `ssh`/`sshd` sends SIGHUP to the listener (sshd re-execs and rereads its
+  `ssh`/`sshd` behaves like ssh.service's `ExecReload`: it fails for a
+  non-root caller (as polkit does over ssh), fails without signalling
+  when `sshd -t` rejects the config (the old sshd keeps serving), and
+  otherwise sends SIGHUP to the listener (sshd re-execs and rereads its
   config); `is-active` answers from `/etc/fakehost-active`, which the
   entrypoint writes from `docker run -e FAKEHOST_ACTIVE="docker ufw"`
   (an ssh session does not see the container's env); every other verb
@@ -70,10 +73,13 @@ scripts/byoh/test/m4-fakehost-check.sh   # builds ubi-m4-fakehost, checks it, cl
 
 The check logs in from a second fakehost as `ubuntu`, and checks sudo,
 the auth line in `docker logs`, no `/dev/kvm`, per-container host keys,
-`is-active`, and that `systemctl reload ssh.service` makes sshd reread
-a drop-in (`sshd -T`) and keep serving. It fails if any `ubi-m4-*`
-container is left. Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20):
-pass in about 5 s after the image build, nothing left behind.
+`is-active`, that `systemctl reload ssh.service` makes sshd reread a
+drop-in (`Received SIGHUP` in `docker logs`, then `sshd -T`) and keep
+serving, and that a reload without sudo or with an invalid drop-in
+exits non-zero without signalling sshd while logins still work. It fails
+if any `ubi-m4-*` container is left. Result (2026-10-15, OpenSSH 9.6p1
+Ubuntu-3ubuntu13.20): pass in about 6 s after the image build, nothing
+left behind.
 
 ## Scenarios
 

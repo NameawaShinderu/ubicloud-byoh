@@ -1,8 +1,12 @@
 #!/bin/bash
 # systemctl shim for the M4 fakehost, which has no systemd.
 #   reload|restart ssh|ssh.service|sshd|sshd.service
-#                  sends SIGHUP to the listening sshd (it re-execs and
-#                  rereads its config, as `systemctl reload ssh` does)
+#                  as Ubuntu 24.04's ssh.service ExecReload: refuses a
+#                  non-root caller (polkit denies it over ssh), runs
+#                  `sshd -t` and fails without signalling when the
+#                  config is bad (the old sshd keeps serving), else
+#                  sends SIGHUP to the listener (it re-execs and
+#                  rereads its config); exits 1 if any step fails
 #   is-active UNIT...
 #                  "active" for each unit listed (space separated) in
 #                  /etc/fakehost-active, else "inactive"; exits 0 only
@@ -28,8 +32,13 @@ case $verb in
   reload | restart | reload-or-restart | try-reload-or-restart)
     case ${args[1]:-} in
       ssh | ssh.service | sshd | sshd.service)
+        if ((EUID != 0)); then
+          echo "Failed to ${verb} ${args[1]}: Interactive authentication required." >&2
+          exit 1
+        fi
+        /usr/sbin/sshd -t || exit 1
         pid=$(cat /run/sshd.pid 2>/dev/null || echo 1)
-        kill -HUP "$pid"
+        kill -HUP "$pid" || exit 1
         ;;
     esac
     ;;

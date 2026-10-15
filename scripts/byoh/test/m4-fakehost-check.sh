@@ -49,6 +49,19 @@ wait_for 10 docker exec "$PREFIX-fakehost" bash -c 'exec 3<>/dev/tcp/127.0.0.1/2
 rssh true || fail "login after reload"
 grep -q "root: systemctl reload ssh.service" <<<"$(dx fakehost cat /var/log/fakehost-systemctl.log)" || fail "shim log"
 
+# A reload fails, and sends no SIGHUP, without root (polkit refuses it
+# on a real host) or with a config `sshd -t` rejects; sshd keeps serving.
+hups() { docker logs "$PREFIX-fakehost" 2>&1 | grep -c 'Received SIGHUP' || true; }
+before=$(hups)
+if rssh 'systemctl reload ssh' 2>/dev/null; then fail "reload without sudo exited 0"; fi
+rssh 'echo "NotAnOption yes" | sudo tee /etc/ssh/sshd_config.d/60-bad.conf >/dev/null' || fail "write bad drop-in"
+if rssh 'sudo systemctl reload ssh' 2>/dev/null; then fail "reload with a bad drop-in exited 0"; fi
+if rssh 'sudo systemctl restart sshd' 2>/dev/null; then fail "restart with a bad drop-in exited 0"; fi
+[[ $(docker inspect -f '{{.State.Running}}' "$PREFIX-fakehost") == true ]] || fail "fakehost died on a failed reload"
+[[ $(hups) == "$before" ]] || fail "a failed reload sent SIGHUP"
+rssh true || fail "login after a failed reload"
+rssh 'sudo rm /etc/ssh/sshd_config.d/60-bad.conf' || fail "remove bad drop-in"
+
 cleanup
 left=$(docker ps -aq --filter "name=^$PREFIX-")
 [[ -z $left ]] || fail "left behind: $(docker ps -a --filter "name=^$PREFIX-" --format '{{.Names}}' | tr '\n' ' ')"
