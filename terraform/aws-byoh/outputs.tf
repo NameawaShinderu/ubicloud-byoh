@@ -138,11 +138,13 @@ output "host_add_command" {
     # host add makes and keeps its own root key, and deletes its staged
     # copy of this one after the prepare phase. --no-wait returns once the
     # host is registered, so the copy of the EC2 key is shredded before the
-    # bring-up watch (about 4 minutes nested, 15-25 on .metal):
+    # bring-up watch (about 4 minutes nested, 15-25 on .metal). The three
+    # steps are chained: when host add fails, the key stays for a retry
+    # and nothing else runs.
     EXPECT='<the --expect-host-key flags printed by step 1>'
-    sudo ubicloud-admin host add --site ${local.byoh_location_name} --ssh ubuntu@${aws_instance.data.private_ip} --ssh-key ~/byoh_ssh_key --pool-file ~/pools.yaml $EXPECT --no-wait
-    shred -u ~/byoh_ssh_key
-    sudo ubicloud-admin host watch ${aws_instance.data.private_ip}
+    sudo ubicloud-admin host add --site ${local.byoh_location_name} --ssh ubuntu@${aws_instance.data.private_ip} --ssh-key ~/byoh_ssh_key --pool-file ~/pools.yaml $EXPECT --no-wait \
+      && shred -u ~/byoh_ssh_key \
+      && sudo ubicloud-admin host watch ${aws_instance.data.private_ip}
     # On a development control plane, run packaging/bin/ubicloud-admin --dev
     # from ~/ubicloud, without sudo, in place of sudo ubicloud-admin.
   EOT

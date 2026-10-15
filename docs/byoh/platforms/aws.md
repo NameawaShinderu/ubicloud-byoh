@@ -318,10 +318,12 @@ bundle exec bin/byoh-pool annotate --host vh... --pool-file live-pools.yaml
    ```bash
    EXPECT='--expect-host-key SHA256:... --expect-host-key SHA256:...'    # from step 1
    sudo ubicloud-admin host add --site byoh-aws-mysite --ssh ubuntu@<data_private_ip> \
-     --ssh-key ~/byoh_ssh_key --pool-file ~/pools.yaml $EXPECT --no-wait
-   shred -u ~/byoh_ssh_key
-   sudo ubicloud-admin host watch <data_private_ip>
+     --ssh-key ~/byoh_ssh_key --pool-file ~/pools.yaml $EXPECT --no-wait \
+     && shred -u ~/byoh_ssh_key \
+     && sudo ubicloud-admin host watch <data_private_ip>
    ```
+
+   The three steps are chained. If `host add` fails (a failing preflight, an SSH or host key error, or `EXPECT` left as printed), the key stays on the control plane for a retry, and the watch does not run.
 
 `host add` runs preflight with the pools (PLATFORMS.md §6), installs its own root key, registers the host pinned to the host keys, and `host watch` follows the bring-up to `accepting` and runs `pool verify`. The EC2 key is only the `ubuntu` login; `host add` deletes its staged copy after the prepare phase, and `--no-wait` lets you shred yours before the watch. On a development control plane, use `packaging/bin/ubicloud-admin --dev` from `~/ubicloud` without `sudo`. None of this has run on AWS yet (UNVERIFIED; the M4 canary in VERIFY.md).
 

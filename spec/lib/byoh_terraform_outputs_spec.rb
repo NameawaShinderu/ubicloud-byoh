@@ -84,22 +84,47 @@ RSpec.describe "terraform/aws-byoh outputs" do
     # The arguments the control plane shell passes to ubicloud-admin for
     # the host add line, with EXPECT set to expect.
     def host_add_argv(expect)
-      line = lines.find { it.start_with?("sudo ubicloud-admin host add ") }
+      line = lines.find { it.start_with?("sudo ubicloud-admin host add ") }.split(" && ").first
       line = line.gsub("~/", "/home/ubuntu/").sub("$EXPECT") { expect.shellsplit.shelljoin }
       Shellwords.split(line).drop(4)
     end
 
-    it "copies the files, adds, shreds and watches in that order" do
+    it "copies the files, then adds, shreds and watches in one chain" do
       expect(lines.map { it.split.first(3).join(" ") }).to eq [
         "aws ec2 get-console-output",
         "scp -i ./.generated/canary/byoh_ssh_key",
         "EXPECT='<the --expect-host-key flags",
         "sudo ubicloud-admin host",
-        "shred -u ~/byoh_ssh_key",
-        "sudo ubicloud-admin host",
       ]
       expect(lines[1]).to eq "scp -i ./.generated/canary/byoh_ssh_key ./.generated/canary/pools.yaml ./.generated/canary/byoh_ssh_key ubuntu@13.0.0.1:"
-      expect(lines.last).to eq "sudo ubicloud-admin host watch 10.98.1.20"
+      expect(lines.last.split(/\s+&&\s+/).drop(1)).to eq ["shred -u ~/byoh_ssh_key", "sudo ubicloud-admin host watch 10.98.1.20"]
+    end
+
+    # Runs the control plane lines in bash, as pasted, with sudo and shred
+    # recording their arguments; host add exits add_status.
+    def paste_on_control_plane(add_status)
+      log = File.join(dir, "calls")
+      text = render("host_add_command")[/^# On the control plane.*/m]
+      script = <<~SH
+        sudo() { echo "sudo $*" >>"$LOG"; [ "$3" != add ] || return #{add_status}; }
+        shred() { echo "shred $*" >>"$LOG"; }
+        #{text}
+      SH
+      _, status = Open3.capture2e({"HOME" => dir, "LOG" => log}, "bash", "-c", script)
+      [status.exitstatus, File.exist?(log) ? File.readlines(log, chomp: true) : []]
+    end
+
+    it "keeps the key and skips the watch when host add fails" do
+      status, calls = paste_on_control_plane(2)
+      expect(status).to eq 2
+      expect(calls.size).to eq 1
+      expect(calls.first).to start_with "sudo ubicloud-admin host add --site byoh-aws-canary "
+    end
+
+    it "shreds the key and watches after host add succeeds" do
+      status, calls = paste_on_control_plane(0)
+      expect(status).to eq 0
+      expect(calls.drop(1)).to eq ["shred -u #{dir}/byoh_ssh_key", "sudo ubicloud-admin host watch 10.98.1.20"]
     end
 
     it "prints a host add that byoh-host add parses" do

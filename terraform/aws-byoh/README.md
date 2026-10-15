@@ -108,9 +108,11 @@ plane with `ubicloud-admin host add` (ROADMAP §6.3, form A):
 3. On the control plane, `sudo ubicloud-admin host add --site ... --ssh
    ubuntu@<data private IP> --ssh-key ~/byoh_ssh_key --pool-file
    ~/pools.yaml $EXPECT --no-wait`, then `shred -u ~/byoh_ssh_key`, then
-   `sudo ubicloud-admin host watch <data private IP>`. `host add` deletes
-   its own staged copy of the key after the prepare phase; `--no-wait`
-   lets the operator's copy go before the bring-up watch too.
+   `sudo ubicloud-admin host watch <data private IP>`, chained with `&&`:
+   when `host add` fails (preflight, SSH, host keys, or `EXPECT` left as
+   printed), the key stays for a retry and the watch does not run. `host
+   add` deletes its own staged copy of the key after the prepare phase;
+   `--no-wait` lets the operator's copy go before the bring-up watch too.
 
 **Development control plane.** `user-data-ctrl.sh` installs only
 prerequisites; if you then run `bootstrap-dev-ctrl-plane.sh` rather
@@ -142,7 +144,7 @@ data_private_ip              = "10.98.1.101"
 pools_yaml_path              = "./.generated/<workspace>/pools.yaml"
 ssh_private_key_path         = "./.generated/<workspace>/byoh_ssh_key"
 handoff_instructions         = <long multi-line string with exact next steps>
-host_add_command             = <scp, sudo ubicloud-admin host add ..., shred, host watch>
+host_add_command             = <scp, sudo ubicloud-admin host add ... && shred && host watch>
 ```
 
 Registered with `--pool-file`, a VM's IPv4 is shown to the customer as
