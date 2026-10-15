@@ -1,0 +1,6 @@
+#!/bin/env ruby
+# frozen_string_literal: true
+
+require_relative "../lib/virt_probe"
+
+exit VirtProbe.main(ARGV)
