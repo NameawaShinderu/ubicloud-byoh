@@ -78,7 +78,7 @@ Two control-plane layouts exist ([SETUP.md](SETUP.md) §4). The table gives the 
 
 ## 2. Host bring-up
 
-`bin/register-byoh-host` creates the host strand. The labels run in this order (generic hosts skip `check_ip_reachability`): `start → setup_ssh_keys → bootstrap_rhizome → prep → wait_prep → setup_hugepages → setup_storage_backend → download_boot_images → wait_download_boot_images → prep_reboot → reboot → [verify_spdk] → verify_hugepages → start_slices → start_vms → configure_metrics → wait`. The host is ready when `allocation_state` is `accepting` (set in `start_vms`). Watch the label in `strand` and the state in `vm_host` (§0); the log does not print `allocation_state`.
+`ubicloud-admin host add` (or the low-level `bin/register-byoh-host`) creates the host strand. The labels run in this order (generic hosts skip `check_ip_reachability`): `start → setup_ssh_keys → bootstrap_rhizome → prep → wait_prep → setup_hugepages → setup_storage_backend → download_boot_images → wait_download_boot_images → prep_reboot → reboot → [verify_spdk] → verify_hugepages → start_slices → start_vms → configure_metrics → wait`. The host is ready when `allocation_state` is `accepting` (set in `start_vms`). Watch the label in `strand` and the state in `vm_host` (§0); the log does not print `allocation_state`.
 
 ### 2.1 Before registration
 
@@ -96,6 +96,18 @@ Two control-plane layouts exist ([SETUP.md](SETUP.md) §4). The table gives the 
 | "an onlink pool needs segment=<LAN CIDR> and gateway=<LAN gateway>" | `onlink` without `segment`/`gateway` | Add both | |
 | Registration fails on a unique index (`sshable.host`, `address.cidr`, `vm_host.net6`) | The same machine or block is registered already | Destroy the old VmHost first (delete its VMs, then `VmHost["vh..."].incr_destroy`). Never delete `location` rows | A reinstalled OS needs this too: host keys are pinned on first connect |
 | "WARNING: env var X is not set; BMC reset will fail at runtime" | `--bmc-pass-env` names a variable this shell lacks | Put it in `.env.rb` and restart `puma` and `respirate` **before** registering (§8) | |
+
+### 2.1a Host preflight checks
+
+Host preflight runs in `ubicloud-admin host add` and `host preflight` (with the pools and the control plane's view), in `bin/register-byoh-host --ssh-key`, and standalone at the end of `bootstrap-data-plane.sh`. Each line reads `<status> <check> <detail>` with a fix; statuses are `pass`, `info`, `warn` and `fail`. Any `fail` stops `host add` before it changes the host. The table of checks is [PLATFORMS.md](PLATFORMS.md) §6.2. Only `PF8-hybrid`, `PF10-btrfs` and `PF16-docker`, `-ufw`, `-tailscaled`, `-k3s`, `-libvirtd` can be accepted, with `--accept-check ID` (repeatable; `PF16` accepts all five); any other ID is a usage error (exit 2).
+
+#### PF1
+
+Not Ubuntu 24.04, or not x86_64/aarch64. Reinstall with Ubuntu 24.04 LTS.
+
+#### PF2
+
+The control plane cannot log in as root with the registration key, or root's login runs a forced command. `host add` installs the key itself; a fail after that names the ssh error. Check sshd's `PermitRootLogin` (`sshd -T | grep -i permitrootlogin`), an `AllowUsers`/`DenyUsers` line, and that TCP 22 reaches the main IP from the control plane. With `--expect-host-key`, a host key mismatch also stops here: compare the fingerprints with the console before retrying.
 
 #### PF3
 
@@ -116,6 +128,78 @@ Fixes by platform, from the platform guides:
 - **Microsoft Azure:** a size that supports nested virtualization, with security type Standard (UNVERIFIED).
 - **VPS without KVM:** not possible ([other-clouds-vps.md](platforms/other-clouds-vps.md) §1.3).
 
+#### PF4
+
+No `pdpe1gb` CPU flag (x86): 1G hugepages are impossible. Another machine, or a host-passthrough CPU model (`qm set <vmid> --cpu host`, libvirt `host-passthrough`). A `flexible` profile without hugepages is PLANNED ([COMPUTE.md](COMPUTE.md)).
+
+#### PF5
+
+No `/etc/default/grub` or `update-grub`: hugepages are set on the kernel command line through GRUB. Install `grub-pc` or `grub-efi-amd64` and boot with it.
+
+#### PF6
+
+`dmidecode` reports a memory size in an unknown unit. kB/MB/GB/TB are accepted (a0259a997); `info` lines say MemTotal is used when dmidecode is missing or fails. Report the `dmidecode -t 17` output.
+
+#### PF7
+
+Too few 1G hugepages from the memory (fewer than 8 fails, under 16 warns). Give the machine at least 15 GiB of memory; on a hypervisor, turn ballooning and dynamic memory off.
+
+#### PF8
+
+Offline CPUs (`warn`): since M4 a BYOH host uses only online CPUs. `PF8-hybrid` (`fail`, acceptable): performance and efficiency cores, or cores of different speeds. Turn E-cores off in the firmware, or `--accept-check PF8-hybrid` ([recipes/homelab.md](recipes/homelab.md) §2).
+
+#### PF-min-cpu
+
+Fewer than 2 online CPUs. Cannot be accepted. Give the machine more CPUs.
+
+#### PF9
+
+`/sys/fs/cgroup` is not cgroup v2 with the `cpuset` controller. Boot with the unified hierarchy (Ubuntu 24.04's default); remove `systemd.unified_cgroup_hierarchy=0` from the kernel command line.
+
+#### PF10
+
+Too little free space at `/var/storage` (5 GiB + 4 per boot image + VM disks), or a warning that it shares the root filesystem. `PF10-zfs`: refused, cannot be accepted; mount ext4 or xfs at `/var/storage`, or give `host add` a blank disk with `--storage-disk`. `PF10-btrfs`: acceptable; write-through detection does not work on btrfs (rhizome keeps flushes on and logs "assuming a write-back cache"), and VM storage there is UNVERIFIED.
+
+#### PF11
+
+`info`: blank disks that VMs would not use. Pass one to `host add --storage-disk <by-id name>` (the line prints it). A disk with no by-id name needs a serial (a virtual disk) first.
+
+#### PF12
+
+`info`: a storage disk without a `/dev/disk/by-id` link; the kernel name is recorded and can change across reboots. Since M4 the monitor checks of a BYOH host work with it.
+
+#### PF13
+
+`fail`: SMART reports a failing disk. Replace it. `info` when SMART is not available (virtual disks) or smartctl is not installed yet.
+
+#### PF14
+
+`warn`: no stable clocksource (`tsc`, `kvm-clock` on a VM, `arch_sys_counter` on arm64). The monitor would read the host as down.
+
+#### PF15
+
+`PF15-apt`: the archive cannot serve the packages bring-up installs; fix the apt sources (`apt-get update` errors). A `warn` with empty package lists is harmless (PrepHost updates them). `PF15-egress`: GitHub release downloads (github.com and release-assets.githubusercontent.com) or the image mirrors (cloud-images.ubuntu.com over HTTPS, cloud-images-archive.ubuntu.com over HTTP) are unreachable. Open outbound 80 and 443.
+
+#### PF16
+
+`PF16-docker`, `-ufw`, `-tailscaled`, `-k3s`, `-libvirtd` (acceptable): that service manages firewall rules, which rhizome's nftables reload flushes on every VM create and destroy (NH-6). Stop and disable it, or accept. `PF16-pve` (never): the target is a Proxmox node; point `--ssh` at the data-plane VM. `PF16-rhizome-user` (never): a `rhizome` user exists, and bring-up deletes it with its home; use another machine or remove that user yourself.
+
+#### PF17
+
+`PF17` (never acceptable): a pool would hand VMs an address of the host itself: the uplink IP, the main IP or the default gateway (contract C5). Take those addresses out of the pool, or `reserve:` them. `PF17-route`: no default route, several (pass `--uplink-ip`), or an `--uplink-ip` the routes do not use. `PF17-main-ip` (`warn`): `--main-ip` is not on the host, right only when it is a NAT address in front of it. `PF17-uplink` (`warn`): the pools file's `uplink` names another interface than the default route's. `PF17-netplan` (`warn`): cloud-init's netplan gives the uplink several IPv4 addresses, which come back at boot (§4, the C5 row; on AWS the `user-data-data.sh` fix).
+
+#### PF19
+
+`info`: an NVIDIA device whose IOMMU group is not all on `vfio-pci`; the host takes only non-GPU VMs. To offer the GPU, bind the whole group (§3, the GPU row).
+
+#### PF20
+
+The site is not a BYOH location, or a boot image cannot be downloaded for the host's architecture from the source in effect. Create the site with `ubicloud-admin site add`; name a boot image with a public mirror, such as `ubuntu-noble`.
+
+#### PF21
+
+`web` or `respirate` is not active, so a registered host would never be set up. `sudo systemctl start ubicloud.target` (development: start the tmux sessions; the check says `info`).
+
 ### 2.2 During bring-up
 
 | Label | Symptom | Cause | Fix | Platform notes |
@@ -134,6 +218,22 @@ Fixes by platform, from the platform guides:
 | after `reboot` | Pool IPs back on the NIC | A cloud agent or cloud-init re-adds them on boot (C5) | `ip -br -4 addr` must show only the main IP; fix the agent (§4) | AWS user-data fix; GCP `instance_configs.cfg`; Azure cloud-init drop-in ([gcp-azure.md](platforms/gcp-azure.md) §3.2) |
 | `start_vms` | Host is `accepting` but every VM waits | No boot image, or the wrong one | §3 | |
 | `wait` | Host goes `unavailable` and pages | `bin/monitor` health checks: a host registered before M4 with stale disk ids, or a generic host still in hetzner-fsn1 (upstream checks) | §8 | |
+
+### 2.3 `host add`: exit codes, resume and Ctrl-C
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | The host accepts VMs and `pool verify` has no FAIL (or `--no-wait` / `--phase prepare` finished) | Nothing |
+| 1 | Validation, preflight, host-key or SSH failure | Read the `!` line or the `fail` checks (§2.1a). Nothing was registered if it stopped before "Registered host" |
+| 2 | Usage error: an unknown option, `--accept-check` of a check that cannot be accepted, `--bmc-password`, `--storage-disk` on a host already registered | Fix the command |
+| 3 | The watch gave up: a phase took longer than its deadline (bootstrap 10 min, boot image download 4 h, reboot 15 min), respirate is not running, `--timeout` passed, or the host sits outside its bring-up without accepting | The bring-up is not undone. Check §2.2 for the label it stopped at; start respirate if it is down; then resume |
+| 4 | `pool verify` failed after the host started accepting | `ubicloud-admin pool verify --host vh...` names the FAIL lines ([POOL_OPERATIONS.md](POOL_OPERATIONS.md)) |
+| 130 | Interrupted | See Ctrl-C below |
+
+- **Resume.** Run the same `host add` again. A host already registered at the main IP is not registered twice: the site, pools, settings and host keys must match, and then it only watches. `--storage-disk` is refused then (prep may already be learning the storage). `ubicloud-admin host watch <vh... or main IP>` only watches.
+- **Ctrl-C.** Before the root key is installed, nothing on the host changed. During and after the key install, until registration, `host add` prints "To undo the key install on the host: ..." with the `sed` line that removes its tagged key from root's `authorized_keys` and the `rm` of its sshd drop-in; a re-run reuses the same key and replaces the tagged line. **After registration, Ctrl-C stops only the watch: the host strand keeps running and still reboots the host.** To give up on a registered host, delete its VMs and destroy the VmHost (§2.1, the unique-index row).
+- **Packaged layout.** `ubicloud-admin host add` runs `byoh-host add` twice, `--phase prepare` then `--phase register`, and deletes its staged copies of `--ssh-key` and `--registration-key` after prepare. Between the two, the registration key waits in `/var/lib/ubicloud/byoh-keys`.
+- **"refusing to reach a host under RACK_ENV=test"**: a control plane must never run with `RACK_ENV=test` (it disables SSH); use `development` or `production`.
 
 ---
 
@@ -156,7 +256,7 @@ The allocator fails with "no space left on any eligible host". The VM sets `wait
 | GPU VMs never place on a BYOH host with an NVIDIA GPU | The GPU, or another function of its IOMMU group (often the HDMI audio on `snd_hda_intel`), is not bound to `vfio-pci`, so LearnPci skipped it. The respirate log says "NVIDIA device not bound to vfio-pci skipped" and names the blocking functions. A GPU outside PCI domain 0000 is skipped too | Bind every endpoint of the group to `vfio-pci` at boot: add `vfio-pci.ids=10de:<gpu>,10de:<audio>` to `GRUB_CMDLINE_LINUX` in `/etc/default/grub`, and put `softdep nouveau pre: vfio-pci`, `softdep nvidia pre: vfio-pci` and `softdep snd_hda_intel pre: vfio-pci` in `/etc/modprobe.d/vfio.conf` (a softdep is a modprobe directive, not a kernel parameter). Run `update-initramfs -u` and `update-grub`, and reboot. Prep learns the GPUs once, so then run `bin/byoh-host relearn-pci --host vh...` (packaged: `sudo ubicloud-admin run byoh-host relearn-pci --host vh...`); it also drops idle rows of GPUs that are no longer on `vfio-pci`. UNVERIFIED on real GPU hardware | [own-hardware.md](platforms/own-hardware.md) §2.1 |
 | Slice VMs never place on a small host | `accepts_slices` does not match | Scoped fix only: `DB[:vm_host].where(id: <uuid>).update(accepts_slices: false)`; never unscoped | |
 | Storage | `available_storage_gib` too low on every enabled `storage_device` | PLATFORMS §7 queries; extra disks only count when mounted at `/var/storage/devices/<name>` before prep; `ubicloud-host storage-disk --by-id <id>` formats and mounts a blank one there | |
-| Every VM fails with `RuntimeError "BUG"` in `write_params_json` | Hybrid P+E-core CPU, SMT off, or offline CPUs (PLATFORMS HW-6, HW-7) | A non-hybrid CPU, SMT on, all CPUs online; then re-register | Homelab desktops, some rental lines |
+| Every VM fails with `RuntimeError "BUG"` in `write_params_json` | Hybrid P+E-core CPU, SMT off on some cores, or offline CPUs (PLATFORMS HW-6, HW-7), on a host whose CPUs were learned before M4 or that is not a BYOH host. Since M4 LearnCpu on a BYOH host keeps only online CPUs and counts every CPU as a core when thread counts differ | Re-register the host in a BYOH location on M4 code (prep learns the CPUs once; `move-location` does not relearn them); otherwise a non-hybrid CPU, SMT on, all CPUs online | Homelab desktops, some rental lines |
 | VM prep fails with `Errno::ENOENT` | `/var/storage` on btrfs or ZFS (STOR-5) on a host whose rhizome predates M4 | ext4 or xfs. From M4, rhizome treats a device with no sysfs write-cache entry as write-back (flushes stay on) and logs "assuming a write-back cache"; push it to an older host with `vm_host.install_rhizome` in `bin/pry`. An `ENOENT` naming the VM's disk file itself is a different fault | |
 | `ubicloud-host storage-disk` refuses a disk | The disk is not blank (partition, signature, backup GPT, holder, swap, mount), it holds `/`, `/boot` or `/boot/efi`, or it is iSCSI/FC/FCoE, NVMe over fabrics (any NVMe controller transport but `pcie`, or none found) or multipath | The message names the reason. The script never wipes: clear the disk yourself only when you are sure it is unused (`wipefs -a /dev/<disk>`, and `sgdisk --zap-all` for a GPT), or pass `--allow-shared-transport` when only this host writes to the SAN volume. "carries the label ubi-diskN but /etc/fstab does not mount" is either a run cut short before its fstab write (it formatted, then stopped) or a `ubi-diskN` disk that came from another host or lost its fstab line by hand, which may hold VM data. Mount it read-only first (`mount -o ro /dev/<disk> /mnt`); wipe and re-run only when it holds no VM data | |
 | VM create fails resolving a billing rate | §6 | | |
