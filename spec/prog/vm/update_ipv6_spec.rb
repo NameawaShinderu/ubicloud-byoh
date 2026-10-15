@@ -157,4 +157,24 @@ RSpec.describe Prog::Vm::UpdateIpv6 do
     end
     pr.write_params_json
   end
+
+  describe "on an emulated host" do
+    let(:vm_host) {
+      create_vm_host(
+        location_id:, virt_tier: "emulated", family: "emulated",
+        total_cpus: 48, total_cores: 48, total_dies: 1, total_sockets: 1,
+        net6: NetAddr::IPv6Net.parse("2001:db8::/48"),
+      )
+    }
+
+    it "writes params json as root, since VM homes are root's, without removing it first" do
+      inhost_name = vm.inhost_name
+      expect(sshable).not_to receive(:_cmd).with("sudo rm /vm/#{inhost_name}/prep.json")
+      expect(sshable).to receive(:_cmd) do |cmd, **kwargs|
+        expect(cmd).to eq("sudo tee /vm/#{inhost_name}/prep.json > /dev/null")
+        expect(kwargs[:stdin]).to include('"vm_name": "test"')
+      end
+      pr.write_params_json
+    end
+  end
 end

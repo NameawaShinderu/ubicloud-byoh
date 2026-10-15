@@ -49,8 +49,20 @@ class Prog::Vm::UpdateIpv6 < Prog::Base
   end
 
   def write_params_json
+    params_json = vm.params_json(**vm.strand.stack.first.slice("swap_size_bytes", "hugepages", "hypervisor", "ch_version", "firmware_version").transform_keys!(&:to_sym))
+
+    # An emulated VM's home is root's (Prog::Vm::Metal::Nexus
+    # EMULATED_UNIX_USER), where its user cannot create prep.json, so root
+    # rewrites the file in place, as Metal::Nexus#write_params_json does.
+    # Removing it first would leave the VM without prep.json if the write
+    # failed, and the retried rm would then fail for good.
+    if vm_host.virt_tier == "emulated"
+      vm_host.sshable.cmd("sudo tee /vm/:inhost_name/prep.json > /dev/null", inhost_name:, stdin: params_json)
+      return
+    end
+
     vm_host.sshable.cmd("sudo rm /vm/:inhost_name/prep.json", inhost_name:)
 
-    vm_host.sshable.cmd("sudo -u :inhost_name tee /vm/:inhost_name/prep.json", inhost_name:, stdin: vm.params_json(**vm.strand.stack.first.slice("swap_size_bytes", "hugepages", "hypervisor", "ch_version", "firmware_version").transform_keys!(&:to_sym)))
+    vm_host.sshable.cmd("sudo -u :inhost_name tee /vm/:inhost_name/prep.json", inhost_name:, stdin: params_json)
   end
 end

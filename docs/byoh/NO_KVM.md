@@ -875,7 +875,8 @@ SHIPPED (spec-gated; nothing of it run on a real host, UNVERIFIED there):
   no `kvm` group, the home created by root as `root:<vm> 0750` (rhizome's `check_emulated_home` refuses
   anything else), `userdel` without `-r` and the old home removed by root with `rm -rf
   --one-file-system`, since `userdel -r` refuses a home its user does not own. `prep.json` is written
-  by root (`sudo tee`) into that home. The KVM heredoc and `sudo -u <vm> tee` are unchanged (goldens).
+  by root (`sudo tee`) into that home, also when `Prog::Vm::UpdateIpv6` rewrites it (in place, without
+  the `rm` that KVM hosts keep). The KVM heredoc and `sudo -u <vm> tee` are unchanged (goldens).
 - **Timings** (`ByohVirtTiers::SLOW_TIMINGS`, only on emulated hosts): 30 minutes from allocation to
   `wait` before the deadline pages (KVM: 10), the BYOH netns SSH probe gives up after 28 minutes (KVM:
   8), and the soft stop (QMP `system_powerdown`) gets 180 s before the hard stop (KVM: 60). The KVM
