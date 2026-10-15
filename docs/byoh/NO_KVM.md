@@ -16,8 +16,8 @@ Labels used throughout:
 
 Rung numbers changed in revision 2: the rungs are now ordered by **measured speed**, so system
 containers are L3 and PVM is L4. The tier ids (`kvm`, `container`, `pvm`, `emulated`) are the stable
-names in code and data; rung numbers are display only. The SHIPPED code (`lib/byoh_virt_ladder.rb`)
-still prints the revision-1 numbers ("L3 PVM", "L4 system containers") until WP3 renumbers them.
+names in code and data; rung numbers are display only. The SHIPPED code prints the revision-2 numbers
+since WP3.
 
 ## 1. The short answer
 
@@ -32,7 +32,7 @@ When none of them is possible, the last resort is QEMU's emulator (L5).
 
 | Rung | Tier id | The machine | What runs the guests | Speed vs native | Isolation | State |
 |---|---|---|---|---|---|---|
-| **L1** | `kvm` | `/dev/kvm` works and has the capabilities Cloud Hypervisor needs | Cloud Hypervisor exactly as today (QEMU-KVM for B200/B300 GPUs, unchanged) | ~native on bare metal; nested: CPU-bound ≥90%, page-fault-heavy work much less (section 3; own measurement planned, L1-T2) | Hardware VM | Today's product, SHIPPED; detection v1 SHIPPED, v2 PLANNED (WP3) |
+| **L1** | `kvm` | `/dev/kvm` works and has the capabilities Cloud Hypervisor needs | Cloud Hypervisor exactly as today (QEMU-KVM for B200/B300 GPUs, unchanged) | ~native on bare metal; nested: CPU-bound ≥90%, page-fault-heavy work much less (section 3; own measurement planned, L1-T2) | Hardware VM | Today's product, SHIPPED; detection v2 SHIPPED (WP3) |
 | **L2** | — | The hardware can virtualize, but KVM is off or hidden (firmware, module, hypervisor CPU model, cloud option) | Nothing until it is fixed | — | — | Detection and per-platform fix SHIPPED; refusal at registration with a recommended plan PLANNED (WP4) |
 | **L3** | `container` | Any x86_64 Linux ≥ 5.12 with cgroup v2 | Unprivileged LXC system container in rhizome's per-VM network namespace | **CPU 95-99%, memory bandwidth 91-98%, 3.6-5.4 s to SSH** (VERIFIED, `dir` disk driver only) | Shared kernel: weaker than a VM | Feasibility VERIFIED (section 5); backend PLANNED (WP5), experimental |
 | **L4** | `pvm` | No hardware virtualization; a PVM host kernel (`kvm_pvm`) | Cloud Hypervisor with direct kernel boot of a PVM guest kernel | SOURCE only: near single-level KVM (paper); 57% of native for a kernel build on m6a (third party). No own number | VM, with a software world switch | Detection SHIPPED; host side VERIFIED under emulation, guest boot UNVERIFIED; build gated on a go/no-go test (WP7) |
@@ -74,146 +74,211 @@ What the user gets on each kind of machine, fastest option first:
 
 | Piece | File | What it does |
 |---|---|---|
-| Probe | `rhizome/host/lib/virt_probe.rb`, `rhizome/host/bin/virt-probe` | Read-only. Gathers facts and prints a tier (`--json` or text). It needs no gems and no rhizome, so it can be piped to a fresh host. |
-| Ladder | `lib/byoh_virt_ladder.rb` | Parses a report, maps the tier to a rung, matches the platform, and builds the fix text and the caveats. |
-| Platforms | `lib/byoh_virt_platforms.rb` | Data table: DMI and `systemd-detect-virt` patterns, nested support, fix text. |
-| Record | `migrate/20261015_vm_host_virt_probe.rb` | `vm_host.virt_probe jsonb` holds the report plus the rung, platform, fix and caveats. |
-| Automatic probe | `prog/learn_virt.rb`; `prog/vm/host_nexus.rb` `prep` | BYOH hosts (`VmHost#byoh?`) probe at prep. A host off L1 gets a page (`ByohVirtTier`) carrying the fix; the page resolves when a later probe finds KVM. |
-| Operator CLI | `bin/byoh-virt` (`lib/byoh_virt_cli.rb`) | `probe --main-ip` (before registration, over SSH), `explain` (saved JSON), `script`, `show --host`, `refresh --host`. |
+| Probe | `rhizome/host/lib/virt_probe.rb`, `rhizome/host/bin/virt-probe` | Read-only fact collector (report v2). It also classifies, for the on-host text output. It needs no gems, no rhizome and no Ruby newer than 3.0, so it can be piped to a fresh host. `--root DIR` reads a fixture tree instead of the machine (below). |
+| Ladder | `lib/byoh_virt_ladder.rb` | Parses a v1 or v2 report, **classifies the facts again** (never trusting the host's tier), maps the tier to a rung, matches the platform, and builds the fix, the cost hint, the caveats, the fallbacks and the recommendation. `preflight_check` is the M4 hook (section 2.3). |
+| Platforms | `lib/byoh_virt_platforms.rb` | Data table: DMI and `systemd-detect-virt` patterns, nested support, fix text, `cost_hint`, and per-platform `rules` (the AWS instance families). |
+| Record | `migrate/20261015_vm_host_virt_probe.rb` | `vm_host.virt_probe jsonb` holds the sanitised report plus the verdict, or `{"error": ...}` when the probe failed. |
+| Automatic probe | `prog/learn_virt.rb`; `prog/vm/host_nexus.rb` `prep` | BYOH hosts (`VmHost#byoh?`) probe at prep. A host off L1 gets a page (`ByohVirtTier`) carrying the fix; the page resolves when a later probe finds L1. **Fail-open:** any error is recorded, paged once, and the strand pops (section 10.5). |
+| Operator CLI | `bin/byoh-virt` (`lib/byoh_virt_cli.rb`) | `probe --main-ip` (before registration, over SSH, under `sudo -n` for a non-root `--user`), `explain` (saved JSON), `script`, `show --host`, `refresh --host` or `refresh --all` (every generic host past prep, to back-fill v2 records). `probe`, `explain` and `show` exit 0 on L1 and 3 otherwise. |
 | Installer | `scripts/byoh/bootstrap-data-plane.sh` step 1b | Prints the probe report, then applies the same KVM checks as before. |
+| Fixtures | `rhizome/host/spec/fixtures/virt_probe/*.json`, `rhizome/host/spec/virt_probe_fixtures.rb` | 23 machines (every tier, every platform case below). The rhizome spec, the ladder spec and the lab harness all read them. |
+| Lab harness | `scripts/byoh/test/nokvm/run.sh`, `inside.sh` | `run.sh probe`: the real probe in Ubuntu 24.04 and Alpine containers, and every fixture tree, under the rules of section 15 (VERIFIED, below). |
 
 What did **not** change: `KvmCheck`, PrepHost, the allocator, VM creation, and every L1 code path.
 A host off L1 is still refused by PrepHost exactly as before. The ladder adds the reason and the fix.
 
-`VirtProbe.classify` (rhizome, report v1) decides, in this order:
+`VirtProbe.classify` (report v2) decides, in this order. `ByohVirtLadder.classify` is the same function
+run on the control plane over sanitised facts, so the two cannot disagree (a parity spec runs every
+fixture through both):
 
 1. `systemd-detect-virt --container` names a container, or (without systemd) `/.dockerenv`,
    `/run/.containerenv` or `container=` in PID 1's environment: **`container`**, which is refused.
-2. `/dev/kvm` is a character device:
-   - it does not answer `KVM_GET_API_VERSION` with 12: **`kvm_blocked`**
+2. Opening `/dev/kvm` failed with `EACCES` or `EPERM`: **`unknown_permission`** ("probe as root"). It
+   is never taken for a KVM problem.
+3. `/dev/kvm` answers `KVM_GET_API_VERSION` with 12, or exists and was not opened (facts from a shell
+   preflight):
    - `kvm_pvm` is loaded and neither `kvm_intel` nor `kvm_amd` is: **`pvm`**
-   - otherwise: **`kvm`**. It is `nested` when the CPU has the `hypervisor` flag or systemd names a VM technology.
-3. There is no `/dev/kvm`:
-   - x86 with `vmx` or `svm`: **`kvm_blocked`** (module not loaded, or loaded without `/dev/kvm`)
-   - bare metal with neither flag: **`kvm_blocked`**, because the firmware disabled VT-x. Since about
-     Linux 5.6 the kernel drops `vmx` from `/proc/cpuinfo` when the firmware locks VMX off (SOURCE,
-     medium; the kernel's "VMX feature" reporting). AMD does not do this for SVM (see 2.2).
+   - the CPU model is a hypervisor's generic one (`kvm64`, `qemu64`, "Common KVM processor", "QEMU
+     Virtual CPU"): **`kvm_blocked`**, cause `cpu_model`
+   - `KVM_CREATE_VM` failed: **`kvm_blocked`**, cause `create_vm`
+   - x86_64 and a capability Cloud Hypervisor requires is missing: **`kvm_blocked`**, cause `missing_caps`
+   - otherwise: **`kvm`**. It is `nested` when the CPU has the `hypervisor` flag, systemd names a VM
+     technology, or the DMI names a hypervisor.
+4. There is no working `/dev/kvm`:
+   - the kernel log says the firmware disabled virtualization: **`kvm_blocked`**, cause `firmware`. This
+     comes **before** the flag checks, which fixes AMD with SVM disabled: Linux keeps `svm` in
+     `/proc/cpuinfo` there, so the flags alone would point at `modprobe`.
+   - a generic CPU model: **`kvm_blocked`**, cause `cpu_model` (Proxmox's default has no `vmx`, and
+     v1 called it `none`)
+   - `/dev/kvm` exists but does not answer: **`kvm_blocked`**, cause `unresponsive`
+   - x86 with `vmx` or `svm`: **`kvm_blocked`**, cause `module` (not loaded) or `no_device` (loaded
+     without `/dev/kvm`)
+   - bare metal with neither flag: **`kvm_blocked`**, cause `firmware`. Bare metal means systemd says
+     `none`, the `hypervisor` flag is absent, **and** no DMI string names a hypervisor (QEMU, VMware,
+     VirtualBox, Xen, Bochs, Parallels, bhyve, OpenStack, Hyper-V's "Virtual Machine", SeaBIOS, and
+     similar, after systemd-detect-virt's own table), so a hypervisor that hides its CPUID bit is not
+     sent to the firmware setup. Since about Linux 5.6 the kernel drops `vmx` from `/proc/cpuinfo` when
+     the firmware locks VMX off (SOURCE, medium; the kernel's "VMX feature" reporting).
    - the running kernel's `modules.dep` lists `kvm-pvm.ko`: **`pvm_blocked`**
    - otherwise: **`none`**
 
-Facts gathered (v1): arch, kernel release, CPU vendor and model, the flags `vmx svm hypervisor pdpe1gb`,
-`/dev/kvm` and its API answer, the loaded modules `kvm kvm_intel kvm_amd kvm_pvm`, the `nested`
-module parameter, `kvm-pvm.ko` availability, `systemd-detect-virt --vm/--container`, and the DMI
-fields `sys_vendor product_name product_version bios_vendor board_vendor chassis_vendor chassis_asset_tag`.
+A fact that is missing (`nil`, or a v1 report) is unknown: it never makes a host L2. On an L1 verdict
+the ladder lists the unknown checks as a caveat, and LearnVirt checks again at prep.
 
-VERIFIED on the lab machine:
-- inside a docker container without `/dev/kvm`, through the real bootstrap step 1b on Ubuntu 24.04 (Ruby 3.2): `tier: container`
-- inside an Alpine container without systemd: `tier: container`, from `/.dockerenv`
+The control plane adds two refusals of its own on top of the tier: **`pdpe1gb`** missing on x86_64
+means `standard_vms?` is false (fix: "give this VM the host's CPU model, or an instance type whose CPU
+shows pdpe1gb"), since `Prog::SetupHugepages` needs 1G pages; and the fix and wording come from the
+platform table (section 4).
 
-UNVERIFIED: a real L1 bare-metal host, a nested VM, a PVM host, and the cloud VMs in section 14.
+**Facts gathered (v2)**, all read-only:
+- arch, kernel release, effective UID, CPU vendor and model, the flags `vmx svm hypervisor pdpe1gb`,
+  EPT/NPT (`kvm_intel`'s `ept`, `kvm_amd`'s `npt`, or `vmx flags`)
+- `/dev/kvm`: mode and group; the answer to `KVM_GET_API_VERSION`; whether `KVM_CREATE_VM` succeeded (the
+  VM fd has no memory and no vCPU and is closed at once); the missing capabilities of Cloud Hypervisor
+  v46's list; the errno name of the step that failed
+- the loaded modules `kvm kvm_intel kvm_amd kvm_pvm`, the `nested` module parameter, `kvm-pvm.ko` availability
+- BIOS evidence: the first kernel-log line (`journalctl -k -b`, else `dmesg`) matching "disabled by bios"
+  or "disabled (by BIOS)"
+- `systemd-detect-virt --vm/--container`, and the DMI fields `sys_vendor product_name product_version
+  bios_vendor board_vendor chassis_vendor chassis_asset_tag`. Never `*_serial` or `product_uuid` (a
+  spec pins this).
+- Secure Boot (efivars), `lockdown`, `/sys/devices/system/cpu/vulnerabilities/{meltdown,l1tf,mds,retbleed,spec_rstack_overflow}`,
+  SMT control, `/var/run/reboot-required`
+- container readiness: cgroup v2, AppArmor enabled, `kernel.apparmor_restrict_unprivileged_userns`
+  (INFO only; Ubicloud never asks to change it), `prjquota` on the filesystem holding `/vm`,
+  `lxc-start` and `lxcfs` installed
+- emulation readiness: `qemu-system-x86_64` and OVMF installed
 
-Using it today: before registering, on the control plane (the host needs `ruby`, which the bootstrap installs):
+**Cloud Hypervisor's required capabilities** (SOURCE, high: `check_required_kvm_extensions` in
+`hypervisor/src/kvm/x86_64/mod.rs` at tag v46.0, read 2026-10-15): AdjustClock, ExtCpuid, GetTscKhz,
+ImmediateExit, Ioeventfd, Irqchip, Irqfd, IrqRouting, MpState, SetIdentityMapAddr, SetTssAddr,
+SplitIrqchip, TscDeadlineTimer, UserMemory, UserNmi, VcpuEvents, Xcrs, Xsave. The numbers come from
+`linux/kvm.h`. VERIFIED on the lab machine (AMD Ryzen 7 3800X, kernel 6.8) with a Python script
+on the host: API 12, `KVM_CREATE_VM` returns an fd, and all 18 capabilities answer nonzero. The Ruby
+ioctl path itself ran only against fakes and non-KVM nodes (rhizome spec): UNVERIFIED on a real
+`/dev/kvm`.
+
+**Fallbacks** (`possible` and `ready` in the report): `container` is possible with cgroup v2 and Linux
+≥ 5.12, `emulated` on any x86_64 host, and `pvm` only on a `pvm_blocked` host; a fallback is ready when
+its packages are installed. A `pvm` host offers only `pvm`; an L1 host, a container and an
+`unknown_permission` host offer none. **`recommended`** is `pvm` on a PVM host, otherwise the fastest
+*possible* fallback (container before emulated; `pvm` is never recommended unless `kvm_pvm` is loaded),
+installed or not. The text says what to install. This deviates from the plan's "fastest ready" so that
+an installed QEMU never outranks system containers: in the lab, containers ran about 3.5 times
+faster than the emulator for CPU work and about 40 times faster for memory bandwidth (VERIFIED, section 5.1).
+`kvm_blocked` and `unknown_permission` recommend fixing KVM and name no fallback. No fallback can
+be registered yet (WP4), so the text says so instead of printing registration commands.
+
+**Sanitising:** the control plane runs every host-supplied value through `VirtProbe.sanitize` (control
+characters removed, invalid UTF-8 replaced, strings capped at 128 characters, arrays and hashes at 64
+entries, nesting at four levels) before it classifies, prints, pages or stores anything. The reasons
+are rebuilt from the sanitised facts, so a host cannot inject a line such as "fix: ...". The same goes
+for SSH error text in `bin/byoh-virt` and LearnVirt.
+
+**Fixture trees.** `virt-probe --root DIR` reads files under `DIR` and takes what commands and
+`/dev/kvm` said from `DIR/.virt-probe/` (`uname`, `detect-virt-vm`, `detect-virt-container`,
+`kernel-log`, `kvm.json`). Nothing runs and no device is opened, so a fixture classifies the same
+anywhere. Cases: bare metal with KVM; VT-x off (kernel log, and no flags); AMD SVM disabled by the BIOS
+(`svm` still in cpuinfo); `kvm_intel` not loaded; a hidden hypervisor bit (QEMU DMI, no flag); Proxmox
+`kvm64` without and with `vmx`; host CPU without `pdpe1gb`; `EACCES`; a missing capability; a refused
+`KVM_CREATE_VM`; AWS m8i nested on and off, m7i, `.metal` without the module, Xen t2; GCP E2; Hetzner
+Cloud; an old kernel with cgroup v1; a PVM host; a PVM kernel with the module unloaded; a docker container.
+The DMI strings in the fixtures are from memory (UNVERIFIED), like the platform table's.
+
+VERIFIED on the lab machine (`scripts/byoh/test/nokvm/run.sh probe`, 2026-10-15): in an `ubuntu:24.04`
+container with the distribution's Ruby 3.2.3, and in `ruby:4.0.2-alpine3.23`, the probe reports
+`tier: container` for the container itself, and every one of the 23 fixture trees gives its expected
+tier, cause, `nested` and `ready` (48 checks). That run found a real case: Docker's `--tmpfs` defaults to
+`noexec`, and the probe correctly treats commands there as not installed, because `access(X_OK)` fails.
+
+UNVERIFIED: a real L1 bare-metal host, a nested VM, a PVM host, every cloud VM in section 14, and the
+exact kernel-log wording on each CPU vendor and kernel.
+
+Using it: before registering, on the control plane (the host needs `ruby`, which the bootstrap installs):
 
 ```
-bin/byoh-virt probe --main-ip 203.0.113.10 --ssh-key ~/.ssh/byoh_data
-# exit 0: L1, register it. exit 3: not L1; the output carries the fix.
+bin/byoh-virt probe --main-ip 203.0.113.10 --ssh-key ~/.ssh/byoh_data [--user ubuntu]
+# exit 0: L1, register it. exit 3: not L1; the output carries the fix and the plan.
 ```
 
-`--user` must be root (the default), or a user in group `kvm`, until WP3 adds `sudo -n`. Today the
-probe runs as the given user without sudo. On Ubuntu `/dev/kvm` is `root:kvm 0660`, so for any other
-user opening it fails with `EACCES`, and a working L1 host is reported as `kvm_blocked` ("/dev/kvm
-exists but does not answer KVM_GET_API_VERSION (Permission denied ...)"), exit 3.
+With `--user` other than root the probe runs under `sudo -n`, because on Ubuntu `/dev/kvm` is
+`root:kvm 0660`. When sudo wants a password, `bin/byoh-virt` says so and stops; it never reports such a
+host as `kvm_blocked`. A probe that still cannot open `/dev/kvm` reports `unknown_permission`.
 
 On the host itself: `scripts/byoh/bootstrap-data-plane.sh` (step 1b), or `sudo ruby rhizome/host/bin/virt-probe`.
 After registration: `bin/byoh-virt show --host vh...`. After fixing the host:
 `bin/byoh-virt refresh --host vh...`, then let PrepHost retry (a failed prep strand retries with backoff).
 
-### 2.2 Detection v2 (PLANNED, WP3)
+### 2.2 Detection v2: differences from the plan
 
-**Facts and classification are split.** `rhizome/host/lib/virt_probe.rb` becomes a fact collector
-(report v2; the parser accepts v1 and v2). `ByohVirtLadder.classify(facts)` is a pure control-plane
-function, so M4's shell preflight can feed it facts gathered its own way (section 2.3). The rhizome
-`VirtProbe.classify` stays for the on-host text output; a shared spec feeds the same fixtures to both
-and requires equal results.
+Detection v2 shipped in WP3 as planned (section 15), with these differences:
+- **One classifier, not two.** The plan had a separate control-plane `classify` plus a parity spec.
+  `ByohVirtLadder.classify` instead runs `VirtProbe.classify` (the control plane already loads the
+  probe file to pipe it to hosts, like `lib/net_ssh.rb` loads rhizome code) on sanitised facts. So
+  parity holds by construction, and the parity spec still runs every fixture through both.
+- **`recommended` is the fastest possible fallback**, not the fastest ready one (section 2.1, Fallbacks).
+- **No registration commands in the plan output yet.** The `--virt-tier` and `--accept-fallback`
+  flags and `bin/byoh-location set --virt-tiers` arrive with WP4. Until then the text names the
+  fallback, what to install, and that it cannot be registered yet.
+- **`pdpe1gb` is a control-plane refusal**, not a probe tier: the probe reports `kvm`, and
+  `Verdict#standard_vms?` is false with its own fix.
+- The harness checks the **bounding** capability set (`CapBnd`) rather than `CapEff`. This is stricter:
+  a capability outside the bounding set can never be gained.
 
-New facts, all read-only:
-- **BIOS evidence in the kernel log** (`journalctl -k -b`, falling back to `dmesg`): "VMX (outside TXT)
-  disabled by BIOS", "SVM disabled (by BIOS)", `kvm: disabled by bios`. It **takes precedence over the
-  flag path**. That fixes AMD with SVMDIS set: Linux keeps `svm` in `/proc/cpuinfo`, so v1 would print a
-  `modprobe` fix where the firmware is the cause (SOURCE, medium, kernel behaviour from memory).
-- **A functional KVM check:** open `/dev/kvm`, `KVM_GET_API_VERSION`, `KVM_CREATE_VM`, then
-  `KVM_CHECK_EXTENSION` for each capability Cloud Hypervisor v46 requires at start. The list is read
-  from CH v46's `hypervisor/src/kvm` `check_required_extensions` when WP3 is written, and recorded per
-  capability. A missing capability fails L1 with its name. EPT/NPT (`vmx_flags`, the `ept`/`npt` module
-  parameters) are recorded. The check creates a VM fd and closes it; it changes nothing.
-- **The errno of each step.** `EACCES`/`EPERM` gives the class **`unknown_permission`** ("re-run as
-  root"), never `kvm_blocked`.
-- `/dev/kvm` mode and group (L4's udev rule check).
-- **CPU model:** `kvm64`, `qemu64`, "Common KVM processor" or "QEMU Virtual CPU" gives tier
-  **`kvm_blocked`** (L2), reason `cpu_model`, fix "set the VM's CPU type to host". The rule applies
-  with or without `vmx` and whether or not `/dev/kvm` answers:
-  - Without `vmx` (Proxmox's default "Common KVM processor"), v1 says `none`.
-  - With `vmx` and a working `/dev/kvm`, v1 says `kvm`.
-  v2 overrides both, so `auto` refuses with the fix (the `kvm_blocked` row of section 11.2) instead of
-  falling back to a lower tier. This is the same rule as M4's PF3, so the two never disagree.
-- **`pdpe1gb`:** missing means `standard_vms?` is false for `kvm`, with its own fix ("expose 1G pages,
-  CPU type host"). It is only a caveat for tiers that do not use 1G hugepages (L3, L4, L5).
-- **DMI naming a VM vendor overrides a `bare_metal` verdict** (a hypervisor that hides its CPUID bit).
-- Secure Boot (`mokutil --sb-state` or efivars), `lockdown`, `/sys/devices/system/cpu/vulnerabilities/*`
-  (meltdown, l1tf, mds, retbleed, srso), SMT state.
-- Kernel release and `/var/run/reboot-required` (the L3/L4 patch-cadence page, section 5.3).
-- **Container readiness:** cgroup v2, kernel ≥ 5.12 (idmapped mounts), AppArmor enabled,
-  `kernel.apparmor_restrict_unprivileged_userns` (INFO only; Ubicloud never asks to change it),
-  `lxc-start`, `lxcfs`, `prjquota` on the VM filesystem.
-- **Emulation readiness:** `qemu-system-x86_64`, OVMF.
-- **PVM readiness:** `kvm-pvm.ko` in `modules.dep`, `kvm_pvm` loaded.
-- **`ready:`** the tiers whose prerequisites are present. **`recommended:`** the fastest ready tier
-  (L3 before L5; L4 is listed only as "isolation option").
-  - Exception: on a `pvm` probe, `recommended` is always `pvm`, and `container` and `emulated` are never
-    listed as ready. That matches `auto` and the refusals in the `pvm` row of section 11.2, so the
-    printed plan is never one that registration refuses.
-- Never read: `*_serial`, `product_uuid`. Every host-supplied string is sanitised (control characters
-  stripped, length capped at 128) before it reaches `Verdict#text`, a page or the database.
+Platform table changes (`lib/byoh_virt_platforms.rb`, SHIPPED):
+- A row `aws_xen`, before `xen`: `sys_vendor` "Xen" and `product_version` matching `amazon` (DMI strings
+  from memory, UNVERIFIED) → "Xen-based EC2 instance type ...: move to a Nitro type (C8i/M8i/R8i with
+  nested virtualization, or .metal)".
+- AWS `rules` on the instance type in `product_name` (on Nitro the DMI product name is the instance type;
+  from memory, UNVERIFIED), as an **explicit family list**: `c8i m8i r8i` → "stop the instance, enable
+  nested virtualization in its CPU options, and start it again"; `*.metal` → "should be L1: check that
+  the KVM module loads"; anything else, 7th generation and `-flex` included → "move to C8i, M8i or R8i
+  ... or to a .metal type". No generation regex. `-flex` is left out because no source here says it
+  supports nested virtualization.
+- `cost_hint` on the `aws`, `aws_xen`, `gcp`, `azure` and `hetzner_cloud` rows and the AWS rules (section 7).
+  `Verdict#text` prints it as `cost:` only when the host is not L1. Every hint says "check current pricing".
+- Wording by the row's `nested` value for a `none` host: `yes`/`some` → "Fixable by changing the instance
+  type or a VM option: ...", `ask` → "Ask your provider whether nested virtualization can be enabled. ...",
+  `no` → the row's fix. Only a `kvm_blocked` verdict is labelled "probably fixable" (`tier: kvm_blocked
+  (L2 probably fixable)`).
 
-Running the probe: `bin/byoh-virt probe` runs `sudo -n ruby - --json` when `--user` is not root, and
-says so when sudo fails instead of misclassifying. LearnVirt runs `sudo host/bin/virt-probe --json`,
-as today.
-
-Platform table changes (`lib/byoh_virt_platforms.rb`, WP3):
-- A new row `aws_xen`, before `xen`: `sys_vendor` "Xen" and `product_version` matching `amazon` (DMI
-  strings from memory, UNVERIFIED) → "Xen-based instance: move to a Nitro type (C8i/M8i/R8i with nested
-  virtualization, or .metal)".
-- AWS sub-rules on the instance type in `product_name`, as an **explicit family list** with its source:
-  `c8i m8i r8i` → "stop the instance and enable nested virtualization in the CPU options"; `*.metal` →
-  "should be L1: check the module"; anything else → "move to C8i/M8i/R8i (same size, similar price) or
-  .metal". No generation regex: 7th-generation support is not assumed (section 4).
-- Each row carries a `cost_hint` (data for section 7).
-- Wording by the row's `nested` value: only a `kvm_blocked` probe is "probably fixable (L2)". `none` on a
-  `yes`/`some` platform is "fixable by changing the instance type or option"; on `ask`, "ask your
-  provider whether nested virtualization can be enabled".
+Rungs as printed: `kvm` L1, `kvm_blocked` L2, `container` (the data plane) refused, `unknown_permission`
+unknown, `none` and `pvm_blocked` L3-L5, `pvm` L4.
 
 ### 2.3 Hook for M4's host preflight
 
 M4 owns host preflight (`scripts/byoh/host/ubicloud-host`, `lib/byoh_host_preflight.rb`, PF3). The
 contract between them:
 
-- **Today (SHIPPED):** in the same SSH session, pipe `ByohVirtLadder.remote_script` to `ruby - --json`
-  and pass the output to `ByohVirtLadder.parse`. Use `Verdict#fix` as PF3's fix text, `Verdict#caveats`
-  as PF3 INFO lines, and `Verdict#standard_vms?` as PF3's pass condition. It agrees with `KvmCheck`
-  except in two cases:
-  - On a PVM host, `KvmCheck` refuses it for lacking `vmx`/`svm`, and the ladder refuses it as "not supported yet".
-  - When `/dev/kvm` exists but the `KVM_GET_API_VERSION` ioctl fails, the ladder says `kvm_blocked`
-    while `KvmCheck`, which checks only the character device and the CPU flag, passes. This includes
-    every probe run as a non-root user outside group `kvm` (section 2.1).
-- **After WP3 (PLANNED), one rule:** PF3 delegates the virtualization verdict to
-  `ByohVirtLadder.preflight_check(facts, declared_tier:)`, which returns
-  `{status: pass|fail|info, fix:, caveats:}`.
-  - M4's bash preflight emits the raw facts it already gathers in its pinned session (flags,
-    `/dev/kvm`, modules, DMI, `systemd-detect-virt`, CPU model). Facts it does not gather (the ioctl
-    results, the capabilities) give `unknown` for that check, never L2; LearnVirt re-checks at prep.
-  - The ladder adopts M4's `kvm64`/`qemu64` refusal as `kvm_blocked`, reason `cpu_model` (section 2.2).
-  - `declared_tier` other than `kvm`: PF3 becomes INFO for the KVM checks, the tier's own readiness
-    facts gate instead, and PF4 (hugepages) is skipped.
+- **The hook (SHIPPED, WP3):** PF3 delegates the virtualization verdict to
+  `ByohVirtLadder.preflight_check(facts, declared_tier: "kvm")`, which returns
+  `{status:, tier:, rung:, platform:, checks:, fix:, caveats:}`:
+  - `status` is `"pass"`, `"fail"`, or `"info"` (passes, but some facts were not gathered).
+  - `checks` maps `kvm_device kvm_open kvm_create_vm kvm_capabilities cpu_model pdpe1gb firmware` to
+    `pass`, `fail`, `unknown` (not gathered) or `skip` (nothing to check). Use `fix` as PF3's fix text
+    and `caveats` as INFO lines.
+  - Two ways to get `facts`, both in M4's own pinned SSH session:
+    - pipe `ByohVirtLadder.remote_script` to `ruby - --json` (under `sudo -n` when not root) and take
+      the report's `"facts"`;
+    - or gather them in shell with the keys of `VirtProbe.facts`: `arch`, `cpu_model`, `cpu_flags`
+      (the subset `vmx svm hypervisor pdpe1gb`), `dev_kvm`, `modules`, `virt_vm`, `virt_container`,
+      `dmi`, and `bios_log` if M4 reads the kernel log.
+  - Facts a shell does not gather (the ioctl results, the capabilities) give `unknown` for that check,
+    never L2, and `status: "info"`; LearnVirt checks them at prep. For `bios_log`, a key present with
+    `nil` means "read the kernel log, found nothing", so leave the key out when the log was not read.
+  - The ladder applies M4's `kvm64`/`qemu64` refusal as `kvm_blocked`, cause `cpu_model`, so PF3 and the
+    ladder never disagree. The same function also refuses a missing `pdpe1gb`, which PF4 (hugepages)
+    would otherwise catch later.
+  - `declared_tier` other than `kvm` (`container`, `pvm`, `emulated`): the KVM verdict becomes an INFO
+    line (`"KVM: ..."`), and the tier's own readiness decides. That means `pass` when it is `ready`, and
+    `fail` with what to install when it is only `possible`. It fails, with a reason, on an L1 host
+    ("register it as kvm"), on a PVM host for another tier, in a container, without permission, or
+    when the kernel cannot run that tier. PF4 (hugepages) should be skipped for those tiers.
+    Registering them arrives with WP4.
+  - Where `KvmCheck` and the ladder still differ: `KvmCheck` checks only the character device and the
+    CPU flag, so it passes a host that the ladder refuses for a generic CPU model, a missing
+    capability, a refused `KVM_CREATE_VM` or a missing `pdpe1gb`. On a PVM host, `KvmCheck` refuses for
+    lacking `vmx`/`svm` and the ladder says `pvm`, which cannot take VMs yet.
 - **Expected merge conflicts with M4**, each planned as additive hunks: `bin/register-byoh-host`, the
   registration files (section 11.4), `lib/byoh_location_cli.rb`, `model/vm_host.rb`,
   `prog/vm/host_nexus.rb` (`assemble`, `prep`, `wait_prep`), `scheduling/allocator.rb`, PLATFORMS.md,
@@ -235,7 +300,7 @@ L1 is today's product; its code is unchanged. The probe adds three caveats when 
 3. **Health checks.** The clocksource and disks are virtual, so `bin/monitor` may misfire (PLATFORMS F5).
 
 The probe also warns when `pdpe1gb` is missing: without it there are no 1G hugepages for
-`Prog::SetupHugepages` (SHIPPED as a caveat; a refusal with its own fix from WP3).
+`Prog::SetupHugepages` (SHIPPED: since WP3 a refusal with its own fix, section 2.1).
 
 ## 4. L2: switch KVM on. Platform table
 
@@ -244,7 +309,7 @@ records in `vm_host.virt_probe["platform"]`. Offerings change; this table was ch
 
 | Key | Platform (DMI signal) | Nested | How to get KVM | Source, confidence |
 |---|---|---|---|---|
-| `aws` | AWS EC2 (`sys_vendor` "Amazon EC2") | some | `.metal`, or 8th-generation Intel (C8i/M8i/R8i and variants) with CPU option nested virtualization enabled; the instance must be stopped to change it. Available since 2026-02-12. | [AWS docs][aws-nested], high; [Classmethod][classmethod], medium. The AWS locales disagree on whether 7th-generation types are included: check the current list. |
+| `aws` | AWS EC2 (`sys_vendor` "Amazon EC2"; the instance type in `product_name` picks a rule) | some | `.metal`, or 8th-generation Intel (C8i/M8i/R8i) with CPU option nested virtualization enabled; the instance must be stopped to change it. Available since 2026-02-12. Rules: `c8i`/`m8i`/`r8i` → switch the option on; `.metal` → check the module; anything else → move. | [AWS docs][aws-nested], high; [Classmethod][classmethod], medium. The AWS locales disagree on whether 7th-generation types are included: check the current list. |
 | `gcp` | Google Compute Engine | some | `--enable-nested-virtualization` on Intel series, or AMD N4D; not E2, memory-optimized or Arm; the org policy must allow it | [GCP][gcp-nested], high |
 | `azure` | Azure (`chassis_asset_tag` 7783-7084-3265-9085-8269-3286-77) | some | Dv3/Ev3 and newer general-purpose and memory families; not B or A series; check the size page | [Azure blog][azure-nested], high for Dv3/Ev3; newer families medium |
 | `hyperv` | Hyper-V guest | yes | `Set-VMProcessor -VMName <vm> -ExposeVirtualizationExtensions $true`, with the VM off | Microsoft docs, high (from memory, well known) |
@@ -258,10 +323,11 @@ records in `vm_host.virt_probe["platform"]`. Offerings change; this table was ch
 | `scaleway` | Scaleway | ask | Some instance types reportedly expose it; Elastic Metal does | [LowEndTalk][scaleway-let], low |
 | `openstack` | OpenStack (OVHcloud Public Cloud and others) | ask | Depends on the cloud operator's nova `cpu_mode` and the compute nodes' `nested=1` | OpenStack docs, high for the mechanism; per-provider unknown |
 | `qemu_kvm` | QEMU/KVM: Proxmox VE, libvirt, KVM VPS | ask | Proxmox: `qm set <vmid> --cpu host`, with `nested=Y` on the node; libvirt: `host-passthrough` | Proxmox and libvirt docs, high (from memory, well known) |
+| `aws_xen` | Xen-based EC2 type such as t2/m4 (`sys_vendor` "Xen", `product_version` containing "amazon"; DMI strings from memory, UNVERIFIED) | no | Move to a Nitro type: C8i/M8i/R8i with nested virtualization, or `.metal` | AWS docs, high for Xen types lacking VT-x (from memory) |
 | `xen` | Xen | ask | `nestedhvm=1`, which Xen marks experimental | Xen docs, medium |
 
-PLANNED rows and sub-rules (WP3, section 2.2): `aws_xen` (Xen-based AWS types such as t2/m4), the
-explicit AWS family list, and a `cost_hint` per row.
+Rows with a `cost_hint` (section 7): `aws`, `aws_xen`, `gcp`, `azure`, `hetzner_cloud`. The others
+have none, because their fix costs nothing or depends on the provider.
 
 The DMI strings for Linode, Vultr and Scaleway are UNVERIFIED guesses, so a miss falls back to the
 generic fix. Bare metal matches no row: the fix there is the firmware setting (power the machine off
@@ -631,8 +697,8 @@ Hypervisor v46 **and** v53. If neither reaches a login prompt, WP7 delivers dete
 
 ## 7. Cost guidance
 
-Approximate and UNVERIFIED: check current pricing. The probe's fix text says "same size, about the
-same price" only where the platform row's `cost_hint` says so (PLANNED, WP3).
+Approximate and UNVERIFIED: check current pricing. Only the platform rows' `cost_hint` talks about
+price (SHIPPED, WP3); `bin/byoh-virt` prints it as a `cost:` line for a host that is not L1.
 
 | Cloud | Non-nested type you may be on | Nested-capable type, same size | Delta |
 |---|---|---|---|
@@ -793,48 +859,83 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
 - Internal services stay on L1: they create VMs with kvm families and pass `allowed_tiers: ["kvm"]`. A
   spec pins this for each service's `assemble`.
 
-### 10.5 LearnVirt: fail-open and tier-aware (PLANNED, WP3/WP4)
+### 10.5 LearnVirt: fail-open (SHIPPED, WP3) and tier-aware (PLANNED, WP4)
 
-- It compares the probe with `virt_tier`, pages `ByohVirtTier` only on disagreement, and resolves the
-  page on agreement. Agreement is a safety check, not an authorisation.
-- Any exception (a parse error, an SSH failure, a probe crash) records `{"error": ...}`, pages once and
-  pops. It never retries forever, and never blocks `wait_prep` for a kvm host.
+- PLANNED (WP4): it compares the probe with `virt_tier`, pages `ByohVirtTier` only on disagreement, and
+  resolves the page on agreement. Agreement is a safety check, not an authorisation. Until then it
+  compares every host with L1, as before.
+- SHIPPED: any exception (a parse error, an SSH failure, a probe crash) records `{"error": ...}`
+  (sanitised), pages once under the same `ByohVirtTier` tag, and pops with "virt probe failed". It never
+  retries forever and never blocks `wait_prep`; a later probe that finds L1 resolves the page.
+  `bin/byoh-virt show` prints "the last probe failed: ..." and exits 3.
 - It pages `ByohKernelReboot` per section 5.3. Page text is sanitised.
 
 ## 11. Operator experience
 
-### 11.1 Before registration: `bin/byoh-virt probe` (SHIPPED; plan output PLANNED, WP3)
+### 11.1 Before registration: `bin/byoh-virt probe` (SHIPPED)
 
-It prints the verdict and exits 0 on L1 and 3 otherwise. The format is `ByohVirtLadder::Verdict#text`;
-the values below are illustrative and UNVERIFIED except the container case.
-
-```
-# AWS m8i.2xlarge, nested on                         # Proxmox VM with cpu=kvm64 (after WP3)
-tier: kvm (L1) nested                                 tier: kvm_blocked (L2)
-platform: AWS EC2                                     platform: QEMU/KVM (Proxmox VE, libvirt, KVM VPS)
-why: /dev/kvm answers KVM_GET_API_VERSION 12          why: cpu_model: "Common KVM processor" (kvm64): the
-caveat: nested virtualization: CPU-bound work ...          hypervisor does not expose hardware virtualization
-caveat: the provider may stop or restart this VM ...  fix: Proxmox: qm set <vmid> --cpu host, then stop and
-caveat: the clocksource is often not tsc ...               start the VM; the node needs nested=Y ...
-
-# Bare metal, Intel VT-x off in the firmware (v1)     # A Docker or OpenVZ "VPS"  (VERIFIED: container case)
-tier: kvm_blocked (L2)                                tier: container (refused)
-platform: unknown platform                            why: this is a docker container
-why: bare metal without the vmx or svm flag: the      fix: Run the data plane on a VM or bare metal, not in
-     firmware has VT-x/AMD-V disabled                      a container.
-fix: Enable Intel VT-x or AMD-V (SVM) in the BIOS/UEFI
-     setup, then reboot.
-```
-
-After WP3 the bare-metal case takes its reason from the kernel log when the log has one ("VMX (outside
-TXT) disabled by BIOS"), and its fix tells the operator to power the machine off and on.
-
-After WP3 a host without KVM also gets a **recommended plan** with the exact commands:
+It prints the verdict and exits 0 on L1 and 3 otherwise. The format is `ByohVirtLadder::Verdict#text`.
+These are real outputs for fixture machines (section 2.1; VERIFIED as program output, while the
+machines' DMI strings and kernel-log lines are from memory, UNVERIFIED). Long lines are cut here with
+"...".
 
 ```
-tier: none (no hardware virtualization)       platform: Hetzner Cloud
-fastest option: a Hetzner dedicated server (L1). Cost: see docs/byoh/NO_KVM.md §7.
-ready fallbacks (fastest first): container (L3, shared kernel, ~native) · emulated (L5, slow)
+# AWS m8i.2xlarge with nested virtualization on (fixture aws_m8i_nested)
+tier: kvm (L1) nested
+platform: AWS EC2
+why: /dev/kvm answers KVM_GET_API_VERSION 12
+caveat: nested virtualization: CPU-bound work typically loses 10% or more, ...
+caveat: the provider may stop or restart this VM for maintenance, ...
+caveat: the clocksource is often not tsc and disks are virtual, ...
+recommended: register it as it is (L1)
+
+# Proxmox VM with the default CPU type (fixture proxmox_kvm64)
+tier: kvm_blocked (L2 probably fixable)
+platform: QEMU/KVM (Proxmox VE, libvirt, KVM-based VPS)
+why: the CPU model is the hypervisor's generic "Common KVM processor", not the host's
+fix: Give this VM the host's CPU model instead of the hypervisor's generic one, with VT-x/AMD-V
+     exposed. Proxmox VE: qm set <vmid> --cpu host, with nested enabled on the node ...
+fallbacks ready: none
+fallbacks possible after installing their packages: container, emulated
+recommended: apply the fix above and probe again
+
+# AMD bare metal with SVM disabled in the firmware (fixture amd_svm_disabled_by_bios)
+tier: kvm_blocked (L2 probably fixable)
+platform: unknown platform
+why: the kernel log says the firmware disabled virtualization: kvm_amd: SVM disabled (by BIOS) ...
+fix: Enable Intel VT-x or AMD-V (SVM) in the BIOS/UEFI setup, then power the machine off and on.
+...
+
+# AWS m7i.large (fixture aws_m7i, with lxc and lxcfs installed)
+tier: none (L3-L5)
+platform: AWS EC2
+why: this VM (amazon) gets no hardware virtualization from its hypervisor
+fix: Fixable by changing the instance type or a VM option: This instance family does not expose
+     VT-x. Move to C8i, M8i or R8i ... or to a .metal type. Without hardware virtualization the
+     fallbacks, fastest first, are: L3 system containers ..., L4 PVM ..., L5 the QEMU emulator ...
+cost: C8i, M8i and R8i cost about the same per vCPU as other current families of the same size; ...
+fallbacks ready: container
+fallbacks possible after installing their packages: emulated
+recommended: L3 system containers (shared host kernel, near-native speed); fallbacks cannot be
+     registered yet (docs/byoh/NO_KVM.md section 11)
+
+# Probed as a user that cannot open /dev/kvm (fixture dev_kvm_eacces)
+tier: unknown_permission (unknown)
+platform: unknown platform
+why: opening /dev/kvm was refused (EACCES); run the probe as root
+fix: Probe as root: bin/byoh-virt probe --user root, or a --user with passwordless sudo (the probe runs sudo -n).
+recommended: apply the fix above and probe again
+
+# A Docker or OpenVZ "VPS" (VERIFIED on the lab machine through the harness)
+tier: container (refused)
+why: this is a docker container
+fix: Run the data plane on a VM or bare metal, not in a container.
+recommended: use a VM or bare metal as the data plane
+```
+
+PLANNED (WP4): once fallback tiers can be registered, the recommendation becomes the exact commands:
+
+```
 recommended:
   bin/byoh-location set fsn-cloud --virt-tiers kvm,container --accept container
   bin/byoh-location rates fsn-cloud --family container --from standard --multiplier <X>
@@ -1157,7 +1258,7 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
   `premium` and the AWS m-families) is assembled in a location that bills it; a family that none
   of them bills fails the spec instead of going unpinned.
 
-### WP3: detection v2 and the harness skeleton
+### WP3: detection v2 and the harness skeleton (DONE)
 
 - `virt_probe.rb` v2 facts (section 2.2), `sudo -n` in `lib/byoh_virt_cli.rb`, the EACCES class,
   sanitisation; `ByohVirtLadder.classify(facts)`, `preflight_check(facts, declared_tier:)`, the
@@ -1172,6 +1273,8 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
   m7i vs m8i); the recommended plan per probe tier, including `pvm` (recommends `pvm`); rhizome specs through
   `--root` trees; a rhizome/control-plane classify parity spec; a sanitisation spec; the LearnVirt error path.
 - Done: the full gate; the harness probe green; `bin/byoh-virt explain` prints a fix for every fixture.
+- Result: shipped as section 2.1 describes, with the differences of section 2.2. Gate and harness
+  results are in the WP3 commit message.
 
 ### WP4: the tier framework
 
