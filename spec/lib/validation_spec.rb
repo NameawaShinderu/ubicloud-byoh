@@ -274,6 +274,20 @@ RSpec.describe Validation do
         expect { described_class.validate_boot_image("invalid-boot-image") }.to raise_error described_class::ValidationFailed
         expect { described_class.validate_boot_image("postgres-ubuntu-2204") }.to raise_error described_class::ValidationFailed
       end
+
+      it "keeps the message of every VM without a lower tier" do
+        expect { described_class.validate_boot_image("x") }.to raise_error(described_class::ValidationFailed) { |e|
+          expect(e.details[:boot_image]).to eq "\"x\" is not a valid boot image name. Available boot image names are: #{Option::BootImages.map(&:name)}, or you can use machine-image-name@version, machine-image-name@latest"
+        }
+      end
+
+      it "accepts a lower tier's boot images when given" do
+        expect { described_class.validate_boot_image("ubuntu-noble-container", extra_names: %w[ubuntu-noble-container]) }.not_to raise_error
+        expect { described_class.validate_boot_image("ubuntu-noble-container") }.to raise_error described_class::ValidationFailed
+        expect { described_class.validate_boot_image("x", extra_names: %w[ubuntu-noble ubuntu-noble-container]) }.to raise_error(described_class::ValidationFailed) { |e|
+          expect(e.details[:boot_image]).to include("Available boot image names are: #{Option::BootImages.map(&:name) + %w[ubuntu-noble-container]},")
+        }
+      end
     end
 
     describe "#validate_short_text" do

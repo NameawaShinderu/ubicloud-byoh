@@ -111,15 +111,19 @@ class Clover
     # Since Vm::Nexus both handles VM creation requests from user and also Postgres
     # service, moved the boot_image validation here to not allow users to pass
     # postgres image as boot image while creating a VM.
+    # The API also offers the lower virtualization tiers of a BYOH location
+    # (ByohVirtTiers); the customer opts in by picking one of their sizes,
+    # which also allows that tier's boot images and defaults to its first.
+    tier_families = api? ? ByohVirtTiers.offered_families(@location) : []
+    tier_boot_images = ByohVirtTiers.boot_images_for_size(assemble_params[:size], tier_families)
     if assemble_params[:boot_image]
-      Validation.validate_boot_image(assemble_params[:boot_image])
+      Validation.validate_boot_image(assemble_params[:boot_image], extra_names: tier_boot_images)
+    elsif tier_boot_images.any?
+      assemble_params[:boot_image] = tier_boot_images.first
     end
 
     # Same as above, moved the size validation here to not allow users to
     # pass gpu instance while creating a VM.
-    # The API also offers the lower virtualization tiers of a BYOH location
-    # (ByohVirtTiers); the customer opts in by picking one of their sizes.
-    tier_families = api? ? ByohVirtTiers.offered_families(@location) : []
     if assemble_params[:size]
       parsed_size = Validation.validate_vm_size(assemble_params[:size], "x64", only_visible: true, extra_families: tier_families)
       tier = ByohVirtTiers.tier_for_family(parsed_size.family)

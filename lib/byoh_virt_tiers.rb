@@ -151,6 +151,15 @@ module ByohVirtTiers
     tiers(location).select { lower?(it) && shipped?(it) }.map { fetch(it).family }
   end
 
+  # The boot images of the lower tier whose size the customer picked, if
+  # the size is one of the offered families' (offered_families); [] for
+  # every other size, so only those boot images widen what a VM create
+  # accepts.
+  def self.boot_images_for_size(size, families)
+    vm_size = Option::TierVmSizes.find { it.name == size && families.include?(it.family) }
+    vm_size ? fetch(tier_for_family(vm_size.family)).boot_images : []
+  end
+
   # The families of allowed_tiers that Validation.validate_vm_size may
   # accept for a VM in the location.
   def self.size_families(location, allowed_tiers)

@@ -141,9 +141,12 @@ module Validation
     [gpu_count, gpu_device]
   end
 
-  def self.validate_boot_image(image_name)
-    unless Option::BootImages.find { it.name == image_name } || image_name.include?("@")
-      fail ValidationFailed.new({boot_image: "\"#{image_name}\" is not a valid boot image name. Available boot image names are: #{Option::BootImages.map(&:name)}, or you can use machine-image-name@version, machine-image-name@latest"})
+  # extra_names: the boot images of a lower virtualization tier the VM
+  # uses (ByohVirtTiers.boot_images_for_size).
+  def self.validate_boot_image(image_name, extra_names: [])
+    names = Option::BootImages.map(&:name) | extra_names
+    unless names.include?(image_name) || image_name.include?("@")
+      fail ValidationFailed.new({boot_image: "\"#{image_name}\" is not a valid boot image name. Available boot image names are: #{names}, or you can use machine-image-name@version, machine-image-name@latest"})
     end
   end
 
