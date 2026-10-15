@@ -1209,11 +1209,19 @@ for every container it creates:
   NET_RAW}; no port bindings; network `ubi-test-net`; a bind allowlist (no `docker.sock`, `/lib/modules`,
   `/dev`, `/sys`, the main checkout or `.env.rb`); `CpusetCpus=12-15`, `NanoCpus=4000000000`, `Memory=6g`;
   a `ubi-q-*` name.
-- Mounts: only `rhizome/` and `scripts/byoh/test/nokvm/`, read-only, plus a container-local scratch volume.
-- `HostConfig.SecurityOpt`: never `systempaths=unconfined`; seccomp is Docker's default, or a custom
-  profile file from the repo named explicitly, never `seccomp=unconfined`; AppArmor is `docker-default`,
-  never `apparmor=unconfined`. The harness grants `SYS_ADMIN` in the initial user namespace, so the
-  AppArmor profile's mount denial is what stops container root from remounting `/sys` or `/proc/sys`
+- Mounts: only `rhizome/` and `scripts/byoh/test/nokvm/`, read-only, plus a container-local scratch
+  tmpfs. Every entry of `.Mounts` must be one of the two binds; `--mount` and `--volumes-from` are
+  refused.
+- `HostConfig.SecurityOpt`: only `no-new-privileges` and `apparmor=ubi-q-nokvm`. So never
+  `systempaths=unconfined`, never a `seccomp=` profile (Docker's default applies; a repo profile would
+  have to be added to the allowlist by name), never `apparmor=unconfined`.
+- The daemon: before any container is created, `docker info` must list `name=apparmor` and
+  `name=seccomp` without `profile=unconfined`, since a daemon without AppArmor leaves the profile
+  empty and the option checks alone would pass. Docker records the effective profile only at start, so
+  the created container must show an empty (daemon default) or `ubi-q-nokvm` profile, and after the run
+  it must show `docker-default` or `ubi-q-nokvm`.
+- AppArmor is `docker-default`. The harness grants `SYS_ADMIN` in the initial user namespace (in the
+  guest-running modes), so the AppArmor profile's mount denial is what stops container root from remounting `/sys` or `/proc/sys`
   read-write, or mounting a fresh sysfs, and writing host-global kernel state. The read-only checks below
   only observe; they enforce nothing.
 - Modes that run LXC inside the container (`run.sh l3`) need `mount`, which `docker-default` denies. They

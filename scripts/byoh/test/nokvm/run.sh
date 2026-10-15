@@ -16,10 +16,16 @@
 # Rules for every container (checked with docker inspect before start):
 #   - named ubi-q-nokvm-*, network ubi-test-net, no published ports
 #   - not privileged; no device but /dev/net/tun; capabilities added only
-#     from NET_ADMIN SYS_ADMIN NET_RAW; no unconfined seccomp, AppArmor
-#     or systempaths; no host PID/IPC/UTS/user namespace
+#     from NET_ADMIN SYS_ADMIN NET_RAW; security options only
+#     no-new-privileges and apparmor=ubi-q-nokvm (no seccomp profile, no
+#     unconfined anything); no host PID/IPC/UTS/user namespace
+#   - AppArmor docker-default (or ubi-q-nokvm) and the daemon's default
+#     seccomp profile: the daemon must have both enabled (docker info,
+#     checked before any container is created), and the profile is
+#     checked again after each run, since docker sets it only at start
 #   - CPUs 12-15, 4 CPUs, 6 GiB
-#   - binds: only rhizome/ and this directory, read-only
+#   - binds: only rhizome/ and this directory, read-only; no --mount, no
+#     --volumes-from, no volume of any kind
 # Inside, at start and at teardown: /sys and every proc mount but /proc
 # read-only, no /dev/kvm, no CAP_SYS_MODULE or CAP_SYS_RAWIO.
 # On the host, before and after: loaded modules, vm.nr_hugepages and
@@ -90,6 +96,25 @@ image_check() {
   docker pull -q "$1" >/dev/null
 }
 
+# daemon_check: the daemon confines containers with AppArmor and its
+# default seccomp profile. Without them a container with SYS_ADMIN could
+# remount /sys or /proc/sys read-write, so nothing starts.
+daemon_check() {
+  local opts
+  opts=$(docker info --format '{{range .SecurityOptions}}{{.}} {{end}}')
+  case " $opts" in *" name=apparmor"*) ;; *) fail "the docker daemon does not use AppArmor (security options: $opts)" ;; esac
+  case " $opts" in *" name=seccomp,"*) ;; *) fail "the docker daemon does not use seccomp (security options: $opts)" ;; esac
+  case "$opts" in *profile=unconfined*) fail "the docker daemon's default seccomp profile is unconfined" ;; esac
+}
+
+# apparmor_ok NAME: the container's AppArmor profile, once started, is
+# docker-default or the shipped ubi-q-nokvm one.
+apparmor_ok() {
+  local profile
+  profile=$(field "$1" '{{.AppArmorProfile}}')
+  case "$profile" in docker-default | ubi-q-nokvm) ;; *) fail "$1: AppArmor profile '$profile', not docker-default" ;; esac
+}
+
 # field NAME TEMPLATE: what docker inspect says about the container.
 field() { docker inspect --format "$2" "$1"; }
 
@@ -106,8 +131,11 @@ assert_safe() {
     case "${item#CAP_}" in NET_ADMIN | SYS_ADMIN | NET_RAW) ;; *) fail "$name: capability $item" ;; esac
   done
   for item in $(field "$name" '{{range .HostConfig.SecurityOpt}}{{.}} {{end}}'); do
-    case "$item" in *unconfined* | *systempaths*) fail "$name: security option $item" ;; esac
+    case "$item" in no-new-privileges | no-new-privileges:true | no-new-privileges=true | apparmor=ubi-q-nokvm) ;; *) fail "$name: security option $item" ;; esac
   done
+  # Docker fills this in only at start; empty means the daemon's default,
+  # which daemon_check proved is AppArmor's docker-default.
+  case "$(field "$name" '{{.AppArmorProfile}}')" in "" | docker-default | ubi-q-nokvm) ;; *) fail "$name: AppArmor profile is not docker-default" ;; esac
   [ "$(field "$name" '{{len .HostConfig.PortBindings}}{{.HostConfig.PublishAllPorts}}')" = 0false ] || fail "$name: published ports"
   [ "$(field "$name" '{{.HostConfig.NetworkMode}}')" = "$NET" ] || fail "$name: network is not $NET"
   for item in PidMode IpcMode UTSMode UsernsMode; do
@@ -116,6 +144,10 @@ assert_safe() {
   [ "$(field "$name" '{{.HostConfig.CpusetCpus}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}')" = "$CPUSET $NANO_CPUS $MEMORY_BYTES" ] ||
     fail "$name: CPU or memory limits are not $CPUSET / $NANO_CPUS / $MEMORY_BYTES"
   [ "$(field "$name" '{{len .HostConfig.Mounts}}')" = 0 ] || fail "$name: --mount is not allowed, use the checked binds"
+  [ "$(field "$name" '{{len .HostConfig.VolumesFrom}}')" = 0 ] || fail "$name: --volumes-from is not allowed"
+  for item in $(field "$name" '{{range .Mounts}}{{.Type}}:{{.Source}} {{end}}'); do
+    case "$item" in "bind:$WT/rhizome" | "bind:$HERE") ;; *) fail "$name: mount $item is not allowed" ;; esac
+  done
   for bind in $(field "$name" '{{range .HostConfig.Binds}}{{.}} {{end}}'); do
     src=${bind%%:*}
     case "$bind" in *:ro) ;; *) fail "$name: bind $bind is not read-only" ;; esac
@@ -136,12 +168,14 @@ run_in() {
   assert_safe "$name"
   say "$name ($image): $mode"
   docker start -a "$name" || fail "$name: $mode failed"
+  apparmor_ok "$name"
 }
 
 probe() {
   local before
   image_check "$UBUNTU_IMAGE"
   image_check "$ALPINE_IMAGE"
+  daemon_check
   before=$(host_state)
   run_in probe-ubuntu "$UBUNTU_IMAGE" probe-apt
   run_in probe-alpine "$ALPINE_IMAGE" probe
