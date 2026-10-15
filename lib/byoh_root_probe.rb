@@ -2,6 +2,7 @@
 
 require "logger"
 require "securerandom"
+require_relative "net_ssh"
 
 # PF2: can the control plane log in to a BYOH host as root with the
 # registration key, and does that login reach a shell? It connects the
@@ -20,7 +21,10 @@ class ByohRootProbe
     def check = ByohHostPreflight::Check.new(id: "PF2", status: ok ? "pass" : "fail", detail:, fix:, accepted: false)
   end
 
-  NET_SSH_START = Net::SSH.method(:start)
+  # Looked up on each call, not when the class loads: the web process
+  # removes Net::SSH.start (lib/net_ssh.rb), and still loads every class
+  # under forced autoload.
+  NET_SSH_START = ->(host, user, **opts, &blk) { Net::SSH.start(host, user, **opts, &blk) }
 
   def initialize(main_ip, private_key, pinned_host_keys: nil, starter: NET_SSH_START, nonce: SecureRandom.hex(8))
     raise ArgumentError, "pinned_host_keys is empty" if pinned_host_keys&.empty?

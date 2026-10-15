@@ -4,6 +4,7 @@ require "digest"
 require "open3"
 require "shellwords"
 require "tmpdir"
+require_relative "net_ssh"
 
 # The operator's own SSH session to a host that is being added
 # (`byoh-host add --ssh USER@IP`). It runs the system ssh client, so any

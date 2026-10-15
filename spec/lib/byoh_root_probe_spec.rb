@@ -98,7 +98,17 @@ RSpec.describe ByohRootProbe do
   end
 
   it "uses Net::SSH.start by default" do
-    expect(described_class::NET_SSH_START).to eq(Net::SSH.method(:start))
-    expect(described_class.new("203.0.113.42", reg_key.private_key).instance_variable_get(:@starter)).to equal(described_class::NET_SSH_START)
+    session = instance_double(Net::SSH::Connection::Session)
+    expect(session).to receive(:exec!).and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("ubi-pf2-n0nce\n", 0))
+    expect(Net::SSH).to receive(:start).with("203.0.113.42", "root", hash_including(key_data: [reg_key.private_key], verify_host_key: :accept_new)).and_yield(session)
+    expect(described_class.new("203.0.113.42", reg_key.private_key, nonce: "n0nce").call.ok).to be true
+  end
+
+  # The web process undefines Net::SSH.start, and forced autoload then
+  # loads every class under lib/, so none may touch it at load time.
+  it "loads with every other class in a web process" do
+    env = {"PROCESS_TYPE" => "web", "ALLOW_WEB_SSH" => nil, "FORCE_AUTOLOAD" => "1", "RUBYOPT" => nil, "COVERAGE" => nil}
+    out, status = Open3.capture2e(env, RbConfig.ruby, "-r./loader", "-e", "print [ByohRootProbe, ByohOperatorSsh::HostKey].size, Net::SSH.respond_to?(:start)")
+    expect([out, status.success?]).to eq(["2false", true])
   end
 end
