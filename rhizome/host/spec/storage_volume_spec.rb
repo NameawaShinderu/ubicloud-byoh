@@ -722,13 +722,19 @@ RSpec.describe StorageVolume do
       expect(encrypted_vhost_sv.write_through_device?).to be false
     end
 
-    it "assumes a write-back cache when the device has no write_cache file" do
-      expect(File).to receive(:stat).with(disk_file).and_return(instance_double(File::Stat, dev_major: 230, dev_minor: 1))
-      expect(File).to receive(:realpath).with("/sys/dev/block/230:1").and_return("/sys/devices/virtual/block/zd0")
-      expect(File).to receive(:exist?).with("/sys/block/zd0").and_return(true)
-      expect(File).to receive(:read).with("/sys/block/zd0/queue/write_cache").and_raise(Errno::ENOENT)
-      expect(encrypted_vhost_sv).to receive(:warn)
-      expect(encrypted_vhost_sv.write_through_device?).to be false
+    it "still raises when a real block device has no write_cache file" do
+      expect(File).to receive(:stat).with(disk_file).and_return(instance_double(File::Stat, dev_major: 8, dev_minor: 1))
+      expect(File).to receive(:realpath).with("/sys/dev/block/8:1").and_return("/sys/devices/pci0000:00/block/sda/sda1")
+      expect(File).to receive(:exist?).with("/sys/block/sda1").and_return(false)
+      expect(File).to receive(:read).with("/sys/block/sda/queue/write_cache").and_raise(Errno::ENOENT)
+      expect(encrypted_vhost_sv).not_to receive(:warn)
+      expect { encrypted_vhost_sv.write_through_device? }.to raise_error(Errno::ENOENT)
+    end
+
+    it "still raises when sysfs has no entry for a real block device" do
+      expect(File).to receive(:stat).with(disk_file).and_return(instance_double(File::Stat, dev_major: 8, dev_minor: 1))
+      expect(File).to receive(:realpath).with("/sys/dev/block/8:1").and_raise(Errno::ENOENT)
+      expect { encrypted_vhost_sv.write_through_device? }.to raise_error(Errno::ENOENT)
     end
 
     it "still raises when the disk file itself is missing" do
