@@ -23,9 +23,17 @@ RSpec.describe ByohVirtTiers, "pvm" do
     expect(described_class::SHIPPED).not_to include("pvm")
   end
 
-  it "refuses to do anything without BYOH_REAL_HOST=1" do
-    out, status = Open3.capture2e({"BYOH_REAL_HOST" => nil}, "bash", path, "install")
-    expect(status.exitstatus).to eq 2
-    expect(out).to include("refusing")
+  # These run the script, which needs bash. The alpine test image has
+  # none unless the run adds it, so they skip there instead of failing.
+  context "when run by bash" do
+    let(:bash) { ENV.fetch("PATH", "").split(":").map { File.join(it, "bash") }.find { File.executable?(it) } }
+
+    before { skip "bash is not installed" unless bash }
+
+    it "refuses to do anything without BYOH_REAL_HOST=1" do
+      out, status = Open3.capture2e({"BYOH_REAL_HOST" => nil}, bash, path, "install")
+      expect(status.exitstatus).to eq 2
+      expect(out).to include("refusing")
+    end
   end
 end
