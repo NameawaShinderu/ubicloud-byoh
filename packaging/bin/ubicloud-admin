@@ -1459,15 +1459,17 @@ stage_dir() {
 }
 
 # stage_in FILE: copies FILE (relative to the caller's directory) for
-# ubicloud and prints the copy's path.
+# ubicloud and sets STAGED_PATH to the copy's path. It runs in the
+# caller's shell, never in $(...), so that its usage_die ends the script
+# even where errexit is off.
+STAGED_PATH=""
 stage_in() {
-  local src=$1 dest
+  local src=$1
   [[ $src == /* ]] || src=$CALLER_PWD/$src
   [[ -f $src && -r $src ]] || usage_die "$1 is not a readable file"
   stage_dir
-  dest=$(mktemp "$STAGE_DIR/in.XXXXXX")
-  install -m 0440 -o root -g ubicloud "$src" "$dest"
-  printf '%s' "$dest"
+  STAGED_PATH=$(mktemp "$STAGE_DIR/in.XXXXXX") || die "cannot create a file in $STAGE_DIR"
+  install -m 0440 -o root -g ubicloud "$src" "$STAGED_PATH" || die "cannot copy $src to $STAGED_PATH"
 }
 
 # Input file options of the tools, and the output option.
@@ -1525,7 +1527,8 @@ stage_args() {
       else
         # In this shell: its EXIT trap removes the copies.
         stage_dir
-        val=$(stage_in "$val")
+        stage_in "$val"
+        val=$STAGED_PATH
         STAGED_ARGS+=("$opt" "$val")
         [[ ! $opt =~ $KEY_FILE_OPTS ]] || STAGED_KEYS+=("$val")
       fi
@@ -1679,11 +1682,16 @@ show_cmd() {
   printf '  %s\n' "${out# }"
 }
 
-# tool_run TOOL ARGS...: runs bin/TOOL with ARGS in the layout; with
-# UBICLOUD_ADMIN_DRYRUN=1 it prints the command line instead.
+# tool_run TOOL ARGS...: runs bin/TOOL with ARGS in the layout and sets
+# TOOL_RC to its exit status; with UBICLOUD_ADMIN_DRYRUN=1 it prints the
+# command line instead. It returns 0 itself, so that callers never put
+# it left of || or in an if: errexit would be off for the staging
+# inside, and a failed step there would go on with an empty path.
+TOOL_RC=0
 tool_run() {
   local tool=$1
   shift
+  TOOL_RC=0
   if [[ $LAYOUT == dev ]]; then
     local repo
     repo=$(dev_repo)
@@ -1704,26 +1712,29 @@ tool_run() {
       cd "$repo" || exit 1
       umask 022
       if [[ $EUID == 0 ]]; then exec runuser -u "$DEV_USER" -- "${cmd[@]}"; else exec "${cmd[@]}"; fi
-    )
-    return
+    ) || TOOL_RC=$?
+    return 0
   fi
   if [[ ${UBICLOUD_ADMIN_DRYRUN:-0} == 1 ]]; then
     show_cmd "bin/$tool" "$@"
     return 0
   fi
   stage_args "$@"
-  local rc=0
-  ruby_as ubicloud "bin/$tool" "${STAGED_ARGS[@]}" || rc=$?
-  ((rc)) || deliver_out
-  return "$rc"
+  ruby_as ubicloud "bin/$tool" "${STAGED_ARGS[@]}" || TOOL_RC=$?
+  ((TOOL_RC)) || deliver_out
+  return 0
 }
 
 # The digest of the billing rate files, to see whether a command
-# changed them.
+# changed them. Root never opens the files, which user ubicloud writes
+# (it could swap one for a FIFO or a link to /dev/zero): find lists each
+# entry's type, size, inode and nanosecond mtime from lstat, without
+# following links. secure_state checked that the directory itself is no
+# symlink, and $STATE is root's.
 rates_digest() {
   local d=$STATE/billing_rates.d
-  [[ -d $d ]] || return 0
-  (cd "$d" && find . -maxdepth 1 -type f -name '*.yml' -print0 | sort -z | xargs -0r sha256sum) | sha256sum
+  [[ -d $d && ! -L $d ]] || return 0
+  find -P "$d" -mindepth 1 -maxdepth 1 -name '*.yml' -printf '%P\t%y\t%s\t%i\t%T@\n' | LC_ALL=C sort | sha256sum
 }
 
 # restart_for_rates: restarts ubicloud.target, so web, respirate and
@@ -1773,8 +1784,12 @@ cmd_byoh() {
   case $verb in
     -h | --help | help)
       byoh_layout
+      if [[ $LAYOUT == packaged && ${UBICLOUD_ADMIN_DRYRUN:-0} != 1 ]]; then
+        need_root
+        need_release
+      fi
       tool_run "$tool" --help
-      return
+      return "$TOOL_RC"
       ;;
     "") usage_die "$noun takes one of: ${verbs[*]}" ;;
   esac
@@ -1789,7 +1804,9 @@ cmd_byoh() {
   ((dry)) || audit "$noun $verb"
   if ((dry)); then
     if [[ $LAYOUT == dev ]]; then
-      printf 'ubicloud-admin: dry run; in the checkout %s it would run:\n' "$(dev_repo)"
+      local repo
+      repo=$(dev_repo)
+      printf 'ubicloud-admin: dry run; in the checkout %s it would run:\n' "$repo"
     else
       printf 'ubicloud-admin: dry run; as user ubicloud in %s it would run:\n' "$CURRENT"
     fi
@@ -1802,7 +1819,8 @@ cmd_byoh() {
     local before rc=0
     before=$(rates_digest)
     SERVICE_EXTRA=(UBICLOUD_ADMIN_RESTARTS=1)
-    tool_run "$tool" "$verb" "${args[@]}" || rc=$?
+    tool_run "$tool" "$verb" "${args[@]}"
+    rc=$TOOL_RC
     SERVICE_EXTRA=()
     # A run that failed after writing rates (a refused --grant) still
     # changed what the services must load.
@@ -1812,6 +1830,7 @@ cmd_byoh() {
     return "$rc"
   fi
   tool_run "$tool" "$verb" "${args[@]}"
+  return "$TOOL_RC"
 }
 
 # host_add ARGS...: byoh-host add in two invocations, so that the
@@ -1822,7 +1841,7 @@ host_add() {
     case $a in
       --phase | --phase=* | -h | --help)
         tool_run byoh-host add "$@"
-        return
+        return "$TOOL_RC"
         ;;
     esac
   done
@@ -1833,7 +1852,8 @@ host_add() {
     install -d -m 0700 -o ubicloud -g ubicloud "$STATE/byoh-keys"
   fi
   local rc=0
-  tool_run byoh-host add "$@" --phase prepare || rc=$?
+  tool_run byoh-host add "$@" --phase prepare
+  rc=$TOOL_RC
   # The staged keys go now, whatever the outcome; the EXIT trap would
   # only remove them at the very end.
   if ((${#STAGED_KEYS[@]})); then
@@ -1855,6 +1875,7 @@ host_add() {
     esac
   done
   tool_run byoh-host add "${reg[@]}" --phase register
+  return "$TOOL_RC"
 }
 
 # --- console ----------------------------------------------------------------------------

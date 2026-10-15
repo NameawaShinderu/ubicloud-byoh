@@ -21,6 +21,13 @@
 #     --pool-file is still there, and neither key option is passed;
 #     byoh-keys/ exists as ubicloud 0700 although the old release's
 #     install.sh never made it
+#   - host add with a missing --ssh-key or --pool-file exits 2 and never
+#     runs the tool; site --help as a non-root user gets the root refusal
+#   - --dev in a ubi-m4-admin-dev container with no packaged layout:
+#     the dry run makes the file options absolute against the caller's
+#     directory; root without SUDO_USER gets the bundle exec line and 2;
+#     with SUDO_USER a stand-in bundle runs as that user in the checkout
+#     with mise's PATH; a copy outside a checkout stops before bundle
 #
 # Containers are named ubi-m4-*, join only ubi-test-net and publish no
 # ports; cleanup removes only the containers this run created.
@@ -87,6 +94,11 @@ grep -q 'restarted' <<<"$(adm_last)" && fail "site rates that changed no file re
 grep -q 'Location      m4-site' <<<"$(adm_last)" || fail "site show NAME: $(adm_last)"
 [[ $(adm site --help) == 0 ]] || fail "site --help: $(adm_last)"
 grep -q 'Usage: bin/byoh-location' <<<"$(adm_last)" || fail "site --help: $(adm_last)"
+[[ $(adm site add --help) == 0 ]] || fail "site add --help: $(adm_last)"
+grep -q -- '--mgmt MODE' <<<"$(adm_last)" || fail "site add --help lists no create options: $(adm_last)"
+rc=0
+out=$(docker exec -u nobody -w / "$PREFIX-$C" ubicloud-admin site --help 2>&1) || rc=$?
+[[ $rc == 1 && $out == *"run ubicloud-admin as root"* ]] || fail "site --help as nobody exited $rc: $out"
 [[ $(adm site add m4-two --postgres yes) == 2 ]] || fail "site add --postgres yes was not refused with 2"
 [[ $(adm site add m4-two --mgmt wireguard) == 2 ]] || fail "site add --mgmt wireguard was not refused with 2"
 [[ $(adm site bogus) == 2 ]] || fail "site bogus was not refused with 2"
@@ -149,6 +161,19 @@ else
 end
 RUBY
 dx "$C" chmod 0755 "$rel/bin/byoh-host"
+# A missing file stops the script before the tool, though host add runs
+# the prepare phase where errexit could be off.
+for bad in "--ssh-key missing --pool-file pools.yaml" "--ssh-key k --pool-file missing.yaml"; do
+  # shellcheck disable=SC2086
+  [[ $(adm host add --site m4-site --ssh ubuntu@10.0.0.9 $bad --yes) == 2 ]] || fail "host add $bad: $(adm_last)"
+  out=$(adm_last)
+  grep -q 'is not a readable file' <<<"$out" || fail "host add $bad: $out"
+  grep -q 'deleted the staged copies' <<<"$out" && fail "host add $bad went on after the refusal: $out"
+  [[ $(dx "$C" bash -c 'ls /var/lib/ubicloud/var/m4-probe.log 2>/dev/null | wc -l') == 0 ]] ||
+    fail "host add $bad ran bin/byoh-host"
+done
+[[ $(dx "$C" bash -c 'ls -d /tmp/ubicloud-admin-files.* 2>/dev/null | wc -l') == 0 ]] || fail "staging directory left behind"
+say "host add: a missing --ssh-key or --pool-file exits 2 and never runs the tool"
 [[ $(adm host add --site m4-site --ssh ubuntu@10.0.0.9 --ssh-key k --registration-key reg --pool-file pools.yaml --yes) == 0 ]] ||
   fail "host add with the probe: $(adm_last)"
 dx "$C" cp -p /root/byoh-host.orig "$rel/bin/byoh-host"
@@ -162,4 +187,58 @@ grep -qE '^register keyopts=false gone=true pool=true listing=in\.[A-Za-z0-9]+,i
 say "host add: the staged keys are gone before the register phase; byoh-keys made"
 
 grep -q ' by root ' <<<"$(dx "$C" journalctl -t ubicloud-admin --no-pager)" || fail "no ubicloud-admin audit lines"
+
+# --- --dev, with no packaged layout ------------------------------------------
+D="$PREFIX-admin-dev"
+docker run -d --name "$D" --network "$NET" ubuntu:24.04 sleep infinity >/dev/null
+echo "$D" >>"$STATE/created"
+ruby_ver=$(sed -n 's/^ruby *= *"\([^"]*\)".*/\1/p' "$WT/mise.toml" | head -1)
+docker cp "$WT/packaging/bin/ubicloud-admin" "$D:/ubicloud-admin"
+# shellcheck disable=SC2016
+docker exec -i -e RUBY_VER="$ruby_ver" "$D" bash -euo pipefail <<'SH'
+useradd -m dev
+mkdir -p /repo/bin /repo/packaging/bin /work/rel /elsewhere
+touch /repo/Gemfile /repo/bin/byoh-location /repo/bin/byoh-host /repo/bin/byoh-pool
+printf '[tools]\nruby = "%s"\n' "$RUBY_VER" >/repo/mise.toml
+install -m 0755 /ubicloud-admin /repo/packaging/bin/ubicloud-admin
+install -m 0755 /ubicloud-admin /elsewhere/ubicloud-admin
+chmod -R a+rX /repo /work
+# The stand-in bundle, on the PATH only through mise's ~/.local/bin.
+install -d -o dev -g dev /home/dev/.local/bin "/home/dev/.local/share/mise/installs/ruby/$RUBY_VER/bin"
+cat >/home/dev/.local/bin/bundle <<'B'
+#!/bin/bash
+printf 'user=%s pwd=%s path=%s args=%s\n' "$(id -un)" "$PWD" "$PATH" "$*" >>/tmp/bundle.log
+B
+chmod 0755 /home/dev/.local/bin/bundle
+SH
+dev_adm() { docker exec -w /work "$@"; }
+
+out=$(dev_adm -e UBICLOUD_ADMIN_DRYRUN=1 "$D" /repo/packaging/bin/ubicloud-admin --dev host add --site s --ssh u@h \
+  --ssh-key rel/k --registration-key=/abs/r --pool-file=p.yaml --yes 2>&1) || fail "--dev dry run host add: $out"
+grep -q '^ubicloud-admin: dry run; in the checkout /repo it would run:$' <<<"$out" || fail "--dev dry run header: $out"
+grep -qx -- '  bundle exec bin/byoh-host add --site s --ssh u@h --ssh-key /work/rel/k --registration-key /abs/r --pool-file /work/p.yaml --yes --phase prepare' <<<"$out" ||
+  fail "--dev dry run prepare line: $out"
+grep -qx -- '  bundle exec bin/byoh-host add --site s --ssh u@h --pool-file /work/p.yaml --yes --phase register' <<<"$out" ||
+  fail "--dev dry run register line: $out"
+
+rc=0
+out=$(dev_adm "$D" /repo/packaging/bin/ubicloud-admin --dev site list 2>&1) || rc=$?
+[[ $rc == 2 ]] || fail "--dev as root without SUDO_USER exited $rc: $out"
+grep -qx '  cd /repo && bundle exec bin/byoh-location list' <<<"$out" || fail "--dev as root printed no bundle exec line: $out"
+
+[[ $(dx admin-dev bash -c 'ls /tmp/bundle.log 2>/dev/null | wc -l') == 0 ]] || fail "--dev ran bundle without SUDO_USER or in a dry run"
+dev_adm -e SUDO_USER=dev "$D" /repo/packaging/bin/ubicloud-admin --dev pool export --out o.yaml >/dev/null 2>&1 ||
+  fail "--dev pool export with SUDO_USER failed"
+log=$(dx admin-dev cat /tmp/bundle.log)
+[[ $log == "user=dev pwd=/repo path=/home/dev/.local/bin:/home/dev/.local/share/mise/installs/ruby/$ruby_ver/bin:"*" args=exec bin/byoh-pool export --out /work/o.yaml" ]] ||
+  fail "--dev with SUDO_USER: $log"
+
+rc=0
+out=$(dev_adm -e SUDO_USER=dev "$D" /elsewhere/ubicloud-admin --dev site list 2>&1) || rc=$?
+[[ $rc == 1 && $out == *"is not a checkout"* ]] || fail "--dev outside a checkout exited $rc: $out"
+rc=0
+out=$(dev_adm -e UBICLOUD_ADMIN_DRYRUN=1 "$D" /elsewhere/ubicloud-admin --dev site list 2>&1) || rc=$?
+[[ $rc == 1 && $out != *"dry run"* ]] || fail "--dev dry run outside a checkout exited $rc: $out"
+[[ $(dx admin-dev bash -c 'wc -l </tmp/bundle.log') == 1 ]] || fail "--dev outside a checkout ran bundle"
+say "--dev: absolute file options, the root refusal, SUDO_USER with mise's PATH, no run outside a checkout"
 say "m4-admin: ok"
