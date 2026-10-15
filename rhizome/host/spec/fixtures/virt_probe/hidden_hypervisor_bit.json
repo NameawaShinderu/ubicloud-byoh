@@ -1,0 +1,26 @@
+{
+  "files": {
+    ".virt-probe/uname": "x86_64 6.8.0-45-generic\n",
+    ".virt-probe/detect-virt-vm": "none\n",
+    ".virt-probe/detect-virt-container": "none\n",
+    ".virt-probe/kernel-log": "",
+    "proc/cpuinfo": "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7763 64-Core Processor\nflags\t\t: fpu lm pdpe1gb\n\n",
+    "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
+    "sys/class/dmi/id/sys_vendor": "QEMU\n",
+    "sys/class/dmi/id/product_name": "Standard PC (Q35 + ICH9, 2009)\n",
+    "sys/class/dmi/id/bios_vendor": "SeaBIOS\n",
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+  },
+  "dirs": [],
+  "execs": [],
+  "expect": {
+    "tier": "none",
+    "cause": "no_virt",
+    "platform": "qemu_kvm",
+    "standard": false,
+    "fix": "Ask your provider whether nested virtualization can be enabled",
+    "nested": false,
+    "ready": [],
+    "recommended": "container"
+  }
+}

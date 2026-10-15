@@ -26,6 +26,10 @@ RSpec.describe ByohVirtPlatforms do
     end
   end
 
+  it "recognizes a Xen-based AWS instance before plain Xen" do
+    expect(described_class.match(facts({"sys_vendor" => "Xen", "product_name" => "HVM domU", "product_version" => "4.11.amazon"}, virt_vm: "xen")).key).to eq "aws_xen"
+  end
+
   it "recognizes xen from systemd-detect-virt" do
     expect(described_class.match(facts({"sys_vendor" => "Xen"}, virt_vm: "xen")).key).to eq "xen"
   end
@@ -33,7 +37,40 @@ RSpec.describe ByohVirtPlatforms do
   it "matches nothing on bare metal or without DMI" do
     expect(described_class.match(facts({"sys_vendor" => "Dell Inc."}, virt_vm: "none"))).to be_nil
     expect(described_class.match({})).to be_nil
+    expect(described_class.match({"dmi" => "junk"})).to be_nil
     expect(described_class.match(facts({"sys_vendor" => nil}, virt_vm: nil))).to be_nil
+  end
+
+  describe ".advice" do
+    let(:aws) { described_class::ROWS.find { it.key == "aws" } }
+
+    def advice(row, product)
+      described_class.advice(row, facts({"sys_vendor" => "Amazon EC2", "product_name" => product}))
+    end
+
+    it "tells an AWS family with nested virtualization to switch it on" do
+      fix, cost = advice(aws, "m8i.2xlarge")
+      expect(fix).to start_with "This instance family offers nested virtualization, but it is switched off"
+      expect(cost).to include "does not change the instance price"
+      expect(advice(aws, "c8i.large").first).to eq fix
+      expect(advice(aws, "r8i.xlarge").first).to eq fix
+    end
+
+    it "tells a .metal instance to check the module" do
+      expect(advice(aws, "m5d.metal")).to eq [aws.rules[1].fix, nil]
+    end
+
+    it "tells every other AWS family, 7th generation included, to move" do
+      %w[m7i.large m6i.large t3.medium c8g.large m8i-flex.large].each do
+        expect(advice(aws, it)).to eq [aws.fix, described_class::AWS_COST]
+      end
+    end
+
+    it "gives a row without rules its own fix and cost" do
+      gcp = described_class::ROWS.find { it.key == "gcp" }
+      expect(described_class.advice(gcp, facts({"sys_vendor" => "Google"}))).to eq [gcp.fix, gcp.cost_hint]
+      expect(described_class::ROWS.find { it.key == "vmware" }.cost_hint).to be_nil
+    end
   end
 
   it "has unique keys, a known nested value and a fix in every row" do
@@ -42,6 +79,8 @@ RSpec.describe ByohVirtPlatforms do
       expect(described_class::NESTED).to include(row.nested)
       expect(row.fix).not_to be_empty
       expect(row.match).not_to be_empty
+      expect(row.cost_hint).to be_nil.or(include("pricing"))
+      row.rules.each { expect(it.fix).not_to be_empty }
     end
   end
 

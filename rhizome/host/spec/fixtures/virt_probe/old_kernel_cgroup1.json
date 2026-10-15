@@ -1,0 +1,24 @@
+{
+  "files": {
+    ".virt-probe/uname": "x86_64 5.4.0-100-generic\n",
+    ".virt-probe/detect-virt-vm": "kvm\n",
+    ".virt-probe/detect-virt-container": "none\n",
+    ".virt-probe/kernel-log": "",
+    "proc/cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) Platinum 8488C\nflags\t\t: fpu lm hypervisor\n\n",
+    "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
+    "sys/class/dmi/id/sys_vendor": "DigitalOcean\n",
+    "sys/class/dmi/id/product_name": "Droplet\n"
+  },
+  "dirs": [],
+  "execs": [],
+  "expect": {
+    "tier": "none",
+    "cause": "no_virt",
+    "platform": "digitalocean",
+    "standard": false,
+    "fix": "DigitalOcean does not support nested",
+    "nested": false,
+    "ready": [],
+    "recommended": "emulated"
+  }
+}

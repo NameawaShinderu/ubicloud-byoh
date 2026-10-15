@@ -1,0 +1,33 @@
+{
+  "files": {
+    ".virt-probe/uname": "x86_64 6.8.0-45-generic\n",
+    ".virt-probe/detect-virt-vm": "kvm\n",
+    ".virt-probe/detect-virt-container": "none\n",
+    ".virt-probe/kernel-log": "",
+    "proc/cpuinfo": "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7763 64-Core Processor\nflags\t\t: fpu lm hypervisor pdpe1gb\n\n",
+    "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
+    "sys/class/dmi/id/sys_vendor": "Hetzner\n",
+    "sys/class/dmi/id/product_name": "vServer\n",
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "usr/share/OVMF/OVMF_CODE_4M.fd": ""
+  },
+  "dirs": [],
+  "execs": [
+    "usr/bin/lxc-start",
+    "usr/bin/lxcfs",
+    "usr/bin/qemu-system-x86_64"
+  ],
+  "expect": {
+    "tier": "none",
+    "cause": "no_virt",
+    "platform": "hetzner_cloud",
+    "standard": false,
+    "fix": "Hetzner dedicated server",
+    "nested": false,
+    "ready": [
+      "container",
+      "emulated"
+    ],
+    "recommended": "container"
+  }
+}

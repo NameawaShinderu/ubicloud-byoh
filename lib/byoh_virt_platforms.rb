@@ -14,13 +14,31 @@
 #           switched on), :no (not offered), :ask (depends on whoever runs
 #           the hypervisor)
 #   fix     how to get a usable /dev/kvm on this platform
+#   cost_hint  what the fix costs compared with staying put, or nil.
+#           Prices are approximate and UNVERIFIED (docs/byoh/NO_KVM.md
+#           section 7); only these texts talk about price.
+#   rules   narrower advice inside the platform: the first rule whose
+#           patterns all match replaces fix and cost_hint. AWS uses it
+#           for the instance type in product_name.
 #
 # The first matching row wins, so narrower rows come first. The fix texts
 # summarize the sources in NO_KVM.md section 4, which carries the
 # citations and confidence; provider offerings change, and the doc says
 # when each was checked.
 module ByohVirtPlatforms
-  Row = Data.define(:key, :name, :match, :nested, :fix)
+  Row = Data.define(:key, :name, :match, :nested, :fix, :cost_hint, :rules) do
+    def initialize(cost_hint: nil, rules: [], **)
+      super
+    end
+  end
+
+  Rule = Data.define(:match, :fix, :cost_hint) do
+    def initialize(cost_hint: nil, **)
+      super
+    end
+  end
+
+  AWS_COST = "C8i, M8i and R8i cost about the same per vCPU as other current families of the same size; .metal costs far more because it is a whole server (approximate and UNVERIFIED; check current pricing)."
 
   NESTED = %i[yes some no ask].freeze
 
@@ -30,7 +48,31 @@ module ByohVirtPlatforms
       name: "AWS EC2",
       match: {"sys_vendor" => /\AAmazon EC2\z/},
       nested: :some,
-      fix: "Use a .metal instance, or an 8th-generation Intel instance (C8i, M8i, R8i and their variants) with the CPU option nested virtualization enabled; the instance must be stopped to change it. Other families do not expose VT-x.",
+      fix: "This instance family does not expose VT-x. Move to C8i, M8i or R8i (the 8th-generation Intel families that offer nested virtualization) and enable nested virtualization in the CPU options, or to a .metal type.",
+      cost_hint: AWS_COST,
+      # On Nitro the DMI product_name is the instance type. The family
+      # list is explicit and sourced (docs/byoh/NO_KVM.md section 4); no
+      # generation is assumed to support nested virtualization.
+      rules: [
+        Rule.new(
+          match: {"product_name" => /\A(?:c8i|m8i|r8i)\./},
+          fix: "This instance family offers nested virtualization, but it is switched off: stop the instance, enable nested virtualization in its CPU options, and start it again.",
+          cost_hint: "Enabling nested virtualization does not change the instance price (UNVERIFIED; check current pricing).",
+        ),
+        Rule.new(
+          match: {"product_name" => /\.metal\z/},
+          fix: "A .metal instance has VT-x, so this host should be L1: check that the KVM module loads (modprobe kvm_intel, or kvm_amd) and read the kernel log.",
+          cost_hint: nil,
+        ),
+      ],
+    ),
+    Row.new(
+      key: "aws_xen",
+      name: "AWS EC2 (Xen-based instance type)",
+      match: {"sys_vendor" => /\AXen\z/, "product_version" => /amazon/i},
+      nested: :no,
+      fix: "This is a Xen-based EC2 instance type (an older family such as t2 or m4), and Xen types never expose VT-x. Move to a Nitro type: C8i, M8i or R8i with nested virtualization enabled in the CPU options, or a .metal type.",
+      cost_hint: AWS_COST,
     ),
     Row.new(
       key: "gcp",
@@ -38,6 +80,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /\AGoogle\z/, "product_name" => /Google Compute Engine/},
       nested: :some,
       fix: "Recreate the VM with --enable-nested-virtualization on an Intel machine series (or AMD N4D); E2, memory-optimized and Arm series do not support it, and the organization policy constraints/compute.disableNestedVirtualization must not be enforced.",
+      cost_hint: "Google charges nothing extra for nested virtualization; an Intel N2 or C3 VM costs about the same as an E2 VM of the same size or somewhat more (approximate; check current pricing).",
     ),
     Row.new(
       key: "azure",
@@ -45,6 +88,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /\AMicrosoft Corporation\z/, "chassis_asset_tag" => /\A7783-7084-3265-9085-8269-3286-77\z/},
       nested: :some,
       fix: "Resize to a size whose documentation lists nested virtualization as supported (Dv3/Ev3 and newer general-purpose and memory families); B-series and A-series do not support it.",
+      cost_hint: "Dv5 and Ev5 sizes cost about the same as B-series sizes with the same vCPUs and memory or somewhat more (approximate and UNVERIFIED; check current pricing).",
     ),
     Row.new(
       key: "hyperv",
@@ -80,6 +124,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /\AHetzner\z/},
       nested: :no,
       fix: "Hetzner Cloud servers do not expose VT-x/AMD-V. Use a Hetzner dedicated server, which has full KVM.",
+      cost_hint: "A Hetzner dedicated server (AX or EX line) costs about as much per month as a cloud server with 8 or more dedicated cores (approximate and UNVERIFIED; check current pricing).",
     ),
     Row.new(
       key: "digitalocean",
@@ -136,10 +181,24 @@ module ByohVirtPlatforms
 
   # The row for a probe's facts, or nil when none matches.
   def self.match(facts)
-    dmi = facts.fetch("dmi", {}).to_h
-    values = dmi.merge("virt_vm" => facts["virt_vm"])
-    ROWS.find do |row|
-      row.match.all? { |field, pattern| values[field].is_a?(String) && pattern.match?(values[field]) }
-    end
+    values = values(facts)
+    ROWS.find { matches?(it.match, values) }
+  end
+
+  # The fix and cost hint for a probe's facts on a row, after the row's
+  # rules.
+  def self.advice(row, facts)
+    values = values(facts)
+    rule = row.rules.find { matches?(it.match, values) }
+    rule ? [rule.fix, rule.cost_hint] : [row.fix, row.cost_hint]
+  end
+
+  def self.values(facts)
+    dmi = facts.fetch("dmi", {})
+    (dmi.is_a?(Hash) ? dmi : {}).merge("virt_vm" => facts["virt_vm"])
+  end
+
+  def self.matches?(patterns, values)
+    patterns.all? { |field, pattern| values[field].is_a?(String) && pattern.match?(values[field]) }
   end
 end

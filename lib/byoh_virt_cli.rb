@@ -14,13 +14,18 @@ class ByohVirtCli
     Commands:
       probe    --main-ip IP [--ssh-key FILE] [--user USER] [--json]
                Probe a host over SSH before registering it (needs ruby on
-               the host; scripts/byoh/bootstrap-data-plane.sh installs it)
+               the host; scripts/byoh/bootstrap-data-plane.sh installs it).
+               A --user other than root needs passwordless sudo: the probe
+               runs under sudo -n, since only root can open /dev/kvm.
       explain  [FILE]   Explain saved virt-probe --json output (default stdin)
       script            Print the probe as a script for "ruby -" on a host
       show     --host UBID   Show what the last probe of a host found
-      refresh  --host UBID   Probe a registered host again
+      refresh  --host UBID | --all
+               Probe a registered host again, or every generic (BYOH)
+               host whose rhizome is installed
 
-    probe and explain exit 0 when the host can run VMs (L1), 3 when not.
+    probe, explain and show exit 0 when the host can run VMs (L1), 3 when
+    not. show exits 0 for a host that was never probed.
   USAGE
 
   NOT_L1 = 3
@@ -61,11 +66,18 @@ class ByohVirtCli
     end
     raise Error, "--main-ip is required" unless opts[:ip]
 
+    remote = (opts[:user] == "root") ? "ruby - --json" : "sudo -n ruby - --json"
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
     cmd.push("-i", opts[:key]) if opts[:key]
-    cmd.push("#{opts[:user]}@#{opts[:ip]}", "ruby - --json")
+    cmd.push("#{opts[:user]}@#{opts[:ip]}", remote)
     out, err, status = Open3.capture3(*cmd, stdin_data: ByohVirtLadder.remote_script)
-    raise Error, "probing #{opts[:ip]} failed (#{status.exitstatus}): #{err.strip}; the host needs ruby (apt-get install ruby) and root SSH from here" unless status.success?
+    unless status.success?
+      err = ByohVirtLadder.sanitize(err.strip)
+      if remote.start_with?("sudo") && err.start_with?("sudo:")
+        raise Error, "sudo -n failed for #{opts[:user]} on #{opts[:ip]}: #{err}; the probe must run as root to open /dev/kvm, so give #{opts[:user]} passwordless sudo or use --user root"
+      end
+      raise Error, "probing #{opts[:ip]} failed (#{status.exitstatus}): #{err}; the host needs ruby (apt-get install ruby) and SSH from here"
+    end
 
     if opts[:json]
       @out.puts out
@@ -94,19 +106,50 @@ class ByohVirtCli
       return
     end
     @out.puts "host #{host.ubid}"
-    @out.puts ByohVirtLadder.verdict(host.virt_probe.to_h).text
+    if (error = host.virt_probe["error"])
+      @out.puts "the last probe failed: #{error}"
+      return NOT_L1
+    end
+    show_verdict(ByohVirtLadder.verdict(host.virt_probe.to_h))
   end
 
   def cmd_refresh(argv)
-    host = find_host(argv, "refresh --host UBID")
-    raise Error, "host #{host.ubid} has no rhizome yet; its prep probes it" if host.strand && ByohHostCli::PRE_PREP_LABELS.include?(host.strand.label)
+    key = nil
+    all = false
+    parse(argv, "refresh --host UBID | --all") do |o|
+      o.on("--host UBID", "VmHost ubid") { key = it }
+      o.on("--all", "Every generic (BYOH) host whose rhizome is installed") { all = true }
+    end
+    raise Error, "give either --host or --all" unless all ^ !key.nil?
 
+    unless all
+      host = lookup_host(key)
+      raise Error, "host #{host.ubid} has no rhizome yet; its prep probes it" unless rhizome_installed?(host)
+      return start_probe(host)
+    end
+
+    VmHost.where(id: HostProvider.where(provider_name: HostProvider::GENERIC_PROVIDER_NAME).select(:id)).order(:id).eager(:strand).all.each do |h|
+      if rhizome_installed?(h)
+        start_probe(h)
+      else
+        @out.puts "Skipped host #{h.ubid}: no rhizome yet; its prep probes it."
+      end
+    end
+    nil
+  end
+
+  def rhizome_installed?(host)
+    !(host.strand && ByohHostCli::PRE_PREP_LABELS.include?(host.strand.label))
+  end
+
+  def start_probe(host)
     strand = DB.transaction do
       st = Prog::LearnVirt.assemble(host.id)
       ByohOperatorLog.record(command: "virt-refresh", target_id: host.id, args: {}, result: "started #{st.ubid}")
       st
     end
     @out.puts "Started #{strand.ubid} to probe host #{host.ubid}; see the result with bin/byoh-virt show --host #{host.ubid}."
+    nil
   end
 
   def show_verdict(verdict)
@@ -128,6 +171,10 @@ class ByohVirtCli
     parse(argv, banner) { |o| o.on("--host UBID", "VmHost ubid") { key = it } }
     raise Error, "--host is required" unless key
 
+    lookup_host(key)
+  end
+
+  def lookup_host(key)
     host = (VmHost[key] if key.match?(/\Avh[0-9a-z]{24}\z/)) || raise(Error, "no host #{key}")
     raise Error, "host #{host.ubid} is not a generic (BYOH) host" unless host.provider_name == HostProvider::GENERIC_PROVIDER_NAME
     host

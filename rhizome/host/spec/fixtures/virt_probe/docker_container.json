@@ -1,0 +1,24 @@
+{
+  "files": {
+    ".virt-probe/uname": "x86_64 6.8.0-45-generic\n",
+    ".virt-probe/detect-virt-vm": "none\n",
+    ".virt-probe/detect-virt-container": "docker\n",
+    ".virt-probe/kernel-log": "",
+    "proc/cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) Platinum 8488C\nflags\t\t: fpu lm vmx pdpe1gb\n\n",
+    "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
+    "sys/class/dmi/id/sys_vendor": "Dell Inc.\n",
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+  },
+  "dirs": [],
+  "execs": [],
+  "expect": {
+    "tier": "container",
+    "cause": null,
+    "platform": null,
+    "standard": false,
+    "fix": "not in a container",
+    "nested": false,
+    "ready": [],
+    "recommended": null
+  }
+}

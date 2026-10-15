@@ -1,0 +1,24 @@
+{
+  "files": {
+    ".virt-probe/uname": "x86_64 6.8.0-45-generic\n",
+    ".virt-probe/detect-virt-vm": "none\n",
+    ".virt-probe/detect-virt-container": "none\n",
+    ".virt-probe/kernel-log": "kvm_amd: SVM disabled (by BIOS) in MSR_VM_CR on CPU 0\nkvm_amd: KVM is unsupported\n",
+    "proc/cpuinfo": "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7763 64-Core Processor\nflags\t\t: fpu lm svm pdpe1gb\n\n",
+    "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
+    "sys/class/dmi/id/sys_vendor": "ASUSTeK COMPUTER INC.\n",
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+  },
+  "dirs": [],
+  "execs": [],
+  "expect": {
+    "tier": "kvm_blocked",
+    "cause": "firmware",
+    "platform": null,
+    "standard": false,
+    "fix": "Enable Intel VT-x or AMD-V",
+    "nested": false,
+    "ready": [],
+    "recommended": null
+  }
+}

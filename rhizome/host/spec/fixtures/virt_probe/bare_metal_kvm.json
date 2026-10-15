@@ -1,0 +1,31 @@
+{
+  "files": {
+    ".virt-probe/uname": "x86_64 6.8.0-45-generic\n",
+    ".virt-probe/detect-virt-vm": "none\n",
+    ".virt-probe/detect-virt-container": "none\n",
+    ".virt-probe/kernel-log": "",
+    "proc/cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) Platinum 8488C\nflags\t\t: fpu lm vmx pdpe1gb\n\n",
+    "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
+    ".virt-probe/kvm.json": "{\"kvm_api\": 12, \"kvm_errno\": null, \"kvm_create_vm\": true, \"kvm_caps_missing\": [], \"dev_kvm\": true, \"kvm_dev_mode\": \"0660\", \"kvm_dev_group\": \"kvm\"}",
+    "sys/class/dmi/id/sys_vendor": "Dell Inc.\n",
+    "sys/class/dmi/id/product_name": "PowerEdge R650\n",
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "sys/module/kvm_intel/parameters/ept": "Y\n",
+    "sys/module/kvm_intel/parameters/nested": "Y\n"
+  },
+  "dirs": [
+    "sys/module/kvm",
+    "sys/module/kvm_intel"
+  ],
+  "execs": [],
+  "expect": {
+    "tier": "kvm",
+    "cause": null,
+    "platform": null,
+    "standard": true,
+    "fix": null,
+    "nested": false,
+    "ready": [],
+    "recommended": null
+  }
+}

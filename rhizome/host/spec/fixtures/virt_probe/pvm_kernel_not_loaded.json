@@ -1,0 +1,31 @@
+{
+  "files": {
+    ".virt-probe/uname": "x86_64 6.12.33-pvm\n",
+    ".virt-probe/detect-virt-vm": "kvm\n",
+    ".virt-probe/detect-virt-container": "none\n",
+    ".virt-probe/kernel-log": "",
+    "proc/cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) Platinum 8488C\nflags\t\t: fpu lm hypervisor pdpe1gb\n\n",
+    "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
+    "sys/class/dmi/id/sys_vendor": "Hetzner\n",
+    "sys/class/dmi/id/product_name": "vServer\n",
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "lib/modules/6.12.33-pvm/modules.dep": "kernel/arch/x86/kvm/kvm-pvm.ko: kernel/arch/x86/kvm/kvm.ko\n"
+  },
+  "dirs": [],
+  "execs": [
+    "usr/bin/lxc-start",
+    "usr/bin/lxcfs"
+  ],
+  "expect": {
+    "tier": "pvm_blocked",
+    "cause": "pvm_module",
+    "platform": "hetzner_cloud",
+    "standard": false,
+    "fix": "modprobe kvm_pvm",
+    "nested": false,
+    "ready": [
+      "container"
+    ],
+    "recommended": "container"
+  }
+}

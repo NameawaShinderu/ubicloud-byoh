@@ -52,8 +52,8 @@ RSpec.describe ByohVirtCli do
       expect(cli("probe")).to eq [1, "", "! --main-ip is required\n"]
     end
 
-    it "probes a host over ssh and explains it" do
-      expect(Open3).to receive(:capture3).with("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-i", "/k", "ubuntu@198.51.100.7", "ruby - --json", stdin_data: ByohVirtLadder.remote_script).and_return([report, "", ok_status])
+    it "probes a host over ssh as root under sudo -n and explains it" do
+      expect(Open3).to receive(:capture3).with("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-i", "/k", "ubuntu@198.51.100.7", "sudo -n ruby - --json", stdin_data: ByohVirtLadder.remote_script).and_return([report, "", ok_status])
       status, out, = cli("probe", "--main-ip", "198.51.100.7", "--ssh-key", "/k", "--user", "ubuntu")
       expect(status).to eq 0
       expect(out).to start_with "tier: kvm (L1)\n"
@@ -74,8 +74,16 @@ RSpec.describe ByohVirtCli do
     end
 
     it "reports an ssh failure" do
-      expect(Open3).to receive(:capture3).and_return(["", "bash: ruby: command not found\n", instance_double(Process::Status, success?: false, exitstatus: 127)])
-      expect(cli("probe", "--main-ip", "198.51.100.7")).to eq [1, "", "! probing 198.51.100.7 failed (127): bash: ruby: command not found; the host needs ruby (apt-get install ruby) and root SSH from here\n"]
+      expect(Open3).to receive(:capture3).and_return(["", "bash: ruby: command not found\e[0m\n", instance_double(Process::Status, success?: false, exitstatus: 127)])
+      expect(cli("probe", "--main-ip", "198.51.100.7")).to eq [1, "", "! probing 198.51.100.7 failed (127): bash: ruby: command not found[0m; the host needs ruby (apt-get install ruby) and SSH from here\n"]
+    end
+
+    it "says when sudo needs a password instead of misclassifying the host" do
+      failed = instance_double(Process::Status, success?: false, exitstatus: 1)
+      expect(Open3).to receive(:capture3).and_return(["", "sudo: a password is required\n", failed])
+      expect(cli("probe", "--main-ip", "198.51.100.7", "--user", "ubuntu")).to eq [1, "", "! sudo -n failed for ubuntu on 198.51.100.7: sudo: a password is required; the probe must run as root to open /dev/kvm, so give ubuntu passwordless sudo or use --user root\n"]
+      expect(Open3).to receive(:capture3).and_return(["", "sudo-ish: no\n", failed])
+      expect(cli("probe", "--main-ip", "198.51.100.7", "--user", "ubuntu")[2]).to start_with "! probing 198.51.100.7 failed (1): sudo-ish: no"
     end
   end
 
@@ -100,11 +108,18 @@ RSpec.describe ByohVirtCli do
       expect(cli("show", "--host", host.ubid)).to eq [0, "host #{host.ubid} was never probed; run bin/byoh-virt refresh --host #{host.ubid}\n", ""]
     end
 
-    it "shows the recorded verdict" do
+    it "shows the recorded verdict and exits by it" do
       host.update(virt_probe: Sequel.pg_jsonb(ByohVirtLadder.parse(no_virt).record))
       status, out, = cli("show", "--host", host.ubid)
-      expect(status).to eq 0
+      expect(status).to eq 3
       expect(out).to start_with "host #{host.ubid}\ntier: none (L3-L5)\nplatform: Vultr\n"
+      host.update(virt_probe: Sequel.pg_jsonb(ByohVirtLadder.parse(report).record))
+      expect(cli("show", "--host", host.ubid)[0]).to eq 0
+    end
+
+    it "shows a failed probe" do
+      host.update(virt_probe: Sequel.pg_jsonb({"error" => "RuntimeError: boom"}))
+      expect(cli("show", "--host", host.ubid)).to eq [3, "host #{host.ubid}\nthe last probe failed: RuntimeError: boom\n", ""]
     end
 
     it "refuses a missing, unknown or non-generic host" do
@@ -128,6 +143,22 @@ RSpec.describe ByohVirtCli do
 
     it "refuses a host before rhizome is installed" do
       expect(cli("refresh", "--host", host.ubid)).to eq [1, "", "! host #{host.ubid} has no rhizome yet; its prep probes it\n"]
+    end
+
+    it "needs exactly one of --host and --all" do
+      expect(cli("refresh")).to eq [1, "", "! give either --host or --all\n"]
+      expect(cli("refresh", "--all", "--host", host.ubid)).to eq [1, "", "! give either --host or --all\n"]
+    end
+
+    it "probes every generic host whose rhizome is installed with --all" do
+      host.strand.update(label: "wait")
+      fresh = Prog::Vm::HostNexus.assemble("203.0.113.43", location_id: location.id, provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+        provider_config: {"main_ip4" => "203.0.113.43", "location_label" => location.name, "routed_networks" => [{"cidr" => "fd00:feed:1::/64"}]}).subject
+      create_vm_host
+      status, out, = cli("refresh", "--all")
+      expect(status).to eq 0
+      expect(Strand.where(prog: "LearnVirt").all.map { it.stack.first["subject_id"] }).to eq [host.id]
+      expect(out).to include("Started ").and include("Skipped host #{fresh.ubid}: no rhizome yet")
     end
 
     it "starts a probe for a host without a strand" do
