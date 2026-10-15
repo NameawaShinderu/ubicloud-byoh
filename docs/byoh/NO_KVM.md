@@ -489,7 +489,8 @@ the design no longer depends on it (section 5.3, "User group").
   - `crypt-loop` (default): a sparse file → LUKS2 → ext4, mounted at the rootfs with an idmapped mount
     (kernel ≥ 5.12). The data key is unwrapped through the same key-encryption path ubiblk uses, and
     passed with `cryptsetup --key-file=-` (never in argv, the environment or a file), with
-    `--pbkdf pbkdf2` (or `luksFormat --volume-key-file -` from stdin). The mapping is closed at stop.
+    `--pbkdf pbkdf2` (or `luksFormat --volume-key-file -` from stdin). The mapping is closed at delete
+    (as shipped it stays open across a stop: section 5.5).
     Disclosure: keys live in the shared kernel. UNVERIFIED in the lab (loop and dm are host devices).
   - `dir`: a plain directory. It requires `prjquota` on the VM filesystem in **every** location, with a
     project quota per VM sized to its storage volume; prep refuses otherwise. There is no mode without a
@@ -556,7 +557,9 @@ SHIPPED, spec-gated (100% line and branch coverage for rhizome and the control p
 | Host prep `prep_host.rb <host> <env> container`: x86_64, cgroup v2, Linux ≥ 5.12, systemd ≥ 254, the packages, AppArmor with `lxc-container-default-cgns` loaded, the four kernel settings, no other subordinate id range over the slots; then root's `/etc/subuid` and `/etc/subgid` entry, `SUB_UID_COUNT`/`SUB_GID_COUNT` 0, `groupadd -f -r kvm`, `lxc-net` off | `rhizome/host/lib/host_tier.rb` |
 | Control plane: `container` in `ByohVirtTiers::SHIPPED` (and the bootstrap's `SHIPPED_TIERS`); prep.json `hypervisor: "lxc"` and `container: {nested_userns, guest_firewall}` for container hosts only (golden `spec/fixtures/golden/params_json_container.json`); the disk encrypted unless the location acknowledged `container:unencrypted-disk`; one disk per container VM; serial log from the console log; no hypervisor learned; `ubuntu-noble-container` 20260926 from cloud-images.ubuntu.com with its SHA256 (never from Ubicloud's blob storage, which has none) kept as `.tar.xz`; a container host downloads the tier's images unless registration names some of them, and refuses others; the API's VM create takes a `container-N` size with `boot_image` `ubuntu-noble-container`, or with none (the tier's first image), and refuses that image with any other size | `lib/byoh_virt_tiers.rb`, `helpers/vm.rb`, `lib/validation.rb`, `model/metal/vm.rb`, `prog/vm/nexus.rb`, `prog/learn_hypervisor.rb`, `prog/download_boot_image.rb`, `model/boot_image.rb`, `prog/vm/host_nexus.rb` |
 
-VERIFIED in the lab (`NOKVM_L3_UNCONFINED=1 scripts/byoh/test/nokvm/run.sh l3`, 72 checks, 2026-10-15):
+VERIFIED in the lab (`NOKVM_L3_UNCONFINED=1 scripts/byoh/test/nokvm/run.sh l3`, 72 checks, 2026-10-15;
+that run had AppArmor and seccomp unconfined on the shared lab machine, which section 15 forbids, and
+the harness now refuses it: see the lab artifacts below):
 two `container` VMs through the real `setup-vm prep`, the network hook, `stop-vm`, `vm-stats`,
 `recreate-unpersisted`, `restart` and `delete` (twice), on ubuntu:24.04 with LXC 5.0.3 and the
 `ubuntu-noble-container` 20260926 image, `dir` driver on tmpfs:
@@ -581,6 +584,21 @@ Differences from section 5.3:
   entry for root covering every slot (`root:1000000000:3276800000`) and refuses any other entry that
   overlaps (VERIFIED: without it the map is refused). `usermod --del-subuids` is not needed: with
   `SUB_UID_COUNT 0` new users get no range, and ranges below 600,100,000 cannot reach the slots.
+- **The LXC directory is 0711, not 0700** (`/var/lib/ubicloud/lxc` and `/var/lib/ubicloud/lxc/<vm>`):
+  LXC's child already runs as the container's root when it bind-mounts the seed, so it must traverse
+  the directory. Others may traverse but not list it; the config, seccomp policy (0600) and network hook
+  (0700) stay root-only. The seed directory (0755) and its files (0644) are readable by every host user
+  who knows the VM's name, user-data included: on a container host only rhizome and the VMs' dnsmasq
+  users exist. Tightening that (a seed owned by the slot's root) is open and UNVERIFIED.
+- **The `crypt-loop` mapping stays open across a stop.** A stopped container is started again by
+  `systemctl start` alone (the control plane's start and `setup-vm restart`), without the key
+  encryption key, so the mapping and the ext4 mount stay until `setup-vm delete` or a host reboot,
+  after which `recreate-unpersisted` opens them again. The key is therefore in the host kernel from prep
+  to delete, not only while the container runs.
+- **Unencrypted (`dir`) disks** also get an inode limit, 65,536 per GiB, so empty files cannot exhaust
+  the shared file system's inode table. **The console log** rotates at 4 MB with one old copy
+  (`lxc.console.size`, `lxc.console.rotate`), since it lives on the host's root file system outside the
+  disk's quota. Both UNVERIFIED in the lab. `lxc.log` (`-l WARN`) has no bound; only LXC writes to it.
 - **The slot** is recorded only on the host (`/var/lib/ubicloud/idmap/<vm>`), not in `prep.json` or the
   control plane.
 - **`/vm/<vm>`** stays owned by the VM's user, as for cloud-hypervisor: on a container host nothing runs
@@ -613,8 +631,14 @@ Lab artifacts, each said in the lab's output (`scripts/byoh/test/nokvm/l3.sh`, `
 `NetworkNamespacePath=`, because docker masks parts of `/sys` and LXC's sysfs mount needs a fully
 visible one); no project quota (tmpfs) and no AppArmor (a container cannot load profiles); no lxcfs
 (`/dev/fuse` is a host device); no `crypt-loop` (loop and device-mapper devices); the lab container runs
-with AppArmor and seccomp unconfined (`NOKVM_L3_UNCONFINED=1`) because LXC mounts proc, sysfs and
-cgroup2, and without docker's `no-new-privileges`, which would pass to every guest and break `sudo`.
+without docker's `no-new-privileges`, which would pass to every guest and break `sudo`, and needs
+`mount` because LXC mounts proc, sysfs and cgroup2. The 2026-10-15 run used `NOKVM_L3_UNCONFINED=1`
+(AppArmor and seccomp unconfined) on the shared machine. Since then `run.sh l3` runs only on a throwaway
+VM (`BYOH_NOKVM_THROWAWAY_VM=1`, unconfined) or under an admin-loaded `ubi-q-nokvm` profile
+(`NOKVM_L3_PROFILE=1`), keeps `/proc/sys` read-only but for `/proc/sys/net` in l3's mount namespace,
+drops guest traffic to the gateway and every private address, and also asserts vm B's isolation and
+under 1 GiB of scratch after the deletes. None of that has run yet (UNVERIFIED): no throwaway VM or
+profile is available here.
 
 UNVERIFIED until L3-T1 (section 14) runs on a real Ubuntu 24.04 host: the unit under systemd
 (`DelegateSubgroup=`, `NetworkNamespacePath=`, `ExecStop`), AppArmor `lxc-container-default-cgns`,
@@ -1389,20 +1413,27 @@ for every container it creates:
   only observe; they enforce nothing.
 - Modes that run LXC inside the container (`run.sh l3`) need `mount`, which `docker-default` denies. They
   refuse to start unless one of these holds:
-  - A machine administrator has loaded the AppArmor profile `ubi-q-nokvm`, shipped in
-    `scripts/byoh/test/nokvm/apparmor/`: `docker-default` plus the mounts LXC needs, with `remount` of
-    `/sys` and `/proc/sys` denied, and `sysfs` and `proc` mounts allowed only under the container rootfs.
-    Loading a profile is host kernel policy, so the harness never loads it. UNVERIFIED: that LXC runs
-    under this profile.
-  - `BYOH_NOKVM_THROWAWAY_VM=1` declares the machine a throwaway VM, where `apparmor=unconfined` is accepted.
+  - A machine administrator has loaded the AppArmor profile `ubi-q-nokvm` (`NOKVM_L3_PROFILE=1`):
+    `docker-default` plus the mounts LXC needs, with `remount` of `/sys` and `/proc/sys` denied, and
+    `sysfs` and `proc` mounts allowed only under the container rootfs. No such profile is shipped yet,
+    and loading one is host kernel policy, so the harness never loads it. UNVERIFIED: that LXC runs
+    under such a profile.
+  - `BYOH_NOKVM_THROWAWAY_VM=1` declares the machine a throwaway VM, where `apparmor=unconfined` and
+    `seccomp=unconfined` are accepted for `ubi-q-nokvm-l3`.
 
   Without either, `l3` does not run on the shared lab machine. The 2026-10-15 spike (section 5.1) ran
   with AppArmor and seccomp unconfined on the shared machine; its safety rested on reading every script
   before running it, not on enforcement.
 - Inside, **at start and again at teardown**: `/sys` and `/proc/sys` are mounted read-only (from
   `/proc/self/mountinfo`), and no other sysfs or proc mount exists; CapEff lacks `SYS_MODULE` and `SYS_RAWIO`.
-- An nft drop toward the `ubi-test-net` subnet (except the gateway's egress) is installed **before** any
-  guest starts; the run aborts if it is missing.
+- In l3's mount namespace (a fresh proc), `/proc/sys` is bind-mounted read-only again with only
+  `/proc/sys/net` writable; `l3.sh` checks at start and end that `kernel.*`, `vm.*`, `fs.*` and the
+  hugepage and THP files are not writable. `ip netns exec` still mounts a fresh sysfs in its own mount
+  namespace, which only AppArmor or a throwaway VM contains.
+- An nft drop toward the `ubi-test-net` subnet, the gateway (the docker host, with every port other
+  projects publish) and every private or link-local address out of `eth0` is installed **before** any
+  guest starts; the run aborts if it is missing, and each guest checks it cannot reach the gateway's
+  ports 5432 and 22.
 - `/proc/modules`, `vm.nr_hugepages` and selected `kernel.*` values (read through `/proc`) are
   snapshotted before and after; any change fails the run.
 - A lint rejects `modprobe`, `insmod` and `sysctl -w` outside the TCG guest's initramfs.

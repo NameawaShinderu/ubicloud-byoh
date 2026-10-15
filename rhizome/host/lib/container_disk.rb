@@ -17,10 +17,13 @@ require_relative "storage_path"
 # - crypt-loop (encrypted): a sparse file of the volume's size, LUKS2,
 #   ext4. The key is random, kept wrapped by the volume's key encryption
 #   key exactly as ubiblk keeps its keys (StorageKeyEncryption), and given
-#   to cryptsetup on stdin only. The mapping is opened and mounted at
-#   start and closed at stop. The key is in the host kernel while the
-#   container runs, as for every encrypted disk. UNVERIFIED: no lab here
-#   may use loop or device-mapper devices.
+#   to cryptsetup on stdin only. The mapping is opened and mounted by
+#   prep and by recreate-unpersisted (after a host reboot), the only
+#   commands that get the key encryption key, and stays open until the
+#   disk is deleted or the host reboots: a stopped container is started
+#   again by its unit alone, without the key. So the key is in the host
+#   kernel from prep to delete, not only while the container runs.
+#   UNVERIFIED: no lab here may use loop or device-mapper devices.
 # - dir (not encrypted, only where the location acknowledged
 #   "container:unencrypted-disk"): a directory limited to the volume's
 #   size and to INODES_PER_GIB inodes per GiB by a project quota, so the
