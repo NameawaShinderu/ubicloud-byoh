@@ -44,6 +44,8 @@ Rules of thumb:
 
 Each guide follows these six steps and links the [SETUP.md](../SETUP.md) section for the details. Only steps 1 and 5 really differ by platform.
 
+**Since M4** steps 3-5 are two commands on the control plane: `ubicloud-admin site add` (step 4) and `ubicloud-admin host add --ssh <user>@<host> --ssh-key <key> --pool-file pools.yaml` (steps 3 and 5: preflight, root key, registration, bring-up, `pool verify`). With `install.sh` (step 2) these are the same three commands on every platform; [recipes/README.md](../recipes/README.md) has them and short recipes for AWS, Proxmox, bare metal and homelabs. The table below is the low-level path, which still works.
+
 | # | Step | What you do | Details |
 |---|---|---|---|
 | 1 | Provision | Create the data-plane machine: Ubuntu 24.04, KVM, `pdpe1gb`, a dedicated machine, only its main IP on the NIC. Create a control-plane machine (no KVM needed). Run the read-only host checks. | Platform guide §3.1; [PLATFORMS.md](../PLATFORMS.md) §1, §6.3 |
@@ -83,3 +85,5 @@ The commits after 29fe8c799 (the first five rows) are covered by unit specs only
 - [other-clouds-vps.md](other-clouds-vps.md): OCI, Scaleway, Vultr, OVHcloud Public Cloud, DigitalOcean, Linode, Hetzner Cloud, and VPS plans without KVM.
 
 Each guide has the same sections: Fit, Requirements, Step by step, Problems and solutions, Status.
+
+Short recipes that end in the three M4 commands: [recipes/](../recipes/README.md) (`aws`, `proxmox`, `bare-metal`, `homelab`).

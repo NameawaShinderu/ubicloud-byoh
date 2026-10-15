@@ -1,6 +1,6 @@
 # BYOH on Proxmox VE (and other hypervisors)
 
-This page is a short guide. The full runbook is [SETUP_PROXMOX.md](../SETUP_PROXMOX.md); each step below links to its section there and does not repeat it. Other hypervisors (VMware ESXi, Hyper-V, XCP-ng, plain libvirt/KVM) are covered at the end, under "Other hypervisors".
+This page is a short guide. The shortest path, with the M4 commands, is [recipes/proxmox.md](../recipes/proxmox.md). The full runbook is [SETUP_PROXMOX.md](../SETUP_PROXMOX.md); each step below links to its section there and does not repeat it. Other hypervisors (VMware ESXi, Hyper-V, XCP-ng, plain libvirt/KVM) are covered at the end, under "Other hypervisors".
 
 > **Status: UNVERIFIED on Proxmox and on every hypervisor on this page.** The flow was run end to end only on AWS (m8i nested virtualization, ap-south-1; [VERIFY.md](../VERIFY.md) §5). Settings here come from the code, [NETWORKING.md](../NETWORKING.md) §9.2 and [PLATFORMS.md](../PLATFORMS.md). Statements about third-party hypervisors are marked "vendor docs, UNVERIFIED here".
 
@@ -38,6 +38,8 @@ Nested virtualization costs performance. A Proxmox guest suits an internal cloud
 ## 3. Step by step
 
 Every command below exists on `m2-network` and on the published `byoh-driver` (17d383a9c): `bin/byoh-location`, `bin/register-byoh-host`, `bin/byoh-pool`, `bin/byoh-host`, `scripts/byoh/*`. Three fixes this page relies on are only on `m2-network`, which is not pushed yet: a0259a997 (LearnMemory units), a092f1b8b ("is a local address of this host") and c73f96ddc (uplink MAC pin skip). [README.md](README.md) "Which branch" lists the workaround for each. The example values are those of SETUP_PROXMOX: bridge `vmbr1`, LAN `10.80.0.0/24`, router `10.80.0.1`, data plane `10.80.0.20`.
+
+**Since M4, steps 2, 3's key install, 6 and 7 are one command**, `ubicloud-admin host add --site <site> --ssh ubuntu@<guest> --ssh-key <key> --pool-file pools.yaml`, which runs host preflight (it refuses a Proxmox node, PF16-pve), installs its own root key, registers the guest and waits until it accepts VMs ([recipes/proxmox.md](../recipes/proxmox.md) §4, SETUP_PROXMOX §7.2). Step 4 is `ubicloud-admin site add`. The steps below are the low-level path.
 
 1. **Provision the guest.** Run the read-only node checks in SETUP_PROXMOX §2. Create the VM with `qm create ... --cpu host --balloon 0 --net0 virtio,bridge=vmbr1,firewall=0` as in §3.2, then run the in-guest checks in §3.3.
 2. **Data-plane bootstrap.** In the guest (SETUP_PROXMOX §5):
@@ -118,8 +120,8 @@ Every command below exists on `m2-network` and on the published `byoh-driver` (1
 | PrepHost fails | No outbound HTTP/HTTPS from the guest | Allow the Ubuntu apt mirrors (`archive.ubuntu.com`, `security.ubuntu.com`; ports 80 and 443), github.com and its release-asset host (`*.githubusercontent.com`) through the router (exact allowlist hostnames UNVERIFIED) |
 | Boot image download never finishes (`download_boot_images`, 4 h deadline) | cloud-images.ubuntu.com or cloud-images-archive.ubuntu.com blocked (the pinned releases redirect to the archive over plain HTTP) | Allow HTTPS to cloud-images.ubuntu.com and HTTP (80) to cloud-images-archive.ubuntu.com |
 | VM stuck at `wait_sshable` | `--cp-reach onhost`, but the control plane cannot reach the pool address | Put the control plane on the LAN, or `bin/byoh-location set --location <name> --cp-reach public` |
-| Host flaps to `unavailable` | `bin/monitor` was started; its disk and SMART checks do not fit virtio disks | Stop `bin/monitor` until PLATFORMS F5 lands |
-| VMs lose their disks or capacity looks wrong after adding a disk | A new disk was mounted over `/var/storage` after registration (OPS-9) | Never do that. Extra disks go at `/var/storage/devices/<n>` **before** registration |
+| Host flaps to `unavailable` | `bin/monitor` was started on a host registered before M4 (stale disk ids), or on a generic host still in hetzner-fsn1 (upstream checks, which do not fit virtio disks) | `bin/byoh-host relearn-device-ids --host vh... --yes`, or `bin/byoh-host move-location`; meanwhile stop `bin/monitor` ([TROUBLESHOOTING.md](../TROUBLESHOOTING.md) §8) |
+| VMs lose their disks or capacity looks wrong after adding a disk | A new disk was mounted over `/var/storage` after registration (OPS-9) | Never do that. Extra disks are dedicated virtual disks given to `host add --storage-disk` **before** the host is added ([SETUP_PROXMOX.md](../SETUP_PROXMOX.md) §3.4) |
 | Other guests on the node lose network, or the Proxmox firewall rules vanish | Ubicloud scripts ran on the node itself, and rhizome flushed its nftables ruleset (NH-6) | Never run Ubicloud scripts on, or register, the node (SETUP_PROXMOX §0); run `pve-firewall restart` on the node to reload its rules (UNVERIFIED) |
 | A guest-side VLAN or bond on the uplink broke `netplan generate` in PrepHost | The uplink MAC pin renamed an interface that a VLAN `link:` or bond `interfaces:` names (builds without c73f96ddc, including the published `byoh-driver`) | Tag the VLAN on the Proxmox NIC (`--net0 ...,tag=<id>`), not in the guest. `m2-network` skips the pin in that case once it is published |
 
@@ -130,8 +132,8 @@ Common problems (root SSH, boot images, capacity, DNS, the egress deny list) are
 ## 5. Status
 
 - **Proxmox:** UNVERIFIED. No run is recorded in this project (VERIFY.md §5). The `onlink` data path has not run on any platform yet.
-- **Known gaps:** health checks on virtio disks (F5, do not start `bin/monitor`); SMT off and hybrid CPUs are unsupported; Docker, ufw, Tailscale or libvirt on the data-plane guest get their nftables rules flushed (NH-6); the pools file `uplink` key and the profile `guest_mtu` are stored but not applied (guests always get MTU 1400 by DHCP); a same-site hairpin for `nat` VMs is PLANNED (NETWORKING §4.6).
-- **Superseded:** `SETUP_PROXMOX_LOWTIER.md` and `docs/byoh/deploy-scripts/` predate M2. Do not use them.
+- **Known gaps:** the monitor's health checks fit virtio disks since M4 (F5), but the 24-hour soak (VERIFY.md G-M4-4) has not run, so leave `bin/monitor` off; SMT off and hybrid CPUs are unsupported; Docker, ufw, Tailscale or libvirt on the data-plane guest get their nftables rules flushed (NH-6); the pools file `uplink` key and the profile `guest_mtu` are stored but not applied (guests always get MTU 1400 by DHCP); a same-site hairpin for `nat` VMs is PLANNED (NETWORKING §4.6).
+- **Deleted in M4:** `SETUP_PROXMOX_LOWTIER.md` and `docs/byoh/deploy-scripts/`, replaced by [recipes/proxmox.md](../recipes/proxmox.md).
 
 ---
 
@@ -142,7 +144,7 @@ The data plane is a guest VM on these hypervisors too. Everything in sections 2-
 - **Expose hardware virtualization and 1G pages to the guest.** `bootstrap-data-plane.sh` checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` and refuses the guest if any is missing. That is the quickest test on a new hypervisor.
 - **Turn off dynamic memory and ballooning.** Most guest memory becomes 1G hugepages.
 - **One NIC, static management IP, no pool addresses on it.** VMs are routed behind the guest's own MAC: the guest answers ARP for `onlink` pool addresses with proxy_arp, and every VM packet leaves with the guest's MAC. So MAC spoofing or promiscuous mode should not be needed (inferred from `rhizome/host/lib/vm_setup.rb`, UNVERIFIED). What can break the path is an **IP** filter on the virtual switch that drops packets whose source is not the guest's own address.
-- **Do not start `bin/monitor`.** Virtual disks have no `wwn-`/`nvme-eui` links or SMART (F5).
+- **Leave `bin/monitor` off for now.** Virtual disks have no `wwn-`/`nvme-eui` links or SMART; since M4 the checks of a BYOH host allow for that (F5), but no soak has run on any hypervisor (UNVERIFIED).
 
 | Hypervisor | Enable nested virtualization (vendor docs, UNVERIFIED here) | Things to check | Status |
 |---|---|---|---|
