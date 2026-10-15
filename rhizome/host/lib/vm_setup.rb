@@ -1100,11 +1100,28 @@ DNSMASQ_SERVICE
   end
 
   def start_systemd_unit
+    check_emulated_unit if emulated?
     r "systemctl", "start", @vm_name
   end
 
   def restart_systemd_unit
+    check_emulated_unit if emulated?
     r "systemctl", "restart", @vm_name
+  end
+
+  # An emulated VM starts only under its confinement: QEMU's TCG is no
+  # security boundary (docs/byoh/EMULATED_HOSTS.md section 4.2), so a unit
+  # that lost a hardening line (edited by hand, written by an older
+  # rhizome, overridden by a drop-in) is refused rather than started, as
+  # is a home the VM user could write. systemctl cat shows the unit with
+  # every drop-in systemd applies to it, so an override anywhere is seen.
+  def check_emulated_unit
+    check_emulated_home
+    stat = lstat_or_nil(vp.systemd_service)
+    unless stat&.file? && stat.uid == 0 && stat.mode & 0o022 == 0
+      fail "#{vp.systemd_service} must be a regular file only root can write; refusing to start #{@vm_name}"
+    end
+    QemuTcg.check_unit!(r("systemctl", "cat", "--", "#{@vm_name}.service"), @vm_name)
   end
 
   def build_ch_service(header:, footer:, slice_name:, mem_gib:, max_vcpus:, cpu_topology:, storage_volumes:, storage_params:, nics:, pci_devices:, boot_image:)

@@ -244,4 +244,82 @@ RSpec.describe VmSetup do
       }.not_to raise_error
     end
   end
+
+  describe "the hardening pinned before every start" do
+    let(:golden) { File.read(File.join(__dir__, "fixtures", "qemu_tcg", "tcg_unit.service")) }
+
+    it "accepts each golden unit, whose hardening includes ProtectSystem=strict" do
+      %w[tcg_unit.service tcg_unit_hugepages.service tcg_unit_4vcpu.service].each do |name|
+        expect(QemuTcg.check_unit!(File.read(File.join(__dir__, "fixtures", "qemu_tcg", name)), "vmtcg001")).to be_nil
+      end
+      expect(QemuTcg.required_settings("vmtcg001")).to include("ProtectSystem=strict", "ReadWritePaths=/vm/vmtcg001", "User=vmtcg001", "CapabilityBoundingSet=")
+      expect(QemuTcg.required_settings("vmtcg001") - golden.lines.map(&:strip)).to eq []
+    end
+
+    it "refuses a unit that lacks any required setting" do
+      QemuTcg.required_settings("vmtcg001").each do |line|
+        unit = golden.lines.reject { |l| l.strip == line }.join
+        expect { QemuTcg.check_unit!(unit, "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks #{line}; refusing to start it")
+      end
+    end
+
+    it "refuses a later line or drop-in that overrides a required setting" do
+      unit = golden + "# /etc/systemd/system/vmtcg001.service.d/override.conf\n[Service]\nProtectSystem=false\nUser=root\n"
+      expect { QemuTcg.check_unit!(unit, "vmtcg001") }.to raise_error("emulated unit of vmtcg001 overrides ProtectSystem=false, User=root; refusing to start it")
+      unit = golden + "[Service]\nCapabilityBoundingSet=CAP_SYS_ADMIN\nNoNewPrivileges=yes\n"
+      expect { QemuTcg.check_unit!(unit, "vmtcg001") }.to raise_error("emulated unit of vmtcg001 overrides CapabilityBoundingSet=CAP_SYS_ADMIN; refusing to start it")
+    end
+
+    it "refuses a unit without MemoryMax, tcg or the QEMU sandbox" do
+      expect { QemuTcg.check_unit!(golden.sub(/^MemoryMax=.*\n/, ""), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 sets no MemoryMax; refusing to start it")
+      expect { QemuTcg.check_unit!(golden.sub("-accel tcg,", "-accel kvm,"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks -accel tcg,thread=multi,tb-size=256; refusing to start it")
+      expect { QemuTcg.check_unit!(golden.sub(/^-sandbox .*\n/, ""), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks -sandbox #{QemuTcg::SANDBOX}; refusing to start it")
+      expect { QemuTcg.check_unit!(golden.sub("ExecStart=qemu-system-x86_64", "ExecStart=/tmp/qemu"), "vmtcg001") }.to raise_error("emulated unit of vmtcg001 lacks ExecStart=qemu-system-x86_64; refusing to start it")
+    end
+
+    describe "#start_systemd_unit and #restart_systemd_unit" do
+      let(:vm_setup) { new_setup }
+
+      def unit_stat(file: true, uid: 0, mode: 0o100644)
+        instance_double(File::Stat, file?: file, uid: uid, mode: mode)
+      end
+
+      it "start or restart the unit as systemd shows it, drop-ins included, once it passes" do
+        %w[start restart].each do |action|
+          expect(vm_setup).to receive(:check_emulated_home).ordered
+          expect(File).to receive(:lstat).with(service).and_return(unit_stat).ordered
+          expect(vm_setup).to receive(:_run_command).with("systemctl", "cat", "--", "vmtcg001.service").and_return(golden).ordered
+          expect(vm_setup).to receive(:_run_command).with("systemctl", action, "vmtcg001").ordered
+          vm_setup.public_send(:"#{action}_systemd_unit")
+        end
+      end
+
+      it "refuses a unit file that is missing, a symlink, or writable by others than root" do
+        [Errno::ENOENT, unit_stat(file: false), unit_stat(uid: 1001), unit_stat(mode: 0o100664)].each do |stat|
+          expect(vm_setup).to receive(:check_emulated_home)
+          if stat.is_a?(Class)
+            expect(File).to receive(:lstat).with(service).and_raise(stat)
+          else
+            expect(File).to receive(:lstat).with(service).and_return(stat)
+          end
+          expect(vm_setup).not_to receive(:_run_command)
+          expect { vm_setup.start_systemd_unit }.to raise_error("#{service} must be a regular file only root can write; refusing to start vmtcg001")
+        end
+      end
+
+      it "never starts a unit that lost its hardening" do
+        expect(vm_setup).to receive(:check_emulated_home)
+        expect(File).to receive(:lstat).with(service).and_return(unit_stat)
+        expect(vm_setup).to receive(:_run_command).with("systemctl", "cat", "--", "vmtcg001.service").and_return(golden.sub("ProtectSystem=strict\n", ""))
+        expect(vm_setup).not_to receive(:_run_command).with("systemctl", "restart", "vmtcg001")
+        expect { vm_setup.restart_systemd_unit }.to raise_error("emulated unit of vmtcg001 lacks ProtectSystem=strict; refusing to start it")
+      end
+
+      it "refuses a home the VM user could write before reading the unit" do
+        expect(File).to receive(:lstat).with("/vm/vmtcg001").and_return(instance_double(File::Stat, directory?: true, uid: 1001, mode: 0o40755))
+        expect(vm_setup).not_to receive(:_run_command)
+        expect { vm_setup.start_systemd_unit }.to raise_error("emulated VMs need /vm/vmtcg001 to be a root-owned directory the VM user cannot write")
+      end
+    end
+  end
 end

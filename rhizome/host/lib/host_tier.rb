@@ -28,7 +28,7 @@ require "etc"
 #   respirate strand, which the dispatcher kills after about 90 seconds,
 #   so prep_host.rb must not depend on how long apt takes to fetch QEMU.
 #   The operator installs them beforehand with
-#   scripts/byoh/bootstrap-data-plane.sh --emulated.
+#   scripts/byoh/bootstrap-data-plane.sh --tier emulated.
 module HostTier
   class Unsupported < RuntimeError
   end

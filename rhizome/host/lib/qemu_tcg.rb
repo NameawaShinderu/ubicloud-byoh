@@ -76,4 +76,37 @@ module QemuTcg
       TasksMax=4096
     HARDENING
   end
+
+  # The [Service] settings an emulated VM's unit must carry before it may
+  # start (check_unit!): every hardening line, the VM user, the QEMU
+  # sandbox and the software accelerator. MemoryMax= varies with the VM's
+  # memory, so only its presence is required.
+  def self.required_settings(vm_name)
+    hardening(vm_name, 0).lines.map(&:chomp).reject { |line| line.start_with?("MemoryMax=") } +
+      ["User=#{vm_name}", "Group=#{vm_name}"]
+  end
+
+  # Raises unless the unit text keeps the confinement QEMU's TCG needs,
+  # because TCG is no security boundary (docs/byoh/EMULATED_HOSTS.md
+  # section 4.2): each required setting is present, no other line sets
+  # one of its keys to something else (systemd takes the last value of
+  # most keys, and adds up others), and the command line runs QEMU under
+  # tcg with its sandbox. The caller passes the unit together with its
+  # drop-ins (VmSetup#check_emulated_unit), which could override any of it.
+  def self.check_unit!(unit, vm_name)
+    lines = unit.lines.map(&:strip)
+    required = required_settings(vm_name)
+    missing = required - lines
+    fail "emulated unit of #{vm_name} lacks #{missing.join(", ")}; refusing to start it" unless missing.empty?
+
+    keys = required.map { |line| line.split("=", 2).first }.uniq
+    conflicting = lines.select { |line| keys.include?(line.split("=", 2).first) && !required.include?(line) }
+    fail "emulated unit of #{vm_name} overrides #{conflicting.join(", ")}; refusing to start it" unless conflicting.empty?
+    fail "emulated unit of #{vm_name} sets no MemoryMax; refusing to start it" unless lines.any? { |line| line.match?(/\AMemoryMax=\d+M\z/) }
+
+    ["ExecStart=qemu-system-x86_64 \\", "-accel tcg,thread=multi,tb-size=#{TB_SIZE_MIB} \\", "-sandbox #{SANDBOX}"].each do |arg|
+      fail "emulated unit of #{vm_name} lacks #{arg.delete_suffix(" \\")}; refusing to start it" unless lines.include?(arg)
+    end
+    nil
+  end
 end
