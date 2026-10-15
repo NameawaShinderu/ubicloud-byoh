@@ -91,6 +91,8 @@ EOS
 
       expect(vmh.reload.available_storage_gib).to eq(3)
       expect(vmh.reload.total_storage_gib).to eq(13)
+      # Only BYOH hosts take relearned ids; upstream keeps the stored ones.
+      expect(StorageDevice.first(vm_host_id: vmh.id, name: "stor1").unix_device_list.to_a).to eq(["nvme0n1"])
     end
 
     it "formats the storage disks before reading them when format_storage is set" do
