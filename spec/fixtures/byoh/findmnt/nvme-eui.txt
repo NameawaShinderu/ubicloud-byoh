@@ -1,0 +1,2 @@
+# fixture: captured on a Samsung NVMe bare-metal host with util-linux 2.39.3
+SOURCE="/dev/nvme0n1p3" MAJ:MIN="259:4" FSTYPE="ext4"

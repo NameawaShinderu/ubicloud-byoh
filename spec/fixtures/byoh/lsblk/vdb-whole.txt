@@ -1,0 +1,2 @@
+# fixture: whole virtio disk without partitions; synthesised in the format util-linux 2.39.3 prints for lsblk -nP -s -o NAME,TYPE (UNVERIFIED)
+NAME="vdb" TYPE="disk"

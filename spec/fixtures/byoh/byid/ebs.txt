@@ -1,0 +1,8 @@
+# fixture: EBS volume on Nitro; synthesised in the format of find /dev/disk/by-id -printf '%f %l\n' under systemd 255 udev rules (UNVERIFIED on EC2)
+nvme-Amazon_Elastic_Block_Store_vol0a1b2c3d4e5f60718 ../../nvme0n1
+nvme-Amazon_Elastic_Block_Store_vol0a1b2c3d4e5f60718-part1 ../../nvme0n1p1
+nvme-Amazon_Elastic_Block_Store_vol0a1b2c3d4e5f60718-part15 ../../nvme0n1p15
+nvme-Amazon_Elastic_Block_Store_vol0a1b2c3d4e5f60718_1 ../../nvme0n1
+nvme-Amazon_Elastic_Block_Store_vol0a1b2c3d4e5f60718_1-part1 ../../nvme0n1p1
+nvme-nvme.1d0f-766f6c3061316232633364346535663630373138-416d617a6f6e20456c617374696320426c6f636b2053746f7265-00000001 ../../nvme0n1
+nvme-nvme.1d0f-766f6c3061316232633364346535663630373138-416d617a6f6e20456c617374696320426c6f636b2053746f7265-00000001-part1 ../../nvme0n1p1

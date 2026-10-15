@@ -1,0 +1,5 @@
+# fixture: two NVMe disks in md RAID1; synthesised in the format of find /dev/disk/by-id -printf '%f %l\n' under systemd 255 udev rules (UNVERIFIED)
+nvme-eui.0025388b91000001 ../../nvme0n1
+nvme-eui.0025388b91000002 ../../nvme1n1
+nvme-SAMSUNG_MZVL2512HCJQ-00B00_S675NX0000001 ../../nvme0n1
+nvme-SAMSUNG_MZVL2512HCJQ-00B00_S675NX0000002 ../../nvme1n1

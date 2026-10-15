@@ -1,0 +1,2 @@
+# fixture: EBS root on nvme0n1p1 (AWS Nitro); synthesised in the format util-linux 2.39.3 prints for findmnt -nP -o SOURCE,MAJ:MIN,FSTYPE --target (UNVERIFIED on EC2)
+SOURCE="/dev/nvme0n1p1" MAJ:MIN="259:1" FSTYPE="ext4"

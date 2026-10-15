@@ -28,10 +28,26 @@ class Prog::LearnStorage < Prog::Base
       )
     end
 
+    learn_byoh_device_ids(sds) if byoh?
     sds
   end
 
+  def byoh?
+    return @byoh if defined?(@byoh)
+
+    @byoh = vm_host.byoh?
+  end
+
+  # BYOH hosts name their disks with ByohDeviceIdentity, which resolves
+  # the mount point rather than the df source; see that module for why.
+  def learn_byoh_device_ids(sds)
+    ids = ByohDeviceIdentity.device_ids(sshable, sds.map { it.path.chomp("/") })
+    sds.each { it.unix_device_list = ids.fetch(it.path.chomp("/")) }
+  end
+
   def find_underlying_unix_device_ids(unix_device)
+    return [] if byoh?
+
     device_names = find_underlying_unix_device_names(unix_device)
     device_names.map { |device_name| StorageDevice.convert_device_name_to_device_id(sshable, device_name) }
   end
@@ -52,13 +68,16 @@ class Prog::LearnStorage < Prog::Base
 
     sshable.cmd("sudo host/bin/format-storage-disks") if format_storage
 
+    update = {
+      total_storage_gib: Sequel[:excluded][:total_storage_gib],
+      available_storage_gib: Sequel[:excluded][:available_storage_gib],
+    }
+    # A BYOH host relearned before it has volumes also takes the new disk
+    # ids, which replace ids learned by an earlier, wrong resolution.
+    update[:unix_device_list] = Sequel[:excluded][:unix_device_list] if byoh?
     make_model_instances.each do |sd|
       sd.skip_auto_validations(:unique) do
-        sd.insert_conflict(target: [:vm_host_id, :name],
-          update: {
-            total_storage_gib: Sequel[:excluded][:total_storage_gib],
-            available_storage_gib: Sequel[:excluded][:available_storage_gib],
-          }).save_changes
+        sd.insert_conflict(target: [:vm_host_id, :name], update:).save_changes
       end
     end
 

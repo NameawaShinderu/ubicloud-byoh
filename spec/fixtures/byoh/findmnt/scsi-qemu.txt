@@ -1,0 +1,2 @@
+# fixture: QEMU SCSI disk without wwn (Proxmox virtio-scsi); synthesised in the format util-linux 2.39.3 prints (UNVERIFIED)
+SOURCE="/dev/sda1" MAJ:MIN="8:1" FSTYPE="ext4"

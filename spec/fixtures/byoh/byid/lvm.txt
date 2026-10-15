@@ -1,0 +1,10 @@
+# fixture: SATA disks under LVM, sda with a wwn, sdb without; synthesised in the format of find /dev/disk/by-id -printf '%f %l\n' under systemd 255 udev rules (UNVERIFIED)
+ata-Samsung_SSD_860_EVO_1TB_S3Z9NB0K000001X ../../sda
+ata-Samsung_SSD_860_EVO_1TB_S3Z9NB0K000001X-part3 ../../sda3
+wwn-0x5002538e40000001 ../../sda
+wwn-0x5002538e40000001-part3 ../../sda3
+ata-CT1000MX500SSD1_2001E0000002 ../../sdb
+ata-CT1000MX500SSD1_2001E0000002-part1 ../../sdb1
+dm-name-ubuntu--vg-ubuntu--lv ../../dm-0
+dm-uuid-LVM-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIjKlMnOpQrStUvWxYz01 ../../dm-0
+lvm-pv-uuid-AbCdEf-0000-1111-2222-3333-4444-555555 ../../sda3

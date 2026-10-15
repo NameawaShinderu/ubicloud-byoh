@@ -1,0 +1,2 @@
+# fixture: whole virtio disk mounted at /var/storage/devices/<name>; synthesised in the format util-linux 2.39.3 prints (UNVERIFIED)
+SOURCE="/dev/vdb" MAJ:MIN="253:16" FSTYPE="ext4"

@@ -1,0 +1,3 @@
+# fixture: virtio disk with serial ubi-root-0001; synthesised in the format of find /dev/disk/by-id -printf '%f %l\n' under systemd 255 udev rules (UNVERIFIED)
+virtio-ubi-root-0001 ../../vda
+virtio-ubi-root-0001-part1 ../../vda1
