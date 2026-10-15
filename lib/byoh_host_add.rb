@@ -668,8 +668,9 @@ class ByohHostAdd
     if requested[:uplink_ip] && stored["uplink_ip"] != requested[:uplink_ip]
       diff << "uplink IP: registered #{stored["uplink_ip"].inspect}, given #{requested[:uplink_ip]}"
     end
+    # start_vms deletes them from the stack once the host accepts VMs.
     images = host.strand.stack.last["default_boot_images"]
-    diff << "boot images: registered #{images.inspect}, given #{requested[:default_boot_images].inspect}" if images != requested[:default_boot_images]
+    diff << "boot images: registered #{images.inspect}, given #{requested[:default_boot_images].inspect}" if images && images != requested[:default_boot_images]
     if requested[:server_identifier] && host.provider.server_identifier != requested[:server_identifier]
       diff << "server identifier: registered #{host.provider.server_identifier}, given #{requested[:server_identifier]}"
     end

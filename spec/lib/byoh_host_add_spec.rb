@@ -410,6 +410,16 @@ RSpec.describe ByohHostAdd do
       expect(calls).to be_empty
     end
 
+    it "resumes a host that accepts VMs, whose stack no longer holds the boot images" do
+      registered
+      frame = host.strand.stack.last.except("install_os", "default_boot_images", "vhost_block_backend_version")
+      host.strand.update(stack: [frame])
+      host.update(allocation_state: "accepting")
+      status, out, err = cli(*base)
+      expect([status, err]).to eq [0, ""]
+      expect(out).to include "Host #{host.ubid} accepts VMs."
+    end
+
     it "compares the legacy pool entries of a host registered before M2 as current ones" do
       registered(["5.9.0.0/29,exposure=public"])
       v4, v6 = host.provider.config["routed_networks"]
