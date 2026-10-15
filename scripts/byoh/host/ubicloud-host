@@ -37,9 +37,12 @@
 
 VERSION=1
 
-# PrepHost and its children install these (rhizome/host/bin/prep_host.rb,
-# prog/*): the apt simulation proves the archive serves them.
-PREP_PACKAGES=(ruby-bundler qemu-utils mtools acl smartmontools nvme-cli jq libaio-dev sysstat nftables dmidecode pciutils)
+# Bring-up installs these (prog/bootstrap_rhizome.rb,
+# rhizome/host/bin/prep_host.rb, prog/install_dnsmasq.rb,
+# rhizome/host/bin/setup-sysstat; rhizome/host/spec/ubicloud_host_parity_spec.rb
+# keeps the list complete): the apt simulation proves the archive serves
+# them.
+PREP_PACKAGES=(ruby-bundler qemu-utils mtools acl smartmontools nvme-cli systemd-coredump jq ethtool make gcc libaio-dev sysstat nftables dmidecode pciutils)
 DEFAULT_URLS=(https://github.com https://cloud-images.ubuntu.com)
 # Units whose firewall rules or bridges collide with the nftables rules
 # rhizome installs (PLATFORMS.md PF16).
