@@ -9,9 +9,22 @@
 #   run.sh probe   the real probe in ubuntu:24.04 (distribution Ruby) and
 #                  in Alpine (expect tier container), and every fixture
 #                  tree of rhizome/host/spec/fixtures/virt_probe in both
+#   run.sh l3      two system containers through the real bin/setup-vm,
+#                  network hook, stop-vm and vm-stats (l3.sh), in
+#                  ubuntu:24.04 with LXC: SSH, DHCP, DNS, apt, isolation,
+#                  symlink and cgroup probes, delete twice
 #
-# Guest-running modes (l3, l5) come with WP5/WP6 and must also install
-# the nft drop toward the test network before any guest starts.
+# l3 nests LXC, which mounts proc, sysfs and cgroup2 and loads seccomp
+# filters; docker-default AppArmor denies those mounts. It therefore runs
+# only with NOKVM_L3_UNCONFINED=1, which allows exactly
+# apparmor=unconfined and seccomp=unconfined for that one container (the
+# limits of the shared-machine rules), or under an admin-loaded
+# ubi-q-nokvm profile. Without AppArmor's mount denial, the guard of
+# inside.sh (read-only /sys and /proc/sys, checked at start and
+# teardown) and the host-state comparison are what show that no host
+# kernel state changed. l3.sh installs the nft drop toward the test
+# network before any guest starts and stops if it is missing. The l5
+# guest mode comes with WP6.
 #
 # Rules for every container (checked with docker inspect before start):
 #   - named ubi-q-nokvm-*, network ubi-test-net, no published ports
@@ -32,7 +45,8 @@
 # some kernel.* settings must not change.
 #
 # Environment: NOKVM_UBUNTU_IMAGE (ubuntu:24.04), NOKVM_ALPINE_IMAGE
-# (ruby:4.0.2-alpine3.23), NOKVM_KEEP=1 keeps containers.
+# (ruby:4.0.2-alpine3.23), NOKVM_KEEP=1 keeps containers,
+# NOKVM_L3_UNCONFINED=1 (see l3).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -112,7 +126,11 @@ daemon_check() {
 apparmor_ok() {
   local profile
   profile=$(field "$1" '{{.AppArmorProfile}}')
-  case "$profile" in docker-default | ubi-q-nokvm) ;; *) fail "$1: AppArmor profile '$profile', not docker-default" ;; esac
+  case "$profile" in
+    docker-default | ubi-q-nokvm) ;;
+    unconfined) [ "$1" = ubi-q-nokvm-l3 ] && [ "${NOKVM_L3_UNCONFINED:-0}" = 1 ] || fail "$1: AppArmor profile '$profile', not docker-default" ;;
+    *) fail "$1: AppArmor profile '$profile', not docker-default" ;;
+  esac
 }
 
 # field NAME TEMPLATE: what docker inspect says about the container.
@@ -131,11 +149,19 @@ assert_safe() {
     case "${item#CAP_}" in NET_ADMIN | SYS_ADMIN | NET_RAW) ;; *) fail "$name: capability $item" ;; esac
   done
   for item in $(field "$name" '{{range .HostConfig.SecurityOpt}}{{.}} {{end}}'); do
-    case "$item" in no-new-privileges | no-new-privileges:true | no-new-privileges=true | apparmor=ubi-q-nokvm) ;; *) fail "$name: security option $item" ;; esac
+    case "$item" in
+      no-new-privileges | no-new-privileges:true | no-new-privileges=true | apparmor=ubi-q-nokvm) ;;
+      apparmor=unconfined | seccomp=unconfined) [ "$name" = ubi-q-nokvm-l3 ] && [ "${NOKVM_L3_UNCONFINED:-0}" = 1 ] || fail "$name: security option $item" ;;
+      *) fail "$name: security option $item" ;;
+    esac
   done
   # Docker fills this in only at start; empty means the daemon's default,
   # which daemon_check proved is AppArmor's docker-default.
-  case "$(field "$name" '{{.AppArmorProfile}}')" in "" | docker-default | ubi-q-nokvm) ;; *) fail "$name: AppArmor profile is not docker-default" ;; esac
+  case "$(field "$name" '{{.AppArmorProfile}}')" in
+    "" | docker-default | ubi-q-nokvm) ;;
+    unconfined) [ "$name" = ubi-q-nokvm-l3 ] && [ "${NOKVM_L3_UNCONFINED:-0}" = 1 ] || fail "$name: AppArmor profile is not docker-default" ;;
+    *) fail "$name: AppArmor profile is not docker-default" ;;
+  esac
   [ "$(field "$name" '{{len .HostConfig.PortBindings}}{{.HostConfig.PublishAllPorts}}')" = 0false ] || fail "$name: published ports"
   [ "$(field "$name" '{{.HostConfig.NetworkMode}}')" = "$NET" ] || fail "$name: network is not $NET"
   for item in PidMode IpcMode UTSMode UsernsMode; do
@@ -155,14 +181,21 @@ assert_safe() {
   done
 }
 
-# run_in NAME IMAGE MODE: creates ubi-q-nokvm-NAME, checks it, and runs
-# inside.sh MODE in it.
+# run_in NAME IMAGE MODE [DOCKER OPTION...]: creates ubi-q-nokvm-NAME,
+# checks it, and runs inside.sh MODE in it.
 run_in() {
-  local name=ubi-q-nokvm-$1 image=$2 mode=$3
+  local name=ubi-q-nokvm-$1 image=$2 mode=$3 scratch=nosuid,nodev,size=256m nnp=(--security-opt no-new-privileges)
+  shift 3
+  # A guest's root file system needs device files and setuid programs
+  # (sudo), and no_new_privs would pass from docker to every guest.
+  if [ "$mode" = l3 ]; then
+    scratch=suid,dev,size=3500m
+    nnp=()
+  fi
   ! docker container inspect "$name" >/dev/null 2>&1 || fail "$name exists; remove it by hand if it is yours"
   docker create --name "$name" --network "$NET" --cpuset-cpus="$CPUSET" --cpus=4 --memory=6g \
-    --security-opt no-new-privileges --tmpfs /scratch:rw,exec,nosuid,nodev,size=256m \
-    -v "$WT/rhizome:/w/rhizome:ro" -v "$HERE:/w/nokvm:ro" -w /w \
+    "${nnp[@]}" --tmpfs "/scratch:rw,exec,$scratch" \
+    -v "$WT/rhizome:/w/rhizome:ro" -v "$HERE:/w/nokvm:ro" -w /w "$@" \
     "$image" sh /w/nokvm/inside.sh "$mode" >/dev/null
   CREATED+=("$name")
   assert_safe "$name"
@@ -184,8 +217,31 @@ probe() {
   say "probe ok"
 }
 
+# l3: see the header. The scratch tmpfs holds the image and both root
+# file systems (about 2.5 GB of this container's memory, no disk).
+l3() {
+  local before
+  if [ "${NOKVM_L3_UNCONFINED:-0}" != 1 ]; then
+    fail "l3 nests LXC and needs NOKVM_L3_UNCONFINED=1 (AppArmor and seccomp unconfined for ubi-q-nokvm-l3 only); see the header"
+  fi
+  image_check "$UBUNTU_IMAGE"
+  daemon_check
+  disk_check
+  before=$(host_state)
+  run_in l3 "$UBUNTU_IMAGE" l3 --cap-add NET_ADMIN --cap-add SYS_ADMIN --cap-add NET_RAW --device /dev/net/tun \
+    --security-opt apparmor=unconfined --security-opt seccomp=unconfined --sysctl net.ipv4.ip_forward=1
+  [ "$before" = "$(host_state)" ] ||
+    fail "host kernel state changed during the run (another workload on this machine may have done it): $(diff <(echo "$before") <(host_state) || true)"
+  disk_check
+  say "l3 ok"
+}
+
 case "${1:-}" in
   lint) lint ;;
+  l3)
+    lint
+    l3
+    ;;
   probe)
     lint
     probe

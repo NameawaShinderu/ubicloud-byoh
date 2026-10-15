@@ -6,6 +6,8 @@
 #                         fixture tree
 #   inside.sh probe-apt   the same after apt-get install ruby (Ubuntu
 #                         images without Ruby)
+#   inside.sh l3          LXC and rhizome's gems, then l3.sh in a private
+#                         mount namespace with a fresh /proc
 set -eu
 
 RHIZOME=/w/rhizome
@@ -71,6 +73,14 @@ case "${1:-}" in
       DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends ruby >/dev/null
     fi
     probe
+    ;;
+  l3)
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get -qq update >/dev/null
+    apt-get -qq install -y --no-install-recommends lxc-utils uidmap xz-utils dnsmasq-base nftables iproute2 ruby ruby-bundler \
+      curl ca-certificates openssh-client adduser perl procps e2fsprogs >/dev/null
+    (cd /w/rhizome && BUNDLE_FROZEN=true bundle install --quiet 2>&1 | grep -v "as root" || true)
+    unshare -m --propagation private sh -c 'mount -t proc proc /proc && exec bash /w/nokvm/l3.sh'
     ;;
   *) fail "unknown mode ${1:-}" ;;
 esac

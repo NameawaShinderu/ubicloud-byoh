@@ -1,0 +1,35 @@
+# frozen_string_literal: true
+
+# bin/setup-vm for the l3 lab container (scripts/byoh/test/nokvm/l3.sh),
+# with the two things the lab cannot do replaced, and said so on stderr:
+#
+# - Project quotas: the lab's disks are on tmpfs, which has none, so an
+#   unencrypted container disk is a plain directory here. On a host,
+#   ContainerDisk refuses a file system without prjquota. UNVERIFIED here.
+# - AppArmor: a container cannot load profiles, so the guest runs
+#   unconfined by AppArmor here; on a host it gets
+#   lxc-container-default-cgns. UNVERIFIED here.
+#
+# Everything else is the real bin/setup-vm.
+require "/w/rhizome/host/lib/vm_setup"
+
+module LabContainerDisk
+  private
+
+  def make_quota_dir
+    warn "lab: no project quota on tmpfs (UNVERIFIED here); #{rootfs} is a plain directory"
+    r "install", "-d", "-o", base.to_s, "-g", base.to_s, "-m", "0755", rootfs
+  end
+end
+
+module LabContainerSetup
+  def apparmor_profile
+    warn "lab: AppArmor profile #{ContainerSetup::APPARMOR_PROFILE} replaced by unconfined (UNVERIFIED here)"
+    "unconfined"
+  end
+end
+
+ContainerDisk.prepend(LabContainerDisk)
+ContainerSetup.prepend(LabContainerSetup)
+
+load "/w/rhizome/host/bin/setup-vm"

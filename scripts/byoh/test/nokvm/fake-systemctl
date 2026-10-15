@@ -1,0 +1,134 @@
+#!/bin/bash
+# systemctl for the l3 lab container, which has no systemd
+# (scripts/byoh/test/nokvm/l3.sh). It runs the two units rhizome writes
+# for a container VM the way systemd would, as far as the lab can:
+#
+#   start UNIT       <vm>-dnsmasq.service: ExecStart in its
+#                    NetworkNamespacePath, in the background.
+#                    <vm>.service: starts the units it Wants first, then
+#                    runs ExecStart from <slice>/<vm>.service/supervisor
+#                    (Delegate=yes, DelegateSubgroup=supervisor) in its
+#                    network namespace. Lab artifact: the namespace is
+#                    joined with `ip netns exec`, which also mounts a
+#                    fresh sysfs (docker masks parts of /sys, and LXC's
+#                    sysfs mount needs a fully visible one) and so needs
+#                    cgroup2 mounted again; systemd joins it without that.
+#   stop UNIT        ExecStop, if any, then waits up to TimeoutStopSec for
+#                    the main process and kills what is left
+#   restart UNIT     stop, then start
+#   is-active UNIT…  "active" while the main process lives
+#   show UNIT --property P   MainPID and ActiveEnterTimestampMonotonic
+#   anything else    does nothing (daemon-reload, reload nftables, ...)
+set -euo pipefail
+
+STATE=/run/fake-systemd
+UNITS=/etc/systemd/system
+CGROUP=/sys/fs/cgroup
+mkdir -p "$STATE"
+
+unit_file() { echo "$UNITS/${1%.service}.service"; }
+unit_name() { local u=${1%.service}; echo "$u"; }
+
+# key UNIT KEY: the value of the first KEY= line of the unit
+key() { sed -n "s/^$2=//p" "$(unit_file "$1")" | head -n1; }
+
+pid_of() { cat "$STATE/$(unit_name "$1").pid" 2>/dev/null || true; }
+
+alive() {
+  local pid
+  pid=$(pid_of "$1")
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+uptime_us() { awk '{ printf "%d", $1 * 1000000 }' /proc/uptime; }
+
+start() {
+  local u netns exec slice cg want
+  u=$(unit_name "$1")
+  alive "$u" && return 0
+  for want in $(key "$u" Wants); do start "$want"; done
+  netns=$(key "$u" NetworkNamespacePath)
+  netns=${netns##*/}
+  exec=$(key "$u" ExecStart)
+  if grep -q '^Delegate=yes' "$(unit_file "$u")"; then
+    slice=$(key "$u" Slice)
+    cg=$CGROUP/$slice/$u.service
+    mkdir -p "$cg/supervisor"
+    (
+      echo "$BASHPID" >"$cg/supervisor/cgroup.procs"
+      exec ip netns exec "$netns" sh -c "mount -t cgroup2 cgroup2 /sys/fs/cgroup && exec $exec"
+    ) >>"$STATE/$u.log" 2>&1 &
+  else
+    # shellcheck disable=SC2086 # ExecStart is a command line
+    ip netns exec "$netns" $exec >>"$STATE/$u.log" 2>&1 &
+  fi
+  echo $! >"$STATE/$u.pid"
+  uptime_us >"$STATE/$u.since"
+}
+
+stop() {
+  local u netns stop_cmd pid timeout i
+  u=$(unit_name "$1")
+  alive "$u" || {
+    rm -f "$STATE/$u.pid"
+    return 0
+  }
+  pid=$(pid_of "$u")
+  stop_cmd=$(key "$u" ExecStop)
+  netns=$(key "$u" NetworkNamespacePath)
+  netns=${netns##*/}
+  timeout=$(key "$u" TimeoutStopSec)
+  timeout=${timeout%s}
+  if [ -n "$stop_cmd" ]; then
+    # shellcheck disable=SC2086 # ExecStop is a command line
+    ip netns exec "$netns" $stop_cmd >>"$STATE/$u.log" 2>&1 || true
+  else
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+  for ((i = 0; i < ${timeout:-10} * 10; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$STATE/$u.pid"
+}
+
+args=()
+for a in "$@"; do
+  case $a in
+    -q | --quiet | --no-block) ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]}"
+
+case ${1:-} in
+  start) start "$2" ;;
+  stop) stop "$2" ;;
+  restart)
+    stop "$2"
+    start "$2"
+    ;;
+  is-active)
+    shift
+    rc=0
+    for u in "$@"; do
+      if alive "$u"; then echo active; else
+        echo inactive
+        rc=3
+      fi
+    done
+    exit "$rc"
+    ;;
+  show)
+    u=$2
+    prop=${4:-}
+    case $prop in
+      MainPID) echo "MainPID=$(alive "$u" && pid_of "$u" || echo 0)" ;;
+      ActiveEnterTimestampMonotonic) echo "ActiveEnterTimestampMonotonic=$(alive "$u" && cat "$STATE/$(unit_name "$u").since" || echo 0)" ;;
+      *) echo "$prop=" ;;
+    esac
+    ;;
+  *) exit 0 ;;
+esac
