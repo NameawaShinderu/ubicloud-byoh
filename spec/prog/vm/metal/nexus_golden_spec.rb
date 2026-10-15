@@ -50,21 +50,26 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         expect { nx.start }.to hop("create_unix_user")
       end
 
+      # Time.now is frozen on a whole second, so the semaphore's
+      # millisecond timestamp is exact and the boundary is pinned to the
+      # millisecond on both sides.
       def stopping_since(seconds)
+        now = Time.at(Time.now.to_i)
         Semaphore.create(name: "stopping", strand_id: st.id) do |sem|
-          sem.id = UBID.generate_from_time(UBID::TYPE_SEMAPHORE, Time.now - seconds).to_uuid
+          sem.id = UBID.generate_from_time(UBID::TYPE_SEMAPHORE, now - seconds).to_uuid
         end
+        allow(Time).to receive(:now).and_return(now)
         expect(sshable).to receive(:_cmd).with("systemctl is-active #{vm.inhost_name} #{vm.inhost_name}-dnsmasq").and_return("active\nactive\n")
       end
 
-      it "keeps soft-stopping a running VM within 60 seconds" do
-        stopping_since(55)
+      it "keeps soft-stopping a running VM for exactly 60 seconds" do
+        stopping_since(60)
         expect(sshable).to receive(:_cmd).with("sudo host/bin/stop-vm #{vm.inhost_name}").and_return("")
         expect { nx.stopped }.to nap(10)
       end
 
-      it "stops a running VM hard after 60 seconds" do
-        stopping_since(65)
+      it "stops a running VM hard 1 ms after 60 seconds" do
+        stopping_since(60.001)
         expect(sshable).to receive(:_cmd).with("sudo systemctl stop #{vm.inhost_name}").and_return("")
         expect { nx.stopped }.to nap(0)
       end
