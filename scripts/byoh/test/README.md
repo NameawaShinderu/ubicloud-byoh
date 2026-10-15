@@ -125,7 +125,7 @@ The PF15 network calls are shimmed (`cmd/curl`, `cmd/apt-get`).
 `rhizome/host/spec/kvm_check_parity_spec.rb` checks that `KvmCheck`, which
 PrepHost runs, gives each fixture host the same PF3 verdict as the
 script. Rerun the script with `--update-spec` after changing it or the
-fixtures. Result (2026-10-15): 19 cases plus base, the guard and the
+fixtures. Result (2026-10-15): 20 cases plus base, the guard and the
 live run pass in about 25 s, with nothing left behind.
 
 ## Scenarios

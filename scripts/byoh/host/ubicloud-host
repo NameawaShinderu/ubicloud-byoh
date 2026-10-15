@@ -323,6 +323,10 @@ pf8_cpu() {
     fact cpus_online 0
     return
   fi
+  # Threads per core count online CPUs only: lscpu gives an offline CPU
+  # no socket or core. With any CPU offline the thread-count rule is
+  # skipped, since an offline sibling would look like a smaller core;
+  # PF8 warns about offline CPUs instead.
   local -A threads=()
   while IFS=, read -r cpu _ socket core on; do
     [[ $cpu == \#* || -z $cpu ]] && continue
@@ -349,7 +353,7 @@ pf8_cpu() {
 
   if [[ -e $R/sys/devices/cpu_atom || -e $R/sys/devices/cpu_core ]]; then
     hybrid="Intel hybrid CPU (cpu_core and cpu_atom PMUs)"
-  elif (($(printf '%s\n' "${threads[@]}" | sort -u | wc -l) > 1)); then
+  elif ((${#offline[@]} == 0)) && (($(printf '%s\n' "${threads[@]}" | sort -u | wc -l) > 1)); then
     hybrid="cores have different thread counts ($(printf '%s\n' "${threads[@]}" | sort -nu | tr '\n' ' ' | sed 's/ $//') threads)"
   else
     for c in "${online[@]}"; do
