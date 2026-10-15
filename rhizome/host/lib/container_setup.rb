@@ -54,6 +54,12 @@ class ContainerSetup
   # LXC kills the container.
   STOP_TIMEOUT_SECONDS = 60
 
+  # The console log is on the host's root file system, outside the
+  # disk's quota, and the guest's root writes to it at pty speed. LXC
+  # rotates it at this size and keeps one old copy, so it never takes
+  # more than twice this (UNVERIFIED: no lab run since).
+  CONSOLE_LOG_SIZE = "4MB"
+
   # LXC's /usr/share/lxc/config/common.seccomp, which a profile of our own
   # replaces, followed by the denials of docs/byoh/NO_KVM.md section 4.2.
   # Argument comparisons are [index,value,op] or, for SCMP_CMP_MASKED_EQ,
@@ -163,6 +169,8 @@ class ContainerSetup
       lxc.cgroup2.memory.swap.max = 0
       lxc.cgroup2.pids.max = #{max_vcpus * PIDS_PER_VCPU}
       lxc.console.logfile = #{console_log}
+      lxc.console.size = #{CONSOLE_LOG_SIZE}
+      lxc.console.rotate = 1
       lxc.init.cmd = /sbin/init
       #{net.join("\n")}
     CONFIG
