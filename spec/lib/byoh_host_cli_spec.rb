@@ -183,6 +183,17 @@ RSpec.describe ByohHostCli do
         "Started #{Strand.first(prog: "LearnPci").ubid} to relearn the GPUs of host #{host.ubid} under the BYOH vfio-pci rule.\n"]
     end
 
+    it "counts a host whose HostNexus pushed a prog after prep as past prep" do
+      host = legacy_host
+      byoh_1
+      host.strand.update(prog: "SetupHugepages", label: "start",
+        stack: [{"subject_id" => host.id, "link" => ["Vm::HostNexus", "setup_hugepages"]}, *host.strand.stack])
+      expect(described_class.past_prep?(VmHost[host.id])).to be true
+      host.strand.update(prog: "BootstrapRhizome", label: "start",
+        stack: [{"subject_id" => host.id, "link" => ["Vm::HostNexus", "bootstrap_rhizome"]}, *host.strand.stack.drop(1)])
+      expect(described_class.past_prep?(VmHost[host.id])).to be false
+    end
+
     it "leaves the egress NAT table to prep on a host that has not reached it" do
       host = legacy_host
       byoh_1

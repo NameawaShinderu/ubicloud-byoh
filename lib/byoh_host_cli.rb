@@ -60,8 +60,11 @@ class ByohHostCli
 
   # Whether the host's prep has started installing its egress NAT table,
   # so a later change must be installed by a SetupByohEgressNat strand.
+  # It reads the HostNexus label, not the strand's: HostNexus pushes
+  # progs such as SetupHugepages after prep, and those start at their
+  # own start label.
   def self.past_prep?(host)
-    !(host.allocation_state == "unprepared" && PRE_PREP_LABELS.include?(host.strand.label))
+    !(host.allocation_state == "unprepared" && PRE_PREP_LABELS.include?(ByohHostWatch.host_label(host.strand)))
   end
 
   private
