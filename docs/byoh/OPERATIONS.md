@@ -493,6 +493,17 @@ before it succeeded.
 
    This is UNVERIFIED on a packaged control plane with real hosts.
 
+9. **Disk ids, only when moving a host registered before M4 to M4 or
+   later.** Before you enable `ubicloud-monitor`, refresh each such BYOH
+   host's stored disk ids, which can be `""`, `root` or a partition name:
+
+   ```
+   sudo ubicloud-admin run byoh-host relearn-device-ids --host vh...         # shows old -> new
+   sudo ubicloud-admin run byoh-host relearn-device-ids --host vh... --yes   # stores them
+   ```
+
+   The host must be reachable over SSH. See §9 for what the ids are for.
+
 Do not flip `current` by hand with `ln -sfn`. That skips the downgrade
 guard below.
 
@@ -661,7 +672,7 @@ LVM hosts has not been run (UNVERIFIED).
 Hosts registered before M4 keep the disk ids learned then, which can be
 `""`, `root` (from a `/dev/root` df source, as on Ubuntu cloud images)
 or a partition name. Before enabling the monitor, refresh them on each
-such host:
+such host (§7 step 9 in a release switch):
 
 ```
 bin/byoh-host relearn-device-ids --host vh...         # shows old -> new
