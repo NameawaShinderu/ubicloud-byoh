@@ -3,8 +3,9 @@
 require_relative "../spec_helper"
 require_relative "../../golden_fixture"
 
-# The prep.json a host receives for a cloud-hypervisor VM, frozen byte for
-# byte for a non-BYOH host and for a BYOH generic host.
+# The prep.json a host receives, frozen byte for byte: a cloud-hypervisor
+# VM on a non-BYOH host and on a BYOH generic host, and a VM with a B200
+# or B300 GPU, which runs under QEMU+KVM.
 RSpec.describe Vm do
   let(:project) { Project.create(name: "golden") }
 
@@ -48,5 +49,17 @@ RSpec.describe Vm do
 
     params = vm.reload.params_json(ch_version: "46.0", firmware_version: "202311")
     expect(params).to eq GoldenFixture.read("params_json_ch_byoh.json", params)
+  end
+
+  {"2901" => [true, "params_json_qemu_gpu.json"], "3182" => [false, "params_json_qemu_gpu_nohugepages.json"]}.each do |device, (hugepages, fixture)|
+    it "writes the same params for a QEMU+KVM VM with GPU device #{device}, hugepages #{hugepages}" do
+      vm_host = create_vm_host(total_cpus: 8, total_cores: 4, total_dies: 1, total_sockets: 1)
+      vm = golden_vm(vm_host, location_id: Location::HETZNER_FSN1_ID)
+      PciDevice.create(vm_host_id: vm_host.id, vm_id: vm.id, slot: "c1:00.0", device_class: "0302", vendor: "10de", device:, numa_node: 0, iommu_group: 17)
+
+      params = vm.reload.params_json(swap_size_bytes: nil, ch_version: "46.0", firmware_version: "202311", hugepages:)
+      expect(JSON.parse(params)["hypervisor"]).to eq "qemu"
+      expect(params).to eq GoldenFixture.read(fixture, params)
+    end
   end
 end

@@ -1,0 +1,234 @@
+{
+  "option_tree": {
+    "name": null,
+    "location": {
+      "Location[\"10saktg1sprp3mxefj1m3kppq2\"]": {
+        "private_subnet_id": {
+          "{location_id: \"caa7a807-36c5-8420-a75c-f906839dad71\", value: \"new-10saktg1sprp3mxefj1m3kppq2\", display_name: \"New Private Subnet\"}": {}
+        },
+        "enable_ip4": {
+          "1": {}
+        },
+        "family": {
+          "standard": {
+            "size": {
+              "standard-2": {
+                "storage_size": {
+                  "40": {},
+                  "80": {}
+                }
+              },
+              "standard-4": {
+                "storage_size": {
+                  "80": {},
+                  "160": {}
+                }
+              },
+              "standard-8": {
+                "storage_size": {
+                  "160": {},
+                  "320": {}
+                }
+              },
+              "standard-16": {
+                "storage_size": {
+                  "320": {},
+                  "640": {}
+                }
+              },
+              "standard-30": {
+                "storage_size": {
+                  "600": {},
+                  "1200": {}
+                }
+              },
+              "standard-60": {
+                "storage_size": {
+                  "1200": {},
+                  "2400": {}
+                }
+              }
+            }
+          },
+          "burstable": {
+            "size": {
+              "burstable-1": {
+                "storage_size": {
+                  "10": {},
+                  "20": {}
+                }
+              },
+              "burstable-2": {
+                "storage_size": {
+                  "20": {},
+                  "40": {}
+                }
+              }
+            }
+          }
+        },
+        "boot_image": {
+          "ubuntu-resolute": {},
+          "ubuntu-noble": {},
+          "ubuntu-jammy": {},
+          "debian-13": {},
+          "debian-12": {},
+          "almalinux-10": {},
+          "almalinux-9": {}
+        }
+      },
+      "Location[\"103wgmgmrbrj0q48dzyw6fvt4z\"]": {
+        "private_subnet_id": {
+          "{location_id: \"1f214853-0bc4-8020-b910-dffb867ef44f\", value: \"new-103wgmgmrbrj0q48dzyw6fvt4z\", display_name: \"New Private Subnet\"}": {}
+        },
+        "enable_ip4": {
+          "1": {}
+        },
+        "family": {
+          "standard": {
+            "size": {
+              "standard-2": {
+                "storage_size": {
+                  "40": {},
+                  "80": {}
+                }
+              },
+              "standard-4": {
+                "storage_size": {
+                  "80": {},
+                  "160": {}
+                }
+              },
+              "standard-8": {
+                "storage_size": {
+                  "160": {},
+                  "320": {}
+                }
+              },
+              "standard-16": {
+                "storage_size": {
+                  "320": {},
+                  "640": {}
+                }
+              },
+              "standard-30": {
+                "storage_size": {
+                  "600": {},
+                  "1200": {}
+                }
+              },
+              "standard-60": {
+                "storage_size": {
+                  "1200": {},
+                  "2400": {}
+                }
+              }
+            }
+          }
+        },
+        "boot_image": {
+          "ubuntu-resolute": {},
+          "ubuntu-noble": {},
+          "ubuntu-jammy": {},
+          "debian-13": {},
+          "debian-12": {},
+          "almalinux-10": {},
+          "almalinux-9": {}
+        }
+      },
+      "Location[\"10w235104t7p1n09fb0bwfbz7z\"]": {
+        "private_subnet_id": {
+          "{location_id: \"e0865080-9a3d-8020-a812-f5817c7afe7f\", value: \"new-10w235104t7p1n09fb0bwfbz7z\", display_name: \"New Private Subnet\"}": {}
+        },
+        "enable_ip4": {
+          "1": {}
+        },
+        "family": {
+          "standard": {
+            "size": {
+              "standard-2": {
+                "storage_size": {
+                  "40": {},
+                  "80": {}
+                }
+              },
+              "standard-4": {
+                "storage_size": {
+                  "80": {},
+                  "160": {}
+                }
+              },
+              "standard-8": {
+                "storage_size": {
+                  "160": {},
+                  "320": {}
+                }
+              },
+              "standard-16": {
+                "storage_size": {
+                  "320": {},
+                  "640": {}
+                }
+              },
+              "standard-30": {
+                "storage_size": {
+                  "600": {},
+                  "1200": {}
+                }
+              },
+              "standard-60": {
+                "storage_size": {
+                  "1200": {},
+                  "2400": {}
+                }
+              }
+            }
+          },
+          "burstable": {
+            "size": {
+              "burstable-1": {
+                "storage_size": {
+                  "10": {},
+                  "20": {}
+                }
+              },
+              "burstable-2": {
+                "storage_size": {
+                  "20": {},
+                  "40": {}
+                }
+              }
+            }
+          }
+        },
+        "boot_image": {
+          "ubuntu-resolute": {},
+          "ubuntu-noble": {},
+          "ubuntu-jammy": {},
+          "debian-13": {},
+          "debian-12": {},
+          "almalinux-10": {},
+          "almalinux-9": {}
+        }
+      }
+    },
+    "unix_user": null,
+    "ssh_public_key": {},
+    "public_key": null,
+    "init_script": null
+  },
+  "option_children": {
+    "location": [
+      "private_subnet_id",
+      "enable_ip4",
+      "family",
+      "boot_image"
+    ],
+    "family": [
+      "size"
+    ],
+    "size": [
+      "storage_size"
+    ]
+  }
+}

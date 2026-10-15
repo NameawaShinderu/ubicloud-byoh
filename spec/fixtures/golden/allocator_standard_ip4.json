@@ -1,0 +1,134 @@
+{
+  "candidates": [
+    {
+      "candidate": {
+        "vm_host_id": "host-a",
+        "total_cpus": 16,
+        "total_cores": 8,
+        "used_cores": 1,
+        "total_hugepages_1g": 54,
+        "used_hugepages_1g": 2,
+        "location_id": "caa7a807-36c5-8420-a75c-f906839dad71",
+        "num_storage_devices": 1,
+        "available_storage_gib": 100,
+        "total_storage_gib": 120,
+        "storage_devices": [
+          {
+            "id": "stor-a",
+            "total_storage_gib": 120,
+            "available_storage_gib": 100
+          }
+        ],
+        "ipv4_available": true,
+        "num_gpus": 0,
+        "available_gpus": 0,
+        "use_gpu_partition": false,
+        "available_iommu_groups": null,
+        "vm_provisioning_count": 0,
+        "accepts_slices": true,
+        "family": "standard",
+        "score_offset": 0.0
+      },
+      "valid": true,
+      "score": 0.5186111111111111
+    },
+    {
+      "candidate": {
+        "vm_host_id": "host-b",
+        "total_cpus": 16,
+        "total_cores": 8,
+        "used_cores": 5,
+        "total_hugepages_1g": 54,
+        "used_hugepages_1g": 2,
+        "location_id": "caa7a807-36c5-8420-a75c-f906839dad71",
+        "num_storage_devices": 1,
+        "available_storage_gib": 100,
+        "total_storage_gib": 120,
+        "storage_devices": [
+          {
+            "id": "stor-b",
+            "total_storage_gib": 120,
+            "available_storage_gib": 100
+          }
+        ],
+        "ipv4_available": true,
+        "num_gpus": 0,
+        "available_gpus": 0,
+        "use_gpu_partition": false,
+        "available_iommu_groups": null,
+        "vm_provisioning_count": 0,
+        "accepts_slices": false,
+        "family": "standard",
+        "score_offset": 0.0
+      },
+      "valid": true,
+      "score": 0.8897530864197531
+    }
+  ],
+  "query_counts": [
+    [
+      "base",
+      3
+    ],
+    [
+      "space",
+      3
+    ],
+    [
+      "boot_image",
+      3
+    ],
+    [
+      "ipv4",
+      3
+    ],
+    [
+      "allocation_state",
+      2
+    ],
+    [
+      "non_gpu",
+      2
+    ]
+  ],
+  "query_sql": "WITH \"available_ipv4\" AS (SELECT \"routed_to_host_id\", (count(*) > 0) AS \"ipv4_available\" FROM \"ipv4_address\" LEFT JOIN \"assigned_vm_address\" ON (\"assigned_vm_address\".\"ip\" = \"ipv4_address\".\"ip\") INNER JOIN \"address\" USING (\"cidr\") WHERE ((\"assigned_vm_address\".\"ip\" IS NULL) AND (\"ipv4_address\".\"reserved\" IS FALSE) AND (\"address\".\"exposure\" IN ('public', 'nat'))) GROUP BY \"routed_to_host_id\"), \"storage_devices\" AS (SELECT \"vm_host_id\", count(*) AS \"num_storage_devices\", sum(\"available_storage_gib\") AS \"available_storage_gib\", sum(\"total_storage_gib\") AS \"total_storage_gib\", json_agg(json_build_object('id', \"storage_device\".\"id\", 'total_storage_gib', \"total_storage_gib\", 'available_storage_gib', \"available_storage_gib\") ORDER BY \"available_storage_gib\") AS \"storage_devices\" FROM \"storage_device\" WHERE (\"enabled\" IS TRUE) GROUP BY \"vm_host_id\" HAVING ((sum(\"available_storage_gib\") >= 10) AND (count(*) >= 1))), \"gpus\" AS (SELECT \"vm_host_id\", count(*) AS \"num_gpus\", sum((CASE WHEN (\"vm_id\" IS NULL) THEN 1 ELSE 0 END)) AS \"available_gpus\", array_agg(jsonb_build_object('iommu_group', \"iommu_group\", 'numa_node', \"numa_node\")) FILTER (WHERE (\"vm_id\" IS NULL)) AS \"available_iommu_groups\" FROM \"pci_device\" WHERE ((\"device_class\" IN ('0300', '0302')) AND ((\"device\" IS NULL) OR true)) GROUP BY \"vm_host_id\"), \"gpu_partitions\" AS (SELECT \"vm_host_id\", bool_or(\"enabled\") AS \"use_gpu_partition\" FROM \"gpu_partition\" GROUP BY \"vm_host_id\"), \"vm_provisioning\" AS (SELECT \"vm_host_id\", count(*) AS \"vm_provisioning_count\" FROM \"vm\" WHERE (\"display_state\" = 'creating') GROUP BY \"vm_host_id\") SELECT \"vm_host\".\"id\" AS \"vm_host_id\", \"total_cpus\", \"total_cores\", \"used_cores\", \"total_hugepages_1g\", \"used_hugepages_1g\", \"location_id\", \"num_storage_devices\", \"available_storage_gib\", \"total_storage_gib\", \"storage_devices\", coalesce(\"ipv4_available\", false) AS \"ipv4_available\", coalesce(\"num_gpus\", 0) AS \"num_gpus\", coalesce(\"available_gpus\", 0) AS \"available_gpus\", coalesce(\"use_gpu_partition\", false) AS \"use_gpu_partition\", \"available_iommu_groups\", coalesce(\"vm_provisioning_count\", 0) AS \"vm_provisioning_count\", \"accepts_slices\", \"family\", \"score_offset\" FROM \"vm_host\" INNER JOIN \"storage_devices\" ON (\"storage_devices\".\"vm_host_id\" = \"vm_host\".\"id\") LEFT JOIN \"available_ipv4\" ON (\"available_ipv4\".\"routed_to_host_id\" = \"vm_host\".\"id\") LEFT JOIN \"gpus\" ON (\"gpus\".\"vm_host_id\" = \"vm_host\".\"id\") LEFT JOIN \"gpu_partitions\" ON (\"gpu_partitions\".\"vm_host_id\" = \"vm_host\".\"id\") LEFT JOIN \"vm_provisioning\" ON (\"vm_provisioning\".\"vm_host_id\" = \"vm_host\".\"id\") INNER JOIN \"boot_image\" ON (\"vm_host\".\"id\" = \"boot_image\".\"vm_host_id\") WHERE ((\"arch\" = 'x64') AND ((\"total_hugepages_1g\" - \"used_hugepages_1g\") >= 8) AND ((\"total_cores\" - \"used_cores\") >= greatest(1, ((2 * \"total_cores\") / \"total_cpus\"))) AND (\"boot_image\".\"name\" = 'ubuntu-noble') AND (\"boot_image\".\"activated_at\" IS NOT NULL) AND \"ipv4_available\" AND (\"allocation_state\" IN ('accepting')) AND (coalesce(\"num_gpus\", 0) <= 0))",
+  "allocated": "vm4hjdwrbn061kar42v5eqrrxm (arch=x64, vcpus=2, mem=8, storage=10) -> host-a (cpu=1/8, mem=2/54, storage=20/120), score=0.5186111111111111",
+  "vm": {
+    "vm_host_id": "host-a",
+    "family": "standard",
+    "cores": 0,
+    "vcpus": 2,
+    "memory_gib": 8,
+    "cpu_percent_limit": 200,
+    "cpu_burst_percent_limit": 0,
+    "ip4_enabled": true
+  },
+  "vm_ip4": "198.51.100.97/32",
+  "slice": {
+    "name": "standard_vm4hjdwr",
+    "family": "standard",
+    "is_shared": false,
+    "cores": 1,
+    "total_cpu_percent": 200,
+    "used_cpu_percent": 200,
+    "total_memory_gib": 8,
+    "used_memory_gib": 8
+  },
+  "slice_cpus": "2-3",
+  "host": {
+    "used_cores": 2,
+    "used_hugepages_1g": 10
+  },
+  "host_cpus_taken": [
+    2,
+    3
+  ],
+  "storage": [
+    [
+      "stor-a",
+      90,
+      "ubuntu-noble",
+      "v0.4.2"
+    ]
+  ]
+}

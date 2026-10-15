@@ -84,4 +84,13 @@ RSpec.describe VmSetup do
     writes = install(vm_setup, 4, "2:2:1:1", 8, [ubiblk_volume], nics, [["c1:00.0", "17"]], "system.slice", 0, "ubuntu-noble")
     expect(writes["/etc/systemd/system/vmgold01.service"]).to eq golden("qemu_kvm_hugepages_amd.service", writes["/etc/systemd/system/vmgold01.service"])
   end
+
+  # Captured from 9e22d71ec: QEMU+KVM without hugepages gives the guest
+  # plain anonymous RAM (-m), not a shared memfd backend.
+  it "writes the same QEMU+KVM unit without hugepages and a GPU on Intel" do
+    vm_setup = new_setup(hypervisor: "qemu", hugepages: false)
+    expect(vm_setup).to receive(:cpu_vendor).and_return("GenuineIntel")
+    writes = install(vm_setup, 4, "2:2:1:1", 8, [ubiblk_volume], nics, [["c1:00.0", "17"]], "system.slice", 0, "ubuntu-noble")
+    expect(writes["/etc/systemd/system/vmgold01.service"]).to eq golden("qemu_kvm_nohugepages.service", writes["/etc/systemd/system/vmgold01.service"])
+  end
 end
