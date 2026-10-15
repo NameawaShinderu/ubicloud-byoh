@@ -113,6 +113,12 @@ plane with `ubicloud-admin host add` (ROADMAP §6.3, form A):
    printed), the key stays for a retry and the watch does not run. `host
    add` deletes its own staged copy of the key after the prepare phase;
    `--no-wait` lets the operator's copy go before the bring-up watch too.
+4. Optional, on the workstation: remove the EC2 key from root's
+   `authorized_keys` on the data plane. `user-data-data.sh` copies it
+   there for `bin/register-byoh-host`, and `host add` keeps every root
+   key but its own, so after `host add` the EC2 key is still a root
+   login. The printed command keeps it as the `ubuntu` login and
+   rewrites root's file only when `host add`'s tagged key would remain.
 
 **Development control plane.** `user-data-ctrl.sh` installs only
 prerequisites; if you then run `bootstrap-dev-ctrl-plane.sh` rather

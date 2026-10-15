@@ -24,6 +24,7 @@ RSpec.describe "terraform/aws-byoh outputs" do
       "local.byoh_rates_dir" => "/var/lib/ubicloud/billing_rates.d",
       "aws_instance.data.id" => "i-0123456789abcdef0",
       "aws_instance.data.private_ip" => "10.98.1.20",
+      "aws_instance.data.public_ip" => "13.0.0.2",
       "local.ssh_key_file" => "./.generated/canary/byoh_ssh_key",
       "local_file.pools_yaml.filename" => "./.generated/canary/pools.yaml",
       "local.ctrl_login" => "ubuntu@13.0.0.1",
@@ -154,6 +155,42 @@ RSpec.describe "terraform/aws-byoh outputs" do
       # checks first; both stop before any SSH.
       expect(err.string).to match(/\A! invalid argument: .*(<the|flags)/)
       expect(err.string.lines.size).to eq 1
+    end
+
+    describe "the optional root key cleanup" do
+      let(:ec2) { "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEc2 ubi-byoh-canary" }
+      let(:tagged) { "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHad # ubicloud-byoh site=byoh-aws-canary ip=10.98.1.20" }
+      let(:home) { File.join(dir, "home") }
+      let(:root) { File.join(dir, "root") }
+
+      # Runs the commented step 4 with sudo as a no-op and both .ssh
+      # directories under dir; root's authorized_keys holds root_lines.
+      def clean_root_keys(root_lines, ubuntu_lines: [ec2])
+        line = render("host_add_command").lines.find { it.start_with?("#   ssh -i ") }
+        argv = Shellwords.split(line.delete_prefix("#"))
+        expect(argv.first(4)).to eq ["ssh", "-i", "./.generated/canary/byoh_ssh_key", "ubuntu@13.0.0.2"]
+        expect(argv.size).to eq 5
+        remote = argv.last.gsub("/home/ubuntu/.ssh", home).gsub("/root/.ssh", root)
+        FileUtils.mkdir_p([home, root])
+        File.write(File.join(home, "authorized_keys"), ubuntu_lines.map { "#{it}\n" }.join) if ubuntu_lines
+        File.write(File.join(root, "authorized_keys"), root_lines.map { "#{it}\n" }.join)
+        _, status = Open3.capture2e("bash", "-c", "sudo() { \"$@\"; }; #{remote}")
+        [status.exitstatus, File.readlines(File.join(root, "authorized_keys"), chomp: true), Dir.children(root)]
+      end
+
+      it "drops only the EC2 key once host add's key is there" do
+        status, lines, files = clean_root_keys([ec2, "ssh-ed25519 AAAAother other", tagged])
+        expect([status, lines, files]).to eq [0, ["ssh-ed25519 AAAAother other", tagged], ["authorized_keys"]]
+        expect(File.stat(File.join(root, "authorized_keys")).mode & 0o777).to eq 0o600
+      end
+
+      it "leaves root's keys alone before host add has installed its key" do
+        expect(clean_root_keys([ec2])).to eq [1, [ec2], ["authorized_keys"]]
+      end
+
+      it "leaves root's keys alone when ubuntu's keys cannot be read" do
+        expect(clean_root_keys([ec2, tagged], ubuntu_lines: nil)).to eq [1, [ec2, tagged], ["authorized_keys"]]
+      end
     end
 
     it "parses the --expect-host-key flags out of the console output" do

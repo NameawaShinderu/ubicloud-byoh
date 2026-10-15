@@ -134,19 +134,27 @@ output "host_add_command" {
     # add shows the fingerprints and asks for a typed "yes"; compare them
     # with step 1. Left as it is, EXPECT makes host add stop with a usage
     # error before it changes anything.
-    # --ssh-key is the operator login (user ubuntu has passwordless sudo);
-    # host add makes and keeps its own root key, and deletes its staged
-    # copy of this one after the prepare phase. --no-wait returns once the
-    # host is registered, so the copy of the EC2 key is shredded before the
-    # bring-up watch (about 4 minutes nested, 15-25 on .metal). The three
-    # steps are chained: when host add fails, the key stays for a retry
-    # and nothing else runs.
+    # --ssh-key is the operator login (user ubuntu has passwordless sudo).
+    # user-data also copied this EC2 key into root's authorized_keys (for
+    # bin/register-byoh-host), and host add leaves that line; step 4
+    # removes it. host add makes and keeps its own root key, and deletes
+    # its staged copy of this one after the prepare phase. --no-wait
+    # returns once the host is registered, so the copy of the EC2 key on
+    # the control plane is shredded before the bring-up watch (about 4
+    # minutes nested, 15-25 on .metal). The three steps are chained: when
+    # host add fails, the key stays for a retry and nothing else runs.
+    # On a development control plane, run packaging/bin/ubicloud-admin --dev
+    # from ~/ubicloud, without sudo, in place of sudo ubicloud-admin.
     EXPECT='<the --expect-host-key flags printed by step 1>'
     sudo ubicloud-admin host add --site ${local.byoh_location_name} --ssh ubuntu@${aws_instance.data.private_ip} --ssh-key ~/byoh_ssh_key --pool-file ~/pools.yaml $EXPECT --no-wait \
       && shred -u ~/byoh_ssh_key \
       && sudo ubicloud-admin host watch ${aws_instance.data.private_ip}
-    # On a development control plane, run packaging/bin/ubicloud-admin --dev
-    # from ~/ubicloud, without sudo, in place of sudo ubicloud-admin.
+
+    # 4. Optional, on the workstation once host add has succeeded: drop the
+    #    EC2 key from root's logins on the data plane (it stays the ubuntu
+    #    login). It keeps every other line, and changes nothing unless host
+    #    add's own key (tagged ubicloud-byoh) would remain:
+    #   ssh -i ${local.ssh_key_file} ubuntu@${aws_instance.data.public_ip} 'sudo sh -c "grep -vxFf /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys >/root/.ssh/ak.new; if [ \$? -le 1 ] && grep -q \" # ubicloud-byoh \" /root/.ssh/ak.new; then chmod 600 /root/.ssh/ak.new && mv /root/.ssh/ak.new /root/.ssh/authorized_keys; else rm -f /root/.ssh/ak.new; echo root keys left unchanged >&2; exit 1; fi"'
   EOT
 }
 

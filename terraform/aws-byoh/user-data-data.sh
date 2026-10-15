@@ -6,10 +6,11 @@
 # Runs ONCE via cloud-init on first boot. Does just enough to
 # be registrable as a BYOH host by the Ubicloud control plane:
 #
-#   1. Allow root login with the AWS key pair (so the operator can
-#      SSH as root to drop the ctrl plane's Ubicloud-generated
-#      SSH key into /root/.ssh/authorized_keys — that's the key
-#      Ubicloud's BootstrapRhizome prog uses)
+#   1. Allow root login with the AWS key pair. bin/register-byoh-host
+#      logs in as root with that key (BootstrapRhizome). ubicloud-admin
+#      host add needs only the ubuntu login and installs its own root
+#      key; it keeps this one, so the root copy stays a login until the
+#      optional step 4 of the host_add_command output removes it.
 #
 #   2. Pre-install ruby-bundler to dodge the apt-get update race in
 #      Prog::BootstrapRhizome.setup. Without this, the bootstrap
@@ -39,8 +40,7 @@ apt-get install -y openssh-server ruby-bundler
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
 # Copy the AWS keypair's pubkey from ubuntu's authorized_keys to
-# root's so the operator can SSH as root immediately (needed to
-# install the ctrl plane's Ubicloud SSH key into /root/.ssh/).
+# root's, for bin/register-byoh-host (see step 1 above).
 if [ -f /home/ubuntu/.ssh/authorized_keys ]; then
   cp /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys
   chmod 600 /root/.ssh/authorized_keys
