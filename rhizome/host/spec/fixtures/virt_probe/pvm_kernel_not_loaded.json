@@ -9,12 +9,18 @@
     "sys/class/dmi/id/sys_vendor": "Hetzner\n",
     "sys/class/dmi/id/product_name": "vServer\n",
     "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
-    "lib/modules/6.12.33-pvm/modules.dep": "kernel/arch/x86/kvm/kvm-pvm.ko: kernel/arch/x86/kvm/kvm.ko\n"
+    "lib/modules/6.12.33-pvm/modules.dep": "kernel/arch/x86/kvm/kvm-pvm.ko: kernel/arch/x86/kvm/kvm.ko\n",
+    "sys/module/apparmor/parameters/enabled": "Y\n"
   },
   "dirs": [],
   "execs": [
     "usr/bin/lxc-start",
-    "usr/bin/lxcfs"
+    "usr/bin/lxcfs",
+    "usr/bin/newuidmap",
+    "usr/bin/xz",
+    "usr/sbin/setquota",
+    "usr/sbin/cryptsetup",
+    "usr/sbin/mkfs.ext4"
   ],
   "expect": {
     "tier": "pvm_blocked",

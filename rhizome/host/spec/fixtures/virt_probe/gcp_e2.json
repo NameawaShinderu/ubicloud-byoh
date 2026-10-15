@@ -8,7 +8,8 @@
     "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
     "sys/class/dmi/id/sys_vendor": "Google\n",
     "sys/class/dmi/id/product_name": "Google Compute Engine\n",
-    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "sys/module/apparmor/parameters/enabled": "Y\n"
   },
   "dirs": [],
   "execs": [],

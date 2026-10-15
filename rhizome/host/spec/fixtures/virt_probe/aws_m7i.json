@@ -8,12 +8,18 @@
     "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
     "sys/class/dmi/id/sys_vendor": "Amazon EC2\n",
     "sys/class/dmi/id/product_name": "m7i.large\n",
-    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "sys/module/apparmor/parameters/enabled": "Y\n"
   },
   "dirs": [],
   "execs": [
     "usr/bin/lxc-start",
-    "usr/bin/lxcfs"
+    "usr/bin/lxcfs",
+    "usr/bin/newuidmap",
+    "usr/bin/xz",
+    "usr/sbin/setquota",
+    "usr/sbin/cryptsetup",
+    "usr/sbin/mkfs.ext4"
   ],
   "expect": {
     "tier": "none",

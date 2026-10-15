@@ -7,7 +7,8 @@
     "proc/cpuinfo": "processor\t: 0\nvendor_id\t: AuthenticAMD\nmodel name\t: AMD EPYC 7763 64-Core Processor\nflags\t\t: fpu lm svm pdpe1gb\n\n",
     "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
     "sys/class/dmi/id/sys_vendor": "ASUSTeK COMPUTER INC.\n",
-    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "sys/module/apparmor/parameters/enabled": "Y\n"
   },
   "dirs": [],
   "execs": [],

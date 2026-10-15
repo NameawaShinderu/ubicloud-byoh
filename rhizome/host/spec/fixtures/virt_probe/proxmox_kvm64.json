@@ -8,7 +8,8 @@
     "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
     "sys/class/dmi/id/sys_vendor": "QEMU\n",
     "sys/class/dmi/id/product_name": "Standard PC (i440FX + PIIX, 1996)\n",
-    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "sys/module/apparmor/parameters/enabled": "Y\n"
   },
   "dirs": [],
   "execs": [],

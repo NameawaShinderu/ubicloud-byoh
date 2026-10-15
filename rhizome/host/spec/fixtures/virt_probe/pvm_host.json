@@ -9,7 +9,8 @@
     ".virt-probe/kvm.json": "{\"kvm_api\": 12, \"kvm_errno\": null, \"kvm_create_vm\": true, \"kvm_caps_missing\": [], \"dev_kvm\": true, \"kvm_dev_mode\": \"0660\", \"kvm_dev_group\": \"kvm\"}",
     "sys/class/dmi/id/sys_vendor": "Hetzner\n",
     "sys/class/dmi/id/product_name": "vServer\n",
-    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "sys/module/apparmor/parameters/enabled": "Y\n"
   },
   "dirs": [
     "sys/module/kvm",

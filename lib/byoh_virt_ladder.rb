@@ -66,7 +66,7 @@ module ByohVirtLadder
 
   # What the kernel and CPU must offer for a fallback tier.
   FALLBACK_NEEDS = {
-    "container" => "cgroup v2 and Linux 5.12 or newer",
+    "container" => "an x86_64 CPU, cgroup v2, AppArmor and Linux 5.12 or newer",
     "pvm" => "a kernel that ships kvm_pvm",
     "emulated" => "an x86_64 host",
   }.freeze

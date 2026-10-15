@@ -30,9 +30,14 @@ RSpec.describe VirtProbe do
       "virt_container" => "none",
       "dmi" => {"sys_vendor" => "Dell Inc.", "product_name" => "PowerEdge R650"},
       "cgroup2" => true,
-      "commands" => {"lxc-start" => false, "lxcfs" => false, "qemu-system-x86_64" => false},
+      "apparmor" => true,
+      "commands" => {**container_commands(false), "qemu-system-x86_64" => false},
       "ovmf" => false,
     }.merge(over.transform_keys(&:to_s))
+  end
+
+  def container_commands(installed)
+    described_class::CONTAINER_COMMANDS.to_h { [it, installed] }
   end
 
   def write(root, path, content)
@@ -140,7 +145,7 @@ RSpec.describe VirtProbe do
           "apparmor" => true,
           "userns_restricted" => true,
           "prjquota" => true,
-          "commands" => {"lxc-start" => false, "lxcfs" => false, "qemu-system-x86_64" => true},
+          "commands" => {**container_commands(false), "qemu-system-x86_64" => true},
           "ovmf" => true,
         )
       end
@@ -582,24 +587,34 @@ RSpec.describe VirtProbe do
     end
 
     it "offers container and emulated on a KVM host without 1G pages, which cannot take today's VMs" do
-      installed = {"lxc-start" => true, "lxcfs" => true, "qemu-system-x86_64" => false}
+      installed = {**container_commands(true), "qemu-system-x86_64" => false}
       expect(described_class.fallbacks(facts(cpu_flags: %w[vmx], commands: installed), "kvm")).to eq("possible" => %w[container emulated], "ready" => %w[container], "unchecked" => [])
       expect(described_class.fallbacks(facts(arch: "aarch64", cpu_flags: []), "kvm")).to eq(none)
       expect(described_class.fallbacks(facts(cpu_flags: nil), "kvm")).to eq(none)
     end
 
     it "lists what the kernel allows and what is installed, fastest first" do
-      installed = {"lxc-start" => true, "lxcfs" => true, "qemu-system-x86_64" => true}
+      installed = {**container_commands(true), "qemu-system-x86_64" => true}
       expect(described_class.fallbacks(facts(commands: installed, ovmf: true), "pvm_blocked")).to eq("possible" => %w[container pvm emulated], "ready" => %w[container emulated], "unchecked" => [])
       expect(described_class.fallbacks(facts(commands: installed.merge("lxcfs" => false)), "none")).to eq("possible" => %w[container emulated], "ready" => [], "unchecked" => [])
       expect(described_class.fallbacks(facts(kernel: "5.4.0-1", commands: nil), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => [])
       expect(described_class.fallbacks(facts(kernel: "5.12.0", cgroup2: false), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => [])
-      expect(described_class.fallbacks(facts(arch: "aarch64", kernel: "6.8.0"), "kvm_blocked")).to eq("possible" => %w[container], "ready" => [], "unchecked" => [])
+    end
+
+    it "offers containers only where prep takes them: x86_64 with AppArmor and every package" do
+      installed = {**container_commands(true), "qemu-system-x86_64" => false}
+      expect(described_class.fallbacks(facts(arch: "aarch64", kernel: "6.8.0", commands: installed), "kvm_blocked")).to eq(none)
+      expect(described_class.fallbacks(facts(apparmor: false, commands: installed), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => [])
+      described_class::CONTAINER_COMMANDS.each do |cmd|
+        expect(described_class.fallbacks(facts(commands: installed.merge(cmd => false)), "none")).to eq("possible" => %w[container emulated], "ready" => [], "unchecked" => [])
+      end
+      expect(described_class.fallbacks(facts(commands: installed), "none")).to eq("possible" => %w[container emulated], "ready" => %w[container], "unchecked" => [])
     end
 
     it "lists a fallback whose kernel needs were not gathered as unchecked, never as impossible" do
       expect(described_class.fallbacks(facts.except("cgroup2"), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => %w[container])
       expect(described_class.fallbacks(facts(kernel: nil), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => %w[container])
+      expect(described_class.fallbacks(facts.except("apparmor"), "none")).to eq("possible" => %w[emulated], "ready" => [], "unchecked" => %w[container])
       expect(described_class.fallbacks(facts(arch: nil, kernel: nil), "kvm_blocked")).to eq("possible" => [], "ready" => [], "unchecked" => %w[container emulated])
     end
   end

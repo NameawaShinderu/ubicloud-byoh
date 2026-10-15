@@ -23,8 +23,8 @@ RSpec.describe Prog::Vm::HostNexus do
     facts = {
       "arch" => "x86_64", "kernel" => "6.8.0-1-generic", "cpu_vendor" => "GenuineIntel", "cpu_model" => "Intel Xeon",
       "cpu_flags" => %w[hypervisor pdpe1gb], "dev_kvm" => false, "modules" => [], "virt_vm" => "kvm", "virt_container" => "none",
-      "bios_log" => nil, "dmi" => {"sys_vendor" => "QEMU"}, "cgroup2" => true,
-      "commands" => {"lxc-start" => true, "lxcfs" => true, "qemu-system-x86_64" => true}, "ovmf" => true,
+      "bios_log" => nil, "dmi" => {"sys_vendor" => "QEMU"}, "cgroup2" => true, "apparmor" => true,
+      "commands" => {**VirtProbe::CONTAINER_COMMANDS.to_h { [it, true] }, "qemu-system-x86_64" => true}, "ovmf" => true,
     }.merge(over.transform_keys(&:to_s))
     ByohVirtLadder.from_facts(facts).record
   end

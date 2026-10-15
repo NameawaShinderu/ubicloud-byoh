@@ -10,8 +10,8 @@ RSpec.describe ByohVirtRegistration do
       "cpu_flags" => %w[vmx pdpe1gb], "tdp" => true, "dev_kvm" => true, "kvm_api" => 12, "kvm_errno" => nil,
       "kvm_create_vm" => true, "kvm_caps_missing" => [], "modules" => %w[kvm kvm_intel], "nested_param" => true,
       "pvm_module_available" => false, "bios_log" => nil, "virt_vm" => "none", "virt_container" => "none",
-      "dmi" => {"sys_vendor" => "Dell Inc.", "product_name" => "PowerEdge R650"}, "cgroup2" => true,
-      "commands" => {"lxc-start" => true, "lxcfs" => true, "qemu-system-x86_64" => true}, "ovmf" => true,
+      "dmi" => {"sys_vendor" => "Dell Inc.", "product_name" => "PowerEdge R650"}, "cgroup2" => true, "apparmor" => true,
+      "commands" => {**VirtProbe::CONTAINER_COMMANDS.to_h { [it, true] }, "qemu-system-x86_64" => true}, "ovmf" => true,
     }.merge(over.transform_keys(&:to_s))
   end
 

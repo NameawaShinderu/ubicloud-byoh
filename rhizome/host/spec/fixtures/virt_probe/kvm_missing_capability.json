@@ -9,7 +9,8 @@
     ".virt-probe/kvm.json": "{\"kvm_api\": 12, \"kvm_errno\": null, \"kvm_create_vm\": true, \"kvm_caps_missing\": [\"SplitIrqchip\"], \"dev_kvm\": true, \"kvm_dev_mode\": \"0660\", \"kvm_dev_group\": \"kvm\"}",
     "sys/class/dmi/id/sys_vendor": "VMware, Inc.\n",
     "sys/class/dmi/id/product_name": "VMware20,1\n",
-    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "sys/module/apparmor/parameters/enabled": "Y\n"
   },
   "dirs": [
     "sys/module/kvm",

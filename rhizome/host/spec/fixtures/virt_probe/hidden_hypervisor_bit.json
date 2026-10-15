@@ -9,7 +9,8 @@
     "sys/class/dmi/id/sys_vendor": "QEMU\n",
     "sys/class/dmi/id/product_name": "Standard PC (Q35 + ICH9, 2009)\n",
     "sys/class/dmi/id/bios_vendor": "SeaBIOS\n",
-    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "sys/module/apparmor/parameters/enabled": "Y\n"
   },
   "dirs": [],
   "execs": [],

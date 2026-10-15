@@ -25,7 +25,7 @@ RSpec.describe ByohVirtLadder do
       "virt_vm" => "none",
       "virt_container" => "none",
       "dmi" => {"sys_vendor" => "Dell Inc.", "product_name" => "PowerEdge R650"},
-      "cgroup2" => true,
+      "cgroup2" => true, "apparmor" => true,
       "commands" => {"lxc-start" => false, "lxcfs" => false, "qemu-system-x86_64" => false},
       "ovmf" => false,
     }.merge(over.transform_keys(&:to_s))
@@ -192,7 +192,7 @@ RSpec.describe ByohVirtLadder do
 
     it "says when no fallback is installed, and when the recommended one is" do
       ship_virt_tiers
-      v = verdict(**no_virt, commands: {"lxc-start" => true, "lxcfs" => true})
+      v = verdict(**no_virt, commands: VirtProbe::CONTAINER_COMMANDS.to_h { [it, true] })
       expect(v.text).to include("fallbacks ready: container\nfallbacks possible after installing their packages: emulated\n")
         .and include("recommended: #{described_class::FALLBACK_LABELS["container"]}; fallbacks")
       expect(verdict(**no_virt).text).to include("fallbacks ready: none\n")
@@ -206,12 +206,12 @@ RSpec.describe ByohVirtLadder do
       expect(v.text).to include("
 fallbacks not checked (the kernel facts were not gathered): container
 ")
-        .and include("recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs, if the host has cgroup v2 and Linux 5.12 or newer (not checked); fallbacks")
+        .and include("recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs, if the host has an x86_64 CPU, cgroup v2, AppArmor and Linux 5.12 or newer (not checked); fallbacks")
       expect(v.record).to include("unchecked" => %w[container])
     end
 
     it "lists the fallbacks of a KVM host without 1G pages, and asks for the fix first" do
-      v = verdict(cpu_flags: %w[vmx], commands: {"lxc-start" => true, "lxcfs" => true})
+      v = verdict(cpu_flags: %w[vmx], commands: VirtProbe::CONTAINER_COMMANDS.to_h { [it, true] })
       expect([v.tier, v.standard_vms?, v.possible, v.ready, v.recommended]).to eq ["kvm", false, %w[container emulated], %w[container], nil]
       expect(v.text).to include("fallbacks ready: container
 ").and end_with("recommended: apply the fix above and probe again")
@@ -257,11 +257,11 @@ fallbacks not checked (the kernel facts were not gathered): container
       expect(result[:checks]["kvm_device"]).to eq "unknown"
       expect(result[:fix]).to start_with "Gather what is missing (dev_kvm)"
       expect(described_class.preflight_check(shell, declared_tier: "container")).to include(status: "info", fix: start_with("Whether KVM works here is unknown, so container cannot be checked yet. Gather"))
-      expect(described_class.preflight_check(facts(**no_virt).except("cgroup2"), declared_tier: "container")).to include(status: "info", fix: "Could not check that this host has cgroup v2 and Linux 5.12 or newer (the facts were not gathered); check it before registering it as container.")
+      expect(described_class.preflight_check(facts(**no_virt).except("cgroup2"), declared_tier: "container")).to include(status: "info", fix: "Could not check that this host has an x86_64 CPU, cgroup v2, AppArmor and Linux 5.12 or newer (the facts were not gathered); check it before registering it as container.")
     end
 
     it "allows the fallbacks on a KVM host without 1G pages, with the KVM fix as advice" do
-      no_1g = facts(cpu_flags: %w[vmx], commands: {"lxc-start" => true, "lxcfs" => true})
+      no_1g = facts(cpu_flags: %w[vmx], commands: VirtProbe::CONTAINER_COMMANDS.to_h { [it, true] })
       result = described_class.preflight_check(no_1g, declared_tier: "container")
       expect(result).to include(status: "pass", fix: nil, tier: "kvm")
       expect(result[:caveats][1]).to eq "KVM fix, if you would rather run today's VMs: #{described_class::NO_1G_FIX}"
@@ -274,12 +274,20 @@ fallbacks not checked (the kernel facts were not gathered): container
     end
 
     it "gates a declared fallback on its own readiness" do
-      ready = facts(**no_virt, commands: {"lxc-start" => true, "lxcfs" => true})
+      ready = facts(**no_virt, commands: VirtProbe::CONTAINER_COMMANDS.to_h { [it, true] })
       result = described_class.preflight_check(ready, declared_tier: "container")
       expect(result).to include(status: "pass", fix: nil)
       expect(result[:caveats].first).to start_with "KVM: none (L3-L5)"
       expect(described_class.preflight_check(facts(**no_virt), declared_tier: "emulated")).to include(status: "fail", fix: "Prepare emulated first: apt-get install qemu-system-x86 ovmf.")
       expect(described_class.preflight_check(facts(**no_virt), declared_tier: "pvm")).to include(status: "fail", fix: "This host cannot run pvm: #{described_class::FALLBACK_LABELS["pvm"]} needs a kernel that ships kvm_pvm.")
+    end
+
+    it "refuses containers where prep would: not x86_64, or a package missing" do
+      installed = VirtProbe::CONTAINER_COMMANDS.to_h { [it, true] }
+      arm = facts(**no_virt, arch: "aarch64", cpu_flags: [], commands: installed)
+      expect(described_class.preflight_check(arm, declared_tier: "container")).to include(status: "fail", fix: "This host cannot run container: #{described_class::FALLBACK_LABELS["container"]} needs an x86_64 CPU, cgroup v2, AppArmor and Linux 5.12 or newer.")
+      no_quota = facts(**no_virt, commands: installed.merge("setquota" => false))
+      expect(described_class.preflight_check(no_quota, declared_tier: "container")).to include(status: "fail", fix: "Prepare container first: #{described_class::FALLBACK_PACKAGES["container"]}.")
     end
 
     it "refuses a fallback where KVM works, in a container, without root, and beside PVM" do

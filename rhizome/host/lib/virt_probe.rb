@@ -133,6 +133,10 @@ module VirtProbe
 
   MIN_CONTAINER_KERNEL = [5, 12].freeze
 
+  # A command of each package a container host needs
+  # (HostTier::CONTAINER_PACKAGES, in that order).
+  CONTAINER_COMMANDS = %w[lxc-start lxcfs newuidmap xz setquota cryptsetup mkfs.ext4].freeze
+
   BIN_DIRS = %w[usr/local/sbin usr/local/bin usr/sbin usr/bin sbin bin].freeze
 
   OVMF_PATHS = %w[usr/share/OVMF/OVMF_CODE_4M.fd usr/share/OVMF/OVMF_CODE.fd usr/share/ovmf/OVMF.fd usr/share/qemu/OVMF.fd].freeze
@@ -173,7 +177,7 @@ module VirtProbe
       "apparmor" => read(root, "sys/module/apparmor/parameters/enabled")&.strip == "Y",
       "userns_restricted" => read(root, "proc/sys/kernel/apparmor_restrict_unprivileged_userns")&.strip == "1",
       "prjquota" => prjquota(root),
-      "commands" => %w[lxc-start lxcfs qemu-system-x86_64].to_h { |cmd| [cmd, BIN_DIRS.any? { |dir| File.executable?(File.join(root, dir, cmd)) }] },
+      "commands" => [*CONTAINER_COMMANDS, "qemu-system-x86_64"].to_h { |cmd| [cmd, BIN_DIRS.any? { |dir| File.executable?(File.join(root, dir, cmd)) }] },
       "ovmf" => OVMF_PATHS.any? { |path| File.exist?(File.join(root, path)) },
     }
   end
@@ -475,11 +479,16 @@ module VirtProbe
     possible = []
     ready = []
     unchecked = []
-    if facts["cgroup2"].nil? || version.empty?
-      unchecked << "container"
-    elsif facts["cgroup2"] && (version <=> MIN_CONTAINER_KERNEL) >= 0
+    # What HostTier's container prep checks that the probe can see: an
+    # x86_64 host with cgroup v2, AppArmor and Linux 5.12 or newer, and
+    # every command of its CONTAINER_PACKAGES. Prep still checks systemd,
+    # LXC's AppArmor profile and the kernel settings.
+    container_needs = [facts["arch"].nil? ? nil : facts["arch"] == "x86_64", facts["cgroup2"], facts["apparmor"], version.empty? ? nil : (version <=> MIN_CONTAINER_KERNEL) >= 0]
+    if container_needs.all?
       possible << "container"
-      ready << "container" if commands["lxc-start"] && commands["lxcfs"]
+      ready << "container" if CONTAINER_COMMANDS.all? { commands[it] }
+    elsif !container_needs.include?(false)
+      unchecked << "container"
     end
     possible << "pvm" if tier == "pvm_blocked"
     if facts["arch"] == "x86_64"

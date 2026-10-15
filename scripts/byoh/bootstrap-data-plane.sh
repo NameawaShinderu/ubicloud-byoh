@@ -216,6 +216,11 @@ else
   echo "  tier $TIER: skipping the KVM checks (docs/byoh/NO_KVM.md)"
   case "$TIER" in
     container)
+      # prep_host.rb refuses others (HostTier check_container_arch).
+      if [ "$(uname -m)" != x86_64 ]; then
+        echo "ERROR: container hosts must be x86_64; this is $(uname -m)." >&2
+        exit 1
+      fi
       if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
         echo "ERROR: containers need the unified cgroup hierarchy (cgroup v2)." >&2
         exit 1

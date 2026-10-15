@@ -8,7 +8,8 @@
     "proc/mounts": "/dev/root / ext4 rw,relatime 0 0\n",
     ".virt-probe/kvm.json": "{\"dev_kvm\": true, \"kvm_dev_mode\": \"0660\", \"kvm_dev_group\": \"kvm\", \"kvm_api\": \"Permission denied @ rb_sysopen - /dev/kvm\", \"kvm_errno\": \"EACCES\"}",
     "sys/class/dmi/id/sys_vendor": "Dell Inc.\n",
-    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n"
+    "sys/fs/cgroup/cgroup.controllers": "cpu io memory pids\n",
+    "sys/module/apparmor/parameters/enabled": "Y\n"
   },
   "dirs": [
     "sys/module/kvm",
