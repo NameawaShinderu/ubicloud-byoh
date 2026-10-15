@@ -266,21 +266,21 @@ Milestone M4 ([ROADMAP.md](ROADMAP.md) §3.3) adds `ubicloud-admin site add` and
 |---|---|---|---|---|
 | G-M4-1 | E2 on AWS: a **fresh** terraform workspace (never `company-mumbai`), `install.sh`, then `site add` and `host add --ssh` exactly as [recipes/aws.md](recipes/aws.md) gives them | `scripts/byoh/verify/m4-e2.sh` with `PLATFORM=aws` | `host add` exits 0, the host reaches `accepting`, and the M2 gate steps pass (default `g1 g2 g4 g5`; `GATE_STEPS` for more once VMs exist) | UNVERIFIED, not run |
 | G-M4-2 | E2 on Proxmox: one VM built from [recipes/proxmox.md](recipes/proxmox.md), the same three commands | `m4-e2.sh` with `PLATFORM=proxmox` | as G-M4-1 | UNVERIFIED, not run |
-| G-M4-3 | F5 soak on an EBS-backed host (the G-M4-1 host) | `scripts/byoh/verify/m4-f5-soak.sh --host vh... --hours 24 --interval 600`, monitor started by hand | every sample passes: the monitor runs; no `unavailable` label; `accepting`; `checkup` unset; no open non-info page for the host; `perform_health_checks` true over a fresh session | UNVERIFIED, not run |
+| G-M4-3 | F5 soak on an EBS-backed host (the G-M4-1 host) | `scripts/byoh/verify/m4-f5-soak.sh --host vh... --hours 24 --interval 600`, monitor started by hand | every sample passes: the monitor runs; no `unavailable` label; `accepting`; `checkup` unset; no open non-info page for the host, and none raised since the soak began and resolved again; `perform_health_checks` true over a fresh session; no down reading of the host in the monitor's log since the last sample | UNVERIFIED, not run |
 | G-M4-4 | F5 soak on a virtio host (the G-M4-2 VM) | as G-M4-3 | as G-M4-3 | UNVERIFIED, not run |
 | G-M4-5 | F5 soak on an LVM-root host (Ubuntu's default LVM install, own hardware or a VM) | as G-M4-3 | as G-M4-3 | UNVERIFIED, not run |
 | G-M4-6 | Preflight catches no `/dev/kvm` or a kvm64-class CPU (PF3), a pool containing the uplink IP (PF17), and a hybrid CPU (`PF8-hybrid`) | `scripts/byoh/test/preflight-fixtures.sh`, `scripts/byoh/test/m4-host-add.sh` (runs A, B, C), `spec/lib/byoh_host_preflight_spec.rb`, `rhizome/host/spec/ubicloud_host_parity_spec.rb` | each is a `fail` that stops `host add` before a change, and none can be accepted except `PF8-hybrid` | **Pass on fixtures and `ubi-m4-*` containers** (2026-10-15). The evidence is fixture files and containers without `/dev/kvm`, not real hardware: the kvm64 and hybrid fixtures are synthesised (`scripts/byoh/test/fixtures/host/{kvm64-model,kvm64-vmx,intel-hybrid,arm-biglittle}`) |
 
 ### 6.1 Running the scripted gates
 
-Both scripts run on the control plane from the repository root, and log to `var/`. They were exercised against stubs only (`scripts/byoh/test/m4-gate-scripts.sh`, 54 checks).
+Both scripts run on the control plane from the repository root, and log to `var/`. They were exercised against stubs only (`scripts/byoh/test/m4-gate-scripts.sh`, 111 checks). Their database checks run `m2-checks`: on a packaged control plane through `sudo ubicloud-admin run m2-checks` (the release and `/etc/ubicloud/env`; the scripts pick it when `/etc/ubicloud` exists or the services run under systemd), on a development one through `bundle exec`. Both try it before anything else and stop with exit 2 when it cannot run, so a setup problem never reads as a failing host; `GATE_CHECKS` and `SOAK_CHECKS` override the command.
 
 **E2 (G-M4-1, G-M4-2).** `install.sh` is the first of the three commands; run it as [INSTALL.md](INSTALL.md) says. Then:
 
 ```bash
 export SITE=byoh-aws-m4 PLATFORM=aws HOST_SSH=ubuntu@<data private IP> \
   HOST_KEY=~/byoh_ssh_key POOL_FILE=~/pools.yaml \
-  EXPECT_HOST_KEY="SHA256:... SHA256:..."            # from the host_add_command step 1
+  EXPECT_HOST_KEY="SHA256:... SHA256:..."            # host_add_command step 1's output, flags and all
 scripts/byoh/verify/m4-e2.sh -- --display "AWS (BYOH M4 canary)" --underlay 10.98.0.0/16 \
   --overlay 172.20.0.0/14 --cp-reach onhost --cp-source <control plane private IP>/32 \
   --mgmt-allow <operator /32> --rates-from hetzner-fsn1
@@ -288,8 +288,12 @@ scripts/byoh/verify/m4-e2.sh -- --display "AWS (BYOH M4 canary)" --underlay 10.9
 
 - `site add` options go after `--`, unchanged (terraform prints them as `byoh_location_create_command`). An existing site is skipped.
 - Without `EXPECT_HOST_KEY`, set `HOST_ADD_YES=1` to confirm with `--yes`; compare the fingerprints in the log with the console afterwards.
-- The script generates the registration key and passes it as `--registration-key`, so the gate's root logins (`GATE_HOST_KEY`) use the key the control plane keeps; set `GATE_HOST_KEY` to use your own.
-- `HOST_ADD_ARGS` adds options (`--storage-disk ...`, `--accept-check ...`). `GATE_STEPS` picks the M2 gate steps; `GATE_*` settings of §1.4 pass through.
+- `EXPECT_HOST_KEY` takes bare `SHA256:...` fingerprints or the `--expect-host-key SHA256:...` flags terraform's step 1 prints.
+- The script generates the registration key and passes it as `--registration-key`, so the gate's root logins (`GATE_HOST_KEY`) use the key the control plane keeps; set `GATE_HOST_KEY` to use your own. The key is a root login to the host, so it lives outside the repository, in `~/.ubicloud-m4-e2/` (0700, `E2_KEY_DIR`), named by platform, site and main IP:
+  - After a failure it stays, and the last log line names it: re-running the same command (the resume `host add` recommends) reuses it, as the control plane already holds it.
+  - After a pass the script shreds it; `E2_KEEP_KEY=1` keeps it for later `GATE_STEPS` runs, and the log says to `shred -u` it when the window ends.
+  - A re-run against a host that is already registered, with the key gone, stops with FAIL before the gate: `resume` never installs a new key. Set `GATE_HOST_KEY` to a root key of the host then.
+- `HOST_ADD_ARGS` adds options (`--storage-disk ...`, `--accept-check ...`, `--main-ip ...`). The gate checks the `--main-ip` given there (else the host of `HOST_SSH`); a `MAIN_IP` that differs from it is refused. `GATE_STEPS` picks the M2 gate steps; `GATE_*` settings of §1.4 pass through.
 - The log has every output line with seconds since its phase began, then the phase durations (`site add`, `host add`, `m2 gate`) and the verdict. The bring-up's own phases show as the watch's label lines.
 - AWS: end the window by stopping the data plane or `terraform destroy` of the workspace. Proxmox: `qm stop` the VM.
 
@@ -299,7 +303,13 @@ scripts/byoh/verify/m4-e2.sh -- --display "AWS (BYOH M4 canary)" --underlay 10.9
 scripts/byoh/verify/m4-f5-soak.sh --host vh<ebs> --host vh<virtio> --host vh<lvm> --hours 24 --interval 600
 ```
 
-Each sample checks the monitor and runs `scripts/byoh/verify/m2-checks health --host H --probe` for each host. `--probe` logs in to the host and runs the monitor's health checks; their read/write check writes and deletes a 1 MiB file in each storage path. Afterwards stop the monitor again (it stays disabled until M9, [OPERATIONS.md](OPERATIONS.md) §9).
+Each sample checks the monitor and runs `m2-checks health --host H --since START --probe` for each host, START being the soak's start:
+
+- `--since` fails on a non-info page for the host raised after START even when it is resolved again, so a host that went `unavailable` and recovered between two samples is not missed.
+- The monitor logs every down reading ("Got new pulse." with `"reading":"down"`), also those that never set `checkup` or recover within the 90 s before HostNexus pages. Each sample reads the log written since the last one (`SOAK_MONITOR_LOG`: the `ubicloud-monitor` journal under systemd, `/tmp/monitor.log` under tmux) and fails on a down reading of the host. A log it cannot read is a WARN line: then only pages and the sampled state count, and a mark-down shorter than the interval and the 90 s deadline goes unseen.
+- `--probe` logs in to the host and runs the monitor's health checks; their read/write check writes and deletes a 1 MiB file in each storage path. It refuses (FAIL) a host whose SSH host keys are not pinned yet, as its session would pin the keys it meets in the database; respirate pins them on its next SSH session to the host. Nothing else is written.
+
+Afterwards stop the monitor again (it stays disabled until M9, [OPERATIONS.md](OPERATIONS.md) §9).
 
 ### 6.2 M4 results
 
