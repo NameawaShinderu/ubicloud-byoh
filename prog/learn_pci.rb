@@ -92,8 +92,17 @@ class Prog::LearnPci < Prog::Base
     # insert_conflict never removes a row, so a BYOH host learned before
     # the vfio-pci filter keeps the GPUs it can't pass through. Drop
     # those that no VM holds. The strand run's transaction covers both.
+    # A row in a GPU partition is kept: deleting it would cascade out of
+    # gpu_partitions_pci_devices and leave the partition enabled but short
+    # of GPUs, which the allocator would keep choosing and failing on.
     if vm_host.byoh?
-      PciDevice.where(vm_host_id: vm_host.id, vm_id: nil).exclude(slot: instances.map(&:slot)).destroy
+      stale = PciDevice.where(vm_host_id: vm_host.id, vm_id: nil).exclude(slot: instances.map(&:slot))
+      in_partition = DB[:gpu_partitions_pci_devices].select(:pci_device_id)
+      partitioned = stale.where(id: in_partition).select_order_map(:slot)
+      unless partitioned.empty?
+        Clog.emit("GPU partition holds PCI devices LearnPci no longer offers on VmHost #{vm_host.ubid}; fix or disable the partition", {slots: partitioned})
+      end
+      stale.exclude(id: in_partition).destroy
     end
 
     pop("created PciDevice records")

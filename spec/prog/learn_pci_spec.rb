@@ -220,6 +220,19 @@ EOS
       expect(rows).to eq([])
     end
 
+    it "keeps an idle stale row that a GPU partition holds, and says so" do
+      kept = PciDevice.create(vm_host_id: vm_host.id, slot: "05:00.0", device_class: "0300", vendor: "10de", device: "27b0", iommu_group: 15)
+      PciDevice.create(vm_host_id: vm_host.id, slot: "07:00.0", device_class: "0300", vendor: "10de", device: "27b0", iommu_group: 17)
+      partition = GpuPartition.create(vm_host_id: vm_host.id, partition_id: 1, gpu_count: 1)
+      DB[:gpu_partitions_pci_devices].insert(gpu_partition_id: partition.id, pci_device_id: kept.id)
+      expect(lp.sshable).to receive(:_cmd).with(lspci).and_return(lspci_fixture("no-gpu"))
+      expect(Clog).to receive(:emit).with("GPU partition holds PCI devices LearnPci no longer offers on VmHost #{vm_host.ubid}; fix or disable the partition", {slots: ["05:00.0"]}).and_call_original
+
+      expect { lp.start }.to exit({"msg" => "created PciDevice records"})
+      expect(rows).to eq([["05:00.0", nil]])
+      expect(DB[:gpu_partitions_pci_devices].where(gpu_partition_id: partition.id).select_map(:pci_device_id)).to eq([kept.id])
+    end
+
     it "keeps the upstream command and rows for a generic host outside a BYOH location" do
       vm_host.update(location_id: Location::HETZNER_FSN1_ID)
       PciDevice.create(vm_host_id: vm_host.id, slot: "05:00.0", device_class: "0300", vendor: "10de", device: "27b0", iommu_group: 15)
