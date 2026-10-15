@@ -422,14 +422,15 @@ one of them resolves to that shim directory, so no real device is
 touched.
 
 The cases cover these refusals:
-- the disk of `/` or `/boot/efi`
+- the disk of `/`, `/boot` or `/boot/efi`, a btrfs `/` (`/dev/sda1[/@]`, major 0), and a ZFS `/` no disk names (a warning, then refused by the partition check)
 - a partition or device-mapper link
-- a by-id prefix that matches two links
+- a by-id prefix that matches two links, also when one of them is an exact name (an exact name alone wins)
 - a missing link, or a link to something other than a disk
 - partitions, a mount, holders or swap
 - a `wipefs` signature, a `blkid` partition table, or a backup GPT in the last 4096-byte block
-- iSCSI (and then allowed with `--allow-shared-transport`), and multipath
-- a `blkid` error (fails closed with exit 3)
+- iSCSI (and then allowed with `--allow-shared-transport`), FCoE, NVMe whose controller transport is `tcp`, `rdma` on one path of a multipath head, or missing, and multipath (NVMe over `pcie` passes)
+- a `blkid` error, a failed or short read of the last block, and a failed `lsblk -o TRAN` (fail closed with exit 3)
+- a failed copy of `/etc/fstab` (exit 3, fstab unchanged, no temporary file)
 - an `ubi-diskN` label without its fstab line
 - a signature that appears between the checks and mkfs
 

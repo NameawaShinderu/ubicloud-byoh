@@ -62,6 +62,15 @@ expect_refused() {
   pass "$case"
 }
 
+# expect_internal CASE WANT: exit 3 naming WANT, and nothing changed.
+expect_internal() {
+  local case=$1 want=$2
+  ((RC == 3)) || fail "$case: exit $RC, expected 3 (out: $OUT; err: $ERR)"
+  [[ $ERR == *"internal error: "*"$want"* ]] || fail "$case: stderr '$ERR' lacks 'internal error: ...$want'"
+  ! grep -q '^mkfs.ext4\|^chattr\|^mount' "$R/fake/log" || fail "$case: a failed run changed something: $(cat "$R/fake/log")"
+  pass "$case"
+}
+
 pass() {
   PASS=$((PASS + 1))
   echo "pass $1"
@@ -83,6 +92,29 @@ printf 'NAME="sdb" TYPE="disk"\n' >"$R/fake/block/_dev_block_8:16"
 sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
 expect_refused "boot/efi disk" "is the disk of /boot/efi"
 
+base boot-mount
+echo "/dev/sdb 8:16" >"$R/fake/mnt/_boot"
+printf 'NAME="sdb" TYPE="disk"\n' >"$R/fake/block/_dev_block_8:16"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+expect_refused "boot disk" "is the disk of /boot"
+
+# btrfs: the source has a subvolume and the anonymous major 0, so the
+# disk is found from the source path.
+base btrfs-root
+echo "/dev/sda1[/@] 0:30" >"$R/fake/mnt/_"
+printf 'NAME="sda1" TYPE="part"\nNAME="sda" TYPE="disk"\n' >"$R/fake/block/_dev_sda1"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_root
+expect_refused "btrfs root disk" "scsi-0QEMU_QEMU_HARDDISK_root is the disk of /"
+
+# ZFS: no block device names the disk of /, so only a warning, and the
+# root disk is still refused by the later checks.
+base zfs-root
+echo "rpool/ROOT/ubuntu 0:25" >"$R/fake/mnt/_"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_root
+expect_refused "unresolvable root still refused" "has partitions (/dev/sda1)"
+grep -q "warning: cannot tell which disk holds /;" <<<"$ERR" || fail "unresolvable root: no warning ($ERR)"
+pass "unresolvable root warns"
+
 base partition-link
 sd --by-id scsi-0QEMU_QEMU_HARDDISK_root-part1
 expect_refused "partition link" "points at sda1, which is not a whole disk"
@@ -94,6 +126,20 @@ expect_refused "dm link" "is a device-mapper, LVM or md link"
 base two-links
 sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank
 expect_refused "by-id matching two links" "matches 2 links (scsi-0QEMU_QEMU_HARDDISK_blank1 scsi-0QEMU_QEMU_HARDDISK_blank2)"
+
+# An exact link wins over the longer links it prefixes.
+base exact-link
+rm "$R/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_blank2"
+ln -s ../../sdd "$R/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_blank10"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+((RC == 0)) || fail "exact link: exit $RC ($ERR)"
+grep -qx "mkfs.ext4 -q -L ubi-disk1 /dev/sdb" "$R/fake/log" || fail "exact link: mkfs call ($(grep ^mkfs "$R/fake/log"))"
+pass "exact link beside a longer one"
+base exact-link-prefix
+rm "$R/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_blank2"
+ln -s ../../sdd "$R/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_blank10"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank
+expect_refused "prefix of an exact link and a longer one" "matches 2 links (scsi-0QEMU_QEMU_HARDDISK_blank1 scsi-0QEMU_QEMU_HARDDISK_blank10)"
 
 base no-link
 sd --by-id wwn-0xdeadbeef
@@ -151,6 +197,38 @@ sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1 --allow-shared-transport
 grep -q "warning: .* shared storage (iscsi)" <<<"$ERR" || fail "iscsi allowed: no warning ($ERR)"
 pass "iscsi with --allow-shared-transport"
 
+base fcoe
+echo fcoe >"$R/fake/disk/sdb/tran"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+expect_refused "fcoe" "is shared storage (fcoe)"
+
+# lsblk says nvme for fabrics too; the controller's transport decides.
+base nvme-tcp
+echo nvme >"$R/fake/disk/sdb/tran"
+mkdir -p "$R/sys/block/sdb/device" && echo tcp >"$R/sys/block/sdb/device/transport"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+expect_refused "nvme over tcp" "is shared storage (nvme-tcp)"
+
+base nvme-subsys
+echo nvme >"$R/fake/disk/sdb/tran"
+mkdir -p "$R/sys/block/sdb/device/nvme0" "$R/sys/block/sdb/device/nvme1"
+echo pcie >"$R/sys/block/sdb/device/nvme0/transport"
+echo rdma >"$R/sys/block/sdb/device/nvme1/transport"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+expect_refused "nvme multipath head with an rdma path" "is shared storage (nvme-rdma)"
+
+base nvme-unknown
+echo nvme >"$R/fake/disk/sdb/tran"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+expect_refused "nvme with no transport" "is shared storage (nvme-unknown)"
+
+base nvme-pcie
+echo nvme >"$R/fake/disk/sdb/tran"
+mkdir -p "$R/sys/block/sdb/device" && echo pcie >"$R/sys/block/sdb/device/transport"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+((RC == 0)) || fail "nvme over pcie: exit $RC ($ERR)"
+pass "nvme over pcie is local"
+
 base multipath
 echo /dev/sdb >"$R/fake/multipath"
 sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
@@ -161,6 +239,21 @@ echo 4 >"$R/fake/disk/sdb/blkid.rc"
 sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
 ((RC == 3)) || fail "blkid error: exit $RC, expected 3 ($ERR)"
 pass "blkid error fails closed"
+
+base dd-error
+echo 1 >"$R/fake/disk/sdb/dd.rc"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+expect_internal "last block read error fails closed" "cannot read the last block of /dev/sdb"
+
+base dd-short
+echo 100 >"$R/fake/disk/sdb/lastblock.len"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+expect_internal "last block short read fails closed" "short read of the last block of /dev/sdb (100 of 512 bytes)"
+
+base tran-error
+echo 1 >"$R/fake/disk/sdb/tran.rc"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+expect_internal "transport lookup error fails closed" "lsblk -o TRAN /dev/sdb failed"
 
 base not-ours
 echo ext4 >"$R/fake/disk/sdb/fstype"
@@ -227,6 +320,22 @@ sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
 [[ $(tail -1 <<<"$OUT") == "storage-disk: ok /var/storage/devices/disk4 UUID=$(<"$R/fake/disk/sdb/uuid")" ]] || fail "next free: '$(tail -1 <<<"$OUT")'"
 grep -qx "UUID=1111 /var/storage/devices/disk1 ext4 defaults 0 2" "$R/etc/fstab" || fail "next free: the unterminated last line was damaged ($(cat "$R/etc/fstab"))"
 pass "next free diskN"
+
+# A failed copy of /etc/fstab leaves it as it was, with no temporary
+# file. The disk is formatted by then, so a re-run refuses it as a disk
+# labelled ubi-diskN without its fstab line.
+base fstab-copy
+cp "$R/etc/fstab" "$WORK/fstab.before"
+# shellcheck disable=SC2016 # expands in the wrapper
+printf '#!/bin/bash\nfor a; do [[ $a == "%s/etc/fstab" ]] && exit 1; done\nexec /usr/bin/cat "$@"\n' "$R" >"$R/shim/cat"
+chmod +x "$R/shim/cat"
+sd --by-id scsi-0QEMU_QEMU_HARDDISK_blank1
+((RC == 3)) || fail "fstab copy: exit $RC ($ERR)"
+grep -q "cannot copy /etc/fstab" <<<"$ERR" || fail "fstab copy: $ERR"
+cmp -s "$WORK/fstab.before" "$R/etc/fstab" || fail "fstab copy: fstab changed to $(cat "$R/etc/fstab")"
+[[ -z $(find "$R/etc" -name '.fstab*') ]] || fail "fstab copy: a temporary fstab is left"
+! grep -q '^mount' "$R/fake/log" || fail "fstab copy: mounted"
+pass "failed fstab copy keeps /etc/fstab"
 
 # --- guards ------------------------------------------------------------
 

@@ -7,8 +7,11 @@
 #   fake/disk/<name>/  type (default disk), tran, size, model, serial,
 #                      sig (wipefs -n lines), pttype, fstype, label,
 #                      uuid, mounts, parts ("<name> [mountpoint]" lines),
-#                      ss, bytes, lastblock (its first bytes),
-#                      blkid.rc (forces a blkid exit status)
+#                      ss, bytes, lastblock (its first bytes, padded
+#                      with zeros to the block size), lastblock.len
+#                      (a short read: bytes dd returns), dd.rc and
+#                      blkid.rc (force an exit status), tran.rc (forces
+#                      the exit status of lsblk -o TRAN)
 #   fake/mnt/<key>     "SOURCE MAJ:MIN" of mount point <key> (/ as _)
 #   fake/block/<key>   lsblk -nPso NAME,TYPE lines for device <key>
 #   fake/mounted       "target device" lines that mount added
@@ -83,6 +86,7 @@ shim_lsblk() {
     return
   fi
   d=$(disk_of "$dev") || exit 32
+  [[ ,$cols, == *,TRAN,* && -f $d/tran.rc ]] && exit "$(<"$d/tran.rc")"
   local IFS=,
   local cs
   read -ra cs <<<"$cols"
@@ -169,7 +173,10 @@ case $cmd in
   dd)
     [[ $1 == if=/dev/* && $# == 5 ]] || unknown "$@"
     d=$(disk_of "${1#if=}")
-    if [[ -f $d/lastblock ]]; then cat "$d/lastblock"; else head -c 512 /dev/zero; fi
+    bs=${2#bs=}
+    [[ -f $d/lastblock.len ]] && bs=$(<"$d/lastblock.len")
+    { val "$d" lastblock; head -c "$bs" /dev/zero; } | head -c "$bs"
+    if [[ -f $d/dd.rc ]]; then exit "$(<"$d/dd.rc")"; fi
     ;;
   mkfs.ext4)
     [[ $# == 4 && $1 == -q && $2 == -L ]] || unknown "$@"
