@@ -22,7 +22,9 @@ require "shellwords"
 #      cross-checks the host keys ssh met with the host's own
 #      /etc/ssh/ssh_host_*_key.pub.
 #   3. Shows what it will change and the host-key fingerprints, and
-#      needs --yes, --expect-host-key or a typed "yes".
+#      needs --yes, --expect-host-key or a typed "yes". --expect-host-key
+#      is checked against the key ssh met, which only the real host can
+#      present, not against the keys the host reports.
 #   4. Installs the registration key in root's authorized_keys, on a
 #      line tagged with the site and the main IP that a re-run replaces,
 #      and, only when sshd does not already allow it, a drop-in that
@@ -336,8 +338,8 @@ class ByohHostAdd
         @out.puts "Checking #{o[:ssh]} (preflight, read-only)"
         sudo!(ssh)
         keys, cp_ip = host_preflight(ssh, reg, o, services, adding: true)
-        print_fingerprints(keys)
-        expected!(o[:expect_host_keys], keys)
+        print_fingerprints(keys, ssh)
+        expected!(o[:expect_host_keys], keys, ssh)
         confirm!(o, mutation_summary(ssh, o, site))
 
         key_path = keep_registration_key(site, o[:main_ip], registration_key)
@@ -370,7 +372,7 @@ class ByohHostAdd
     ByohOperatorSsh.open(o[:ssh], port: o[:ssh_port], key: o[:ssh_key], runner: @runner || ByohOperatorSsh::OPEN3_RUNNER) do |ssh|
       sudo!(ssh)
       keys, = host_preflight(ssh, reg, o, services, adding: false)
-      print_fingerprints(keys)
+      print_fingerprints(keys, ssh)
     end
     @out.puts "Preflight passed; nothing on the host was changed."
     0
@@ -439,12 +441,25 @@ class ByohHostAdd
     end
   end
 
-  def print_fingerprints(keys)
+  # The keys the host reports, marking the one ssh met: only that one
+  # proves which machine answered, as the others are public.
+  def print_fingerprints(keys, ssh)
+    met = ssh.recorded_host_keys
     @out.puts "Host keys:"
-    keys.each { @out.puts "  #{it.type} #{it.fingerprint}" }
+    keys.each { @out.puts "  #{it.type} #{it.fingerprint}#{" (presented to ssh)" if met.include?(it)}" }
   end
 
-  def expected!(fingerprints, keys)
+  # Every key ssh met must be an expected one. The reported keys cannot
+  # prove it: a man in the middle can report the real host's public keys
+  # next to its own. Every expected key must also be the host's own.
+  def expected!(fingerprints, keys, ssh)
+    return if fingerprints.empty?
+
+    met = ssh.recorded_host_keys.map(&:fingerprint)
+    unless (met - fingerprints).empty?
+      raise Failure, "ssh met the host key #{met.join(", ")} at #{ssh.host}, not the expected #{fingerprints.join(", ")}: " \
+        "a man in the middle, or --ssh reaches a different machine; nothing was changed"
+    end
     missing = fingerprints - keys.map(&:fingerprint)
     return if missing.empty?
 
@@ -604,7 +619,7 @@ class ByohHostAdd
     @out.puts "Resuming: #{o[:main_ip]} is already registered as host #{host.ubid} (at #{host.strand.prog}.#{host.strand.label})."
     if o[:phase] != "register"
       ByohOperatorSsh.open(o[:ssh], port: o[:ssh_port], key: o[:ssh_key], runner: @runner || ByohOperatorSsh::OPEN3_RUNNER) do |ssh|
-        reinstalled!(host, host_keys_of(ssh))
+        reinstalled!(host, host_keys_of(ssh), ssh.recorded_host_keys)
         unless o[:storage_disks].empty?
           sudo!(ssh)
           o[:storage_disks].each { storage_disk(ssh, it, o[:allow_shared]) }
@@ -618,12 +633,19 @@ class ByohHostAdd
     raise Failure, ex.message
   end
 
-  def reinstalled!(host, keys)
+  # keys are the host's reported keys, met the ones ssh met.
+  def reinstalled!(host, keys, met)
     pinned = Array(host.sshable.host_keys)
-    return if pinned.empty? || (pinned - keys.map(&:to_s)).empty?
+    return if pinned.empty?
 
-    raise Failure, "host #{host.ubid} no longer has the host keys pinned at registration: the host was reinstalled, " \
-      "so destroy host #{host.ubid} and add it again"
+    unless (pinned - keys.map(&:to_s)).empty?
+      raise Failure, "host #{host.ubid} no longer has the host keys pinned at registration: the host was reinstalled, " \
+        "so destroy host #{host.ubid} and add it again"
+    end
+    return if (met.map(&:to_s) - pinned).empty?
+
+    raise Failure, "ssh met the host key #{met.map(&:fingerprint).join(", ")} at #{host.sshable.host}, which is not one pinned at registration: " \
+      "a man in the middle, or the address reaches a different machine"
   end
 
   # How the registered host's settings differ from the requested ones.

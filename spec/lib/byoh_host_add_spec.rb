@@ -25,6 +25,8 @@ RSpec.describe ByohHostAdd do
   # The fixture's ecdsa key is not a valid key, so only its ed25519 key
   # is pinned.
   let(:pinned) { fixture_keys.filter_map { ByohOperatorSsh::HostKey.parse(it)&.to_s } }
+  # A key the host does not have, as a man in the middle presents it.
+  let(:mitm_key) { "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDtqJ7zOtqQtYqOo0CpvDXNlMhV3HeJDpjrASKGLWdop" }
 
   after { FileUtils.rm_rf(dir) }
 
@@ -122,7 +124,7 @@ RSpec.describe ByohHostAdd do
 
       expect(out).to include row("info", "PF2", "runs once the key is installed; sshd lets root log in with a key")
       expect(out).to match(/^pass +PF17-route /)
-      expect(out).to include "Host keys:\n  ssh-ed25519 #{ByohOperatorSsh::HostKey.parse(ByohFakeRootLogin::FIXTURE_HOST_KEY).fingerprint}\n"
+      expect(out).to include "Host keys:\n  ssh-ed25519 #{ByohOperatorSsh::HostKey.parse(ByohFakeRootLogin::FIXTURE_HOST_KEY).fingerprint} (presented to ssh)\n"
       expect(out).to include "  - install the registration key in /root/.ssh/authorized_keys, on a line tagged #{tag}"
       expect(out).not_to include "format /dev/disk"
       expect(out).to include "Generated a registration key (#{key_dir}/byoh-add-203.0.113.10)"
@@ -324,13 +326,30 @@ RSpec.describe ByohHostAdd do
 
     it "takes --expect-host-key as the confirmation, and refuses a host without that key" do
       other = "SHA256:#{"A" * 43}"
+      fingerprint = ByohOperatorSsh::HostKey.parse(ByohFakeRootLogin::FIXTURE_HOST_KEY).fingerprint
       status, _, err = cli(*base, "--expect-host-key", other)
+      expect(status).to eq 1
+      expect(err).to start_with "! ssh met the host key #{fingerprint} at 203.0.113.10, not the expected #{other}"
+      status, _, err = cli(*base, "--expect-host-key", fingerprint, "--expect-host-key", other)
       expect(status).to eq 1
       expect(err).to start_with "! the host does not have the expected host key #{other}"
       expect(remote_commands.grep(/ssh-ed25519/)).to be_empty
 
-      fingerprint = ByohOperatorSsh::HostKey.parse(ByohFakeRootLogin::FIXTURE_HOST_KEY).fingerprint
       expect(cli(*base, "--expect-host-key", fingerprint, "--no-wait")[0]).to eq 0
+    end
+
+    it "checks --expect-host-key against the key ssh met, not the keys the host reports" do
+      # A man in the middle reports the real host's public keys next to
+      # its own, and presents its own to ssh.
+      replies["sudo -n bash -s -- preflight"] = [preflight_fixture("base").sub('"id":"host_keys","value":[', "\\0#{mitm_key.to_json},"), "", 0]
+      real = ByohOperatorSsh::HostKey.parse(ByohFakeRootLogin::FIXTURE_HOST_KEY).fingerprint
+      fake = ByohOperatorSsh::HostKey.parse(mitm_key).fingerprint
+      status, out, err = cli(*base, "--expect-host-key", real, runner: runner(presented: mitm_key))
+      expect(status).to eq 1
+      expect(err).to start_with "! ssh met the host key #{fake} at 203.0.113.10, not the expected #{real}: a man in the middle"
+      expect(out).to include "  ssh-ed25519 #{fake} (presented to ssh)\n", "  ssh-ed25519 #{real}\n"
+      expect(remote_commands.grep(/ssh-ed25519/)).to be_empty
+      expect(Dir.exist?(key_dir)).to be false
     end
 
     it "asks on a terminal, and needs --yes without one" do
@@ -396,6 +415,15 @@ RSpec.describe ByohHostAdd do
       status, _, err = cli(*base, "--storage-disk", "virtio-data")
       expect(status).to eq 2
       expect(err).to include "is past prep"
+    end
+
+    it "refuses a resume whose ssh met a key that was not pinned" do
+      registered
+      replies["cat"] = [[*fixture_keys, mitm_key].join("\n") + "\n", "", 0]
+      status, _, err = cli(*base, runner: runner(presented: mitm_key))
+      expect(status).to eq 1
+      expect(err).to end_with "! ssh met the host key #{ByohOperatorSsh::HostKey.parse(mitm_key).fingerprint} at 203.0.113.10, which is not one pinned at registration: " \
+        "a man in the middle, or the address reaches a different machine\n"
     end
 
     it "refuses a host in another site, of another provider, or being destroyed" do
