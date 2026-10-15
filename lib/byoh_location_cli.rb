@@ -13,12 +13,16 @@ require "yaml"
 class ByohLocationCli
   class Error < StandardError; end
 
+  # A refused option or value; exits 2, like a usage error.
+  class UsageError < Error; end
+
   USAGE = <<~USAGE
     Usage: bin/byoh-location COMMAND [options]
 
     Commands:
       create   --name NAME [--display-name NAME] [--ui-name TEXT] [profile options]
-               [--rates-from LOCATION [--multiplier X]] [--visible]
+               [--rates-from LOCATION [--multiplier X]] [--visible] [--grant PROJECT]...
+      add      NAME [the options of create]
       list
       show     --location NAME
       set      --location NAME [--ui-name TEXT] [--[no-]visible] [--unset KEY] [profile options]
@@ -27,6 +31,7 @@ class ByohLocationCli
       revoke   --location NAME --project UBID
       delete   --location NAME
 
+    The commands that take --location NAME also take NAME alone.
     Run a command with --help for its options.
   USAGE
 
@@ -62,10 +67,18 @@ class ByohLocationCli
 
   RESTART_NOTE = "Restart web, respirate and monitor with BILLING_RATES_EXTRA_DIR set, so that they load the new rates."
 
-  def initialize(out: $stdout, err: $stderr, random: SecureRandom)
+  # ubicloud-admin restarts the services itself when a rate file changed;
+  # it sets UBICLOUD_ADMIN_RESTARTS=1 for the tool.
+  ADMIN_RESTART_NOTE = "ubicloud-admin restarts the services if a rate file changed, so that they load the new rates."
+
+  # Commands that name one location, which they also take alone.
+  LOCATION_COMMANDS = %w[show set rates grant revoke delete].freeze
+
+  def initialize(out: $stdout, err: $stderr, random: SecureRandom, restart_note: (ENV["UBICLOUD_ADMIN_RESTARTS"] == "1") ? ADMIN_RESTART_NOTE : RESTART_NOTE)
     @out = out
     @err = err
     @random = random
+    @restart_note = restart_note
   end
 
   # Returns the process exit status.
@@ -74,7 +87,13 @@ class ByohLocationCli
     command = argv.shift
     case command
     when "create", "list", "show", "set", "rates", "grant", "revoke", "delete"
+      argv = location_argument(argv) if LOCATION_COMMANDS.include?(command)
       send(:"cmd_#{command}", argv)
+    when "add"
+      # site add NAME: create --name NAME.
+      name = argv.shift
+      raise UsageError, "add needs a location name: add NAME [options]" if name.nil? || name.start_with?("-")
+      cmd_create(["--name", name, *argv])
     when nil, "help", "-h", "--help"
       @out.puts USAGE
     else
@@ -83,21 +102,36 @@ class ByohLocationCli
     0
   rescue Error, OptionParser::ParseError => e
     @err.puts "! #{e.message}"
-    1
+    e.is_a?(UsageError) ? 2 : 1
   end
 
   private
 
+  # NAME alone, first, stands for --location NAME.
+  def location_argument(argv)
+    (argv.first && !argv.first.start_with?("-")) ? ["--location", *argv] : argv
+  end
+
   def cmd_create(argv)
-    opts = {}
+    opts = {grants: []}
     profile = {}
     parse(argv, "create --name NAME [options]") do |o|
       o.on("--name NAME", "Location name, also the billing rate key (lowercase letters, digits and -)") { opts[:name] = it }
       o.on("--display-name NAME", "Name used in API paths (default: --name)") { opts[:display_name] = it }
-      o.on("--ui-name TEXT", "Name shown to customers (default: --name)") { opts[:ui_name] = it }
+      # An exact option name wins over a prefix of a longer one in
+      # OptionParser, so --display stays apart from --display-name.
+      o.on("--ui-name TEXT", "--display TEXT", "Name shown to customers (default: --name)") { opts[:ui_name] = it }
       o.on("--rates-from LOCATION", "Copy every billing rate of LOCATION (see the rates command)") { opts[:rates_from] = it }
       o.on("--multiplier X", Float, "Price multiplier for --rates-from (default 1.0)") { opts[:multiplier] = it }
       o.on("--visible", "Show the location to every project (needs complete billing rates)") { opts[:visible] = true }
+      o.on("--grant PROJECT", "Let project PROJECT (a ubid) use the location (repeatable; needs complete billing rates)") { opts[:grants] << it }
+      o.on("--postgres CHOICE", "Managed Postgres in the location: no (the only choice yet)") do
+        raise UsageError, "--postgres takes no or yes, not #{it}" unless %w[no yes].include?(it)
+        raise UsageError, "--postgres yes is UNVERIFIED: Location.postgres_locations excludes BYOH locations (ROADMAP §8.2); pass --postgres no" if it == "yes"
+      end
+      o.on("--mgmt MODE", "How the control plane reaches the hosts: direct (the only choice until M8)") do
+        raise UsageError, "--mgmt #{it} is available in M8 (the management overlay); M4 supports only --mgmt direct, the operator's own route or VPN" unless it == "direct"
+      end
       profile_options(o, profile)
     end
 
@@ -109,6 +143,7 @@ class ByohLocationCli
     end
     raise Error, "--name global is reserved for global billing rates" if name == "global"
     raise Error, "--multiplier needs --rates-from" if opts[:multiplier] && !opts[:rates_from]
+    projects = opts[:grants].uniq.map { find_project(it) }
 
     taken = Location.where(project_id: nil)
       .where(Sequel.|({name:}, {display_name:}, {ui_name:}))
@@ -120,6 +155,7 @@ class ByohLocationCli
     # Checked before anything is created, so that a refused --visible
     # leaves no location behind.
     require_rates!(name, "cannot be created visible", copies) if opts[:visible]
+    require_rates!(name, "cannot be granted", copies) unless projects.empty?
     profile["ula48"] ||= generate_ula48
     check_profile!(profile, nil)
 
@@ -135,7 +171,9 @@ class ByohLocationCli
 
     copy_rates(location, opts[:rates_from], multiplier) if opts[:rates_from]
     update_visibility(location, true) if opts[:visible]
-    @out.puts RESTART_NOTE
+    projects.each { grant(location, it) }
+    @out.puts @restart_note
+    @out.puts "Next: ubicloud-admin host add --site #{name} --ssh USER@HOST --ssh-key KEY --pool-file pools.yaml (bin/byoh-host add takes the same options)"
     print_warnings
   end
 
@@ -235,13 +273,16 @@ class ByohLocationCli
     raise Error, "--rates-from is required" unless opts[:rates_from]
 
     copy_rates(location, opts[:rates_from], opts[:multiplier] || 1.0)
-    @out.puts RESTART_NOTE
+    @out.puts @restart_note
   end
 
   def cmd_grant(argv)
     location, project = location_and_project(argv, "grant")
     require_rates!(location.name, "cannot be granted (run the rates command)")
+    grant(location, project)
+  end
 
+  def grant(location, project)
     DB.transaction do
       project.set_ff_visible_locations(((project.get_ff_visible_locations || []) + [location.name]).uniq)
       audit("grant", location, {project: project.ubid})
@@ -307,7 +348,10 @@ class ByohLocationCli
       o.on("--#{flag} LIST", Array, "#{key}, comma-separated") { profile[key] = it }
     end
     CHOICE_FLAGS.each do |flag, key|
-      o.on("--#{flag} VALUE", "#{key}: #{ByohNetworkProfile::CHOICES.fetch(key).join(", ")}") { profile[key] = it }
+      o.on("--#{flag} VALUE", "#{key}: #{ByohNetworkProfile::CHOICES.fetch(key).join(", ")}") do
+        raise UsageError, "--cp-reach mgmt is available in M8 (the management overlay); use onhost or public" if key == "cp_reach" && it == "mgmt"
+        profile[key] = it
+      end
     end
     o.on("--ula48 CIDR", "ULA /48 that host IPv6 prefixes are drawn from (default: random)") { profile["ula48"] = it }
     o.on("--guest-mtu N", Integer, "Guest MTU") { profile["guest_mtu"] = it }
@@ -330,9 +374,11 @@ class ByohLocationCli
       o.on("--project UBID", "Project ubid") { opts[:project] = it }
     end
     location = find_location(opts)
-    project_ubid = opts[:project] || raise(Error, "--project is required")
-    project = (Project[project_ubid] if project_ubid.match?(/\Apj[0-9a-z]{24}\z/)) || raise(Error, "no project #{project_ubid}")
-    [location, project]
+    [location, find_project(opts[:project] || raise(Error, "--project is required"))]
+  end
+
+  def find_project(ubid)
+    (Project[ubid] if ubid.match?(/\Apj[0-9a-z]{24}\z/)) || raise(Error, "no project #{ubid}")
   end
 
   def byoh_locations

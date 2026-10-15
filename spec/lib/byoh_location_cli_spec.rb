@@ -85,7 +85,8 @@ RSpec.describe ByohLocationCli do
         "ula48" => "fd12:3456:789a::/48",
       )
       expect(Strand[location.id].prog).to eq "LocationNexus"
-      expect(output).to eq "Created location byoh-aws-aps1 (#{location.ubid}), hidden.\n#{described_class::RESTART_NOTE}\n"
+      expect(output).to eq "Created location byoh-aws-aps1 (#{location.ubid}), hidden.\n#{described_class::RESTART_NOTE}\n" \
+        "Next: ubicloud-admin host add --site byoh-aws-aps1 --ssh USER@HOST --ssh-key KEY --pool-file pools.yaml (bin/byoh-host add takes the same options)\n"
       expect(error).to include "warning: location byoh-aws-aps1: cp_source_cidrs 10.98.1.10/32 is not in CONTROL_PLANE_OUTBOUND_CIDRS"
 
       row = audit_rows.last
@@ -158,6 +159,62 @@ RSpec.describe ByohLocationCli do
         expect(cli("create", *args)).to eq [1, "", "! #{message}\n"]
       end
       expect(Location.where(name: "byoh-1").count).to eq 0
+    end
+  end
+
+  describe "add (ubicloud-admin site add)" do
+    let(:project) { Project.create(name: "p") }
+
+    it "creates the location named by its argument, with the site add spellings" do
+      expect(random).to receive(:random_bytes).and_return("\x01\x02\x03\x04\x05".b)
+      status, output, error = cli("add", "byoh-aws-aps1", "--display", "AWS Mumbai (BYOH)", "--display-name", "aws-aps1",
+        "--dns", "10.80.0.1", "--postgres", "no", "--mgmt", "direct", "--cp-reach", "onhost")
+      expect(status).to eq 0
+      expect(error).to start_with "warning: BILLING_RATES_EXTRA_DIR is unset"
+      location = Location.first(name: "byoh-aws-aps1")
+      expect(location.values.slice(:display_name, :ui_name)).to eq(display_name: "aws-aps1", ui_name: "AWS Mumbai (BYOH)")
+      # --dns is OptionParser's unique prefix of --dns-servers.
+      expect(location.byoh_network.to_h).to include("dns_servers" => ["10.80.0.1"], "cp_reach" => "onhost")
+      expect(output).to end_with "Next: ubicloud-admin host add --site byoh-aws-aps1 --ssh USER@HOST --ssh-key KEY --pool-file pools.yaml (bin/byoh-host add takes the same options)\n"
+    end
+
+    it "grants projects after copying the rates" do
+      allow(Config).to receive(:billing_rates_extra_dir).and_return(dir)
+      expect(random).to receive(:random_bytes).and_return("\x01\x02\x03\x04\x05".b)
+      status, output, error = cli("add", "byoh-1", "--rates-from", "hetzner-fsn1", "--grant", project.ubid, "--grant", project.ubid)
+      expect([status, error]).to eq [0, ""]
+      expect(output).to include "Project #{project.ubid} can now use location byoh-1."
+      expect(project.reload.get_ff_visible_locations).to eq ["byoh-1"]
+      expect(audit_rows.map { it[:command] }).to eq ["byoh-location create", "byoh-location rates", "byoh-location grant"]
+    end
+
+    it "refuses a grant before creating anything" do
+      allow(Config).to receive(:billing_rates_extra_dir).and_return(dir)
+      expect(cli("add", "byoh-1", "--grant", "nope")).to eq [1, "", "! no project nope\n"]
+      expect(cli("add", "byoh-1", "--grant", project.ubid)[2]).to start_with "! location byoh-1 cannot be granted: no billing rate for VmVCpu/standard"
+      expect(Location.where(name: "byoh-1").count).to eq 0
+      expect(audit_rows).to be_empty
+    end
+
+    it "refuses the choices that come later with exit status 2" do
+      {
+        [] => "add needs a location name: add NAME [options]",
+        ["--name", "byoh-1"] => "add needs a location name: add NAME [options]",
+        ["byoh-1", "--postgres", "yes"] => "--postgres yes is UNVERIFIED: Location.postgres_locations excludes BYOH locations (ROADMAP §8.2); pass --postgres no",
+        ["byoh-1", "--postgres", "maybe"] => "--postgres takes no or yes, not maybe",
+        ["byoh-1", "--mgmt", "wireguard"] => "--mgmt wireguard is available in M8 (the management overlay); M4 supports only --mgmt direct, the operator's own route or VPN",
+        ["byoh-1", "--cp-reach", "mgmt"] => "--cp-reach mgmt is available in M8 (the management overlay); use onhost or public",
+      }.each do |args, message|
+        expect(cli("add", *args)).to eq [2, "", "! #{message}\n"]
+      end
+      expect(Location.where(name: "byoh-1").count).to eq 0
+    end
+
+    it "says that ubicloud-admin restarts the services when it runs the tool" do
+      ENV["UBICLOUD_ADMIN_RESTARTS"] = "1"
+      expect(described_class.new.instance_variable_get(:@restart_note)).to eq described_class::ADMIN_RESTART_NOTE
+    ensure
+      ENV.delete("UBICLOUD_ADMIN_RESTARTS")
     end
   end
 
@@ -272,6 +329,13 @@ RSpec.describe ByohLocationCli do
       loc = byoh_location("byoh-2", {})
       byoh_location("byoh-3", {})
       expect(cli("set", "--location", loc.name, "--cp-reach", "public")[0]).to eq 0
+    end
+
+    it "takes the location name alone and refuses --cp-reach mgmt" do
+      location = byoh_location("byoh-1")
+      expect(cli("set", "byoh-1", "--cp-reach", "mgmt")).to eq [2, "", "! --cp-reach mgmt is available in M8 (the management overlay); use onhost or public\n"]
+      expect(cli("set", "byoh-1", "--cp-reach", "public")[0]).to eq 0
+      expect(location.reload.byoh_network["cp_reach"]).to eq "public"
     end
 
     it "refuses an invalid profile and unknown --unset keys" do
