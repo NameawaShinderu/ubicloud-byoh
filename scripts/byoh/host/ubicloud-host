@@ -560,6 +560,8 @@ pf15_egress() {
   if [[ -z $lists ]]; then
     check PF15-apt warn "the apt package lists are empty, so the packages could not be checked" "PrepHost runs apt-get update; or run it now"
   else
+    # A simulation takes no dpkg or apt lock, as root too, so it neither
+    # waits for nor blocks cloud-init or unattended-upgrades.
     out=$(run_cmd apt-get apt-get -s install "${PREP_PACKAGES[@]}")
     rc=$?
     if ((rc == 0)); then
