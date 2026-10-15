@@ -847,7 +847,8 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
   - **tenancy, inside the create transaction:** lock the location row (`SELECT ... FOR UPDATE`) and
     refuse if another project has a VM of a lower-tier family in the location (L3, L4) or on the
     target host (L5), unless the location holds the tier's `multitenant` ack.
-- Callers that create service VMs pass `allowed_tiers: ["kvm"]` explicitly (belt and braces).
+- Callers that create service VMs get kvm only from the default `allowed_tiers: ["kvm"]`; as shipped
+  they pass nothing (section 10.6).
 - `bin/byoh-location grant` refuses a second project for a location whose tiers include a lower tier
   without `<tier>:multitenant`, and `set --visible` is refused likewise. A private location
   (`Location.project_id`) is the recommended default.
@@ -874,10 +875,15 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
   Container: `MemTotal` minus a host reserve; emulated: the EMULATED_HOSTS.md §6.4 budget; pvm: as
   container, minus guest overhead.
 - `bin/byoh-host move-location` refuses to move a non-kvm host into a location without its tier, and
-  `--rollback-to` refuses non-kvm hosts. `MoveVm` refuses moves across tiers; `RolloutRhizome` rolls
-  out per tier; GPUs are refused for every non-kvm family.
-- Internal services stay on L1: they create VMs with kvm families and pass `allowed_tiers: ["kvm"]`. A
-  spec pins this for each service's `assemble`.
+  `--rollback-to` refuses non-kvm hosts. `MoveVm` refuses moves across tiers; GPUs are refused for
+  every non-kvm family. `RolloutRhizome` is unchanged: it only selects hosts in the upstream
+  locations, so it never meets a lower-tier host (section 10.6).
+- Internal services stay on L1: they create VMs with kvm families and pass no `allowed_tiers`, so the
+  kvm-only default applies. There is no per-service spec of that; the specs pin the shared paths
+  instead: `validation_golden_spec.rb` (every tier size refused by `validate_vm_size`,
+  `validate_vm_storage_size` and `Prog::Vm::Nexus.assemble` without `allowed_tiers`, a VM pool's
+  size error, and no GitHub runner label on a tier family) and `vm_size_error_golden_spec.rb` (the
+  Kubernetes and VM APIs refuse every tier size).
 
 ### 10.5 LearnVirt: fail-open (SHIPPED, WP3) and tier-aware (SHIPPED, WP4)
 
