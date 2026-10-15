@@ -44,7 +44,9 @@ require "shellwords"
 #
 # A host already registered at the main IP is resumed rather than
 # registered again: the site, the pools and settings, and the host keys
-# must match, and add then only watches.
+# must match, and add then only watches. --storage-disk is refused then:
+# prepare formats disks before it registers, and a registered host's
+# prep may learn its storage at any moment.
 #
 # Exit status: 0 the host accepts VMs (or --no-wait, or --phase
 # prepare, finished); 1 a validation, preflight, host-key or SSH
@@ -612,18 +614,16 @@ class ByohHostAdd
 
     diff = config_diff(host, requested)
     raise Failure.new("host #{host.ubid} is registered with other settings:\n  #{diff.join("\n  ")}", 2) unless diff.empty?
-    if !o[:storage_disks].empty? && ByohHostCli.past_prep?(host)
-      raise Failure.new("host #{host.ubid} is past prep, which learned its storage; --storage-disk on a running host is not supported yet (M5)", 2)
+    unless o[:storage_disks].empty?
+      raise Failure.new("host #{host.ubid} is registered already, and add formats storage disks only before it registers a host, " \
+        "as the host's prep may learn its storage at any moment; leave out --storage-disk to resume " \
+        "(adding a disk to a registered host is not supported yet, M5)", 2)
     end
 
     @out.puts "Resuming: #{o[:main_ip]} is already registered as host #{host.ubid} (at #{host.strand.prog}.#{host.strand.label})."
     if o[:phase] != "register"
       ByohOperatorSsh.open(o[:ssh], port: o[:ssh_port], key: o[:ssh_key], runner: @runner || ByohOperatorSsh::OPEN3_RUNNER) do |ssh|
         reinstalled!(host, host_keys_of(ssh), ssh.recorded_host_keys)
-        unless o[:storage_disks].empty?
-          sudo!(ssh)
-          o[:storage_disks].each { storage_disk(ssh, it, o[:allow_shared]) }
-        end
       end
     end
     return 0 if o[:phase] == "prepare" || o[:no_wait]

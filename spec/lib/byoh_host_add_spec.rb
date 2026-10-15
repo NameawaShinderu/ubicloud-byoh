@@ -402,19 +402,12 @@ RSpec.describe ByohHostAdd do
       expect(calls).to be_empty
     end
 
-    it "formats a storage disk on a host not yet past prep" do
+    it "refuses a storage disk on any registered host, without reaching it" do
       registered
-      status, out, _ = cli(*base, "--storage-disk", "virtio-data", "--no-wait")
-      expect(status).to eq 0
-      expect(out).to include "storage-disk: ok"
-      expect(remote_commands).to eq ["cat /etc/ssh/ssh_host_*_key.pub", "sudo -n true", "sudo -n bash -s -- storage-disk --by-id virtio-data"]
-    end
-
-    it "refuses a storage disk on a host past prep" do
-      registered.strand.update(label: "wait")
-      status, _, err = cli(*base, "--storage-disk", "virtio-data")
+      status, _, err = cli(*base, "--storage-disk", "virtio-data", "--yes")
       expect(status).to eq 2
-      expect(err).to include "is past prep"
+      expect(err).to start_with "! host #{host.ubid} is registered already, and add formats storage disks only before it registers a host"
+      expect(calls).to be_empty
     end
 
     it "refuses a resume whose ssh met a key that was not pinned" do
