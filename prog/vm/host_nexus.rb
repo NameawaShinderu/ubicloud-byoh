@@ -176,12 +176,16 @@ class Prog::Vm::HostNexus < Prog::Base
         # set no CPUs aside for IO. Decide once, so the reserved CPUs and
         # used_cores agree.
         io_cpu_count = (vm_host.provider_name == HostProvider::GENERIC_PROVIDER_NAME) ? 0 : vm_host.io_cpu_count
-        (0..total_cpus - 1).each do |cpu|
+        # LearnCpu reports the online CPU numbers of a BYOH host, which can
+        # have gaps; cpu_numa_nodes is aligned with them by position.
+        cpu_numbers = st.exitval["cpu_numbers"] || (0..total_cpus - 1).to_a
+        fail "LearnCpu reported #{cpu_numbers.size} cpu numbers for #{total_cpus} cpus" unless cpu_numbers.size == total_cpus
+        cpu_numbers.each_with_index do |cpu, index|
           VmHostCpu.create(
             vm_host_id: vm_host.id,
             cpu_number: cpu,
-            io: cpu < io_cpu_count,
-            numa_node: cpu_numa_nodes[cpu],
+            io: index < io_cpu_count,
+            numa_node: cpu_numa_nodes[index],
           )
         end
         vm_host.update(used_cores: io_cpu_count * total_cores / total_cpus)

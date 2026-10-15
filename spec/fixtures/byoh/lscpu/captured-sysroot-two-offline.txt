@@ -1,0 +1,9 @@
+# fixture: cpus 2-3 offline; captured with util-linux 2.39.3 lscpu --sysroot on a hand-made sysfs
+# The following is the parsable format, which can be fed to other
+# programs. Each different item in every column has an unique ID
+# starting usually from zero.
+# CPU,Node,Socket,Core,Online
+0,,0,0,Y
+1,,0,1,Y
+2,,0,,N
+3,,0,,N

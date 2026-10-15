@@ -592,6 +592,24 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(vm_host.used_cores).to eq 0
     end
 
+    it "creates vm_host_cpu rows for the online cpus a BYOH host reports" do
+      cpu_numbers = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15]
+      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "x64", "total_sockets" => 1, "total_dies" => 1, "total_cores" => 7, "total_cpus" => 14, "cpu_numa_nodes" => [0] * 7 + [1] * 7, "cpu_numbers" => cpu_numbers})
+      expect(vm_host).to receive(:io_cpu_count).and_return(2)
+
+      expect { nx.wait_prep }.to hop("setup_hugepages")
+
+      expect(VmHostCpu.where(vm_host_id: vm_host.id).select_order_map([:cpu_number, :io, :numa_node])).to eq(
+        cpu_numbers.each_with_index.map { |cpu, index| [cpu, index < 2, (index < 7) ? 0 : 1] },
+      )
+      expect(vm_host.reload.used_cores).to eq 1
+    end
+
+    it "crashes if LearnCpu reports cpu numbers that do not match the cpu count" do
+      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "x64", "total_sockets" => 1, "total_dies" => 1, "total_cores" => 2, "total_cpus" => 2, "cpu_numa_nodes" => [0], "cpu_numbers" => [0]})
+      expect { nx.wait_prep }.to raise_error RuntimeError, "LearnCpu reported 1 cpu numbers for 2 cpus"
+    end
+
     it "crashes if an expected field is not set for LearnMemory" do
       Strand.create(parent_id: st.id, prog: "LearnMemory", label: "start", exitval: {})
       expect { nx.wait_prep }.to raise_error KeyError, "key not found: \"mem_gib\""

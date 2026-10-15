@@ -162,6 +162,14 @@ RSpec.describe Vm do
       expect(vm.cloud_hypervisor_cpu_topology.to_s).to eq("2:1:1:1")
     end
 
+    it "scales a hybrid system that LearnCpu normalised to one thread per core" do
+      vmh = create_vm_host(total_cpus: 20, total_cores: 20, total_dies: 1, total_sockets: 1)
+      vm = create_vm(vm_host_id: vmh.id, family: "standard", vcpus: 4)
+      expect(vm.cloud_hypervisor_cpu_topology.to_s).to eq("1:4:1:1")
+      vm = create_vm(vm_host_id: vmh.id, family: "standard", vcpus: 1)
+      expect(vm.cloud_hypervisor_cpu_topology.to_s).to eq("1:1:1:1")
+    end
+
     it "scales a single-socket non-hyperthreaded system for burstable family for 2 vcpus" do
       vmh = create_vm_host(total_cpus: 12, total_cores: 12, total_dies: 1, total_sockets: 1)
       vm = create_vm(vm_host_id: vmh.id, family: "burstable", vcpus: 2)
