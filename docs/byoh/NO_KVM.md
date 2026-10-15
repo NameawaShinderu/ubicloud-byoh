@@ -1438,8 +1438,11 @@ Executed here (VERIFIED, 2026-10-15): the refusal without `BYOH_REAL_HOST=1`; `p
 `ubi-q-*` ubuntu:24.04 container (refuses: container, `vmx`/`svm`, no GRUB); and the helpers on
 synthetic input (stock-entry path, the `pti=off` and `root=UUID` checks, driver-to-module lookup,
 the `SHA256SUMS` listing check, the measurements on the lab host, the user-data YAML round trip,
-the ratio report). That run caught a menu title that itself contained `pti=off`. Nothing else ran:
-no kernel was installed and no GRUB was touched.
+the ratio report). That run caught a menu title that itself contained `pti=off`. Its small files
+missed a pipe that died of SIGPIPE under `pipefail` on a real 860 KB `modules.dep`, so every loadable
+module (ENA, NVMe, gVNIC) read as missing; `spec/lib/byoh_virt_tiers_pvm_spec.rb` now runs the
+lookup against a `modules.dep` larger than a pipe buffer. Nothing else ran: no kernel was installed
+and no GRUB was touched.
 
 UNVERIFIED, to watch on the first real run:
 - The menu path `Advanced options for Ubuntu>Ubuntu, with Linux <ver>` on GCP and AWS cloud images,

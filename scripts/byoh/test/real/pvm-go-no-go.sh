@@ -103,6 +103,7 @@ GRUB_SCRIPT=/etc/grub.d/42_byoh_pvm_test
 ART=$PVM_WORK/artifacts
 STATE=$PVM_WORK/state
 REPORT=$PVM_WORK/report.txt
+MODULES_DIR=/lib/modules
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 VIRT_PROBE=${PVM_VIRT_PROBE:-$SCRIPT_DIR/../../../../rhizome/host/lib/virt_probe.rb}
 
@@ -265,11 +266,12 @@ kernel_has_driver() {
     sd) drv=sd_mod ;;
     sr) drv=sr_mod ;;
   esac
-  for m in "/lib/modules/$kver/modules.builtin" "/lib/modules/$kver/modules.dep"; do
+  for m in "$MODULES_DIR/$kver/modules.builtin" "$MODULES_DIR/$kver/modules.dep"; do
     [ -f "$m" ] || continue
-    if sed 's/:.*//' "$m" | sed 's,.*/,,; s/\.ko.*//' | tr - _ | grep -qx "$drv"; then
-      return 0
-    fi
+    # One process: under pipefail a `... | grep -q` that matches early
+    # kills the writers with SIGPIPE and fails, so a module in an 860 KB
+    # modules.dep read as missing.
+    awk -v d="$drv" '{n = $1; sub(/:.*/, "", n); sub(/.*\//, "", n); sub(/\.ko.*/, "", n); gsub(/-/, "_", n); if (n == d) {f = 1; exit}} END {exit !f}' "$m" && return 0
   done
   return 1
 }
