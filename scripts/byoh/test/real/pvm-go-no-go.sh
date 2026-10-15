@@ -44,9 +44,11 @@
 #   PVM_HOST_DEB       [linux-image-6.12.33-pvm_6.12.33+pvm.g91e9c9be4472_amd64.deb]
 #   PVM_GUEST_KERNEL   [vmlinux-pvm-amd64]
 #   PVM_GUEST_CONFIG   [guest-pvm-amd64.config]
-#   PVM_HOST_DEB_SHA256, PVM_GUEST_KERNEL_SHA256
-#                      optional extra pins, checked on top of SHA256SUMS
-#                      (use them for your own builds of virt-pvm)
+#   PVM_HOST_DEB_SHA256, PVM_GUEST_KERNEL_SHA256, PVM_GUEST_CONFIG_SHA256
+#                      sha256 pins, checked on top of SHA256SUMS. They
+#                      default to the v0.1.0 files above and are REQUIRED
+#                      when the URL or any file name is overridden (for
+#                      example your own builds of virt-pvm)
 #   PVM_IMAGE_URL      guest disk image (with SHA256SUMS beside it)
 #                      [https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img]
 #   PVM_BOOT_TIMEOUT   seconds per Cloud Hypervisor run [900]
@@ -85,11 +87,34 @@ case "$PHASE" in
     ;;
 esac
 
+# The default release and its sha256s, recorded on 2026-10-15 from a
+# download that matched the release's SHA256SUMS. The .deb runs as root
+# and becomes a bootable kernel, and SHA256SUMS sits beside it on the
+# same mutable release, so it proves integrity, not authenticity: a
+# replaced asset could replace its line too. The pins stop that.
+DEFAULT_RELEASE_URL=https://github.com/cocoonstack/pvm/releases/download/v0.1.0
+DEFAULT_HOST_DEB=linux-image-6.12.33-pvm_6.12.33+pvm.g91e9c9be4472_amd64.deb
+DEFAULT_GUEST_KERNEL=vmlinux-pvm-amd64
+DEFAULT_GUEST_CONFIG=guest-pvm-amd64.config
+DEFAULT_HOST_DEB_SHA256=a02e2555c0ae65c2007dc9db2a92b14b63a61c86b3eb796d5a25868f3701ffd1
+DEFAULT_GUEST_KERNEL_SHA256=84dcf08143ce7e945a770ff1b6d25e0505c1da69d674831b470cabc139598acb
+DEFAULT_GUEST_CONFIG_SHA256=51ce5c264373e18817bf94816cfb08c365eaee36cfa624045ccbb7c17aad90f5
+
 PVM_WORK=${PVM_WORK:-/var/lib/byoh-pvm-test}
-PVM_RELEASE_URL=${PVM_RELEASE_URL:-https://github.com/cocoonstack/pvm/releases/download/v0.1.0}
-PVM_HOST_DEB=${PVM_HOST_DEB:-linux-image-6.12.33-pvm_6.12.33+pvm.g91e9c9be4472_amd64.deb}
-PVM_GUEST_KERNEL=${PVM_GUEST_KERNEL:-vmlinux-pvm-amd64}
-PVM_GUEST_CONFIG=${PVM_GUEST_CONFIG:-guest-pvm-amd64.config}
+PVM_RELEASE_URL=${PVM_RELEASE_URL:-$DEFAULT_RELEASE_URL}
+PVM_HOST_DEB=${PVM_HOST_DEB:-$DEFAULT_HOST_DEB}
+PVM_GUEST_KERNEL=${PVM_GUEST_KERNEL:-$DEFAULT_GUEST_KERNEL}
+PVM_GUEST_CONFIG=${PVM_GUEST_CONFIG:-$DEFAULT_GUEST_CONFIG}
+# The default pins apply only to the default release and file names.
+default_pins() {
+  if [ "$PVM_RELEASE_URL" = "$DEFAULT_RELEASE_URL" ] && [ "$PVM_HOST_DEB" = "$DEFAULT_HOST_DEB" ] &&
+    [ "$PVM_GUEST_KERNEL" = "$DEFAULT_GUEST_KERNEL" ] && [ "$PVM_GUEST_CONFIG" = "$DEFAULT_GUEST_CONFIG" ]; then
+    PVM_HOST_DEB_SHA256=${PVM_HOST_DEB_SHA256:-$DEFAULT_HOST_DEB_SHA256}
+    PVM_GUEST_KERNEL_SHA256=${PVM_GUEST_KERNEL_SHA256:-$DEFAULT_GUEST_KERNEL_SHA256}
+    PVM_GUEST_CONFIG_SHA256=${PVM_GUEST_CONFIG_SHA256:-$DEFAULT_GUEST_CONFIG_SHA256}
+  fi
+}
+default_pins
 PVM_IMAGE_URL=${PVM_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}
 PVM_BOOT_TIMEOUT=${PVM_BOOT_TIMEOUT:-900}
 PVM_ALLOW_HW_VIRT=${PVM_ALLOW_HW_VIRT:-0}
@@ -158,8 +183,17 @@ check_listed_sum() { # sums file
   [ "$want" = "$got" ] || die "$2: sha256 $got, expected $want"
 }
 
-check_pin() { # file sha256-or-empty
-  [ -z "$2" ] && return 0
+# Every release file needs a pin: the defaults, or the operator's own
+# for an overridden URL or file name.
+require_pins() {
+  local v missing=""
+  for v in PVM_HOST_DEB_SHA256 PVM_GUEST_KERNEL_SHA256 PVM_GUEST_CONFIG_SHA256; do
+    [[ "${!v:-}" =~ ^[0-9a-f]{64}$ ]] || missing="$missing $v"
+  done
+  [ -z "$missing" ] || die "no sha256 pin (64 lowercase hex) for:$missing. They are required when PVM_RELEASE_URL or a file name is overridden."
+}
+
+check_pin() { # file sha256
   local got
   got=$(sha256sum "$1" | cut -d' ' -f1)
   [ "$got" = "$2" ] || die "$(basename "$1"): sha256 $got, expected the pin $2"
@@ -297,6 +331,7 @@ driver_unchecked_ok() {
 
 install_phase() {
   preflight || die "preflight failed; nothing was changed"
+  require_pins
   [ "$(uname -r)" != "$(state_get kver)" ] || die "already running the PVM kernel; run boot-test"
   : >"$REPORT"
   mkdir -p "$ART"
@@ -309,8 +344,9 @@ install_phase() {
   for f in "$PVM_HOST_DEB" "$PVM_GUEST_KERNEL" "$PVM_GUEST_CONFIG"; do
     check_listed_sum "$ART/SHA256SUMS" "$f"
   done
-  check_pin "$ART/$PVM_HOST_DEB" "${PVM_HOST_DEB_SHA256:-}"
-  check_pin "$ART/$PVM_GUEST_KERNEL" "${PVM_GUEST_KERNEL_SHA256:-}"
+  check_pin "$ART/$PVM_HOST_DEB" "$PVM_HOST_DEB_SHA256"
+  check_pin "$ART/$PVM_GUEST_KERNEL" "$PVM_GUEST_KERNEL_SHA256"
+  check_pin "$ART/$PVM_GUEST_CONFIG" "$PVM_GUEST_CONFIG_SHA256"
 
   # The guest kernel has no modules and no initramfs: rhizome's CIDATA
   # seed is vfat, and the image root is ext4 on virtio-blk.

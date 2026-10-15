@@ -20,6 +20,12 @@ RSpec.describe ByohVirtTiers, "pvm" do
     end
   end
 
+  it "pins the default PVM release files" do
+    %w[HOST_DEB GUEST_KERNEL GUEST_CONFIG].each do |f|
+      expect(script[/^DEFAULT_#{f}_SHA256=(\h{64})$/, 1]).not_to be_nil
+    end
+  end
+
   it "keeps pvm unoffered until the test reports GO" do
     expect(described_class::SHIPPED).not_to include("pvm")
   end
@@ -50,6 +56,30 @@ RSpec.describe ByohVirtTiers, "pvm" do
       end
       expect(allowed).to eq %w[pcieport vmbus]
       expect(run_functions(%w[driver_unchecked_ok], "driver_unchecked_ok vmbus")[1].success?).to be false
+    end
+
+    describe "the release pins" do
+      let(:defaults) { script.scan(/^(DEFAULT_\w+)=(\S+)$/).to_h }
+      let(:release) { {PVM_RELEASE_URL: defaults["DEFAULT_RELEASE_URL"], PVM_HOST_DEB: defaults["DEFAULT_HOST_DEB"], PVM_GUEST_KERNEL: defaults["DEFAULT_GUEST_KERNEL"], PVM_GUEST_CONFIG: defaults["DEFAULT_GUEST_CONFIG"]} }
+
+      def pins(vars)
+        run_functions(%w[die default_pins require_pins], "default_pins\nrequire_pins\necho \"$PVM_HOST_DEB_SHA256\"", defaults.merge(vars))
+      end
+
+      it "default to the recorded sums for the default release" do
+        out, status = pins(release)
+        expect(status.success?).to be true
+        expect(out).to eq "#{defaults["DEFAULT_HOST_DEB_SHA256"]}\n"
+      end
+
+      it "are required when the release URL or a file name is overridden" do
+        out, status = pins(release.merge(PVM_RELEASE_URL: "https://example.com/my-pvm"))
+        expect(status.exitstatus).to eq 1
+        expect(out).to include("no sha256 pin (64 lowercase hex) for: PVM_HOST_DEB_SHA256 PVM_GUEST_KERNEL_SHA256 PVM_GUEST_CONFIG_SHA256.")
+        sums = {PVM_HOST_DEB_SHA256: "a" * 64, PVM_GUEST_KERNEL_SHA256: "b" * 64, PVM_GUEST_CONFIG_SHA256: "c" * 64}
+        out, status = pins(release.merge(PVM_GUEST_KERNEL: "vmlinux-mine", **sums))
+        expect([out, status.success?]).to eq ["#{"a" * 64}\n", true]
+      end
     end
 
     describe "kernel_has_driver" do

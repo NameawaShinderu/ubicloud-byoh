@@ -1405,8 +1405,12 @@ What each phase checks (the script's header lists the environment overrides):
   refusal, on this throwaway VM; the product refuses it (section 6.5).
 - **install**: downloads the release (default: [cocoonstack/pvm][cocoon-pvm] v0.1.0; third party, so
   fine for this test and never a default for registered hosts). Every file must be **listed** in
-  `SHA256SUMS` (`sha256sum -c --ignore-missing` alone passes on an unlisted file) and match it;
-  optional `PVM_HOST_DEB_SHA256`/`PVM_GUEST_KERNEL_SHA256` pin your own builds. It refuses a guest
+  `SHA256SUMS` (`sha256sum -c --ignore-missing` alone passes on an unlisted file) and match it, and
+  match a sha256 pin: `SHA256SUMS` lives on the same mutable release as the `.deb` that runs as root,
+  so it shows integrity, not authenticity. The script pins the v0.1.0 `.deb`, `vmlinux` and guest
+  config (recorded 2026-10-15 from a download that matched `SHA256SUMS`); when `PVM_RELEASE_URL` or a
+  file name is overridden, `PVM_HOST_DEB_SHA256`, `PVM_GUEST_KERNEL_SHA256` and
+  `PVM_GUEST_CONFIG_SHA256` are required. It refuses a guest
   config without `=y` for VFAT, NLS 437 and ISO8859-1, PVM_GUEST, X86_PIE, virtio-blk/net/pci, ext4
   and the 8250 console. Then, in the order of section 6.7: `GRUB_DEFAULT=saved` in a `grub.d` drop-in,
   `grub-set-default` the running stock kernel, and checks that `grub.cfg` boots `${saved_entry}` and
