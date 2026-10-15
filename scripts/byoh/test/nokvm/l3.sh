@@ -9,7 +9,8 @@
 # touches only this container's own network namespaces, its delegated
 # cgroup subtree and tmpfs. Guests reach only the internet: forwarding
 # toward the test network, the gateway (the docker host) and every
-# private or link-local address is dropped.
+# private or link-local address is dropped. After both deletes the
+# scratch tmpfs must hold under 1 GiB (the image and nothing of the VMs).
 #
 # What it cannot do, and fakes (each says so in the log): systemd
 # (fake-systemctl), project quotas and AppArmor (lab-setup-vm.rb),
@@ -296,6 +297,8 @@ isolation() {
   say "isolation between the two VMs"
   check_not "vm A cannot reach vm B's private address" ssh_vm "$POOL.11" "timeout 4 bash -c 'echo > /dev/tcp/10.0.2.5/22'"
   check "vm A sees only its own processes" ssh_vm "$POOL.11" "! ps -eo comm | grep -qx -e lxc-start -e dnsmasq"
+  check_not "vm B cannot reach vm A's private address" ssh_vm "$POOL.12" "timeout 4 bash -c 'echo > /dev/tcp/10.0.1.5/22'"
+  check "vm B sees only its own processes" ssh_vm "$POOL.12" "! ps -eo comm | grep -qx -e lxc-start -e dnsmasq"
   check "the two VMs have disjoint id ranges" test "$(cat /var/lib/ubicloud/idmap/vml3aaa1)" != "$(cat /var/lib/ubicloud/idmap/vml3aaa2)"
 }
 
@@ -332,7 +335,9 @@ vm_delete vml3aaa1
 vm_delete vml3aaa2
 check "no process of any container id is left" bash -c "! ps -eo uid= | awk '\$1 >= 1000000000' | grep -q ."
 check "no LXC monitor is left" bash -c "! pgrep -x lxc-start"
-say "scratch used: $(du -sh $SCRATCH | cut -f1)"
+used=$(du -sb "$SCRATCH" | cut -f1)
+say "scratch used after the deletes: $((used / 1048576)) MiB"
+if [ "$used" -lt $((1024 * 1024 * 1024)) ]; then ok "the scratch tmpfs holds under 1 GiB after the deletes"; else bad "the scratch tmpfs holds $((used / 1048576)) MiB after the deletes, 1 GiB or more"; fi
 kernel_guard
 if [ "$fails" -eq 0 ]; then say "l3 ok"; else
   say "l3: $fails failures"
