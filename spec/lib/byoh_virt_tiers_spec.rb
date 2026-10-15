@@ -145,10 +145,18 @@ RSpec.describe ByohVirtTiers do
         .to eq "location byoh-test already runs lower-tier VMs of another project, and its container tier is single-project"
     end
 
-    it "allows several projects once multitenant is acknowledged" do
+    it "allows several projects once multitenant is acknowledged and its host checks exist" do
       offer(location, {"tiers" => %w[kvm container], "acks" => {"container" => ["multitenant"]}})
       create_vm(project_id: project.id, location_id: location.id, family: "container")
+      expect(refusal { described_class.check_tenancy!("container", location, other.id) }).to include "single-project"
+      check_virt_multitenant("container")
       expect(described_class.check_tenancy!("container", location, other.id)).to be_nil
+    end
+
+    it "keeps every tier single-project while no tier's host checks exist" do
+      expect(described_class::MULTITENANT_CHECKED).to eq []
+      expect(described_class::TIERS.values.select { it.options.include?("multitenant") }.map(&:id)).to eq %w[container pvm]
+      expect(described_class.shared?({"acks" => {"pvm" => ["multitenant"]}}, "pvm")).to be false
     end
   end
 

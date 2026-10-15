@@ -524,9 +524,13 @@ RSpec.describe ByohLocationCli do
         expect(location.reload.byoh_virt.to_h).to eq("tiers" => %w[kvm container], "acks" => {"container" => []})
         expect(audit_rows.last[:args]["byoh_virt"]).to eq("tiers" => %w[kvm container], "acks" => {"container" => []})
         expect(cli("show", "--location", location.name)[1]).to include "Virt tiers    kvm, container (L3, experimental)\n"
-        expect(cli("set", "--location", location.name, "--unaccept", "emulated:multitenant")[0]).to eq 0
+        expect(cli("set", "--location", location.name, "--unaccept", "pvm:multitenant")[0]).to eq 0
         expect(location.reload.byoh_virt["acks"]).to eq("container" => [])
 
+        expect(cli("set", "--location", location.name, "--accept", "container:multitenant")[2])
+          .to eq "! container:multitenant is not available yet: nothing checks container hosts for what sharing them between projects needs (docs/byoh/NO_KVM.md section 6.5), so container stays single-project\n"
+        expect(location.reload.byoh_virt["acks"]).to eq("container" => [])
+        check_virt_multitenant("container")
         expect(cli("set", "--location", location.name, "--accept", "container:multitenant", "--accept", "container:guest-firewall")[0]).to eq 0
         expect(cli("show", "--location", location.name)[1]).to include "Virt tiers    kvm, container (L3, experimental) [multitenant, guest-firewall]\n"
         expect(cli("set", "--location", location.name, "--unaccept", "container:guest-firewall")[0]).to eq 0
@@ -540,7 +544,9 @@ RSpec.describe ByohLocationCli do
         expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,tcg")[2]).to eq "! unknown tier tcg; expected kvm, container, pvm, emulated\n"
         expect(cli("set", "--location", location.name, "--virt-tiers", "")[2]).to eq "! --virt-tiers needs at least one tier\n"
         expect(cli("set", "--location", location.name, "--accept", "kvm")[2]).to eq "! cannot acknowledge kvm: expected one of container, pvm, emulated\n"
-        expect(cli("set", "--location", location.name, "--accept", "emulated:guest-firewall")[2]).to eq "! emulated has no option guest-firewall; expected one of multitenant\n"
+        expect(cli("set", "--location", location.name, "--accept", "emulated:guest-firewall")[2]).to eq "! emulated has no options\n"
+        expect(cli("set", "--location", location.name, "--accept", "emulated:multitenant")[2]).to eq "! emulated has no options\n"
+        expect(cli("set", "--location", location.name, "--accept", "pvm:guest-firewall")[2]).to eq "! pvm has no option guest-firewall; expected one of multitenant\n"
       end
 
       it "keeps a tier while hosts are registered on it" do
@@ -562,6 +568,12 @@ RSpec.describe ByohLocationCli do
         expect(cli("grant", "--location", location.name, "--project", second.ubid)[2])
           .to start_with "! location byoh-1 offers container to one project only, and is granted to #{first.ubid}; revoke first"
 
+        # A multitenant ack stored without its host checks lifts nothing.
+        location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container], "acks" => {"container" => ["multitenant"]}}))
+        expect(cli("grant", "--location", location.name, "--project", second.ubid)[2])
+          .to start_with "! location byoh-1 offers container to one project only, and is granted to #{first.ubid}; revoke first"
+
+        check_virt_multitenant("container")
         expect(cli("set", "--location", location.name, "--accept", "container:multitenant")[0]).to eq 0
         expect(cli("grant", "--location", location.name, "--project", second.ubid)[0]).to eq 0
         expect(cli("set", "--location", location.name, "--unaccept", "container:multitenant")[2])

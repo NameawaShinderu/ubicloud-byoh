@@ -333,6 +333,12 @@ RSpec.configure do |config|
       allow(ByohVirtTiers).to receive(:shipped?) { |tier| tier == ByohVirtTiers::KVM || tiers.include?(tier) }
     end
 
+    # Lets the given tiers be shared between projects, as the WP that
+    # adds each tier's host checks will (ByohVirtTiers::MULTITENANT_CHECKED).
+    def check_virt_multitenant(*tiers)
+      allow(ByohVirtTiers).to receive(:multitenant_checked?) { |tier| tiers.include?(tier) }
+    end
+
     def create_vm_host(**args)
       args = {location_id: Location::HETZNER_FSN1_ID, allocation_state: "accepting", arch: "x64", family: "standard", total_cores: 48, used_cores: 2, total_hugepages_1g: 375, used_hugepages_1g: 16}.merge(args)
       ubid = VmHost.generate_ubid

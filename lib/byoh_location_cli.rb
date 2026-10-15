@@ -339,6 +339,9 @@ class ByohLocationCli
     acks = old["acks"].transform_values(&:dup)
     Array(opts[:accept]).each do |item|
       tier, option = parse_ack(item)
+      if option == "multitenant" && !ByohVirtTiers.multitenant_checked?(tier)
+        raise Error, "#{tier}:multitenant is not available yet: nothing checks #{tier} hosts for what sharing them between projects needs (docs/byoh/NO_KVM.md section 6.5), so #{tier} stays single-project"
+      end
       acks[tier] ||= []
       acks[tier] |= [option] if option
     end
@@ -367,13 +370,15 @@ class ByohLocationCli
   def parse_ack(item)
     tier, option = item.split(":", 2)
     spec = ByohVirtTiers::TIERS[tier] || raise(Error, "cannot acknowledge #{tier}: expected one of #{ByohVirtTiers::TIERS.keys.join(", ")}")
-    raise Error, "#{tier} has no option #{option}; expected one of #{spec.options.join(", ")}" if option && !spec.options.include?(option)
+    if option && !spec.options.include?(option)
+      raise Error, spec.options.empty? ? "#{tier} has no options" : "#{tier} has no option #{option}; expected one of #{spec.options.join(", ")}"
+    end
     [tier, option]
   end
 
   # The lower tiers of a policy that are single-project.
   def single_project_tiers(policy)
-    policy["tiers"].select { ByohVirtTiers.lower?(it) && !Array(policy["acks"][it]).include?("multitenant") }
+    policy["tiers"].select { ByohVirtTiers.lower?(it) && !ByohVirtTiers.shared?(policy, it) }
   end
 
   # Refuses a policy whose single-project tiers would be shared: a

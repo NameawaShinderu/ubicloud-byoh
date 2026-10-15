@@ -20,7 +20,8 @@
 #   tier, which requires the operator's acknowledgement of it;
 # - the project may use the location, and no other project has a
 #   lower-tier VM there unless the tier's "multitenant" option is
-#   acknowledged (check_tenancy!, under a lock on the location row);
+#   acknowledged and its host checks exist (check_tenancy!, under a lock
+#   on the location row);
 # - it uses no GPU, no machine image, no remote storage and no explicit
 #   hypervisor, and one of the tier's boot images.
 module ByohVirtTiers
@@ -67,7 +68,9 @@ module ByohVirtTiers
     "emulated" => Tier.new(
       id: "emulated", rung: "L5", prep_arg: "emulated",
       description: "Emulated: slow, compatibility only. Not a security boundary.",
-      storage: "vhost", options: %w[multitenant],
+      # No multitenant option: not a security boundary, so one project
+      # per location (docs/byoh/NO_KVM.md section 12).
+      storage: "vhost", options: [],
       boot_images: %w[ubuntu-noble ubuntu-jammy],
       # docs/byoh/EMULATED_HOSTS.md section 6.4 (provisional 512).
       host_reserve_mib: 2048, vm_overhead_mib: 512, min_vcpus: 2,
@@ -80,6 +83,15 @@ module ByohVirtTiers
   # offer them and hosts can be registered on them. A tier joins this
   # list in the commit that ships it (docs/byoh/NO_KVM.md section 11).
   SHIPPED = [].freeze
+
+  # The tiers whose "multitenant" acknowledgement takes effect: those
+  # whose hosts are checked for what sharing needs (docs/byoh/NO_KVM.md
+  # section 6.5 and the policy table: for pvm SMT off or core scheduling
+  # and CPUs not affected by l1tf and mds, for container whole-core
+  # cpusets or SMT off). No such check exists yet, so until the WP that
+  # ships a tier adds it, bin/byoh-location refuses the acknowledgement
+  # and every lower tier stays single-project.
+  MULTITENANT_CHECKED = [].freeze
 
   # The acknowledgement of a tier itself, stored as the tier's key in
   # byoh_virt["acks"].
@@ -122,6 +134,14 @@ module ByohVirtTiers
     return false unless acks.key?(tier)
 
     option.nil? || Array(acks[tier]).include?(option)
+  end
+
+  def self.multitenant_checked?(tier) = MULTITENANT_CHECKED.include?(tier)
+
+  # Whether projects may share the tier in a location with this policy:
+  # the operator acknowledged "multitenant" and its host checks exist.
+  def self.shared?(policy, tier)
+    multitenant_checked?(tier) && Array(policy["acks"][tier]).include?("multitenant")
   end
 
   # The lower-tier families a customer may pick in the location: shipped
@@ -178,13 +198,13 @@ module ByohVirtTiers
     nil
   end
 
-  # One project per location for every lower tier, unless the operator
-  # acknowledged the tier's "multitenant" option. Takes a lock on the
+  # One project per location for every lower tier, unless the tier is
+  # shared (shared?). Takes a lock on the
   # location row, so two creates for different projects cannot both pass;
   # call it inside the create transaction.
   def self.check_tenancy!(tier, location, project_id)
     Location.dataset.for_update.where(id: location.id).get(:id)
-    return if acked?(location, tier, "multitenant")
+    return if shared?(policy(location), tier)
 
     others = Vm.where(location_id: location.id, family: TIERS.values.map(&:family)).exclude(project_id:)
     refuse "location #{location.display_name} already runs lower-tier VMs of another project, and its #{tier} tier is single-project" unless others.empty?

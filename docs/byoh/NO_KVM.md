@@ -909,7 +909,13 @@ Differences from sections 10.3, 10.4 and 11.2, each stricter or equal:
   the VM create API passes the tier of a size the customer picked. The web form offers none.
 - **Tenancy is per location for every lower tier**, emulated included (the plan had per host for L5):
   the target host is unknown when `assemble` runs, and per location is the stricter rule.
-  `<tier>:multitenant` lifts it.
+- **No lower tier can be shared between projects yet.** `<tier>:multitenant` would lift the
+  per-location rule, but sharing needs per-host conditions (section 6.5 and section 12: SMT off or
+  core scheduling and l1tf/mds "Not affected" for pvm; whole-core cpusets or SMT off for container)
+  that nothing checks yet. `ByohVirtTiers::MULTITENANT_CHECKED` is empty, so `bin/byoh-location set
+  --accept <tier>:multitenant` is refused and a stored ack has no effect; the WP that ships a tier
+  adds that tier's host check (at registration, `verify_virt_tier` and LearnVirt) and lists it there.
+  `emulated` has no `multitenant` option at all: it is not a security boundary.
 - `pvm` declared on a `pvm_blocked` probe is refused with the `modprobe kvm_pvm` fix (the plan said
   "ack with advice"): prep would refuse that host anyway.
 - `auto` picks the fastest *possible* fallback; when that tier is not offered or not installed it
@@ -1066,9 +1072,9 @@ tier is registered and then held at `verify_virt_tier` until a probe agrees.
 | Rung | Customer label (UI and API family description) | Default tenancy | Location acks (`bin/byoh-location set --accept`) | Hard refusals |
 |---|---|---|---|---|
 | L1 | as today | as today | — | — |
-| L3 `container` | "System container: shared host kernel, near-native speed. Not a VM." | One project per location | `container`; options `container:multitenant` (needs whole-core cpusets or SMT off), `container:unencrypted-disk`, `container:nested-userns`, `container:guest-firewall` | Host sysctl checks fail; `dir` driver without `prjquota` (any location) |
-| L4 `pvm` | "PVM: software virtualization (experimental). Weaker isolation than standard VMs; Ubicloud-supplied guest kernel without AppArmor. Linux only." | One project per location | `pvm`; option `pvm:multitenant` only with SMT off or core scheduling and CPUs "Not affected" for l1tf and mds | Secure Boot on; a Meltdown-affected CPU (any tenancy, section 6.5) |
-| L5 `emulated` | "Emulated: slow, compatibility only. Not a security boundary." | One project per **host** | `emulated` | The unit's hardening directives missing |
+| L3 `container` | "System container: shared host kernel, near-native speed. Not a VM." | One project per location | `container`; options `container:multitenant` (needs whole-core cpusets or SMT off; refused until that is checked, section 10.6), `container:unencrypted-disk`, `container:nested-userns`, `container:guest-firewall` | Host sysctl checks fail; `dir` driver without `prjquota` (any location) |
+| L4 `pvm` | "PVM: software virtualization (experimental). Weaker isolation than standard VMs; Ubicloud-supplied guest kernel without AppArmor. Linux only." | One project per location | `pvm`; option `pvm:multitenant` only with SMT off or core scheduling and CPUs "Not affected" for l1tf and mds (refused until that is checked, section 10.6) | Secure Boot on; a Meltdown-affected CPU (any tenancy, section 6.5) |
+| L5 `emulated` | "Emulated: slow, compatibility only. Not a security boundary." | One project per **host** (as shipped: per location, section 10.6) | `emulated`; no options, so never shared | The unit's hardening directives missing |
 
 Applies to every lower rung:
 - Its families and sizes are separate (`Option::TierVmSizes`) and never chosen implicitly.
