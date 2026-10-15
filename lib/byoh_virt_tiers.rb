@@ -203,10 +203,6 @@ module ByohVirtTiers
     nil
   end
 
-  # One project per location for every lower tier, unless the tier is
-  # shared (shared?). Takes a lock on the
-  # location row, so two creates for different projects cannot both pass;
-  # call it inside the create transaction.
   # Whether a container VM's disk is encrypted (crypt-loop) or a plain
   # directory under a project quota (dir): the location decides, by
   # acknowledging "container:unencrypted-disk" (docs/byoh/NO_KVM.md
@@ -219,6 +215,10 @@ module ByohVirtTiers
     {"nested_userns" => acked?(location, "container", "nested-userns"), "guest_firewall" => acked?(location, "container", "guest-firewall")}
   end
 
+  # One project per location for every lower tier, unless the tier is
+  # shared (shared?). Takes a lock on the location row, so two creates
+  # for different projects cannot both pass; call it inside the create
+  # transaction.
   def self.check_tenancy!(tier, location, project_id)
     Location.dataset.for_update.where(id: location.id).get(:id)
     return if shared?(policy(location), tier)
