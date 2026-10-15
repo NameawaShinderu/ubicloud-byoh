@@ -81,8 +81,9 @@ RSpec.describe ByohRegistrationCli do
       "--pool-file", pools, "--ipv6-mode", "gua", "--server-identifier", "rack-1", "--default-boot-image", "ubuntu-noble", "--yes")
     expect(status).to eq 0
     expect(err).to eq "note: 10.99.0.0/29: no exposure given, using internal because it is not globally routable\n" \
-      "warning: preflight skipped: it logs in with the registration key, which this run generated; " \
-      "once the key is installed, check the host with `ubicloud-admin host preflight`, or pass --ssh-key next time\n"
+      "warning: preflight skipped: this run generated the registration key and --yes skipped the step that installs it, " \
+      "so the login cannot work yet; check the host by running scripts/byoh/host/ubicloud-host preflight on it, " \
+      "or install a key first and pass --ssh-key\n"
     expect(starts).to be_empty
 
     vm_host = VmHost.first
@@ -105,10 +106,24 @@ RSpec.describe ByohRegistrationCli do
     expect(out).not_to include "BMC "
   end
 
-  it "waits for confirmation without --yes" do
-    status, out, _ = cli(*required, "--routed-network", "fd00:feed::/64", input: "\n")
-    expect(status).to eq 0
+  it "waits for confirmation without --yes, then preflights the host with the generated key" do
+    status, out, err = cli("--main-ip", "203.0.113.10", "--location", "byoh-test", "--routed-network", "fd00:feed::/64", input: "\n")
+    expect([status, err]).to eq [0, ""]
     expect(out).to include "Press ENTER once the public key is installed", "Host registered."
+    expect(out).to match(/^pass +PF2 +root@203\.0\.113\.10 logs in/)
+    expect(starts.map(&:first)).to eq ["203.0.113.10"]
+    vm_host = VmHost.first
+    expect(vm_host.sshable.host_keys).to eq [ByohFakeRootLogin::FIXTURE_HOST_KEY]
+    expect(starts.first[2][:key_data].map { Net::SSH::Authentication::ED25519::PrivKey.read(it, nil).sign_key.keypair }).to eq [vm_host.sshable.raw_private_key_1]
+  end
+
+  it "refuses a host that fails preflight with a generated key, and says the key was not kept" do
+    status, out, err = cli("--main-ip", "203.0.113.10", "--location", "byoh-test", "--routed-network", "fd00:feed::/64", input: "\n", fixture: "no-kvm")
+    expect(status).to eq 1
+    expect(out).to match(/^fail +PF3 +no \/dev\/kvm$/)
+    expect(err).to eq "! preflight failed: fix the checks marked fail, or accept an overridable one with --accept-check; nothing was registered\n" \
+      "  The generated key was not kept: remove its line from root's authorized_keys on the host. The next run prints a new key, or pass --ssh-key with one you keep.\n"
+    expect(VmHost.count).to eq 0
   end
 
   it "aborts when standard input has no confirmation" do

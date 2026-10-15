@@ -7,10 +7,12 @@
 # Sshable/VmHost/HostProvider/Address/Strand rows that drive
 # Prog::Vm::HostNexus bootstrap.
 #
-# With --ssh-key (a key already in root's authorized_keys on the host)
-# it first runs host preflight (docs/byoh/PLATFORMS.md PF1-PF21) as root
-# over that key, refuses a host that fails it, and pins the host keys it
-# met. With a generated key it skips preflight and says so.
+# Once the registration key is in root's authorized_keys on the host
+# (--ssh-key, or a generated key the operator confirms installing) it
+# runs host preflight (docs/byoh/PLATFORMS.md PF1-PF21) as root over
+# that key, refuses a host that fails it, and pins the host keys it met.
+# With a generated key and --yes nothing confirms the install, so it
+# skips preflight and says so.
 #
 # Example:
 #

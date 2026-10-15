@@ -4,8 +4,9 @@ require "optparse"
 
 # bin/register-byoh-host: registers a bring-your-own host in a BYOH
 # location. Parses the options, shows the SSH key the operator installs
-# on the host, runs host preflight when that key is already installed
-# (--ssh-key), and hands the rest to ByohRegistration.
+# on the host, runs host preflight once that key is installed (given
+# with --ssh-key, or confirmed by the operator), and hands the rest to
+# ByohRegistration.
 class ByohRegistrationCli
   class Error < StandardError; end
 
@@ -110,7 +111,7 @@ class ByohRegistrationCli
       o.separator "SSH key:"
       o.on("--ssh-key PATH", "Use an existing Ed25519 private key file, already in root's authorized_keys on the host (default: generate a new one)") { options[:ssh_key_source] = it }
       o.separator ""
-      o.separator "Preflight (docs/byoh/PLATFORMS.md PF1-PF21; runs with --ssh-key, as root over the control plane's own login):"
+      o.separator "Preflight (docs/byoh/PLATFORMS.md PF1-PF21; runs as root over the control plane's own login, except with a generated key and --yes):"
       o.on("--skip-preflight", "Register without checking the host first") { options[:skip_preflight] = true }
       o.on("--accept-check ID", "Accept an overridable failed check, such as PF8-hybrid or PF16-docker (repeatable)") { options[:accept_checks] << it }
       o.on("--uplink-ip IP", "The address the host's default route leaves from (default: what preflight detects); no pool may hand it to VMs") { options[:uplink_ip] = it }
@@ -153,9 +154,11 @@ class ByohRegistrationCli
       @err.puts "warning: preflight skipped (--skip-preflight); the host was not checked"
       return true
     end
-    if options[:ssh_key_source] == :generate
-      @err.puts "warning: preflight skipped: it logs in with the registration key, which this run generated; " \
-        "once the key is installed, check the host with `ubicloud-admin host preflight`, or pass --ssh-key next time"
+    generated = options[:ssh_key_source] == :generate
+    if generated && options[:assume_yes]
+      @err.puts "warning: preflight skipped: this run generated the registration key and --yes skipped the step that installs it, " \
+        "so the login cannot work yet; check the host by running scripts/byoh/host/ubicloud-host preflight on it, " \
+        "or install a key first and pass --ssh-key"
       return true
     end
 
@@ -164,6 +167,10 @@ class ByohRegistrationCli
     return true unless report.blocking?
 
     @err.puts "! preflight failed: fix the checks marked fail, or accept an overridable one with --accept-check; nothing was registered"
+    if generated
+      @err.puts "  The generated key was not kept: remove its line from root's authorized_keys on the host. " \
+        "The next run prints a new key, or pass --ssh-key with one you keep."
+    end
     false
   end
 

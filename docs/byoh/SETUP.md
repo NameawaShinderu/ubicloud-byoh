@@ -225,7 +225,7 @@ bundle exec bin/register-byoh-host \
 
 Other options: `--routed-network CIDR[,key=value...]` (inline pools, repeatable), `--ipv6-mode gua|ula`, `--server-identifier`, `--default-boot-image` (repeatable; `ubuntu-noble` when none is given, which is also the image of a VM that names none; add `ubuntu-jammy` only if customers will pick it), and the Redfish BMC flags (`--bmc-endpoint`, `--bmc-user`, `--bmc-pass-env`, …). There is no `--provider` flag.
 
-**Preflight.** With `--ssh-key`, the key is already in root's `authorized_keys`, so the command first logs in as root with it and runs host preflight (`scripts/byoh/host/ubicloud-host`, checks PF1-PF21 in `docs/byoh/PLATFORMS.md`):
+**Preflight.** Once the registration key is in root's `authorized_keys` (given with `--ssh-key`, or generated and confirmed with ENTER), the command logs in as root with it and runs host preflight (`scripts/byoh/host/ubicloud-host`, checks PF1-PF21 in `docs/byoh/PLATFORMS.md`):
 
 - PF2 (root login runs commands) comes first. The script then runs over the same connection, sent on stdin, so nothing is copied to the host and nothing on it changes.
 - Any `fail` stops the command before anything is registered, for example no `/dev/kvm`, a kvm64-class CPU model, or a pool that holds the host's uplink IP or default gateway.
@@ -234,7 +234,7 @@ Other options: `--routed-network CIDR[,key=value...]` (inline pools, repeatable)
 - The host keys this login met are pinned, so the control plane's first root login during bring-up must meet the same key.
 - The uplink IP (the source address of the default route) is stored as `uplink_ip` in the host's provider config. `--uplink-ip IP` sets it instead, for a host with more than one default route. No pool may hand it to VMs.
 
-Without `--ssh-key` the command generates the key, so preflight cannot log in yet: it warns and registers without it.
+Without `--ssh-key` the command generates the key and waits for ENTER while you install it, then runs preflight as above. If preflight fails, the generated key is not kept: remove its line from `authorized_keys` before you run the command again, which prints a new key. With a generated key and `--yes` nothing confirms the install, so the command warns and registers without preflight; to check such a host, run `scripts/byoh/host/ubicloud-host preflight` on it.
 
 Bring-up takes 15-25 minutes on bare metal and about 4 minutes on a nested-virtualization cloud VM. It **reboots the host once**. Watch it:
 
