@@ -36,9 +36,10 @@ class Prog::Vm::HostNexus < Prog::Base
         raise "#{virt_tier} hosts are not available yet" unless ByohVirtTiers.shipped?(virt_tier)
         raise "Location #{location.name} does not offer #{virt_tier} hosts" unless ByohVirtTiers.allows?(location, virt_tier) && ByohVirtTiers.acked?(location, virt_tier)
         raise "A #{virt_tier} host has family #{virt_tier}, not #{family}" unless family == "standard"
-        # Its VMs boot only the tier's images.
+        # Its VMs boot only the tier's images; it downloads the first of
+        # them unless registration names others.
         tier_images = ByohVirtTiers.fetch(virt_tier).boot_images
-        default_boot_images = tier_images if default_boot_images.empty?
+        default_boot_images = tier_images.first(1) if default_boot_images.empty?
         unless (other = default_boot_images - tier_images).empty?
           raise "A #{virt_tier} host cannot boot #{other.join(", ")}; its images are #{tier_images.join(", ")}"
         end

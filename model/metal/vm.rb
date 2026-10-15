@@ -128,6 +128,14 @@ class Vm < Sequel::Model
         params[:hypervisor] = "lxc"
         params[:container] = ByohVirtTiers.container_options(vm_host.location)
       end
+      # An emulated VM (docs/byoh/EMULATED_HOSTS.md section 6.5): rhizome
+      # runs it under QEMU's software translator, without hugepages, which
+      # emulated hosts do not reserve.
+      if vm_host.virt_tier == "emulated"
+        params[:hypervisor] = "qemu"
+        params[:hugepages] = false
+        params[:accel] = "tcg"
+      end
       params[:egress_nat4] = vm_host.location.byoh_profile.egress_nat4_params if byoh_egress_nat4?
       JSON.pretty_generate(params)
     end

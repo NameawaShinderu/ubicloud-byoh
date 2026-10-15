@@ -58,7 +58,7 @@ set -euo pipefail
 
 # The lower tiers this checkout can register; keep it equal to
 # ByohVirtTiers::SHIPPED (spec/lib/byoh_virt_tiers_spec.rb checks).
-SHIPPED_TIERS="container"
+SHIPPED_TIERS="container emulated"
 
 usage() {
   echo "usage: $0 [--tier kvm|auto|container|pvm|emulated]"
@@ -240,10 +240,24 @@ else
       tier_packages="lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs"
       ;;
     emulated)
+      # prep_host.rb refuses others (HostTier check_arch).
       if [ "$(uname -m)" != x86_64 ]; then
         echo "ERROR: emulated hosts must be x86_64; this is $(uname -m)." >&2
         exit 1
       fi
+      # The last rung: say so, and say what is faster (docs/byoh/NO_KVM.md).
+      echo "  WARNING: emulated VMs run under QEMU's software translator: about a quarter of native"
+      echo "  CPU speed, far less for memory-heavy work, minutes to boot, and no security boundary"
+      echo "  between tenants. Prefer KVM (bin/byoh-virt probe prints the fix) or --tier container."
+      if [ -c /dev/kvm ]; then
+        echo "  NOTE: /dev/kvm exists here; register this host as kvm instead if the probe above agrees."
+      fi
+      if awk '$1 == "SwapTotal:" && $2 > 0 { found = 1 } END { exit !found }' /proc/meminfo; then
+        echo "  NOTE: swap is on. Emulated guest RAM can be swapped out, which makes slow VMs slower."
+      fi
+      echo "  NOTE: on burstable instances (AWS T, Azure B) emulated VMs burn CPU credits all the time: demo only."
+      # rhizome/host/lib/host_tier.rb PACKAGES, which prep checks:
+      # QEMU's x86_64 system emulator and the OVMF firmware the VMs boot.
       tier_packages="qemu-system-x86 ovmf"
       ;;
     pvm)
@@ -259,6 +273,19 @@ else
     # shellcheck disable=SC2086 # the package list is meant to split
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $tier_packages >/dev/null
     echo "  installed: $tier_packages"
+  fi
+  # The check prep runs (HostTier.check_emulator!), made here so a broken
+  # QEMU is found before registration.
+  if [ "$TIER" = emulated ]; then
+    if ! qemu-system-x86_64 -accel help 2>/dev/null | grep -qx tcg; then
+      echo "ERROR: qemu-system-x86_64 does not list the tcg accelerator." >&2
+      exit 1
+    fi
+    if [ ! -f /usr/share/ovmf/OVMF.fd ]; then
+      echo "ERROR: /usr/share/ovmf/OVMF.fd is missing; reinstall ovmf." >&2
+      exit 1
+    fi
+    echo "  qemu-system-x86_64 lists tcg; OVMF present"
   fi
 fi
 

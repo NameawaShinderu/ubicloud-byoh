@@ -48,10 +48,10 @@ RSpec.describe ByohVirtTiers do
     expect(described_class.family_for("pvm")).to eq "pvm"
   end
 
-  it "ships the container tier, and pvm and emulated not yet" do
+  it "ships the container and emulated tiers, and pvm not yet" do
     expect(described_class.shipped?("kvm")).to be true
-    expect(described_class.shipped?("container")).to be true
-    %w[pvm emulated].each { expect(described_class.shipped?(it)).to be false }
+    %w[container emulated].each { expect(described_class.shipped?(it)).to be true }
+    expect(described_class.shipped?("pvm")).to be false
   end
 
   describe ".policy" do

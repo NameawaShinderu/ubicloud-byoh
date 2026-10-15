@@ -262,11 +262,13 @@ module Option
   # VmSizes so that no existing caller can see them: only
   # Validation.validate_vm_size with extra_families: returns one, and
   # only Prog::Vm::Nexus.assemble and the VM create API pass it. The
-  # shapes follow standard (4 GiB per vCPU); emulated stays small because
-  # every vCPU is a host thread running flat out.
-  TierVmSizes = {"container" => [2, 4, 8, 16], "pvm" => [2, 4, 8, 16], "emulated" => [2, 4]}.flat_map { |family, vcpus|
+  # shapes follow standard (4 GiB per vCPU). Emulated stays small: every
+  # vCPU is a host thread running flat out, and with 1 GiB per vCPU an
+  # emulated-2 fits the memory budget of an 8 GiB machine
+  # (docs/byoh/EMULATED_HOSTS.md sections 6.4 and 6.8).
+  TierVmSizes = {"container" => [[2, 4, 8, 16], 4], "pvm" => [[2, 4, 8, 16], 4], "emulated" => [[2, 4], 1]}.flat_map { |family, (vcpus, gib_per_vcpu)|
     vcpus.map {
-      VmSize.new("#{family}-#{it}", family, it, it * 100, 0, it * 4, [it * 20, it * 40], NO_IO_LIMITS, vring_workers(it), false, "x64")
+      VmSize.new("#{family}-#{it}", family, it, it * 100, 0, it * gib_per_vcpu, [it * 20, it * 40], NO_IO_LIMITS, vring_workers(it), false, "x64")
     }
   }.freeze
 

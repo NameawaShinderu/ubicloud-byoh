@@ -5,6 +5,8 @@ class Prog::DownloadFirmware < Prog::Base
   frame_reader :version, :sha256
 
   label def start
+    # Container and emulated hosts never start cloud-hypervisor.
+    pop "#{vm_host} is a #{vm_host.virt_tier} host, which runs no cloud-hypervisor firmware" unless ByohVirtTiers.runs_cloud_hypervisor?(vm_host.virt_tier)
     fail "Version is required" if version.nil?
     fail "SHA-256 digest is required" if sha256.nil?
 

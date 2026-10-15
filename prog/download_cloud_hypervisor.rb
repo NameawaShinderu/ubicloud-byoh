@@ -13,6 +13,8 @@ class Prog::DownloadCloudHypervisor < Prog::Base
   end
 
   label def start
+    # Container and emulated hosts never start cloud-hypervisor.
+    pop "#{vm_host} is a #{vm_host.virt_tier} host, which runs no cloud-hypervisor" unless ByohVirtTiers.runs_cloud_hypervisor?(vm_host.virt_tier)
     fail "Version is required" if version.nil?
     fail "SHA-256 digest of cloud-hypervisor is required" if sha256_ch_bin.nil?
     fail "SHA-256 digest of ch-remote is required" if sha256_ch_remote.nil?

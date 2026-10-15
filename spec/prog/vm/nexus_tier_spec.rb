@@ -26,7 +26,7 @@ RSpec.describe Prog::Vm::Nexus do
 
   it "creates a lower-tier VM without hugepages" do
     st = assemble("emulated-2", boot_image: "ubuntu-noble")
-    expect(st.subject.values.slice(:family, :vcpus, :memory_gib)).to eq(family: "emulated", vcpus: 2, memory_gib: 8)
+    expect(st.subject.values.slice(:family, :vcpus, :memory_gib)).to eq(family: "emulated", vcpus: 2, memory_gib: 2)
     expect(st.stack.first["hugepages"]).to be false
     expect(st.stack.first["storage_volumes"].first["track_written"]).to be true
   end

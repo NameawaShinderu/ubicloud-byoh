@@ -266,7 +266,13 @@ class VmHost < Sequel::Model
   end
 
   # Introduced for downloading firmware via REPL.
+  # Refuses hosts of a tier that runs no cloud-hypervisor (ByohVirtTiers).
+  def check_runs_cloud_hypervisor!
+    fail ArgumentError, "#{self} is a #{virt_tier} host, which runs no cloud-hypervisor" unless ByohVirtTiers.runs_cloud_hypervisor?(virt_tier)
+  end
+
   def download_firmware(version_x64: nil, version_arm64: nil, sha256_x64: nil, sha256_arm64: nil)
+    check_runs_cloud_hypervisor!
     version, sha256 = (arch == "x64") ? [version_x64, sha256_x64] : [version_arm64, sha256_arm64]
     fail ArgumentError, "No version provided" if version.nil?
     fail ArgumentError, "No SHA-256 digest provided" if sha256.nil?
@@ -276,6 +282,7 @@ class VmHost < Sequel::Model
 
   # Introduced for downloading cloud hypervisor via REPL.
   def download_cloud_hypervisor(version_x64: nil, version_arm64: nil, sha256_ch_bin_x64: nil, sha256_ch_bin_arm64: nil, sha256_ch_remote_x64: nil, sha256_ch_remote_arm64: nil)
+    check_runs_cloud_hypervisor!
     version, sha256_ch_bin, sha256_ch_remote = if arch == "x64"
       [version_x64, sha256_ch_bin_x64, sha256_ch_remote_x64]
     elsif arch == "arm64"

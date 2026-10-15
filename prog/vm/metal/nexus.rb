@@ -21,8 +21,46 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   # room for the last probe and the hop.
   NETNS_PROBE_SECONDS = 8 * 60
 
+  # create_unix_user on an emulated host. QEMU runs the guest under its
+  # software translator, which is no security boundary, so the VM user
+  # must not own its home: it could otherwise swap prep.json, serial.log
+  # or run/ for symlinks that root later follows. Rhizome refuses to set
+  # up an emulated VM whose home is not root:<vm> 0750
+  # (VmSetup#check_emulated_home). userdel -r refuses a home its user does
+  # not own, so root removes the home itself, without crossing into
+  # other file systems. The host has no KVM, so no kvm group either.
+  EMULATED_UNIX_USER = <<~COMMAND
+    set -ueo pipefail
+    if id :vm_name &>/dev/null; then
+      procs=$(ps -u :vm_name -o pid,comm,args --no-headers) || [ $? -eq 1 ]
+      if [ -n "$procs" ]; then
+        echo "Terminating ":vm_name" processes:"
+        echo "$procs"
+        sudo pkill -u :vm_name || [ $? -eq 1 ]
+        sleep 1
+      fi
+      sudo userdel :vm_name
+    fi
+    if getent group :vm_name &>/dev/null; then sudo groupdel :vm_name; fi
+    sudo rm -rf --one-file-system :vm_home
+    sudo adduser --disabled-password --gecos '' --no-create-home --home :vm_home --uid :uid :vm_name
+    sudo install -d -o root -g :vm_name -m 0750 :vm_home
+  COMMAND
+
   def vm_name
     @vm_name ||= vm.inhost_name
+  end
+
+  # The longer wait of the host's tier (ByohVirtTiers::SLOW_TIMINGS), or
+  # nil for today's value.
+  def slow_timing(key)
+    ByohVirtTiers.slow_timing(host.virt_tier, key)
+  end
+
+  # An emulated host's VM: QEMU runs untrusted guest code under its
+  # software translator (docs/byoh/EMULATED_HOSTS.md section 4).
+  def emulated_host?
+    host.virt_tier == "emulated"
   end
 
   def vm_home
@@ -182,7 +220,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       page.incr_resolve
     end
 
-    register_deadline("wait", 10 * 60, page: !boots_from_customer_machine_image?)
+    register_deadline("wait", slow_timing(:start_deadline) || 10 * 60, page: !boots_from_customer_machine_image?)
 
     # We don't need storage_volume info anymore, so delete it before
     # transitioning to the next state.
@@ -210,6 +248,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       # Enable KVM access for VM user
       sudo usermod -a -G kvm :vm_name
     COMMAND
+    command = EMULATED_UNIX_USER if emulated_host?
 
     host.sshable.cmd(command, vm_name:, vm_home:, uid:, log: :on_error)
 
@@ -245,7 +284,10 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   end
 
   def write_params_json
-    host.sshable.cmd("sudo -u :vm_name tee :params_path > /dev/null", vm_name:, params_path:,
+    # An emulated VM's home is root's (EMULATED_UNIX_USER), so root writes
+    # its prep.json there.
+    tee = emulated_host? ? "sudo tee :params_path > /dev/null" : "sudo -u :vm_name tee :params_path > /dev/null"
+    host.sshable.cmd(tee, vm_name:, params_path:,
       stdin: vm.params_json(**frame.slice("swap_size_bytes", "hugepages", "hypervisor", "ch_version", "firmware_version").transform_keys!(&:to_sym)), log: :on_error)
   end
 
@@ -290,7 +332,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   # VM run, so a guest without sshd is not stuck and does not page.
   def probe_from_netns
     waited = Time.now - vm.allocated_at
-    if waited >= NETNS_PROBE_SECONDS
+    if waited >= (slow_timing(:netns_probe) || NETNS_PROBE_SECONDS)
       Clog.emit("byoh netns probe gave up", {byoh_netns_probe: {vm_ubid: vm.ubid, vm_host_ubid: host.ubid, waited: waited.round}})
       return
     end
@@ -511,7 +553,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
       if vm_process_running_map[vm_name] == false
         decr_stopping
         nap 0
-      elsif @snap.set_at(:stopping) + 60 < Time.now
+      elsif @snap.set_at(:stopping) + (slow_timing(:soft_stop) || 60) < Time.now
         hard_stop
         decr_stopping
         nap 0

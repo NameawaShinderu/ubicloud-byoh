@@ -504,8 +504,8 @@ RSpec.describe ByohLocationCli do
     end
 
     it "refuses a tier this control plane cannot run yet" do
-      expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,emulated", "--accept", "emulated")[2])
-        .to eq "! emulated is not available yet: this control plane's rhizome cannot run emulated hosts (docs/byoh/NO_KVM.md section 11)\n"
+      expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,pvm", "--accept", "pvm")[2])
+        .to eq "! pvm is not available yet: this control plane's rhizome cannot run pvm hosts (docs/byoh/NO_KVM.md section 11)\n"
       expect(location.reload.byoh_virt).to be_nil
     end
 

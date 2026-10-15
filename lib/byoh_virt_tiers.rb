@@ -30,18 +30,20 @@ module ByohVirtTiers
   # Per tier:
   #   rung             the ladder rung, for display only
   #   prep_arg         the tier argument of rhizome's prep_host.rb
+  #   hypervisor       what runs its VMs: "lxc", "ch" (cloud-hypervisor) or
+  #                    "qemu" (the QEMU emulator, accel tcg)
   #   description      what customers and operators are told
   #   storage          "vhost" (ubiblk volumes, as on KVM hosts) or "none"
   #                    (the tier keeps its own disks; no vhost backend)
   #   options          what the operator can acknowledge beyond the tier
-  #   boot_images      the boot images its VMs may use, and its hosts
-  #                    download unless registration names others of them
+  #   boot_images      the boot images its VMs may use; its hosts download
+  #                    the first unless registration names others of them
   #   host_reserve_mib memory kept for the host itself
   #   vm_overhead_mib  memory each VM needs beyond its own RAM
   #   min_vcpus        vCPUs of the smallest size, to bound the VM count
   # None of the tiers uses 1G hugepages; verify_tier_capacity keeps a
   # memory budget in the hugepage columns instead.
-  Tier = Data.define(:id, :rung, :prep_arg, :description, :storage, :options, :boot_images,
+  Tier = Data.define(:id, :rung, :prep_arg, :hypervisor, :description, :storage, :options, :boot_images,
     :host_reserve_mib, :vm_overhead_mib, :min_vcpus) do
     def family = id
 
@@ -50,7 +52,7 @@ module ByohVirtTiers
 
   TIERS = {
     "container" => Tier.new(
-      id: "container", rung: "L3", prep_arg: "container",
+      id: "container", rung: "L3", prep_arg: "container", hypervisor: "lxc",
       description: "System container: shared host kernel, near-native speed. Not a VM.",
       storage: "none", options: %w[multitenant unencrypted-disk nested-userns guest-firewall],
       boot_images: %w[ubuntu-noble-container],
@@ -58,7 +60,7 @@ module ByohVirtTiers
       host_reserve_mib: 2048, vm_overhead_mib: 128, min_vcpus: 2,
     ),
     "pvm" => Tier.new(
-      id: "pvm", rung: "L4", prep_arg: "pvm",
+      id: "pvm", rung: "L4", prep_arg: "pvm", hypervisor: "ch",
       description: "PVM: software virtualization (experimental). Weaker isolation than standard VMs; Ubicloud-supplied guest kernel without AppArmor. Linux only.",
       storage: "vhost", options: %w[multitenant],
       boot_images: %w[ubuntu-noble],
@@ -67,13 +69,15 @@ module ByohVirtTiers
       host_reserve_mib: 2048, vm_overhead_mib: 384, min_vcpus: 2,
     ),
     "emulated" => Tier.new(
-      id: "emulated", rung: "L5", prep_arg: "emulated",
+      id: "emulated", rung: "L5", prep_arg: "emulated", hypervisor: "qemu",
       description: "Emulated: slow, compatibility only. Not a security boundary.",
       # No multitenant option: not a security boundary, so one project
       # per location (docs/byoh/NO_KVM.md section 12).
       storage: "vhost", options: [],
       boot_images: %w[ubuntu-noble ubuntu-jammy],
-      # docs/byoh/EMULATED_HOSTS.md section 6.4 (provisional 512).
+      # docs/byoh/EMULATED_HOSTS.md section 6.4: QEMU's 256 MiB
+      # translation cache plus about 128 MiB of QEMU itself (measured
+      # 384 MiB together), ubiblk and dnsmasq, with headroom. Provisional.
       host_reserve_mib: 2048, vm_overhead_mib: 512, min_vcpus: 2,
     ),
   }.freeze
@@ -83,7 +87,7 @@ module ByohVirtTiers
   # The lower tiers whose rhizome support exists, so that a location can
   # offer them and hosts can be registered on them. A tier joins this
   # list in the commit that ships it (docs/byoh/NO_KVM.md section 11).
-  SHIPPED = %w[container].freeze
+  SHIPPED = %w[container emulated].freeze
 
   # The tiers whose "multitenant" acknowledgement takes effect: those
   # whose hosts are checked for what sharing needs (docs/byoh/NO_KVM.md
@@ -116,6 +120,23 @@ module ByohVirtTiers
   def self.shipped?(tier) = tier == KVM || SHIPPED.include?(tier)
 
   def self.family_for(tier) = lower?(tier) ? fetch(tier).family : "standard"
+
+  # Whether hosts of the tier run cloud-hypervisor, so that downloading
+  # it or its firmware there makes sense: KVM and PVM hosts do; container
+  # and emulated hosts never start it.
+  def self.runs_cloud_hypervisor?(tier) = !lower?(tier) || fetch(tier).hypervisor == "ch"
+
+  # Emulated VMs boot under QEMU's software translator: 64-96 s to SSH on
+  # an idle lab host (docs/byoh/EMULATED_HOSTS.md section 3), several
+  # times that on a loaded one, and a guest shutdown is as slow. So on an
+  # emulated host the VM path waits longer before paging or giving up
+  # (Prog::Vm::Metal::Nexus); every other host keeps today's values.
+  # Seconds, per host tier.
+  SLOW_TIMINGS = {
+    "emulated" => {start_deadline: 30 * 60, netns_probe: 28 * 60, soft_stop: 180},
+  }.freeze
+
+  def self.slow_timing(tier, key) = SLOW_TIMINGS.dig(tier, key)
 
   # The location's policy. Only BYOH locations have one; every other
   # location is KVM only.
