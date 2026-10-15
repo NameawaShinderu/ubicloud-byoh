@@ -210,16 +210,33 @@ RSpec.describe ByohHostPreflight do
         expect(check(preflight, "PF17-route")).to have_attributes(status: "fail", detail: "2 IPv4 default routes (eth0, eth1); the uplink is ambiguous")
         expect(preflight.uplink_ip).to eq "10.0.0.5"
 
-        preflight = evaluate(parse({}, "ip_route" => routes, "ip_addr" => addr), uplink_ip: "192.168.1.20")
-        expect(check(preflight, "PF17-route")).to have_attributes(status: "warn", detail: "2 IPv4 default routes (eth0, eth1); uplink 192.168.1.20 given with --uplink-ip")
-
         preflight = evaluate(parse({}, "ip_route" => routes), uplink_ip: "10.0.0.5")
-        expect(check(preflight, "PF17-route").detail).to end_with "uplink 10.0.0.5 given with --uplink-ip"
+        expect(check(preflight, "PF17-route")).to have_attributes(status: "warn", detail: "2 IPv4 default routes (eth0, eth1); uplink 10.0.0.5 given with --uplink-ip")
 
         routes[0] = routes[0].merge("prefsrc" => "192.168.1.20")
         preflight = evaluate(parse({}, "ip_route" => routes, "ip_addr" => addr), uplink_ip: "192.168.1.20")
         expect(preflight.uplink_ip).to eq "192.168.1.20"
         expect(status(preflight, "PF17-route")).to eq "warn"
+      end
+
+      it "refuses an --uplink-ip on an interface without a default route" do
+        # 192.168.1.20 is on eth2; the default routes leave by eth0 and
+        # eth1, so neither gateway belongs to the named uplink.
+        routes = [
+          {"dst" => "default", "gateway" => "192.168.1.1", "dev" => "eth1", "metric" => 200},
+          {"dst" => "default", "gateway" => "10.0.0.1", "dev" => "eth0", "metric" => 100},
+        ]
+        addr = self.addr + [{"ifname" => "eth2", "addr_info" => [{"family" => "inet", "local" => "192.168.1.20"}]}]
+        # The pool holds eth0's gateway 10.0.0.1, which is not the named
+        # uplink's gateway, so PF17 must not judge the pool against it.
+        preflight = evaluate(parse({}, "ip_route" => routes, "ip_addr" => addr), uplink_ip: "192.168.1.20", uplink: "eth0", pools: pools("10.0.0.0/30"))
+        expect(check(preflight, "PF17-route")).to have_attributes(status: "fail",
+          detail: "--uplink-ip 192.168.1.20 is not on an interface with a default route (eth0, eth1)")
+        expect(check(preflight, "PF17")).to have_attributes(status: "pass", detail: "1 pool(s) hand VMs no address of the host")
+        expect(preflight.uplink_ip).to eq "192.168.1.20"
+        expect(check(preflight, "PF17-uplink")).to be_nil
+        expect(check(preflight, "PF17-netplan")).to be_nil
+        expect(preflight).to be_blocking
       end
 
       it "reads two default routes from the fixture host" do

@@ -223,14 +223,14 @@ class ByohHostPreflight
     Array(@facts["ip_route"]).select { it.is_a?(Hash) && it["dst"] == "default" }.sort_by { it["metric"].to_i }
   end
 
-  # The default route VMs leave by: the only one, or the one that carries
-  # an explicit uplink IP.
+  # The default route VMs leave by: the first by metric, or the one that
+  # carries an explicit uplink IP, and nil when no default route does.
   def default_route(explicit)
     routes = default_routes
     return routes.first unless explicit
 
     explicit_dev = ipv4_addresses.find { |_, ip| ip == explicit }&.first
-    routes.find { it["prefsrc"] == explicit || it["dev"] == explicit_dev } || routes.first
+    routes.find { it["prefsrc"] == explicit || it["dev"] == explicit_dev }
   end
 
   def addressing(route, main_ip:, pools:, uplink:, explicit_uplink_ip:, location:)
@@ -244,6 +244,8 @@ class ByohHostPreflight
       add("PF17-route", "fail", "no IPv4 default route; the host needs one for egress and as its uplink", "give the host a default route")
     elsif explicit_uplink_ip && !local_ips.include?(explicit_uplink_ip)
       add("PF17-route", "fail", "--uplink-ip #{explicit_uplink_ip} is not an address of the host", "pass an address the host's default route leaves from")
+    elsif !route
+      add("PF17-route", "fail", "--uplink-ip #{explicit_uplink_ip} is not on an interface with a default route (#{devs})", "pass an address the host's default route leaves from")
     elsif !@uplink_ip
       add("PF17-route", "fail", "the default route on #{route["dev"]} has no IPv4 source address", "pass --uplink-ip")
     elsif routes.size > 1 && !explicit_uplink_ip
