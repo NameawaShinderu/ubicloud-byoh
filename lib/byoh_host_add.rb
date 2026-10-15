@@ -46,8 +46,9 @@ require "shellwords"
 #
 # Exit status: 0 the host accepts VMs (or --no-wait, or --phase
 # prepare, finished); 1 a validation, preflight, host-key or SSH
-# failure; 2 a usage error; 3 a timeout, or respirate is not running; 4
-# `pool verify` failed; 130 interrupted.
+# failure; 2 a usage error; 3 a timeout, respirate is not running, or
+# the host is outside a bring-up and not accepting; 4 `pool verify`
+# failed; 130 interrupted.
 class ByohHostAdd
   class Failure < StandardError
     attr_reader :status

@@ -91,10 +91,27 @@ RSpec.describe ByohHostWatch do
     expect(out.string).to include "! host #{host.ubid} is not accepting VMs after 1000 s (--timeout)"
   end
 
-  it "has no phase for a prog pushed from elsewhere" do
+  it "stops at once on a host outside the bring-up that is not accepting" do
+    strand.update(label: "wait")
+    host.update(allocation_state: "draining")
+    expect(watch.run).to eq :not_bringup
+    expect(now[0]).to eq 0
+    expect(out.string).to include "! host #{host.ubid} is draining at Vm::HostNexus.wait, which is not part of a bring-up"
+    expect(described_class::EXIT[:not_bringup]).to eq 3
+  end
+
+  it "has no phase for a prog pushed from elsewhere, and stops on it" do
     strand.update(prog: "Other", label: "x", stack: [{}])
     expect(described_class.host_label(strand)).to be_nil
-    expect(watch(timeout: 10).run).to eq :timeout
+    expect(watch.run).to eq :not_bringup
+    expect(out.string).to include "is unprepared at Other.x, which is not part of a bring-up"
+  end
+
+  it "gives a hardware reset its own limit, so a reset wedged without a BMC ends the watch" do
+    strand.update(label: "hardware_reset")
+    expect(watch.run).to eq :timeout
+    expect(now[0]).to eq 1205
+    expect(out.string).to include "has been in its hardware reset phase (at Vm::HostNexus.hardware_reset) for 1205 s, over its 1200 s limit"
   end
 
   it "reports a destroyed host" do

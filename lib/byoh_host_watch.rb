@@ -10,7 +10,10 @@
 #   start nor taken a lease within RESPIRATE_GRACE seconds;
 # - each phase of the bring-up has a limit (PHASES), the deadlines that
 #   HostNexus pages at, counted from when the watch first saw the phase;
-# - timeout, when given, caps the whole watch.
+# - timeout, when given, caps the whole watch;
+# - a host that is not accepting at a HostNexus label outside the
+#   bring-up (PHASES), such as wait on a host an operator set to
+#   draining, will not turn accepting by itself, so the watch stops.
 #
 # Stopping the watch never stops the bring-up: the strand keeps running
 # and reboots the host, and the watch can be resumed.
@@ -18,11 +21,14 @@ class ByohHostWatch
   # Bring-up phases by the host strand's HostNexus label, with their
   # limits in seconds: bootstrap_rhizome's deadline to reach
   # download_boot_images, download_boot_images' deadline to reach
-  # prep_reboot, and prep_reboot's deadline to reach wait.
+  # prep_reboot, and prep_reboot's deadline to reach wait, which
+  # prep_hardware_reset replaces with its own when reboot fails over to
+  # a hardware reset.
   PHASES = {
     "bootstrap" => [600, %w[start install_host_os setup_ssh_keys bootstrap_rhizome check_ip_reachability prep wait_prep setup_hugepages setup_storage_backend]],
     "boot image download" => [4 * 60 * 60, %w[download_boot_images wait_download_boot_images]],
     "reboot" => [15 * 60, %w[prep_reboot reboot verify_spdk verify_hugepages start_slices start_vms]],
+    "hardware reset" => [20 * 60, %w[prep_hardware_reset hardware_reset]],
   }.freeze
   PHASE_OF = PHASES.flat_map { |phase, (_, labels)| labels.map { [it, phase] } }.to_h.freeze
 
@@ -32,7 +38,7 @@ class ByohHostWatch
   HOST_PROG = "Vm::HostNexus"
 
   # How the watch ended, and the exit status byoh-host gives it.
-  EXIT = {accepting: 0, gone: 1, timeout: 3, respirate: 3, interrupted: 130}.freeze
+  EXIT = {accepting: 0, gone: 1, timeout: 3, respirate: 3, not_bringup: 3, interrupted: 130}.freeze
 
   # clock returns monotonic seconds, sleeper waits that many; specs pass
   # stand-ins.
@@ -102,6 +108,12 @@ class ByohHostWatch
       return :accepting
     end
 
+    unless PHASE_OF.key?(self.class.host_label(strand))
+      @out.puts "! host #{@ubid} is #{host.allocation_state} at #{strand.prog}.#{strand.label}, which is not part of a bring-up, so it will not accept VMs by itself"
+      @out.puts "  An operator set it to #{host.allocation_state}, or it is being rebooted or destroyed; see its page in the admin UI"
+      return :not_bringup
+    end
+
     @progress ||= strand.label != "start" || strand.prog != HOST_PROG || strand.lease > Time.now
     if !@progress && elapsed >= RESPIRATE_GRACE
       @out.puts "! host strand #{@ubid} has not started in #{RESPIRATE_GRACE} s: respirate is not running"
@@ -133,7 +145,6 @@ class ByohHostWatch
       @phase = phase
       @phase_start = elapsed
     end
-    return unless phase
 
     limit = PHASES[phase].first
     spent = elapsed - @phase_start
