@@ -16,6 +16,7 @@ class ByohHostCli
       move-location       --host UBID --rollback-to LOCATION --empty-only
       setup-egress-nat    --host UBID
       relearn-device-ids  --host UBID [--yes]
+      relearn-pci         --host UBID
       export-audit        [--out FILE]
 
     Run a command with --help for its options.
@@ -33,7 +34,7 @@ class ByohHostCli
     argv = argv.dup
     command = argv.shift
     case command
-    when "move-location", "setup-egress-nat", "relearn-device-ids", "export-audit"
+    when "move-location", "setup-egress-nat", "relearn-device-ids", "relearn-pci", "export-audit"
       send(:"cmd_#{command.tr("-", "_")}", argv)
     when nil, "help", "-h", "--help"
       @out.puts USAGE
@@ -87,7 +88,7 @@ class ByohHostCli
     from = host.location
     notes = []
     pools = 0
-    strand = DB.transaction do
+    strand, relearn = DB.transaction do
       # The row lock makes the move wait for an allocation that already
       # wrote a VM to the host, so that VM is counted here. It does not
       # stop an allocation that chose the host before the lock but writes
@@ -116,12 +117,19 @@ class ByohHostCli
       # table before it takes VMs, as it is all that keeps them off the
       # metadata service and the underlay; prep installs it only on hosts
       # that are BYOH hosts when prep runs, so a host past prep gets it
-      # here.
-      Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}]) if rollback || self.class.past_prep?(host)
+      # here. Such a host also learned its GPUs under upstream's rule,
+      # which keeps GPUs that are not on vfio-pci; LearnPci applies the
+      # BYOH rule and drops those rows (the host has no VMs to hold one).
+      past_prep = self.class.past_prep?(host)
+      [
+        (Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}]) if rollback || past_prep),
+        (start_learn_pci(host) if !rollback && past_prep),
+      ]
     end
     @out.puts "Moved host #{host.ubid} from location #{from.name} to #{target.name}."
     @out.puts "Reset #{pools} IPv4 pools to routed and public, with nothing reserved and no external IPs." if pools.positive?
     @out.puts "Started #{strand.ubid} to #{rollback ? "remove" : "install"} the egress NAT table #{rollback ? "from" : "on"} host #{host.ubid}." if strand
+    @out.puts "Started #{relearn.ubid} to relearn the GPUs of host #{host.ubid} under the BYOH vfio-pci rule." if relearn
     notes.each { @out.puts "  #{it}" }
     @out.puts "The host is #{host.allocation_state}; set it to accepting in the admin UI when it should take VMs." if host.allocation_state == "draining"
   end
@@ -204,6 +212,30 @@ class ByohHostCli
       end
       @out.puts "Stored the new ids of #{changes.size} storage devices of host #{host.ubid}."
     end
+  end
+
+  # Reruns LearnPci on a BYOH host past prep. Prep learns a host's GPUs
+  # once, so a host learned before the vfio-pci rule (PLATFORMS F9), or
+  # whose GPU binding changed since, keeps rows of GPUs a VM cannot
+  # open. LearnPci records the GPUs whose IOMMU group is all on vfio-pci
+  # and drops the idle rows of the others; a row a VM holds stays.
+  def cmd_relearn_pci(argv)
+    opts = {}
+    parse(argv, "relearn-pci --host UBID") { host_option(it, opts) }
+    host = find_host(opts)
+    raise Error, "host #{host.ubid} is not a BYOH host (a generic host in a BYOH location)" unless host.byoh?
+    raise Error, "host #{host.ubid} is still being prepared; its prep learns the GPUs" unless self.class.past_prep?(host)
+
+    strand = DB.transaction do
+      st = start_learn_pci(host)
+      ByohOperatorLog.record(command: "relearn-pci", target_id: host.id, args: {}, result: "started #{st.ubid}")
+      st
+    end
+    @out.puts "Started #{strand.ubid} to relearn the GPUs of host #{host.ubid}. The respirate log names each GPU it skips and why."
+  end
+
+  def start_learn_pci(host)
+    Strand.create(prog: "LearnPci", label: "start", stack: [{subject_id: host.id}])
   end
 
   # Writes every byoh_operator_action row as JSON lines and records the

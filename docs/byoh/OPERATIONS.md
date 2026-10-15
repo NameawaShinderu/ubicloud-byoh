@@ -504,6 +504,21 @@ before it succeeded.
 
    The host must be reachable over SSH. See §9 for what the ids are for.
 
+10. **GPUs, only when moving a BYOH host with an NVIDIA GPU registered
+    before M4 to M4 or later.** Its GPU rows were learned under
+    upstream's rule, which keeps a GPU whatever its driver. Rerun
+    LearnPci so a GPU that is not on `vfio-pci` stops being offered to
+    GPU VMs:
+
+    ```
+    sudo ubicloud-admin run byoh-host relearn-pci --host vh...
+    ```
+
+    It starts a `LearnPci` strand, writes a `byoh_operator_action` row,
+    and drops only idle rows; a GPU a VM holds keeps its row. The
+    respirate log names each GPU it skips. UNVERIFIED on real GPU
+    hardware.
+
 Do not flip `current` by hand with `ln -sfn`. That skips the downgrade
 guard below.
 

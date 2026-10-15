@@ -66,7 +66,7 @@ Menu names differ by vendor; these are the usual ones. UNVERIFIED on any specifi
 | Setting | Value | Why |
 |---|---|---|
 | Intel Virtualization Technology (VT-x) / AMD SVM Mode | **Enabled** | Without it there is no `/dev/kvm`, and the bootstrap stops with "/dev/kvm is missing" or "the CPU has neither the vmx nor the svm flag" |
-| VT-d / AMD-Vi / IOMMU | Not needed for normal VMs. Turn it on only to pass an NVIDIA GPU through. | For GPU VMs, turn the IOMMU on and bind every function of the GPU's IOMMU group to `vfio-pci` before registration (§2.1). A GPU left on `nouveau` or `nvidia` is not recorded, and the host serves only normal VMs. UNVERIFIED on real GPU hardware. |
+| VT-d / AMD-Vi / IOMMU | Not needed for normal VMs. Turn it on only to pass an NVIDIA GPU through. | For GPU VMs, turn the IOMMU on and bind every function of the GPU's IOMMU group to `vfio-pci` before registration (§2.1). A GPU left on `nouveau` or `nvidia` is not recorded, and the host serves only normal VMs. After binding it later, run `bin/byoh-host relearn-pci --host vh...`, as prep learns the GPUs only once. UNVERIFIED on real GPU hardware. |
 | Hyper-Threading / SMT | **Enabled** | §2.1 |
 | E-cores (hybrid Intel) | Disabled, if the board offers it | §2.1 |
 | Restore on AC power loss | **Power On** or **Last State** | The host comes back by itself after an outage (§3.10) |
@@ -468,7 +468,7 @@ ssh -o "ProxyCommand=ssh -i ~/.ssh/byoh_data root@<main IP> ip netns exec <inhos
 | `bootstrap-data-plane.sh`: "/dev/kvm is missing" or "neither the vmx nor the svm flag" | VT-x / AMD SVM disabled in the firmware | Enable it (§2.2), power-cycle, rerun the bootstrap |
 | Bootstrap: "the CPU lacks the pdpe1gb flag" | Very old CPU | Use another machine; a `flexible` profile without hugepages is PLANNED ([COMPUTE.md](../COMPUTE.md)) |
 | Every VM fails with `RuntimeError BUG` in `write_params_json` | Hybrid Intel CPU (P+E cores), or SMT off / CPUs offline | Disable E-cores in the firmware, enable SMT, remove `nosmt`; then re-register (PLATFORMS HW-6, HW-7) |
-| Internet and internal VMs wait for capacity on a host with an NVIDIA GPU | The host is a legacy generic host outside a BYOH location; the allocator excludes GPU hosts from non-GPU VMs there | `bin/byoh-host move-location`; a host in a BYOH location takes non-GPU VMs (M4) |
+| Internet and internal VMs wait for capacity on a host with an NVIDIA GPU | The host is a legacy generic host outside a BYOH location; the allocator excludes GPU hosts from non-GPU VMs there | `bin/byoh-host move-location`; a host in a BYOH location takes non-GPU VMs (M4). The move also starts LearnPci on a host past prep, which drops the GPU rows learned under upstream's rule for GPUs that are not on `vfio-pci`; for a host moved before that, run `bin/byoh-host relearn-pci --host vh...` |
 | VM prep fails with `Errno::ENOENT` | `/var/storage` on btrfs or ZFS | Reinstall with ext4 or xfs (STOR-5) |
 | A second data disk is never used | Mounted after registration, or not under `/var/storage/devices/<name>` | Mount it there and re-register (STOR-3); never mount over `/var/storage` |
 | Host flaps to `unavailable` and pages | `bin/monitor` running with an LVM root or a disk without `wwn-`/`nvme-eui` links | Stop the monitor (§3.10) |

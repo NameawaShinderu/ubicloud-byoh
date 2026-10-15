@@ -148,16 +148,20 @@ RSpec.describe ByohHostCli do
       byoh_1
       status, out, err = cli("move-location", "--host", host.ubid, "--location", "byoh-1", "--empty-only")
       install = Strand.first(prog: "SetupByohEgressNat")
+      relearn = Strand.first(prog: "LearnPci")
       expect([status, out, err]).to eq [0,
         "Moved host #{host.ubid} from location hetzner-fsn1 to byoh-1.\n" \
         "Started #{install.ubid} to install the egress NAT table on host #{host.ubid}.\n" \
+        "Started #{relearn.ubid} to relearn the GPUs of host #{host.ubid} under the BYOH vfio-pci rule.\n" \
         "The host is draining; set it to accepting in the admin UI when it should take VMs.\n", ""]
       expect([install.label, install.stack]).to eq ["start", [{"subject_id" => host.id}]]
+      expect([relearn.label, relearn.stack]).to eq ["start", [{"subject_id" => host.id}]]
       expect(host.reload.allocation_state).to eq "draining"
       expect(cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-fsn1", "--empty-only")[1])
         .to eq "Moved host #{host.ubid} from location byoh-1 to hetzner-fsn1.\n" \
           "Started #{Strand.exclude(id: install.id).first(prog: "SetupByohEgressNat").ubid} to remove the egress NAT table from host #{host.ubid}.\n" \
           "The host is draining; set it to accepting in the admin UI when it should take VMs.\n"
+      expect(Strand.where(prog: "LearnPci").count).to eq 1
     end
 
     it "installs the egress NAT table on an unprepared host that is past prep" do
@@ -168,14 +172,15 @@ RSpec.describe ByohHostCli do
       strand = Strand.first(prog: "SetupByohEgressNat")
       expect([status, out]).to eq [0,
         "Moved host #{host.ubid} from location hetzner-fsn1 to byoh-1.\n" \
-        "Started #{strand.ubid} to install the egress NAT table on host #{host.ubid}.\n"]
+        "Started #{strand.ubid} to install the egress NAT table on host #{host.ubid}.\n" \
+        "Started #{Strand.first(prog: "LearnPci").ubid} to relearn the GPUs of host #{host.ubid} under the BYOH vfio-pci rule.\n"]
     end
 
     it "leaves the egress NAT table to prep on a host that has not reached it" do
       host = legacy_host
       byoh_1
       expect(cli("move-location", "--host", host.ubid, "--location", "byoh-1", "--empty-only")[1]).to eq "Moved host #{host.ubid} from location hetzner-fsn1 to byoh-1.\n"
-      expect(Strand.where(prog: "SetupByohEgressNat").count).to eq 0
+      expect(Strand.where(prog: ["SetupByohEgressNat", "LearnPci"]).count).to eq 0
     end
 
     it "refuses pools that overlap the target's overlay network or private subnets" do
@@ -324,6 +329,32 @@ RSpec.describe ByohHostCli do
       expect([strand.label, strand.stack]).to eq ["start", [{"subject_id" => host.id}]]
       row = audit_rows.last
       expect([row[:command], row[:target_id], row[:args].to_h, row[:result]]).to eq ["setup-egress-nat", host.id, {"location" => "byoh-1"}, "started #{strand.ubid}"]
+    end
+  end
+
+  describe "relearn-pci" do
+    it "refuses a host that is not a BYOH host" do
+      host = legacy_host
+      host.update(allocation_state: "accepting")
+      expect(cli("relearn-pci", "--host", host.ubid)).to eq [1, "", "! host #{host.ubid} is not a BYOH host (a generic host in a BYOH location)\n"]
+    end
+
+    it "refuses a host whose prep has not started" do
+      host = generic_host(byoh_1)
+      expect(cli("relearn-pci", "--host", host.ubid)).to eq [1, "", "! host #{host.ubid} is still being prepared; its prep learns the GPUs\n"]
+      expect(Strand.where(prog: "LearnPci").count).to eq 0
+      expect(audit_rows).to be_empty
+    end
+
+    it "starts LearnPci on the host and records it" do
+      host = generic_host(byoh_1)
+      host.update(allocation_state: "accepting")
+      status, out, err = cli("relearn-pci", "--host", host.ubid)
+      strand = Strand.first(prog: "LearnPci")
+      expect([status, out, err]).to eq [0, "Started #{strand.ubid} to relearn the GPUs of host #{host.ubid}. The respirate log names each GPU it skips and why.\n", ""]
+      expect([strand.label, strand.stack]).to eq ["start", [{"subject_id" => host.id}]]
+      row = audit_rows.last
+      expect([row[:command], row[:target_id], row[:args].to_h, row[:result]]).to eq ["relearn-pci", host.id, {}, "started #{strand.ubid}"]
     end
   end
 

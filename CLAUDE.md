@@ -435,7 +435,7 @@ Plan: WP1–WP10. Runbooks: `docs/byoh/VERIFY.md`, `docs/byoh/POOL_OPERATIONS.md
 - **Operator CLIs** (each mutation writes a `byoh_operator_action` row):
   - `bin/byoh-location` (create/list/show/set/rates/grant/revoke/delete),
   - `bin/register-byoh-host` (`--location` required, `--pool-file`, `--ipv6-mode`),
-  - `bin/byoh-host` (move-location, setup-egress-nat, export-audit),
+  - `bin/byoh-host` (move-location, setup-egress-nat, relearn-device-ids, relearn-pci, export-audit),
   - `bin/byoh-pool` (list/export/add/remove/remap/annotate/ipv6 set/verify/trace),
   - `scripts/byoh/verify/m2-checks` (read-only gate checks) and `m2-gate.sh`. The gate reaches VMs with `ssh -n -o ProxyCommand="ssh root@<host> ip netns exec <inhost> nc %h %p" ubi@<private_ipv4>` (`m2-checks info` prints both), never over IPv6 (§10 #7). Platform knobs: `GATE_IPV6_MODE`, `GATE_EXPECT_MONITOR` (default 0), `GATE_VM_A_EXPOSURE` (nat/public). A moved host's missing register audit row is INFO.
 - **Billing overlay:** `BILLING_RATES_EXTRA_DIR` (no `CLOVER_` prefix) in `.env.rb`. **web, respirate and monitor all need it**; restart all three after `byoh-location create --rates-from` or `rates`. Back the directory up with the DB.

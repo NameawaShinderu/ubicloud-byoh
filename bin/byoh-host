@@ -2,7 +2,8 @@
 # frozen_string_literal: true
 
 # Operator commands for registered BYOH hosts: moving an empty host into or
-# out of a BYOH location, and exporting the operator audit log. The logic
+# out of a BYOH location, reinstalling its egress NAT table, relearning its
+# disk ids or GPUs, and exporting the operator audit log. The logic
 # lives in lib/byoh_host_cli.rb; run with --help for the commands.
 #
 # Example:
