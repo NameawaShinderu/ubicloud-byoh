@@ -33,7 +33,8 @@ vm_setup = VmSetup.new(vm_name,
   firmware_version: params["firmware_version"],
   append_serial_console: params.fetch("append_serial_console", false),
   egress_nat4: params.fetch("egress_nat4", nil),
-  byoh_host: params.fetch("byoh_host", false))
+  byoh_host: params.fetch("byoh_host", false),
+  accel: params["accel"])
 
 if action == "delete"
   vm_setup.purge

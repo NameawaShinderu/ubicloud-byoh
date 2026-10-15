@@ -39,6 +39,21 @@ class VmPath
     File.join("", "vm", @vm_name, n)
   end
 
+  # The VM user's home directory, `/vm/#{vm_name}`.
+  def home_dir
+    File.join("", "vm", @vm_name)
+  end
+
+  # A directory only the VM user can enter. QEMU VMs on emulated hosts keep
+  # their QMP socket here.
+  def run_dir
+    home("run")
+  end
+
+  def qmp_sock
+    File.join(run_dir, "qmp.sock")
+  end
+
   def self.define_new_method(m, &block)
     fail "BUG" if method_defined?(m)
     define_method(m, &block)

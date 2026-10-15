@@ -60,6 +60,14 @@ RSpec.describe VmPath do
     end
   end
 
+  describe "#home_dir, #run_dir and #qmp_sock" do
+    it "places the QMP socket in run/ under the VM home" do
+      expect(vp.home_dir).to eq("/vm/vm123456")
+      expect(vp.run_dir).to eq("/vm/vm123456/run")
+      expect(vp.qmp_sock).to eq("/vm/vm123456/run/qmp.sock")
+    end
+  end
+
   describe "#write_yaml_*" do
     it "serializes data to YAML and writes it" do
       expect(File).to receive(:write).with(vp.meta_data, satisfy { |s| s.include?("key: value") })

@@ -15,24 +15,58 @@ require_relative "vm_path"
 require_relative "cloud_hypervisor"
 require_relative "storage_volume"
 require_relative "byoh_egress_nat"
+require_relative "qemu_tcg"
 
 class VmSetup
   Nic = Struct.new(:net6, :net4, :tap, :mac, :private_ipv4_gateway)
 
-  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false)
+  ACCELS = [nil, "kvm", "tcg"].freeze
+
+  # accel is "tcg" only for VMs on emulated hosts (hosts without KVM), which
+  # run under QEMU's software translator. nil and "kvm" both mean hardware
+  # virtualization, as on every other host.
+  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false, accel: nil)
+    fail "unsupported accel #{accel.inspect}" unless ACCELS.include?(accel)
+    fail "accel tcg needs hypervisor qemu, not #{hypervisor}" if accel == "tcg" && hypervisor != "qemu"
+
     @vm_name = vm_name
     @hugepages = hugepages
     @hypervisor = hypervisor
-    @ch_version = CloudHypervisor::Version[ch_version] || no_valid_ch_version
-    @firmware_version = CloudHypervisor::Firmware[firmware_version] || no_valid_firmware_version
+    @ch_version_name = ch_version
+    @firmware_version_name = firmware_version
     @append_serial_console = append_serial_console
     @egress_nat4 = egress_nat4&.transform_keys(&:to_sym)
     @byoh_host = byoh_host
+    @accel = accel
   end
 
   # Whether the host masquerades the VM's IPv4 egress (ByohEgressNat). Only
   # BYOH hosts ask for it, for VMs without an internet-facing IPv4.
   def host_nat? = !!@egress_nat4
+
+  # Whether the VM runs under QEMU's software translator (an emulated host).
+  def emulated? = @accel == "tcg"
+
+  # The cloud-hypervisor binary and firmware are looked up only when a
+  # cloud-hypervisor unit is written, so the actions that never start
+  # cloud-hypervisor (delete, restart) work on hosts without it, such as
+  # emulated hosts.
+  def ch_version
+    @ch_version ||= CloudHypervisor::Version[@ch_version_name] || no_valid_ch_version
+  end
+
+  def firmware_version
+    @firmware_version ||= CloudHypervisor::Firmware[@firmware_version_name] || no_valid_firmware_version
+  end
+
+  # Fail before any host state changes when a cloud-hypervisor VM is set
+  # up on a host without the requested cloud-hypervisor or firmware.
+  private def check_ch_installed
+    return unless @hypervisor == "ch"
+
+    ch_version
+    firmware_version
+  end
 
   private def no_valid_ch_version
     raise("no valid cloud hypervisor version")
@@ -51,6 +85,7 @@ class VmSetup
     boot_image, dns_ipv4, slice_name, cpu_percent_limit, cpu_burst_percent_limit,
     init_script, ipv6_disabled, gpu_partition_id)
 
+    check_ch_installed
     cloudinit(unix_user, public_keys, gua, nics, swap_size_bytes, boot_image, dns_ipv4, ipv6_disabled: ipv6_disabled, ip4: ip4, init_script: init_script)
     network_thread = Thread.new do
       setup_networking(false, gua, ip4, local_ip4, nics, ndp_needed, dns_ipv4, multiqueue: max_vcpus > 1)
@@ -61,6 +96,7 @@ class VmSetup
     [network_thread, storage_thread].each(&:join)
     hugepages(mem_gib)
     prepare_gpus(pci_devices, gpu_partition_id)
+    emulated_layout if emulated?
     install_systemd_unit(max_vcpus, cpu_topology, mem_gib, storage_params, nics, pci_devices, slice_name, cpu_percent_limit, boot_image)
     start_systemd_unit
     update_via_routes(nics)
@@ -68,9 +104,19 @@ class VmSetup
     enable_bursting(slice_name, cpu_burst_percent_limit) unless cpu_burst_percent_limit == 0
   end
 
+  # Files QEMU writes on an emulated host. The QMP socket lives in run/,
+  # which only the VM user can enter, so another VM's user cannot reach
+  # it. serial.log is owned by root and only group-writable by the VM
+  # user, so QEMU can write it but cannot replace it.
+  def emulated_layout
+    r "install", "-d", "-o", @vm_name, "-g", @vm_name, "-m", "0700", vp.run_dir
+    r "install", "-o", "root", "-g", @vm_name, "-m", "0660", File::NULL, vp.serial_log
+  end
+
   def recreate_unpersisted(gua, ip4, local_ip4, nics, mem_gib, ndp_needed, storage_params,
     storage_secrets, dns_ipv4, pci_devices, slice_name, cpu_burst_percent_limit, gpu_partition_id, multiqueue:)
 
+    check_ch_installed
     setup_networking(true, gua, ip4, local_ip4, nics, ndp_needed, dns_ipv4, multiqueue: multiqueue)
     hugepages(mem_gib)
     storage(storage_params, storage_secrets, false)
@@ -82,6 +128,7 @@ class VmSetup
   end
 
   def restart(slice_name, cpu_burst_percent_limit)
+    check_ch_installed
     restart_systemd_unit
     enable_bursting(slice_name, cpu_burst_percent_limit) unless cpu_burst_percent_limit == 0
   end
@@ -90,6 +137,7 @@ class VmSetup
     mem_gib, ndp_needed, storage_params, storage_secrets, swap_size_bytes, pci_devices, boot_image,
     dns_ipv4, slice_name, cpu_percent_limit, cpu_burst_percent_limit, ipv6_disabled, init_script)
 
+    check_ch_installed
     cloudinit(unix_user, public_keys, gua, nics, swap_size_bytes, boot_image, dns_ipv4, ipv6_disabled: ipv6_disabled, ip4: ip4, init_script: init_script)
     setup_networking(false, gua, ip4, local_ip4, nics, ndp_needed, dns_ipv4, multiqueue: max_vcpus > 1)
     hugepages(mem_gib)
@@ -206,9 +254,30 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
   end
 
   def purge_user
-    r "deluser", "--remove-home", @vm_name
-  rescue CommandFail => ex
-    raise unless /The user `.*' does not exist./.match?(ex.stderr)
+    # A root-owned home is the emulated-host layout. deluser is not relied
+    # on to remove it, so it is removed explicitly. Cloud-hypervisor hosts
+    # have homes owned by the VM user, so this never runs there.
+    remove_home = emulated? || root_owned_home?
+    begin
+      r "deluser", "--remove-home", @vm_name
+    rescue CommandFail => ex
+      raise unless /The user `.*' does not exist./.match?(ex.stderr)
+    end
+    remove_home_dir if remove_home
+  end
+
+  def root_owned_home?
+    stat = File.lstat(vp.home_dir)
+    stat.directory? && stat.uid == 0
+  rescue Errno::ENOENT
+    false
+  end
+
+  # GNU rm walks the tree relative to open directory handles and never
+  # follows symlinks, so the VM user cannot swap a directory in run/ for a
+  # symlink halfway through and make root delete outside the home.
+  def remove_home_dir
+    r "rm", "-rf", "--one-file-system", "--", vp.home_dir
   end
 
   def purge_storage
@@ -746,6 +815,7 @@ DNSMASQ_CONF
 
   def install_systemd_unit(max_vcpus, cpu_topology, mem_gib, storage_params, nics, pci_devices, slice_name, cpu_percent_limit, boot_image)
     fail "BUG" if /["'\s]/.match?(cpu_topology)
+    check_ch_installed
 
     tapnames = nics.map { "-i #{_1.tap}" }.join(" ")
 
@@ -866,7 +936,7 @@ DNSMASQ_SERVICE
     disk_params << "path=#{vp.cloudinit_img}"
 
     disk_args =
-      if Gem::Version.new(@ch_version.version) >= Gem::Version.new("36")
+      if Gem::Version.new(ch_version.version) >= Gem::Version.new("36")
         "--disk #{disk_params.join(" ")}"
       else
         disk_params.map { |x| "--disk #{x}" }.join(" ")
@@ -878,7 +948,7 @@ DNSMASQ_SERVICE
     pci_device_params =
       if pci_devices.empty?
         nil
-      elsif Gem::Version.new(@ch_version.version) >= Gem::Version.new("36")
+      elsif Gem::Version.new(ch_version.version) >= Gem::Version.new("36")
         "--device #{pci_devices.map { |dev| "path=/sys/bus/pci/devices/0000:#{dev[0]}/" }.join(" ")}"
       else
         pci_devices.map { |dev| "--device path=/sys/bus/pci/devices/0000:#{dev[0]}/" }.join(" ")
@@ -891,9 +961,9 @@ DNSMASQ_SERVICE
     end
 
     exec_start_cmd = [
-      "#{@ch_version.bin} -v",
+      "#{ch_version.bin} -v",
       "--api-socket path=#{vp.ch_api_sock}",
-      "--kernel #{@firmware_version.path}",
+      "--kernel #{firmware_version.path}",
       disk_args,
       serial_arg,
       "--cpus boot=#{max_vcpus},topology=#{cpu_topology}",
@@ -916,6 +986,11 @@ DNSMASQ_SERVICE
   end
 
   def build_qemu_service(header:, footer:, slice_name:, mem_gib:, max_vcpus:, cpu_topology:, storage_volumes:, storage_params:, nics:, pci_devices:, boot_image:)
+    if emulated?
+      fail "emulated hosts support x86_64 only" if Arch.arm64?
+      fail "PCI passthrough is not available on emulated hosts" unless pci_devices.empty?
+    end
+
     disk_parts = storage_volumes.each_with_index.flat_map do |vol, i|
       if vol.read_only
         [
@@ -934,28 +1009,42 @@ DNSMASQ_SERVICE
       "-device virtio-blk-pci,drive=cidrive,romfile=",
     ]
 
-    mem_parts =
+    # vhost-user devices need guest RAM the backend can map, so guest RAM
+    # is a shared memfd with or without hugepages. Plain -m makes the
+    # vhost-user disk fail to start ("vhost start failed").
+    size = "#{mem_gib}G"
+    mem_parts = [
       if @hugepages
-        size = "#{mem_gib}G"
-        [
-          "-object memory-backend-memfd,id=mem0,size=#{size},hugetlb=on,hugetlbsize=1G,prealloc=on,share=on",
-          "-numa node,memdev=mem0",
-          "-m #{size}",
-        ]
+        "-object memory-backend-memfd,id=mem0,size=#{size},hugetlb=on,hugetlbsize=1G,prealloc=on,share=on"
       else
-        ["-m #{mem_gib}G"]
-      end
-
-    cpu_parts = [
-      qemu_smp(cpu_topology, max_vcpus),
-      qemu_cpu,
-      "-enable-kvm",
-      "-machine accel=kvm,type=q35",
+        "-object memory-backend-memfd,id=mem0,size=#{size},share=on"
+      end,
+      "-numa node,memdev=mem0",
+      "-m #{size}",
     ]
 
+    cpu_parts = if emulated?
+      [
+        qemu_smp(cpu_topology, max_vcpus),
+        "-cpu #{QemuTcg::CPU}",
+        "-machine q35",
+        "-accel tcg,thread=multi,tb-size=#{QemuTcg::TB_SIZE_MIB}",
+      ]
+    else
+      [
+        qemu_smp(cpu_topology, max_vcpus),
+        qemu_cpu,
+        "-enable-kvm",
+        "-machine accel=kvm,type=q35",
+      ]
+    end
+
+    # In-kernel vhost-net is untested under TCG, and the translator, not
+    # the network path, is the bottleneck there.
+    vhost = emulated? ? "off" : "on"
     net_parts = nics.each_with_index.flat_map { |nic, i|
       [
-        "-netdev tap,id=net#{i},ifname=#{nic.tap},script=no,downscript=no,queues=#{max_vcpus * 2 + 1},vhost=on",
+        "-netdev tap,id=net#{i},ifname=#{nic.tap},script=no,downscript=no,queues=#{max_vcpus * 2 + 1},vhost=#{vhost}",
         "-device virtio-net-pci,mac=#{nic.mac},netdev=net#{i},mq=on,romfile=",
       ]
     }
@@ -972,6 +1061,35 @@ DNSMASQ_SERVICE
       "-display none",
       "-vga none",
     ]
+
+    if emulated?
+      parts = [
+        "-name #{@vm_name}",
+        "-nodefaults",
+        "-no-user-config",
+        "-bios #{QemuTcg::FIRMWARE}",
+      ] + mem_parts + cpu_parts + disk_parts + net_parts + ["-device virtio-rng-pci"] + serial_parts + [
+        "-qmp unix:#{vp.qmp_sock},server=on,wait=off",
+        "-sandbox #{QemuTcg::SANDBOX}",
+      ]
+
+      return <<~SERVICE
+  #{header}
+  [Service]
+  Slice=#{slice_name}
+  NetworkNamespacePath=/var/run/netns/#{@vm_name}
+  ExecStartPre=/usr/bin/rm -f #{vp.qmp_sock}
+
+  ExecStart=qemu-system-x86_64 \\
+  #{parts.join(" \\\n")}
+
+  KillSignal=SIGTERM
+  TimeoutStopSec=30s
+
+  #{QemuTcg.hardening(@vm_name, mem_gib)}
+  #{footer}
+      SERVICE
+    end
 
     kernel_parts = [
       "-bios /opt/fw/QEMU.fd",

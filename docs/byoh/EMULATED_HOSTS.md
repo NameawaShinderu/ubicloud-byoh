@@ -139,12 +139,12 @@ Items 5-8 apply to **emulated hosts only**. CH hosts are unchanged (U1); the equ
    - `ProtectKernelTunables=yes`, `ProtectKernelModules=yes`, `ProtectKernelLogs=yes`, `ProtectControlGroups=yes`, `ProtectClock=yes`, `ProtectHostname=yes`
    - `ProtectProc=invisible`, `ProcSubset=pid`
    - `RestrictNamespaces=yes`, `RestrictRealtime=yes`, `RestrictSUIDSGID=yes`, `RemoveIPC=yes`, `LockPersonality=yes`
-   - `SystemCallArchitectures=native`, `SystemCallFilter=@system-service`, `CapabilityBoundingSet=`
+   - `SystemCallArchitectures=native`, `SystemCallFilter=@system-service seccomp`, `SystemCallErrorNumber=EPERM`, `CapabilityBoundingSet=`. `@system-service` does not contain `seccomp()`, which QEMU needs to install its `-sandbox` filter (VERIFIED by expanding the set with `systemd-analyze syscall-filter`, systemd 255 in Ubuntu 24.04). Without it an allow-list kills QEMU with SIGSYS at start. With `SystemCallErrorNumber=EPERM`, any other call outside the set fails instead of killing QEMU.
    - `RestrictAddressFamilies=AF_UNIX` (fallback `AF_UNIX AF_INET AF_INET6` if QEMU 8.2 needs it with a tap netdev; UNVERIFIED), `IPAddressDeny=any`
    - `DevicePolicy=closed` with `DeviceAllow=/dev/net/tun rw`
    - `UMask=0077`, `MemoryMax=<guest MiB + EMULATED_VM_OVERHEAD_MIB>`, `TasksMax=4096`
    - **Not** `MemoryDenyWriteExecute`: the TCG JIT needs W+X memory.
-   - The container harness runs `systemd-analyze verify` and `systemd-analyze security --offline=yes` on the generated unit and records the exposure score. It cannot run systemd itself without `--privileged`, so runtime enforcement is checked only at the live gate L-Q (UNVERIFIED). Each directive that breaks QEMU at L-Q is removed, and the removal is documented, **except** `ProtectSystem=strict`, which may only be swapped for an equivalent (above).
+   - The container harness runs `systemd-analyze verify` and `systemd-analyze security --offline=yes` on the generated unit and records the exposure score. WP2 ran both once on the generated `emulated-2` unit (systemd 255): `verify` passes, and the offline exposure level is 1.2 ("OK"). It cannot run systemd itself without `--privileged`, so runtime enforcement is checked only at the live gate L-Q (UNVERIFIED). Each directive that breaks QEMU at L-Q is removed, and the removal is documented, **except** `ProtectSystem=strict`, which may only be swapped for an equivalent (above).
    - `TemporaryFileSystem=/var/storage` with `BindPaths` is deferred: other VMs' storage directories are already per-uid 0700, the VM's **own** storage directory is covered by `ProtectSystem=strict` above, and the mount-namespace interplay with ubiblk socket paths is UNVERIFIED.
 9. **Host kernel attack surface:** smaller than under CH, because the KVM ioctl surface is gone.
 
@@ -295,7 +295,7 @@ When `@hypervisor == "qemu"` and `@accel == "tcg"`, `build_qemu_service` emits t
 ```
 ExecStartPre=/usr/bin/rm -f /vm/<n>/run/qmp.sock
 ExecStart=qemu-system-x86_64 \
--name <vm>,debug-threads=on -nodefaults -no-user-config \
+-name <vm> -nodefaults -no-user-config \
 -bios /usr/share/ovmf/OVMF.fd \
 -object memory-backend-memfd,id=mem0,size=<M>G,share=on \  # hugetlb memfd when hugepages: true
 -numa node,memdev=mem0 \
@@ -324,10 +324,10 @@ Notes on the argv:
 - `TB_SIZE_MIB = 256` is a rhizome constant (`rhizome/host/lib/qemu_tcg.rb`), not a prep.json key.
 - arm64 TCG raises "emulated hosts support x86_64 only" (gap G7 stays as it is for KVM).
 
-**Emulated-host directory layout** (`prep` when `accel == "tcg"`; 4.2 item 5): `install -d` of `run/` as `<vm> 0700`; `serial.log` pre-created as `root:<vm> 0660`; `purge` removes the home explicitly.
+**Emulated-host directory layout** (`prep` when `accel == "tcg"`; 4.2 item 5): `install -d` of `run/` as `<vm> 0700`; `serial.log` pre-created as `root:<vm> 0660`; `purge` removes the home explicitly with `rm -rf --one-file-system`, which does not follow symlinks. It does so for a tcg VM, and also for any root-owned home. That second case covers a delete whose `prep.json` is already gone; CH homes are owned by the VM user, so it never fires on CH hosts.
 
 **Changes outside the TCG branch:**
-- **G5:** `@ch_version` and `@firmware_version` are resolved lazily inside `build_ch_service`, which raises the same messages as today. The CH unit text is unchanged. A `delete` with no `prep.json` on a host without CH now succeeds; a CH `prep` on a host without CH still raises.
+- **G5:** the CH binary and firmware are no longer looked up in `VmSetup#initialize`. A CH VM looks them up at the start of every non-delete action (`prep`, `recreate_unpersisted`, `reassign_ip6`, `restart`, `install_systemd_unit`), so those still fail with the same messages before any host state changes. A QEMU VM never looks them up, and the delete actions do not either. The CH unit text is unchanged. A `delete` with no `prep.json` on a host without CH now succeeds.
 - **G3:** the non-hugepage memory bug is fixed for **QEMU+KVM** too. The KVM non-hugepage branch emits the shared memfd backend. That changes output only for `hypervisor: "qemu", hugepages: false`, which cannot boot a writable disk today, and no production caller passes `hugepages: false`. The CH builder and the QEMU+KVM hugepage unit (the GPU path, spec `rhizome/host/spec/vm_setup_spec.rb:551-600`) stay byte-identical, which the WP1 golden fixtures prove.
 - `VmPath` gains `run_dir` and `qmp_sock` under it (`rhizome/host/lib/vm_path.rb:57`).
 - `vm_stats` sets `with_memory: true` (plus RssAnon) when prep.json has `accel == "tcg"`; CH output is unchanged (`rhizome/host/lib/vm_stats.rb:20`).

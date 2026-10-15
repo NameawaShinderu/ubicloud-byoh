@@ -13,14 +13,20 @@ class VmStats
   end
 
   def collect
+    # A VM with hugepages keeps its guest RAM out of the process RSS, so
+    # memory figures say nothing about it. An emulated (TCG) VM has no
+    # hugepages, and its anonymous memory is QEMU's own overhead, mostly the
+    # translation cache, which capacity planning needs.
+    emulated = vm_params["accel"] == "tcg"
     result = {
       "vm" => unit_stats(
         @vm_name,
         with_io: false,    # Actual IO is done by the vhost block backend of each disk
-        with_memory: false, # VM uses hugepages, so memory usage is not reflected in the process RSS
+        with_memory: emulated,
       ),
     }
     result["vm"]["vcpus"] = vm_params.fetch("max_vcpus")
+    result["vm"]["rss_anon_bytes"] = rss_anon_bytes(result["vm"]["main_pid"]) if emulated
 
     ubiblk_disks.each do |disk|
       disk_index = disk["disk_index"]
@@ -79,6 +85,16 @@ class VmStats
       end
     end
     stats
+  end
+
+  def rss_anon_bytes(main_pid)
+    File.foreach("/proc/#{main_pid}/status") do |line|
+      key, value = line.split(":", 2)
+      next unless key == "RssAnon"
+      kib = value.strip.delete_suffix(" kB")
+      return Integer(kib, 10) * 1024
+    end
+    raise "no RssAnon in /proc/#{main_pid}/status"
   end
 
   def cpu_stats(main_pid)

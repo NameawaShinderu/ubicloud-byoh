@@ -108,6 +108,44 @@ RSpec.describe VmStats do
     end
   end
 
+  describe "#collect for an emulated (TCG) VM" do
+    it "adds the QEMU unit's memory figures and its anonymous RSS" do
+      stub_unit_property("vmh6b1sz", "MainPID", "3373")
+      stub_unit_property("vmh6b1sz", "MemoryPeak", "1215299584")
+      stub_unit_property("vmh6b1sz", "MemorySwapPeak", "0")
+      stub_unit_property("vmh6b1sz", "ActiveEnterTimestampMonotonic", "31554196")
+      expect(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC).and_return(1616.0)
+      expect(File).to receive(:read).with("/proc/3373/stat").and_return("3373 (qemu-system-x86) S 1 3373 3373 0 -1 4194560 1163 0 0 0 95143 16431 0 0 20 0 13 0 3364 8618754048 960 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 7 0 0 0 0 0 0 0 0 0 0 0 0 0")
+      expect(File).to receive(:foreach).with("/proc/3373/status")
+        .and_yield("Name:\tqemu-system-x86\n")
+        .and_yield("VmRSS:\t  826000 kB\n")
+        .and_yield("RssAnon:\t  358400 kB\n")
+        .and_yield("RssShmem:\t  465000 kB\n")
+      expect(File).to receive(:read).with("/vm/vmh6b1sz/prep.json").and_return(JSON.generate(
+        {"max_vcpus" => 2, "hypervisor" => "qemu", "accel" => "tcg", "storage_volumes" => []},
+      ))
+
+      expect(vm_stats.collect).to eq(
+        "vm" => {
+          "main_pid" => "3373",
+          "vcpus" => 2,
+          "active_age_ms" => 1584446,
+          "cpu_stats" => {"user_time_ms" => 951430, "system_time_ms" => 164310, "total_time_ms" => 1115740},
+          "memory_peak_bytes" => 1215299584,
+          "memory_swap_peak_bytes" => 0,
+          "rss_anon_bytes" => 367001600,
+        },
+      )
+    end
+  end
+
+  describe "#rss_anon_bytes" do
+    it "raises when the status file has no RssAnon line" do
+      expect(File).to receive(:foreach).with("/proc/1234/status").and_yield("Name:\tqemu\n")
+      expect { vm_stats.rss_anon_bytes("1234") }.to raise_error(RuntimeError, "no RssAnon in /proc/1234/status")
+    end
+  end
+
   describe "#unit_active_age_ms" do
     it "returns nil when ActiveEnterTimestampMonotonic is zero" do
       stub_unit_property("my-unit", "ActiveEnterTimestampMonotonic", "0")

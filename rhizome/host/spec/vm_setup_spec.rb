@@ -1009,6 +1009,37 @@ NFTABLES_CONF
   end
 
   describe "#purge_user" do
+    it "leaves the home to deluser on a cloud-hypervisor host" do
+      expect(File).to receive(:lstat).with("/vm/test").and_return(instance_double(File::Stat, directory?: true, uid: 1234))
+      expect(vs).to receive(:_run_command).with("deluser", "--remove-home", "test")
+      expect(vs).not_to receive(:remove_home_dir)
+      vs.purge_user
+    end
+
+    it "removes a root-owned home explicitly, even without prep.json" do
+      expect(File).to receive(:lstat).with("/vm/test").and_return(instance_double(File::Stat, directory?: true, uid: 0))
+      expect(vs).to receive(:_run_command).with("deluser", "--remove-home", "test").and_raise(
+        CommandFail.new("err", "", "The user `test' does not exist."),
+      )
+      expect(vs).to receive(:_run_command).with("rm", "-rf", "--one-file-system", "--", "/vm/test")
+      vs.purge_user
+    end
+
+    it "removes the home of an emulated VM" do
+      vm_setup = described_class.new("test", hypervisor: "qemu", accel: "tcg")
+      expect(File).not_to receive(:lstat)
+      expect(vm_setup).to receive(:_run_command).with("deluser", "--remove-home", "test")
+      expect(vm_setup).to receive(:_run_command).with("rm", "-rf", "--one-file-system", "--", "/vm/test")
+      vm_setup.purge_user
+    end
+
+    it "does not treat a missing or non-directory home as root-owned" do
+      expect(File).to receive(:lstat).with("/vm/test").and_raise(Errno::ENOENT)
+      expect(vs.root_owned_home?).to be false
+      expect(File).to receive(:lstat).with("/vm/test").and_return(instance_double(File::Stat, directory?: false, uid: 0))
+      expect(vs.root_owned_home?).to be false
+    end
+
     it "silently ignores 'user does not exist' error" do
       expect(vs).to receive(:_run_command).with("deluser", "--remove-home", "test").and_raise(
         CommandFail.new("err", "", "The user `test' does not exist."),
@@ -1415,17 +1446,73 @@ NFTABLES_CONF
 
   describe "#no_valid_ch_version / #no_valid_firmware_version" do
     it "raises when no valid cloud hypervisor version is given" do
-      expect { described_class.new("test", ch_version: "nonexistent-version") }.to raise_error("no valid cloud hypervisor version")
+      expect { described_class.new("test", ch_version: "nonexistent-version").ch_version }.to raise_error("no valid cloud hypervisor version")
     end
 
     it "raises when no valid firmware version is given" do
-      # Bypass ch_version check by overriding no_valid_ch_version to return nil
-      klass = Class.new(VmSetup) do
-        def no_valid_ch_version
-          nil
-        end
-      end
-      expect { klass.new("test", firmware_version: "nonexistent-fw") }.to raise_error("no valid cloud hypervisor firmware version")
+      expect { described_class.new("test", firmware_version: "nonexistent-fw").firmware_version }.to raise_error("no valid cloud hypervisor firmware version")
+    end
+  end
+
+  describe "cloud-hypervisor lookup" do
+    let(:missing_ch) { described_class.new("test", ch_version: "nonexistent-version") }
+
+    it "does not look up cloud-hypervisor when the object is created" do
+      expect { missing_ch }.not_to raise_error
+    end
+
+    it "deletes a VM with no prep.json on a host without cloud-hypervisor" do
+      # setup-vm builds VmSetup from empty params when prep.json is gone.
+      vm_setup = described_class.new("test", hypervisor: "ch", ch_version: nil, firmware_version: nil)
+      stub_const("CloudHypervisor::Version::INSTALLED", {}.freeze)
+      stub_const("CloudHypervisor::Firmware::INSTALLED", {}.freeze)
+      expect(vm_setup).to receive(:block_ip4)
+      expect(vm_setup).to receive(:_run_command).with("ip", "netns", "del", "test")
+      expect(vm_setup).to receive(:rm_if_exists).exactly(3).times
+      expect(vm_setup).to receive(:_run_command).with("systemctl daemon-reload")
+      expect(vm_setup).to receive(:purge_storage)
+      expect(vm_setup).to receive(:unmount_hugepages)
+      expect(vm_setup).to receive(:_run_command).with("deluser", "--remove-home", "test")
+      expect { vm_setup.purge }.not_to raise_error
+    end
+
+    it "fails a cloud-hypervisor prep before changing anything on a host without it" do
+      expect(missing_ch).not_to receive(:cloudinit)
+      expect(missing_ch).not_to receive(:_run_command)
+      expect {
+        missing_ch.prep("user", ["key"], [], "fddf::/79", "", "10.0.0.0/31", 2, "1:1:1:2", 4,
+          false, [], {}, nil, [], "ubuntu-noble", "10.0.0.2", "some.slice", 50, 0, nil, false, nil)
+      }.to raise_error("no valid cloud hypervisor version")
+    end
+
+    it "fails the other cloud-hypervisor actions on a host without it" do
+      expect(missing_ch).not_to receive(:_run_command)
+      expect { missing_ch.restart("system.slice", 0) }.to raise_error("no valid cloud hypervisor version")
+      expect { missing_ch.recreate_unpersisted("fddf::/79", "", "10.0.0.0/31", [], 4, false, [], {}, "10.0.0.2", [], "system.slice", 0, nil, multiqueue: false) }.to raise_error("no valid cloud hypervisor version")
+      expect { missing_ch.reassign_ip6("user", ["key"], [], "fddf::/79", "", "10.0.0.0/31", 2, "1:1:1:2", 4, false, [], {}, nil, [], "ubuntu-noble", "10.0.0.2", "system.slice", 0, 0, false, nil) }.to raise_error("no valid cloud hypervisor version")
+      expect { missing_ch.install_systemd_unit(2, "1:1:1:2", 4, [], [], [], "system.slice", 0, "ubuntu-noble") }.to raise_error("no valid cloud hypervisor version")
+    end
+
+    it "never looks up cloud-hypervisor for a QEMU VM" do
+      vm_setup = described_class.new("test", hypervisor: "qemu", ch_version: "nonexistent-version")
+      expect(vm_setup).to receive(:restart_systemd_unit)
+      expect { vm_setup.restart("system.slice", 0) }.not_to raise_error
+    end
+  end
+
+  describe "accel" do
+    it "accepts no accel, kvm and tcg" do
+      expect(described_class.new("test").emulated?).to be false
+      expect(described_class.new("test", accel: "kvm").emulated?).to be false
+      expect(described_class.new("test", hypervisor: "qemu", accel: "tcg").emulated?).to be true
+    end
+
+    it "refuses an unknown accel" do
+      expect { described_class.new("test", hypervisor: "qemu", accel: "hvf") }.to raise_error('unsupported accel "hvf"')
+    end
+
+    it "refuses tcg with cloud-hypervisor" do
+      expect { described_class.new("test", accel: "tcg") }.to raise_error("accel tcg needs hypervisor qemu, not ch")
     end
   end
 
@@ -1687,7 +1774,11 @@ NFTABLES_CONF
   end
 
   describe "#build_qemu_service without hugepages" do
-    it "uses -m flag instead of memory-backend-memfd when hugepages is false" do
+    # vhost-user disks need guest RAM the backend can map, so even without
+    # hugepages guest RAM is a shared memfd. Plain -m fails at start with
+    # "vhost start failed". No production caller passes hugepages: false
+    # for QEMU+KVM; the golden QEMU+KVM unit has hugepages and is unchanged.
+    it "backs guest RAM with a shared memfd" do
       vs.instance_variable_set(:@hypervisor, "qemu")
       vs.instance_variable_set(:@hugepages, false)
 
@@ -1706,8 +1797,8 @@ NFTABLES_CONF
       vs.send(:install_systemd_unit, *args)
 
       expect(vps).to have_received(:write_systemd_service) { |content|
-        expect(content).to include("-m 2G")
-        expect(content).not_to include("memory-backend-memfd")
+        expect(content).to include("-object memory-backend-memfd,id=mem0,size=2G,share=on \\\n-numa node,memdev=mem0 \\\n-m 2G \\\n")
+        expect(content).not_to include("hugetlb")
       }
     end
   end
