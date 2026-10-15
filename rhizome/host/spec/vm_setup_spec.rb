@@ -1500,6 +1500,39 @@ NFTABLES_CONF
     end
   end
 
+  describe ".read_params / .from_params (bin/setup-vm)" do
+    it "reads prep.json" do
+      expect(File).to receive(:read).with("/vm/test/prep.json").and_return('{"accel":"tcg"}')
+      expect(described_class.read_params("test", "prep")).to eq("accel" => "tcg")
+    end
+
+    it "uses empty params for a delete whose prep.json is gone" do
+      expect(File).to receive(:read).with("/vm/test/prep.json").and_raise(Errno::ENOENT).twice
+      expect(described_class.read_params("test", "delete")).to eq({})
+      expect(described_class.read_params("test", "delete_net")).to eq({})
+    end
+
+    it "raises for other actions whose prep.json is gone" do
+      expect(File).to receive(:read).with("/vm/test/prep.json").and_raise(Errno::ENOENT)
+      expect { described_class.read_params("test", "prep") }.to raise_error(Errno::ENOENT)
+    end
+
+    it "builds a cloud-hypervisor VmSetup from empty params" do
+      expect(described_class).to receive(:new).with("test", hugepages: true, hypervisor: "ch", ch_version: nil,
+        firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false, accel: nil).and_call_original
+      vm_setup = described_class.from_params("test", {})
+      expect(vm_setup.emulated?).to be false
+    end
+
+    it "passes every prep.json key through, accel included" do
+      params = {"hugepages" => false, "hypervisor" => "qemu", "ch_version" => "46.0", "firmware_version" => "202311",
+                "append_serial_console" => true, "egress_nat4" => {"a" => 1}, "byoh_host" => true, "accel" => "tcg"}
+      expect(described_class).to receive(:new).with("test", hugepages: false, hypervisor: "qemu", ch_version: "46.0",
+        firmware_version: "202311", append_serial_console: true, egress_nat4: {"a" => 1}, byoh_host: true, accel: "tcg").and_call_original
+      expect(described_class.from_params("test", params).emulated?).to be true
+    end
+  end
+
   describe "accel" do
     it "accepts no accel, kvm and tcg" do
       expect(described_class.new("test").emulated?).to be false

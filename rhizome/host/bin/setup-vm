@@ -14,27 +14,8 @@ unless (vm_name = ARGV.shift)
   exit 1
 end
 
-params = begin
-  JSON.parse(File.read(VmPath.new(vm_name).prep_json))
-rescue Errno::ENOENT
-  if action.start_with?("delete")
-    # Params were not historically needed for the delete actions,
-    # so handle case where prep file has already been deleted.
-    {}
-  else
-    raise
-  end
-end
-
-vm_setup = VmSetup.new(vm_name,
-  hugepages: params.fetch("hugepages", true),
-  hypervisor: params.fetch("hypervisor", "ch"),
-  ch_version: params["ch_version"],
-  firmware_version: params["firmware_version"],
-  append_serial_console: params.fetch("append_serial_console", false),
-  egress_nat4: params.fetch("egress_nat4", nil),
-  byoh_host: params.fetch("byoh_host", false),
-  accel: params["accel"])
+params = VmSetup.read_params(vm_name, action)
+vm_setup = VmSetup.from_params(vm_name, params)
 
 if action == "delete"
   vm_setup.purge

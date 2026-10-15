@@ -44,6 +44,29 @@ class VmSetup
   # BYOH hosts ask for it, for VMs without an internet-facing IPv4.
   def host_nat? = !!@egress_nat4
 
+  # The params of a VM's prep.json. The delete actions historically did not
+  # need them, so a delete whose prep.json is already gone gets {}.
+  def self.read_params(vm_name, action)
+    JSON.parse(File.read(VmPath.new(vm_name).prep_json))
+  rescue Errno::ENOENT
+    raise unless action.start_with?("delete")
+    {}
+  end
+
+  # The VmSetup that bin/setup-vm drives, built from prep.json params. Keys
+  # absent from older prep.json files keep their cloud-hypervisor defaults.
+  def self.from_params(vm_name, params)
+    new(vm_name,
+      hugepages: params.fetch("hugepages", true),
+      hypervisor: params.fetch("hypervisor", "ch"),
+      ch_version: params["ch_version"],
+      firmware_version: params["firmware_version"],
+      append_serial_console: params.fetch("append_serial_console", false),
+      egress_nat4: params.fetch("egress_nat4", nil),
+      byoh_host: params.fetch("byoh_host", false),
+      accel: params["accel"])
+  end
+
   # Whether the VM runs under QEMU's software translator (an emulated host).
   def emulated? = @accel == "tcg"
 
