@@ -1401,7 +1401,9 @@ What each phase checks (the script's header lists the environment overrides):
 - **preflight** (changes nothing): root, x86_64, Ubuntu 24.04, not a container, no `vmx`/`svm`
   (else this is L1; `PVM_ALLOW_HW_VIRT=1` runs anyway and says the result proves nothing for the
   no-hardware case), no `/dev/kvm` on the stock kernel, Secure Boot off, no `GRUB_SAVEDEFAULT=true`,
-  the GRUB tools, about 4 GiB of memory and 8 GiB of disk. A Meltdown-affected CPU is a note, not a
+  the GRUB tools, about 4 GiB of memory, and free disk: 8 GiB for `PVM_WORK`, 1.5 GiB on `/` for the
+  kernel's modules and 300 MiB in `/boot`, added up where they share a file system. It measures
+  `PVM_WORK`'s nearest existing parent and creates nothing. A Meltdown-affected CPU is a note, not a
   refusal, on this throwaway VM; the product refuses it (section 6.5).
 - **install**: downloads the release (default: [cocoonstack/pvm][cocoon-pvm] v0.1.0; third party, so
   fine for this test and never a default for registered hosts). Every file must be **listed** in
@@ -1434,7 +1436,9 @@ What each phase checks (the script's header lists the environment overrides):
   2 GiB, `PVM_BOOT_TIMEOUT` (900 s) each. In the guest, cloud-init prints `BYOH_PVM_GUEST_UP`, the
   PVM lines of `dmesg`, and the same five measurements the script took on the host first (sha256 of
   1 GiB, an 8 GiB `dd` to `/dev/null`, 200k one-byte reads and writes, 2000 fork+exec, 512 MiB of
-  direct writes), then powers off. **GO** = `BYOH_PVM_GUEST_UP` with at least one CH version; the
+  direct writes), then powers off. boot-test checks free disk again first (6 GiB in `PVM_WORK`, 3 GiB
+  when the raw disk is kept from an earlier run) and deletes each guest's disk once its result is
+  recorded, keeping `guest-<version>.serial.log` and `.ch.log`. **GO** = `BYOH_PVM_GUEST_UP` with at least one CH version; the
   report gives seconds to the login prompt and to user space, and each measurement as a percentage of
   the host's. A NO-GO keeps the last serial and CH log lines.
 - **recovery-check** (after the second reboot): the stock kernel, no `pti=off`, no `next_entry`.

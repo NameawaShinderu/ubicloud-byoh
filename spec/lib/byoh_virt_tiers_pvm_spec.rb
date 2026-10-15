@@ -91,6 +91,26 @@ RSpec.describe ByohVirtTiers, "pvm" do
       end
     end
 
+    it "measures free space without creating PVM_WORK, summed per file system" do
+      Dir.mktmpdir do |dir|
+        Dir.mkdir("#{dir}/boot")
+        df = <<~SH
+          df() {
+            echo "$2" >>"$DIR/asked"
+            echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+            case $2 in */boot) echo "/dev/b 1 1 250000 1% /boot" ;; *) echo "/dev/r 1 1 9000000 1% /" ;; esac
+          }
+        SH
+        out, status = run_functions(%w[ok bad expect existing_parent check_space], "FAILS=0\n#{df}check_space \"$DIR/work/sub\" 8000000 / 1500000 \"$DIR/boot\" 300000\necho FAILS=$FAILS", DIR: dir)
+        expect(status.success?).to be true
+        expect(out).to include("FAIL  needs about 9277 MiB free on / (for #{dir}/work/sub and /), has 8789 MiB")
+        expect(out).to include("FAIL  needs about 292 MiB free on /boot (for #{dir}/boot), has 244 MiB")
+        expect(out).to end_with("FAILS=2\n")
+        expect(File.read("#{dir}/asked")).to eq "#{dir}\n/\n#{dir}/boot\n"
+        expect(Dir.exist?("#{dir}/work")).to be false
+      end
+    end
+
     describe "the release pins" do
       let(:defaults) { script.scan(/^(DEFAULT_\w+)=(\S+)$/).to_h }
       let(:release) { {PVM_RELEASE_URL: defaults["DEFAULT_RELEASE_URL"], PVM_HOST_DEB: defaults["DEFAULT_HOST_DEB"], PVM_GUEST_KERNEL: defaults["DEFAULT_GUEST_KERNEL"], PVM_GUEST_CONFIG: defaults["DEFAULT_GUEST_CONFIG"]} }

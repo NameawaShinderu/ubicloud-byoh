@@ -267,13 +267,41 @@ preflight() {
   else
     note "meltdown: $melt. pti=off exposes host memory to guests: acceptable on this throwaway VM only; the product refuses such CPUs for PVM"
   fi
-  local mem_kib avail_kib
+  local mem_kib
   mem_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
   expect "memory $((mem_kib / 1024)) MiB" "needs about 4 GiB of memory (2 GiB guest plus host)" [ "$mem_kib" -ge 3900000 ]
-  mkdir -p "$PVM_WORK"
-  avail_kib=$(df -Pk "$PVM_WORK" | awk 'NR == 2 {print $4}')
-  expect "free disk $((avail_kib / 1024 / 1024)) GiB in $PVM_WORK" "needs about 8 GiB free in $PVM_WORK" [ "$avail_kib" -ge 8000000 ]
+  # Downloads, the raw guest disk, one guest and the benches in
+  # PVM_WORK; the kernel's modules on / and its vmlinuz and initrd in
+  # /boot. Summed per file system, since they often share one.
+  check_space "$PVM_WORK" 8000000 / 1500000 "$BOOT_DIR" 300000
   [ "$FAILS" = 0 ]
+}
+
+# The nearest existing directory at or above $1: preflight measures
+# PVM_WORK without creating it.
+existing_parent() {
+  local d=$1
+  while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+  echo "$d"
+}
+
+# check_space path kib [path kib]...: ok or FAIL per file system, with
+# the needs of paths on the same file system added up.
+check_space() {
+  local -A need=() avail=() paths=()
+  local mnt free
+  while [ $# -ge 2 ]; do
+    read -r mnt free < <(df -Pk "$(existing_parent "$1")" | awk 'NR == 2 {print $6, $4}')
+    need[$mnt]=$((${need[$mnt]:-0} + $2))
+    avail[$mnt]=$free
+    paths[$mnt]="${paths[$mnt]:+${paths[$mnt]} and }$1"
+    shift 2
+  done
+  for mnt in "${!need[@]}"; do
+    expect "free disk $((avail[$mnt] / 1024)) MiB on $mnt (for ${paths[$mnt]})" \
+      "needs about $((need[$mnt] / 1024)) MiB free on $mnt (for ${paths[$mnt]}), has $((avail[$mnt] / 1024)) MiB" \
+      [ "${avail[$mnt]}" -ge "${need[$mnt]}" ]
+  done
 }
 
 stock_entry() {
@@ -523,6 +551,12 @@ boot_test_phase() {
   [ -c /dev/kvm ] || die "/dev/kvm did not appear"
   report "/dev/kvm: $(stat -c '%A %U:%G %t,%T' /dev/kvm)"
 
+  # The image and its raw copy (unless kept from a run before), then one
+  # guest at a time and the benches' 512 MiB files.
+  FAILS=0
+  if [ -s "$ART/base.raw" ]; then check_space "$PVM_WORK" 3000000; else check_space "$PVM_WORK" 6000000; fi
+  [ "$FAILS" = 0 ] || die "not enough disk for boot-test; free some, then rerun boot-test (still on the PVM kernel)"
+
   apt-get install -y ruby qemu-utils dosfstools mtools >/dev/null
   if [ -f "$VIRT_PROBE" ]; then
     local tier
@@ -624,18 +658,23 @@ boot_guest() {
   wait "$pid" 2>/dev/null || true
   grep -q BYOH_PVM_GUEST_UP "$dir/serial.log" 2>/dev/null && [ -z "$up" ] && up=$(($(date +%s) - t0))
 
-  report "  serial bytes: $(stat -c %s "$dir/serial.log" 2>/dev/null || echo 0); login prompt: ${login:-never}s; user space: ${up:-never}s"
-  grep -E 'BYOH_PVM_GUEST_UP|BYOH_PVM_BENCH|[Pp][Vv][Mm]' "$dir/serial.log" 2>/dev/null | head -40 | sed 's/^/  guest: /' | tee -a "$REPORT" || true
+  # Keep only the logs: the next guest needs the disk.
+  local log=$PVM_WORK/guest-$v
+  mv "$dir/serial.log" "$log.serial.log" 2>/dev/null || : >"$log.serial.log"
+  mv "$dir/ch.log" "$log.ch.log"
+  rm -rf "$dir"
+  report "  serial bytes: $(stat -c %s "$log.serial.log"); login prompt: ${login:-never}s; user space: ${up:-never}s"
+  grep -E 'BYOH_PVM_GUEST_UP|BYOH_PVM_BENCH|[Pp][Vv][Mm]' "$log.serial.log" | head -40 | sed 's/^/  guest: /' | tee -a "$REPORT" || true
   if [ -n "$up" ]; then
     awk 'FNR == NR {h[$2] = $3; next} $1 == "BYOH_PVM_BENCH" && h[$2] > 0 {printf "  ratio %s: guest %d ms, host %d ms, guest at %.0f%% of host speed\n", $2, $3, h[$2], 100 * h[$2] / ($3 > 0 ? $3 : 1)}' \
-      "$PVM_WORK/bench-host.txt" <(tr -d '\r' <"$dir/serial.log" | grep -o 'BYOH_PVM_BENCH.*') | tee -a "$REPORT"
+      "$PVM_WORK/bench-host.txt" <(tr -d '\r' <"$log.serial.log" | grep -o 'BYOH_PVM_BENCH.*') | tee -a "$REPORT"
     report "  CH $v: GO"
     return 0
   fi
   report "  CH $v: NO-GO. Last serial lines:"
-  tail -n 30 "$dir/serial.log" 2>/dev/null | sed 's/^/    /' | tee -a "$REPORT" || true
+  tail -n 30 "$log.serial.log" | sed 's/^/    /' | tee -a "$REPORT" || true
   report "  CH log tail:"
-  tail -n 15 "$dir/ch.log" | sed 's/^/    /' | tee -a "$REPORT"
+  tail -n 15 "$log.ch.log" | sed 's/^/    /' | tee -a "$REPORT"
   return 1
 }
 
