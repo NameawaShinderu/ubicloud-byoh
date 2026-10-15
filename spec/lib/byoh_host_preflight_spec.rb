@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "tempfile"
+
 RSpec.describe ByohHostPreflight do
   # Raw output of scripts/byoh/host/ubicloud-host on the fixture hosts,
   # written by scripts/byoh/test/preflight-fixtures.sh --update-spec.
