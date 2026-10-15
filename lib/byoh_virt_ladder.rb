@@ -37,7 +37,7 @@ module ByohVirtLadder
   }.freeze
 
   FALLBACKS = <<~TEXT.chomp
-    Without hardware virtualization the fallbacks, fastest first, are: L3 PVM (a kvm_pvm host kernel; needs PVM guest kernels, not supported for Ubicloud VMs yet), L4 system containers (shared kernel; design only) and L5 the QEMU emulator (typically 5-20% of native speed; compatibility only). See docs/byoh/NO_KVM.md.
+    Without hardware virtualization the fallbacks, fastest first, are: L3 PVM (a kvm_pvm host kernel; needs PVM guest kernels, not supported for Ubicloud VMs yet), L4 system containers (shared kernel; design only) and L5 the QEMU emulator (an estimated 5-25% of native speed; compatibility only). See docs/byoh/NO_KVM.md.
   TEXT
 
   NESTED_CAVEATS = [

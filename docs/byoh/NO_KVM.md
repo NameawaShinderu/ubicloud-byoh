@@ -120,6 +120,11 @@ bin/byoh-virt probe --main-ip 203.0.113.10 --ssh-key ~/.ssh/byoh_data
 # exit 0: L1, register it. exit 3: not L1; the output carries the fix.
 ```
 
+`--user` must be root (the default), or a user in group `kvm`, until WP3 adds `sudo -n`. Today the
+probe runs as the given user without sudo. On Ubuntu `/dev/kvm` is `root:kvm 0660`, so for any other
+user opening it fails with `EACCES`, and a working L1 host is reported as `kvm_blocked` ("/dev/kvm
+exists but does not answer KVM_GET_API_VERSION (Permission denied ...)"), exit 3.
+
 On the host itself: `scripts/byoh/bootstrap-data-plane.sh` (step 1b), or `sudo ruby rhizome/host/bin/virt-probe`.
 After registration: `bin/byoh-virt show --host vh...`. After fixing the host:
 `bin/byoh-virt refresh --host vh...`, then let PrepHost retry (a failed prep strand retries with backoff).
@@ -145,9 +150,13 @@ New facts, all read-only:
 - **The errno of each step.** `EACCES`/`EPERM` gives the class **`unknown_permission`** ("re-run as
   root"), never `kvm_blocked`.
 - `/dev/kvm` mode and group (L4's udev rule check).
-- **CPU model:** `kvm64`, `qemu64`, "Common KVM processor" or "QEMU Virtual CPU", with or without
-  `vmx`, gives **L2** "set the VM's CPU type to host". This is the same rule as M4's PF3, so the two
-  never disagree.
+- **CPU model:** `kvm64`, `qemu64`, "Common KVM processor" or "QEMU Virtual CPU" gives tier
+  **`kvm_blocked`** (L2), reason `cpu_model`, fix "set the VM's CPU type to host". The rule applies
+  with or without `vmx` and whether or not `/dev/kvm` answers:
+  - Without `vmx` (Proxmox's default "Common KVM processor"), v1 says `none`.
+  - With `vmx` and a working `/dev/kvm`, v1 says `kvm`.
+  v2 overrides both, so `auto` refuses with the fix (the `kvm_blocked` row of section 11.2) instead of
+  falling back to a lower tier. This is the same rule as M4's PF3, so the two never disagree.
 - **`pdpe1gb`:** missing means `standard_vms?` is false for `kvm`, with its own fix ("expose 1G pages,
   CPU type host"). It is only a caveat for tiers that do not use 1G hugepages (L3, L4, L5).
 - **DMI naming a VM vendor overrides a `bare_metal` verdict** (a hypervisor that hides its CPUID bit).
@@ -161,6 +170,9 @@ New facts, all read-only:
 - **PVM readiness:** `kvm-pvm.ko` in `modules.dep`, `kvm_pvm` loaded.
 - **`ready:`** the tiers whose prerequisites are present. **`recommended:`** the fastest ready tier
   (L3 before L5; L4 is listed only as "isolation option").
+  - Exception: on a `pvm` probe, `recommended` is always `pvm`, and `container` and `emulated` are never
+    listed as ready. That matches `auto` and the refusals in the `pvm` row of section 11.2, so the
+    printed plan is never one that registration refuses.
 - Never read: `*_serial`, `product_uuid`. Every host-supplied string is sanitised (control characters
   stripped, length capped at 128) before it reaches `Verdict#text`, a page or the database.
 
@@ -189,15 +201,18 @@ contract between them:
 - **Today (SHIPPED):** in the same SSH session, pipe `ByohVirtLadder.remote_script` to `ruby - --json`
   and pass the output to `ByohVirtLadder.parse`. Use `Verdict#fix` as PF3's fix text, `Verdict#caveats`
   as PF3 INFO lines, and `Verdict#standard_vms?` as PF3's pass condition. It agrees with `KvmCheck`
-  except on a PVM host, which `KvmCheck` refuses for lacking `vmx`/`svm` and the ladder refuses as "not
-  supported yet".
+  except in two cases:
+  - On a PVM host, `KvmCheck` refuses it for lacking `vmx`/`svm`, and the ladder refuses it as "not supported yet".
+  - When `/dev/kvm` exists but the `KVM_GET_API_VERSION` ioctl fails, the ladder says `kvm_blocked`
+    while `KvmCheck`, which checks only the character device and the CPU flag, passes. This includes
+    every probe run as a non-root user outside group `kvm` (section 2.1).
 - **After WP3 (PLANNED), one rule:** PF3 delegates the virtualization verdict to
   `ByohVirtLadder.preflight_check(facts, declared_tier:)`, which returns
   `{status: pass|fail|info, fix:, caveats:}`.
   - M4's bash preflight emits the raw facts it already gathers in its pinned session (flags,
     `/dev/kvm`, modules, DMI, `systemd-detect-virt`, CPU model). Facts it does not gather (the ioctl
     results, the capabilities) give `unknown` for that check, never L2; LearnVirt re-checks at prep.
-  - The ladder adopts M4's `kvm64`/`qemu64` refusal (L2).
+  - The ladder adopts M4's `kvm64`/`qemu64` refusal as `kvm_blocked`, reason `cpu_model` (section 2.2).
   - `declared_tier` other than `kvm`: PF3 becomes INFO for the KVM checks, the tier's own readiness
     facts gate instead, and PF4 (hugepages) is skipped.
 - **Expected merge conflicts with M4**, each planned as additive hunks: `bin/register-byoh-host`, the
@@ -361,9 +376,14 @@ the design no longer depends on it (section 5.3, "User group").
 - **Hardening:**
   - LXC's default seccomp, plus denial of `keyctl bpf userfaultfd perf_event_open kexec_* open_by_handle_at
     io_uring_setup io_uring_enter io_uring_register`.
-  - New user namespaces denied by default (seccomp on `clone`/`clone3`/`unshare` with `CLONE_NEWUSER`).
-    Opt-in per location: ack `container:nested-userns`. Guest systemd units with `PrivateUsers=` then fail
-    (documented; which units is UNVERIFIED).
+  - New user namespaces are denied by default.
+    - `clone3` is denied outright with `ENOSYS`, because seccomp cannot read its flags: they sit in a
+      `struct clone_args` pointer, and seccomp-BPF cannot dereference pointers. glibc then falls back
+      to `clone`, as it does under Docker's and LXC's own profiles.
+    - `clone` and `unshare` are denied when their flags argument has `CLONE_NEWUSER`.
+    - Opt-in per location: ack `container:nested-userns` lifts the `clone`/`unshare` rule; `clone3`
+      stays `ENOSYS`. Guest systemd units with `PrivateUsers=` fail without that ack
+      (documented; which units is UNVERIFIED).
   - `socket(AF_NETLINK, *, NETLINK_NETFILTER)` denied by default: no in-guest nftables or iptables-nft,
     which also reduces nf_tables exposure. Opt-in ack `container:guest-firewall`. The guest keeps
     `CAP_NET_ADMIN` for netplan.
@@ -386,9 +406,11 @@ the design no longer depends on it (section 5.3, "User group").
     passed with `cryptsetup --key-file=-` (never in argv, the environment or a file), with
     `--pbkdf pbkdf2` (or `luksFormat --volume-key-file -` from stdin). The mapping is closed at stop.
     Disclosure: keys live in the shared kernel. UNVERIFIED in the lab (loop and dm are host devices).
-  - `dir`: a plain directory. It requires `prjquota` on the VM filesystem (prep refuses otherwise), or
-    a single-project location. The label says "not encrypted", and the location needs the ack
-    `container:unencrypted-disk`. It is the only driver the lab harness can run.
+  - `dir`: a plain directory. It requires `prjquota` on the VM filesystem in **every** location, with a
+    project quota per VM sized to its storage volume; prep refuses otherwise. There is no mode without a
+    quota: one guest could otherwise fill the host's VM filesystem, and rhizome, journald, dnsmasq leases
+    and the other VMs on the host would fail with it. The label says "not encrypted", and the location
+    needs the ack `container:unencrypted-disk`. It is the only driver the lab harness can run.
   - ubiblk (vhost-user-blk) cannot serve a container; ublk might later (UNVERIFIED).
 - **Storage allocation.** `allocate_storage_volume_associations` gets an explicit tier branch: on a
   `container` host a volume gets neither a vhost-block backend nor an SPDK installation (nil/nil,
@@ -429,7 +451,8 @@ the design no longer depends on it (section 5.3, "User group").
 
 - The spike ran the whole path without host devices, so the runtime, network, cloud-init and
   lifecycle can be built and tested end to end in the lab harness (`scripts/byoh/test/nokvm/`) with the
-  `dir` driver. PVM's guest could not be booted here at all (section 6.6).
+  `dir` driver, on a throwaway VM, or on the shared lab machine only with the `ubi-q-nokvm` AppArmor
+  profile loaded (section 15, lab harness rules). PVM's guest could not be booted here at all (section 6.6).
 - The pieces the lab cannot run (`crypt-loop`, AppArmor, lxcfs, the host sysctl checks) sit in their
   own modules with rhizome specs only. They stay UNVERIFIED until L3-T1 (section 14) passes.
 - Until then the `container` family is **experimental**: hidden, granted per project, and labelled.
@@ -488,9 +511,14 @@ that speaks the KVM API sees a `/dev/kvm`. (SOURCE, high: [SOSP'23 paper][pvm-pa
   independent audit. PVM has had far less scrutiny than VT-x KVM. Treat it as weaker than L1 and
   stronger than L3 for kernel-level isolation.
 - The host kernel is custom, so the host's kernel CVE response becomes ours (section 6.8).
-- The host kernel needs `pti=off`, which removes Meltdown protection on CPUs that need it. Hence:
-  multi-tenant PVM requires SMT off or core scheduling **and** "Not affected" for meltdown, l1tf and
-  mds; otherwise the location is single-project. There is no override flag for multi-tenant.
+- The PVM kernel needs `pti=off`, which removes Meltdown protection on CPUs that need it. PVM guests
+  run in hardware ring 3, so on such a CPU any guest could read host kernel memory: the other VMs'
+  dm-crypt and ubiblk keys, the host's credentials and rhizome state. "Single-project" does not make
+  that safe when the operator and the project are different parties. Hence:
+  - A CPU whose `vulnerabilities/meltdown` is not "Not affected" is **refused for PVM outright**, in
+    every location. There is no ack and no override.
+  - Multi-tenant PVM also requires SMT off or core scheduling, and "Not affected" for l1tf and mds;
+    otherwise the location is single-project. There is no override flag for multi-tenant.
 
 ### 6.6 What the lab spike showed (VERIFIED, partial)
 
@@ -550,19 +578,34 @@ Hypervisor v46 **and** v53. If neither reaches a login prompt, WP7 delivers dete
   uses (`lsmod`, `/sys/class/net/*/device/driver`; for example `CONFIG_ENA_ETHERNET`,
   `CONFIG_BLK_DEV_NVME`); otherwise refuse. AWS is UNVERIFIED separately from GCP.
 - **Install** (`rhizome/host/bin/install-pvm-host-kernel`) refuses, before changing anything, when
-  Secure Boot is on, on non-x86_64, on a sha256 mismatch, and on Meltdown-affected CPUs unless the
-  location is single-project. Then it:
-  - installs the `.deb` and `apt-mark hold`s it
-  - writes `/etc/default/grub.d/98-ubicloud-pvm.cfg` (`GRUB_DEFAULT=saved`, `pti=off`); it never edits `/etc/default/grub`
-  - blacklists `kvm_intel` and `kvm_amd`, and loads `kvm_pvm` at boot
-  - ships a udev rule `KERNEL=="kvm", GROUP="kvm", MODE="0660"`
-  - runs `grub-reboot` for the PVM entry: a **one-shot** boot
+  Secure Boot is on, on non-x86_64, on a sha256 mismatch, on a Meltdown-affected CPU (any tenancy,
+  section 6.5), and when `GRUB_SAVEDEFAULT=true` is set (booting the PVM entry would then save it as
+  the default). Then, in this order:
+  - **It pins the running stock kernel before installing anything.** It writes
+    `/etc/default/grub.d/98-ubicloud-pvm.cfg` with only `GRUB_DEFAULT=saved`, runs
+    `grub-set-default "Advanced options for Ubuntu>Ubuntu, with Linux $(uname -r)"` and `update-grub`,
+    and checks that `grub-editenv list` shows that `saved_entry`. Without the pin, the `.deb`'s own
+    `update-grub` would make the PVM kernel the persistent default: Ubuntu's `10_linux` puts the newest
+    kernel version in the top entry (6.12-pvm sorts above noble's 6.8), and `GRUB_DEFAULT=0`, or `saved`
+    with no `saved_entry`, boots that top entry.
+  - It installs the `.deb` and `apt-mark hold`s it.
+  - It writes `/etc/grub.d/42_ubicloud_pvm`: one menu entry, `--id ubicloud-pvm`, for the PVM kernel with
+    the stock command line plus `pti=off`. `pti=off` goes on that entry only. `GRUB_CMDLINE_LINUX_DEFAULT`
+    is never touched, because `10_linux` applies it to every entry, including the stock kernel that is
+    the recovery path. It never edits `/etc/default/grub`. After `update-grub` it checks that `pti=off`
+    appears in `grub.cfg` exactly once, in the `ubicloud-pvm` entry.
+  - It blacklists `kvm_intel` and `kvm_amd`, and loads `kvm_pvm` at boot.
+  - It ships a udev rule `KERNEL=="kvm", GROUP="kvm", MODE="0660"`.
+  - It runs `grub-reboot ubicloud-pvm`, then checks that `grub-editenv list` shows
+    `next_entry=ubicloud-pvm` **and** the stock `saved_entry`. Only then is the boot **one-shot**.
 - **HostNexus walk.** `prep` buds PrepHost with the pvm step list (without the KVM check when
   installing) and `Prog::InstallPvmHostKernel`; `wait_prep` accepts a probe of `none`/`pvm_blocked` for
   such a host; `reboot`; a new `verify_virt_tier` label requires LearnVirt to say `pvm`, `/dev/kvm` 0660
-  group kvm, API 12 and the capabilities, and only then runs `grub-set-default` for the PVM entry. On
+  group kvm, API 12 and the capabilities, and only then runs `grub-set-default ubicloud-pvm`. On
   failure it pages "power-cycle the instance from the provider console; it returns to the stock
-  kernel", which the one-shot boot guarantees. The per-host ack and the `lockdown` state are recorded in
+  kernel". That holds only because the install asserted the stock `saved_entry` before the reboot;
+  a host whose assertion failed never reboots. Back on the stock kernel, prep checks that
+  `/proc/cmdline` lacks `pti=off`. The per-host ack and the `lockdown` state are recorded in
   `byoh_operator_action`.
 - **Capacity.** No hugepages on PVM (shadow paging; this also avoids the `pdpe1gb` requirement); a
   nohugepages-style CH unit; the budget comes from `verify_tier_capacity` (section 10.4).
@@ -612,7 +655,9 @@ L5 is QEMU TCG, described in [EMULATED_HOSTS.md](EMULATED_HOSTS.md). Measured (V
 - 26-29% of native CPU per vCPU
 - about 2.5% of native memory bandwidth
 - 64-96 s to boot to SSH
-- typical workloads at 5-20% of native
+
+Estimated, not measured: typical workloads at roughly 5-25% of native (UNVERIFIED, EXTERNAL;
+[EMULATED_HOSTS.md](EMULATED_HOSTS.md) section 3).
 
 `tb-size` is pinned to 256, which costs about 384 MiB of overhead per VM. ubiblk works under TCG with
 `memory-backend-memfd,share=on`. TCG is not a security boundary.
@@ -766,20 +811,24 @@ the values below are illustrative and UNVERIFIED except the container case.
 
 ```
 # AWS m8i.2xlarge, nested on                         # Proxmox VM with cpu=kvm64 (after WP3)
-tier: kvm (L1) nested                                 tier: none (L2)
+tier: kvm (L1) nested                                 tier: kvm_blocked (L2)
 platform: AWS EC2                                     platform: QEMU/KVM (Proxmox VE, libvirt, KVM VPS)
-why: /dev/kvm answers KVM_GET_API_VERSION 12          why: CPU model "Common KVM processor": the hypervisor
-caveat: nested virtualization: CPU-bound work ...          does not expose hardware virtualization
+why: /dev/kvm answers KVM_GET_API_VERSION 12          why: cpu_model: "Common KVM processor" (kvm64): the
+caveat: nested virtualization: CPU-bound work ...          hypervisor does not expose hardware virtualization
 caveat: the provider may stop or restart this VM ...  fix: Proxmox: qm set <vmid> --cpu host, then stop and
 caveat: the clocksource is often not tsc ...               start the VM; the node needs nested=Y ...
 
-# Bare metal, Intel VT-x off in the firmware          # A Docker or OpenVZ "VPS"  (VERIFIED: container case)
+# Bare metal, Intel VT-x off in the firmware (v1)     # A Docker or OpenVZ "VPS"  (VERIFIED: container case)
 tier: kvm_blocked (L2)                                tier: container (refused)
 platform: unknown platform                            why: this is a docker container
-why: kernel log: "VMX (outside TXT) disabled by BIOS" fix: Run the data plane on a VM or bare metal, not in
-fix: Enable Intel VT-x or AMD-V (SVM) in the BIOS/UEFI     a container.
-     setup, then power the machine off and on.
+why: bare metal without the vmx or svm flag: the      fix: Run the data plane on a VM or bare metal, not in
+     firmware has VT-x/AMD-V disabled                      a container.
+fix: Enable Intel VT-x or AMD-V (SVM) in the BIOS/UEFI
+     setup, then reboot.
 ```
+
+After WP3 the bare-metal case takes its reason from the kernel log when the log has one ("VMX (outside
+TXT) disabled by BIOS"), and its fix tells the operator to power the machine off and on.
 
 After WP3 a host without KVM also gets a **recommended plan** with the exact commands:
 
@@ -810,8 +859,8 @@ The registration matrix (probe × declared tier). "ack" means allowed with `--ac
 | Probe | `kvm` | `auto` | `container` | `pvm` | `emulated` |
 |---|---|---|---|---|---|
 | `kvm` (capabilities ok, `pdpe1gb`) | register | → kvm | refuse ("has KVM") | refuse | refuse |
-| `kvm`, but a capability, `pdpe1gb` or CPU-model check fails | refuse, fix | refuse, fix | ack; the fix printed as advice | refuse | ack |
-| `kvm_blocked` (firmware, module, BIOS log) | refuse, L2 fix | refuse, L2 fix ("fix KVM, or declare a tier explicitly") | ack; fix printed | ack; fix printed; needs `--install-pvm-kernel` | ack |
+| `kvm`, but a capability or `pdpe1gb` check fails | refuse, fix | refuse, fix | ack; the fix printed as advice | refuse | ack |
+| `kvm_blocked` (firmware, module, BIOS log, or a `kvm64`-class CPU model with or without `vmx`) | refuse, L2 fix | refuse, L2 fix ("fix KVM, or declare a tier explicitly") | ack; fix printed | ack; fix printed; needs `--install-pvm-kernel` | ack |
 | `unknown_permission` | refuse: "re-run the probe as root" | same | same | same | same |
 | `none`, platform nested `yes`/`some`/`ask` | refuse, fix and cost hint | → recommended fallback, ack; fix printed as advice | ack | ack; needs `--install-pvm-kernel` | ack |
 | `none`, platform nested `no` or unknown | refuse; lists the ready fallbacks | → recommended, ack | ack | ack; needs `--install-pvm-kernel` | ack |
@@ -849,8 +898,8 @@ the existing registration SSH path.
 | Rung | Customer label (UI and API family description) | Default tenancy | Location acks (`bin/byoh-location set --accept`) | Hard refusals |
 |---|---|---|---|---|
 | L1 | as today | as today | — | — |
-| L3 `container` | "System container: shared host kernel, near-native speed. Not a VM." | One project per location | `container`; options `container:multitenant` (needs whole-core cpusets or SMT off), `container:unencrypted-disk`, `container:nested-userns`, `container:guest-firewall` | Host sysctl checks fail; `dir` driver without `prjquota` in a multi-project location |
-| L4 `pvm` | "PVM: software virtualization (experimental). Weaker isolation than standard VMs; Ubicloud-supplied guest kernel without AppArmor. Linux only." | One project per location | `pvm`; option `pvm:multitenant` only with SMT off or core scheduling and CPUs "Not affected" | Secure Boot on; a Meltdown-affected CPU with multitenant |
+| L3 `container` | "System container: shared host kernel, near-native speed. Not a VM." | One project per location | `container`; options `container:multitenant` (needs whole-core cpusets or SMT off), `container:unencrypted-disk`, `container:nested-userns`, `container:guest-firewall` | Host sysctl checks fail; `dir` driver without `prjquota` (any location) |
+| L4 `pvm` | "PVM: software virtualization (experimental). Weaker isolation than standard VMs; Ubicloud-supplied guest kernel without AppArmor. Linux only." | One project per location | `pvm`; option `pvm:multitenant` only with SMT off or core scheduling and CPUs "Not affected" for l1tf and mds | Secure Boot on; a Meltdown-affected CPU (any tenancy, section 6.5) |
 | L5 `emulated` | "Emulated: slow, compatibility only. Not a security boundary." | One project per **host** | `emulated` | The unit's hardening directives missing |
 
 Applies to every lower rung:
@@ -902,7 +951,8 @@ bin/byoh-virt probe --main-ip $IP --ssh-key $KEY; echo exit=$?
 ssh ubuntu@$IP 'sudo apt-get install -y ruby' && bin/byoh-virt probe --main-ip $IP --user ubuntu --ssh-key $KEY; echo exit=$?
 #   (after WP3 the probe runs under sudo -n for a non-root --user)
 # L2-T2 AWS m8i.large with nested virtualization left off: expect none, platform aws, "stop the instance and enable nested virtualization"
-# L2-T3 Proxmox VM with cpu=kvm64: expect L2, platform qemu_kvm, "qm set <vmid> --cpu host"; after the change and a stop/start: kvm nested
+# L2-T3 Proxmox VM with cpu=kvm64 (the default "Common KVM processor", no vmx): v1 says none; after WP3 expect
+#   kvm_blocked (L2), reason cpu_model, platform qemu_kvm, "qm set <vmid> --cpu host"; after the change and a stop/start: kvm nested
 # L2-T4 bare metal with VT-x off in the firmware: expect kvm_blocked, "firmware has VT-x/AMD-V disabled"
 # L2-T5 VMware VM without "expose hardware assisted virtualization": expect none, platform vmware
 # L2-T6 Hetzner Cloud CX22 / DigitalOcean / Vultr: expect none with that platform's row, the ready fallbacks listed
@@ -910,7 +960,8 @@ ssh ubuntu@$IP 'sudo apt-get install -y ruby' && bin/byoh-virt probe --main-ip $
 # L2-T8 AMD bare metal with SVM disabled in the firmware: expect kvm_blocked with the firmware fix taken
 #   from the kernel log ("SVM disabled (by BIOS)"), not a modprobe fix
 # L2-T9 AWS Xen-based type (t2 or m4): expect platform aws_xen, "move to a Nitro type"
-# L2-T10 Proxmox VM with cpu=kvm64 and nested=Y on the node: expect L2 "set the CPU type to host"
+# L2-T10 Proxmox VM with cpu=kvm64,+vmx and nested=Y on the node (/dev/kvm works): v1 says kvm; after WP3 expect
+#   kvm_blocked (L2), reason cpu_model, "set the CPU type to host"
 ```
 
 ### L3 system containers
@@ -923,7 +974,10 @@ bin/register-byoh-host --location $LOC --main-ip $IP ... --virt-tier auto --acce
 # Create a container-2 VM, then on the host:
 sudo aa-status | grep -c lxc-container-default            # >= 1: AppArmor confines it
 sudo cryptsetup status <vm>-root | grep -q LUKS2           # crypt-loop: encrypted at rest
-awk '{print $2}' /proc/$(pgrep -f "lxc-start.*<vm>")/uid_map   # >= 1000000000: an allocator slot
+pid=$(sudo lxc-info -n <vm> -P /var/lib/ubicloud/lxc -p -H)   # the container's init; lxc-start is the monitor in
+                                                           #   the initial user namespace (uid_map "0 0 4294967295")
+sudo awk '{print $2}' /proc/$pid/uid_map                   # = 1000000000 + slot*65536, the slot recorded in
+                                                           #   /vm/<vm>/prep.json (key name fixed in WP5)
 cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns # unchanged by Ubicloud
 sudo systemctl stop <vm>.service; ps -eo uid= | awk '$1 >= 1000000000' | wc -l   # 0: nothing of the container left
 # Plant a symlink at the seed path and in the rootfs, restart, and check that no host file changed.
@@ -933,6 +987,10 @@ sudo modprobe dummy; echo $?                               # != 0
 sudo mount -t proc proc /mnt; echo $?                      # != 0
 sudo sh -c 'echo 1 > /proc/sys/kernel/panic'; echo $?      # != 0
 sudo unshare -U true; echo $?                              # != 0 (no nested userns without the ack)
+python3 -c 'import ctypes,os,struct; l=ctypes.CDLL(None,use_errno=True); a=ctypes.create_string_buffer(struct.pack("8Q",0x10000000,0,0,0,17,0,0,0)); r=l.syscall(435,a,64); r==0 and os._exit(0); print(r,ctypes.get_errno())'
+                                                           # "-1 38": clone3 (syscall 435, CLONE_NEWUSER) is ENOSYS
+python3 -c 'import ctypes,os; l=ctypes.CDLL(None,use_errno=True); r=l.syscall(56,0x10000000|17,0,0,0,0); r==0 and os._exit(0); print(r,ctypes.get_errno())'
+                                                           # "-1 ...": clone (syscall 56) with CLONE_NEWUSER is denied
 sudo nft list ruleset; echo $?                             # != 0 (no guest firewall without the ack)
 ls /dev/kvm /dev/fuse /dev/sda 2>&1 | grep -c 'No such'    # 3
 # Two containers of two projects (multitenant ack) must not see each other's processes, files or traffic.
@@ -952,16 +1010,39 @@ mkdir pvm && cd pvm
 for f in SHA256SUMS linux-image-6.12.33-pvm_6.12.33+pvm.g91e9c9be4472_amd64.deb vmlinux-pvm-amd64 guest-pvm-amd64.config; do curl -fLO "$R/$f"; done
 sha256sum -c --ignore-missing SHA256SUMS
 grep -E '^CONFIG_(VFAT_FS|NLS_CODEPAGE_437|NLS_ISO8859_1|PVM_GUEST|X86_PIE)=y' guest-pvm-amd64.config   # expect all 5
+# Pin the running stock kernel as GRUB's saved default BEFORE the .deb runs update-grub: that makes 6.12-pvm the
+#   top entry, which GRUB_DEFAULT=0 (or saved without a saved_entry) would boot from then on.
+grep -sE '^GRUB_SAVEDEFAULT=.?true' /etc/default/grub /etc/default/grub.d/*.cfg && echo 'STOP: GRUB_SAVEDEFAULT would make the PVM boot permanent'
+STOCK="Advanced options for Ubuntu>Ubuntu, with Linux $(uname -r)"
+echo 'GRUB_DEFAULT=saved' | sudo tee /etc/default/grub.d/98-pvm-test.cfg
+sudo grub-set-default "$STOCK" && sudo update-grub
+sudo grub-editenv list                                  # expect saved_entry=$STOCK; stop here if it is not
 sudo apt-get install -y ./linux-image-6.12.33-pvm_6.12.33+pvm.g91e9c9be4472_amd64.deb
 for l in /sys/class/net/*/device/driver /sys/block/*/device/driver /sys/block/*/device/device/driver; do
   [ -e "$l" ] && basename "$(readlink -f "$l")"; done | sort -u | while read -r d; do
   echo "$d: $(grep -ciE "_$(echo "$d" | tr - _)(_|=)" /boot/config-6.12.33-pvm)"; done   # approximate: every driver the instance uses (ena, nvme, virtio...) must show > 0; check the =y/=m lines by eye
-echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT pti=off"' | sudo tee /etc/default/grub.d/98-pvm-test.cfg
-sudo update-grub
-sudo grub-reboot "Advanced options for Ubuntu>Ubuntu, with Linux 6.12.33-pvm"   # one-shot: a power cycle returns to the stock kernel
+# pti=off on the PVM entry only: GRUB_CMDLINE_LINUX_DEFAULT would also strip PTI from the stock recovery kernel.
+sudo tee /etc/grub.d/42_pvm_test >/dev/null <<'EOF'
+#!/bin/sh
+set -e
+. /usr/share/grub/grub-mkconfig_lib
+k=/boot/vmlinuz-6.12.33-pvm
+[ -f "$k" ] || exit 0
+echo "menuentry 'Ubuntu, with Linux 6.12.33-pvm (pti=off)' --id ubicloud-pvm {"
+prepare_grub_to_access_device "$(${grub_probe} --target=device "$k")" | sed 's/^/  /'
+echo "  linux $(make_system_path_relative_to_its_root "$k") root=UUID=${GRUB_DEVICE_UUID} ro ${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT} pti=off"
+echo "  initrd $(make_system_path_relative_to_its_root /boot/initrd.img-6.12.33-pvm)"
+echo "}"
+EOF
+sudo chmod 755 /etc/grub.d/42_pvm_test && sudo update-grub
+grep -c 'pti=off' /boot/grub/grub.cfg                   # expect 1: the ubicloud-pvm entry only
+sudo grub-reboot ubicloud-pvm
+sudo grub-editenv list                                  # expect next_entry=ubicloud-pvm AND saved_entry=$STOCK; do not reboot otherwise
 sudo reboot
 # after the reboot
-uname -r                                                # 6.12.33-pvm
+uname -r; grep -o 'pti=off' /proc/cmdline               # 6.12.33-pvm, pti=off
+sudo grub-editenv list                                  # next_entry gone, saved_entry still the stock kernel:
+                                                        #   only now does a power cycle return to the stock kernel
 sudo modprobe -r kvm_intel kvm_amd 2>/dev/null; sudo modprobe kvm-pvm && ls -l /dev/kvm
 sudo ruby virt_probe.rb                                 # copy of rhizome/host/bin/virt-probe: expect tier: pvm
 curl -fLo ch46 https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v46.0/cloud-hypervisor-static
@@ -980,6 +1061,7 @@ for ch in ./ch46 ./ch53; do
 done
 # GO: a login prompt with at least one CH version. In the guest: dmesg | grep -i pvm; the section 5.1
 #   benchmark set; compare with the host itself. Report GO/NO-GO, the CH versions, and the numbers.
+# Recovery check, last: sudo reboot. Expect the stock kernel (uname -r) and no pti=off in /proc/cmdline.
 # L4-T2 (only after a GO and WP7) the same kind of VM registered with --virt-tier pvm --install-pvm-kernel
 #   --accept-fallback into a location with --virt-tiers kvm,pvm --accept pvm: the host reaches accepting
 #   after one reboot, a pvm-2 VM reaches running, SSH works, and destroy cleans up.
@@ -1009,7 +1091,26 @@ for every container it creates:
   `/dev`, `/sys`, the main checkout or `.env.rb`); `CpusetCpus=12-15`, `NanoCpus=4000000000`, `Memory=6g`;
   a `ubi-q-*` name.
 - Mounts: only `rhizome/` and `scripts/byoh/test/nokvm/`, read-only, plus a container-local scratch volume.
-- Inside: `/sys` and `/proc/sys` are read-only; CapEff lacks `SYS_MODULE` and `SYS_RAWIO`.
+- `HostConfig.SecurityOpt`: never `systempaths=unconfined`; seccomp is Docker's default, or a custom
+  profile file from the repo named explicitly, never `seccomp=unconfined`; AppArmor is `docker-default`,
+  never `apparmor=unconfined`. The harness grants `SYS_ADMIN` in the initial user namespace, so the
+  AppArmor profile's mount denial is what stops container root from remounting `/sys` or `/proc/sys`
+  read-write, or mounting a fresh sysfs, and writing host-global kernel state. The read-only checks below
+  only observe; they enforce nothing.
+- Modes that run LXC inside the container (`run.sh l3`) need `mount`, which `docker-default` denies. They
+  refuse to start unless one of these holds:
+  - A machine administrator has loaded the AppArmor profile `ubi-q-nokvm`, shipped in
+    `scripts/byoh/test/nokvm/apparmor/`: `docker-default` plus the mounts LXC needs, with `remount` of
+    `/sys` and `/proc/sys` denied, and `sysfs` and `proc` mounts allowed only under the container rootfs.
+    Loading a profile is host kernel policy, so the harness never loads it. UNVERIFIED: that LXC runs
+    under this profile.
+  - `BYOH_NOKVM_THROWAWAY_VM=1` declares the machine a throwaway VM, where `apparmor=unconfined` is accepted.
+
+  Without either, `l3` does not run on the shared lab machine. The 2026-10-15 spike (section 5.1) ran
+  with AppArmor and seccomp unconfined on the shared machine; its safety rested on reading every script
+  before running it, not on enforcement.
+- Inside, **at start and again at teardown**: `/sys` and `/proc/sys` are mounted read-only (from
+  `/proc/self/mountinfo`), and no other sysfs or proc mount exists; CapEff lacks `SYS_MODULE` and `SYS_RAWIO`.
 - An nft drop toward the `ubi-test-net` subnet (except the gateway's egress) is installed **before** any
   guest starts; the run aborts if it is missing.
 - `/proc/modules`, `vm.nr_hugepages` and selected `kernel.*` values (read through `/proc`) are
@@ -1055,7 +1156,9 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 - `scripts/byoh/test/nokvm/run.sh` with the safety preamble above; `run.sh probe` runs the real probe in
   ubuntu:24.04 and alpine (expect `container`) and over the fixture trees.
 - Tests: JSON fixtures per platform row and per case (AMD SVMDIS, hidden hypervisor bit, kvm64 with
-  vmx, missing `pdpe1gb`, EACCES, a missing capability, Xen AWS, m7i vs m8i); rhizome specs through
+  vmx, kvm64 without vmx (Proxmox's default "Common KVM processor"; both kvm64 cases expect
+  `kvm_blocked` with reason `cpu_model`), missing `pdpe1gb`, EACCES, a missing capability, Xen AWS,
+  m7i vs m8i); the recommended plan per probe tier, including `pvm` (recommends `pvm`); rhizome specs through
   `--root` trees; a rhizome/control-plane classify parity spec; a sanitisation spec; the LearnVirt error path.
 - Done: the full gate; the harness probe green; `bin/byoh-virt explain` prints a fix for every fixture.
 
@@ -1073,7 +1176,9 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 - Tests: the migration up, down, CHECKs and trigger on `clover_q_test1`; a mixed-tier allocator
   fixture; `force_host_id` across tiers gives NoSpaceLeft; every validator caller refuses tier sizes;
   Kubernetes, runner and VM pool specs; a tenancy race spec (two creates, the second refused); the
-  grant and visible refusals; every cell of the registration matrix; `accepts_slices` and capacity per
+  grant and visible refusals; every cell of the registration matrix, and for each probe tier that the
+  printed `recommended` tier is accepted by `auto` and by an explicit declaration (a `pvm` probe
+  recommends `pvm`); `accepts_slices` and capacity per
   tier; every WP2 golden unchanged.
 - Done: the full gate; goldens unchanged; in a spec, `wait_prep` of a kvm BYOH host with a crashing
   probe still reaches `setup_hugepages`.
