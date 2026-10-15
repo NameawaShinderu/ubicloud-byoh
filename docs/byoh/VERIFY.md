@@ -1,4 +1,4 @@
-# BYOH verification: M2 canary gate, live window and rollback
+# BYOH verification: M2 canary gate, live window, rollback and the M4 gates
 
 This page is the runbook for milestone M2 ([ROADMAP.md](ROADMAP.md) §3.3): honest addresses, real locations, and IPv4 egress for VMs without a public IPv4. It has four parts:
 
@@ -6,6 +6,8 @@ This page is the runbook for milestone M2 ([ROADMAP.md](ROADMAP.md) §3.3): hone
 2. The canary gate G0-G17, run in the `canary` terraform workspace on AWS. `scripts/byoh/verify/m2-gate.sh` automates the checks. §2.5 is the same gate for other platforms.
 3. The live window L0-L4 in ap-south-1.
 4. Rollback levels R1-R3.
+
+§6 holds the M4 gates G-M4-1 to G-M4-6 (one-command site and host, the F5 monitor soak, preflight).
 
 The full continuous checklist (NETWORKING §8.5: `host_guard`, the hairpin, `--from-outside`) belongs to P2/P3 (milestone M7) and is not part of this gate.
 
@@ -253,3 +255,57 @@ Never rename `migrate/20261013_byoh_network_contract.rb` once it has been applie
 - **Afterwards:**
   - A stale "No capacity left" page from before the storage upgrade stayed open until it was resolved by hand.
   - The data-plane instance was stopped to save cost.
+
+---
+
+## 6. M4 gates (G-M4-1 to G-M4-6)
+
+Milestone M4 ([ROADMAP.md](ROADMAP.md) §3.3) adds `ubicloud-admin site add` and `host add --ssh`, host preflight, and the F4/F5/F6/F9/F10 portability fixes. Its exit gates need real infrastructure, which the build machine does not have. They are **scripted, not run**: each row says what has been checked locally instead. Record runs in §6.2.
+
+| Gate | What | Script | Pass when | Status |
+|---|---|---|---|---|
+| G-M4-1 | E2 on AWS: a **fresh** terraform workspace (never `company-mumbai`), `install.sh`, then `site add` and `host add --ssh` exactly as [recipes/aws.md](recipes/aws.md) gives them | `scripts/byoh/verify/m4-e2.sh` with `PLATFORM=aws` | `host add` exits 0, the host reaches `accepting`, and the M2 gate steps pass (default `g1 g2 g4 g5`; `GATE_STEPS` for more once VMs exist) | UNVERIFIED, not run |
+| G-M4-2 | E2 on Proxmox: one VM built from [recipes/proxmox.md](recipes/proxmox.md), the same three commands | `m4-e2.sh` with `PLATFORM=proxmox` | as G-M4-1 | UNVERIFIED, not run |
+| G-M4-3 | F5 soak on an EBS-backed host (the G-M4-1 host) | `scripts/byoh/verify/m4-f5-soak.sh --host vh... --hours 24 --interval 600`, monitor started by hand | every sample passes: the monitor runs; no `unavailable` label; `accepting`; `checkup` unset; no open non-info page for the host; `perform_health_checks` true over a fresh session | UNVERIFIED, not run |
+| G-M4-4 | F5 soak on a virtio host (the G-M4-2 VM) | as G-M4-3 | as G-M4-3 | UNVERIFIED, not run |
+| G-M4-5 | F5 soak on an LVM-root host (Ubuntu's default LVM install, own hardware or a VM) | as G-M4-3 | as G-M4-3 | UNVERIFIED, not run |
+| G-M4-6 | Preflight catches no `/dev/kvm` or a kvm64-class CPU (PF3), a pool containing the uplink IP (PF17), and a hybrid CPU (`PF8-hybrid`) | `scripts/byoh/test/preflight-fixtures.sh`, `scripts/byoh/test/m4-host-add.sh` (runs A, B, C), `spec/lib/byoh_host_preflight_spec.rb`, `rhizome/host/spec/ubicloud_host_parity_spec.rb` | each is a `fail` that stops `host add` before a change, and none can be accepted except `PF8-hybrid` | **Pass on fixtures and `ubi-m4-*` containers** (2026-10-15). The evidence is fixture files and containers without `/dev/kvm`, not real hardware: the kvm64 and hybrid fixtures are synthesised (`scripts/byoh/test/fixtures/host/{kvm64-model,kvm64-vmx,intel-hybrid,arm-biglittle}`) |
+
+### 6.1 Running the scripted gates
+
+Both scripts run on the control plane from the repository root, and log to `var/`. They were exercised against stubs only (`scripts/byoh/test/m4-gate-scripts.sh`, 54 checks).
+
+**E2 (G-M4-1, G-M4-2).** `install.sh` is the first of the three commands; run it as [INSTALL.md](INSTALL.md) says. Then:
+
+```bash
+export SITE=byoh-aws-m4 PLATFORM=aws HOST_SSH=ubuntu@<data private IP> \
+  HOST_KEY=~/byoh_ssh_key POOL_FILE=~/pools.yaml \
+  EXPECT_HOST_KEY="SHA256:... SHA256:..."            # from the host_add_command step 1
+scripts/byoh/verify/m4-e2.sh -- --display "AWS (BYOH M4 canary)" --underlay 10.98.0.0/16 \
+  --overlay 172.20.0.0/14 --cp-reach onhost --cp-source <control plane private IP>/32 \
+  --mgmt-allow <operator /32> --rates-from hetzner-fsn1
+```
+
+- `site add` options go after `--`, unchanged (terraform prints them as `byoh_location_create_command`). An existing site is skipped.
+- Without `EXPECT_HOST_KEY`, set `HOST_ADD_YES=1` to confirm with `--yes`; compare the fingerprints in the log with the console afterwards.
+- The script generates the registration key and passes it as `--registration-key`, so the gate's root logins (`GATE_HOST_KEY`) use the key the control plane keeps; set `GATE_HOST_KEY` to use your own.
+- `HOST_ADD_ARGS` adds options (`--storage-disk ...`, `--accept-check ...`). `GATE_STEPS` picks the M2 gate steps; `GATE_*` settings of §1.4 pass through.
+- The log has every output line with seconds since its phase began, then the phase durations (`site add`, `host add`, `m2 gate`) and the verdict. The bring-up's own phases show as the watch's label lines.
+- AWS: end the window by stopping the data plane or `terraform destroy` of the workspace. Proxmox: `qm stop` the VM.
+
+**F5 soak (G-M4-3 to G-M4-5).** On a host registered on M4 code (an older one needs `byoh-host relearn-device-ids --host vh... --yes` first), start the monitor by hand (packaged: `sudo systemctl start ubicloud-monitor`; development: `bin/monitor` in a tmux session), then:
+
+```bash
+scripts/byoh/verify/m4-f5-soak.sh --host vh<ebs> --host vh<virtio> --host vh<lvm> --hours 24 --interval 600
+```
+
+Each sample checks the monitor and runs `scripts/byoh/verify/m2-checks health --host H --probe` for each host. `--probe` logs in to the host and runs the monitor's health checks; their read/write check writes and deletes a 1 MiB file in each storage path. Afterwards stop the monitor again (it stays disabled until M9, [OPERATIONS.md](OPERATIONS.md) §9).
+
+### 6.2 M4 results
+
+| Gate | Date | Result | Notes |
+|---|---|---|---|
+| G-M4-1 | — | not run | needs an AWS canary |
+| G-M4-2 | — | not run | needs a Proxmox VM |
+| G-M4-3, 4, 5 | — | not run | need G-M4-1, G-M4-2 and an LVM-root host, 24 h each |
+| G-M4-6 | 2026-10-15 | pass (fixtures and containers) | `m4-host-add.sh` runs A (no `/dev/kvm`: exit 1 at preflight, no change), B (a /29 holding the uplink IP: exit 1 with PF17), C (the `intel-hybrid` fixture: `PF8-hybrid` blocks, `--accept-check PF8-hybrid` downgrades it) |

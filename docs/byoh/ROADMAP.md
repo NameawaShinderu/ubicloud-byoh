@@ -191,14 +191,15 @@ Not done in M0:
 | Live window | Separate window after the gates (§6.8), run with `migrate-from-dev.sh` ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)): window A copies `clover_test` into `ubicloud` and `.env.rb`'s secrets verbatim into `/etc/ubicloud/env`, stops tmux, starts the units, keeps the existing cloudflared unit (origin `127.0.0.1:3000`), behaviour still development. Window B flips to production after the E1 canary. Rollback = restart tmux on the untouched old DB. |
 | Customer can | Nothing new visible; the platform survives restarts and reboots, mail works, and HTTPS cookies are secure. |
 
-#### M4. One-command site and host, with preflight (E2 + F4/F5/F6/F9/F10) [PLANNED M4]
+#### M4. One-command site and host, with preflight (E2 + F4/F5/F6/F9/F10) [BUILT M4; E2 and F5 soak UNVERIFIED]
 
 | Item | Detail |
 |---|---|
 | Scope | `ubicloud-admin site add` (NET `byoh-location` logic, billing overlay in `/var/lib/ubicloud/billing_rates.d/` (M3-n), visibility and Postgres choice) and `host add --ssh` (form A): preflight PF1-PF21 → register → stream HostNexus labels → `pool verify` (prints UNVERIFIED for pool checks until M7). Register CLI: `--location` resolution, `--uplink-ip`, `--pool-file`, default boot image `ubuntu-noble`, preflight by default. Remaining portability fixes: F4 CPU topology (online CPUs, non-uniform SMT), F5 control-plane device identity and health checks, F6 storage safety (`--storage-disk`, btrfs/ZFS error), F9 GPU `vfio-pci` filter and LearnMemory units, F10 Proxmox recipe rewrite (delete `deploy-scripts/02-05,99`), terraform `host_add_command` output. |
-| Docs | [PLATFORMS.md §5, §6](PLATFORMS.md); §6.2-§6.3 of this page |
-| Key files | `bin/register-byoh-host:60-157`; `lib/byoh_registration.rb`; `lib/billing_rate.rb:14`; `scripts/byoh/host/ubicloud-host` (`preflight`); `prog/learn_cpu.rb`; `prog/learn_pci.rb`; `model/storage_device.rb:24-33`; `model/vm_host.rb:286-296,351-361,383-394`; `model/location.rb:36-38`; `terraform/aws-byoh/*`; `docs/byoh/recipes/*` |
-| Gates | E2 exit test: AWS canary and one Proxmox VM with the **same three commands**. Preflight catches `kvm64` (no `/dev/kvm`), a pool containing the uplink IP, and a hybrid CPU. F5: health checks pass on EBS, virtio and LVM for 24 h with `bin/monitor` run by hand. |
+| Built (branch `m4-site-host`, from 9e22d71ec) | **Form A only** (D-1: `--mgmt direct`; `--cp-reach mgmt` and `--postgres yes` refused with exit 2). `ubicloud-admin site add\|show\|set\|rates\|grant\|...`, `host add\|preflight\|watch\|...`, `pool ...` (D1; `--dev` on a development checkout). `host add` runs in two phases (prepare with the operator's key, register without it), pins the host keys it read over the operator's login into `sshable.host_keys` and the first root login (D-11 as built: a `pin_host_keys` frame flag set only by BYOH registration), and exits 0 only at `accepting` with no `pool verify` FAIL (D6). `register-byoh-host` preflights with `--ssh-key`. F4 (online CPUs, mixed thread counts), F5 (`ByohDeviceIdentity`, `ByohHealthProbe`, `relearn-device-ids`), F6 (rhizome rescue, `ubicloud-host storage-disk`), F9 (`vfio-pci` IOMMU-group filter, `relearn-pci`, allocator exemption for BYOH locations; LearnMemory units were already a0259a997), F10 (`deploy-scripts/` and `SETUP_PROXMOX_LOWTIER.md` deleted, [recipes/](recipes/README.md)), terraform `host_add_command` (files only, never applied). Every behaviour change keys on `vm_host.byoh?`, except the rhizome rescue, a no-op wherever sysfs has the entry. 100% line and branch coverage |
+| Docs | [PLATFORMS.md §5, §6](PLATFORMS.md); §6.2-§6.3 of this page; [recipes/](recipes/README.md); [SETUP.md](SETUP.md) §6, §8.1; [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.1a, §2.3; [VERIFY.md](VERIFY.md) §6 |
+| Key files | `packaging/bin/ubicloud-admin` (site, host, pool); `bin/byoh-host`, `lib/byoh_host_cli.rb`, `lib/byoh_host_add.rb`, `lib/byoh_host_watch.rb`, `lib/byoh_host_preflight.rb`, `lib/byoh_operator_ssh.rb`, `lib/byoh_root_probe.rb`; `scripts/byoh/host/ubicloud-host` (`preflight`, `storage-disk`); `bin/register-byoh-host`, `lib/byoh_registration.rb`, `lib/byoh_registration_cli.rb`; `lib/byoh_location_cli.rb` (`add`, `--display`); `prog/learn_cpu.rb`, `prog/learn_numa_node.rb`; `lib/byoh_device_identity.rb`, `lib/byoh_health_probe.rb`, `model/vm_host.rb` (`perform_health_checks`, `disk_device_names`), `prog/vm/host_nexus.rb` (`available?`, the pin frame flag), `prog/bootstrap_rhizome.rb` with `Util.rootish_ssh(known_hosts:)` (`lib/util.rb`); `prog/learn_pci.rb`, `scheduling/allocator.rb`; `rhizome/host/lib/storage_volume.rb`; `scripts/byoh/bootstrap-data-plane.sh`; `terraform/aws-byoh/{outputs,variables}.tf`; `docs/byoh/recipes/*`; gate scripts `scripts/byoh/verify/m4-e2.sh`, `m4-f5-soak.sh` |
+| Gates | E2 exit test: AWS canary and one Proxmox VM with the **same three commands** (G-M4-1, G-M4-2, scripted in `m4-e2.sh`): **UNVERIFIED**, not run. Preflight catches `kvm64` (no `/dev/kvm`), a pool containing the uplink IP, and a hybrid CPU (G-M4-6): **passed** on fixtures and `ubi-m4-*` containers (`preflight-fixtures.sh`, `m4-host-add.sh` runs A-C), not on real hardware. F5: health checks pass on EBS, virtio and LVM for 24 h with `bin/monitor` run by hand (G-M4-3 to 5, `m4-f5-soak.sh`): **UNVERIFIED**, not run. [VERIFY.md](VERIFY.md) §6 |
 | Customer can | Nothing directly; operators add sites and hosts in minutes on any platform. |
 
 #### M5. Flexible tier (CMP-P1) [PLANNED M5]
@@ -596,9 +597,9 @@ Line numbers refer to the bootstrap at fc693b1e0 (`scripts/byoh/bootstrap-ctrl-p
 | register CLI | `bin/register-byoh-host:73,116-124,138-141` | `--location` label only; no preflight; interactive ENTER | major | M2, M4 |
 | terraform | `variables.tf:28` | `operator_ssh_cidr` default `0.0.0.0/0` (M4: `operator_ssh_cidr` and `web_ui_cidr` are required) | major | M4 |
 | terraform | `outputs.tf:43-52` | No `pools.yaml`, no host-add command (M2: `pools.yaml`; M4: `host_add_command` and `site add` in `byoh_location_create_command`, never applied: UNVERIFIED) | medium | M2, M4 |
-| Proxmox scripts | `docs/byoh/deploy-scripts/04-register-host.sh:58-62` | Unscoped `accepts_slices:false` on every host | major | M4 (delete) |
-| Proxmox scripts | `04:35-44,52,59,21-22`; `02:21`; `03:12,21`; `00:57`, `01:52-54,71-73` | /29 split into 3 /32s, `.first` host, no key, `PermitRootLogin yes`, `curl \| bash` of branch head, MASQUERADE over the pool, two NICs | major | M4 (recipe rewrite) |
-| cross-recipe | `01-create-vms.sh` vs `variables.tf:16-22` | Both default to 10.98.1.0/24; one CP managing both collides | major | M4 (distinct defaults), M8 (unique mgmt addresses) |
+| Proxmox scripts | `docs/byoh/deploy-scripts/04-register-host.sh:58-62` (deleted) | Unscoped `accepts_slices:false` on every host | major | M4 (deleted) |
+| Proxmox scripts | `04:35-44,52,59,21-22`; `02:21`; `03:12,21`; `00:57`, `01:52-54,71-73` | /29 split into 3 /32s, `.first` host, no key, `PermitRootLogin yes`, `curl \| bash` of branch head, MASQUERADE over the pool, two NICs | major | M4 (deleted; [recipes/proxmox.md](recipes/proxmox.md)) |
+| cross-recipe | `01-create-vms.sh` vs `variables.tf:16-22` | Both default to 10.98.1.0/24; one CP managing both collides | major | M4 (the Proxmox recipe uses 10.77.0.0/24), M8 (unique mgmt addresses) |
 
 ### 6.3 Target operator experience
 
@@ -639,6 +640,8 @@ sudo ubicloud-admin restore <id> --key-file /secure/ubicloud-keys.age
 
 `--cp-reach mgmt` and `--mgmt wireguard` exist only after M8. Until then `site add` uses NETWORKING's `onhost`/`public` and the operator's own route or VPN.
 
+**As built in M4** (form A): `site add` takes `--display` (the customer-facing name), `--underlay`, `--overlay`, `--cp-reach onhost|public`, `--cp-source`, `--mgmt-allow`, `--rates-from`, `--grant` (repeatable) and `--mgmt direct`; `--dns` reaches `--dns-servers`; `--postgres` takes only `no`. `host add` also needs `--ssh-key` for the operator's login (any key type; never stored), and takes `--registration-key`, `--storage-disk`, `--accept-check`, `--expect-host-key`, `--uplink-ip`, `--no-wait`, `--timeout` and the BMC flags (`--bmc-password` refused). `host preflight` needs `--site` too. `host drain`/`remove`, `upgrade`, `install.sh --mgmt-endpoint` and the release download are later (§1 deferrals of the M4 plan; M12). The recipes: [recipes/README.md](recipes/README.md).
+
 **What `install.sh` does** (every step checks real state; re-run with the same version is a no-op; a different version points to `upgrade`). As built in M3 ([INSTALL.md](INSTALL.md)): the source is a git checkout or tarball (no release download yet), `--smtp` became `--smtp-file` (no password on argv), `--mgmt-endpoint` and `wireguard-tools` wait for M8, `CONTROL_PLANE_OUTBOUND_CIDRS` is not written (M8), `s3://` waits for E5, a different version exits 2 and points to the manual release switch ([OPERATIONS.md](OPERATIONS.md) §7), and the caches are the committed ones:
 
 | Step | Action |
@@ -669,6 +672,8 @@ sudo ubicloud-admin restore <id> --key-file /secure/ubicloud-keys.age
 | 7 | CP | Stream HostNexus labels with timeouts; `pool verify`; exit 0 only at `accepting` + hard checks | |
 
 Re-running resumes; never registers twice (keyed on WG pubkey or uplink IP).
+
+As built in M4 (form A), the steps are: control-plane checks (input, site, PF20/PF21, `--accept-check`, an existing registration to resume); operator login with passwordless sudo, preflight as root with the script on stdin, host keys read and cross-checked with the key ssh met; the confirmation (`yes`, `--yes` or `--expect-host-key`); the registration key on a tagged root line and an sshd drop-in only if needed; PF2 as root, pinned; `--storage-disk`; `register!` under an advisory lock; the watch; `pool verify`. Steps 2 and 4's WireGuard and `from=` wait for M8; the resume key is the main IP. `lib/byoh_host_add.rb` has the order.
 
 ### 6.4 Control plane ↔ site connectivity (M8)
 
@@ -730,9 +735,10 @@ Re-running resumes; never registers twice (keyed on WG pubkey or uplink IP).
 | Recipe | Produces | Fixes folded in |
 |---|---|---|
 | `terraform/aws-byoh` | CP instance (optional auto-install), nested-virt data instances, ENI secondary IPs + EIPs, `pools.yaml`, `host_add_command` | no `0.0.0.0/0` default for `operator_ssh_cidr`; `data_plane_open_ingress=false` until `host_guard`; src/dst check per NETWORKING §9.1 |
-| `docs/byoh/recipes/proxmox` (replaces `deploy-scripts/`) | data VM `--cpu host`, memory multiple of 1024 MiB, one vmbr1 uplink, pfSense notes, `pools.yaml` example | no MASQUERADE over the pool; no `PermitRootLogin yes`; addressing that does not reuse 10.98.1.0/24 |
-| `docs/byoh/recipes/bare-metal` | BIOS VT, storage mount before registration (F6) | |
-| `docs/byoh/recipes/homelab` | router static route or tunnel; form B join | hybrid-CPU warning (F4) |
+| [`docs/byoh/recipes/proxmox.md`](recipes/proxmox.md) (replaces `deploy-scripts/`, M4) | data VM `--cpu host`, memory multiple of 1024 MiB, one vmbr1 uplink, pfSense notes, `pools.yaml` example | no MASQUERADE over the pool; no `PermitRootLogin yes`; 10.77.0.0/24, not 10.98.1.0/24; dedicated virtual disks only; `--storage-disk` |
+| [`docs/byoh/recipes/bare-metal.md`](recipes/bare-metal.md) (M4) | BIOS VT, storage decided before `host add` (`--storage-disk`, F6), routed block | |
+| [`docs/byoh/recipes/homelab.md`](recipes/homelab.md) (M4) | router static route or LAN pool; form B join in M8 | hybrid CPUs and `--accept-check PF8-hybrid` (F4); the PF16 override and `flush ruleset`; password SSH disabled |
+| [`docs/byoh/recipes/aws.md`](recipes/aws.md) (M4) | the short path through `terraform/aws-byoh` and `host_add_command` | the C5 fix, the former PF18 checks by hand, the EC2 key deleted after prepare |
 | `docs/byoh/recipes/relay-hub` | VPS relay for a CP behind NAT | |
 
 ### 6.7 Phases
@@ -741,7 +747,7 @@ Re-running resumes; never registers twice (keyed on WG pubkey or uplink IP).
 |---|---|---|---|---|
 | E0 | `install.sh`, units, DB peer auth, TLS, `BIND`, backup/restore/status, INSTALL/OPERATIONS docs | none | one command → HTTPS UI; `kill -9` respirate → back in 10 s; reboot; backup → wipe → restore, hosts SSH-able | M3 |
 | E1 | `boot_image_source`, `account create`, SMTP/logger, `BASE_URL`, `production_check` | E0; M0 | production-mode VM boot with `ubuntu-noble` from the public URL | M3 |
-| E2 | `site add`, `host add --ssh`, register CLI fixes, terraform outputs, Proxmox recipe | NET-P1 (M2); NET-P3 for hard `pool verify` (M7) | same three commands on AWS and Proxmox; preflight catches `kvm64`, pool containing uplink IP, hybrid CPU | M4 |
+| E2 | `site add`, `host add --ssh`, register CLI fixes, terraform outputs, Proxmox recipe | NET-P1 (M2); NET-P3 for hard `pool verify` (M7) | same three commands on AWS and Proxmox (UNVERIFIED, `m4-e2.sh`); preflight catches `kvm64`, pool containing uplink IP, hybrid CPU (fixtures and containers only) | M4 (built) |
 | E3 | `ubimgmt`, `cp_reach: mgmt`, invite/join, host_guard rules, relay recipe | E2; NET-P2 (M7) | homelab host joins with one line; CP manages a PG VM there; uplink 22 closed | M8 |
 | E4 | Release workflow, `upgrade`/`--rollback`, rolling rhizome | NET-P0 (M1) | v0.1 → v0.2 with migrations, 3 VMs undisturbed, rollback works | M12 |
 | E5 | Enable monitor, alert routing, probe agent, WAL/PITR, DNS zone | F5 (M4), CMP-P2 | 7 days, no false `unavailable` | M9 |
@@ -812,7 +818,7 @@ After M1, stay close: merge or rebase upstream at least once per milestone, befo
 | D-8 | Interim egress-only NAT before `host_guard` | own nft file in M2 / wait for M7 | **Decided:** own gated file in M2 (`/etc/nftables.d/1-byoh-egress.conf`, BYOH hosts only), folded into `host_guard` in M7 |
 | D-9 | Default tier for BYOH | Dedicated / Flexible | Flexible for new BYOH locations after the 7-day soak; Dedicated stays for Postgres, K8s, runners |
 | D-10 | Order of host security (M7) vs flexible tier and console (M5, M6) | as planned / M7 first | As planned while the live env has only test traffic and closed ingress; **move M7 before M5 the day any real customer traffic or open ingress is needed** |
-| D-11 | Host-key pinning | console-only column (C1) / rely on upstream TOFU after M1 for Sshable | Use upstream TOFU for Sshable; keep the C1 column for `ubiconsole` only; drop the C5 "extend pinning to Sshable" item |
+| D-11 | Host-key pinning | console-only column (C1) / rely on upstream TOFU after M1 for Sshable | Use upstream TOFU for Sshable; keep the C1 column for `ubiconsole` only; drop the C5 "extend pinning to Sshable" item. **M4:** BYOH `host add` and `register-byoh-host --ssh-key` read the host keys over an authenticated login, store them in `sshable.host_keys` and pin the first root login (`Util.rootish_ssh(known_hosts:)`), closing the TOFU window on the control-plane side; operator-side trust rests on the fingerprint confirmation |
 | D-12 | Overcommit ratios | CPU 2.0, memory 1.0, storage 1.5 at M5; higher only after gates | As stated in COMPUTE.md; no memory overcommit before G1 |
 | D-13 | IO CPUs on small hosts | free both (CMP-P0) / keep 1 thread reserved under 16 threads | Free in M0; set the reserve from G3 in M5 |
 
@@ -827,7 +833,7 @@ After M1, stay close: merge or rebase upstream at least once per milestone, befo
 | `CheckIpReachability` after rebase | Hosts stuck before `prep` forever; pool IPs briefly local | Generic skip policy ships inside M1 |
 | Balloon with vhost-user `shared=on` | Memory not actually returned | G1/G1b gate; Flexible ships without balloon |
 | `/byoh/join` | Only unauthenticated route added | Hashed single-use tokens, rate limit, security review before M8 |
-| Postgres on BYOH locations | `Location.postgres_locations` may filter `generic` out (UNVERIFIED) | Decide in M2/M4 (`--postgres yes` or `no`) |
+| Postgres on BYOH locations | `Location.postgres_locations` may filter `generic` out (UNVERIFIED) | M4: `site add --postgres` takes only `no`; `yes` waits for this to be checked |
 | Terraform provider compatibility with this fork | "Use Terraform" UX may not work | UNVERIFIED; test before documenting |
 
 ### 8.3 Cost (EXTERNAL prices, ap-south-1, UNVERIFIED for the account)

@@ -25,10 +25,11 @@ Anything marked UNVERIFIED was never executed.
 | `docs/byoh/NETWORKING.md` | One host network contract for all platforms (`delivery` routed/onlink/fabric × `exposure` public/nat/internal), `host_guard`, `public_ip4`, real locations |
 | `docs/byoh/COMPUTE.md` | Dedicated vs Flexible tiers, custom shapes, overcommit and balloon gates, usage-based placement |
 | `docs/byoh/PLATFORMS.md` | Platform compatibility, 54 verified portability findings (F1–F10), host preflight PF1–PF21 |
-| `docs/byoh/VERIFY.md` | M2 canary gate G0–G17 (`scripts/byoh/verify/m2-gate.sh`), live window L0–L4, rollback R1–R3, backup checklist |
+| `docs/byoh/VERIFY.md` | M2 canary gate G0–G17 (`scripts/byoh/verify/m2-gate.sh`), live window L0–L4, rollback R1–R3, backup checklist; §6 the M4 gates G-M4-1…6 (`m4-e2.sh`, `m4-f5-soak.sh`) |
 | `docs/byoh/POOL_OPERATIONS.md` | pools.yaml v2, `bin/byoh-pool`, billing `resource_name` rule, location egress keys |
 | `docs/byoh/platforms/` | Operator guides per platform (AWS, rented bare metal, own hardware/colo, Proxmox and other hypervisors, GCP/Azure, other clouds/VPS); `README.md` has the chooser table, the common 6-step flow and which branch carries which fix. Only AWS is tested |
 | `docs/byoh/TROUBLESHOOTING.md` | One Symptom/Cause/Fix catalogue by phase (install, bring-up labels, allocation, VM networking, DNS, billing, upgrades, monitor/BMC), with platform pointers; covers both control-plane layouts |
+| `docs/byoh/recipes/` | M4: one recipe per platform (`aws`, `proxmox`, `bare-metal`, `homelab`), each a machine plus a `pools.yaml`, then the same three commands (`README.md`) |
 | `docs/byoh/INSTALL.md`, `OPERATIONS.md`, `MIGRATE_FROM_DEV.md` | M3: the packaged control plane (`install.sh` flags, env reference, TLS fronts, production differences), day-2 operation (`ubicloud-admin`, backups, restore, release switch, the 2027-01-01 partition deadline), and the live move from tmux/`clover_test` |
 
 Product direction from the user:
@@ -51,6 +52,7 @@ Product direction from the user:
 
 - The fork has **no `main` branch**.
 - `m3-packaging` (worktree `.claude/worktrees/m3`, from `m2-network` fc693b1e0) carries M3, the packaged control plane; not pushed or merged yet.
+- `m4-site-host` (worktree `.claude/worktrees/m4`, from `byoh-driver` 9e22d71ec, which has M0-M3) carries M4: `site add`, `host add`, preflight, F4/F5/F6/F9/F10. Not pushed or merged yet.
 - The GitHub fork is the source of truth. Local `byoh-driver` tracks `byoh-fork/byoh-driver`.
 - Ask before pushing.
 - Authors:
@@ -122,7 +124,15 @@ Product direction from the user:
 | `config.rb`, `puma_config.rb`, `bin/restarter`, `bin/pry`, `prog/download_boot_image.rb`, `prog/deleted_record_archiver.rb` | M (M3) | Opt-ins with upstream defaults: `BIND`, `RESTART_MAX_SLEEP`, `BOOT_IMAGE_SOURCE` (auto/public), `DELETED_RECORD_DROP_UNARCHIVED`, `PRY_ALLOW_UNAUDITED` (console session only); restarter signals only a live child |
 | `scripts/byoh/test/` | A (M3) | Container harness (systemd in `ubi-m3-*` containers), §7 |
 | `terraform/aws-byoh/*` | A | VPC 10.98.0.0/16; t3.medium control plane; m5d.metal data plane with `source_dest_check=false`; 3 secondary IPs + EIPs. |
-| `docs/byoh/{QUICKSTART,SETUP,SETUP_PROXMOX}.md`, `docs/providers/generic.md` | A | Docs, rewritten for M2 on 2026-10-13: SETUP is platform-neutral with an "AWS-specific (optional)" section; SETUP_PROXMOX is the Proxmox runbook (UNVERIFIED). `SETUP_PROXMOX_LOWTIER.md` is superseded, `deploy-scripts/` unsupported (they exit unless `BYOH_RUN_UNSUPPORTED_DEPLOY_SCRIPTS=1`). |
+| `docs/byoh/{QUICKSTART,SETUP,SETUP_PROXMOX}.md`, `docs/providers/generic.md` | A | Docs, rewritten for M2 on 2026-10-13 and for the M4 commands: SETUP is platform-neutral with an "AWS-specific (optional)" section; SETUP_PROXMOX is the Proxmox runbook (UNVERIFIED). `SETUP_PROXMOX_LOWTIER.md` and `docs/byoh/deploy-scripts/` were deleted in M4 (git history only); `docs/byoh/recipes/` replaces them. |
+| `scripts/byoh/host/ubicloud-host` | A (M4) | Bash, runs as root on a would-be host, sent on stdin (`bash -s`). `preflight [--json] [--standalone]`: read-only facts and host-local verdicts (PF1-PF19), `UBIPF:<nonce>` JSON lines. `storage-disk --by-id ID [--allow-shared-transport]`: formats one blank whole disk as ext4 `ubi-diskN` at `/var/storage/devices/diskN`, never wipes. Fixture mode: `--fixture-root` plus `UBICLOUD_HOST_TEST_ROOT` |
+| `lib/byoh_host_preflight.rb` | A (M4) | `ByohHostPreflight`: judges the facts on the control plane (PF17/C5 with the pools, PF20 boot images, PF21 services, PF-min-cpu), `--accept-check` (only `PF8-hybrid`, `PF10-btrfs`, `PF16-{docker,ufw,tailscaled,k3s,libvirtd}`) |
+| `lib/byoh_host_add.rb`, `lib/byoh_host_watch.rb`, `lib/byoh_host_cli.rb` | A/M (M4) | `byoh-host add\|preflight\|watch` (form A): prepare (operator login, preflight, host keys, confirm, tagged root key, sshd drop-in only if needed, PF2, `--storage-disk`) and register (`register!` pinned, watch, `pool verify`). Exit 0/1/2/3/4/130. Resumes on the main IP. Refuses under `RACK_ENV=test` without injected runners |
+| `lib/byoh_operator_ssh.rb`, `lib/byoh_root_probe.rb` | A (M4) | The operator's system `ssh` (hardened flags, temp known_hosts, exit 255 kept apart); `ByohRootProbe` = PF2 as root with Net::SSH, verifying the pinned keys |
+| `lib/byoh_device_identity.rb`, `lib/byoh_health_probe.rb` | A (M4) | F5: disk ids from the mount down (`findmnt`, `lsblk -s`, best by-id link, kernel name; ZFS refused), one SSH exec per pulse for SMART/nvme/clocksource/virt; used only when `vm_host.byoh?` |
+| `prog/learn_cpu.rb`, `prog/learn_numa_node.rb`, `prog/learn_pci.rb`, `prog/vm/host_nexus.rb`, `prog/bootstrap_rhizome.rb`, `lib/util.rb`, `model/vm_host.rb`, `scheduling/allocator.rb`, `rhizome/host/lib/storage_volume.rb` | M (M4) | F4 online CPUs; F9 `vfio-pci` IOMMU-group filter and allocator exemption; F5 checks; the `pin_host_keys` frame flag → `Util.rootish_ssh(known_hosts:)`; F6 `write_through_device?` rescue (ungated no-op where sysfs has the entry). All other changes gated on `vm_host.byoh?` |
+| `packaging/bin/ubicloud-admin` (site, host, pool), `lib/byoh_location_cli.rb` (`add`, `--display`) | M (M4) | `site add\|...`, `host add` in two invocations (staged keys deleted after prepare), `pool ...`; `--dev` for a development checkout |
+| `scripts/byoh/verify/m4-e2.sh`, `m4-f5-soak.sh`, `m2-checks health` | A (M4) | Real-infra gates G-M4-1…5 (VERIFY.md §6), UNVERIFIED; tested against stubs (`scripts/byoh/test/m4-gate-scripts.sh`) |
 
 **GenericApis methods** (`lib/hosting/generic_apis.rb`):
 
@@ -251,9 +261,27 @@ Ubuntu 24.04, run as a non-root sudo user.
 4. Open the UI at `http://<ctrl>:3000/create-account`. **No admin account is seeded.**
    - The verification email goes to the logger, so look in `/tmp/puma.log`, not the tmux pane.
 
+### The three commands (M4, `m4-site-host`; UNVERIFIED on real infrastructure)
+
+Every platform: `install.sh` (above), then on the control plane
+
+```
+sudo ubicloud-admin site add <site> --display "<UI name>" --underlay <CIDRs> --overlay 172.20.0.0/14 \
+  --cp-reach onhost|public --cp-source <cp>/32 --mgmt-allow <CIDRs> --rates-from hetzner-fsn1
+sudo ubicloud-admin host add --site <site> --ssh <user>@<main IP> --ssh-key <operator key> --pool-file pools.yaml \
+  [--registration-key F] [--storage-disk <by-id>] [--accept-check PF8-hybrid] [--uplink-ip IP] [--expect-host-key SHA256:...] [--yes]
+```
+
+- Development layout: `packaging/bin/ubicloud-admin --dev ...` from the checkout, no sudo, restarts nothing.
+- `host add` needs only a login with passwordless sudo on the host; it installs its own root key (tagged line) and needs no `bootstrap-data-plane.sh`. `--ssh-key` (any type) is never stored; `--registration-key` (Ed25519) is generated when absent and then lives only in the DB.
+- `--main-ip` defaults to the `--ssh` host. `--uplink-ip` (stored as `provider_config["uplink_ip"]`) is detected from the default route; give it only with several default routes. No pool may contain the uplink IP, main IP or gateway (PF17, never acceptable). `pull_ips` still skips on `main_ip` until M8.
+- Default boot image `ubuntu-noble` for both `host add` and `register-byoh-host` (`--default-boot-image` replaces it).
+- Exit 0 only at `accepting` with no `pool verify` FAIL; a re-run resumes; Ctrl-C after registration stops only the watch (`host watch` resumes it).
+- Recipes: `docs/byoh/recipes/`; details: SETUP.md §6, §8.1; TROUBLESHOOTING §2.1a (one `#pfN` anchor per check), §2.3.
+
 ### Data plane
 
-Ubuntu 24.04 with KVM, outbound internet, and root SSH from the control plane.
+Ubuntu 24.04 with KVM, outbound internet, and root SSH from the control plane (low-level `register-byoh-host` path; `host add` sets up root SSH itself).
 
 - Run `scripts/byoh/bootstrap-data-plane.sh`, or use terraform's `user-data-data.sh`.
   - It does openssh, `PermitRootLogin prohibit-password`, and pre-installs ruby-bundler and netcat-openbsd (the gate's netns proxy).
@@ -329,10 +357,13 @@ The operator-facing catalogue is `docs/byoh/TROUBLESHOOTING.md`; keep it consist
 | VM stuck at `wait_sshable` | The control plane can't reach `<vm ip4>:22`. This is a missing operator L3 route, not a driver bug |
 | Strand stuck at `hardware_reset` | Admin "Hardware Reset" on a host with no BMC raises `CapabilityMissing` forever (or on a host with VMs that isn't draining); VMs show as "rebooting". **Don't click it** without a BMC |
 | Redfish reset fails with an auth error after a control-plane restart | The `--bmc-pass-env` variable is missing from respirate's environment, so the call goes out with a nil password |
+| `host add` / `register-byoh-host` stops at preflight | The `fail` line names the check; TROUBLESHOOTING §2.1a `#pfN`. Only `PF8-hybrid`, `PF10-btrfs`, `PF16-<service>` are `--accept-check`able; PF3 (no KVM, kvm64 model), PF10-zfs, PF16-pve (a Proxmox node), PF16-rhizome-user, PF17 (pool holds uplink/main IP/gateway) and PF-min-cpu never |
+| `host add` exits 3 | The watch gave up (phase deadline, respirate down, `--timeout`, host outside bring-up); the strand keeps running. Fix and re-run, or `host watch` |
+| Monitor marks a pre-M4 BYOH host down ("stale storage device id", "is not a whole disk") | Disk ids learned before M4: `bin/byoh-host relearn-device-ids --host vh... --yes` |
 | `pgrep -a cloud-hypervisor` shows nothing | The name is longer than 15 chars. Use `pgrep -af cloud-hypervisor` |
 | Health / `unavailable` never triggers | `bin/monitor` isn't running |
 
-- **Nested or virtual hosts:** if monitor is started, upstream health checks may mark the host down. They require the `tsc` clocksource and smartctl, and handle `sd*` without wwn badly. UNVERIFIED.
+- **Nested or virtual hosts:** upstream health checks require the `tsc` clocksource and smartctl, and handle `sd*` without wwn badly. Since M4 a BYOH host (`vm_host.byoh?`) gets its own checks (F5); a generic host still in hetzner-fsn1 keeps upstream's. The 24-hour soak (VERIFY.md G-M4-3…5) is UNVERIFIED, so the monitor stays off.
 
 ## 7. Running tests on THIS machine (shared machine)
 
@@ -375,6 +406,7 @@ docker run --rm --network ubi-test-net -v "$PWD:/app" -w /app -e RACK_ENV=test u
 - **Never run `RACK_ENV=test` on a real control plane.** It disables SSH.
 - **Never run `rake setup_database[test]` on a control plane.** It drops `clover_test`, which is the deployment DB.
 - **M3 (2026-10-14):** image `ubi-bundler-m1`, databases `clover_m2_test1..6` (the worktree's `.env.rb`). Gate order: `rake coverage_pspec`, `frozen_pspec`, `rubocop`, then `rake rhizome_spec` with `/etc/os-release` mounted when `rhizome/` changes. `bash -n` and shellcheck (`docker run --rm --name ubi-m3-shellcheck --network ubi-test-net -v $WT:/mnt:ro koalaman/shellcheck-alpine shellcheck -x <files>`) on every shell script.
+- **M4 (2026-10-15):** runner `rt_m4.sh` (same image and `clover_m2_test1..6`, `RACK_ENV=test`). Containers `ubi-m4-*` only (`UBI_TEST_PREFIX`; image `ubi-m4-fakehost`: ubuntu:24.04 sshd as PID 1, no systemd, no `/dev/kvm`, a `systemctl` shim). The plan's `rt_m4_dev` became the `ubi-m4-cp` container of `scripts/byoh/test/m4-host-add.sh` (`RACK_ENV=development`, `TEST_ENV_NUMBER=6` = `clover_m2_test6`; `m4-db-state` snapshots and restores that DB, refuses `clover_test`; never run it during a pspec). Other M4 harness scripts: `m4-fakehost-check.sh`, `preflight-fixtures.sh` (fixture hosts in `fixtures/host/`), `storage-disk-fixtures.sh`, `m4-install-key-cases.sh`, `m4-admin.sh`, `bootstrap-preflight.sh`, `m4-gate-scripts.sh`. Shellcheck as `ubi-m4-shellcheck`.
 - **Container harness** (`scripts/byoh/test/run.sh`, README there): systemd 255 as PID 1 in `--privileged` containers with a private cgroup namespace (never bind-mount `/sys/fs/cgroup`). Every container is `ubi-m3-*`, joins only `ubi-test-net`, publishes no port; a run removes only its own (`UBI_M3_KEEP=1` keeps them). Images: `ubi-m3-systemd` (`--prepare-image`), `ubi-m3-tools` (`--prepare-tools`: `install.sh --stage tools`), `ubi-m3-release` (`--prepare-release`: the working tree installed as release `t1`); re-prepare the release after a change to code or install.sh's release steps. Scenarios: `parity envfmt verify fresh rerun flags smoke kill restart reboot tls-provided tunnel backup admin devshim gate-journal migrate migrate-preM1 upgrade-manual` (`all`). It never reaches a real server; ACME, a real tunnel and a real reboot stay UNVERIFIED.
 
 ## 8. Upstream merge (M1, 2026-10-12)
@@ -425,6 +457,12 @@ How the 22 conflicts were resolved:
 6. Start the services, then run `VmHost.all.each(&:install_rhizome)` in pry. Existing hosts keep running VMs; recreate VMs only if they need the new rhizome behaviour.
    - **Upgrade vhost-block-backend** on hosts registered before M1: they have v0.2.2, new VMs need `version_code >= 401`, and without it every VM create fails with "No capacity left" (live, 2026-10-13): `VmHost.all.each { Prog::Storage::SetupVhostBlockBackend.assemble(it.id, Config.vhost_block_backend_version, allocation_weight: 100) }`. Resolve the stale "No capacity left" page by hand afterwards.
 7. SSH host keys are now TOFU-pinned on first connect. Reinstalling a host's OS requires destroying and re-registering the VmHost.
+
+**Moving a control plane to M4** (after the M3 steps; UNVERIFIED on a live host):
+1. `VmHost.all.each(&:install_rhizome)` (F6: the btrfs/ZFS `write_through_device?` rescue reaches existing hosts only this way).
+2. For each BYOH host registered before M4, before ever enabling the monitor: `bin/byoh-host relearn-device-ids --host vh...` (shows old → new), then with `--yes` (packaged: `sudo ubicloud-admin run byoh-host ...`). Needs SSH to the host. OPERATIONS.md §7 steps 9-10, §9.
+3. BYOH hosts with an NVIDIA GPU: `bin/byoh-host relearn-pci --host vh...`.
+4. Hosts learned before M4 keep their CPU rows (offline CPUs included); only re-registration relearns them.
 
 ## 8a. M2 network contract (branch `m2-network`)
 
@@ -487,18 +525,9 @@ Scripts (the development bootstrap; `install.sh` fixes each for packaged control
   - doesn't update net6
   - prints the global pool
 
-Docs: SETUP.md, QUICKSTART.md, SETUP_PROXMOX.md and `docs/providers/generic.md` were rewritten for M2 on 2026-10-13 (the old errors: `--provider`, no location, invented labels and outputs, SPDK/NVMe claims, the route-via-Proxmox-node next hop). Still stale: `SETUP_PROXMOX_LOWTIER.md` (marked superseded) and NETWORKING §4 packet walks (AWS values, labelled). SETUP_PROXMOX.md has never been run on Proxmox (UNVERIFIED).
+Docs: SETUP.md, QUICKSTART.md, SETUP_PROXMOX.md and `docs/providers/generic.md` were rewritten for M2 on 2026-10-13 (the old errors: `--provider`, no location, invented labels and outputs, SPDK/NVMe claims, the route-via-Proxmox-node next hop), and for the M4 commands on 2026-10-15. Still stale: NETWORKING §4 packet walks (AWS values, labelled). SETUP_PROXMOX.md and `docs/byoh/recipes/` have never been run on Proxmox, bare metal or a homelab (UNVERIFIED).
 
-Fork deploy-scripts (06f359de4; unsupported, every script exits unless `BYOH_RUN_UNSUPPORTED_DEPLOY_SCRIPTS=1`):
-- `04` does ctrl→data `ssh ubuntu@` with no key and no `-A`, which blocks `99-deploy-all`.
-- `|tee` without pipefail.
-- AMD nested check broken.
-- Preflight requires 20 GB / 250 GB, contradicting the 16 GB target.
-- Env vars aren't forwarded.
-- Unscoped `DB[:vm_host].update(accepts_slices:false)`.
-- `admin@admin.com` login that nothing creates.
-- `reset.sh` destroys VMIDs 400/401/**9000** by number only.
-- `--cipassword ubuntu` and `PermitRootLogin yes`.
+The fork's `docs/byoh/deploy-scripts/` (06f359de4) and `SETUP_PROXMOX_LOWTIER.md` were deleted in M4; `docs/byoh/recipes/proxmox.md` replaces them (git history keeps them).
 
 ## 10a. Validated deployment: AWS with nested virtualization (2026-10-11)
 
@@ -546,6 +575,7 @@ The full flow was proven on non-metal EC2: register → `accepting` in about 4 m
   - Per-workspace key name and `.generated/<workspace>/`.
   - `lifecycle { ignore_changes = [user_data] }`, so editing first-boot scripts never stops a registered host.
   - Use one Terraform workspace plus one `<name>.tfvars` (gitignored) per environment.
+  - M4 (files only, never applied, UNVERIFIED): `operator_ssh_cidr` and `web_ui_cidr` are required; `byoh_location_create_command` prints `sudo ubicloud-admin site add ...`; `host_add_command` prints the `get-console-output` fingerprint parse (`--expect-host-key`), the `scp` of `pools.yaml` and the EC2 key, `host add --no-wait && shred -u && host watch`, and an optional step that drops the EC2 key from root's logins. `user-data-data.sh` still copies the EC2 key into root's `authorized_keys` (for `register-byoh-host`) and runs no preflight; `host add` runs it. `docs/byoh/recipes/aws.md`.
 
 ## 11. Conventions
 
