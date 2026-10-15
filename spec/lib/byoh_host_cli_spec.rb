@@ -13,10 +13,10 @@ RSpec.describe ByohHostCli do
   let(:legacy_host) { generic_host(byoh_1).tap { it.update(location_id: Location::HETZNER_FSN1_ID) } }
 
   # Runs one command; returns its exit status, stdout and stderr.
-  def cli(*argv)
+  def cli(*argv, **)
     out = StringIO.new
     err = StringIO.new
-    status = described_class.new(out:, err:).run(argv)
+    status = described_class.new(out:, err:, **).run(argv)
     [status, out.string, err.string]
   end
 
@@ -219,6 +219,74 @@ RSpec.describe ByohHostCli do
       host.update(location_id: fsn1.id)
       expect(cli("move-location", "--host", host.ubid, "--rollback-to", "hetzner-hel1", "--empty-only")[2])
         .to eq "! host #{host.ubid} is not in a BYOH location; nothing to roll back\n"
+    end
+  end
+
+  describe "relearn-device-ids" do
+    let(:host) { generic_host(byoh_1) }
+
+    def add_device(name, ids)
+      StorageDevice.create(vm_host_id: host.id, name:, total_storage_gib: 100, available_storage_gib: 90, unix_device_list: ids)
+    end
+
+    # A stand-in for ByohDeviceIdentity.device_ids (frozen in frozen
+    # specs) that checks it is asked about the host's storage paths.
+    def relearn(result)
+      lambda do |sshable, mounts|
+        expect(sshable.id).to eq host.id
+        expect(mounts).to eq result.keys
+        result
+      end
+    end
+
+    it "shows the new ids without --yes and writes nothing" do
+      add_device("DEFAULT", [""])
+      status, out, err = cli("relearn-device-ids", "--host", host.ubid, device_ids: relearn("/var/storage" => ["nvme-Amazon_Elastic_Block_Store_vol0a1b2c3d4e5f60718"]))
+      expect([status, err]).to eq [0, ""]
+      expect(out).to eq <<~OUT
+        DEFAULT (/var/storage): [""] -> ["nvme-Amazon_Elastic_Block_Store_vol0a1b2c3d4e5f60718"]
+        Nothing written; re-run with --yes to store the new ids.
+      OUT
+      expect(host.storage_devices.first.unix_device_list.to_a).to eq [""]
+      expect(audit_rows).to be_empty
+    end
+
+    it "stores the changed ids with --yes and records them" do
+      add_device("DEFAULT", ["vda1"])
+      add_device("extra", ["vdb"])
+      status, out, = cli("relearn-device-ids", "--host", host.ubid, "--yes", device_ids: relearn("/var/storage" => ["vda"], "/var/storage/devices/extra" => ["vdb"]))
+      expect(status).to eq 0
+      expect(out).to eq <<~OUT
+        DEFAULT (/var/storage): ["vda1"] -> ["vda"]
+        extra (/var/storage/devices/extra): ["vdb"] -> ["vdb"] (unchanged)
+        Stored the new ids of 1 storage devices of host #{host.ubid}.
+      OUT
+      expect(host.storage_devices_dataset.order(:name).select_map(:unix_device_list).map(&:to_a)).to eq [["vda"], ["vdb"]]
+      expect(host.storage_devices_dataset.select_map(:available_storage_gib)).to eq [90, 90]
+      row = audit_rows.last
+      expect(row[:command]).to eq "relearn-device-ids"
+      expect(row[:target_id]).to eq host.id
+      expect(row[:args].to_h).to eq("devices" => {"DEFAULT" => {"from" => ["vda1"], "to" => ["vda"]}})
+    end
+
+    it "says so when nothing changes" do
+      add_device("DEFAULT", ["vda"])
+      expect(cli("relearn-device-ids", "--host", host.ubid, "--yes", device_ids: relearn("/var/storage" => ["vda"]))).to eq [0, "DEFAULT (/var/storage): [\"vda\"] -> [\"vda\"] (unchanged)\nNothing to change.\n", ""]
+      expect(audit_rows).to be_empty
+    end
+
+    it "refuses a generic host outside a BYOH location" do
+      expect(cli("relearn-device-ids", "--host", legacy_host.ubid)).to eq [1, "", "! host #{legacy_host.ubid} is not a BYOH host (a generic host in a BYOH location)\n"]
+    end
+
+    it "refuses a host without storage devices" do
+      expect(cli("relearn-device-ids", "--host", host.ubid)).to eq [1, "", "! host #{host.ubid} has no storage devices yet; LearnStorage records them during prep\n"]
+    end
+
+    it "reports a device identity error" do
+      add_device("DEFAULT", [""])
+      zfs = ->(_, _) { raise ByohDeviceIdentity::Error, "/var/storage is on rpool/ROOT (zfs), not a block device" }
+      expect(cli("relearn-device-ids", "--host", host.ubid, device_ids: zfs)).to eq [1, "", "! /var/storage is on rpool/ROOT (zfs), not a block device\n"]
     end
   end
 

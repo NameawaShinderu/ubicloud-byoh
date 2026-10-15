@@ -12,17 +12,20 @@ class ByohHostCli
     Usage: bin/byoh-host COMMAND [options]
 
     Commands:
-      move-location     --host UBID --location NAME --empty-only
-      move-location     --host UBID --rollback-to LOCATION --empty-only
-      setup-egress-nat  --host UBID
-      export-audit      [--out FILE]
+      move-location       --host UBID --location NAME --empty-only
+      move-location       --host UBID --rollback-to LOCATION --empty-only
+      setup-egress-nat    --host UBID
+      relearn-device-ids  --host UBID [--yes]
+      export-audit        [--out FILE]
 
     Run a command with --help for its options.
   USAGE
 
-  def initialize(out: $stdout, err: $stderr)
+  # device_ids is ByohDeviceIdentity.device_ids; specs pass a stand-in.
+  def initialize(out: $stdout, err: $stderr, device_ids: ByohDeviceIdentity.method(:device_ids))
     @out = out
     @err = err
+    @device_ids = device_ids
   end
 
   # Returns the process exit status.
@@ -30,7 +33,7 @@ class ByohHostCli
     argv = argv.dup
     command = argv.shift
     case command
-    when "move-location", "setup-egress-nat", "export-audit"
+    when "move-location", "setup-egress-nat", "relearn-device-ids", "export-audit"
       send(:"cmd_#{command.tr("-", "_")}", argv)
     when nil, "help", "-h", "--help"
       @out.puts USAGE
@@ -153,6 +156,49 @@ class ByohHostCli
       st
     end
     @out.puts "Started #{strand.ubid} to install the egress NAT table on host #{host.ubid} from location #{host.location.name}'s profile."
+  end
+
+  # Recomputes the disk ids of a BYOH host's storage devices with
+  # ByohDeviceIdentity and, with --yes, stores them. Hosts registered
+  # before it hold "" or partition names, which the health checks cannot
+  # resolve, and LearnStorage refuses to relearn once VMs have volumes.
+  # Only unix_device_list changes; capacity is left alone.
+  def cmd_relearn_device_ids(argv)
+    opts = {}
+    parse(argv, "relearn-device-ids --host UBID [--yes]") do |o|
+      host_option(o, opts)
+      o.on("--yes", "Store the new ids (without it, only show them)") { opts[:yes] = true }
+    end
+    host = find_host(opts)
+    raise Error, "host #{host.ubid} is not a BYOH host (a generic host in a BYOH location)" unless host.byoh?
+
+    devices = host.storage_devices.sort_by(&:name)
+    raise Error, "host #{host.ubid} has no storage devices yet; LearnStorage records them during prep" if devices.empty?
+
+    ids = begin
+      @device_ids.call(host.sshable, devices.map { it.path.chomp("/") })
+    rescue ByohDeviceIdentity::Error => e
+      raise Error, e.message
+    end
+    changes = devices.filter_map do |sd|
+      new_ids = ids.fetch(sd.path.chomp("/"))
+      old_ids = sd.unix_device_list.to_a
+      @out.puts "#{sd.name} (#{sd.path.chomp("/")}): #{old_ids.inspect} -> #{new_ids.inspect}#{" (unchanged)" if old_ids == new_ids}"
+      [sd, old_ids, new_ids] unless old_ids == new_ids
+    end
+
+    if changes.empty?
+      @out.puts "Nothing to change."
+    elsif !opts[:yes]
+      @out.puts "Nothing written; re-run with --yes to store the new ids."
+    else
+      DB.transaction do
+        changes.each { |sd, _, new_ids| sd.update(unix_device_list: Sequel.pg_array(new_ids, :text)) }
+        ByohOperatorLog.record(command: "relearn-device-ids", target_id: host.id,
+          args: {devices: changes.to_h { |sd, old_ids, new_ids| [sd.name, {from: old_ids, to: new_ids}] }}, result: "ok")
+      end
+      @out.puts "Stored the new ids of #{changes.size} storage devices of host #{host.ubid}."
+    end
   end
 
   # Writes every byoh_operator_action row as JSON lines and records the
