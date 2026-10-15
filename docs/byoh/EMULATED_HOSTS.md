@@ -128,10 +128,10 @@ Items 5-8 apply to **emulated hosts only**. CH hosts are unchanged (U1); the equ
    - `metal_fetch_serial_log` additionally runs `sudo -u <vm> tail` on emulated hosts, as defence in depth.
    - `purge` removes `/vm/<n>` explicitly. Whether `deluser --remove-home` removes a root-owned home is UNVERIFIED, so it is not relied on.
 6. **QMP** only on a unix socket at `/vm/<n>/run/qmp.sock`, inside the VM user's 0700 `run/` directory. `stop-vm` talks to it safely:
-   - It `lstat`s the path first: it must exist, be a socket, and be owned by the VM uid.
-   - The connect happens in a child process that drops to the VM uid and gid (supplementary groups cleared, no new privileges), so a symlinked socket into another VM's 0700 `run/` is not traversable.
-   - Reads use `gets(65_536)` under one overall deadline.
-   - ENOENT or ECONNREFUSED on a stale socket means "already stopped" and exits 0.
+   - It `lstat`s the path first, as root: `run/` must be a directory owned by the VM uid, and `qmp.sock` must be a socket (not a symlink) owned by the VM uid. A VM user of uid or gid 0 is refused.
+   - The connect happens in a forked child that drops to the VM uid and gid for good (`setgroups([])`, then `setresgid`, then `setresuid`, then the four ids are read back and checked), so a symlink swapped in after the `lstat` cannot reach another VM's 0700 `run/` (VERIFIED in a container: the dropped child got EACCES on the other VM's socket and connected to its own).
+   - One deadline (10 s) covers connect, greeting and commands. Reads are non-blocking and buffered, and a message may be at most 65,536 bytes. Events are skipped; error replies, a reply with the wrong `id`, EOF, non-JSON and oversize messages raise. The parent kills the child if it is still running 5 s after that deadline. A stopped (SIGSTOP) QEMU made `stop-vm` exit 1 after 10.1 s (VERIFIED).
+   - ENOENT or ECONNREFUSED (a missing `run/` or socket, or a stale socket after QEMU died) means "already stopped": it prints that and exits 0 (VERIFIED).
 7. **Disk access** goes only through the ubiblk vhost-user socket. The backend runs in its own hardened unit (`rhizome/host/lib/storage_volume.rb:177-240`), and QEMU never opens the encrypted data file.
 8. **systemd hardening on the QEMU unit** (TCG only), the same class as the ubiblk unit:
    - `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectHome=yes`, `PrivateMounts=yes`

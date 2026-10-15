@@ -20,6 +20,19 @@ require_relative "../lib/cloud_hypervisor"
 vm_path = VmPath.new(vm_name)
 params = JSON.parse(File.read(vm_path.prep_json))
 
+# QEMU VMs on emulated hosts (no KVM). Every other VM takes the
+# cloud-hypervisor path below, unchanged.
+require_relative "../lib/emulated_stop"
+if EmulatedStop.handles?(params)
+  begin
+    puts "#{vm_name} is already stopped" if EmulatedStop.powerdown(vm_name) == :already_stopped
+  rescue => e
+    warn "stop-vm: #{e.message}"
+    exit 1
+  end
+  exit 0
+end
+
 unless params.fetch("hypervisor", "ch") == "ch"
   warn "stop-vm is only supported for VMs using cloud-hypervisor"
   exit 1
