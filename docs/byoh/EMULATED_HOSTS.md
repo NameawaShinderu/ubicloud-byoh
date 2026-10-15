@@ -103,6 +103,7 @@ QEMU's security policy (https://www.qemu.org/docs/master/system/security.html; t
 - **Disk encryption does not protect the VM's own disk from its own QEMU.** It protects data at rest and across VMs. The VM's ubiblk backend runs as the same unix user as QEMU, so an escaped QEMU can read that VM's `secrets.toml` and race the KEK FIFO. Other VMs' disks stay protected by their own uids.
 - **Writable JIT memory.** The TCG JIT needs memory that is both writable and executable, so `MemoryDenyWriteExecute` cannot be set, which makes post-escape exploitation easier than under CH.
 - **Root-trust paths into `/vm/<n>`.** Today `/vm/<n>` is the VM user's home and the VM user owns it. Several root-side operations read or write inside it (`VmPath#write`, `dnsmasq -C`, the `prep.json` parse, the serial-log `tail`), so the VM uid could plant symlinks there. On emulated hosts that directory becomes root-owned (4.2 item 5).
+- **Root-trust paths into `/var/storage/<vm>/<idx>`.** `StorageVolume#prep` chowns that directory to the VM uid (`rhizome/host/lib/storage_volume.rb:77-78`), and root still writes inside it: on every storage start `KekPipe#with_kek_pipe` removes `kek.pipe`, `mkfifo`s it and `FileUtils.chown`s it by path (`rhizome/host/lib/kek_pipe.rb:12-14`), and `write_new_file`/`safe_write_to_file` open `<path>.tmp` and `<path>.tmp.lock` as root with `O_CREAT`, following symlinks. A VM-uid process running during a storage start can rename entries in its own directory and redirect that chown or write. Today's flows stop the VM before a storage start (`prog/vm/update_ipv6.rb:15`, host reboot), so the window needs an escaped QEMU that survives its own stop, but it is real. What closes it on emulated hosts is that QEMU cannot write under `/var` at all: `ProtectSystem=strict` (4.2 item 8) is **load-bearing** for this, not optional hardening.
 
 ### 4.2 Mitigations (defence in depth)
 
@@ -134,7 +135,7 @@ Items 5-8 apply to **emulated hosts only**. CH hosts are unchanged (U1); the equ
 7. **Disk access** goes only through the ubiblk vhost-user socket. The backend runs in its own hardened unit (`rhizome/host/lib/storage_volume.rb:177-240`), and QEMU never opens the encrypted data file.
 8. **systemd hardening on the QEMU unit** (TCG only), the same class as the ubiblk unit:
    - `NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectHome=yes`, `PrivateMounts=yes`
-   - `ProtectSystem=strict` with `ReadWritePaths=/vm/<n>`
+   - `ProtectSystem=strict` with `ReadWritePaths=/vm/<n>`. **Load-bearing** (4.1, `/var/storage/<vm>`): it keeps an escaped QEMU from writing under `/var/storage`, where root chowns and writes by path. It must not be removed at L-Q without a replacement that keeps `/var/storage` read-only for the QEMU unit (`ReadOnlyPaths=/var/storage` or `InaccessiblePaths=` on everything but the vhost-user socket). QEMU still has to `connect()` to the vhost-user socket on that read-only mount, which Linux allows for sockets (UNVERIFIED for this unit until L-Q). Making the storage root `root:<vm>` on emulated hosts, as for `/vm/<n>`, is a possible follow-up.
    - `ProtectKernelTunables=yes`, `ProtectKernelModules=yes`, `ProtectKernelLogs=yes`, `ProtectControlGroups=yes`, `ProtectClock=yes`, `ProtectHostname=yes`
    - `ProtectProc=invisible`, `ProcSubset=pid`
    - `RestrictNamespaces=yes`, `RestrictRealtime=yes`, `RestrictSUIDSGID=yes`, `RemoveIPC=yes`, `LockPersonality=yes`
@@ -143,8 +144,8 @@ Items 5-8 apply to **emulated hosts only**. CH hosts are unchanged (U1); the equ
    - `DevicePolicy=closed` with `DeviceAllow=/dev/net/tun rw`
    - `UMask=0077`, `MemoryMax=<guest MiB + EMULATED_VM_OVERHEAD_MIB>`, `TasksMax=4096`
    - **Not** `MemoryDenyWriteExecute`: the TCG JIT needs W+X memory.
-   - The container harness runs `systemd-analyze verify` and `systemd-analyze security --offline=yes` on the generated unit and records the exposure score. It cannot run systemd itself without `--privileged`, so runtime enforcement is checked only at the live gate L-Q (UNVERIFIED). Each directive that breaks QEMU at L-Q is removed, and the removal is documented.
-   - `TemporaryFileSystem=/var/storage` with `BindPaths` is deferred: other VMs' storage directories are already per-uid 0700, and the mount-namespace interplay with ubiblk socket paths is UNVERIFIED.
+   - The container harness runs `systemd-analyze verify` and `systemd-analyze security --offline=yes` on the generated unit and records the exposure score. It cannot run systemd itself without `--privileged`, so runtime enforcement is checked only at the live gate L-Q (UNVERIFIED). Each directive that breaks QEMU at L-Q is removed, and the removal is documented, **except** `ProtectSystem=strict`, which may only be swapped for an equivalent (above).
+   - `TemporaryFileSystem=/var/storage` with `BindPaths` is deferred: other VMs' storage directories are already per-uid 0700, the VM's **own** storage directory is covered by `ProtectSystem=strict` above, and the mount-namespace interplay with ubiblk socket paths is UNVERIFIED.
 9. **Host kernel attack surface:** smaller than under CH, because the KVM ioctl surface is gone.
 
 ### 4.3 Product policy
@@ -360,12 +361,22 @@ Notes on the argv:
 **Family isolation** already exists for normal placement: `family_filter = [vm.family]` (`prog/vm/metal/nexus.rb:138`; `scheduling/allocator.rb:337-338`). But `metal/nexus.rb:115` sends an **empty** family filter together with `force_host_id`, and `allocator.rb:399` copies the host's family onto the VM. So family alone does not stop a forced placement.
 
 The VM-to-host rule ("an emulated VM only on a tcg host, every other VM only on a kvm host") is enforced by four guards:
-1. **Allocator filter**, applied unconditionally, including under `force_host_id`:
-   `apply_filter(:accel) { ds.where(Sequel[:vm_host][:accel] => vm.family == "emulated" ? "tcg" : "kvm") }`.
+1. **Allocator filter**, applied unconditionally, including under `force_host_id`, in `CandidateHosts#hosts`:
+   `apply_filter(:accel) { ds = ds.where(Sequel[:vm_host][:accel] => (request.family == "emulated") ? "tcg" : "kvm") }`.
+   - The block must **reassign** `ds`, like every other filter there (`allocator.rb:317-366`): `apply_filter` (`:183-187`) only records the dataset the block returns, so a block that just returns `ds.where(…)` adds a diagnostic count and filters nothing.
+   - `request.family` is `vm.family` (`Request#family`, filled at `allocator.rb:60`); `vm` itself is not in scope in `CandidateHosts`.
    The same predicate goes into `host_capacity_summary` (`prog/vm/metal/nexus.rb:53-80`). For every existing host and VM the predicate is true, so placement is unchanged.
-2. **`update_vm` guard** in `Allocator::VmHostSlice…#update_vm`: it fails with `NoSpaceLeft, "host accel does not match vm family"` when `(vm.family == "emulated") != vm_host.emulated?`. The check runs **before** `update_args[:family] = vm_host.family`, in the same transaction that sets `vm_host_id`.
-3. **`MoveVm.assemble`** (`prog/vm/metal/move_vm.rb:10-18`, which has no such check today) fails with "VmHost accel does not match Vm".
+2. **`update_vm` guard** in the class method `Scheduling::Allocator::Allocation.update_vm` (`allocator.rb:389`), which `Allocation#update` (`:429-436`) calls for every placement: it fails with `NoSpaceLeft, "host accel does not match vm family"` when `(vm.family == "emulated") != vm_host.emulated?`. The check runs **before** `update_args[:family] = vm_host.family` (`:399`), in the same savepoint that sets `vm_host_id`.
+   - It must **not** go in `VmHostSliceAllocation#update` (`:584`). That runs only when `request.use_slices && candidate_host[:accepts_slices]` (`:416`), and emulated hosts set `accepts_slices = false`, so a guard there would never run on them.
+   - The WP7 spec places a VM on a host with `accepts_slices = false`.
+3. **`MoveVm.assemble`** (`prog/vm/metal/move_vm.rb:10-18`, which has no such check today) fails with "VmHost accel does not match Vm" **before** it calls `Prog::Vm::Nexus.assemble`. The path that reaches it is a standard VM sent to a tcg host: the standard size validates, so only this guard stops it, and its spec uses that path.
+   - **Moving an emulated VM is unsupported in v1.** `MoveVm` re-creates the VM with `size: vm.display_size` (`move_vm.rb:27-31`) and no `extra_families`, so `validate_vm_size` would refuse it with an unrelated size error. `MoveVm.assemble` therefore refuses `vm.family == "emulated"` first with "moving emulated VMs is not supported", and the operator docs say so.
 4. **`VmHost#move_to_location`** refuses a tcg host into a location whose profile lacks `emulated_hosts?` and a kvm host into one that has it, which also covers the admin "Move to Location" action.
+
+**Other paths that force a host** (`force_host_id`) and how each treats emulated hosts:
+- **`Prog::RolloutRhizome`** (`prog/rollout_rhizome.rb:10-25, 90-100`) picks initial hosts by free cores, hugepages and IPv4, then forces a default-size (standard) VM onto each one. Guard 1 would refuse that VM on a tcg host, and the rollout would wait at `wait_vms_on_initial_hosts` forever. The rollout host query therefore adds `.where(accel: "kvm")`. Emulated hosts get new rhizome through the ordinary per-host install, not as rollout canaries. (Today the hugepage condition usually excludes them anyway, but hugepages are optional there, not absent.)
+- **Admin "Create VM" on a host** (`clover_admin.rb:1050`) calls `Vm::Nexus.assemble(size:, force_host_id:)` with no `extra_families`. On an emulated host it passes `extra_families: ["emulated"]` and offers only `emulated-*` sizes in the size select; on every other host the action is unchanged (U1).
+- **`MoveVm`**: see guard 3.
 
 A BEFORE UPDATE trigger on `vm.vm_host_id` was considered and rejected: the guards above run in the transaction that sets `vm_host_id` and are specced, while a trigger on `vm` fires on every non-BYOH VM update (a U1 and performance risk for no additional coverage).
 
@@ -417,7 +428,7 @@ It is useful only where CH misbehaves. It is **not in the MQ gate** and stays UN
 
 ## 7. Rollout and gates
 
-1. **Code gate** (every WP): the full Ruby gate with 100% line and branch coverage, frozen specs, rubocop, rhizome specs, shellcheck. The WP1 golden fixtures (CH units, QEMU+KVM unit, CH `params_json`, PrepHost command, `create_unix_user` heredoc, timings, `validate_vm_size` messages) must pass unchanged from WP2 on.
+1. **Code gate** (every WP): the full Ruby gate with 100% line and branch coverage, frozen specs, rubocop, rhizome specs, shellcheck. The WP1 golden fixtures (CH units, QEMU+KVM unit, CH `params_json`, PrepHost command, `create_unix_user` heredoc) and the WP1 pins (timings; `validate_vm_size` errors) must pass unchanged from WP2 on. The size-error pin computes the list from `Option::VmSizes` without family `emulated`, so an upstream merge that adds or renames a size does not break it, but an emulated size leaking into any caller does.
 2. **Container gate** (`scripts/byoh/test/qemu/run.sh all`, WP10). In an `ubi-q-*` container with no `--privileged`, no `/dev/kvm` and no `/dev/vhost-net`, the **real** `host/bin/setup-vm prep` boots an `emulated-2` VM under TCG from the server cloud image, with ubiblk encryption, rhizome networking (including the real ByohEgressNat config) and cloud-init. It then checks:
    - SSH within 420 s, DNS and egress (`apt-get update`, timed); the guest cannot reach the test database
    - `query-kvm` enabled=false, no `/dev/kvm` among QEMU's file descriptors, guest `systemd-detect-virt` = `qemu`, no `svm`/`vmx` flags (proves `-cpu max,-svm,-vmx` boots)
@@ -426,6 +437,7 @@ It is useful only where CH misbehaves. It is **not in the MQ gate** and stays UN
    - stop through the real `stop-vm` (QMP) idle and under load, start (data persists), restart, and delete twice (the second without `prep.json`), after which the netns, user, home and storage are gone
    - RSS of QEMU, ubiblk and dnsmasq for `emulated-2` and `emulated-4` (sets `EMULATED_VM_OVERHEAD_MIB`), idle CPU, and two concurrent boots under `--cpus=2` (checks the 30-min deadline)
    - Only host-global steps are stubbed: systemd, hugepages, PrepHost global sysctls, reboot. If the net procfs setup needs `--privileged`, that line of testing stops and is reported.
+   - Docker's default seccomp profile is always kept. If `ip netns` or the net procfs bind needs `apparmor=unconfined` (docker-default denies `mount`), the run is reported as "CAP_SYS_ADMIN without AppArmor", never as unprivileged, and the fail-closed `docker inspect` check asserts `SecurityOpt` holds nothing else.
 3. **Live gate L-Q (UNVERIFIED, operator window, never run from this workflow):**
    - Machine: a **non-nested** x86_64 machine (AWS m6i.xlarge or c6i.xlarge, or any non-nested x86_64 VPS) with Ubuntu 24.04 and at least a 100 GiB data volume at `/var/storage`. Check that `/dev/kvm` is absent.
    - Bootstrap: `bootstrap-data-plane.sh --emulated`.
