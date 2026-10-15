@@ -396,6 +396,13 @@ RSpec.describe ByohHostAdd do
       expect(err).to start_with "! validation failed:"
       expect(calls).to be_empty
     end
+
+    it "refuses a pool that holds an explicit --uplink-ip before reaching the host" do
+      status, _, err = cli(*base, "--uplink-ip", "10.99.0.3", "--yes")
+      expect([status, err]).to eq [1, "! validation failed: 10.99.0.0/29 hands the uplink IP 10.99.0.3 to VMs; declare pools without it, or reserve it\n"]
+      expect(calls).to be_empty
+      expect(starts).to be_empty
+    end
   end
 
   describe "resume" do

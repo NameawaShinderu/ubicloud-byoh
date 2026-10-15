@@ -26,7 +26,6 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/m4-lib.sh"
 trap cleanup EXIT
 
-FIXTURES=$HARNESS_DIR/fixtures/host
 HOST_DIR=$WT/scripts/byoh/host
 SPEC_OUT=$WT/spec/fixtures/byoh/preflight
 NONCE=f1x7ure
@@ -47,26 +46,10 @@ if ((${#cases[@]} == 0)); then
   done
 fi
 
-# lay_out CASE: builds the case's tree under $STATE/pf/CASE.
-lay_out() {
-  local dir=$STATE/pf/$1 p
-  rm -rf "$dir"
-  mkdir -p "$dir"
-  cp -R "$FIXTURES/base/." "$dir/"
-  cp -R "$FIXTURES/$1/." "$dir/"
-  if [[ -f $FIXTURES/$1/.remove ]]; then
-    while read -r p; do
-      [[ -n $p ]] && rm -rf "${dir:?}/$p"
-    done <"$FIXTURES/$1/.remove"
-  fi
-  chmod -R a+rX "$dir"
-  echo "$dir"
-}
-
 # run_case CASE: prints the script's stdout; fails on a non-zero exit.
 run_case() {
   local dir name=$PREFIX-pf-$1 env=() rc=0
-  dir=$(lay_out "$1")
+  dir=$(pf_fixture "$1")
   [[ -f $dir/noise ]] && env=(-e BASH_ENV=/fx/noise)
   echo "$name" >>"$STATE/created"
   docker run --rm --name "$name" --network "$NET" -i \

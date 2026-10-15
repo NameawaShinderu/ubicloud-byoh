@@ -9,6 +9,7 @@
 #                            args after NAME (e.g. -e FAKEHOST_ACTIVE=docker)
 #   fakehost_ip NAME         its address on ubi-test-net
 #   fakehost_key             the per-run RSA login key for user ubuntu
+#   pf_fixture CASE          lay out the preflight fixture host CASE
 #
 # The login key is generated per run in $STATE and never committed.
 # Never `set -x` here.
@@ -52,4 +53,23 @@ start_fakehost() {
 
 fakehost_ip() {
   docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$PREFIX-$1"
+}
+
+# pf_fixture CASE: lays out fixtures/host/base with fixtures/host/CASE
+# over it under $STATE/pf/CASE (CASE/.remove lists base paths it
+# deletes), and prints that directory.
+FIXTURES=$HARNESS_DIR/fixtures/host
+pf_fixture() {
+  local dir=$STATE/pf/$1 p
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  cp -R "$FIXTURES/base/." "$dir/"
+  cp -R "$FIXTURES/$1/." "$dir/"
+  if [[ -f $FIXTURES/$1/.remove ]]; then
+    while read -r p; do
+      [[ -n $p ]] && rm -rf "${dir:?}/$p"
+    done <"$FIXTURES/$1/.remove"
+  fi
+  chmod -R a+rX "$dir"
+  echo "$dir"
 }

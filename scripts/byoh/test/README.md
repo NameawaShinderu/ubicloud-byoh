@@ -222,6 +222,47 @@ Result (2026-10-15): all cases pass in about 6 s, with nothing left
 behind. The install steps themselves (apt, sshd reload) are not run
 here; they are unchanged by WP11.
 
+### Host add gate (WP12)
+
+```
+scripts/byoh/test/m4-host-add.sh
+```
+
+Runs `bin/byoh-host add` end to end, with the real ssh client, Net::SSH
+and a real database, against two fakehosts (`ubi-m4-host`,
+`ubi-m4-host2`). The control plane is `ubi-m4-cp`, a `ubi-bundler-m1`
+container (`UBI_M4_RUBY_IMAGE`) with the working tree mounted read-only
+and a tmpfs over `var/`, so the registration keys never reach the
+worktree. It runs `RACK_ENV=development`: under `RACK_ENV=test` Net::SSH
+raises MissingMock and host add refuses to reach a host.
+
+The database is the worktree `.env.rb`'s `CLOVER_DATABASE_URL` with
+`TEST_ENV_NUMBER=6` (`UBI_M4_DB_NUMBER`), `clover_m2_test6` here, which
+the spec suite shares, so **never run this while a pspec runs**.
+`m4-db-state` refuses a database whose name does not end in `_test` or
+`_test<n>`, takes a snapshot (an md5 per row of every table) before the
+first command, and on exit, pass or fail, deletes every row the run
+added and checks that each table is back as it was. A row the run
+changed in place stops the restore with the table named.
+
+| Run | Asserts |
+|---|---|
+| A | No `/dev/kvm`: exit 1 at preflight with `fail PF3 no /dev/kvm`; no host row; root's `authorized_keys` and `sshd_config.d` unchanged |
+| B | A /29 holding the fakehost's own address (`--main-ip 192.0.2.10`, so registration's own main-IP check passes): exit 1 with PF17 "hands the uplink IP ... to VMs", after a read-only login that `docker logs` shows; no root login, no change. `spec/lib/byoh_host_add_spec.rb` covers an explicit `--uplink-ip` in a pool, which fails before any ssh |
+| C | `ubicloud-host preflight` on the `intel-hybrid` fixture, sent over the operator's ssh with sudo as add sends it: `ByohHostPreflight` reads PF8-hybrid as fail and blocking, and `accept(["PF8-hybrid"])` downgrades it to an accepted warn with no other fail |
+| D | `--skip-preflight --yes --no-wait` registers the host: one sshable and VmHost, `byoh?`, `uplink_ip` detected, boot images `ubuntu-noble`, `sshable.host_keys` equal to the host's `/etc/ssh/ssh_host_*_key.pub`, `pin_host_keys` in the HostNexus frame, `authorized_keys` keeping cloud-init's forced-command line and a comment next to the tagged key, no drop-in (Ubuntu's sshd already allows root key login), PF2 passed, the kept key deleted. A re-run says "Resuming" and adds nothing; a re-run with `--storage-disk` exits 2 |
+| D2 | A host with `PermitRootLogin no` after the `Include` and a `/usr/local/sbin/sshd` shim whose `sshd -t` fails: exit 1 with the rollback message and the undo line, no drop-in left, sshd serving, no host row |
+| E | `--storage-disk` naming a missing disk: exit 1 before any change. Then `storage-disk-fixtures.sh`, whose holders, partition table, backup GPT, iscsi and two-link refusals must pass |
+| D3 | The D2 host without the shim: the kept key is reused, the drop-in is written, sshd reloads (shim log), PF2 passes and the host registers |
+
+Not covered: the watch until `accepting` (no respirate runs, and the
+fakehost cannot be set up), a socket-activated `ssh.socket`, and a real
+disk for `--storage-disk`. These, and the same flow on an AWS canary and
+a Proxmox VM, are UNVERIFIED here.
+Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): every run passes
+in about 70 s, the database is restored (35 rows deleted), and nothing
+is left behind.
+
 ## Scenarios
 
 | Scenario | Checks |
