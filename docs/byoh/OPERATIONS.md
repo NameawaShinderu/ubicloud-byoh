@@ -91,7 +91,7 @@ timer never races a restore, an install or a release switch.
 | `env set KEY [--no-restart]`, `env unset KEY`, `env get KEY --reveal`, `env keys` | §4 |
 | `logs ...` | §1 |
 | `account create --email E [--name N] [--project P] [--password-stdin\|--password-file F]`, `account list` | §5 |
-| `run TOOL [ARGS...]` | `byoh-location`, `byoh-pool`, `byoh-host`, `register-byoh-host`, `byoh-config-check`, `production_check`, `create_prod_admin_account LOGIN` in the release as `ubicloud`. Input files (`--pool-file`, `--ssh-key`, `--external-map`, `--password-file`) are copied for it; `--out F` comes back to you (0600). `--bmc-password` in any spelling is refused |
+| `run TOOL [ARGS...]` | `byoh-location`, `byoh-pool`, `byoh-host`, `register-byoh-host`, `byoh-config-check`, `production_check`, `create_prod_admin_account LOGIN`, `m2-checks` (the database checks of the M2 and M4 gates, [VERIFY.md](VERIFY.md)) in the release as `ubicloud`. Input files (`--pool-file`, `--ssh-key`, `--registration-key`, `--external-map`, `--password-file`, `--snapshot`) are copied for it; `--out F` comes back to you (0600). `--bmc-password` in any spelling is refused |
 | `console [-e CODE\|-e -]` | §3 |
 | `release list\|check\|migrate\|use\|prune` | §7 |
 

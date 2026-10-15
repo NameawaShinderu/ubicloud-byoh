@@ -10,6 +10,7 @@
 #     restarts ubicloud.target (a new web PID); a site rates that changes
 #     no file and a site set restart nothing
 #   - site show NAME, site --help, the M8 and --postgres refusals (2)
+#   - run m2-checks location in the release, and its staged --snapshot
 #   - UBICLOUD_ADMIN_DRYRUN=1 mappings of site add and of the two-phase
 #     host add
 #   - --dev (and UBICLOUD_ADMIN_DEV=1) refused on the packaged layout
@@ -92,6 +93,15 @@ grep -q 'restarted' <<<"$(adm_last)" && fail "site rates that changed no file re
 [[ $(web_pid "$C") == "$pid" ]] || fail "site rates (no change) or site set restarted web"
 [[ $(adm site show m4-site) == 0 ]] || fail "site show NAME: $(adm_last)"
 grep -q 'Location      m4-site' <<<"$(adm_last)" || fail "site show NAME: $(adm_last)"
+# m2-checks runs in the release with the env file (the M4 E2 and F5
+# gates on a packaged control plane), and its --snapshot is staged.
+[[ $(adm run m2-checks location --location m4-site --rates-from hetzner-fsn1) == 0 ]] ||
+  fail "run m2-checks location: $(adm_last)"
+grep -q '^PASS location m4-site is a BYOH location' <<<"$(adm_last)" || fail "run m2-checks location: $(adm_last)"
+[[ $(adm run m2-checks compare --host vh000000000000000000000000 --snapshot /root/no-such.json) == 2 ]] ||
+  fail "run m2-checks did not stage --snapshot: $(adm_last)"
+grep -q 'no-such.json is not a readable file' <<<"$(adm_last)" || fail "run m2-checks --snapshot: $(adm_last)"
+say "run m2-checks: runs in the release with its env; --snapshot is staged"
 [[ $(adm site --help) == 0 ]] || fail "site --help: $(adm_last)"
 grep -q 'Usage: bin/byoh-location' <<<"$(adm_last)" || fail "site --help: $(adm_last)"
 [[ $(adm site add --help) == 0 ]] || fail "site add --help: $(adm_last)"

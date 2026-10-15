@@ -59,6 +59,10 @@
 #                        journal needs root or group adm or systemd-journal;
 #                        otherwise the gate tries sudo -n
 #   GATE_STATE_DIR       where snapshots and exports go (default var/m2-gate)
+#   GATE_CHECKS          the m2-checks command, split on spaces (default:
+#                        "sudo ubicloud-admin run m2-checks" under systemd,
+#                        which runs it in the release with /etc/ubicloud/env,
+#                        else "bundle exec scripts/byoh/verify/m2-checks")
 
 set -euo pipefail
 
@@ -82,6 +86,12 @@ case $GATE_SERVICES in
     ;;
 esac
 GATE_STATE_DIR=${GATE_STATE_DIR:-var/m2-gate}
+if [[ $GATE_SERVICES == systemd ]]; then
+  GATE_CHECKS=${GATE_CHECKS:-sudo ubicloud-admin run m2-checks}
+else
+  GATE_CHECKS=${GATE_CHECKS:-bundle exec scripts/byoh/verify/m2-checks}
+fi
+read -ra CHECKS_CMD <<<"$GATE_CHECKS"
 GATE_EXPECT_MONITOR=${GATE_EXPECT_MONITOR:-0}
 GATE_VM_A_EXPOSURE=${GATE_VM_A_EXPOSURE:-nat}
 
@@ -103,7 +113,7 @@ need() {
 }
 
 checks() {
-  bundle exec scripts/byoh/verify/m2-checks "$@"
+  "${CHECKS_CMD[@]}" "$@"
 }
 
 # Runs an m2-checks command and counts its result.

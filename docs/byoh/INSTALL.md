@@ -306,10 +306,11 @@ sudo ubicloud-admin logs respirate -f
 
 - `ubicloud-admin run TOOL` runs `byoh-location`, `byoh-pool`,
   `byoh-host`, `register-byoh-host`, `byoh-config-check`,
-  `production_check` or `create_prod_admin_account` in the release as
-  user `ubicloud`. Files named by `--pool-file`, `--ssh-key`,
-  `--external-map` and `--password-file` are copied for it, relative to
-  your directory; `--out F` is written back to you.
+  `production_check`, `create_prod_admin_account` or `m2-checks` (the
+  gates' database checks, VERIFY.md) in the release as user `ubicloud`.
+  Files named by `--pool-file`, `--ssh-key`, `--registration-key`,
+  `--external-map`, `--password-file` and `--snapshot` are copied for it,
+  relative to your directory; `--out F` is written back to you.
 - Use `--bmc-pass-env`, never `--bmc-password` (refused): OPERATIONS.md §4.2.
 - A database query: `sudo -u postgres psql -d ubicloud -c "SELECT allocation_state FROM vm_host"`.
 - A REPL: `sudo ubicloud-admin console`, which is **not audited** unless
