@@ -24,6 +24,14 @@
 #                step 1
 #   no-kvm       without /dev/kvm the existing step 1b exit stays: exit
 #                1, and preflight never runs
+#   unsafe-*     a found ubicloud-host that another user could have put
+#                there is skipped with the reason, never run as root:
+#                a sticky world-writable directory (like /tmp) with a file
+#                planted by nobody, a host/ directory owned by nobody, a
+#                directory writable by a group other than the owner's
+#                own; exit 0 and the planted script leaves no mark
+#   upg          a clone owned by ubuntu:ubuntu with mode 775 (Ubuntu's
+#                umask 002, a user-private group) still runs: exit 0
 # Fixture runs wrap ubicloud-host so that it reads fixtures/host/<case>
 # laid over fixtures/host/base (as preflight-fixtures.sh does).
 set -euo pipefail
@@ -66,13 +74,21 @@ EOF
 #   alone/     bootstrap-data-plane.sh only
 #   hybrid     a wrapper -> fixture intel-hybrid
 #   broken     a preflight script that exits 3
+#   shared/    bootstrap-data-plane.sh, ubicloud-host planted (1777, nobody)
+#   owned/     bootstrap-data-plane.sh, host/ubicloud-host planted (host/ is nobody's)
+#   grp/       bootstrap-data-plane.sh, ubicloud-host planted (dir 775 root:ubuntu)
+#   upg/       bootstrap-data-plane.sh, ubicloud-host -> fixture base (ubuntu:ubuntu 775)
 T=$STATE/bs/t
 rm -rf "$T"
-mkdir -p "$T"/{live/host,base/host,next,alone}
+mkdir -p "$T"/{live/host,base/host,next,alone,shared,owned/host,grp,upg}
 cp "$BYOH/host/ubicloud-host" "$T/ubicloud-host"
-for d in live base next alone; do
+for d in live base next alone shared owned grp upg; do
   cp "$BYOH/bootstrap-data-plane.sh" "$T/$d/"
 done
+for f in shared/ubicloud-host owned/host/ubicloud-host grp/ubicloud-host; do
+  printf '#!/bin/bash\ntouch /t/pwned\necho "pass  PF1 planted"\n' >"$T/$f"
+done
+wrapper "$T/upg/ubicloud-host" base
 cp "$BYOH/host/ubicloud-host" "$T/live/host/ubicloud-host"
 for c in base intel-hybrid kvm64-model; do
   lay_out "$c"
@@ -93,7 +109,11 @@ docker exec "$CTR" bash -c 'chmod -R a+rX /t &&
   install -d -o ubuntu -g ubuntu /home/ubuntu/.ubi-data-plane-bootstrap &&
   for m in sshd-installed root-sshd-config bundler-preinstalled; do
     install -o ubuntu -g ubuntu /dev/null /home/ubuntu/.ubi-data-plane-bootstrap/$m
-  done'
+  done &&
+  chown -R root:root /t && chmod 1777 /t/shared && chown nobody /t/shared/ubicloud-host &&
+  chown -R nobody /t/owned/host &&
+  chgrp ubuntu /t/grp && chmod 775 /t/grp &&
+  chown -R ubuntu:ubuntu /t/upg && chmod 775 /t/upg'
 LIVE_IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" "$CTR")
 
 # bs NAME WANT_RC ARGS...: runs a bootstrap as ubuntu; its output (stdout
@@ -184,6 +204,24 @@ bs usage-value 2 /t/live/bootstrap-data-plane.sh --main-ip
 has usage-value "--main-ip needs a value"
 lacks usage-value "OS check"
 say "pass usage"
+
+# unsafe NAME DIR WHY: the planted ubicloud-host under DIR is skipped.
+unsafe() {
+  bs "$1" 0 "/t/$2/bootstrap-data-plane.sh"
+  has "$1" "\[skip\] not running /t/$2/[a-z/]*ubicloud-host as root: $3"
+  has "$1" "sudo ubicloud-admin host preflight --site <site>"
+  lacks "$1" "planted|ERROR"
+  if docker exec "$CTR" test -e /t/pwned; then fail "$1: the planted script ran"; fi
+  say "pass $1"
+}
+unsafe unsafe-shared shared "/t/shared is writable by others \(mode 1777\)"
+unsafe unsafe-owned owned "/t/owned/host is owned by uid 65534, neither root nor you"
+unsafe unsafe-grp grp "/t/grp is writable by group [0-9]+ \(mode 775\)"
+
+bs upg 0 /t/upg/bootstrap-data-plane.sh --main-ip "$MAIN_IP"
+has upg "/t/upg/ubicloud-host preflight --standalone --main-ip $MAIN_IP"
+has upg "preflight: 0 failing"
+say "pass upg"
 
 docker exec "$CTR" rm -f /dev/kvm
 bs no-kvm 1 /t/base/bootstrap-data-plane.sh

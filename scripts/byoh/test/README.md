@@ -215,6 +215,8 @@ script's own step 1b. Fixture runs put a wrapper in place of
 | broken | A preflight script that exits 3: "could not run (exit 3)", its stderr shown, exit 1 |
 | usage | Missing `--preflight-script` file, bad `--main-ip`, `--no-preflight` with `--preflight-script`, an unknown option, a missing value: exit 2 before step 1 |
 | no-kvm | `/dev/kvm` removed: the existing step 1b exit (1) stays and preflight never runs |
+| unsafe-shared, unsafe-owned, unsafe-grp | A found `ubicloud-host` that another user could have placed is skipped with the reason and never run as root: a sticky world-writable directory (like `/tmp`) with a file `nobody` planted, a `host/` directory owned by `nobody`, a directory writable by a group other than the owner's own. Exit 0, and the planted script leaves no mark |
+| upg | A copy owned by `ubuntu:ubuntu` with mode 775 (Ubuntu's umask 002, a user-private group) still runs preflight: exit 0 |
 
 Result (2026-10-15): all cases pass in about 6 s, with nothing left
 behind. The install steps themselves (apt, sshd reload) are not run

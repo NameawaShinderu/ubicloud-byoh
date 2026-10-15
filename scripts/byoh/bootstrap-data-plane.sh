@@ -38,10 +38,14 @@
 #   --main-ip IP             the address the control plane will reach this
 #                            host at; preflight checks that it is on this
 #                            host (a NAT address in front of it only warns)
-#   --preflight-script PATH  the ubicloud-host script to run preflight with.
-#                            Default: ubicloud-host next to this script, or
-#                            host/ubicloud-host below its directory (the
-#                            repository layout)
+#   --preflight-script PATH  the ubicloud-host script to run preflight with
+#                            (as root, as given). Default: ubicloud-host
+#                            next to this script, or host/ubicloud-host
+#                            below its directory (the repository layout),
+#                            run only when it and the directories above it
+#                            are owned by root or you and writable by no
+#                            one else; otherwise preflight is skipped with
+#                            the reason
 #   --no-preflight           skip preflight
 #
 # Exit status: 0 the host is prepared and preflight found no failing
@@ -63,8 +67,41 @@ usage_error() {
   exit 2
 }
 
+# unsafe_path PATH: prints why root must not run a file reached through
+# PATH, or nothing when it may. PATH and every directory above it must
+# be owned by root or by the user running this script, and writable by
+# nobody else: never by others (a sticky /tmp too), and by the group
+# only when that is the owner's own group, root's or this user's
+# user-private group (Ubuntu's umask 002 makes clones group-writable).
+unsafe_path() {
+  local p=$1 owner group mode upg=""
+  [[ $(id -gn) != "$(id -un)" ]] || upg=$(id -g)
+  while :; do
+    read -r owner group mode < <(stat -c '%u %g %a' -- "$p" 2>/dev/null) || {
+      echo "cannot stat $p"
+      return
+    }
+    if [[ $owner != 0 && $owner != "$EUID" ]]; then
+      echo "$p is owned by uid $owner, neither root nor you"
+      return
+    fi
+    if ((8#$mode & 8#002)); then
+      echo "$p is writable by others (mode $mode)"
+      return
+    fi
+    if ((8#$mode & 8#020)) && ! [[ ($owner == 0 && $group == 0) || ($owner == "$EUID" && $group == "$upg") ]]; then
+      echo "$p is writable by group $group (mode $mode)"
+      return
+    fi
+    [[ $p != / ]] || return 0
+    p=$(dirname "$p")
+  done
+}
+
 MAIN_IP=""
 PREFLIGHT_SCRIPT=""
+PREFLIGHT_FOUND=""
+PREFLIGHT_UNSAFE=""
 RUN_PREFLIGHT=1
 while (($#)); do
   case $1 in
@@ -86,15 +123,22 @@ if [[ -n $PREFLIGHT_SCRIPT ]]; then
 elif ((RUN_PREFLIGHT)); then
   # Found by the script's own location, never by the working directory;
   # piped into bash, the script has no location and preflight is skipped
-  # with a hint.
+  # with a hint. A found script runs as root, so it must sit where only
+  # root or this user can change it (unsafe_path): a copy of this script
+  # in /tmp must not run whatever another user put next to it.
   self=${BASH_SOURCE[0]:-}
   if [[ -f $self ]]; then
-    self_dir=$(cd "$(dirname "$self")" && pwd)
+    self_dir=$(cd "$(dirname "$self")" && pwd -P)
     for candidate in "$self_dir/ubicloud-host" "$self_dir/host/ubicloud-host"; do
-      if [[ -f $candidate ]]; then
-        PREFLIGHT_SCRIPT=$candidate
-        break
-      fi
+      [[ -f $candidate ]] || continue
+      PREFLIGHT_FOUND=$candidate
+      real=$(realpath -e -- "$candidate" 2>/dev/null) || real=$candidate
+      for p in "$self_dir" "$(realpath -e -- "$(dirname "$candidate")" 2>/dev/null || dirname "$candidate")" "$real"; do
+        PREFLIGHT_UNSAFE=$(unsafe_path "$p")
+        [[ -z $PREFLIGHT_UNSAFE ]] || break
+      done
+      [[ -n $PREFLIGHT_UNSAFE ]] || PREFLIGHT_SCRIPT=$real
+      break
     done
   fi
 fi
@@ -204,7 +248,13 @@ PREFLIGHT_FAILS=0
 if ((!RUN_PREFLIGHT)); then
   echo "  [skip] --no-preflight"
 elif [[ -z $PREFLIGHT_SCRIPT ]]; then
-  echo "  [skip] ubicloud-host was not found next to this script."
+  if [[ -n $PREFLIGHT_UNSAFE ]]; then
+    echo "  [skip] not running $PREFLIGHT_FOUND as root: $PREFLIGHT_UNSAFE."
+    echo "  Keep this script in a directory only root or you can write, or pass"
+    echo "  --preflight-script with a copy you trust."
+  else
+    echo "  [skip] ubicloud-host was not found next to this script."
+  fi
   echo "  ubicloud-admin host add runs it from the control plane anyway. To run it"
   echo "  now, copy scripts/byoh/host/ubicloud-host here and pass --preflight-script,"
   echo "  or from the control plane, without changing anything on this host:"
