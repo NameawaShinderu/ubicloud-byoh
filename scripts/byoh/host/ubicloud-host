@@ -5,6 +5,7 @@
 #   ubicloud-host preflight [--json] [--nonce N] [--main-ip IP] [--cp-ip IP]
 #                           [--boot-image-url URL]... [--images N]
 #                           [--vm-disk-gib N] [--standalone]
+#   ubicloud-host storage-disk --by-id ID [--allow-shared-transport]
 #   ubicloud-host version
 #
 # preflight gathers facts and gives verdicts only for the host-local
@@ -29,11 +30,24 @@
 # Exit status: 0 when the checks ran (verdicts are in the output), 2 on a
 # usage error, 3 on an internal error.
 #
+# storage-disk formats one blank whole disk, named by its
+# /dev/disk/by-id link, as ext4 and mounts it at the next free
+# /var/storage/devices/diskN, where LearnStorage finds it. It runs as
+# root and never wipes: a disk with any partition, signature (a backup
+# GPT included), holder, swap or mount is refused, as are the disks of /,
+# /boot and /boot/efi. iSCSI, FC and multipath disks are refused unless
+# --allow-shared-transport, since another machine may write to them. A
+# re-run on a disk it set up passes. The last stdout line on success is
+#   storage-disk: ok /var/storage/devices/diskN UUID=<uuid>
+# Exit status: 0 done, 1 refused, 2 usage error, 3 internal error.
+#
 # Test mode: --fixture-root DIR together with UBICLOUD_HOST_TEST_ROOT=DIR
 # (the same value) reads every file under DIR and every command's output
 # from DIR/cmd/<key> (exit status in DIR/cmd/<key>.rc, default 0; a
 # missing key is a missing command). DIR/bin/<name> marks a tool as
-# installed. See scripts/byoh/test/preflight-fixtures.sh.
+# installed. See scripts/byoh/test/preflight-fixtures.sh. storage-disk in
+# test mode reads and writes its files under DIR and runs every block
+# device command from DIR/shim (scripts/byoh/test/storage-disk-fixtures.sh).
 
 VERSION=1
 
@@ -64,6 +78,7 @@ URLS=()
 
 usage() {
   echo "usage: ubicloud-host preflight [--json] [--nonce N] [--main-ip IP] [--cp-ip IP] [--boot-image-url URL]... [--images N] [--vm-disk-gib N] [--standalone]" >&2
+  echo "       ubicloud-host storage-disk --by-id ID [--allow-shared-transport]" >&2
   echo "       ubicloud-host version" >&2
   exit 2
 }
@@ -737,6 +752,267 @@ preflight() {
   fi
 }
 
+# --- storage-disk ----------------------------------------------------
+
+STORAGE_DEVICES=/var/storage/devices
+# The block device commands storage-disk runs. In test mode each must be
+# a shim under the fixture root, so that no real disk is touched.
+SD_COMMANDS=(lsblk findmnt blkid wipefs swapon blockdev dd mkfs.ext4 chattr mount multipath udevadm systemctl)
+
+refuse() {
+  echo "ubicloud-host storage-disk: refused: $*" >&2
+  exit 1
+}
+
+say_sd() {
+  echo "storage-disk: $*"
+}
+
+# sd_resolve ID: sets SD_LINK (the by-id name) and SD_NAME (the kernel
+# name). An exact link name wins; otherwise ID must be the prefix of
+# exactly one whole-disk link.
+sd_resolve() {
+  local id=${1#/dev/disk/by-id/} dir=$R/dev/disk/by-id f n matches=()
+  [[ -n $id && $id != */* && $id != .* ]] || usage_error "--by-id takes a name from /dev/disk/by-id"
+  case $id in
+    dm-* | lvm-* | md-*) refuse "$id is a device-mapper, LVM or md link; give the by-id name of a whole disk" ;;
+  esac
+  if [[ -L $dir/$id ]]; then
+    matches=("$id")
+  else
+    for f in "$dir/$id"*; do
+      [[ -L $f ]] || continue
+      n=${f##*/}
+      [[ $n =~ -part[0-9]+$ || $n == dm-* || $n == lvm-* || $n == md-* ]] && continue
+      matches+=("$n")
+    done
+  fi
+  if ((${#matches[@]} == 0)); then
+    refuse "no /dev/disk/by-id link named $id"
+  elif ((${#matches[@]} > 1)); then
+    refuse "$id matches ${#matches[@]} links (${matches[*]}); give the full name"
+  fi
+  SD_LINK=${matches[0]}
+  SD_NAME=$(readlink "$dir/$SD_LINK") || internal_error "cannot read the link $SD_LINK"
+  SD_NAME=${SD_NAME##*/}
+  [[ $SD_NAME =~ ^[A-Za-z0-9._-]+$ ]] || internal_error "the link $SD_LINK points at an odd name ($SD_NAME)"
+}
+
+# The kernel names of the disks under the filesystem mounted at $1, or
+# nothing when $1 is not a mount point. Returns 1 when they cannot be
+# told.
+sd_disks_of_mount() {
+  local src majmin dev out line
+  read -r src majmin <<<"$(findmnt -nro SOURCE,MAJ:MIN --mountpoint "$1")" || true
+  [[ -z $src ]] && return 0
+  if [[ $majmin =~ ^[1-9][0-9]*:[0-9]+$ ]]; then
+    dev=/dev/block/$majmin
+  else
+    dev=${src%%\[*}
+  fi
+  out=$(lsblk -nPso NAME,TYPE "$dev" 2>/dev/null) || return 1
+  while read -r line; do
+    [[ $(kv TYPE "$line") == disk ]] && kv NAME "$line"
+  done <<<"$out"
+}
+
+# Ours already: an ext4 labelled ubi-diskN with its fstab line at
+# diskN. Mounts it when it is not mounted yet (a run cut short after the
+# fstab write). Returns 1 when the disk is not ours.
+sd_already_ours() {
+  local probe=$1 label uuid fstype n target mounts
+  label=$(sed -n 's/^LABEL=//p' <<<"$probe")
+  uuid=$(sed -n 's/^UUID=//p' <<<"$probe")
+  fstype=$(sed -n 's/^TYPE=//p' <<<"$probe")
+  [[ $label =~ ^ubi-disk([0-9]+)$ && $fstype == ext4 && -n $uuid ]] || return 1
+  n=${BASH_REMATCH[1]}
+  target=$STORAGE_DEVICES/disk$n
+  if ! awk -v u="UUID=$uuid" -v t="$target" '$1 == u && $2 == t { f = 1 } END { exit !f }' "$R/etc/fstab"; then
+    refuse "$SD_LINK carries the label $label but /etc/fstab does not mount UUID=$uuid at $target; to start over, wipefs -a /dev/$SD_NAME"
+  fi
+  mounts=$(lsblk -nro MOUNTPOINTS "/dev/$SD_NAME")
+  if [[ -z ${mounts//[[:space:]]/} ]]; then
+    mount "$target" || internal_error "mount $target failed"
+    mounts=$(lsblk -nro MOUNTPOINTS "/dev/$SD_NAME")
+  fi
+  grep -qxF "$target" <<<"$mounts" || refuse "$SD_LINK is ours ($label) but mounted at ${mounts//$'\n'/ }, not $target"
+  say_sd "$SD_LINK (/dev/$SD_NAME) is already set up"
+  say_sd "ok $target UUID=$uuid"
+  return 0
+}
+
+sd_refusals() {
+  local allow_shared=$1 dev=/dev/$SD_NAME m disks out rc line ss bytes sig tran swaps
+  for m in / /boot /boot/efi; do
+    if ! disks=$(sd_disks_of_mount "$m"); then
+      echo "ubicloud-host storage-disk: warning: cannot tell which disk holds $m; relying on the other checks" >&2
+    elif grep -qxF "$SD_NAME" <<<"$disks"; then
+      refuse "$SD_LINK is the disk of $m"
+    fi
+  done
+
+  out=$(lsblk -nPo NAME,TYPE,MOUNTPOINTS "$dev") || internal_error "lsblk $dev failed"
+  while read -r line; do
+    [[ -z $line ]] && continue
+    [[ $(kv TYPE "$line") == part ]] && refuse "$SD_LINK has partitions (/dev/$(kv NAME "$line"))"
+    [[ -n $(kv MOUNTPOINTS "$line") ]] && refuse "$SD_LINK is mounted (/dev/$(kv NAME "$line") at $(kv MOUNTPOINTS "$line"))"
+  done <<<"$out"
+
+  if compgen -G "$R/sys/block/$SD_NAME/holders/*" >/dev/null; then
+    refuse "$SD_LINK is held by $(cd "$R/sys/block/$SD_NAME/holders" && echo *) (LVM, md, multipath or dm-crypt)"
+  fi
+
+  swaps=$(swapon --show=NAME --noheadings --raw) || internal_error "swapon --show failed"
+  grep -qxF "$dev" <<<"$swaps" && refuse "$SD_LINK is in use as swap"
+
+  out=$(wipefs -n -i "$dev") || internal_error "wipefs -n $dev failed"
+  [[ -n ${out//[[:space:]]/} ]] && refuse "$SD_LINK carries a signature: $(head -1 <<<"$out")"
+
+  rc=0
+  out=$(blkid -p -o export "$dev") || rc=$?
+  if ((rc == 0)); then
+    refuse "$SD_LINK carries a signature: $(grep -E '^(TYPE|PTTYPE)=' <<<"$out" | tr '\n' ' ')"
+  elif ((rc != 2)); then
+    internal_error "blkid -p $dev failed (exit $rc)"
+  fi
+
+  # A GPT whose primary header is gone still has its backup in the last
+  # block, which neither probe above reports without a protective MBR.
+  ss=$(blockdev --getss "$dev") || internal_error "blockdev --getss $dev failed"
+  bytes=$(blockdev --getsize64 "$dev") || internal_error "blockdev --getsize64 $dev failed"
+  if ! [[ $ss =~ ^[1-9][0-9]*$ && $bytes =~ ^[0-9]+$ ]] || ((bytes < ss)); then
+    internal_error "odd size of $dev ($bytes bytes, $ss-byte blocks)"
+  fi
+  sig=$(dd if="$dev" bs="$ss" skip=$((bytes / ss - 1)) count=1 status=none | head -c 8 | tr -d '\000')
+  [[ $sig == "EFI PART" ]] && refuse "$SD_LINK carries a backup GPT header in its last block"
+
+  tran=$(lsblk -ndro TRAN "$dev")
+  if [[ $tran == iscsi || $tran == fc ]] || multipath -c "$dev" >/dev/null 2>&1; then
+    if ((allow_shared)); then
+      echo "ubicloud-host storage-disk: warning: $SD_LINK is shared storage (${tran:-multipath}); allowed by --allow-shared-transport" >&2
+    else
+      refuse "$SD_LINK is shared storage (${tran:-multipath}) another machine may write to; pass --allow-shared-transport if only this host uses it"
+    fi
+  fi
+}
+
+sd_still_blank() {
+  local out rc=0
+  out=$(wipefs -n -i "$1") || internal_error "wipefs -n $1 failed"
+  [[ -n ${out//[[:space:]]/} ]] && refuse "$SD_LINK gained a signature while being checked: $(head -1 <<<"$out")"
+  blkid -p -o export "$1" >/dev/null || rc=$?
+  ((rc == 2)) || refuse "$SD_LINK gained a signature while being checked (blkid exit $rc)"
+}
+
+# The next diskN no fstab line, mount or file uses. Caller holds the
+# fstab lock.
+sd_next_mount() {
+  local n=1 target
+  while :; do
+    target=$STORAGE_DEVICES/disk$n
+    if ! awk -v t="$target" '$1 !~ /^#/ && $2 == t { f = 1 } END { exit !f }' "$R/etc/fstab" &&
+      [[ -z $(findmnt -nro TARGET --mountpoint "$target") ]] &&
+      { [[ ! -e $R$target ]] || [[ -d $R$target && -z $(ls -A "$R$target") ]]; }; then
+      echo "$n"
+      return
+    fi
+    n=$((n + 1))
+  done
+}
+
+storage_disk() {
+  local by_id=$1 allow_shared=$2 dev info probe rc n target label uuid tmp
+  sd_resolve "$by_id"
+  dev=/dev/$SD_NAME
+  [[ -e $R/sys/block/$SD_NAME ]] || refuse "$SD_LINK points at $SD_NAME, which is not a whole disk"
+  info=$(lsblk -ndPo TYPE,SIZE,MODEL,SERIAL "$dev") || internal_error "lsblk $dev failed"
+  [[ $(kv TYPE "$info") == disk ]] || refuse "$SD_LINK is a $(kv TYPE "$info"), not a disk"
+  say_sd "$SD_LINK is /dev/$SD_NAME: $(kv SIZE "$info"), model '$(kv MODEL "$info")', serial '$(kv SERIAL "$info")'"
+
+  rc=0
+  probe=$(blkid -p -o export "$dev") || rc=$?
+  ((rc == 0)) && sd_already_ours "$probe" && return 0
+
+  sd_refusals "$allow_shared"
+
+  [[ -f $R/etc/fstab ]] || internal_error "/etc/fstab is missing"
+  exec 9<"$R/etc/fstab"
+  flock -w 60 9 || internal_error "cannot lock /etc/fstab"
+  # mke2fs looks for an existing filesystem only when it runs on a tty,
+  # so below it would overwrite one, -F or not. Probe again under the
+  # lock, just before.
+  sd_still_blank "$dev"
+  n=$(sd_next_mount)
+  target=$STORAGE_DEVICES/disk$n
+  label=ubi-disk$n
+
+  # An empty, immutable mount point: while the disk is missing, writes
+  # fail rather than fill the root filesystem.
+  mkdir -p "$R$target" || internal_error "mkdir $target failed"
+  chattr +i "$R$target" || internal_error "chattr +i $target failed"
+
+  trap '' HUP INT
+  mkfs.ext4 -q -L "$label" "$dev" || internal_error "mkfs.ext4 $dev failed"
+  udevadm settle >/dev/null 2>&1 || true
+  uuid=$(blkid -p -s UUID -o value "$dev") || internal_error "blkid cannot read the new filesystem on $dev"
+  [[ $uuid =~ ^[0-9a-fA-F-]+$ ]] || internal_error "odd UUID '$uuid' on $dev"
+  tmp=$R/etc/.fstab.ubicloud-host.$$
+  {
+    cat "$R/etc/fstab"
+    [[ -n $(tail -c 1 "$R/etc/fstab") ]] && echo
+    echo "# ubicloud-host storage-disk $SD_LINK"
+    echo "UUID=$uuid $target ext4 defaults,nofail 0 2"
+  } >"$tmp" || internal_error "cannot write $tmp"
+  chmod --reference="$R/etc/fstab" "$tmp" || internal_error "cannot set the mode of $tmp"
+  mv -f "$tmp" "$R/etc/fstab" || internal_error "cannot replace /etc/fstab"
+  trap - HUP INT
+  exec 9<&-
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  mount "$target" || internal_error "mount $target failed; the fstab line is in place, so a re-run mounts it"
+  grep -qxF "$target" <<<"$(lsblk -nro MOUNTPOINTS "$dev")" || internal_error "$dev is not mounted at $target after mount"
+  say_sd "formatted $SD_LINK as ext4 ($label) and mounted it at $target"
+  say_sd "ok $target UUID=$uuid"
+}
+
+# test_root DIR: enters test mode when DIR or UBICLOUD_HOST_TEST_ROOT is
+# set, which needs both, alike.
+test_root() {
+  local fixture=$1
+  if [[ -n $fixture || -n ${UBICLOUD_HOST_TEST_ROOT:-} ]]; then
+    [[ $fixture == "${UBICLOUD_HOST_TEST_ROOT:-}" ]] ||
+      usage_error "test mode needs --fixture-root and UBICLOUD_HOST_TEST_ROOT set to the same directory"
+    [[ -d $fixture ]] || internal_error "fixture root $fixture is not a directory"
+    R=${fixture%/}
+  fi
+}
+
+storage_disk_main() {
+  local by_id="" allow_shared=0 fixture="" c
+  while (($#)); do
+    case $1 in
+      --allow-shared-transport) allow_shared=1 ;;
+      --by-id | --fixture-root)
+        (($# >= 2)) || usage_error "$1 needs a value"
+        if [[ $1 == --by-id ]]; then by_id=$2; else fixture=$2; fi
+        shift
+        ;;
+      *) usage_error "unknown argument $1" ;;
+    esac
+    shift
+  done
+  [[ -n $by_id ]] || usage_error "storage-disk needs --by-id"
+  test_root "$fixture"
+  if [[ -n $R ]]; then
+    for c in "${SD_COMMANDS[@]}"; do
+      [[ $(command -v "$c") == "$R/shim/$c" ]] || internal_error "test mode: $c is not the shim $R/shim/$c"
+    done
+  elif ((EUID != 0)); then
+    usage_error "storage-disk must run as root"
+  fi
+  storage_disk "$by_id" "$allow_shared"
+}
+
 main() {
   exec </dev/null
   local cmd=${1:-}
@@ -746,6 +1022,10 @@ main() {
     version)
       echo "ubicloud-host $VERSION"
       return 0
+      ;;
+    storage-disk)
+      storage_disk_main "$@"
+      return
       ;;
     preflight) ;;
     *) usage ;;
@@ -775,12 +1055,7 @@ main() {
   [[ $VM_DISK_GIB =~ ^[0-9]+$ ]] || usage_error "--vm-disk-gib must be a number"
   [[ $NONCE =~ ^[A-Za-z0-9]*$ ]] || usage_error "--nonce must be alphanumeric"
   [[ -z $MAIN_IP || $MAIN_IP =~ ^[0-9.]+$ ]] || usage_error "--main-ip must be an IPv4 address"
-  if [[ -n $fixture || -n ${UBICLOUD_HOST_TEST_ROOT:-} ]]; then
-    [[ $fixture == "${UBICLOUD_HOST_TEST_ROOT:-}" ]] ||
-      usage_error "test mode needs --fixture-root and UBICLOUD_HOST_TEST_ROOT set to the same directory"
-    [[ -d $fixture ]] || internal_error "fixture root $fixture is not a directory"
-    R=${fixture%/}
-  fi
+  test_root "$fixture"
   if [[ -z $NONCE ]]; then
     NONCE=$(tr -d - </proc/sys/kernel/random/uuid 2>/dev/null) || internal_error "no random source"
   fi

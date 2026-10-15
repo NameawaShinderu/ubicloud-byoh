@@ -402,3 +402,47 @@ minutes (rc 0, no `ubi-m3-*` container left). This run uses the
 `grep -q ... <<<"$(adm_last)"` form in `upgrade-manual`: the newest
 shellcheck (SC2337) flags `cmd | grep -q` under `pipefail`, because
 grep's early exit can fail the pipe with SIGPIPE.
+
+### Storage disk fixtures (WP6)
+
+```
+scripts/byoh/test/storage-disk-fixtures.sh
+```
+
+Runs `storage-disk-cases.sh` in one throwaway `ubi-m4-sd` container
+(ubuntu:24.04, `--rm`, no ports) against
+`scripts/byoh/host/ubicloud-host storage-disk`. Each case builds a
+fixture root inside the container with a root disk `sda` (`sda1` holds
+`/`) and blank disks `sdb` and `sdc`. Every block device command
+(`lsblk`, `findmnt`, `blkid`, `wipefs`, `swapon`, `blockdev`, `dd`,
+`mkfs.ext4`, `chattr`, `mount`, `multipath`, `udevadm`, `systemctl`) is
+`storage-disk-shim`, linked into `<root>/shim` and acting on fake disks
+under `<root>/fake`. In test mode the script refuses to run unless every
+one of them resolves to that shim directory, so no real device is
+touched.
+
+The cases cover these refusals:
+- the disk of `/` or `/boot/efi`
+- a partition or device-mapper link
+- a by-id prefix that matches two links
+- a missing link, or a link to something other than a disk
+- partitions, a mount, holders or swap
+- a `wipefs` signature, a `blkid` partition table, or a backup GPT in the last 4096-byte block
+- iSCSI (and then allowed with `--allow-shared-transport`), and multipath
+- a `blkid` error (fails closed with exit 3)
+- an `ubi-diskN` label without its fstab line
+- a signature that appears between the checks and mkfs
+
+They also cover:
+- a blank disk: the fstab line and `disk1`, `chattr +i` before mkfs, and no temporary file left behind
+- a re-run that changes nothing
+- a re-run that mounts a disk left unmounted
+- `disk2` for the second disk, and skipping used `diskN` names
+- the guards: no shims, non-root, and usage errors
+
+One check runs the real `mkfs.ext4` on an image file. It confirms that
+mke2fs 1.47 without a tty overwrites an existing filesystem whether or not
+`-F` is given. That is why the script's own probes, repeated under the
+fstab lock, are the only guard. Result (2026-10-15): 29 checks pass in
+about 10 s, with nothing left behind. A run against a real disk or loop
+device is UNVERIFIED.
