@@ -140,12 +140,20 @@ RSpec.describe "terraform/aws-byoh outputs" do
     end
 
     it "stops with a usage error, before any SSH, when EXPECT is left as printed" do
+      # The whole value, word-split as the unquoted $EXPECT is: OptionParser
+      # takes "--expect-host-key flags" and the other words are left over.
       placeholder = lines.find { it.start_with?("EXPECT=") }.delete_prefix("EXPECT=").shellsplit.first
+      expect(placeholder).to eq "<the --expect-host-key flags printed by step 1>"
+      argv = host_add_argv(placeholder)
+      expect(argv).to include("<the", "--expect-host-key", "flags", "1>")
       err = StringIO.new
       runner = ->(*) { raise "no SSH may run" }
-      status = ByohHostAdd.new(out: StringIO.new, err:, runner:, services: -> {}).run("add", host_add_argv(placeholder))
+      status = ByohHostAdd.new(out: StringIO.new, err:, runner:, services: -> {}).run("add", argv)
       expect(status).to eq 2
-      expect(err.string).to eq "! invalid argument: unexpected argument <the\n"
+      # Either the leftover words or the bad fingerprint, whichever parse
+      # checks first; both stop before any SSH.
+      expect(err.string).to match(/\A! invalid argument: .*(<the|flags)/)
+      expect(err.string.lines.size).to eq 1
     end
 
     it "parses the --expect-host-key flags out of the console output" do
