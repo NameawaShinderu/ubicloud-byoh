@@ -799,22 +799,25 @@ ensure_users() {
   # ubicloud-migrate and the services rewrite each other's ca_bundles.
   # $STATE itself is root's, so a service cannot swap var/ or
   # billing_rates.d/ for a symlink that root would then follow.
-  [[ -d $STATE/var && -d $STATE/billing_rates.d ]] || changed=1
+  [[ -d $STATE/var && -d $STATE/billing_rates.d && -d $STATE/byoh-keys ]] || changed=1
   [[ $(stat -c %U "$STATE" 2>/dev/null) == ubicloud ]] && changed=1
   secure_state
   install -d -m 2770 -o ubicloud -g ubicloud "$STATE/var"
   install -d -m 0750 -o ubicloud -g ubicloud "$STATE/billing_rates.d"
+  # byoh-host add keeps a host's registration key here between its
+  # prepare and register phases (M4).
+  install -d -m 0700 -o ubicloud -g ubicloud "$STATE/byoh-keys"
   if ((changed)); then report changed "users: ubicloud, ubicloud-migrate, $STATE"; else report ok "users: ubicloud, ubicloud-migrate"; fi
 }
 
 # secure_state: makes $STATE root:ubicloud 0750 (layouts before this
-# had it owned by ubicloud) and refuses a var/ or billing_rates.d/ that
-# is not a real directory, which root must never follow.
+# had it owned by ubicloud) and refuses a var/, billing_rates.d/ or
+# byoh-keys/ that is not a real directory, which root must never follow.
 secure_state() {
   [[ ! -L $STATE ]] || die "$STATE is a symlink; it must be a directory"
   install -d -m 0750 -o root -g ubicloud "$STATE"
   local d
-  for d in "$STATE/var" "$STATE/billing_rates.d"; do
+  for d in "$STATE/var" "$STATE/billing_rates.d" "$STATE/byoh-keys"; do
     [[ ! -L $d && (! -e $d || -d $d) ]] ||
       die "$d is a symlink or not a directory; a process of user ubicloud may have replaced it. Inspect it, move it away and rerun"
   done

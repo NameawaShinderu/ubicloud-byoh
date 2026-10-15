@@ -177,12 +177,50 @@ the database. The variable is part of the secrets backup. A control plane
 moved with `migrate-from-dev.sh` already has the variables `preflight`
 found ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)).
 
+### 4.2a Sites, hosts and pools (M4)
+
+`ubicloud-admin site`, `host` and `pool` are the primary commands for
+BYOH sites. They run `bin/byoh-location`, `bin/byoh-host` and
+`bin/byoh-pool` the way `run` does: files are copied for user `ubicloud`,
+`--bmc-password` is refused, and `--help` goes to the tool.
+
+```bash
+sudo ubicloud-admin site add aws-aps1 --display "AWS Mumbai (BYOH)" \
+  --underlay 10.98.0.0/16 --cp-reach onhost --rates-from hetzner-fsn1 [--grant pj...]
+sudo ubicloud-admin site show aws-aps1          # NAME alone stands for --location NAME
+sudo ubicloud-admin host add --site aws-aps1 --ssh ubuntu@10.98.1.30 \
+  --ssh-key ~/aws.pem --pool-file pools.yaml
+sudo ubicloud-admin host watch vh...
+sudo ubicloud-admin pool verify --host vh...
+```
+
+- `site add NAME` is `byoh-location create --name NAME`.
+  - `--display` sets the name customers see (`--ui-name`). `--display-name` is still the API path name.
+  - Until M8, `--mgmt` takes only `direct`, and `--cp-reach mgmt` is refused.
+  - `--postgres` takes only `no` (ROADMAP §8.2).
+  - These refusals exit 2.
+- `host add` runs `byoh-host add` twice:
+  1. `--phase prepare`, with the staged copies of `--ssh-key` and `--registration-key`. `ubicloud-admin` deletes those copies when this phase ends.
+  2. `--phase register`, without them.
+
+  So the operator's key is gone before the bring-up watch starts, which can take hours. User `ubicloud`, which puma and respirate run as, can read it only during the prepare phase.
+
+  Between the two phases, the registration key waits in `/var/lib/ubicloud/byoh-keys` (owner `ubicloud`, mode 0700). Registration deletes it once the key is stored in the database. If you pass `--phase` yourself, the tool runs once, with that phase.
+- `UBICLOUD_ADMIN_DRYRUN=1` prints the command lines and runs nothing.
+- A development control plane (`scripts/byoh/bootstrap-ctrl-plane.sh`) has neither `/etc/ubicloud` nor `/opt/ubicloud`. On one, run the checkout's own `packaging/bin/ubicloud-admin --dev site|host|pool ...`, or set `UBICLOUD_ADMIN_DEV=1`.
+  - It runs `bundle exec bin/byoh-...` in the checkout as you, or as `SUDO_USER` under sudo, with `~/.local/bin` and the mise Ruby on `PATH`.
+  - It restarts nothing; restart puma and respirate yourself after a rates change.
+  - `--dev` is refused where a packaged layout exists.
+
 ### 4.3 Billing rates
 
 `BILLING_RATES_EXTRA_DIR` is `/var/lib/ubicloud/billing_rates.d`, owned by
 `ubicloud` (never a path under `/home`: the services cannot see it). The
-services read the rates once at start, so after `ubicloud-admin run
-byoh-location create --rates-from ...` or `... rates ...`:
+services read the rates once at start. `ubicloud-admin site add ...
+--rates-from ...` and `site rates ...` restart `ubicloud.target` (when it
+runs) and wait for web whenever they changed a rate file; `site set`
+restarts nothing. After `ubicloud-admin run byoh-location create
+--rates-from ...` or `... rates ...`, restart by hand:
 
 ```bash
 sudo systemctl restart ubicloud.target

@@ -112,6 +112,43 @@ the fakehost): UNVERIFIED.
 Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): all 7 cases pass
 in about 10 s after the image build, nothing left behind.
 
+### ubicloud-admin site, host and pool (WP10)
+
+```
+scripts/byoh/test/m4-admin.sh
+```
+
+Boots `ubi-m4-admin` from `ubi-m3-release` (`UBI_M4_RELEASE_IMAGE`; build
+it with `run.sh --prepare-image --prepare-tools --prepare-release`). It
+extracts the working tree over that release, which works because M4 adds
+no migration and no gem, and installs the working tree's `ubicloud-admin`
+and units. It checks:
+
+- `site add --rates-from` writes `billing_rates.d/<name>.yml` and
+  restarts `ubicloud.target` (web gets a new PID). A `site rates` that
+  changes no file, and `site set`, restart nothing.
+- `site show NAME` and `site --help` work.
+- These exit 2: `--postgres yes`, `--mgmt wireguard`, an unknown verb and
+  `--bmc-password`.
+- The `UBICLOUD_ADMIN_DRYRUN=1` mappings of `site add` and of the
+  two-phase `host add`.
+- `--dev` and `UBICLOUD_ADMIN_DEV=1` are refused on the packaged layout.
+- With the real `byoh-host` and an unknown site, the failed prepare phase
+  stops the run before register.
+- With a Ruby probe in place of `bin/byoh-host`:
+  - the register phase gets neither key option;
+  - the staged key copies are gone (a listing of the staging directory
+    holds only the two pool file copies);
+  - `byoh-keys/` was made `ubicloud` 0700, although the release's
+    `install.sh` predates it.
+
+The script does not cover the dev layout. Its runs were checked by hand
+in a throwaway `ubi-m4-devadm` ubuntu:24.04 container with a stub
+`bundle`: running as `SUDO_USER` through `runuser`, relative files made
+absolute, and the exit-2 refusal for root without `SUDO_USER`.
+
+Result (2026-10-15): passes in about 50 s, and nothing is left behind.
+
 ### Host preflight fixtures (WP5)
 
 ```
