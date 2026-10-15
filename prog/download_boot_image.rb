@@ -18,7 +18,12 @@ class Prog::DownloadBootImage < Prog::Base
   end
 
   def download_from_blob_storage?
-    image_name.start_with?("github", "postgres", "ai-", "kubernetes", "gpu") || production_sources?
+    self.class.blob_storage_only?(image_name) || production_sources?
+  end
+
+  # Images that only Ubicloud's blob storage serves, in every environment.
+  def self.blob_storage_only?(image_name)
+    image_name.start_with?("github", "postgres", "ai-", "kubernetes", "gpu")
   end
 
   def latest_boot_image_version(image_name)

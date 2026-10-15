@@ -255,7 +255,53 @@ RSpec.describe ByohPoolDeclaration do
     end
   end
 
+  describe ".host_address_errors" do
+    def errors(inputs, **) = described_class.host_address_errors(inputs.map { parse(it) }, main_ip: "198.51.100.10", **)
+
+    it "finds nothing without host facts" do
+      expect(errors(["10.0.0.4/30", "8.8.8.0/30"])).to eq []
+    end
+
+    it "refuses a pool that hands VMs the uplink IP or the gateway" do
+      expect(errors(["10.0.0.4/30"], uplink_ip: "10.0.0.5", gateway: "10.0.0.6")).to eq [
+        "10.0.0.4/30 hands the uplink IP 10.0.0.5 to VMs; declare pools without it, or reserve it",
+        "10.0.0.4/30 hands the default gateway 10.0.0.6 to VMs; declare pools without it, or reserve it",
+      ]
+    end
+
+    it "honours reserved addresses and an onlink pool's gateway" do
+      expect(errors(["10.0.0.4/30,reserve=10.0.0.5"], uplink_ip: "10.0.0.5", local_ips: ["10.0.0.5"])).to eq []
+      onlink = "192.168.1.0/28,delivery=onlink,segment=192.168.1.0/24,gateway=192.168.1.1"
+      expect(errors([onlink], gateway: "192.168.1.1")).to eq []
+      expect(errors(["#{onlink},usable=all"], gateway: "192.168.1.1")).to eq [
+        "192.168.1.0/28 hands the default gateway 192.168.1.1 to VMs; declare pools without it, or reserve it",
+      ]
+    end
+
+    it "checks a nat pool's own addresses, not its external ones" do
+      nat = "10.0.0.5/32,delivery=fabric,exposure=nat,external=10.0.0.5:203.0.113.5"
+      expect(errors([nat], uplink_ip: "10.0.0.5")).to eq ["10.0.0.5/32 hands the uplink IP 10.0.0.5 to VMs; declare pools without it, or reserve it"]
+      expect(errors([nat], uplink_ip: "203.0.113.5")).to eq []
+    end
+
+    it "refuses pool addresses configured on the host (contract C5), once each" do
+      expect(errors(["10.0.0.4/30"], uplink_ip: "10.0.0.5", local_ips: ["10.0.0.5", "10.0.0.6", "10.0.0.7", "127.0.0.1"])).to eq [
+        "10.0.0.4/30 hands the uplink IP 10.0.0.5 to VMs; declare pools without it, or reserve it",
+        "10.0.0.4/30: 10.0.0.6, 10.0.0.7 is configured on the host; remove it from the interface, since the host must not answer for a VM address (contract C5)",
+      ]
+    end
+
+    it "skips IPv6 pools and the main IP's own /32" do
+      expect(errors(["2001:db8::/64", "198.51.100.10/32"], uplink_ip: "198.51.100.10", local_ips: ["198.51.100.10"])).to eq []
+    end
+  end
+
   describe ".validate_set!" do
+    it "adds the host address errors when given host facts" do
+      expect(validate_error(["10.0.0.4/30"], uplink_ip: "10.0.0.5", gateway: "10.0.0.1", local_ips: ["10.0.0.5"]))
+        .to eq "10.0.0.4/30 hands the uplink IP 10.0.0.5 to VMs; declare pools without it, or reserve it"
+    end
+
     it "accepts a valid set and returns notes" do
       notes = validate(["8.8.8.0/30", "10.1.0.0/29", "8.8.4.0/30,delivery=fabric,exposure=public", "198.51.100.10/32", "2001:db8::/64,ndp"])
       expect(notes).to eq [

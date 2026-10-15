@@ -107,6 +107,20 @@ class ByohConfigCheck
     DB.fetch(ROLE_FACTS_SQL, *HASH_TABLES, *HASH_FUNCTIONS).first
   end
 
+  # Where hosts fetch boot images from, as [level, message]. Shared with
+  # ByohHostPreflight (PF20).
+  def self.boot_image_source(production:)
+    return ["ok", "boot images: BOOT_IMAGE_SOURCE=#{Config.boot_image_source}, not production"] unless production
+    return ["ok", "boot images: public upstream mirrors"] if Config.boot_image_source == "public"
+
+    r2 = [Config.ubicloud_images_r2_bucket_name, Config.ubicloud_images_r2_endpoint, Config.ubicloud_images_r2_access_key, Config.ubicloud_images_r2_secret_key]
+    if r2.all?
+      ["ok", "boot images: Ubicloud R2 storage"]
+    else
+      ["fail", "BOOT_IMAGE_SOURCE=auto fetches every boot image from Ubicloud's R2 storage in production, but UBICLOUD_IMAGES_R2_* are not all set; set BOOT_IMAGE_SOURCE=public"]
+    end
+  end
+
   private
 
   def ok(message) = Result.new("ok", message)
@@ -192,15 +206,8 @@ class ByohConfigCheck
   end
 
   def boot_images
-    return ok("boot images: BOOT_IMAGE_SOURCE=#{Config.boot_image_source}, not production") unless @production
-    return ok("boot images: public upstream mirrors") if Config.boot_image_source == "public"
-
-    r2 = [Config.ubicloud_images_r2_bucket_name, Config.ubicloud_images_r2_endpoint, Config.ubicloud_images_r2_access_key, Config.ubicloud_images_r2_secret_key]
-    if r2.all?
-      ok("boot images: Ubicloud R2 storage")
-    else
-      failure("BOOT_IMAGE_SOURCE=auto fetches every boot image from Ubicloud's R2 storage in production, but UBICLOUD_IMAGES_R2_* are not all set; set BOOT_IMAGE_SOURCE=public")
-    end
+    level, message = self.class.boot_image_source(production: @production)
+    Result.new(level, message)
   end
 
   def billing_rates_dir
