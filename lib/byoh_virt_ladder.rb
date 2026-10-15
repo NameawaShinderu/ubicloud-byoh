@@ -59,7 +59,7 @@ module ByohVirtLadder
 
   # What a fallback tier needs installed, for the operator's message.
   FALLBACK_PACKAGES = {
-    "container" => "apt-get install lxc lxcfs uidmap",
+    "container" => "apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs",
     "pvm" => "modprobe kvm_pvm",
     "emulated" => "apt-get install qemu-system-x86 ovmf",
   }.freeze

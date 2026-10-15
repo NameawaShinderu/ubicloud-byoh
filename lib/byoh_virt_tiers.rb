@@ -34,7 +34,8 @@ module ByohVirtTiers
   #   storage          "vhost" (ubiblk volumes, as on KVM hosts) or "none"
   #                    (the tier keeps its own disks; no vhost backend)
   #   options          what the operator can acknowledge beyond the tier
-  #   boot_images      the boot images its VMs may use
+  #   boot_images      the boot images its VMs may use, and its hosts
+  #                    download unless registration names others of them
   #   host_reserve_mib memory kept for the host itself
   #   vm_overhead_mib  memory each VM needs beyond its own RAM
   #   min_vcpus        vCPUs of the smallest size, to bound the VM count
@@ -82,7 +83,7 @@ module ByohVirtTiers
   # The lower tiers whose rhizome support exists, so that a location can
   # offer them and hosts can be registered on them. A tier joins this
   # list in the commit that ships it (docs/byoh/NO_KVM.md section 11).
-  SHIPPED = [].freeze
+  SHIPPED = %w[container].freeze
 
   # The tiers whose "multitenant" acknowledgement takes effect: those
   # whose hosts are checked for what sharing needs (docs/byoh/NO_KVM.md
@@ -194,8 +195,10 @@ module ByohVirtTiers
     if remote_storage_server_id || storage_volumes.any? { it[:machine_image_version_id] || it[:remote_storage_server_id] }
       refuse "#{tier} VMs cannot use machine images or remote storage"
     end
-    if spec.storage == "none" && storage_volumes.any? { it[:track_written] }
-      refuse "#{tier} VMs cannot track written blocks"
+    if spec.storage == "none"
+      refuse "#{tier} VMs cannot track written blocks" if storage_volumes.any? { it[:track_written] }
+      # The guest's root file system is its only disk (ContainerDisk).
+      refuse "#{tier} VMs have exactly one disk" unless storage_volumes.size == 1 && !storage_volumes.first[:read_only]
     end
     nil
   end
@@ -204,6 +207,18 @@ module ByohVirtTiers
   # shared (shared?). Takes a lock on the
   # location row, so two creates for different projects cannot both pass;
   # call it inside the create transaction.
+  # Whether a container VM's disk is encrypted (crypt-loop) or a plain
+  # directory under a project quota (dir): the location decides, by
+  # acknowledging "container:unencrypted-disk" (docs/byoh/NO_KVM.md
+  # section 4.2).
+  def self.container_disk_encrypted?(location) = !acked?(location, "container", "unencrypted-disk")
+
+  # The container options rhizome applies (ContainerSetup) that the
+  # location acknowledged.
+  def self.container_options(location)
+    {"nested_userns" => acked?(location, "container", "nested-userns"), "guest_firewall" => acked?(location, "container", "guest-firewall")}
+  end
+
   def self.check_tenancy!(tier, location, project_id)
     Location.dataset.for_update.where(id: location.id).get(:id)
     return if shared?(policy(location), tier)

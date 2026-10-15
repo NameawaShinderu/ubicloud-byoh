@@ -122,6 +122,12 @@ class Vm < Sequel::Model
         append_serial_console: location_id == Location::GITHUB_RUNNERS_ID,
       }
       params[:byoh_host] = true if byoh_host?
+      # A system container (docs/byoh/NO_KVM.md section 4.2): rhizome runs
+      # it with LXC and the options its location acknowledged.
+      if vm_host.virt_tier == "container"
+        params[:hypervisor] = "lxc"
+        params[:container] = ByohVirtTiers.container_options(vm_host.location)
+      end
       params[:egress_nat4] = vm_host.location.byoh_profile.egress_nat4_params if byoh_egress_nat4?
       JSON.pretty_generate(params)
     end
@@ -247,6 +253,11 @@ class Vm < Sequel::Model
     end
 
     def metal_fetch_serial_log
+      # A system container's console log is root's (ContainerSetup).
+      if vm_host.virt_tier == "container"
+        return vm_host.sshable.cmd("sudo tail -c :max_bytes /var/lib/ubicloud/lxc/:vm_name/console.log", max_bytes: RunCommand::MAX_OUTPUT_BYTES, vm_name: inhost_name)
+      end
+
       vm_host.sshable.cmd("sudo tail -c :max_bytes /vm/:vm_name/serial.log", max_bytes: RunCommand::MAX_OUTPUT_BYTES, vm_name: inhost_name)
     end
 

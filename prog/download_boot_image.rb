@@ -17,7 +17,13 @@ class Prog::DownloadBootImage < Prog::Base
     @image ||= BootImage[vm_host_id: vm_host.id, name: image_name, version:]
   end
 
+  # Root file system tarballs of system containers (ByohVirtTiers) come
+  # from cloud-images.ubuntu.com: Ubicloud's blob storage has none.
+  CONTAINER_IMAGES = %w[ubuntu-noble-container].freeze
+
   def download_from_blob_storage?
+    return false if CONTAINER_IMAGES.include?(image_name)
+
     image_name.start_with?("github", "postgres", "ai-", "kubernetes", "gpu") || production_sources?
   end
 
@@ -83,6 +89,9 @@ class Prog::DownloadBootImage < Prog::Base
 
   def self.upstream_url(image_name, version, arch)
     case image_name
+    when "ubuntu-noble-container"
+      arch = render_arch(arch, arm64: "arm64", x64: "amd64")
+      "https://cloud-images.ubuntu.com/releases/noble/release-#{version}/ubuntu-24.04-server-cloudimg-#{arch}-root.tar.xz"
     when "ubuntu-resolute", "ubuntu-noble", "ubuntu-jammy"
       arch = render_arch(arch, arm64: "arm64", x64: "amd64")
       nickname = image_name.split("-").last
@@ -119,6 +128,12 @@ class Prog::DownloadBootImage < Prog::Base
         "20240523.1" => "54f6b62cc8d393e5c82495a49b8980157dfa6a13b930d8d4170e34e30742d949",
         "20240702" => "5fe06e10a3b53cfff06edcb8595552b1f0372265b69fa424aa464eb4bcba3b09",
         "20250502.1" => "5452ba9308557ef728078e829c2f221dfd4c05635fe67037d4f714efd12dbdbc",
+      },
+    },
+    # From release-20260926/SHA256SUMS on cloud-images.ubuntu.com.
+    "ubuntu-noble-container" => {
+      "x64" => {
+        "20260926" => "820311e238ea34d76a8ca2643d6c01065212e9417109e7397d70472a236df261",
       },
     },
     "ubuntu-jammy" => {

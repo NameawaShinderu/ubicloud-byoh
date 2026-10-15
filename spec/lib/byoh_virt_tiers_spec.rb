@@ -48,9 +48,10 @@ RSpec.describe ByohVirtTiers do
     expect(described_class.family_for("pvm")).to eq "pvm"
   end
 
-  it "ships no lower tier yet" do
+  it "ships the container tier, and pvm and emulated not yet" do
     expect(described_class.shipped?("kvm")).to be true
-    described_class::TIERS.each_key { expect(described_class.shipped?(it)).to be false }
+    expect(described_class.shipped?("container")).to be true
+    %w[pvm emulated].each { expect(described_class.shipped?(it)).to be false }
   end
 
   describe ".policy" do
@@ -72,6 +73,7 @@ RSpec.describe ByohVirtTiers do
 
     it "offers only shipped tiers of BYOH locations to customers" do
       offer(location, {"tiers" => %w[kvm container emulated], "acks" => {"container" => [], "emulated" => []}})
+      ship_virt_tiers
       expect(described_class.offered_families(location)).to eq []
       ship_virt_tiers("emulated")
       expect(described_class.offered_families(location)).to eq %w[emulated]

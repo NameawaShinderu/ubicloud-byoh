@@ -1,0 +1,70 @@
+{
+  "vm_name": "golden-vm",
+  "public_ipv6": "2a01:4f8:10a:128b:3bfa::/79",
+  "public_ipv4": "",
+  "local_ipv4": "169.254.0.5/32",
+  "dns_ipv4": "10.0.0.2",
+  "unix_user": "ubi",
+  "ssh_public_keys": [
+    "ssh-ed25519 AAAAgolden"
+  ],
+  "nics": [
+    [
+      "fd10:9b0b:6b4b:8fbb:abc::/79",
+      "10.0.0.5/32",
+      "kjfwxnmqha",
+      "52:54:00:12:34:56",
+      "10.0.0.1/26"
+    ]
+  ],
+  "boot_image": "ubuntu-noble-container",
+  "max_vcpus": 2,
+  "cpu_topology": "1:2:1:1",
+  "mem_gib": 8,
+  "ndp_needed": false,
+  "storage_volumes": [
+    {
+      "boot": true,
+      "image": "ubuntu-noble-container",
+      "image_version": "20260926",
+      "size_gib": 40,
+      "device_id": "vm4hjdwr_0",
+      "disk_index": 0,
+      "encrypted": true,
+      "spdk_version": null,
+      "vhost_block_backend_version": null,
+      "use_bdev_ubi": false,
+      "storage_device": "DEFAULT",
+      "read_only": false,
+      "max_read_mbytes_per_sec": null,
+      "max_write_mbytes_per_sec": null,
+      "slice_name": "system.slice",
+      "num_queues": 1,
+      "queue_size": 256,
+      "copy_on_read": false,
+      "track_written": false
+    }
+  ],
+  "swap_size_bytes": null,
+  "pci_devices": [],
+  "gpu_partition_id": null,
+  "slice_name": "system.slice",
+  "cpu_percent_limit": 200,
+  "cpu_burst_percent_limit": 0,
+  "hypervisor": "lxc",
+  "ch_version": null,
+  "firmware_version": null,
+  "hugepages": false,
+  "init_script": "",
+  "ipv6_disabled": false,
+  "append_serial_console": false,
+  "byoh_host": true,
+  "container": {
+    "nested_userns": false,
+    "guest_firewall": true
+  },
+  "egress_nat4": {
+    "deny4": [],
+    "smtp": false
+  }
+}

@@ -177,19 +177,21 @@ RSpec.describe ByohVirtLadder do
 
   describe "the plan in the text" do
     it "prints the cost of the fix, the fallbacks and the recommendation" do
+      ship_virt_tiers
       v = verdict(**no_virt, dmi: {"sys_vendor" => "Amazon EC2", "product_name" => "m7i.large"}, commands: {"qemu-system-x86_64" => true}, ovmf: true)
       expect(v.text).to include("\ncost: #{ByohVirtPlatforms::AWS_COST}\n")
         .and include("\nfallbacks ready: emulated\nfallbacks possible after installing their packages: container\n")
-        .and end_with("recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap; fallbacks cannot be registered yet (docs/byoh/NO_KVM.md section 11)")
+        .and end_with("recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs; fallbacks cannot be registered yet (docs/byoh/NO_KVM.md section 11)")
     end
 
     it "says how to register a shipped fallback" do
       ship_virt_tiers("container")
-      expect(verdict(**no_virt).text).to end_with "recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap; " \
+      expect(verdict(**no_virt).text).to end_with "recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs; " \
         "register it with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers it (bin/byoh-location set --virt-tiers)"
     end
 
     it "says when no fallback is installed, and when the recommended one is" do
+      ship_virt_tiers
       v = verdict(**no_virt, commands: {"lxc-start" => true, "lxcfs" => true})
       expect(v.text).to include("fallbacks ready: container\nfallbacks possible after installing their packages: emulated\n")
         .and include("recommended: #{described_class::FALLBACK_LABELS["container"]}; fallbacks")
@@ -198,12 +200,13 @@ RSpec.describe ByohVirtLadder do
     end
 
     it "still recommends containers over the emulator when the kernel facts were not gathered" do
+      ship_virt_tiers
       v = described_class.from_facts(facts(**no_virt).except("cgroup2"))
       expect([v.possible, v.unchecked, v.recommended]).to eq [%w[emulated], %w[container], "container"]
       expect(v.text).to include("
 fallbacks not checked (the kernel facts were not gathered): container
 ")
-        .and include("recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap, if the host has cgroup v2 and Linux 5.12 or newer (not checked); fallbacks")
+        .and include("recommended: #{described_class::FALLBACK_LABELS["container"]} after apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs, if the host has cgroup v2 and Linux 5.12 or newer (not checked); fallbacks")
       expect(v.record).to include("unchecked" => %w[container])
     end
 

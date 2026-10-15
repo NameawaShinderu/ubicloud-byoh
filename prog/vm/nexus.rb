@@ -71,6 +71,8 @@ class Prog::Vm::Nexus < Prog::Base
         hypervisor:, ch_version:, remote_storage_server_id:)
       # No lower tier uses 1G hugepages (ByohVirtTiers).
       hugepages = false
+      # The location decides whether a container's disk is encrypted.
+      storage_volumes.first[:encrypted] = ByohVirtTiers.container_disk_encrypted?(location) if tier == "container"
     end
 
     metal_vm = location.provider_dispatcher_group_name == "metal"

@@ -13,8 +13,11 @@ class BootImage < Sequel::Model
     Strand.create(prog: "RemoveBootImage", label: "start", stack: [{subject_id: id}])
   end
 
+  # Root file system tarballs of system containers (such as
+  # ubuntu-noble-container) stay as downloaded (rhizome's BootImage).
   def path
-    "/var/storage/images/#{name}-#{version}.raw"
+    ext = name.end_with?("-container") ? "tar.xz" : "raw"
+    "/var/storage/images/#{name}-#{version}.#{ext}"
   end
 end
 

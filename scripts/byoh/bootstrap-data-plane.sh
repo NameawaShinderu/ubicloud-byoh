@@ -58,7 +58,7 @@ set -euo pipefail
 
 # The lower tiers this checkout can register; keep it equal to
 # ByohVirtTiers::SHIPPED (spec/lib/byoh_virt_tiers_spec.rb checks).
-SHIPPED_TIERS=""
+SHIPPED_TIERS="container"
 
 usage() {
   echo "usage: $0 [--tier kvm|auto|container|pvm|emulated]"
@@ -225,11 +225,14 @@ else
         echo "ERROR: containers need Linux 5.12 or newer (idmapped mounts); this is $kver." >&2
         exit 1
       fi
-      # UNVERIFIED: Ubuntu's lxc package normally enables lxc-net (an
-      # lxcbr0 bridge with its own dnsmasq and NAT), next to the BYOH
-      # nftables and per-VM dnsmasq. The WP that ships container must
-      # turn it off (USE_LXC_BRIDGE="false"); docs/byoh/NO_KVM.md 11.3.
-      tier_packages="lxc lxcfs uidmap"
+      # rhizome/host/lib/host_tier.rb CONTAINER_PACKAGES, which prep
+      # checks: LXC, lxcfs, newuidmap, xz for the root tarballs, setquota
+      # for unencrypted disks, cryptsetup and mkfs.ext4 for encrypted
+      # ones. Ubuntu's lxc package enables lxc-net (an lxcbr0 bridge with
+      # its own dnsmasq and NAT); prep_host.rb turns it off
+      # (HostTier.container_host_setup), so it never runs beside the BYOH
+      # nftables and per-VM dnsmasq.
+      tier_packages="lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs"
       ;;
     emulated)
       if [ "$(uname -m)" != x86_64 ]; then

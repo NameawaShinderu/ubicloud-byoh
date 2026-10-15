@@ -13,6 +13,8 @@ class Prog::LearnHypervisor < Prog::Base
     register_deadline("start", 30 * 60)
 
     pop "exiting as Vm destroyed" unless vm
+    # System containers run on the host kernel, under no hypervisor.
+    pop "#{vm} is a system container" if ByohVirtTiers.tier_for_family(vm.family) == "container"
     inhost_name = vm.inhost_name
     unit = vm.vm_host.sshable.cmd("sudo cat /etc/systemd/system/:inhost_name.service", inhost_name:)
 
