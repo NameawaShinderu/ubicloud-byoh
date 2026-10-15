@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "../lib/htcat_setup"
+
 # scripts/byoh/host/ubicloud-host runs before registration and must test
 # what bring-up will need: this keeps its constants in step with the code
 # they stand for.
@@ -19,5 +21,13 @@ RSpec.describe "ubicloud-host preflight constants" do
 
     prep_packages = script[/^PREP_PACKAGES=\(([^)]*)\)$/, 1].split
     expect(installed.uniq - prep_packages).to eq []
+  end
+
+  it "probes the release asset PrepHost downloads first" do
+    expect(script[/^HTCAT_VERSION=(.*)$/, 1]).to eq HtcatSetup::VERSION
+    setup = File.read(File.join(repo, "rhizome/host/lib/htcat_setup.rb"))
+    expect(setup).to include(%("htcat_\#{VERSION}_linux_\#{Arch.render(x64: "amd64", arm64: "arm64")}.tar.gz"))
+    expect(setup).to include(%("https://github.com/ubicloud/htcat/releases/download/v\#{VERSION}/\#{tarball}"))
+    expect(script).to include('"https://github.com/ubicloud/htcat/releases/download/v${HTCAT_VERSION}/htcat_${HTCAT_VERSION}_linux_${deb_arch}.tar.gz"')
   end
 end

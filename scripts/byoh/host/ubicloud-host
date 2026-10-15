@@ -43,7 +43,10 @@ VERSION=1
 # keeps the list complete): the apt simulation proves the archive serves
 # them.
 PREP_PACKAGES=(ruby-bundler qemu-utils mtools acl smartmontools nvme-cli systemd-coredump jq ethtool make gcc libaio-dev sysstat nftables dmidecode pciutils)
-DEFAULT_URLS=(https://github.com https://cloud-images.ubuntu.com)
+# PrepHost's first download (rhizome/host/lib/htcat_setup.rb). GitHub
+# redirects release downloads to release-assets.githubusercontent.com, so
+# following the redirect proves egress to both hosts.
+HTCAT_VERSION=2.0.0-ubi1
 # Units whose firewall rules or bridges collide with the nftables rules
 # rhizome installs (PLATFORMS.md PF16).
 CONFLICTING_UNITS=(docker ufw tailscaled k3s libvirtd)
@@ -513,7 +516,7 @@ pf14_clock() {
 }
 
 pf15_egress() {
-  local lists out rc url failed=()
+  local lists out rc url failed=() urls
   lists=$(find "$R/var/lib/apt/lists" -maxdepth 1 -name '*_Packages' 2>/dev/null | head -1)
   if [[ -z $lists ]]; then
     check PF15-apt warn "the apt package lists are empty, so the packages could not be checked" "PrepHost runs apt-get update; or run it now"
@@ -527,13 +530,17 @@ pf15_egress() {
     fi
   fi
 
-  for url in "${DEFAULT_URLS[@]}" "${URLS[@]}"; do
+  local deb_arch=amd64
+  [[ $ARCH == aarch64 ]] && deb_arch=arm64
+  urls=("https://github.com/ubicloud/htcat/releases/download/v${HTCAT_VERSION}/htcat_${HTCAT_VERSION}_linux_${deb_arch}.tar.gz"
+    https://cloud-images.ubuntu.com "${URLS[@]}")
+  for url in "${urls[@]}"; do
     run_cmd curl curl -sfIL --max-time 20 -o /dev/null "$url" >/dev/null || failed+=("$url")
   done
   if ((${#failed[@]})); then
-    check PF15-egress fail "cannot reach ${failed[*]}" "the host needs outbound HTTPS to GitHub releases and the boot image mirrors"
+    check PF15-egress fail "cannot reach ${failed[*]}" "the host needs outbound HTTPS to GitHub release downloads (github.com and release-assets.githubusercontent.com) and the boot image mirrors"
   else
-    check PF15-egress pass "reached $((${#DEFAULT_URLS[@]} + ${#URLS[@]})) URL(s)"
+    check PF15-egress pass "reached ${#urls[@]} URL(s)"
   fi
 }
 
