@@ -90,10 +90,14 @@ class ByohLocationCli
       argv = location_argument(argv) if LOCATION_COMMANDS.include?(command)
       send(:"cmd_#{command}", argv)
     when "add"
-      # site add NAME: create --name NAME.
-      name = argv.shift
-      raise UsageError, "add needs a location name: add NAME [options]" if name.nil? || name.start_with?("-")
-      cmd_create(["--name", name, *argv])
+      # site add NAME: create with NAME in place of --name.
+      if %w[-h --help].include?(argv.first)
+        cmd_create(argv, banner: "add NAME [options]")
+      else
+        name = argv.shift
+        raise UsageError, "add needs a location name: add NAME [options]" if name.nil? || name.start_with?("-")
+        cmd_create(argv, name:, banner: "add NAME [options]")
+      end
     when nil, "help", "-h", "--help"
       @out.puts USAGE
     else
@@ -112,11 +116,16 @@ class ByohLocationCli
     (argv.first && !argv.first.start_with?("-")) ? ["--location", *argv] : argv
   end
 
-  def cmd_create(argv)
-    opts = {grants: []}
+  # NAME, from add, stands for --name; add refuses --name (in any
+  # spelling OptionParser takes for it) beside it.
+  def cmd_create(argv, name: nil, banner: "create --name NAME [options]")
+    opts = {grants: [], name:}
     profile = {}
-    parse(argv, "create --name NAME [options]") do |o|
-      o.on("--name NAME", "Location name, also the billing rate key (lowercase letters, digits and -)") { opts[:name] = it }
+    parse(argv, banner) do |o|
+      o.on("--name NAME", "Location name, also the billing rate key (lowercase letters, digits and -)") do
+        raise UsageError, "add takes the location name as its argument (add #{name}), not --name #{it}" if name
+        opts[:name] = it
+      end
       o.on("--display-name NAME", "Name used in API paths (default: --name)") { opts[:display_name] = it }
       # An exact option name wins over a prefix of a longer one in
       # OptionParser, so --display stays apart from --display-name.
@@ -128,9 +137,6 @@ class ByohLocationCli
       o.on("--postgres CHOICE", "Managed Postgres in the location: no (the only choice yet)") do
         raise UsageError, "--postgres takes no or yes, not #{it}" unless %w[no yes].include?(it)
         raise UsageError, "--postgres yes is UNVERIFIED: Location.postgres_locations excludes BYOH locations (ROADMAP §8.2); pass --postgres no" if it == "yes"
-      end
-      o.on("--mgmt MODE", "How the control plane reaches the hosts: direct (the only choice until M8)") do
-        raise UsageError, "--mgmt #{it} is available in M8 (the management overlay); M4 supports only --mgmt direct, the operator's own route or VPN" unless it == "direct"
       end
       profile_options(o, profile)
     end
@@ -352,6 +358,11 @@ class ByohLocationCli
         raise UsageError, "--cp-reach mgmt is available in M8 (the management overlay); use onhost or public" if key == "cp_reach" && it == "mgmt"
         profile[key] = it
       end
+    end
+    # Here, so that set takes it too: otherwise OptionParser would read
+    # --mgmt as the prefix of --mgmt-allow there.
+    o.on("--mgmt MODE", "How the control plane reaches the hosts: direct (the only choice until M8)") do
+      raise UsageError, "--mgmt #{it} is available in M8 (the management overlay); M4 supports only --mgmt direct, the operator's own route or VPN" unless it == "direct"
     end
     o.on("--ula48 CIDR", "ULA /48 that host IPv6 prefixes are drawn from (default: random)") { profile["ula48"] = it }
     o.on("--guest-mtu N", Integer, "Guest MTU") { profile["guest_mtu"] = it }

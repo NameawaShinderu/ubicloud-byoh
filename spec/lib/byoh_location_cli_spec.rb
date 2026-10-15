@@ -204,10 +204,18 @@ RSpec.describe ByohLocationCli do
         ["byoh-1", "--postgres", "maybe"] => "--postgres takes no or yes, not maybe",
         ["byoh-1", "--mgmt", "wireguard"] => "--mgmt wireguard is available in M8 (the management overlay); M4 supports only --mgmt direct, the operator's own route or VPN",
         ["byoh-1", "--cp-reach", "mgmt"] => "--cp-reach mgmt is available in M8 (the management overlay); use onhost or public",
+        ["byoh-1", "--name", "byoh-2"] => "add takes the location name as its argument (add byoh-1), not --name byoh-2",
+        ["byoh-1", "--na=byoh-2"] => "add takes the location name as its argument (add byoh-1), not --name byoh-2",
       }.each do |args, message|
         expect(cli("add", *args)).to eq [2, "", "! #{message}\n"]
       end
-      expect(Location.where(name: "byoh-1").count).to eq 0
+      expect(Location.where(name: %w[byoh-1 byoh-2]).count).to eq 0
+    end
+
+    it "prints the options of create for add --help" do
+      expect { cli("add", "--help") }.to output(/\AUsage: bin\/byoh-location add NAME \[options\].*--display TEXT.*--grant PROJECT.*--postgres CHOICE.*--mgmt MODE/m).to_stdout
+        .and raise_error(SystemExit) { expect(it.status).to eq 0 }
+      expect(Location.where(provider: HostProvider::GENERIC_PROVIDER_NAME).count).to eq 0
     end
 
     it "says that ubicloud-admin restarts the services when it runs the tool" do
@@ -334,6 +342,9 @@ RSpec.describe ByohLocationCli do
     it "takes the location name alone and refuses --cp-reach mgmt" do
       location = byoh_location("byoh-1")
       expect(cli("set", "byoh-1", "--cp-reach", "mgmt")).to eq [2, "", "! --cp-reach mgmt is available in M8 (the management overlay); use onhost or public\n"]
+      # Not the prefix of --mgmt-allow.
+      expect(cli("set", "byoh-1", "--mgmt", "wireguard")).to eq [2, "", "! --mgmt wireguard is available in M8 (the management overlay); M4 supports only --mgmt direct, the operator's own route or VPN\n"]
+      expect(cli("set", "byoh-1", "--mgmt", "direct")[0]).to eq 0
       expect(cli("set", "byoh-1", "--cp-reach", "public")[0]).to eq 0
       expect(location.reload.byoh_network["cp_reach"]).to eq "public"
     end
