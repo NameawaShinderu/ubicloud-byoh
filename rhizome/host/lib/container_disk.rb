@@ -23,12 +23,17 @@ require_relative "storage_path"
 #   may use loop or device-mapper devices.
 # - dir (not encrypted, only where the location acknowledged
 #   "container:unencrypted-disk"): a directory limited to the volume's
-#   size by a project quota, so the file system must be mounted with
-#   prjquota. The container cannot change a file's project from inside
-#   its user namespace.
+#   size and to INODES_PER_GIB inodes per GiB by a project quota, so the
+#   file system must be mounted with prjquota. The container cannot
+#   change a file's project from inside its user namespace.
 class ContainerDisk
   # The key is 512 random bits, so key stretching adds nothing.
   PBKDF_ITERATIONS = "1000"
+
+  # The inode limit of a dir disk per GiB of its size: ext4's default of
+  # one inode per 16 KiB. Without it a guest could fill the shared file
+  # system's fixed inode table with empty files, which cost no blocks.
+  INODES_PER_GIB = 65_536
 
   # Run as the container's root in the fresh root file system: masks the
   # units a container cannot run (ContainerSetup::MASKED_UNITS), keeps apt
@@ -166,6 +171,6 @@ class ContainerDisk
     mount_point = r("findmnt", "-n", "-o", "TARGET", "--target", storage_dir).strip
     r "install", "-d", "-o", base.to_s, "-g", base.to_s, "-m", "0755", rootfs
     r "chattr", "+P", "-p", project_id.to_s, rootfs
-    r "setquota", "-P", project_id.to_s, "0", (size_gib * 1024 * 1024).to_s, "0", "0", mount_point
+    r "setquota", "-P", project_id.to_s, "0", (size_gib * 1024 * 1024).to_s, "0", (size_gib * INODES_PER_GIB).to_s, mount_point
   end
 end

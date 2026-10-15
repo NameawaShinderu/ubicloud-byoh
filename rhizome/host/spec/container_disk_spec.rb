@@ -75,7 +75,7 @@ RSpec.describe ContainerDisk do
       expect(disk).to receive(:r).with("findmnt", "-n", "-o", "TARGET", "--target", "/var/storage/vmcont01/0").and_return("/var/storage\n").ordered
       expect(disk).to receive(:r).with("install", "-d", "-o", base.to_s, "-g", base.to_s, "-m", "0755", rootfs).ordered
       expect(disk).to receive(:r).with("chattr", "+P", "-p", "1000000002", rootfs).ordered
-      expect(disk).to receive(:r).with("setquota", "-P", "1000000002", "0", "20971520", "0", "0", "/var/storage").ordered
+      expect(disk).to receive(:r).with("setquota", "-P", "1000000002", "0", "20971520", "0", "1310720", "/var/storage").ordered
       expect_extract
       disk.prep(kek, image)
     end
