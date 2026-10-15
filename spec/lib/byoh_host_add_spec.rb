@@ -410,6 +410,15 @@ RSpec.describe ByohHostAdd do
       expect(calls).to be_empty
     end
 
+    it "compares the legacy pool entries of a host registered before M2 as current ones" do
+      registered(["5.9.0.0/29,exposure=public"])
+      v4, v6 = host.provider.config["routed_networks"]
+      legacy = [{"cidr" => v4["cidr"], "source_host_ip" => "203.0.113.10"}, {"cidr" => v6["cidr"]}]
+      host.provider.update(config: Sequel.pg_jsonb(host.provider.config.to_h.merge("routed_networks" => legacy)))
+      status, _, err = cli(*base.first(4), "--routed-network", "5.9.0.0/29,exposure=public", "--no-wait")
+      expect([status, err]).to eq [0, ""]
+    end
+
     it "refuses a resume whose ssh met a key that was not pinned" do
       registered
       replies["cat"] = [[*fixture_keys, mitm_key].join("\n") + "\n", "", 0]

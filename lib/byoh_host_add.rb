@@ -652,7 +652,9 @@ class ByohHostAdd
   def config_diff(host, requested)
     stored = host.provider.config.to_h
     diff = []
-    networks = Array(stored["routed_networks"])
+    # Hosts registered before M2 keep legacy entries; compare them as
+    # every other reader of the config sees them.
+    networks = Array(stored["routed_networks"]).map { ByohPoolDeclaration.parse(it, legacy: true).to_config }
     given = requested[:routed_networks]
     v4 = ->(list) { list.reject { it["cidr"].include?(":") } }
     diff << "pools: registered #{v4.call(networks).to_json}, given #{v4.call(given).to_json}" if v4.call(networks) != v4.call(given)
