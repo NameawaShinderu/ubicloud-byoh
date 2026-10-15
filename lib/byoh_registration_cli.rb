@@ -31,6 +31,7 @@ class ByohRegistrationCli
       default_boot_images: options[:default_boot_images],
     )
     registration.validate!
+    virt = ByohVirtRegistration.new(declared: options[:virt_tier], accept_fallback: options[:accept_fallback], probe: options[:virt_probe] != false)
     cfg = registration.provider_config
     registration.notes.each { @err.puts "note: #{it}" }
 
@@ -45,12 +46,17 @@ class ByohRegistrationCli
       @input.readline
     end
 
+    # The host can be probed only once the key is installed.
+    verdict, unprobed = virt.probe(options[:main_ip], SshKey.from_binary(registration.keypair).private_key)
+    decision = virt.decide!(verdict, location: registration.location, main_ip: options[:main_ip], unprobed_reason: unprobed)
+    decision.notes.each { @err.puts "note: #{it}" }
+
     @out.puts
     @out.puts "Step 2/2 — Registering host with control plane"
     @out.puts "────────────────────────────────"
-    print_summary(registration, cfg)
+    print_summary(registration, cfg, decision)
 
-    strand = registration.register!
+    strand = registration.register!(virt: decision)
     vm_host = VmHost[strand.id]
 
     @out.puts "Host registered."
@@ -63,6 +69,9 @@ class ByohRegistrationCli
     0
   rescue ByohRegistration::ValidationError => ex
     @err.puts "! validation failed: #{ex.message}"
+    1
+  rescue ByohVirtRegistration::Refused => ex
+    @err.puts "! refused: #{ex.message}"
     1
   rescue Error, OptionParser::ParseError => ex
     @err.puts "! #{ex.message}"
@@ -111,6 +120,7 @@ class ByohRegistrationCli
       o.on("--bmc-system-id ID", "Explicit Redfish SystemId (needed for chassis BMCs)") { bmc(options)["system_id"] = it }
       o.on("--bmc-verify-ssl", "Enable TLS verification (default: disabled — BMC certs are usually self-signed)") { bmc(options)["verify_ssl"] = true }
       o.on("--bmc-reset-type TYPE", "Redfish ResetType (default: ForceRestart)") { bmc(options)["reset_type"] = it }
+      ByohVirtRegistration.add_options(o, options)
       o.separator ""
       o.on("-h", "--help", "Show this help") { help = true }
     end
@@ -131,7 +141,7 @@ class ByohRegistrationCli
     options[:bmc] ||= {"protocol" => "redfish"}
   end
 
-  def print_summary(registration, cfg)
+  def print_summary(registration, cfg, decision)
     location = registration.location
     @out.puts "Provider         generic"
     @out.puts "Management IP    #{cfg["main_ip4"]}"
@@ -142,6 +152,7 @@ class ByohRegistrationCli
     if (bmc = cfg["bmc"])
       @out.puts "BMC              #{bmc["endpoint"]} (protocol=#{bmc["protocol"]}, system_id=#{bmc["system_id"] || "auto"})"
     end
+    @out.puts "Virt tier        #{decision.tier}#{" (#{ByohVirtTiers.fetch(decision.tier).label}, accepted with --accept-fallback)" if ByohVirtTiers.lower?(decision.tier)}"
     @out.puts
   end
 

@@ -2,14 +2,30 @@
 
 require "stringio"
 require "tmpdir"
+require_relative "../../rhizome/host/lib/virt_probe"
 
 RSpec.describe ByohRegistrationCli do
   let(:dir) { Dir.mktmpdir }
   let(:required) { ["--main-ip", "203.0.113.42", "--location", "byoh-test"] }
 
+  # The virt-probe report of a bare-metal host with working KVM (L1).
+  def l1_probe(**over)
+    facts = {
+      "arch" => "x86_64", "kernel" => "6.8.0-1-generic", "cpu_vendor" => "GenuineIntel", "cpu_model" => "Intel Xeon",
+      "cpu_flags" => %w[vmx pdpe1gb], "tdp" => true, "dev_kvm" => true, "kvm_api" => 12, "kvm_errno" => nil,
+      "kvm_create_vm" => true, "kvm_caps_missing" => [], "modules" => %w[kvm kvm_intel], "nested_param" => true,
+      "pvm_module_available" => false, "bios_log" => nil, "virt_vm" => "none", "virt_container" => "none",
+      "dmi" => {"sys_vendor" => "Dell Inc.", "product_name" => "PowerEdge R650"}, "cgroup2" => true,
+      "commands" => {"lxc-start" => false, "lxcfs" => false, "qemu-system-x86_64" => false}, "ovmf" => false,
+    }.merge(over.transform_keys(&:to_s))
+    JSON.generate(VirtProbe.report(facts))
+  end
+
   before do
     Location.create(name: "byoh-test", display_name: "byoh-test", ui_name: "BYOH test", visible: false,
       provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"ula48" => "fd00:1:2::/48"})
+    # Registration probes the host over SSH once the key is installed.
+    allow(Util).to receive(:rootish_ssh).with(String, "root", [String], "ruby - --json", stdin: ByohVirtLadder.remote_script).and_return(l1_probe)
   end
 
   after { FileUtils.rm_rf(dir) }
@@ -119,5 +135,48 @@ RSpec.describe ByohRegistrationCli do
     expect(status).to eq 0
     expect(out).to include "system_id=auto"
     expect(VmHost.first.provider.config["bmc"]).to include("password" => "pw", "verify_ssl" => true)
+  end
+
+  describe "virtualization tier" do
+    let(:no_virt) { {cpu_flags: %w[hypervisor pdpe1gb], dev_kvm: false, kvm_api: nil, kvm_create_vm: nil, kvm_caps_missing: nil, modules: [], virt_vm: "kvm"} }
+
+    it "probes the host and records the tier" do
+      status, out, err = cli(*required, "--routed-network", "fd00:feed::/64", "--yes")
+      expect([status, err]).to eq [0, ""]
+      expect(out).to include "Virt tier        kvm\n"
+      expect(VmHost.first.virt_tier).to eq "kvm"
+      expect(DB[:byoh_operator_action].first[:args]["virt"]).to eq("declared" => "kvm", "tier" => "kvm", "probe" => "kvm", "accepted_fallback" => false)
+    end
+
+    it "refuses a host without KVM, with the fix" do
+      allow(Util).to receive(:rootish_ssh).and_return(l1_probe(**no_virt))
+      status, out, err = cli(*required, "--routed-network", "fd00:feed::/64", "--yes")
+      expect(status).to eq 1
+      expect(out).not_to include "Step 2/2"
+      expect(err).to start_with("! refused: tier: none (L3-L5)").and include("refused: ")
+      expect(VmHost.count).to eq 0
+    end
+
+    it "registers a fallback tier the operator accepted" do
+      ship_virt_tiers("emulated")
+      Location.first(name: "byoh-test").update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm emulated], "acks" => {"emulated" => []}}))
+      allow(Util).to receive(:rootish_ssh).and_return(l1_probe(**no_virt, commands: {"qemu-system-x86_64" => true}, ovmf: true))
+      status, out, err = cli(*required, "--routed-network", "fd00:feed::/64", "--virt-tier", "emulated", "--accept-fallback", "--yes")
+      expect([status, err]).to eq [0, ""]
+      expect(out).to include "Virt tier        emulated (emulated (L5, experimental), accepted with --accept-fallback)\n"
+      expect(VmHost.first.values.slice(:virt_tier, :family)).to eq(virt_tier: "emulated", family: "emulated")
+      expect(DB[:byoh_operator_action].first[:args]["virt"]).to eq("declared" => "emulated", "tier" => "emulated", "probe" => "none", "accepted_fallback" => true)
+    end
+
+    it "registers without the probe when asked, with a note" do
+      expect(Util).not_to receive(:rootish_ssh)
+      status, _, err = cli(*required, "--routed-network", "fd00:feed::/64", "--no-virt-probe", "--yes")
+      expect(status).to eq 0
+      expect(err).to eq "note: the host was not probed (the probe was skipped (--no-virt-probe)); Prog::LearnVirt checks it at prep, and a kvm host waits there until the probe agrees\n"
+    end
+
+    it "refuses an unknown tier before anything else" do
+      expect(cli(*required, "--virt-tier", "tcg", "--yes")).to eq [1, "", "! refused: --virt-tier tcg is not one of kvm, auto, container, pvm, emulated\n"]
+    end
   end
 end

@@ -145,7 +145,9 @@ class ByohRegistration
   # SSH key. Returns the resulting Strand. Caller is responsible for
   # printing the UBID to the operator. The registration is written to the
   # operator log, a failure outside the failed transaction.
-  def register!
+  # virt: the ByohVirtRegistration::Decision of the virtualization tier,
+  # or nil for kvm without a probe.
+  def register!(virt: nil)
     validate!
     prepare_keypair
 
@@ -159,8 +161,10 @@ class ByohRegistration
       ndp_needed: entries.any?(&:ndp_needed?),
     }
     kwargs[:default_boot_images] = @default_boot_images unless @default_boot_images.empty?
+    kwargs[:virt_tier] = virt.tier if virt && ByohVirtTiers.lower?(virt.tier)
 
     args = {main_ip: @main_ip, location: location.name, pools: provider_config["routed_networks"], server_identifier: @server_identifier}
+    args[:virt] = virt.record if virt
     begin
       DB.transaction do
         strand = Prog::Vm::HostNexus.assemble(@main_ip, **kwargs)
