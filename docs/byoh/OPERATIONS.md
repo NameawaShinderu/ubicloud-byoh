@@ -659,8 +659,9 @@ writes into `/var/storage`. The 24-hour monitor soak on EBS, virtio and
 LVM hosts has not been run (UNVERIFIED).
 
 Hosts registered before M4 keep the disk ids learned then, which can be
-`""` or a partition name. Before enabling the monitor, refresh them on
-each such host:
+`""`, `root` (from a `/dev/root` df source, as on Ubuntu cloud images)
+or a partition name. Before enabling the monitor, refresh them on each
+such host:
 
 ```
 bin/byoh-host relearn-device-ids --host vh...         # shows old -> new
@@ -669,8 +670,10 @@ bin/byoh-host relearn-device-ids --host vh... --yes   # stores them
 
 (packaged: `sudo ubicloud-admin run byoh-host relearn-device-ids ...`).
 It changes only `storage_device.unix_device_list`, writes a
-`byoh_operator_action` row, and needs SSH to the host. A host with a
-blank id reads as down until then.
+`byoh_operator_action` row, and needs SSH to the host. Until then the
+monitor reads such a host as down: a blank or `root` id fails with "has a
+stale storage device id", and a partition with "is not a whole disk";
+both messages name the command.
 
 ---
 

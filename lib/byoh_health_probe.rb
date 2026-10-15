@@ -23,6 +23,10 @@ module ByohHealthProbe
         printf '%s\\n' "==ubicloud-probe missing $d"
         continue
       fi
+      if [ ! -e "/sys/block/$d" ]; then
+        printf '%s\\n' "==ubicloud-probe notdisk $d"
+        continue
+      fi
       printf '%s\\n' "==ubicloud-probe smartctl $d"
       sudo smartctl -j -i -H "/dev/$d" 2>/dev/null || true
       case $d in nvme*)
@@ -92,6 +96,10 @@ module ByohHealthProbe
     # smartctl prints no SMART support for a device that does not exist,
     # which would pass a vanished disk as a SMART-less one.
     return Verdict.new(false, "/dev/#{device} is not a block device") if sections.key?("missing")
+    # A partition passes smartctl as a SMART-less disk, which would hide
+    # the disk under it. Hosts registered before ByohDeviceIdentity store
+    # the df source, often a partition.
+    return Verdict.new(false, "/dev/#{device} is not a whole disk; run bin/byoh-host relearn-device-ids") if sections.key?("notdisk")
 
     smartctl = json(sections["smartctl"])
     nvme_id = json(sections["nvme-id"])

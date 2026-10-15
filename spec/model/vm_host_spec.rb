@@ -861,7 +861,12 @@ RSpec.describe VmHost do
 
       it "refuses a blank id stored before ByohDeviceIdentity, naming the fix" do
         add_device("DEFAULT", [""])
-        expect { vm_host.disk_device_names(ssh_session) }.to raise_error(ByohDeviceIdentity::Error, "VmHost #{vm_host.ubid} has a blank storage device id; run bin/byoh-host relearn-device-ids --host #{vm_host.ubid}")
+        expect { vm_host.disk_device_names(ssh_session) }.to raise_error(ByohDeviceIdentity::Error, "VmHost #{vm_host.ubid} has a stale storage device id \"\"; run bin/byoh-host relearn-device-ids --host #{vm_host.ubid}")
+      end
+
+      it "refuses the id root that upstream stored for a /dev/root df source, naming the fix" do
+        add_device("DEFAULT", ["root"])
+        expect { vm_host.disk_device_names(ssh_session) }.to raise_error(ByohDeviceIdentity::Error, "VmHost #{vm_host.ubid} has a stale storage device id \"root\"; run bin/byoh-host relearn-device-ids --host #{vm_host.ubid}")
       end
     end
 
@@ -921,6 +926,14 @@ RSpec.describe VmHost do
         add_device("DEFAULT", ["sdb"])
         stub_probe(["sdb"], virt: "none", clocksource: "bare-metal-tsc", devices: {"sdb" => {"smartctl" => "ata-failed"}})
         expect(Clog).to receive(:emit).with("Device sdb failed its health check on VmHost #{vm_host.ubid}", {byoh_device_health: {device: "sdb", reason: "smartctl reports a failing disk"}}).and_call_original
+        expect(vm_host.perform_health_checks(ssh_session)).to be false
+      end
+
+      it "fails a partition id stored before ByohDeviceIdentity, naming the fix" do
+        add_device("DEFAULT", ["vda1"])
+        probe = "==ubicloud-probe virt\nkvm\n==ubicloud-probe clocksource\n#{fixture("clocksource", "kvm-guest-no-tsc")}==ubicloud-probe notdisk vda1\n"
+        expect(ssh_session).to receive(:_exec!).with(NetSsh.command(ByohHealthProbe::SCRIPT, shelljoin_devices: ["vda1"])).and_return(ok(probe))
+        expect(Clog).to receive(:emit).with("Device vda1 failed its health check on VmHost #{vm_host.ubid}", {byoh_device_health: {device: "vda1", reason: "/dev/vda1 is not a whole disk; run bin/byoh-host relearn-device-ids"}}).and_call_original
         expect(vm_host.perform_health_checks(ssh_session)).to be false
       end
 

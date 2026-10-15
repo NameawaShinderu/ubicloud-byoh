@@ -459,10 +459,15 @@ class VmHost < Sequel::Model
   # ByohDeviceIdentity names a disk without a by-id link by its kernel
   # name, which readlink under /dev/disk/by-id would turn into a path that
   # names no device.
+  #
+  # Hosts registered before ByohDeviceIdentity may hold "" or "root" (the
+  # df source /dev/root of cloud images, which names no device node);
+  # both are refused with the fix. A stored partition name is caught by
+  # ByohHealthProbe, which checks that each name is a whole disk.
   def byoh_disk_device_names(ssh_session)
     disk_device_ids.map do |id|
-      if id.to_s.empty?
-        raise ByohDeviceIdentity::Error, "VmHost #{ubid} has a blank storage device id; run bin/byoh-host relearn-device-ids --host #{ubid}"
+      if id.to_s.empty? || id == "root"
+        raise ByohDeviceIdentity::Error, "VmHost #{ubid} has a stale storage device id #{id.to_s.inspect}; run bin/byoh-host relearn-device-ids --host #{ubid}"
       end
 
       if ByohDeviceIdentity.kernel_name?(id)

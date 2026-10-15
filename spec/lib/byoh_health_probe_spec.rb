@@ -28,6 +28,7 @@ RSpec.describe ByohHealthProbe do
       expect(session).to receive(:_exec!) do |command|
         expect(command).to include("for d in vda nvme0n1\\;\\ reboot; do")
         expect(command).to include("sudo smartctl -j -i -H \"/dev/$d\" 2>/dev/null || true")
+        expect(command).to include("if [ ! -e \"/sys/block/$d\" ]; then")
         Net::SSH::Connection::Session::StringWithExitstatus.new(probe_output(virt: "kvm"), 0)
       end
       result = described_class.run(session, ["vda", "nvme0n1; reboot"])
@@ -105,6 +106,10 @@ RSpec.describe ByohHealthProbe do
 
     it "fails a device that is not a block device on the host" do
       expect(described_class.device_verdict(described_class.parse("==ubicloud-probe missing vdz\n"), "vdz")).to eq described_class::Verdict.new(false, "/dev/vdz is not a block device")
+    end
+
+    it "fails a partition or other device that is not a whole disk, naming the fix" do
+      expect(described_class.device_verdict(described_class.parse("==ubicloud-probe notdisk vda1\n"), "vda1")).to eq described_class::Verdict.new(false, "/dev/vda1 is not a whole disk; run bin/byoh-host relearn-device-ids")
     end
 
     it "fails a device missing from the probe" do
