@@ -34,7 +34,7 @@ When none of them is possible, the last resort is QEMU's emulator (L5).
 |---|---|---|---|---|---|---|
 | **L1** | `kvm` | `/dev/kvm` works and has the capabilities Cloud Hypervisor needs | Cloud Hypervisor exactly as today (QEMU-KVM for B200/B300 GPUs, unchanged) | ~native on bare metal; nested: CPU-bound ≥90%, page-fault-heavy work much less (section 3; own measurement planned, L1-T2) | Hardware VM | Today's product, SHIPPED; detection v2 SHIPPED (WP3) |
 | **L2** | — | The hardware can virtualize, but KVM is off or hidden (firmware, module, hypervisor CPU model, cloud option) | Nothing until it is fixed | — | — | Detection, per-platform fix, and refusal at registration with a recommended plan SHIPPED (WP4) |
-| **L3** | `container` | Any x86_64 Linux ≥ 5.12 with cgroup v2 | Unprivileged LXC system container in rhizome's per-VM network namespace | **CPU 95-99%, memory bandwidth 91-98%, 3.6-5.4 s to SSH** (VERIFIED, `dir` disk driver only) | Shared kernel: weaker than a VM | Feasibility VERIFIED (section 5); backend PLANNED (WP5), experimental |
+| **L3** | `container` | Any x86_64 Linux ≥ 5.12 with cgroup v2 | Unprivileged LXC system container in rhizome's per-VM network namespace | **CPU 95-99%, memory bandwidth 91-98%, 3.6-5.4 s to SSH** (VERIFIED, `dir` disk driver only) | Shared kernel: weaker than a VM | SHIPPED (WP5), experimental: `dir` disk VERIFIED end to end in the lab (section 5.5); `crypt-loop`, AppArmor, lxcfs and project quotas UNVERIFIED |
 | **L4** | `pvm` | No hardware virtualization; a PVM host kernel (`kvm_pvm`) | Cloud Hypervisor with direct kernel boot of a PVM guest kernel | SOURCE only: near single-level KVM (paper); 57% of native for a kernel build on m6a (third party). No own number | VM, with a software world switch | Detection SHIPPED; host side VERIFIED under emulation, guest boot UNVERIFIED; build gated on a go/no-go test (WP7) |
 | **L5** | `emulated` | Anything x86_64 | QEMU TCG (software CPU) | CPU 26-29%, memory bandwidth ~2.5%, 64-96 s to SSH (VERIFIED) | Not a security boundary | Rhizome side on this branch; control-plane hookup PLANNED (WP6), experimental ([EMULATED_HOSTS.md](EMULATED_HOSTS.md)) |
 
@@ -430,7 +430,7 @@ the design no longer depends on it (section 5.3, "User group").
 | P8 | `/proc/meminfo` shows host RAM | lxcfs is required on L3 hosts (UNVERIFIED here) |
 | P1, P5 | `/proc` masking; netns SNAT | Lab-only artefacts; nothing to change |
 
-### 5.3 Design (PLANNED, WP5)
+### 5.3 Design (SHIPPED in WP5, with the differences of section 5.5)
 
 - **Runtime.** liblxc driven by rhizome, not an Incus daemon, so there is one control plane.
   `lxc-start -F` runs **as root** from `<vm>.service` with an explicit `lxc.idmap`; never as the VM
@@ -541,6 +541,84 @@ the design no longer depends on it (section 5.3, "User group").
 - The pieces the lab cannot run (`crypt-loop`, AppArmor, lxcfs, the host sysctl checks) sit in their
   own modules with rhizome specs only. They stay UNVERIFIED until L3-T1 (section 14) passes.
 - Until then the `container` family is **experimental**: hidden, granted per project, and labelled.
+
+### 5.5 What WP5 shipped, and where it differs from section 5.3
+
+SHIPPED, spec-gated (100% line and branch coverage for rhizome and the control plane):
+
+| Piece | Where |
+|---|---|
+| Id slots: `base = 1_000_000_000 + slot × 65536`, slots 0..49,999, a file per VM under `/var/lib/ubicloud/idmap/` (root 0700) and an `flock`; freed only after the disk is gone | `rhizome/host/lib/container_idmap.rb` |
+| LXC configuration, seccomp policy, network hook, NoCloud seed, unit and stop command, all in `/var/lib/ubicloud/lxc/<vm>/` (root, 0711; config and policy 0600) | `rhizome/host/lib/container_setup.rb`, goldens `rhizome/host/spec/fixtures/golden/container_*` |
+| The disk: `crypt-loop` (LUKS2 on a sparse file, ext4 owned by the slot's root, a random 512-bit key wrapped with the volume's KEK exactly like ubiblk's, given to `cryptsetup` on stdin) and `dir` (a project quota of the volume's size; refuses a file system without `prjquota` or mounted `nodev`/`nosuid`). The image is extracted by the container's own root (`lxc-usernsexec`, `dev/*` excluded), which also masks `sys-kernel-config.mount`, `sys-kernel-debug.mount` and `systemd-remount-fs.service`, pins every kernel package to priority -1 and limits cloud-init to NoCloud | `rhizome/host/lib/container_disk.rb` |
+| `VmSetup` for `hypervisor: "lxc"`: no tap (LXC makes a veth whose host end is the tap), `bind-dynamic` dnsmasq, network-config by interface name, seed instead of CIDATA, `growpart` and `resize_rootfs` off, the nftables bootcmd only with `container:guest-firewall`, one disk, one NIC, no swap, no PCI devices | `rhizome/host/lib/vm_setup.rb` (the CH and QEMU goldens are unchanged) |
+| `setup-vm net-up` (LXC's `script.up`), `stop-vm` (`lxc-stop --nowait` in the VM's netns), `vm-stats` from the `lxc.payload` cgroup | `rhizome/host/bin/`, `rhizome/host/lib/vm_stats.rb` |
+| Host prep `prep_host.rb <host> <env> container`: x86_64, cgroup v2, Linux ≥ 5.12, systemd ≥ 254, the packages, AppArmor with `lxc-container-default-cgns` loaded, the four kernel settings, no other subordinate id range over the slots; then root's `/etc/subuid` and `/etc/subgid` entry, `SUB_UID_COUNT`/`SUB_GID_COUNT` 0, `groupadd -f -r kvm`, `lxc-net` off | `rhizome/host/lib/host_tier.rb` |
+| Control plane: `container` in `ByohVirtTiers::SHIPPED` (and the bootstrap's `SHIPPED_TIERS`); prep.json `hypervisor: "lxc"` and `container: {nested_userns, guest_firewall}` for container hosts only (golden `spec/fixtures/golden/params_json_container.json`); the disk encrypted unless the location acknowledged `container:unencrypted-disk`; one disk per container VM; serial log from the console log; no hypervisor learned; `ubuntu-noble-container` 20260926 from cloud-images.ubuntu.com with its SHA256 (never from Ubicloud's blob storage, which has none) kept as `.tar.xz`; a container host downloads the tier's images unless registration names some of them, and refuses others | `lib/byoh_virt_tiers.rb`, `model/metal/vm.rb`, `prog/vm/nexus.rb`, `prog/learn_hypervisor.rb`, `prog/download_boot_image.rb`, `model/boot_image.rb`, `prog/vm/host_nexus.rb` |
+
+VERIFIED in the lab (`NOKVM_L3_UNCONFINED=1 scripts/byoh/test/nokvm/run.sh l3`, 72 checks, 2026-10-15):
+two `container` VMs through the real `setup-vm prep`, the network hook, `stop-vm`, `vm-stats`,
+`recreate-unpersisted`, `restart` and `delete` (twice), on ubuntu:24.04 with LXC 5.0.3 and the
+`ubuntu-noble-container` 20260926 image, `dir` driver on tmpfs:
+- SSH as `ubi` 17.5 to 18.1 s after `setup-vm prep` began, about 13 s of it extracting the image; DHCP,
+  DNS through the VM's dnsmasq, `apt-get update`, cloud-init done, no failed units.
+- The guest's root is host uid 1,000,000,000 (slot 0) and 1,000,065,536 (slot 1); `systemd-detect-virt`
+  says lxc; no `/dev/kvm` or `/dev/fuse`; `/proc/sys` and the seed read-only; `dmesg` refused; the
+  cgroup limits (1 GiB, 2 CPUs) seen from inside.
+- Seccomp, from a probe run as the guest's root: `clone3` ENOSYS, `unshare(CLONE_NEWUSER)` EPERM, `keyctl`
+  ENOSYS, `bpf`, `io_uring_setup`, `userfaultfd` and `perf_event_open` EPERM, a netfilter netlink
+  socket EAFNOSUPPORT.
+- The guest's processes sit in `system.slice/<vm>.service/lxc.payload`; after a stop no process of the
+  slot's ids and no process in the unit's cgroups remain.
+- Symlinks planted by the guest's root (`/x`, `/var/log/x`, `/etc/hostname`, pointing at host files)
+  changed no host file across a stop, `recreate-unpersisted` and a restart.
+- One VM cannot reach the other's private address or see its processes, and neither reaches another
+  host of the test network.
+
+Differences from section 5.3:
+- **newuidmap.** With the `uidmap` package installed, LXC (and `lxc-usernsexec`) write the maps through
+  `newuidmap` even as root, so the slots need `/etc/subuid` and `/etc/subgid` entries. Prep adds one
+  entry for root covering every slot (`root:1000000000:3276800000`) and refuses any other entry that
+  overlaps (VERIFIED: without it the map is refused). `usermod --del-subuids` is not needed: with
+  `SUB_UID_COUNT 0` new users get no range, and ranges below 600,100,000 cannot reach the slots.
+- **The slot** is recorded only on the host (`/var/lib/ubicloud/idmap/<vm>`), not in `prep.json` or the
+  control plane.
+- **`/vm/<vm>`** stays owned by the VM's user, as for cloud-hypervisor: on a container host nothing runs
+  as that user but dnsmasq, and nothing root writes for the container lives there (the console log
+  and the seed are in the root-only LXC directory).
+- **cgroups.** The unit has `Delegate=yes` and `DelegateSubgroup=supervisor` (systemd ≥ 254), and the
+  LXC paths are absolute from the cgroup root (`system.slice/<vm>.service/lxc.monitor` and
+  `lxc.payload`), so `<vm>.service` itself holds no process when LXC enables controllers below it. Limits
+  are `cpu.max` (the VM's vCPUs), `memory.max`, `memory.swap.max = 0` and `pids.max` (2048 per vCPU);
+  `io.max` is not set (UNVERIFIED which device numbers a loop file would need).
+- **No explicit `/dev/fuse` deny.** An extra `lxc.cgroup2.devices.deny` entry made LXC 5.0.3 refuse
+  `/dev/null` too (VERIFIED). The guest cannot create device files, and LXC creates none but its
+  standard ones, so `/dev/fuse` is absent anyway (VERIFIED).
+- **Network-config** names the interfaces (`eth0`): netplan matches a MAC address as the permanent
+  one, which a veth lacks, so the guest never configured its network (VERIFIED).
+- **Root file system mounts** must allow device files and setuid programs (VERIFIED: `nodev` broke
+  `/dev/null`, `nosuid` broke `sudo`). `crypt-loop` mounts without either; `dir` refuses such a file system.
+- **The network hook** starts in `/home/rhizome`, where bundler finds rhizome's Gemfile; LXC starts
+  hooks in `/`.
+- **Rhizome stays Ruby 3.0 syntax** (hosts run the distribution's Ruby; 3.2 on 24.04): the lab caught a
+  Ruby 3.4 `it` in the slot allocator.
+- **Not built in WP5**: `ByohKernelReboot` (section 10.5), the multi-tenant host checks (so
+  `container:multitenant` stays refused and every location is single-project), lxcfs-specific setup
+  (Ubuntu's `lxcfs` package hooks itself into every LXC container through `common.conf.d`), and the
+  DoS limit advice beyond this section. `container:nested-userns` lifts the `clone`/`unshare` rules and
+  `clone3`'s ENOSYS together (one switch, simpler than 5.3's split).
+
+Lab artifacts, each said in the lab's output (`scripts/byoh/test/nokvm/l3.sh`, `fake-systemctl`,
+`lab-setup-vm.rb`): no systemd (a shell emulation of the two units; `ip netns exec` instead of
+`NetworkNamespacePath=`, because docker masks parts of `/sys` and LXC's sysfs mount needs a fully
+visible one); no project quota (tmpfs) and no AppArmor (a container cannot load profiles); no lxcfs
+(`/dev/fuse` is a host device); no `crypt-loop` (loop and device-mapper devices); the lab container runs
+with AppArmor and seccomp unconfined (`NOKVM_L3_UNCONFINED=1`) because LXC mounts proc, sysfs and
+cgroup2, and without docker's `no-new-privileges`, which would pass to every guest and break `sudo`.
+
+UNVERIFIED until L3-T1 (section 14) runs on a real Ubuntu 24.04 host: the unit under systemd
+(`DelegateSubgroup=`, `NetworkNamespacePath=`, `ExecStop`), AppArmor `lxc-container-default-cgns`,
+lxcfs, `crypt-loop`, project quotas, the host prep steps, and the time to SSH on a disk instead of tmpfs.
 
 ## 6. L4: PVM, KVM without hardware virtualization (`pvm`)
 
@@ -804,7 +882,7 @@ real-infrastructure tests pass.
 | Probe report | `vm_host.virt_probe jsonb` (`migrate/20261015_vm_host_virt_probe.rb`) | `Prog::LearnVirt`, `bin/byoh-virt refresh` | The facts, the detected tier, the rung, the platform key, the fix and the caveats. Refreshable; **never changes behaviour** | SHIPPED |
 | Declared tier | `vm_host.virt_tier text NOT NULL DEFAULT 'kvm'`, CHECK `IN ('kvm','pvm','container','emulated')` | `HostNexus.assemble(virt_tier:)` at registration only | Which backend the host runs. A `BEFORE UPDATE OF virt_tier` trigger raises when it changes: changing it means re-registering | SHIPPED (WP4) |
 | Tier/family coupling | CHECK `(virt_tier = 'kvm') = (family NOT IN ('pvm','container','emulated'))` on `vm_host` | the migration | A KVM host never carries a lower-tier family, and vice versa; with the trigger, family changes across the boundary are blocked too | SHIPPED (WP4) |
-| Location policy | `location.byoh_virt jsonb`: `{"tiers": ["kvm", ...], "acks": {"<tier>": [option, ...]}}` (`container_disk` arrives with WP5), NULL meaning `{"tiers": ["kvm"]}`. CHECK: every non-kvm tier in `tiers` has its base ack | `bin/byoh-location create/set` (each change writes a `byoh_operator_action` row) | Which lower tiers may be offered in this location | SHIPPED (WP4) |
+| Location policy | `location.byoh_virt jsonb`: `{"tiers": ["kvm", ...], "acks": {"<tier>": [option, ...]}}` (a container's disk driver follows the `container:unencrypted-disk` ack, section 5.5), NULL meaning `{"tiers": ["kvm"]}`. CHECK: every non-kvm tier in `tiers` has its base ack | `bin/byoh-location create/set` (each change writes a `byoh_operator_action` row) | Which lower tiers may be offered in this location | SHIPPED (WP4) |
 | Tier table | `lib/byoh_virt_tiers.rb` (data, like `ByohVirtPlatforms`) | code | Per lower-tier family: tier, accepted probe tiers, hypervisor, PrepHost argument, label, required acks, experimental, uses hugepages, storage | SHIPPED (WP4) |
 
 The migration (`migrate/20261016_byoh_virt_tier.rb`) has a `down` that refuses while any non-kvm host
@@ -894,7 +972,7 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
   (sanitised), pages once under the same `ByohVirtTier` tag, and pops with "virt probe failed". It never
   retries forever and never blocks `wait_prep`; a later probe that finds L1 resolves the page.
   `bin/byoh-virt show` prints "the last probe failed: ..." and exits 3.
-- It will page `ByohKernelReboot` per section 5.3 (PLANNED, WP5: it only matters for container and PVM hosts). Page text is sanitised.
+- It will page `ByohKernelReboot` per section 5.3 (PLANNED: WP5 did not build it, section 5.5; it only matters for container and PVM hosts). Page text is sanitised.
 
 ### 10.6 What WP4 shipped, and where it differs from this plan
 
@@ -1057,13 +1135,14 @@ kernels, sysctls or GRUB.
   the fastest possible fallback (container, then emulated) on `none` or `pvm_blocked`, and a refusal
   with the probe's reasons otherwise, `kvm_blocked` included.
 - A lower tier, declared or chosen by `auto`, is refused **before anything is installed** unless it
-  is in the script's `SHIPPED_TIERS`, which a spec keeps equal to `ByohVirtTiers::SHIPPED` (empty
-  today). `BYOH_ALLOW_UNSHIPPED_TIER=1` prepares it anyway, with a warning, for lab work only. A
-  shipped tier skips only the KVM checks and installs only its userspace packages (`lxc lxcfs
-  uidmap`; `qemu-system-x86 ovmf`; nothing for pvm).
-- UNVERIFIED: Ubuntu's `lxc` package normally enables `lxc-net` (an `lxcbr0` bridge with its own
-  dnsmasq and NAT rules) beside the BYOH nftables and per-VM dnsmasq. The WP that ships `container`
-  must turn it off (`USE_LXC_BRIDGE="false"` in `/etc/default/lxc-net`) and check the result on a host.
+  is in the script's `SHIPPED_TIERS`, which a spec keeps equal to `ByohVirtTiers::SHIPPED` (`container`
+  since WP5). `BYOH_ALLOW_UNSHIPPED_TIER=1` prepares it anyway, with a warning, for lab work only. A
+  shipped tier skips only the KVM checks and installs only its userspace packages (`lxc lxcfs uidmap
+  xz-utils quota cryptsetup-bin e2fsprogs`; `qemu-system-x86 ovmf`; nothing for pvm).
+- Ubuntu's `lxc` package enables `lxc-net` (an `lxcbr0` bridge with its own dnsmasq and NAT rules).
+  Container host prep (`HostTier.container_host_setup`, WP5) writes `USE_LXC_BRIDGE="false"` to
+  `/etc/default/lxc-net` and disables the unit, so it never runs beside the BYOH nftables and per-VM
+  dnsmasq. UNVERIFIED on a host.
 
 VERIFIED in a throwaway `ubuntu:24.04` container without `/dev/kvm`, with `sudo` stubbed and the probe
 replaced by fixture reports (kvm, kvm_blocked with `missing_caps`, none, pvm, container): the default
@@ -1176,11 +1255,11 @@ bin/byoh-location rates $LOC --family container --from standard --multiplier 1
 bin/register-byoh-host --location $LOC --main-ip $IP ... --virt-tier auto --accept-fallback   # expect: container chosen and printed
 # Create a container-2 VM, then on the host:
 sudo aa-status | grep -c lxc-container-default            # >= 1: AppArmor confines it
-sudo cryptsetup status <vm>-root | grep -q LUKS2           # crypt-loop: encrypted at rest
-pid=$(sudo lxc-info -n <vm> -P /var/lib/ubicloud/lxc -p -H)   # the container's init; lxc-start is the monitor in
+sudo cryptsetup status ubi-<vm>-0 | grep -q LUKS2          # crypt-loop: encrypted at rest
+pid=$(sudo nsenter --net=/run/netns/<vm> lxc-info -n <vm> -P /var/lib/ubicloud/lxc -p -H)   # the container's init; lxc-start is the monitor in
                                                            #   the initial user namespace (uid_map "0 0 4294967295")
 sudo awk '{print $2}' /proc/$pid/uid_map                   # = 1000000000 + slot*65536, the slot recorded in
-                                                           #   /vm/<vm>/prep.json (key name fixed in WP5)
+                                                           #   /var/lib/ubicloud/idmap/<vm>
 cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns # unchanged by Ubicloud
 sudo systemctl stop <vm>.service; ps -eo uid= | awk '$1 >= 1000000000' | wc -l   # 0: nothing of the container left
 # Plant a symlink at the seed path and in the rootfs, restart, and check that no host file changed.
