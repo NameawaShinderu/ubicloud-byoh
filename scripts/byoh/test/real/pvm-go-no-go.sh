@@ -167,7 +167,8 @@ check_pin() { # file sha256-or-empty
 
 secure_boot_on() {
   if command -v mokutil >/dev/null 2>&1; then
-    mokutil --sb-state 2>/dev/null | grep -q 'SecureBoot enabled'
+    # No `| grep -q`: under pipefail an early match can fail the pipe.
+    grep -q 'SecureBoot enabled' <<<"$(mokutil --sb-state 2>/dev/null || true)"
     return
   fi
   local v
