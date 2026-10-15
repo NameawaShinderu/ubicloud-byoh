@@ -151,7 +151,7 @@ Duplicates are merged; the canonical ID comes first. Severity is for BYOH hosts.
 |---|---|
 | `scripts/byoh/host/ubicloud-host preflight [--json]` ([ROADMAP.md](ROADMAP.md) M4; earlier drafts called it `scripts/byoh/preflight-data-plane.sh`) | Runs as root on the host. Read-only. Prints one JSON line per check: `{check, status: pass\|warn\|fail, detail, fix}` |
 | `bin/register-byoh-host` (and `ubicloud-admin host add`, which wraps it in M4) | Runs the preflight by default (`--skip-preflight` to opt out). SSHes as root with the registration key, uploads and runs the script, aborts on any `fail` **before** `register!`, and prints the resolved Location |
-| `scripts/byoh/bootstrap-data-plane.sh` | Runs the same script at the end |
+| `scripts/byoh/bootstrap-data-plane.sh` | Runs the same script at the end with `--standalone` (M4 WP11): found next to it, at `host/ubicloud-host` below its directory, or by `--preflight-script`; `--main-ip` adds the main-IP check. Exits 1 on any `fail`, after its own steps are done and marked |
 
 The networking contract checks (C1-C7, `host_guard`, inbound probes) are **not** part of this preflight. They extend upstream `CheckIpReachability` in NET-P3 and block `accepting` there. PF17 and PF18 below are the subset that can run before registration.
 

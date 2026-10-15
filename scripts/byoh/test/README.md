@@ -191,6 +191,35 @@ script, except on kvm64-class CPU models, which only the script refuses
 fixtures. Result (2026-10-15): 23 cases plus base, the guard and the
 live run pass in about 25 s, with nothing left behind.
 
+### Bootstrap preflight hook (WP11)
+
+```
+scripts/byoh/test/bootstrap-preflight.sh
+```
+
+Runs `scripts/byoh/bootstrap-data-plane.sh` as user `ubuntu` (passwordless
+sudo) in one `ubi-m4-bs` container of the `ubi-m4-fakehost` image
+(ubi-test-net, no ports). The install steps are pre-marked done, so
+nothing is installed, and `/dev/kvm` is a `mknod` node, enough for the
+script's own step 1b. Fixture runs put a wrapper in place of
+`ubicloud-host` that runs the real script on `fixtures/host/<case>`.
+
+| Case | Asserts |
+|---|---|
+| live | The repository layout (`host/ubicloud-host` below the script), real commands: the rows are printed, `main-ip-local` passes for the container's address, and the exit is 1 exactly when a row is `fail` (here PF5: no GRUB in the image) |
+| base | Fixture host without failures: exit 0, `preflight: 0 failing` |
+| hybrid | `--preflight-script` with `intel-hybrid`: `fail PF8-hybrid`, exit 1, the next steps still printed |
+| kvm64 | `ubicloud-host` next to the script, `kvm64-model`: `fail PF3 kvm64-class CPU model`, exit 1; without `--main-ip`, `main-ip-local` is `info` |
+| not-found | The script alone: preflight skipped with the `ubicloud-admin host preflight` hint, exit 0 |
+| no-preflight | `--no-preflight`: skipped, exit 0 |
+| broken | A preflight script that exits 3: "could not run (exit 3)", its stderr shown, exit 1 |
+| usage | Missing `--preflight-script` file, bad `--main-ip`, `--no-preflight` with `--preflight-script`, an unknown option, a missing value: exit 2 before step 1 |
+| no-kvm | `/dev/kvm` removed: the existing step 1b exit (1) stays and preflight never runs |
+
+Result (2026-10-15): all cases pass in about 6 s, with nothing left
+behind. The install steps themselves (apt, sshd reload) are not run
+here; they are unchanged by WP11.
+
 ## Scenarios
 
 | Scenario | Checks |

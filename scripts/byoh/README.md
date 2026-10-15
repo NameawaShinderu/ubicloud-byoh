@@ -155,18 +155,26 @@ The script does not clone the repository: clone it first
 
 ```bash
 # On the BYOH target host (as a sudo-capable user):
-./scripts/byoh/bootstrap-data-plane.sh
+./scripts/byoh/bootstrap-data-plane.sh [--main-ip IP] [--preflight-script PATH | --no-preflight]
 ```
 
 Idempotent. Prepares the host for the control plane's rhizome bootstrap
 by ensuring root SSH works, pre-seeding `ruby-bundler` so Ubicloud's
-`BootstrapRhizome` doesn't race on `apt-get update`, and printing the
-operator's next step.
+`BootstrapRhizome` doesn't race on `apt-get update`, then runs host
+preflight and prints the operator's next step.
 
-You'll also need to install the control plane's SSH public key into
-`/root/.ssh/authorized_keys` on this host before running
-`bin/register-byoh-host` on the control plane — the script prints
-instructions for this step.
+Preflight is `scripts/byoh/host/ubicloud-host preflight --standalone`
+(read-only, PLATFORMS.md §6), found next to the script or at
+`host/ubicloud-host` below its directory, or given with
+`--preflight-script`. Standalone it checks what needs no pools: PF1-PF19
+plus one IPv4 default route and, with `--main-ip`, that the main IP is
+on the host. The script exits 1 when a check fails (the finished steps
+stay marked, so a re-run only repeats the checks), and prints how to run
+preflight from the control plane when the script is not found.
+`ubicloud-admin host add` runs the full preflight again with the pools
+and installs its own root key; with `bin/register-byoh-host`, install
+the control plane's public key in `/root/.ssh/authorized_keys` yourself
+first. Tested by `scripts/byoh/test/bootstrap-preflight.sh`.
 
 ## Provider-specific pre-work
 
