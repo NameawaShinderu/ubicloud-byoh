@@ -35,7 +35,7 @@ When none of them is possible, the last resort is QEMU's emulator (L5).
 | **L1** | `kvm` | `/dev/kvm` works and has the capabilities Cloud Hypervisor needs | Cloud Hypervisor exactly as today (QEMU-KVM for B200/B300 GPUs, unchanged) | ~native on bare metal; nested: CPU-bound ≥90%, page-fault-heavy work much less (section 3; own measurement planned, L1-T2) | Hardware VM | Today's product, SHIPPED; detection v2 SHIPPED (WP3) |
 | **L2** | — | The hardware can virtualize, but KVM is off or hidden (firmware, module, hypervisor CPU model, cloud option) | Nothing until it is fixed | — | — | Detection, per-platform fix, and refusal at registration with a recommended plan SHIPPED (WP4) |
 | **L3** | `container` | Any x86_64 Linux ≥ 5.12 with cgroup v2 | Unprivileged LXC system container in rhizome's per-VM network namespace | **CPU 95-99%, memory bandwidth 91-98%, 3.6-5.4 s to SSH** (VERIFIED, `dir` disk driver only) | Shared kernel: weaker than a VM | SHIPPED (WP5), experimental: `dir` disk VERIFIED end to end in the lab (section 5.5); `crypt-loop`, AppArmor, lxcfs and project quotas UNVERIFIED |
-| **L4** | `pvm` | No hardware virtualization; a PVM host kernel (`kvm_pvm`) | Cloud Hypervisor with direct kernel boot of a PVM guest kernel | SOURCE only: near single-level KVM (paper); 57% of native for a kernel build on m6a (third party). No own number | VM, with a software world switch | Detection SHIPPED; host side VERIFIED under emulation, guest boot UNVERIFIED; build gated on a go/no-go test (WP7) |
+| **L4** | `pvm` | No hardware virtualization; a PVM host kernel (`kvm_pvm`) | Cloud Hypervisor with direct kernel boot of a PVM guest kernel | SOURCE only: near single-level KVM (paper); 57% of native for a kernel build on m6a (third party). No own number | VM, with a software world switch | **Detected, not offered.** Detection SHIPPED; host side VERIFIED under emulation, guest boot UNVERIFIED; the go/no-go script SHIPPED (WP7), never run; the build waits for its GO |
 | **L5** | `emulated` | Anything x86_64 | QEMU TCG (software CPU) | CPU 26-29%, memory bandwidth ~2.5%, 64-96 s to SSH (VERIFIED) | Not a security boundary | SHIPPED (WP6), experimental: control plane spec-gated; the end-to-end lab (`run.sh l5`) and real hosts UNVERIFIED (section 8.1; [EMULATED_HOSTS.md](EMULATED_HOSTS.md)) |
 
 **L3 or L4?** L3 is the speed fallback. L4 is chosen only when the operator needs VM-level isolation
@@ -750,6 +750,19 @@ More constraints found by the spike (SOURCE, medium: cocoonstack and virt-pvm do
 
 ### 6.7 Design (PLANNED, WP7; built only on a GO from L4-T1)
 
+**Status (WP7, 2026-10-15): L4 is detected, not offered.** WP7 shipped the go/no-go test as
+`scripts/byoh/test/real/pvm-go-no-go.sh` (section 14). Nobody has run it yet, so nobody has reported
+a GO, and nothing below this paragraph is built. What that means today:
+- A host whose probe says `pvm` or `pvm_blocked` is recorded and explained (`bin/byoh-virt probe`
+  says Ubicloud cannot run VMs there yet). `pvm` is not in `ByohVirtTiers::SHIPPED`, so
+  `--virt-tier pvm`, `bin/byoh-location set --virt-tiers ...,pvm` and `bootstrap-data-plane.sh --tier pvm`
+  are refused (the last one unless `BYOH_ALLOW_UNSHIPPED_TIER=1`, for lab work only).
+  `spec/lib/byoh_virt_tiers_pvm_spec.rb` fails if `pvm` is added to that list.
+- `--virt-tier auto` never picks `pvm` on a `pvm_blocked` host, and on a `pvm` host it refuses
+  rather than registering a tier that cannot run VMs.
+- To unblock the build: run the script on a throwaway VM and send back `report.txt` with GO or
+  NO-GO. On GO, the build follows this section; on NO-GO, L4 stays as it is.
+
 **Go/no-go.** Run L4-T1 (section 14) once on a throwaway non-nested GCP e2 or AWS m6i VM, with Cloud
 Hypervisor v46 **and** v53. If neither reaches a login prompt, WP7 delivers detection and docs only:
 `pvm` stays a recorded fact, and L4 is "detected, not offered". If GO:
@@ -1368,70 +1381,75 @@ ls /dev/kvm /dev/fuse /dev/sda 2>&1 | grep -c 'No such'    # 3
 
 ### L4 PVM go/no-go
 
+L4-T1 is a script, `scripts/byoh/test/real/pvm-go-no-go.sh` (SHIPPED in WP7, UNVERIFIED: never run
+on a real host). It refuses to do anything unless `BYOH_REAL_HOST=1`. Run it on a **throwaway**
+Ubuntu 24.04 x86_64 VM **without** nested virtualization (GCP e2-standard-4 or AWS m6i.large),
+Secure Boot off, that you can power-cycle from the provider console. Never on a registered host.
+
 ```bash
-# L4-T1 PVM host side + a bare CH guest, on a throwaway Ubuntu 24.04 VM WITHOUT nested virtualization
-#   (GCP e2-standard-4 or AWS m6i.large), Secure Boot OFF. Not a registered host. WP7 ships this as
-#   scripts/byoh/test/real/pvm-go-no-go.sh, which refuses to run unless BYOH_REAL_HOST=1.
-grep -cwE 'vmx|svm' /proc/cpuinfo                       # expect 0
-mokutil --sb-state                                      # expect: SecureBoot disabled
-R=https://github.com/cocoonstack/pvm/releases/download/v0.1.0
-mkdir pvm && cd pvm
-for f in SHA256SUMS linux-image-6.12.33-pvm_6.12.33+pvm.g91e9c9be4472_amd64.deb vmlinux-pvm-amd64 guest-pvm-amd64.config; do curl -fLO "$R/$f"; done
-sha256sum -c --ignore-missing SHA256SUMS
-grep -E '^CONFIG_(VFAT_FS|NLS_CODEPAGE_437|NLS_ISO8859_1|PVM_GUEST|X86_PIE)=y' guest-pvm-amd64.config   # expect all 5
-# Pin the running stock kernel as GRUB's saved default BEFORE the .deb runs update-grub: that makes 6.12-pvm the
-#   top entry, which GRUB_DEFAULT=0 (or saved without a saved_entry) would boot from then on.
-grep -sE '^GRUB_SAVEDEFAULT=.?true' /etc/default/grub /etc/default/grub.d/*.cfg && echo 'STOP: GRUB_SAVEDEFAULT would make the PVM boot permanent'
-STOCK="Advanced options for Ubuntu>Ubuntu, with Linux $(uname -r)"
-echo 'GRUB_DEFAULT=saved' | sudo tee /etc/default/grub.d/98-pvm-test.cfg
-sudo grub-set-default "$STOCK" && sudo update-grub
-sudo grub-editenv list                                  # expect saved_entry=$STOCK; stop here if it is not
-sudo apt-get install -y ./linux-image-6.12.33-pvm_6.12.33+pvm.g91e9c9be4472_amd64.deb
-for l in /sys/class/net/*/device/driver /sys/block/*/device/driver /sys/block/*/device/device/driver; do
-  [ -e "$l" ] && basename "$(readlink -f "$l")"; done | sort -u | while read -r d; do
-  echo "$d: $(grep -ciE "_$(echo "$d" | tr - _)(_|=)" /boot/config-6.12.33-pvm)"; done   # approximate: every driver the instance uses (ena, nvme, virtio...) must show > 0; check the =y/=m lines by eye
-# pti=off on the PVM entry only: GRUB_CMDLINE_LINUX_DEFAULT would also strip PTI from the stock recovery kernel.
-sudo tee /etc/grub.d/42_pvm_test >/dev/null <<'EOF'
-#!/bin/sh
-set -e
-. /usr/share/grub/grub-mkconfig_lib
-k=/boot/vmlinuz-6.12.33-pvm
-[ -f "$k" ] || exit 0
-echo "menuentry 'Ubuntu, with Linux 6.12.33-pvm (pti=off)' --id ubicloud-pvm {"
-prepare_grub_to_access_device "$(${grub_probe} --target=device "$k")" | sed 's/^/  /'
-echo "  linux $(make_system_path_relative_to_its_root "$k") root=UUID=${GRUB_DEVICE_UUID} ro ${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT} pti=off"
-echo "  initrd $(make_system_path_relative_to_its_root /boot/initrd.img-6.12.33-pvm)"
-echo "}"
-EOF
-sudo chmod 755 /etc/grub.d/42_pvm_test && sudo update-grub
-grep -c 'pti=off' /boot/grub/grub.cfg                   # expect 1: the ubicloud-pvm entry only
-sudo grub-reboot ubicloud-pvm
-sudo grub-editenv list                                  # expect next_entry=ubicloud-pvm AND saved_entry=$STOCK; do not reboot otherwise
-sudo reboot
-# after the reboot
-uname -r; grep -o 'pti=off' /proc/cmdline               # 6.12.33-pvm, pti=off
-sudo grub-editenv list                                  # next_entry gone, saved_entry still the stock kernel:
-                                                        #   only now does a power cycle return to the stock kernel
-sudo modprobe -r kvm_intel kvm_amd 2>/dev/null; sudo modprobe kvm-pvm && ls -l /dev/kvm
-sudo ruby virt_probe.rb                                 # copy of rhizome/host/bin/virt-probe: expect tier: pvm
-curl -fLo ch46 https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v46.0/cloud-hypervisor-static
-echo "00b5cf2976847d2f21d2b7266038c8fc40bd14f2a542115055e9e214867edc9e  ch46" | sha256sum -c && chmod +x ch46
-curl -fLo ch53 https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v53.0/cloud-hypervisor-static
-sha256sum ch53 && chmod +x ch53                        # record the sum against the release page; no pin exists yet
-curl -fLO https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
-sudo apt-get install -y qemu-utils dosfstools mtools
-qemu-img convert -O raw noble-server-cloudimg-amd64.img disk.raw
-printf '#cloud-config\npassword: ubuntu\nchpasswd: {expire: false}\nssh_pwauth: true\n' > user-data
-printf 'instance-id: pvm-test\nlocal-hostname: pvm-test\n' > meta-data
-mkdosfs -n CIDATA -C seed.img 128 && mcopy -oi seed.img user-data meta-data ::   # the same seed format rhizome builds
-for ch in ./ch46 ./ch53; do
-  time sudo $ch --kernel vmlinux-pvm-amd64 --cmdline "console=ttyS0 root=/dev/vda1 rw" \
-    --disk path=disk.raw path=seed.img,readonly=on --serial tty --console off --cpus boot=2 --memory size=2048M
-done
-# GO: a login prompt with at least one CH version. In the guest: dmesg | grep -i pvm; the section 5.1
-#   benchmark set; compare with the host itself. Report GO/NO-GO, the CH versions, and the numbers.
-# Recovery check, last: sudo reboot. Expect the stock kernel (uname -r) and no pti=off in /proc/cmdline.
-# L4-T2 (only after a GO and WP7) the same kind of VM registered with --virt-tier pvm --install-pvm-kernel
+# On the throwaway VM, from a copy of this repository (the script uses rhizome/host/lib/virt_probe.rb):
+sudo BYOH_REAL_HOST=1 scripts/byoh/test/real/pvm-go-no-go.sh preflight       # read-only; all ok?
+sudo BYOH_REAL_HOST=1 scripts/byoh/test/real/pvm-go-no-go.sh install         # kernel + one-shot entry
+sudo reboot                                                                 # boots the PVM kernel once
+sudo BYOH_REAL_HOST=1 scripts/byoh/test/real/pvm-go-no-go.sh boot-test       # exit 0 = GO, 1 = NO-GO
+sudo reboot                                                                 # back to the stock kernel
+sudo BYOH_REAL_HOST=1 scripts/byoh/test/real/pvm-go-no-go.sh recovery-check
+# Send back /var/lib/byoh-pvm-test/report.txt with the verdict. Optional: ... uninstall
+```
+
+What each phase checks (the script's header lists the environment overrides):
+- **preflight** (changes nothing): root, x86_64, Ubuntu 24.04, not a container, no `vmx`/`svm`
+  (else this is L1; `PVM_ALLOW_HW_VIRT=1` runs anyway and says the result proves nothing for the
+  no-hardware case), no `/dev/kvm` on the stock kernel, Secure Boot off, no `GRUB_SAVEDEFAULT=true`,
+  the GRUB tools, about 4 GiB of memory and 8 GiB of disk. A Meltdown-affected CPU is a note, not a
+  refusal, on this throwaway VM; the product refuses it (section 6.5).
+- **install**: downloads the release (default: [cocoonstack/pvm][cocoon-pvm] v0.1.0; third party, so
+  fine for this test and never a default for registered hosts). Every file must be **listed** in
+  `SHA256SUMS` (`sha256sum -c --ignore-missing` alone passes on an unlisted file) and match it;
+  optional `PVM_HOST_DEB_SHA256`/`PVM_GUEST_KERNEL_SHA256` pin your own builds. It refuses a guest
+  config without `=y` for VFAT, NLS 437 and ISO8859-1, PVM_GUEST, X86_PIE, virtio-blk/net/pci, ext4
+  and the 8250 console. Then, in the order of section 6.7: `GRUB_DEFAULT=saved` in a `grub.d` drop-in,
+  `grub-set-default` the running stock kernel, and checks that `grub.cfg` boots `${saved_entry}` and
+  can clear `next_entry` (`save_env`), all **before** the `.deb`'s own `update-grub`; installs and
+  `apt-mark hold`s the `.deb`; refuses unless the PVM kernel has a module or built-in for every driver
+  between this instance's disks and NICs and `/sys/devices` (ENA, NVMe, virtio, gVNIC...) and for the
+  root file system; writes `/etc/grub.d/42_byoh_pvm_test` (one `--id ubicloud-pvm` entry, `pti=off`
+  on that entry only) and checks `pti=off` appears exactly once in `grub.cfg`, inside that entry;
+  then `grub-reboot ubicloud-pvm` and checks `next_entry` **and** the stock `saved_entry`.
+- **boot-test** (on the PVM kernel): one-shot proven (`next_entry` cleared, `saved_entry` still
+  stock); `modprobe kvm_pvm`; `/dev/kvm` mode and owner recorded; `virt_probe.rb --json` must say
+  `pvm` (a "DETECTION MISMATCH" line otherwise); Cloud Hypervisor v46.0 **and** v53.0
+  (`cloud-hypervisor-static`, sha256 equal to rhizome's pins; the spec keeps them equal); the noble
+  cloud image (listed in its `SHA256SUMS`) as raw, a vfat `CIDATA` seed like rhizome's, direct kernel
+  boot `--kernel vmlinux-pvm-amd64 --cmdline "console=ttyS0 root=/dev/vda1 rw"`, no network, 2 vCPUs,
+  2 GiB, `PVM_BOOT_TIMEOUT` (900 s) each. In the guest, cloud-init prints `BYOH_PVM_GUEST_UP`, the
+  PVM lines of `dmesg`, and the same five measurements the script took on the host first (sha256 of
+  1 GiB, an 8 GiB `dd` to `/dev/null`, 200k one-byte reads and writes, 2000 fork+exec, 512 MiB of
+  direct writes), then powers off. **GO** = `BYOH_PVM_GUEST_UP` with at least one CH version; the
+  report gives seconds to the login prompt and to user space, and each measurement as a percentage of
+  the host's. A NO-GO keeps the last serial and CH log lines.
+- **recovery-check** (after the second reboot): the stock kernel, no `pti=off`, no `next_entry`.
+
+If the instance does not come back after the first reboot, power-cycle it from the provider console:
+it returns to the stock kernel, and `boot-test` then reports "NO-GO (host)". Save the provider's
+serial console log.
+
+Executed here (VERIFIED, 2026-10-15): the refusal without `BYOH_REAL_HOST=1`; `preflight` in a
+`ubi-q-*` ubuntu:24.04 container (refuses: container, `vmx`/`svm`, no GRUB); and the helpers on
+synthetic input (stock-entry path, the `pti=off` and `root=UUID` checks, driver-to-module lookup,
+the `SHA256SUMS` listing check, the measurements on the lab host, the user-data YAML round trip,
+the ratio report). That run caught a menu title that itself contained `pti=off`. Nothing else ran:
+no kernel was installed and no GRUB was touched.
+
+UNVERIFIED, to watch on the first real run:
+- The menu path `Advanced options for Ubuntu>Ubuntu, with Linux <ver>` on GCP and AWS cloud images,
+  and `GRUB_FORCE_PARTUUID` on cloud images (the PVM entry boots with an initrd and `root=UUID`).
+- Whether noble's cloud-init waits long for a network that is not there (no NIC is given).
+- Whether the guest's `/boot/efi` vfat mount (from memory: no `nofail`) passes with the CIDATA-style
+  kernel config; the config check requires VFAT for this reason.
+
+```bash
+# L4-T2 (only after a GO and the WP7 build) the same kind of VM registered with --virt-tier pvm --install-pvm-kernel
 #   --accept-fallback into a location with --virt-tiers kvm,pvm --accept pvm: the host reaches accepting
 #   after one reboot, a pvm-2 VM reaches running, SSH works, and destroy cleans up.
 ```
@@ -1621,6 +1639,10 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 - Done: the full gate and the harness; the family experimental.
 
 ### WP7: PVM, go/no-go first (blocked on L4-T1)
+
+Status 2026-10-15: the "always" part is SHIPPED (the script, `spec/lib/byoh_virt_tiers_pvm_spec.rb`,
+section 14). No GO has been reported, so the build below has not started and L4 is
+"detected, not offered".
 
 - Always (this branch): `scripts/byoh/test/real/pvm-go-no-go.sh`, the L4-T1 script (never run here; it
   refuses unless `BYOH_REAL_HOST=1`), plus docs. Detection of `pvm` and `pvm_blocked` is already SHIPPED.
