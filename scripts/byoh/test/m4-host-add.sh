@@ -11,7 +11,8 @@
 # refuses to reach a host. The database is the worktree .env.rb's
 # CLOVER_DATABASE_URL with TEST_ENV_NUMBER=$UBI_M4_DB_NUMBER (default 6,
 # clover_m2_test6 here), shared with the spec suite: never run this while
-# a pspec runs. m4-db-state refuses any database not named *_test<n>,
+# a pspec runs. m4-db-state refuses unless UBI_M4_GATE=1 and the database
+# is named *_test<n> with <n> = TEST_ENV_NUMBER (never clover_test),
 # snapshots it first, and on exit deletes every row the run added and
 # checks that each table is back as it was.
 #
@@ -76,9 +77,19 @@ docker image inspect "$RUBY_IMAGE" >/dev/null 2>&1 || fail "no $RUBY_IMAGE image
 
 mkdir -p "$STATE/cp"
 docker run -d --name "$CP" --network "$NET" -v "$WT:/app:ro" --tmpfs /app/var -v "$STATE/cp:/state" -w /app \
-  -e RACK_ENV=development -e TEST_ENV_NUMBER="$DB_NUMBER" "$RUBY_IMAGE" sleep infinity >/dev/null
+  -e RACK_ENV=development -e TEST_ENV_NUMBER="$DB_NUMBER" -e UBI_M4_GATE=1 "$RUBY_IMAGE" sleep infinity >/dev/null
 echo "$CP" >>"$STATE/created"
 docker exec "$CP" apk add --quiet bash openssh-client >/dev/null 2>&1 || fail "$CP: apk add bash openssh-client"
+# The guard itself: refused without UBI_M4_GATE=1, and on the gate's own
+# database with a TEST_ENV_NUMBER its name does not end in (the URL is
+# fixed first, so the refusal is the guard's, not a failed connection).
+out=$(docker exec -e UBI_M4_GATE=0 "$CP" bundle exec scripts/byoh/test/m4-db-state check 2>&1) &&
+  fail "$CP: m4-db-state check passed without UBI_M4_GATE=1"
+[[ $out == *"UBI_M4_GATE=1 is not set"* ]] || fail "$CP: m4-db-state without UBI_M4_GATE: $out"
+# shellcheck disable=SC2016 # expanded by the container's shell
+out=$(docker exec "$CP" sh -c 'CLOVER_DATABASE_URL=$(ruby -e "load %q(./.env.rb); print ENV.fetch(%q(CLOVER_DATABASE_URL))") TEST_ENV_NUMBER=${TEST_ENV_NUMBER}9 exec bundle exec scripts/byoh/test/m4-db-state check' 2>&1) &&
+  fail "$CP: m4-db-state check passed with TEST_ENV_NUMBER=${DB_NUMBER}9"
+[[ $out == *"refusing database "*"_test$DB_NUMBER: only a *_test<n>"* ]] || fail "$CP: m4-db-state with TEST_ENV_NUMBER=${DB_NUMBER}9: $out"
 db=$(docker exec "$CP" bundle exec scripts/byoh/test/m4-db-state check) || fail "$CP: the database check refused (see above)"
 docker exec "$CP" bundle exec bin/rake-task-runner migrate '' 0 >/dev/null || fail "$CP: migrate $db"
 docker exec "$CP" bundle exec scripts/byoh/test/m4-db-state snapshot /state/db.json >>"$LOGS/harness.log"

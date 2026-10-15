@@ -5,7 +5,8 @@
 # (m4-host-add.sh), which runs the real CLIs against a test database
 # that the spec suite shares. Run from the repository root:
 #
-#   m4-db-state check             refuse unless the database is a test one
+#   m4-db-state check             refuse unless the database is the gate's
+#                                 numbered test database
 #   m4-db-state snapshot FILE     write every table's row digests to FILE
 #   m4-db-state restore FILE      delete every row FILE does not hold, then
 #                                 check that every table matches FILE
@@ -16,9 +17,20 @@
 # session_replication_role = replica, so foreign keys need no order;
 # that needs a superuser, which the test database's owner is.
 #
+# The guard needs UBI_M4_GATE=1, which only m4-host-add.sh's control
+# plane container sets, and a database named *_test<n> whose <n> is
+# TEST_ENV_NUMBER. A bare *_test name is refused: the development
+# bootstrap's deployment database is clover_test.
+#
 # The file has no .rb suffix, so the coverage gate does not track it.
 
 require "json"
+
+unless ENV["UBI_M4_GATE"] == "1"
+  warn "m4-db-state: refusing: UBI_M4_GATE=1 is not set; only m4-host-add.sh runs this"
+  exit 2
+end
+
 require_relative "../../../db"
 
 def tables = DB.tables.map(&:to_s).reject { it == "schema_migrations" }.sort
@@ -29,9 +41,10 @@ end
 
 def state = tables.to_h { [it, digests(it)] }
 
+number = ENV["TEST_ENV_NUMBER"].to_s
 name = DB.get(Sequel.function(:current_database))
-unless name.match?(/_test\d*\z/)
-  warn "m4-db-state: refusing database #{name}: only a *_test database can be snapshotted and restored"
+unless number.match?(/\A\d+\z/) && name.end_with?("_test#{number}")
+  warn "m4-db-state: refusing database #{name}: only a *_test<n> database with <n> = TEST_ENV_NUMBER (#{number.empty? ? "unset" : number}) can be snapshotted and restored"
   exit 2
 end
 

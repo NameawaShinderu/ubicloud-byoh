@@ -239,8 +239,10 @@ raises MissingMock and host add refuses to reach a host.
 The database is the worktree `.env.rb`'s `CLOVER_DATABASE_URL` with
 `TEST_ENV_NUMBER=6` (`UBI_M4_DB_NUMBER`), `clover_m2_test6` here, which
 the spec suite shares, so **never run this while a pspec runs**.
-`m4-db-state` refuses a database whose name does not end in `_test` or
-`_test<n>`, takes a snapshot (an md5 per row of every table) before the
+`m4-db-state` refuses to run without `UBI_M4_GATE=1` (set only on the
+gate's control-plane container) or on a database whose name does not end
+in `_test<n>` with `<n>` = `TEST_ENV_NUMBER`, so the development
+bootstrap's deployment database `clover_test` is always refused. It takes a snapshot (an md5 per row of every table) before the
 first command, and on exit, pass or fail, deletes every row the run
 added and checks that each table is back as it was. A row the run
 changed in place stops the restore with the table named.
