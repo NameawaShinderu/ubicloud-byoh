@@ -298,6 +298,19 @@ RSpec.describe ByohHostPreflight do
         expect(check(evaluate, "PF20").detail).to start_with "BOOT_IMAGE_SOURCE=auto fetches every boot image from Ubicloud's R2 storage"
       end
 
+      it "takes blob-storage images when production fetches every image from R2" do
+        allow(Config).to receive_messages(production?: true, boot_image_source: "auto", ubicloud_images_r2_bucket_name: "b",
+          ubicloud_images_r2_endpoint: "https://r2.example", ubicloud_images_r2_access_key: "a", ubicloud_images_r2_secret_key: "s")
+        preflight = evaluate(boot_images: ["ubuntu-noble", "github-ubuntu-2404", "ubuntu-hardy"])
+        expect(check(preflight, "PF20").detail).to eq "ubuntu-hardy is not a known boot image for x64"
+        expect(status(evaluate(boot_images: ["github-ubuntu-2404"]), "PF20")).to eq "pass"
+      end
+
+      it "keeps refusing blob-storage images in production with public sources" do
+        allow(Config).to receive_messages(production?: true, boot_image_source: "public")
+        expect(check(evaluate(boot_images: ["github-ubuntu-2404"]), "PF20").detail).to eq "github-ubuntu-2404 is served only from Ubicloud's blob storage"
+      end
+
       it "checks arm64 images" do
         expect(check(evaluate(from_fixture("arm-biglittle"), main_ip: "203.0.113.10"), "PF20").detail).to eq "location byoh-pf, boot image(s) ubuntu-noble for arm64"
       end
@@ -334,6 +347,13 @@ RSpec.describe ByohHostPreflight do
       version = Prog::DownloadBootImage::BOOT_IMAGE_SHA256["ubuntu-noble"]["x64"].keys.max
       expect(urls).to eq ["https://cloud-images.ubuntu.com/releases/noble/release-#{version}/ubuntu-24.04-server-cloudimg-amd64.img"]
       expect(from_fixture("arm-biglittle").boot_image_urls(["ubuntu-noble"]).first).to end_with "-arm64.img"
+    end
+
+    it "gives none when production fetches every image from blob storage" do
+      allow(Config).to receive_messages(production?: true, boot_image_source: "auto")
+      expect(parse.boot_image_urls(["ubuntu-noble"])).to eq []
+      allow(Config).to receive(:boot_image_source).and_return("public")
+      expect(parse.boot_image_urls(["ubuntu-noble"]).size).to eq 1
     end
 
     it "gives none for an unknown architecture" do

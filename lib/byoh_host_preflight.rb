@@ -178,8 +178,11 @@ class ByohHostPreflight
 
   # The URL a host downloads each image from, for the PF15 egress check
   # (--boot-image-url); images without one are left out, PF20 reports
-  # them. Every image outside blob storage has a public mirror.
+  # them. Every image outside blob storage has a public mirror. When
+  # production fetches every image from blob storage, whose URLs are
+  # signed per download, there is nothing to probe in advance.
   def boot_image_urls(boot_images)
+    return [] if Prog::DownloadBootImage.production_sources?
     return [] unless (arch = ARCHES[@facts["arch"]])
 
     boot_images.reject { boot_image_problem(it, arch) }.map do |name|
@@ -352,7 +355,7 @@ class ByohHostPreflight
   def boot_image_problem(name, arch)
     if Prog::DownloadBootImage::BOOT_IMAGE_SHA256.dig(name, arch).to_h.empty?
       "#{name} is not a known boot image for #{arch}"
-    elsif Prog::DownloadBootImage.blob_storage_only?(name)
+    elsif Prog::DownloadBootImage.blob_storage_only?(name) && !Prog::DownloadBootImage.production_sources?
       "#{name} is served only from Ubicloud's blob storage"
     end
   end
