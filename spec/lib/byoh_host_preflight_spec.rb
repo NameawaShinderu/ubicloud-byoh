@@ -58,7 +58,7 @@ RSpec.describe ByohHostPreflight do
 
   describe ".parse" do
     it "reads every fixture host's real output" do
-      %w[base amd-uniform arm-biglittle btrfs ebs-nvme gpu-nouveau intel-hybrid kvm64-model lvm no-kvm noisy-bashrc
+      %w[base amd-uniform arm-biglittle btrfs ebs-nvme gpu-nouveau intel-hybrid kvm64-model kvm64-vmx lvm no-kvm noisy-bashrc
         offline-cpus one-cpu pve-node rhizome-user smt-offline two-default-routes ufw-off ufw-on virtio-vda zfs].each do |name|
         preflight = from_fixture(name)
         expect(preflight).to be_readable, name
