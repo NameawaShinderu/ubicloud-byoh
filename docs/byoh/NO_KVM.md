@@ -36,7 +36,7 @@ When none of them is possible, the last resort is QEMU's emulator (L5).
 | **L2** | — | The hardware can virtualize, but KVM is off or hidden (firmware, module, hypervisor CPU model, cloud option) | Nothing until it is fixed | — | — | Detection, per-platform fix, and refusal at registration with a recommended plan SHIPPED (WP4) |
 | **L3** | `container` | Any x86_64 Linux ≥ 5.12 with cgroup v2 | Unprivileged LXC system container in rhizome's per-VM network namespace | **CPU 95-99%, memory bandwidth 91-98%, 3.6-5.4 s to SSH** (VERIFIED, `dir` disk driver only) | Shared kernel: weaker than a VM | SHIPPED (WP5), experimental: `dir` disk VERIFIED end to end in the lab (section 5.5); `crypt-loop`, AppArmor, lxcfs and project quotas UNVERIFIED |
 | **L4** | `pvm` | No hardware virtualization; a PVM host kernel (`kvm_pvm`) | Cloud Hypervisor with direct kernel boot of a PVM guest kernel | SOURCE only: near single-level KVM (paper); 57% of native for a kernel build on m6a (third party). No own number | VM, with a software world switch | Detection SHIPPED; host side VERIFIED under emulation, guest boot UNVERIFIED; build gated on a go/no-go test (WP7) |
-| **L5** | `emulated` | Anything x86_64 | QEMU TCG (software CPU) | CPU 26-29%, memory bandwidth ~2.5%, 64-96 s to SSH (VERIFIED) | Not a security boundary | Rhizome side on this branch; control-plane hookup PLANNED (WP6), experimental ([EMULATED_HOSTS.md](EMULATED_HOSTS.md)) |
+| **L5** | `emulated` | Anything x86_64 | QEMU TCG (software CPU) | CPU 26-29%, memory bandwidth ~2.5%, 64-96 s to SSH (VERIFIED) | Not a security boundary | SHIPPED (WP6), experimental: control plane spec-gated; the end-to-end lab (`run.sh l5`) and real hosts UNVERIFIED (section 8.1; [EMULATED_HOSTS.md](EMULATED_HOSTS.md)) |
 
 **L3 or L4?** L3 is the speed fallback. L4 is chosen only when the operator needs VM-level isolation
 without hardware virtualization and accepts a custom host kernel. On AWS, GCP and Azure the
@@ -516,8 +516,9 @@ the design no longer depends on it (section 5.3, "User group").
   `sys-kernel-config.mount` and `sys-kernel-debug.mount`, and holds or diverts `linux-image-*` and
   `linux-modules-*` so unattended-upgrades never installs kernels the container cannot use. The refresh
   cadence is documented with the image.
-- **User group.** The `create_unix_user` heredoc is unchanged for every tier. Container (and emulated)
+- **User group.** The `create_unix_user` heredoc is unchanged for KVM and container hosts. Container
   host prep runs `groupadd -f -r kvm`, so `usermod -a -G kvm` cannot fail whether or not the group exists.
+  Emulated hosts get their own heredoc (section 8.1).
 - **Serial log** from `lxc.console.logfile` (no early kernel messages). **Metrics** from cgroup
   `cpu.stat`, `memory.current` and `io.stat` instead of the per-PID reads in `rhizome/host/lib/vm_stats.rb`.
 - **Unsupported on L3** (the API refuses, or the docs say so):
@@ -858,6 +859,55 @@ never written, so nothing is renamed. WP6 hooks it up: the family and sizes, the
 lacks them. Tenancy: one project per **host** by default. Deferred: tuning `EMULATED_VM_OVERHEAD_MIB`
 beyond the measured 384 MiB, and further timing tuning.
 
+### 8.1 What WP6 shipped
+
+SHIPPED (spec-gated; nothing of it run on a real host, UNVERIFIED there):
+- **Offered.** `emulated` joins `ByohVirtTiers::SHIPPED` (and `SHIPPED_TIERS` of
+  `bootstrap-data-plane.sh`), so `bin/byoh-location set --virt-tiers kvm,emulated --accept emulated`,
+  `bin/register-byoh-host --virt-tier emulated --accept-fallback` (or `auto` when no faster fallback is
+  ready) and the VM API with an `emulated-*` size work, behind every gate of section 10.3.
+- **Sizes.** `emulated-2` and `emulated-4` in `Option::TierVmSizes`, at **1 GiB per vCPU** (the other
+  tiers keep 4 GiB): with the tier's 512 MiB per-VM overhead and 2 GiB host reserve an 8 GiB machine has
+  a 4 GiB budget, which an `emulated-2` fits and a 4 GiB-per-vCPU size would not.
+- **prep.json.** On an emulated host `Vm#params_json` sets `hypervisor: "qemu"`, `accel: "tcg"` and
+  `hugepages: false` (golden `params_json_emulated.json`); every other host's JSON is unchanged.
+- **Unix user.** `Prog::Vm::Metal::Nexus::EMULATED_UNIX_USER` (golden `create_unix_user_emulated.sh`):
+  no `kvm` group, the home created by root as `root:<vm> 0750` (rhizome's `check_emulated_home` refuses
+  anything else), `userdel` without `-r` and the old home removed by root with `rm -rf
+  --one-file-system`, since `userdel -r` refuses a home its user does not own. `prep.json` is written
+  by root (`sudo tee`) into that home. The KVM heredoc and `sudo -u <vm> tee` are unchanged (goldens).
+- **Timings** (`ByohVirtTiers::SLOW_TIMINGS`, only on emulated hosts): 30 minutes from allocation to
+  `wait` before the deadline pages (KVM: 10), the BYOH netns SSH probe gives up after 28 minutes (KVM:
+  8), and the soft stop (QMP `system_powerdown`) gets 180 s before the hard stop (KVM: 60). The KVM
+  values stay pinned by `nexus_golden_spec.rb`.
+- **Downloads.** `Prog::DownloadCloudHypervisor`, `Prog::DownloadFirmware` and the `VmHost` helpers
+  that start them refuse hosts whose tier runs no cloud-hypervisor (`emulated` and `container`;
+  `ByohVirtTiers.runs_cloud_hypervisor?`). A tier host downloads only the first of its tier's images
+  (`ubuntu-noble`) unless registration names others (`--default-boot-image ubuntu-jammy`).
+- **Refuse to start.** Before every `systemctl start` or `restart` of an emulated VM, rhizome checks
+  that the home is root-owned, that the unit file is a regular file only root can write, and that
+  `systemctl cat` (the unit with every drop-in) still carries every line of `QemuTcg.hardening`
+  (`ProtectSystem=strict`, `ReadWritePaths=/vm/<vm>`, `CapabilityBoundingSet=`, the syscall filter and
+  the rest), `User=`/`Group=` of the VM, a `MemoryMax=`, `-accel tcg,...` and QEMU's `-sandbox`, and
+  that no line or drop-in sets one of those keys to anything else (`QemuTcg.check_unit!`). The golden
+  units in `rhizome/host/spec/fixtures/qemu_tcg/` pin the text, and a spec removes each line in turn.
+- **Bootstrap.** `bootstrap-data-plane.sh --tier emulated` prints what the tier costs (speed, no
+  security boundary, burstable credits), notes swap and a present `/dev/kvm`, installs `qemu-system-x86
+  ovmf`, and checks that `qemu-system-x86_64 -accel help` lists `tcg` and that OVMF exists.
+- **Lab.** `scripts/byoh/test/nokvm/run.sh l5` (`l5.sh`): one VM through the real `setup-vm`, ubiblk,
+  `stop-vm` and `vm-stats`, with SSH within 420 s, QMP `query-kvm` false, no `/dev/kvm` among QEMU's
+  descriptors, guest `systemd-detect-virt` = `qemu` without `vmx`/`svm`, the VM user unable to replace
+  anything in its home, a swapped QMP socket that only makes `stop-vm` fall back, the hardening refusal
+  on a weakened unit, QMP power-down, recreate-unpersisted, restart, and delete twice. It needs mounts
+  (`ip netns add`), so it runs only where `l3` may (a throwaway VM or the admin-loaded profile, section
+  15) and **has not been run** (UNVERIFIED). `fake-systemctl` now runs units with `User=`, without a
+  network namespace and with continuation lines, and answers `systemctl cat`; checked in a plain
+  container, the l3 lab was not re-run.
+
+Not shipped (deferred, as planned): the exit-reason diagnosis of EMULATED_HOSTS.md section 6.5, the
+admin "Create VM" size list for emulated hosts, an "Emulated" badge in the UI (no lower tier has one
+yet), per-host instead of per-location tenancy, and RSS-based tuning of the 512 MiB overhead.
+
 ### Options rejected
 
 | Option | Verdict | Why (source, confidence) |
@@ -1006,10 +1056,10 @@ the policy gate, R2, the storage tier branch, the HostNexus labels `verify_virt_
 the `MoveVm` and `move-location` refusals, the location CLI (`--virt-tiers`, `--accept`, `--unaccept`,
 `rates --family`), `ByohVirtRegistration` and its wiring, `bootstrap-data-plane.sh --tier`.
 
-**No lower tier can be used yet.** `ByohVirtTiers::SHIPPED` is empty: `bin/byoh-location set` refuses
-to offer a tier, and registration refuses one, until the WP that ships its rhizome support adds it
-(container: WP5; emulated: WP6; pvm: WP7 on a GO). Every lower-tier path is exercised in specs with
-the constant stubbed.
+**As WP4 shipped, no lower tier could be used.** `ByohVirtTiers::SHIPPED` was empty: `bin/byoh-location
+set` refuses to offer a tier, and registration refuses one, until the WP that ships its rhizome support
+adds it. Container joined it in WP5 and emulated in WP6; pvm joins only in WP7 on a GO. Every
+lower-tier path is also exercised in specs with the constant stubbed.
 
 Differences from sections 10.3, 10.4 and 11.2, each stricter or equal:
 - `Prog::Vm::Nexus.assemble(allowed_tiers:)` **defaults to `["kvm"]`**. Service callers (Kubernetes,
@@ -1174,7 +1224,8 @@ path refuses `kvm_blocked` with the probe's reasons and otherwise refuses on the
 before; `auto` refuses `kvm_blocked` and a container, picks kvm, pvm or container as above and then
 refuses the unshipped pvm and container before any `apt-get`; `--tier emulated` is refused before any
 `apt-get`; with `BYOH_ALLOW_UNSHIPPED_TIER=1` the emulated and container paths install their packages
-(stubbed) and print `--virt-tier <tier> --accept-fallback`; `--tier pvm` refuses without `kvm_pvm`;
+(stubbed) and print `--virt-tier <tier> --accept-fallback`. (That run predates WP5 and WP6, which ship
+container and emulated; the emulated additions of section 8.1 are UNVERIFIED); `--tier pvm` refuses without `kvm_pvm`;
 `auto` outside a checkout and bad arguments are refused. On a real VM without KVM it is UNVERIFIED.
 
 ### 11.4 Where the registration code lives (M4 collision)
@@ -1206,7 +1257,7 @@ tier is registered and then held at `verify_virt_tier` until a probe agrees.
 | L1 | as today | as today | — | — |
 | L3 `container` | "System container: shared host kernel, near-native speed. Not a VM." | One project per location | `container`; options `container:multitenant` (needs whole-core cpusets or SMT off; refused until that is checked, section 10.6), `container:unencrypted-disk`, `container:nested-userns`, `container:guest-firewall` | Host sysctl checks fail; `dir` driver without `prjquota` (any location) |
 | L4 `pvm` | "PVM: software virtualization (experimental). Weaker isolation than standard VMs; Ubicloud-supplied guest kernel without AppArmor. Linux only." | One project per location | `pvm`; option `pvm:multitenant` only with SMT off or core scheduling and CPUs "Not affected" for l1tf and mds (refused until that is checked, section 10.6) | Secure Boot on; a Meltdown-affected CPU (any tenancy, section 6.5) |
-| L5 `emulated` | "Emulated: slow, compatibility only. Not a security boundary." | One project per **host** (as shipped: per location, section 10.6) | `emulated`; no options, so never shared | The unit's hardening directives missing |
+| L5 `emulated` | "Emulated: slow, compatibility only. Not a security boundary." | One project per **host** (as shipped: per location, section 10.6; SHIPPED in WP6, section 8.1) | `emulated`; no options, so never shared | The unit's hardening directives missing |
 
 Applies to every lower rung:
 - Its families and sizes are separate (`Option::TierVmSizes`) and never chosen implicitly.
@@ -1229,7 +1280,7 @@ Applies to every lower rung:
 | 3 | WP3 | Detection v2: the probe identifies more causes, prints a recommended plan, `refresh --all` back-fills | L1-T1, L2-T1..T3 (section 14) on at least one cloud |
 | 4 | WP4 | `virt_tier` and the location policy; every existing host becomes `kvm` by the column default; registration refuses with the plan | Full gate; goldens unchanged; an upgrade rehearsal on a copy of the live DB |
 | 5 | WP5 | `container` tier, experimental | The lab harness (dir driver); L3-T1 on a real Ubuntu 24.04 host (crypt-loop, AppArmor, lxcfs, escape probes) before the family is granted outside the operator's own org |
-| 6 | WP6 | `emulated` tier end to end, experimental | The L5 harness |
+| 6 | WP6 | `emulated` tier end to end, experimental (SHIPPED, section 8.1) | The L5 harness (written, not run here: it needs a throwaway VM) and L5-T1 |
 | 7 | WP7 | PVM: the go/no-go script always; the tier only on a reported GO | L4-T1 GO, then L4-T2 |
 | 8 | WP8 | Docs final | Every claim labelled; full gate |
 
@@ -1376,7 +1427,19 @@ done
 ### L5 emulated
 
 ```bash
-# L5-T1 the L-Q live gate of EMULATED_HOSTS.md on a host without /dev/kvm, after WP6.
+# L5-T1 on a throwaway x86_64 Ubuntu 24.04 VM WITHOUT /dev/kvm (AWS m6i.large, a VPS), after WP6:
+#   the lab first, which needs no control plane:
+BYOH_NOKVM_THROWAWAY_VM=1 scripts/byoh/test/nokvm/run.sh l5     # expect "l5 ok"; record the SSH time
+# Then the L-Q live gate of EMULATED_HOSTS.md section 7, with the shipped commands:
+#   data plane:     sudo scripts/byoh/bootstrap-data-plane.sh --tier emulated
+#   control plane:  bin/byoh-location rates --location <loc> --family emulated --from standard --multiplier <X>
+#                   bin/byoh-location set --location <loc> --virt-tiers kvm,emulated --accept emulated
+#                   (restart web, respirate and monitor)
+#                   bin/register-byoh-host --location <loc> --main-ip <ip> ... --virt-tier emulated --accept-fallback --yes
+#                   bin/byoh-location grant --location <loc> --project <ubid>
+# Expect accepting after one reboot with total_hugepages_1g = the memory budget, then
+#   an emulated-2 VM via the API (size emulated-2, boot_image ubuntu-noble): running, SSH, apt-get update,
+#   stop/start/restart/delete, serial log, QMP query-kvm false; a standard-2 VM in the same location fails with 400.
 ```
 
 ## 15. Build plan (sequential on `no-kvm`)

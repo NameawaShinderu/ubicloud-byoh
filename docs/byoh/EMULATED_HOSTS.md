@@ -2,6 +2,12 @@
 
 > This is rung L5, the last resort, of the virtualization ladder in [NO_KVM.md](NO_KVM.md).
 > Faster rungs come first: switch KVM on (L2), system containers (L3) and PVM (L4).
+>
+> Superseded control-plane design: sections 6.1, 6.2, 6.6-6.8 plan a `vm_host.accel` column, an
+> `--accel tcg` flag and an `emulated_hosts` location key. None of that was built. The shipped hookup
+> uses the tier framework instead (`virt_tier = 'emulated'`, `--virt-tier emulated`, the location's
+> `byoh_virt` policy): see NO_KVM.md sections 8.1 and 10. The rhizome side (section 6.5), the security
+> model (section 4) and the memory budget (section 6.4) hold as written.
 
 Status: DESIGN (revision 2), 2026-10-15. Branch `qemu-tcg`, starting from `byoh-driver` 9e22d71ec (M0-M3).
 File:line references are to 9e22d71ec. Re-read a file before relying on a line number.
