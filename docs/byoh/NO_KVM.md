@@ -45,10 +45,9 @@ not L3 or L4.
 
 Rules (U1 and "never silent"):
 1. **An L1 host behaves byte for byte as today**, pinned by golden specs captured from 9e22d71ec
-   (section 15, "U1 proof"). One known exception is open: the QEMU-KVM path *without* hugepages
-   switched from `-m` to a shared memfd backend on this branch (commit f1e99cdaa,
-   `rhizome/host/lib/vm_setup.rb` "vhost-user devices need guest RAM ..."). WP2 restricts that
-   change to emulated VMs and pins the old unit with a golden fixture. Open until WP2.
+   (section 15, "U1 proof"). The one known exception is closed: commit f1e99cdaa had switched the
+   QEMU-KVM path *without* hugepages from `-m` to a shared memfd backend; WP2 restricts the memfd
+   backend to emulated VMs and pins the 9e22d71ec unit (`qemu_kvm_nohugepages.service`).
 2. **A host's tier is set once, at registration**: declared, or `auto` (chosen from the probe and
    printed, and only with `--accept-fallback`). It never changes afterwards (a database trigger). A
    later probe can page, but never moves a host.
@@ -1121,8 +1120,14 @@ for every container it creates:
 - The existing M3 harness in `scripts/byoh/test/` uses `--privileged` for systemd and is not reused.
 
 **U1 proof, kept in every WP.** These golden specs must stay unchanged:
-- `rhizome/host/spec/vm_setup_golden_spec.rb`, with the fixtures `ch_unit.service`, `ch_unit_nohugepages.service`, `ch_dnsmasq.service`, `qemu_kvm_hugepages*.service`
-- `spec/model/metal/vm_golden_spec.rb` (`params_json_ch*.json`)
+- `rhizome/host/spec/vm_setup_golden_spec.rb`, with the fixtures `ch_unit.service`, `ch_unit_nohugepages.service`, `ch_dnsmasq.service`, `qemu_kvm_hugepages*.service`, `qemu_kvm_nohugepages.service` (WP2)
+- `spec/model/metal/vm_golden_spec.rb` (`params_json_ch*.json`; `params_json_qemu_gpu*.json`, WP2)
+- `spec/scheduling/allocator_golden_spec.rb` (`allocator_*.json`, WP2): candidate hosts, scores, the
+  logged query and filter counts, and what is booked, on an L1 fixture
+- `spec/prog/vm/nexus_assemble_golden_spec.rb` (`nexus_assemble_families.json`, WP2): the VM row,
+  volumes and strand for the first size of every family and architecture
+- `spec/routes/web/vm_options_golden_spec.rb` (`vm_create_options.json`, WP2): the create form's
+  option tree for a project without BYOH locations
 - `spec/prog/vm/metal/nexus_golden_spec.rb` (`create_unix_user.sh`)
 - `spec/prog/vm/prep_host_golden_spec.rb` (the PrepHost command)
 - `spec/lib/validation_golden_spec.rb`
@@ -1145,6 +1150,10 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
    They fail on HEAD only for the nohugepages unit.
 2. Gate the memfd backend in `vm_setup.rb` on `emulated?`; every golden green.
 - Done: `git diff 9e22d71ec -- '*golden*'` shows only added files; the full gate.
+- Status: SHIPPED. Every WP2 golden was generated in a worktree of 9e22d71ec (which also needed
+  this branch's `virt_probe` migration, only to share the test databases), and the pre-existing
+  goldens regenerate byte for byte there. Families with no VmVCpu rate in hetzner-fsn1, us-west-2 or
+  gcp-us-central1 (for example `premium`, `m6a`) are pinned as "no location", not assembled.
 
 ### WP3: detection v2 and the harness skeleton
 

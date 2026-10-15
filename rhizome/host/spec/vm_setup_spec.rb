@@ -1807,11 +1807,10 @@ NFTABLES_CONF
   end
 
   describe "#build_qemu_service without hugepages" do
-    # vhost-user disks need guest RAM the backend can map, so even without
-    # hugepages guest RAM is a shared memfd. Plain -m fails at start with
-    # "vhost start failed". No production caller passes hugepages: false
-    # for QEMU+KVM; the golden QEMU+KVM unit has hugepages and is unchanged.
-    it "backs guest RAM with a shared memfd" do
+    # Upstream QEMU+KVM without hugepages gives the guest plain -m; only
+    # emulated VMs get a shared memfd for their vhost-user disks
+    # (vm_setup_tcg_spec.rb and the golden qemu_kvm_nohugepages unit).
+    it "uses -m flag instead of memory-backend-memfd when hugepages is false" do
       vs.instance_variable_set(:@hypervisor, "qemu")
       vs.instance_variable_set(:@hugepages, false)
 
@@ -1830,8 +1829,8 @@ NFTABLES_CONF
       vs.send(:install_systemd_unit, *args)
 
       expect(vps).to have_received(:write_systemd_service) { |content|
-        expect(content).to include("-object memory-backend-memfd,id=mem0,size=2G,share=on \\\n-numa node,memdev=mem0 \\\n-m 2G \\\n")
-        expect(content).not_to include("hugetlb")
+        expect(content).to include("-m 2G")
+        expect(content).not_to include("memory-backend-memfd")
       }
     end
   end

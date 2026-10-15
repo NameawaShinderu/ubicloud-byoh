@@ -1067,19 +1067,27 @@ DNSMASQ_SERVICE
       "-device virtio-blk-pci,drive=cidrive,romfile=",
     ]
 
-    # vhost-user devices need guest RAM the backend can map, so guest RAM
-    # is a shared memfd with or without hugepages. Plain -m makes the
-    # vhost-user disk fail to start ("vhost start failed").
+    # vhost-user devices need guest RAM the backend can map, so emulated
+    # VMs, which run without hugepages, get a shared memfd. Plain -m makes
+    # their vhost-user disk fail to start ("vhost start failed"). QEMU+KVM
+    # without hugepages keeps plain -m, as upstream has it.
     size = "#{mem_gib}G"
-    mem_parts = [
+    mem_parts =
       if @hugepages
-        "-object memory-backend-memfd,id=mem0,size=#{size},hugetlb=on,hugetlbsize=1G,prealloc=on,share=on"
+        [
+          "-object memory-backend-memfd,id=mem0,size=#{size},hugetlb=on,hugetlbsize=1G,prealloc=on,share=on",
+          "-numa node,memdev=mem0",
+          "-m #{size}",
+        ]
+      elsif emulated?
+        [
+          "-object memory-backend-memfd,id=mem0,size=#{size},share=on",
+          "-numa node,memdev=mem0",
+          "-m #{size}",
+        ]
       else
-        "-object memory-backend-memfd,id=mem0,size=#{size},share=on"
-      end,
-      "-numa node,memdev=mem0",
-      "-m #{size}",
-    ]
+        ["-m #{size}"]
+      end
 
     cpu_parts = if emulated?
       [
