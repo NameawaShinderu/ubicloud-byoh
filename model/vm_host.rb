@@ -582,6 +582,7 @@ end
 #  score_offset       | double precision         | NOT NULL DEFAULT 0
 #  ipv6_mode          | text                     | NOT NULL DEFAULT 'gua'::text
 #  network_check      | jsonb                    |
+#  virt_probe         | jsonb                    |
 # Indexes:
 #  vm_host_pkey     | PRIMARY KEY btree (id)
 #  vm_host_ip6_key  | UNIQUE btree (ip6)

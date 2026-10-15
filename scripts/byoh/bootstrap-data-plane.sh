@@ -56,7 +56,19 @@ echo "  $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '\"')"
 # such as a VPS without nested virtualization, is refused before it is
 # registered rather than looping in PrepHost.
 step "1b. hardware virtualization"
-virt_hint="Enable VT-x/AMD-V in the firmware on bare metal. On a cloud VM, use an instance type with nested virtualization enabled (AWS m8i/c8i/r8i with nested virtualization, GCP --enable-nested-virtualization, an Azure size that supports nested virtualization) or a bare-metal type. On Proxmox: qm set <vmid> --cpu host. A VPS without nested virtualization cannot be a data plane."
+# The virtualization ladder report (docs/byoh/NO_KVM.md): which rung this
+# machine is on and why. It only reads; the checks below still decide.
+# The probe needs ruby, which step 4 installs anyway. A copy of this
+# script run outside a checkout skips the report.
+probe="$(cd "$(dirname "$0")" && pwd)/../../rhizome/host/bin/virt-probe"
+if [ -f "$probe" ]; then
+  if ! command -v ruby >/dev/null 2>&1; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ruby >/dev/null
+  fi
+  sudo ruby "$probe" | sed 's/^/  /'
+fi
+virt_hint="For the fix on this platform run, on the control plane: bin/byoh-virt probe --main-ip <this host>. Enable VT-x/AMD-V in the firmware on bare metal. On a cloud VM, use an instance type with nested virtualization enabled (AWS m8i/c8i/r8i with nested virtualization, GCP --enable-nested-virtualization, an Azure size that supports nested virtualization) or a bare-metal type. On Proxmox: qm set <vmid> --cpu host. A VPS without nested virtualization cannot be a data plane."
 if [ ! -c /dev/kvm ]; then
   echo "ERROR: /dev/kvm is missing, so KVM is unavailable." >&2
   echo "  $virt_hint" >&2

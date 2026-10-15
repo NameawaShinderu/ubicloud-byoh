@@ -141,6 +141,7 @@ class Prog::Vm::HostNexus < Prog::Base
     bud Prog::SetupSysstat
     bud Prog::SetupNftables
     bud Prog::SetupByohEgressNat if vm_host.byoh?
+    bud Prog::LearnVirt if vm_host.byoh?
     bud Prog::SetupNdpProxy if vm_host.ndp_needed
     bud Prog::SetupNodeExporter
     hop_wait_prep

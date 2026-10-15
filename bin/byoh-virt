@@ -1,0 +1,30 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Where a host stands on the virtualization ladder (docs/byoh/NO_KVM.md):
+# probing before registration, and the record of registered hosts.
+# The logic lives in lib/byoh_virt_cli.rb; run with --help for the commands.
+#
+# Example:
+#
+#   bundle exec bin/byoh-virt probe --main-ip 203.0.113.10 --ssh-key ~/.ssh/byoh_data
+#
+# Uses RACK_ENV from the environment (defaults to "development").
+
+unless ENV["RACK_ENV"]
+  ENV["RACK_ENV"] = "development"
+end
+
+ENV["SKIP_LIT_REQUIRE_FROZEN"] = "1"
+require "bundler"
+if ENV["RACK_ENV"] == "production"
+  Bundler.setup(:default)
+else
+  Bundler.setup(:default, :development)
+end
+
+require "logger"
+require_relative "../db"
+require_relative "../loader"
+
+exit ByohVirtCli.new.run(ARGV)
