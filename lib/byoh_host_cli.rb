@@ -160,8 +160,9 @@ class ByohHostCli
 
   # Recomputes the disk ids of a BYOH host's storage devices with
   # ByohDeviceIdentity and, with --yes, stores them. Hosts registered
-  # before it hold "" or partition names, which the health checks cannot
-  # resolve, and LearnStorage refuses to relearn once VMs have volumes.
+  # before it hold "", "root" or partition names, which the health checks
+  # cannot resolve, and LearnStorage refuses to relearn once VMs have
+  # volumes.
   # Only unix_device_list changes; capacity is left alone.
   def cmd_relearn_device_ids(argv)
     opts = {}
@@ -179,6 +180,10 @@ class ByohHostCli
       @device_ids.call(host.sshable, devices.map { it.path.chomp("/") })
     rescue ByohDeviceIdentity::Error => e
       raise Error, e.message
+    rescue Sshable::SshError => e
+      raise Error, "could not read disk ids from host #{host.ubid} over SSH: #{e.message}: #{e.stderr.to_s.strip}"
+    rescue *Sshable::SSH_CONNECTION_ERRORS => e
+      raise Error, "could not read disk ids from host #{host.ubid} over SSH: #{e.class}: #{e.message}"
     end
     changes = devices.filter_map do |sd|
       new_ids = ids.fetch(sd.path.chomp("/"))

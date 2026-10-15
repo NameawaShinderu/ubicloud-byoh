@@ -288,6 +288,19 @@ RSpec.describe ByohHostCli do
       zfs = ->(_, _) { raise ByohDeviceIdentity::Error, "/var/storage is on rpool/ROOT (zfs), not a block device" }
       expect(cli("relearn-device-ids", "--host", host.ubid, device_ids: zfs)).to eq [1, "", "! /var/storage is on rpool/ROOT (zfs), not a block device\n"]
     end
+
+    it "reports a command that failed on the host without a backtrace" do
+      add_device("DEFAULT", [""])
+      failed = ->(_, _) { raise Sshable::SshError.new("findmnt -nP -o SOURCE,MAJ:MIN,FSTYPE --target /var/storage", "", "findmnt: /var/storage: not found\n", 1, nil) }
+      expect(cli("relearn-device-ids", "--host", host.ubid, device_ids: failed)).to eq [1, "", "! could not read disk ids from host #{host.ubid} over SSH: command exited with an error: findmnt -nP -o SOURCE,MAJ:MIN,FSTYPE --target /var/storage: findmnt: /var/storage: not found\n"]
+      expect(host.storage_devices.first.unix_device_list.to_a).to eq [""]
+    end
+
+    it "reports an unreachable host without a backtrace" do
+      add_device("DEFAULT", [""])
+      down = ->(_, _) { raise Net::SSH::ConnectionTimeout, "timed out connecting to 10.0.0.5" }
+      expect(cli("relearn-device-ids", "--host", host.ubid, device_ids: down)).to eq [1, "", "! could not read disk ids from host #{host.ubid} over SSH: Net::SSH::ConnectionTimeout: timed out connecting to 10.0.0.5\n"]
+    end
   end
 
   describe "setup-egress-nat" do
