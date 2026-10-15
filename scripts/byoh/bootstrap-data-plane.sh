@@ -34,15 +34,31 @@
 #
 # --tier picks the rung of the virtualization ladder (docs/byoh/NO_KVM.md)
 # the host will be registered on. The default, kvm, refuses a host
-# without usable KVM, as this script always did. auto runs the
-# virtualization probe and picks kvm when the machine has hardware
-# virtualization, pvm on a PVM host, and otherwise the fastest fallback
-# its kernel allows (container, then emulated); never silently: it prints
-# the choice, and registration still needs --accept-fallback. A lower tier
-# skips only the KVM checks and installs only that tier's userspace
+# without usable KVM, as this script always did; with the probe at hand
+# it also refuses a host the probe finds kvm_blocked (KVM present but not
+# usable for cloud-hypervisor), which registration would refuse. auto
+# makes the choice bin/register-byoh-host --virt-tier auto makes: kvm on
+# a host that runs KVM (the checks below then demand 1G pages, as
+# registration does), pvm on a PVM host, the fastest fallback its kernel
+# allows (container, then emulated) on a host without hardware
+# virtualization, and a refusal with the probe's reasons otherwise, a
+# kvm_blocked host included. Never silently: it prints the choice, and
+# registration still needs --accept-fallback.
+#
+# A lower tier is refused before anything is installed until this
+# checkout can register it (SHIPPED_TIERS below). Once shipped, a lower
+# tier skips only the KVM checks and installs only that tier's userspace
 # packages. This script never changes kernels, sysctls or GRUB.
 #
+# Environment:
+#   BYOH_ALLOW_UNSHIPPED_TIER=1  prepare a lower tier that cannot be
+#                                registered yet (lab work only)
+#
 set -euo pipefail
+
+# The lower tiers this checkout can register; keep it equal to
+# ByohVirtTiers::SHIPPED (spec/lib/byoh_virt_tiers_spec.rb checks).
+SHIPPED_TIERS=""
 
 usage() {
   echo "usage: $0 [--tier kvm|auto|container|pvm|emulated]"
@@ -84,6 +100,25 @@ case "$TIER" in
     ;;
 esac
 
+# Refuses a lower tier this checkout cannot register yet, before any
+# package is installed for it.
+require_shipped_tier() {
+  case "$1" in
+    kvm|auto) return 0 ;;
+  esac
+  case " $SHIPPED_TIERS " in
+    *" $1 "*) return 0 ;;
+  esac
+  if [ "${BYOH_ALLOW_UNSHIPPED_TIER:-0}" = 1 ]; then
+    echo "  WARNING: tier $1 cannot be registered yet; preparing it anyway (BYOH_ALLOW_UNSHIPPED_TIER=1)." >&2
+    return 0
+  fi
+  echo "ERROR: $1 hosts cannot be registered yet (docs/byoh/NO_KVM.md section 11), so this script installs nothing for them." >&2
+  echo "  Run the data plane where KVM works instead; for lab work only, set BYOH_ALLOW_UNSHIPPED_TIER=1." >&2
+  exit 1
+}
+require_shipped_tier "$TIER"
+
 MARKERS_DIR="$HOME/.ubi-data-plane-bootstrap"
 mkdir -p "$MARKERS_DIR"
 
@@ -118,31 +153,42 @@ if [ -f "$probe" ]; then
   fi
   sudo ruby "$probe" | sed 's/^/  /'
 fi
-if [ "$TIER" = auto ]; then
-  if [ ! -f "$probe" ]; then
-    echo "ERROR: --tier auto needs the virtualization probe; run this script from a checkout, or pass --tier explicitly." >&2
-    exit 1
-  fi
-  # The same choice as bin/register-byoh-host --virt-tier auto: KVM when
-  # the machine has hardware virtualization (the checks below then say
-  # whether it is usable), pvm on a PVM host, else the fastest fallback.
-  TIER=$(sudo ruby "$probe" --json | ruby -rjson -e '
+if [ "$TIER" = auto ] && [ ! -f "$probe" ]; then
+  echo "ERROR: --tier auto needs the virtualization probe; run this script from a checkout, or pass --tier explicitly." >&2
+  exit 1
+fi
+if [ -f "$probe" ] && { [ "$TIER" = auto ] || [ "$TIER" = kvm ]; }; then
+  # The choice of bin/register-byoh-host --virt-tier auto
+  # (ByohVirtRegistration#auto_tier): kvm where KVM runs, pvm on a PVM
+  # host, the fastest fallback without hardware virtualization, a refusal
+  # otherwise. A kvm_blocked host is refused in both modes: registration
+  # refuses it whether declared kvm or auto. Prints "<tier>" or
+  # "refuse:<why>".
+  choice=$(sudo ruby "$probe" --json | ruby -rjson -e '
     r = JSON.parse(STDIN.read)
+    auto = ARGV[0] == "auto"
+    why = "the probe found #{r["tier"]}#{" (#{r["cause"]})" if r["cause"]}: #{Array(r["reasons"]).join("; ")}"
     case r["tier"]
-    when "kvm", "kvm_blocked" then puts "kvm"
-    when "pvm" then puts "pvm"
+    when "kvm" then puts "kvm"
+    when "kvm_blocked" then puts "refuse:#{why}. KVM is there but not usable, and registration refuses such a host; fix KVM first"
+    when "pvm" then puts(auto ? "pvm" : "kvm")
     when "none", "pvm_blocked"
-      pick = %w[container emulated].find { |t| (r["possible"] + r["unchecked"]).include?(t) }
-      puts(pick || "refuse:#{r["tier"]}")
-    else puts "refuse:#{r["tier"]}"
-    end')
-  case "$TIER" in
+      pick = %w[container emulated].find { |t| (r["possible"] + r["unchecked"]).include?(t) } if auto
+      puts(pick || (auto ? "refuse:#{why}. No fallback fits this host" : "kvm"))
+    else puts(auto ? "refuse:#{why}. There is no automatic choice for it" : "kvm")
+    end' "$TIER")
+  case "$choice" in
     refuse:*)
-      echo "ERROR: the probe found tier ${TIER#refuse:}, for which there is no automatic choice; see the report above and docs/byoh/NO_KVM.md." >&2
+      echo "ERROR: ${choice#refuse:}; see the report above and docs/byoh/NO_KVM.md." >&2
+      echo "  For the fix on this platform run, on the control plane: bin/byoh-virt probe --main-ip <this host>." >&2
       exit 1
       ;;
   esac
-  echo "  --tier auto chose: $TIER"
+  if [ "$TIER" = auto ]; then
+    TIER=$choice
+    echo "  --tier auto chose: $TIER"
+    require_shipped_tier "$TIER"
+  fi
 fi
 virt_hint="For the fix on this platform run, on the control plane: bin/byoh-virt probe --main-ip <this host>. Enable VT-x/AMD-V in the firmware on bare metal. On a cloud VM, use an instance type with nested virtualization enabled (AWS m8i/c8i/r8i with nested virtualization, GCP --enable-nested-virtualization, an Azure size that supports nested virtualization) or a bare-metal type. On Proxmox: qm set <vmid> --cpu host. A VPS without nested virtualization cannot be a data plane."
 if [ "$TIER" = kvm ]; then
@@ -179,6 +225,10 @@ else
         echo "ERROR: containers need Linux 5.12 or newer (idmapped mounts); this is $kver." >&2
         exit 1
       fi
+      # UNVERIFIED: Ubuntu's lxc package normally enables lxc-net (an
+      # lxcbr0 bridge with its own dnsmasq and NAT), next to the BYOH
+      # nftables and per-VM dnsmasq. The WP that ships container must
+      # turn it off (USE_LXC_BRIDGE="false"); docs/byoh/NO_KVM.md 11.3.
       tier_packages="lxc lxcfs uidmap"
       ;;
     emulated)

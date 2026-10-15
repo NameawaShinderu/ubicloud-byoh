@@ -182,6 +182,11 @@ RSpec.describe ByohVirtTiers do
     end
   end
 
+  it "lets the data-plane bootstrap prepare only the shipped tiers" do
+    script = File.read(File.expand_path("../../scripts/byoh/bootstrap-data-plane.sh", __dir__))
+    expect(script[/^SHIPPED_TIERS="([^"]*)"$/, 1].split).to eq described_class::SHIPPED
+  end
+
   describe ".memory_budget_gib" do
     it "keeps the host reserve and the per-VM overhead out of the budget" do
       # (32768 - 0) * 42 / 43 = 32006; - 2048 - 512 * (8 / 2) = 27910 MiB

@@ -1046,15 +1046,33 @@ The registration matrix (probe × declared tier). "ack" means allowed with `--ac
 
 ### 11.3 Data-plane bootstrap (SHIPPED, WP4)
 
-`scripts/byoh/bootstrap-data-plane.sh`: the default path stays byte-identical, KVM refusal included.
-`--tier auto|container|emulated|pvm` runs the probe, prints the chosen tier, installs only that tier's
-userspace packages (`lxc lxcfs uidmap`; `qemu-system-x86 ovmf`; nothing for pvm), and skips only the
-checks that tier does not need. It never changes kernels, sysctls or GRUB.
-VERIFIED in a throwaway container without `/dev/kvm` (privileged commands stubbed): the default path
-refuses as before; `--tier emulated` and `--tier container` skip the KVM checks and print the
-registration command with `--virt-tier <tier> --accept-fallback`; `--tier pvm` refuses without
-`kvm_pvm`; `--tier auto` refuses in a container; bad arguments exit 2. `--tier auto` on a real VM
-without KVM is UNVERIFIED.
+`scripts/byoh/bootstrap-data-plane.sh --tier kvm|auto|container|pvm|emulated`. It never changes
+kernels, sysctls or GRUB.
+- `kvm` (the default) refuses a host without usable KVM, as before. When the probe is at hand (a
+  checkout), it also refuses a host the probe finds `kvm_blocked`, for example KVM without the
+  capabilities cloud-hypervisor needs or a generic CPU model, which still passed the old `/dev/kvm`,
+  vmx/svm and pdpe1gb checks but which registration refuses.
+- `auto` makes the choice of `bin/register-byoh-host --virt-tier auto`: `kvm` on a `kvm` probe (the
+  pdpe1gb check then refuses a host without 1G pages, as registration does), `pvm` on a PVM host,
+  the fastest possible fallback (container, then emulated) on `none` or `pvm_blocked`, and a refusal
+  with the probe's reasons otherwise, `kvm_blocked` included.
+- A lower tier, declared or chosen by `auto`, is refused **before anything is installed** unless it
+  is in the script's `SHIPPED_TIERS`, which a spec keeps equal to `ByohVirtTiers::SHIPPED` (empty
+  today). `BYOH_ALLOW_UNSHIPPED_TIER=1` prepares it anyway, with a warning, for lab work only. A
+  shipped tier skips only the KVM checks and installs only its userspace packages (`lxc lxcfs
+  uidmap`; `qemu-system-x86 ovmf`; nothing for pvm).
+- UNVERIFIED: Ubuntu's `lxc` package normally enables `lxc-net` (an `lxcbr0` bridge with its own
+  dnsmasq and NAT rules) beside the BYOH nftables and per-VM dnsmasq. The WP that ships `container`
+  must turn it off (`USE_LXC_BRIDGE="false"` in `/etc/default/lxc-net`) and check the result on a host.
+
+VERIFIED in a throwaway `ubuntu:24.04` container without `/dev/kvm`, with `sudo` stubbed and the probe
+replaced by fixture reports (kvm, kvm_blocked with `missing_caps`, none, pvm, container): the default
+path refuses `kvm_blocked` with the probe's reasons and otherwise refuses on the missing `/dev/kvm` as
+before; `auto` refuses `kvm_blocked` and a container, picks kvm, pvm or container as above and then
+refuses the unshipped pvm and container before any `apt-get`; `--tier emulated` is refused before any
+`apt-get`; with `BYOH_ALLOW_UNSHIPPED_TIER=1` the emulated and container paths install their packages
+(stubbed) and print `--virt-tier <tier> --accept-fallback`; `--tier pvm` refuses without `kvm_pvm`;
+`auto` outside a checkout and bad arguments are refused. On a real VM without KVM it is UNVERIFIED.
 
 ### 11.4 Where the registration code lives (M4 collision)
 
