@@ -120,8 +120,8 @@ availability_zone = "ap-south-1a"
 vpc_cidr          = "10.98.0.0/16"
 subnet_cidr       = "10.98.1.0/24"
 
-operator_ssh_cidr = "<your public IP>/32"   # never leave 0.0.0.0/0
-web_ui_cidr       = "<your public IP>/32"   # ports 3000 and 443 on the control plane
+operator_ssh_cidr = "<your public IP>/32"   # required since M4; never 0.0.0.0/0
+web_ui_cidr       = "<your public IP>/32"   # required since M4; ports 3000 and 443 on the control plane
 
 # The variables.tf defaults (m5d.metal, nested off) are stale.
 data_plane_instance_type         = "m8i.2xlarge"
@@ -148,7 +148,9 @@ The module creates:
 - one EIP per `byoh_secondary_private_ips` entry, each associated 1:1 with its private IP;
 - `.generated/<workspace>/pools.yaml` and `.generated/<workspace>/byoh_ssh_key{,.pub}`.
 
-`terraform output` prints `handoff_instructions`, `byoh_location_create_command`, `data_private_ip`, `data_eni_id`, `byoh_eip_to_private_ip` and `pools_yaml_path`.
+`terraform output` prints `handoff_instructions`, `byoh_location_create_command` (§3.5), `host_add_command` (§3.7), `data_private_ip`, `data_eni_id`, `byoh_eip_to_private_ip` and `pools_yaml_path`.
+
+`operator_ssh_cidr` and `web_ui_cidr` have no default since M4: a tfvars file that leaves either out stops `plan` with "No value for required variable".
 
 The private key is also stored in `terraform.tfstate`. Treat the state file as a secret (CLAUDE.md §9).
 
@@ -224,10 +226,8 @@ terraform output -raw byoh_location_create_command     # on the workstation
 It expands to:
 
 ```bash
-bundle exec bin/byoh-location create \
-  --name byoh-aws-mysite \
-  --display-name byoh-aws-mysite \
-  --ui-name "AWS ap-south-1 (BYOH)" \
+sudo ubicloud-admin site add byoh-aws-mysite \
+  --display "AWS ap-south-1 (BYOH)" \
   --underlay 10.98.0.0/16 \
   --overlay 172.20.0.0/14 \
   --cp-reach onhost \
@@ -237,17 +237,19 @@ bundle exec bin/byoh-location create \
   --rates-from hetzner-fsn1
 ```
 
-- **The billing-rate directory must match.** The terraform output also prints `sudo install -d ... /etc/ubicloud/billing_rates.d`, `export BILLING_RATES_EXTRA_DIR=/etc/ubicloud/billing_rates.d`, and a comment that tells you to add `ENV["BILLING_RATES_EXTRA_DIR"] ||= "/etc/ubicloud/billing_rates.d"` to `.env.rb`. A packaged control plane (`install.sh`) sets `BILLING_RATES_EXTRA_DIR=/var/lib/ubicloud/billing_rates.d` in `/etc/ubicloud/env`; skip those lines there too. A control plane bootstrapped by `bootstrap-dev-ctrl-plane.sh` (formerly `bootstrap-ctrl-plane.sh`) already sets `ENV["BILLING_RATES_EXTRA_DIR"] ||= "/home/ubuntu/ubicloud-billing-rates.d"` (the expanded `$HOME/ubicloud-billing-rates.d`) in `.env.rb`, and the services read that directory. On such a control plane, **skip those two lines and ignore that comment**. Otherwise the rates are written where `puma` and `respirate` never look. `bin/byoh-location show` prints the `Rate file` it uses. The live environment uses `/home/ubuntu/ubicloud-billing-rates.d`.
+- **Packaged control plane** (`install.sh`): `site add` writes the rates to `/var/lib/ubicloud/billing_rates.d`, the `BILLING_RATES_EXTRA_DIR` of `/etc/ubicloud/env`, and restarts `ubicloud.target`, so web, respirate and monitor load them.
+- **Development control plane** (`bootstrap-dev-ctrl-plane.sh`): there is no `ubicloud-admin` on PATH. From `~/ubicloud`, run `packaging/bin/ubicloud-admin --dev site add ...` without `sudo`, or `bundle exec bin/byoh-location add ...` with the same options. The rates go to the `BILLING_RATES_EXTRA_DIR` of `.env.rb` (`$HOME/ubicloud-billing-rates.d`); restart `puma` and `respirate` yourself (below). `bin/byoh-location show` prints the `Rate file` it uses. Before M4 the output printed `/etc/ubicloud/billing_rates.d` and an `export` of it, which the services never read; the live environment uses `/home/ubuntu/ubicloud-billing-rates.d`.
 - With `operator_ssh_cidr = 0.0.0.0/0`, the output warns and leaves the operator out of `--mgmt-allow`. VMs behind the host NAT are denied every `mgmt_allow` network, so a world-open CIDR there would cut VMs off from the internet.
 - `--ula48` is random by default. Pass one only to fit an existing host's `net6`, as the live window did (`--ula48 fd1b:3821:6123::/48`).
 
 Then restart the services so they load the rates, check the location, and grant your project once the account exists (§3.8):
 
 ```bash
+# development only; site add already restarted a packaged control plane
 tmux kill-session -t puma; tmux kill-session -t respirate
-bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh     # packaged: sudo systemctl restart ubicloud.target
-bundle exec bin/byoh-location show --location byoh-aws-mysite
-bundle exec bin/byoh-location grant --location byoh-aws-mysite --project pj...
+bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
+sudo ubicloud-admin site show byoh-aws-mysite
+sudo ubicloud-admin site grant byoh-aws-mysite --project pj...
 ```
 
 `create` and `show` print preflight warnings. On a default control plane, expect:
@@ -307,7 +309,23 @@ bundle exec bin/byoh-pool annotate --host vh... --pool-file live-pools.yaml
 
 ### 3.7 Register
 
-On the control plane, from `~/ubicloud`:
+**With `host add` (M4).** `terraform output -raw host_add_command` prints the commands for this workspace:
+
+1. On the workstation, the `--expect-host-key` flags parsed from the SSH host key fingerprints that cloud-init prints to the data plane's console (`aws ec2 get-console-output --latest`). Terraform cannot know the keys, which the instance makes at first boot. The parse is UNVERIFIED on current AMIs; if it prints nothing, leave `EXPECT` empty and compare the fingerprints `host add` shows by hand.
+2. On the workstation, `scp` of `pools.yaml` and the EC2 key to the control plane.
+3. On the control plane:
+
+   ```bash
+   EXPECT='--expect-host-key SHA256:... --expect-host-key SHA256:...'    # from step 1
+   sudo ubicloud-admin host add --site byoh-aws-mysite --ssh ubuntu@<data_private_ip> \
+     --ssh-key ~/byoh_ssh_key --pool-file ~/pools.yaml $EXPECT --no-wait
+   shred -u ~/byoh_ssh_key
+   sudo ubicloud-admin host watch <data_private_ip>
+   ```
+
+`host add` runs preflight with the pools (PLATFORMS.md §6), installs its own root key, registers the host pinned to the host keys, and `host watch` follows the bring-up to `accepting` and runs `pool verify`. The EC2 key is only the `ubuntu` login; `host add` deletes its staged copy after the prepare phase, and `--no-wait` lets you shred yours before the watch. On a development control plane, use `packaging/bin/ubicloud-admin --dev` from `~/ubicloud` without `sudo`. None of this has run on AWS yet (UNVERIFIED; the M4 canary in VERIFY.md).
+
+**With `register-byoh-host`** (as validated in 2026-10; the user-data copies the EC2 key into root's `authorized_keys`). On the control plane, from `~/ubicloud`:
 
 ```bash
 bundle exec bin/register-byoh-host \
@@ -428,7 +446,7 @@ Common, platform-neutral problems are in [TROUBLESHOOTING.md](../TROUBLESHOOTING
 | VM waits for capacity ("no space left") | All `nat` addresses are taken (gate G10 expects this); `-e internal` with no `byoh_internal_private_ips`; or no boot image | Add a secondary IP with an EIP (terraform), then `bin/byoh-pool add --host H --pool <ip>/32,delivery=fabric,exposure=nat,external=<ip>:<EIP>`; check `byoh-pool list` |
 | Every VM create fails with "No capacity left" on a host registered before M1 | vhost-block-backend v0.2.2; new VMs need `version_code >= 401` (verified live, 2026-10-13) | In `bin/pry`: `VmHost.all.each { Prog::Storage::SetupVhostBlockBackend.assemble(it.id, Config.vhost_block_backend_version, allocation_weight: 100) }` |
 | Host goes `unavailable`, or health pages about SMART/clocksource | `bin/monitor` running against EBS (PLATFORMS.md F5) | Stop `bin/monitor` (`tmux kill-session -t monitor` if the bootstrap started it), then in `bin/pry`: `VmHost["vh..."].update(allocation_state: "accepting")` |
-| VM create fails resolving a billing rate; `show` reports missing coverage | `BILLING_RATES_EXTRA_DIR` differs between the shell that ran `create` (terraform's `/etc/ubicloud/billing_rates.d`) and `.env.rb` | Use the `.env.rb` directory, rerun `bin/byoh-location rates --location <name> --rates-from hetzner-fsn1`, restart the services |
+| VM create fails resolving a billing rate; `show` reports missing coverage | `BILLING_RATES_EXTRA_DIR` differs between the shell that ran `create` (the pre-M4 terraform output exported `/etc/ubicloud/billing_rates.d`) and `.env.rb` | Use the `.env.rb` directory, rerun `bin/byoh-location rates --location <name> --rates-from hetzner-fsn1`, restart the services |
 | VMs cannot reach the control plane or other VPC hosts | By design: `--underlay`, `--cp-source` and `--mgmt-allow` are in `deny4` (G9b) | Expected. `--egress-allow` is stored but nothing reads it yet (PLANNED). The only lever is to leave a range out of `--underlay`, `--cp-source` and `--mgmt-allow`. |
 | Outbound SMTP (port 25) from VMs fails | `egress_smtp` defaults to false (G9b) | `bin/byoh-location set --location <name> --egress-smtp` if you accept the abuse risk |
 | `bundle install` fails: `No such file or directory - mise` | `~/.local/bin` not on PATH (verified live, 2026-10-13) | `export PATH=$HOME/.local/bin:$PATH` |

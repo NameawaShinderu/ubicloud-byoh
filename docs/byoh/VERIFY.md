@@ -100,9 +100,9 @@ Run the canary in the existing `canary` workspace. Never create a `canary-m2` wo
 
 | Step | Action | PASS when | Script |
 |---|---|---|---|
-| G0 | On the operator workstation: `terraform -chdir=terraform/aws-byoh workspace select canary`, then `terraform state list`. If state is not empty, `destroy` first. Apply with `canary.tfvars`: 3 `byoh_secondary_private_ips`, 1 `byoh_internal_private_ips`, and `data_plane_nested_virtualization = true`. | `.generated/canary/pools.yaml` has 3 `nat` entries and 1 `internal` entry | manual |
+| G0 | On the operator workstation: `terraform -chdir=terraform/aws-byoh workspace select canary`, then `terraform state list`. If state is not empty, `destroy` first. Apply with `canary.tfvars`: 3 `byoh_secondary_private_ips`, 1 `byoh_internal_private_ips`, `data_plane_nested_virtualization = true`, and `operator_ssh_cidr` and `web_ui_cidr` (required since M4). | `.generated/canary/pools.yaml` has 3 `nat` entries and 1 `internal` entry | manual |
 | G1 | Clone `byoh-driver` and bootstrap. Check `BILLING_RATES_EXTRA_DIR` (§1.1). Leave the monitor off on EBS (§1.2). | puma and respirate run; `.env.rb` sets the variable | `g1` |
-| G2 | Run the `byoh_location_create_command` terraform output (`bin/byoh-location create ... --rates-from hetzner-fsn1`). Restart the three processes. `bin/byoh-location grant --location <name> --project <ubid>`. | `show` reports full coverage; every rate type of hetzner-fsn1 was copied | `g2` |
+| G2 | Run the `byoh_location_create_command` terraform output (since M4 `sudo ubicloud-admin site add ... --rates-from hetzner-fsn1`; on the development control plane of G1, `packaging/bin/ubicloud-admin --dev site add ...` or `bin/byoh-location add ...` with the same options). Restart the three processes. `bin/byoh-location grant --location <name> --project <ubid>`. | `show` reports full coverage; every rate type of hetzner-fsn1 was copied | `g2` |
 
 ### 2.2 Registration
 

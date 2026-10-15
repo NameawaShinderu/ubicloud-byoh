@@ -592,10 +592,10 @@ Line numbers refer to the bootstrap at fc693b1e0 (`scripts/byoh/bootstrap-ctrl-p
 | ctrl bootstrap | `:217-236` | tmux, logs in `/tmp`, no restarter, no boot persistence | major | M3 |
 | ctrl bootstrap | — | No TLS, no backups, puma on `0.0.0.0` (`puma_config.rb:5`), default `BASE_URL` (`config.rb:86`), no SMTP | major | M3 |
 | data bootstrap | `bootstrap-data-plane.sh:121-127` | No `--default-boot-image`; hard-coded `fd00:aa55::/64` (same net6 for every host) | major | M2, M4 |
-| data bootstrap | whole file; README | No preflight; "no shared network required" claim is false (`wait_sshable` needs CP → VM) | major | M2, M4, M8 |
+| data bootstrap | whole file; README | No preflight (M4: runs `ubicloud-host preflight --standalone` at the end); "no shared network required" claim is false (`wait_sshable` needs CP → VM) | major | M2, M4, M8 |
 | register CLI | `bin/register-byoh-host:73,116-124,138-141` | `--location` label only; no preflight; interactive ENTER | major | M2, M4 |
-| terraform | `variables.tf:28` | `operator_ssh_cidr` default `0.0.0.0/0` | major | M4 |
-| terraform | `outputs.tf:43-52` | No `pools.yaml`, no host-add command | medium | M2, M4 |
+| terraform | `variables.tf:28` | `operator_ssh_cidr` default `0.0.0.0/0` (M4: `operator_ssh_cidr` and `web_ui_cidr` are required) | major | M4 |
+| terraform | `outputs.tf:43-52` | No `pools.yaml`, no host-add command (M2: `pools.yaml`; M4: `host_add_command` and `site add` in `byoh_location_create_command`, never applied: UNVERIFIED) | medium | M2, M4 |
 | Proxmox scripts | `docs/byoh/deploy-scripts/04-register-host.sh:58-62` | Unscoped `accepts_slices:false` on every host | major | M4 (delete) |
 | Proxmox scripts | `04:35-44,52,59,21-22`; `02:21`; `03:12,21`; `00:57`, `01:52-54,71-73` | /29 split into 3 /32s, `.first` host, no key, `PermitRootLogin yes`, `curl \| bash` of branch head, MASQUERADE over the pool, two NICs | major | M4 (recipe rewrite) |
 | cross-recipe | `01-create-vms.sh` vs `variables.tf:16-22` | Both default to 10.98.1.0/24; one CP managing both collides | major | M4 (distinct defaults), M8 (unique mgmt addresses) |

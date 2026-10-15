@@ -123,9 +123,9 @@ This is the validated path. It uses `terraform/aws-byoh` to create the machines,
    ```
    Set these variables:
    - `data_plane_instance_type = "m8i.2xlarge"` and `data_plane_nested_virtualization = true`. The defaults (m5d.metal, nested off) are stale.
-   - `operator_ssh_cidr` and `web_ui_cidr` set to your /32.
+   - `operator_ssh_cidr` and `web_ui_cidr` set to your /32. Both are required since M4.
    - `byoh_secondary_private_ips`, which get EIPs and become `nat`, and optionally `byoh_internal_private_ips`, which become `internal`.
-3. **Outputs.** Terraform prints `handoff_instructions`. It also writes `.generated/<workspace>/pools.yaml` (`fabric` + `nat`, with the EIPs as `external`), and `byoh_location_create_command` prints the step 3 command for this VPC. Copy `pools.yaml` and the generated SSH key to the control plane, as the handoff text shows.
+3. **Outputs.** Terraform prints `handoff_instructions`. It also writes `.generated/<workspace>/pools.yaml` (`fabric` + `nat`, with the EIPs as `external`), and `byoh_location_create_command` prints the step 3 command for this VPC (`sudo ubicloud-admin site add ...`). `host_add_command` prints how to copy `pools.yaml` and the generated SSH key to the control plane and add the host with `ubicloud-admin host add` (platforms/aws.md §3.7; UNVERIFIED on AWS). On a development control plane, run `packaging/bin/ubicloud-admin --dev` from `~/ubicloud` in place of `sudo ubicloud-admin`.
 4. **Data plane.** Terraform's `user-data-data.sh` replaces `bootstrap-data-plane.sh`, and it also applies the cloud-init secondary-IP fix. Check that `ip -br -4 addr` on the data plane shows only the primary IP. `--main-ip` is the data plane's **private** IP.
 5. **Monitor.** Do not run `bin/monitor` for EBS-backed hosts, and run the gate with `GATE_EXPECT_MONITOR=0`.
 6. **SSH.** A `nat` VM is reached at its EIP: `ssh ubi@<EIP>`.

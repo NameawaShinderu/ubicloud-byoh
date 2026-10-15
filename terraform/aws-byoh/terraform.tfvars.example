@@ -10,10 +10,12 @@
 aws_region        = "ap-south-1"
 availability_zone = "ap-south-1a"
 
-# Tighten this to your public IP /32 for production testing.
-# Leave 0.0.0.0/0 only if you really need SSH open to the world.
-# operator_ssh_cidr = "203.0.113.42/32"
-operator_ssh_cidr = "0.0.0.0/0"
+# Required (no defaults): your public IP as a /32. operator_ssh_cidr
+# opens SSH to both instances; web_ui_cidr opens ports 3000 and 443 on
+# the control plane. 0.0.0.0/0 is accepted for operator_ssh_cidr, but
+# then SSH is open to the world and byoh_location_create_command warns.
+operator_ssh_cidr = "203.0.113.42/32"
+web_ui_cidr       = "203.0.113.42/32"
 
 # The VPC CIDR. Make sure this doesn't overlap with any existing
 # VPC in your account. Default 10.98.0.0/16 is chosen to be unusual.

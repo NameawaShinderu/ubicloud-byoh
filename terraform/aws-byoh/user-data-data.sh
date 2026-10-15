@@ -23,9 +23,11 @@
 #      also does this, but setting it here means it's ready
 #      immediately, before the rhizome install.)
 #
-# Everything else — SPDK, cloud-hypervisor, KVM, hugepages, the
-# rhizome agent, boot images — is installed by the Ubicloud control
-# plane via SSH after the operator runs bin/register-byoh-host.
+# Everything else — cloud-hypervisor, the vhost-block-backend storage
+# backend, hugepages, the rhizome agent, boot images — is installed by
+# the Ubicloud control plane via SSH after the operator runs
+# ubicloud-admin host add (terraform output host_add_command) or
+# bin/register-byoh-host.
 set -eu
 exec > /var/log/user-data.log 2>&1
 
@@ -59,9 +61,10 @@ datasource:
     apply_full_imds_network_config: false
 CLOUDCFG
 primary_ip=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)" http://169.254.169.254/latest/meta-data/local-ipv4)
-for f in /etc/netplan/50-cloud-init.yaml; do
-  [ -f "$f" ] && sed -i '/^      addresses:/,/^      [a-z]/{/^      addresses:/d;/^      - /d}' "$f"
-done
+f=/etc/netplan/50-cloud-init.yaml
+if [ -f "$f" ]; then
+  sed -i '/^      addresses:/,/^      [a-z]/{/^      addresses:/d;/^      - /d}' "$f"
+fi
 dev=$(ip -4 -o addr show | awk -v p="$primary_ip" '$4 ~ "^"p"/" {print $2; exit}')
 sysctl -w "net.ipv4.conf.${dev}.promote_secondaries=1"
 ip -4 -o addr show dev "$dev" | awk '{print $4}' | grep -v "^${primary_ip}/" | sort -r | while read -r cidr; do
@@ -92,9 +95,9 @@ cat <<BANNER
 
   This host does NOT need manual setup — it's managed entirely by
   the Ubicloud control plane via SSH. The control plane's rhizome
-  agent will install SPDK, cloud-hypervisor, nftables rules,
-  hugepages, and everything else when the operator runs
-  bin/register-byoh-host.
+  agent will install cloud-hypervisor, nftables rules, hugepages,
+  and everything else when the operator runs ubicloud-admin host add
+  (or bin/register-byoh-host).
 
   Current state:
     - openssh-server: enabled

@@ -13,7 +13,7 @@ Declarative Terraform module that provisions a complete Ubicloud
     - Pre-installed `ruby-bundler` and root SSH pubkey login via user-data
     - optional `byoh_internal_private_ips`: more secondary private IPs with no EIP
 - 3 Elastic IPs, each 1:1 associated with a secondary private IP
-- `.generated/<workspace>/pools.yaml`, the pool file for `bin/register-byoh-host --pool-file`
+- `.generated/<workspace>/pools.yaml`, the pool file for `ubicloud-admin host add --pool-file` (or `bin/register-byoh-host --pool-file`)
 
 > **Do not apply in `company-mumbai` until M7 (P2).** The live security
 > group has drifted from `main.tf`, and the state does not match the live
@@ -49,7 +49,7 @@ cd terraform/aws-byoh
 
 # 1. Copy the example tfvars and edit it
 cp terraform.tfvars.example terraform.tfvars
-$EDITOR terraform.tfvars   # set operator_ssh_cidr, aws_region, etc.
+$EDITOR terraform.tfvars   # set operator_ssh_cidr, web_ui_cidr, aws_region, etc.
 
 # 2. Export AWS credentials (terraform.tfvars should NOT contain secrets)
 export AWS_ACCESS_KEY_ID=AKIA...
@@ -59,6 +59,13 @@ export AWS_SECRET_ACCESS_KEY=...
 terraform init
 terraform apply
 ```
+
+**`operator_ssh_cidr` and `web_ui_cidr` are required (M4).** They no
+longer default to `0.0.0.0/0`, so an existing `terraform.tfvars` or
+`<name>.tfvars` that leaves either out now stops `plan` with "No value
+for required variable". Set both, normally to your public IP as a
+`/32`. To keep the old behaviour, set them to `"0.0.0.0/0"` explicitly
+(SSH open to the world; `byoh_location_create_command` warns).
 
 `terraform apply` takes ~5-10 minutes — most of it is the `m5d.metal`'s Nitro BMC POST. It prints a big `handoff_instructions` block at the end with the public IPs, SSH commands, and EIP mapping.
 
@@ -79,13 +86,42 @@ With the default `byoh_internal_private_ips = []`, the AWS resources are
 the same as before; only the local `pools.yaml` file is added.
 
 `terraform output -raw byoh_location_create_command` prints the
-`bin/byoh-location create` command for this VPC: underlay = the VPC
+`sudo ubicloud-admin site add` command for this VPC: underlay = the VPC
 CIDR, `cp_source` = the control plane's private `/32`, `mgmt_allow` =
 that `/32` plus `operator_ssh_cidr`, and billing rates copied from
-`hetzner-fsn1` into `BILLING_RATES_EXTRA_DIR`. It warns when
-`operator_ssh_cidr` is `0.0.0.0/0`, and leaves that CIDR out of
-`--mgmt-allow`, because VMs behind the host NAT are denied the
+`hetzner-fsn1`. On a packaged control plane, `site add` writes them to
+`/var/lib/ubicloud/billing_rates.d` and restarts `ubicloud.target`. It
+warns when `operator_ssh_cidr` is `0.0.0.0/0`, and leaves that CIDR out
+of `--mgmt-allow`, because VMs behind the host NAT are denied the
 `mgmt_allow` networks.
+
+`terraform output -raw host_add_command` prints how to add the data
+plane with `ubicloud-admin host add` (ROADMAP §6.3, form A):
+
+1. On the workstation, the `--expect-host-key` flags, parsed from the
+   SSH host key fingerprints cloud-init prints to the data plane's
+   console (`aws ec2 get-console-output`; this parse is UNVERIFIED on
+   current AMIs). Terraform cannot know the host keys: the instance
+   makes them at first boot.
+2. On the workstation, `scp` of `pools.yaml` and the EC2 key from
+   `.generated/<workspace>/` to the control plane.
+3. On the control plane, `sudo ubicloud-admin host add --site ... --ssh
+   ubuntu@<data private IP> --ssh-key ~/byoh_ssh_key --pool-file
+   ~/pools.yaml $EXPECT --no-wait`, then `shred -u ~/byoh_ssh_key`, then
+   `sudo ubicloud-admin host watch <data private IP>`. `host add` deletes
+   its own staged copy of the key after the prepare phase; `--no-wait`
+   lets the operator's copy go before the bring-up watch too.
+
+**Development control plane.** `user-data-ctrl.sh` installs only
+prerequisites; if you then run `bootstrap-dev-ctrl-plane.sh` rather
+than `install.sh`, there is no `ubicloud-admin` on `PATH`. Run
+`packaging/bin/ubicloud-admin --dev` from `~/ubicloud`, without `sudo`,
+in place of `sudo ubicloud-admin` in both outputs, and restart `puma`
+and `respirate` yourself after `site add`.
+
+Neither output has been run against AWS (UNVERIFIED; the M4 AWS canary
+in `docs/byoh/VERIFY.md`). `terraform fmt` and `validate` were not run
+on these files either.
 
 ## Outputs
 
@@ -99,13 +135,14 @@ byoh_eip_to_private_ip = {
 }
 byoh_internal_ip_pool        = []
 byoh_ip_pool                 = ["10.98.1.128", "10.98.1.129", "10.98.1.130"]
-byoh_location_create_command = <commands for bin/byoh-location create>
+byoh_location_create_command = <sudo ubicloud-admin site add ...>
 ctrl_public_ip               = "13.aaa.aaa.aaa"
 data_public_ip               = "52.bbb.bbb.bbb"
 data_private_ip              = "10.98.1.101"
 pools_yaml_path              = "./.generated/<workspace>/pools.yaml"
 ssh_private_key_path         = "./.generated/<workspace>/byoh_ssh_key"
 handoff_instructions         = <long multi-line string with exact next steps>
+host_add_command             = <scp, sudo ubicloud-admin host add ..., shred, host watch>
 ```
 
 Registered with `--pool-file`, a VM's IPv4 is shown to the customer as
@@ -129,10 +166,9 @@ bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
 ```
 
 
-The `QUICKSTART.md` walks through generating the ctrl→data SSH key,
-installing it on the data plane, running `bin/register-byoh-host`,
-opening the web UI, creating a project + SSH key + VM. Clean ~10-minute
-procedure end-to-end.
+Then run `terraform output -raw byoh_location_create_command` and
+`terraform output -raw host_add_command` (above). `QUICKSTART.md` walks
+through the rest: the web UI, a project, an SSH key and a VM.
 
 ## Teardown
 

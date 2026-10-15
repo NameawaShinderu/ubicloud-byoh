@@ -276,7 +276,7 @@ RACK_ENV=development bundle exec bin/register-byoh-host \
 - `--ssh-key` must be an unencrypted OpenSSH Ed25519 key.
 - Run the CLI from the repo root with a working `.env.rb`; it loads `db.rb` and `loader.rb`.
 - `--location` is **required** and must name a BYOH location created with `bin/byoh-location create` (§8a). Pools are optional: `--pool-file` and `--routed-network` add to each other; with none, only IPv6-only VMs place.
-- Terraform: SSH ingress comes from `var.operator_ssh_cidr` (default 0.0.0.0/0), and ports 3000 and 443 from `var.web_ui_cidr` (default 0.0.0.0/0). Set both to your /32.
+- Terraform: SSH ingress comes from `var.operator_ssh_cidr`, and ports 3000 and 443 from `var.web_ui_cidr`. Both are required since M4 (no default); set both to your /32. Outputs `byoh_location_create_command` (`ubicloud-admin site add`) and `host_add_command` (`scp`, `host add --ssh`, `shred`, `host watch`); never applied (UNVERIFIED).
 - Boot images live only in the strand stack. To add one later, run `vm_host.download_boot_image("name")` in `bin/pry`.
 
 - There is **no `--provider` flag**; passing one aborts with InvalidOption. Several docs still pass it.
