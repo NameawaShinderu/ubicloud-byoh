@@ -109,7 +109,7 @@
 #          they would run and runs nothing.
 # --dev    (or UBICLOUD_ADMIN_DEV=1) For site, host and pool only: runs
 #          the tools of the development checkout this script is in
-#          (scripts/byoh/bootstrap-ctrl-plane.sh), with bundle exec, as
+#          (scripts/byoh/bootstrap-dev-ctrl-plane.sh), with bundle exec, as
 #          the invoking user, or as SUDO_USER under sudo, with
 #          ~/.local/bin and the mise Ruby of mise.toml on PATH. Refused
 #          when /etc/ubicloud or /opt/ubicloud exists. It restarts
@@ -1667,7 +1667,7 @@ dev_user() {
 }
 
 # dev_path REPO: PATH for the dev tools: mise's ~/.local/bin and the
-# Ruby of the checkout's mise.toml, as scripts/byoh/bootstrap-ctrl-plane.sh
+# Ruby of the checkout's mise.toml, as scripts/byoh/bootstrap-dev-ctrl-plane.sh
 # installs them, then the caller's PATH.
 dev_path() {
   local ruby p=$DEV_HOME/.local/bin

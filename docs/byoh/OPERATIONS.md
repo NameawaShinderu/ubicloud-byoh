@@ -207,7 +207,7 @@ sudo ubicloud-admin pool verify --host vh...
 
   Between the two phases, the registration key waits in `/var/lib/ubicloud/byoh-keys` (owner `ubicloud`, mode 0700). Registration deletes it once the key is stored in the database. If you pass `--phase` yourself, the tool runs once, with that phase.
 - `UBICLOUD_ADMIN_DRYRUN=1` prints the command lines and runs nothing.
-- A development control plane (`scripts/byoh/bootstrap-ctrl-plane.sh`) has neither `/etc/ubicloud` nor `/opt/ubicloud`. On one, run the checkout's own `packaging/bin/ubicloud-admin --dev site|host|pool ...`, or set `UBICLOUD_ADMIN_DEV=1`.
+- A development control plane (`scripts/byoh/bootstrap-dev-ctrl-plane.sh`) has neither `/etc/ubicloud` nor `/opt/ubicloud`. On one, run the checkout's own `packaging/bin/ubicloud-admin --dev site|host|pool ...`, or set `UBICLOUD_ADMIN_DEV=1`.
   - It runs `bundle exec bin/byoh-...` in the checkout as you, or as `SUDO_USER` under sudo, with `~/.local/bin` and the mise Ruby on `PATH`.
   - It restarts nothing; restart puma and respirate yourself after a rates change.
   - `--dev` is refused where a packaged layout exists.

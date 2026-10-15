@@ -73,8 +73,8 @@ free -g; pvesm status                            # memory and storage headroom
 ```
 
 - **Nested virtualization off.** Ask the node's owner to enable it: `options kvm-intel nested=Y` (or `options kvm-amd nested=1`) in `/etc/modprobe.d/`, then a node reboot. This affects every guest on the node.
-- **Hybrid CPUs.** Intel 12th-14th gen and Core Ultra parts with P and E cores fail every VM with `BUG` (PLATFORMS.md HW-6/VR-3). Disable E-cores in the BIOS, or use another node.
-- **SMT off (`nosmt`)** is not supported (PLATFORMS.md HW-7).
+- **Hybrid CPUs.** Intel 12th-14th gen and Core Ultra parts with P and E cores: since M4 a BYOH host counts every CPU as a core and VMs boot, with uneven core speeds (PLATFORMS.md HW-6/VR-3, FIXED IN M4 for BYOH hosts; UNVERIFIED on hybrid hardware). Preflight fails `PF8-hybrid` unless you pass `--accept-check PF8-hybrid`. A host whose CPUs were learned before M4 still fails every VM with `BUG`: re-register it.
+- **SMT off (`nosmt`) or offlined CPUs** work on a BYOH host since M4: LearnCpu keeps only online CPUs and counts every CPU as a core when thread counts differ (PLATFORMS.md HW-7). Hosts learned before M4 keep their old rows and need re-registering.
 
 ---
 
