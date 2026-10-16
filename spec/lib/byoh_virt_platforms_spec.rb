@@ -69,17 +69,17 @@ RSpec.describe ByohVirtPlatforms do
     it "gives a row without rules its own fix and cost" do
       gcp = described_class::ROWS.find { it.key == "gcp" }
       expect(described_class.advice(gcp, facts({"sys_vendor" => "Google"}))).to eq [gcp.fix, gcp.cost_hint]
-      expect(described_class::ROWS.find { it.key == "vmware" }.cost_hint).to be_nil
+      expect(described_class::ROWS.find { it.key == "vmware" }.cost_hint).to eq described_class::SELF_HOSTED_COST
     end
   end
 
-  it "has unique keys, a known nested value and a fix in every row" do
+  it "has unique keys, a known nested value, a fix and a cost hint in every row" do
     expect(described_class::ROWS.map(&:key).uniq.size).to eq described_class::ROWS.size
     described_class::ROWS.each do |row|
       expect(described_class::NESTED).to include(row.nested)
       expect(row.fix).not_to be_empty
       expect(row.match).not_to be_empty
-      expect(row.cost_hint).to be_nil.or(include("pricing"))
+      expect(row.cost_hint).to include("pricing").or(eq(described_class::SELF_HOSTED_COST))
       row.rules.each { expect(it.fix).not_to be_empty }
     end
   end

@@ -14,7 +14,8 @@
 #           switched on), :no (not offered), :ask (depends on whoever runs
 #           the hypervisor)
 #   fix     how to get a usable /dev/kvm on this platform
-#   cost_hint  what the fix costs compared with staying put, or nil.
+#   cost_hint  what the fix costs compared with staying put; every row
+#           has one (a rule may say nil when its fix costs nothing).
 #           Prices are approximate and UNVERIFIED (docs/byoh/NO_KVM.md
 #           section 7); only these texts talk about price.
 #   rules   narrower advice inside the platform: the first rule whose
@@ -39,6 +40,13 @@ module ByohVirtPlatforms
   end
 
   AWS_COST = "C8i, M8i and R8i cost about the same per vCPU as other current families of the same size; .metal costs far more because it is a whole server (approximate and UNVERIFIED; check current pricing)."
+
+  # Platforms without per-row pricing share these hints.
+  SELF_HOSTED_COST = "No price change on a hypervisor you run yourself; the fix costs one power-off of this VM."
+
+  ASK_COST = "Provider-specific: nothing on a hypervisor you run yourself; a provider may charge for a plan or flavor that exposes VT-x/AMD-V, if it offers one (check current pricing)."
+
+  NO_NESTED_COST = "Bare metal costs far more than a small VM, since it is a whole server; a fallback rung costs nothing extra but is slower or isolates less (approximate; check current pricing)."
 
   NESTED = %i[yes some no ask].freeze
 
@@ -96,6 +104,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /\AMicrosoft Corporation\z/, "product_name" => /\AVirtual Machine\z/},
       nested: :yes,
       fix: "With the VM off, run on the Hyper-V host: Set-VMProcessor -VMName <vm> -ExposeVirtualizationExtensions $true",
+      cost_hint: SELF_HOSTED_COST,
     ),
     Row.new(
       key: "vmware",
@@ -103,6 +112,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /\AVMware/},
       nested: :yes,
       fix: "Power the VM off, then enable \"Expose hardware assisted virtualization to the guest OS\" in its CPU settings (vhv.enable = \"TRUE\").",
+      cost_hint: SELF_HOSTED_COST,
     ),
     Row.new(
       key: "virtualbox",
@@ -110,6 +120,7 @@ module ByohVirtPlatforms
       match: {"product_name" => /\AVirtualBox\z/},
       nested: :yes,
       fix: "Power the VM off, then run: VBoxManage modifyvm <vm> --nested-hw-virt on",
+      cost_hint: SELF_HOSTED_COST,
     ),
     Row.new(
       key: "oci",
@@ -117,6 +128,7 @@ module ByohVirtPlatforms
       match: {"chassis_asset_tag" => /\AOracleCloud\.com\z/},
       nested: :some,
       fix: "Use an x86 VM shape that exposes nested virtualization (VM.Standard3.Flex on Intel, VM.Standard.E5.Flex on AMD) or a bare-metal shape; Ampere (Arm) VM shapes do not.",
+      cost_hint: "The x86 Flex shapes that expose nested virtualization cost about the same per OCPU as other current x86 shapes (approximate and UNVERIFIED; check current pricing).",
     ),
     Row.new(
       key: "hetzner_cloud",
@@ -132,6 +144,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /\ADigitalOcean\z/},
       nested: :no,
       fix: "DigitalOcean does not support nested virtualization on Droplets (some Intel Droplets expose VT-x, unsupported and slow). Use bare metal elsewhere, or a fallback rung.",
+      cost_hint: NO_NESTED_COST,
     ),
     Row.new(
       key: "linode",
@@ -139,6 +152,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /Linode|Akamai/},
       nested: :no,
       fix: "Akamai Cloud (Linode) does not offer nested virtualization. Use bare metal elsewhere, or a fallback rung.",
+      cost_hint: NO_NESTED_COST,
     ),
     Row.new(
       key: "vultr",
@@ -146,6 +160,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /\AVultr\z/},
       nested: :no,
       fix: "Vultr cloud instances do not expose hardware virtualization. Use Vultr Bare Metal, or a fallback rung.",
+      cost_hint: NO_NESTED_COST,
     ),
     Row.new(
       key: "scaleway",
@@ -153,6 +168,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /\AScaleway\z/},
       nested: :ask,
       fix: "Check whether the instance type exposes VT-x/AMD-V (some do); otherwise use a Scaleway Elastic Metal server.",
+      cost_hint: ASK_COST,
     ),
     Row.new(
       key: "openstack",
@@ -160,6 +176,7 @@ module ByohVirtPlatforms
       match: {"product_name" => /OpenStack/},
       nested: :ask,
       fix: "Nested virtualization depends on the cloud operator (nova cpu_mode host-passthrough and kvm nested=1 on compute nodes). Ask the provider for a flavor with VT-x/AMD-V, or use a dedicated server.",
+      cost_hint: ASK_COST,
     ),
     Row.new(
       key: "qemu_kvm",
@@ -167,6 +184,7 @@ module ByohVirtPlatforms
       match: {"sys_vendor" => /\AQEMU\z/},
       nested: :ask,
       fix: "Proxmox VE: qm set <vmid> --cpu host, with nested enabled on the node (cat /sys/module/kvm_intel/parameters/nested prints Y; else add \"options kvm-intel nested=Y\" (or kvm-amd nested=1) under /etc/modprobe.d and reload the module). libvirt: <cpu mode='host-passthrough'/>. A VPS provider must enable it for you.",
+      cost_hint: ASK_COST,
     ),
     Row.new(
       key: "xen",
@@ -174,6 +192,7 @@ module ByohVirtPlatforms
       match: {"virt_vm" => /\Axen\z/},
       nested: :ask,
       fix: "Xen HVM guests see VT-x only with nestedhvm=1 in the domain configuration, which Xen marks experimental; most Xen-based VPS do not offer it.",
+      cost_hint: ASK_COST,
     ),
   ].freeze
 
