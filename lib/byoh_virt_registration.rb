@@ -59,7 +59,10 @@ class ByohVirtRegistration
 
   # The tier to register on, or Refused with the fix. verdict is nil when
   # the host was not probed (unprobed_reason says why).
-  def decide!(verdict, location:, main_ip:, unprobed_reason: nil)
+  # boot_images are the --default-boot-image names: a lower tier boots
+  # only its own images, so a wrong one is refused here, with the names
+  # to use, rather than by Prog::Vm::HostNexus.assemble.
+  def decide!(verdict, location:, main_ip:, unprobed_reason: nil, boot_images: [])
     # A declared tier that is not shipped gets the same refusal on every
     # host, before the probe's preflight could ask the operator to
     # prepare the host for it.
@@ -81,6 +84,7 @@ class ByohVirtRegistration
     end
 
     check_location!(tier, location, verdict, main_ip:)
+    check_boot_images!(tier, boot_images, verdict)
     if ByohVirtTiers.lower?(tier) && !@accept_fallback
       raise Refused, "#{explain(verdict)}#{tier} is #{ByohVirtTiers.fetch(tier).description} Pass --accept-fallback to register the host on it."
     end
@@ -135,6 +139,16 @@ class ByohVirtRegistration
 
     fix = "fix KVM on the host, or declare a tier explicitly with --virt-tier"
     raise Refused, refusal(verdict, [verdict.fix, fix].compact.join(" Then: "), location:, main_ip:)
+  end
+
+  def check_boot_images!(tier, boot_images, verdict)
+    return unless ByohVirtTiers.lower?(tier)
+
+    images = ByohVirtTiers.fetch(tier).boot_images
+    return if (other = boot_images - images).empty?
+
+    raise Refused, "#{explain(verdict)}a #{tier} host cannot boot #{other.join(", ")}; its images are #{images.join(", ")}. " \
+      "Drop --default-boot-image (the host then downloads #{images.first}) or pass --default-boot-image #{images.first}."
   end
 
   def check_shipped!(tier, verdict)

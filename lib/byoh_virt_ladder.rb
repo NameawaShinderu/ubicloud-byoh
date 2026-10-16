@@ -71,9 +71,19 @@ module ByohVirtLadder
     "emulated" => "an x86_64 host",
   }.freeze
 
-  FALLBACKS = <<~TEXT.chomp
-    Without hardware virtualization the fallbacks, fastest first, are: #{FALLBACK_LABELS.values.join(", ")}. None of them can be registered yet. See docs/byoh/NO_KVM.md.
-  TEXT
+  # What a host without hardware virtualization can fall back to, from
+  # the tiers this control plane ships (ByohVirtTiers::SHIPPED).
+  def self.fallbacks_text
+    shipped, unshipped = FALLBACK_LABELS.keys.partition { ByohVirtTiers.shipped?(it) }
+    registrable = if shipped.empty?
+      "None of them can be registered yet."
+    else
+      "This control plane registers #{shipped.join(" and ")} hosts, with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers the tier"
+    end
+    registrable += "; #{unshipped.join(" and ")} is not offered yet." unless shipped.empty? || unshipped.empty?
+    registrable += "." if !shipped.empty? && unshipped.empty?
+    "Without hardware virtualization the fallbacks, fastest first, are: #{FALLBACK_LABELS.values.join(", ")}. #{registrable} See docs/byoh/NO_KVM.md."
+  end
 
   NESTED_CAVEATS = [
     "nested virtualization: CPU-bound work typically loses 10% or more, and memory- and page-fault-heavy work much more, since every guest page-table change traps to two hypervisors",
@@ -275,7 +285,7 @@ module ByohVirtLadder
       when :ask then "Ask your provider whether nested virtualization can be enabled. #{platform_fix}"
       else platform_fix
       end
-      "#{advice} #{FALLBACKS}"
+      "#{advice} #{fallbacks_text}"
     else
       "Run the data plane on a VM or bare metal, not in a container."
     end

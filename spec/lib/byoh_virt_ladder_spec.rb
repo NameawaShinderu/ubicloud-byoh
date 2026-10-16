@@ -161,10 +161,18 @@ RSpec.describe ByohVirtLadder do
     it "words the platform fix by whether the platform offers nested virtualization" do
       gcp = verdict(**no_virt, dmi: {"sys_vendor" => "Google", "product_name" => "Google Compute Engine"})
       expect([gcp.tier, gcp.rung, gcp.platform_name]).to eq ["none", "L3-L5", "Google Compute Engine"]
-      expect(gcp.fix).to start_with("Fixable by changing the instance type or a VM option: Recreate the VM").and end_with(described_class::FALLBACKS)
+      expect(gcp.fix).to start_with("Fixable by changing the instance type or a VM option: Recreate the VM").and end_with(described_class.fallbacks_text)
       expect(verdict(**no_virt, dmi: {"sys_vendor" => "Scaleway"}).fix).to start_with "Ask your provider whether nested virtualization can be enabled. Check whether"
       expect(verdict(**no_virt, dmi: {"sys_vendor" => "Vultr"}).fix).to start_with "Vultr cloud instances"
       expect(verdict(**no_virt, dmi: {}).fix).to start_with ByohVirtPlatforms::GENERIC_FIX
+    end
+
+    it "names the fallbacks this control plane can register" do
+      expect(described_class.fallbacks_text).to include("This control plane registers container and emulated hosts, with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers the tier; pvm is not offered yet. See docs/byoh/NO_KVM.md.")
+      ship_virt_tiers
+      expect(described_class.fallbacks_text).to include("None of them can be registered yet. See")
+      ship_virt_tiers("container", "pvm", "emulated")
+      expect(described_class.fallbacks_text).to include("container and pvm and emulated hosts, with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers the tier. See")
     end
 
     it "refuses a container" do

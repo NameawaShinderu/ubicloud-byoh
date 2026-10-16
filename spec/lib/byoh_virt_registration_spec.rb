@@ -100,6 +100,15 @@ RSpec.describe ByohVirtRegistration do
       .to raise_error(described_class::Refused, /\Aemulated is Emulated: slow, compatibility only/)
   end
 
+  it "refuses boot images the tier cannot boot, with the ones it can" do
+    auto = described_class.new(declared: "auto", accept_fallback: true)
+    expect { auto.decide!(verdict_for("none"), location:, main_ip: "x", boot_images: %w[ubuntu-noble]) }
+      .to raise_error(described_class::Refused, /\Athe probe found none .*a container host cannot boot ubuntu-noble; its images are ubuntu-noble-container\. Drop --default-boot-image \(the host then downloads ubuntu-noble-container\) or pass --default-boot-image ubuntu-noble-container\.\z/m)
+    expect(auto.decide!(verdict_for("none"), location:, main_ip: "x", boot_images: %w[ubuntu-noble-container]).tier).to eq "container"
+    expect(described_class.new(declared: "emulated", accept_fallback: true).decide!(verdict_for("none"), location:, main_ip: "x", boot_images: %w[ubuntu-noble ubuntu-jammy]).tier).to eq "emulated"
+    expect(described_class.new.decide!(verdict_for("kvm"), location:, main_ip: "x", boot_images: %w[ubuntu-noble]).tier).to eq "kvm"
+  end
+
   it "refuses a tier the location does not offer, with the commands that offer it" do
     location.update(byoh_virt: nil)
     expect { described_class.new(declared: "container", accept_fallback: true).decide!(verdict_for("none"), location:, main_ip: "x") }

@@ -48,7 +48,7 @@ class ByohRegistrationCli
 
     # The host can be probed only once the key is installed.
     verdict, unprobed = virt.probe(options[:main_ip], SshKey.from_binary(registration.keypair).private_key)
-    decision = virt.decide!(verdict, location: registration.location, main_ip: options[:main_ip], unprobed_reason: unprobed)
+    decision = virt.decide!(verdict, location: registration.location, main_ip: options[:main_ip], unprobed_reason: unprobed, boot_images: registration.default_boot_images)
     decision.notes.each { @err.puts "note: #{it}" }
 
     @out.puts
