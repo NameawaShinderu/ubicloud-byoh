@@ -1211,8 +1211,10 @@ Flags on `bin/register-byoh-host`:
   today on an L1 host; a non-L1 host is refused, now with the fix and a recommended command line.
 - `--accept-fallback`: required whenever the resulting tier is not `kvm`, including through `auto`.
 - `--install-pvm-kernel`: not built (WP7 stopped at the go/no-go script). Since `pvm` is not in
-  `ByohVirtTiers::SHIPPED`, `--virt-tier pvm` (and `auto` on a PVM host) is refused with "pvm hosts
-  are not available yet"; the `pvm` column of the matrix below describes the design after a GO.
+  `ByohVirtTiers::SHIPPED`, `--virt-tier pvm` is refused with "pvm hosts are not available yet" on
+  every host, probed or not, before the probe's preflight could ask for host work such as
+  `modprobe kvm_pvm`. `auto` on a ready PVM host gets the same refusal. The `pvm` column of the
+  matrix below describes the design after a GO.
 - `--no-virt-probe`: skip the pre-registration probe; LearnVirt checks at prep. A lower-tier host
   waits at `verify_virt_tier` until a probe agrees with its tier. A `kvm` host is not held: LearnVirt
   fails open, prep goes on, and LearnVirt pages with the fix if the host cannot run VMs (PrepHost

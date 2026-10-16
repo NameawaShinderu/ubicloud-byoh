@@ -113,6 +113,16 @@ RSpec.describe ByohVirtRegistration do
     ship_virt_tiers
     expect { described_class.new(declared: "emulated", accept_fallback: true).decide!(verdict_for("none"), location:, main_ip: "x") }
       .to raise_error(described_class::Refused, /emulated hosts are not available yet/)
+    expect { described_class.new(declared: "auto", accept_fallback: true).decide!(verdict_for("pvm"), location:, main_ip: "x") }
+      .to raise_error(described_class::Refused, /\Athe probe found .*pvm hosts are not available yet/m)
+  end
+
+  it "refuses a declared tier that is not shipped before the probe's preflight, on every host" do
+    ship_virt_tiers("container", "emulated")
+    probe_table.each_key do |probe|
+      expect { described_class.new(declared: "pvm", accept_fallback: true).decide!(verdict_for(probe), location:, main_ip: "x", unprobed_reason: "skipped") }
+        .to raise_error(described_class::Refused, /pvm hosts are not available yet: this control plane's rhizome cannot run them/)
+    end
   end
 
   it "refuses unknown declarations and auto without a probe" do

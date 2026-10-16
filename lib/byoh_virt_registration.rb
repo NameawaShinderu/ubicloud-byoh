@@ -60,6 +60,10 @@ class ByohVirtRegistration
   # The tier to register on, or Refused with the fix. verdict is nil when
   # the host was not probed (unprobed_reason says why).
   def decide!(verdict, location:, main_ip:, unprobed_reason: nil)
+    # A declared tier that is not shipped gets the same refusal on every
+    # host, before the probe's preflight could ask the operator to
+    # prepare the host for it.
+    check_shipped!(@declared, verdict) unless @declared == "auto"
     notes = []
     tier = if verdict.nil?
       raise Refused, "--virt-tier auto needs the probe, which failed: #{unprobed_reason}" if @declared == "auto"
@@ -133,10 +137,15 @@ class ByohVirtRegistration
     raise Refused, refusal(verdict, [verdict.fix, fix].compact.join(" Then: "), location:, main_ip:)
   end
 
+  def check_shipped!(tier, verdict)
+    return if ByohVirtTiers.shipped?(tier)
+
+    raise Refused, "#{explain(verdict)}#{tier} hosts are not available yet: this control plane's rhizome cannot run them (docs/byoh/NO_KVM.md section 11)."
+  end
+
+  # auto may pick a tier that is not shipped (a ready PVM host).
   def check_location!(tier, location, verdict, main_ip:)
-    unless ByohVirtTiers.shipped?(tier)
-      raise Refused, "#{explain(verdict)}#{tier} hosts are not available yet: this control plane's rhizome cannot run them (docs/byoh/NO_KVM.md section 11)."
-    end
+    check_shipped!(tier, verdict)
     return if ByohVirtTiers.allows?(location, tier)
 
     commands = if ByohVirtTiers.lower?(tier)
