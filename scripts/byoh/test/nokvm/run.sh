@@ -30,9 +30,10 @@
 #     apparmor=unconfined and seccomp=unconfined are accepted for
 #     ubi-q-nokvm-l3 (never on the shared lab machine);
 #   - NOKVM_L3_PROFILE=1: a machine administrator loaded the AppArmor
-#     profile ubi-q-nokvm, which l3 then runs under, with docker's
-#     default seccomp profile. The harness never loads a profile, and
-#     none is shipped yet.
+#     profile ubi-q-nokvm (ubi-q-nokvm.apparmor in this directory, which
+#     says how), and l3 then runs under it, with docker's default
+#     seccomp profile. The harness never loads a profile. The profile is
+#     UNVERIFIED: it parses, but has never been loaded or run under.
 # inside.sh still mounts /proc/sys read-only but for /proc/sys/net in
 # l3's mount namespace, and l3.sh checks there, at start and at the end,
 # that host kernel settings are not writable; the host-state comparison

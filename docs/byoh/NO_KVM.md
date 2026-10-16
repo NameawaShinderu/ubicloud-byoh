@@ -261,8 +261,11 @@ Platform table changes (`lib/byoh_virt_platforms.rb`, SHIPPED):
   the KVM module loads"; anything else, 7th generation and `-flex` included → "move to C8i, M8i or R8i
   ... or to a .metal type". No generation regex. `-flex` is left out because no source here says it
   supports nested virtualization.
-- `cost_hint` on the `aws`, `aws_xen`, `gcp`, `azure` and `hetzner_cloud` rows and the AWS rules (section 7).
-  `Verdict#text` prints it as `cost:` only when the host is not L1. Every hint says "check current pricing".
+- `cost_hint` on every row and the AWS rules (section 7): row-specific prices on `aws`, `aws_xen`, `gcp`,
+  `azure`, `hetzner_cloud` and `oci`, and shared hints for the rest (`SELF_HOSTED_COST` for Hyper-V,
+  VMware and VirtualBox, `ASK_COST` for the "ask" rows, `NO_NESTED_COST` for providers without nested
+  virtualization). `Verdict#text` prints it as `cost:` only when the host is not L1. Every hint but the
+  self-hosted one says "check current pricing".
 - Wording by the row's `nested` value for a `none` host: `yes`/`some` → "Fixable by changing the instance
   type or a VM option: ...", `ask` → "Ask your provider whether nested virtualization can be enabled. ...",
   `no` → the row's fix. Only a `kvm_blocked` verdict is labelled "probably fixable" (`tier: kvm_blocked
@@ -353,8 +356,9 @@ records in `vm_host.virt_probe["platform"]`. Offerings change; this table was ch
 | `aws_xen` | Xen-based EC2 type such as t2/m4 (`sys_vendor` "Xen", `product_version` containing "amazon"; DMI strings from memory, UNVERIFIED) | no | Move to a Nitro type: C8i/M8i/R8i with nested virtualization, or `.metal` | AWS docs, high for Xen types lacking VT-x (from memory) |
 | `xen` | Xen | ask | `nestedhvm=1`, which Xen marks experimental | Xen docs, medium |
 
-Rows with a `cost_hint` (section 7): `aws`, `aws_xen`, `gcp`, `azure`, `hetzner_cloud`. The others
-have none, because their fix costs nothing or depends on the provider.
+Every row has a `cost_hint` (section 7): its own for `aws`, `aws_xen`, `gcp`, `azure`, `hetzner_cloud`
+and `oci`, and a shared one for the others (free on a hypervisor you run, provider-specific, or "bare
+metal costs far more").
 
 The DMI strings for Linode, Vultr and Scaleway are UNVERIFIED guesses, so a miss falls back to the
 generic fix. Bare metal matches no row: the fix there is the firmware setting (power the machine off
@@ -486,7 +490,7 @@ the design no longer depends on it (section 5.3, "User group").
     carries the fix.
   - Patch cadence: LearnVirt (and `bin/byoh-virt refresh`) pages `ByohKernelReboot` when
     `reboot-required` has been present on an L3 or L4 host for more than 7 days. The host kernel
-    version is shown on the VM page.
+    version is shown on the VM page. (SHIPPED in the final pass; section 10.5.)
   - gVisor is not used (section 8).
 - **cgroups.** `lxc.cgroup.dir.monitor` and `lxc.cgroup.dir.container` are under `<vm>.service`
   (`Delegate=yes`). Limits: `cpu.max`, `memory.max`, `memory.swap.max = 0`, `pids.max`, `io.max`. A
@@ -595,9 +599,10 @@ Differences from section 5.3:
 - **The LXC directory is 0711, not 0700** (`/var/lib/ubicloud/lxc` and `/var/lib/ubicloud/lxc/<vm>`):
   LXC's child already runs as the container's root when it bind-mounts the seed, so it must traverse
   the directory. Others may traverse but not list it; the config, seccomp policy (0600) and network hook
-  (0700) stay root-only. The seed directory (0755) and its files (0644) are readable by every host user
-  who knows the VM's name, user-data included: on a container host only rhizome and the VMs' dnsmasq
-  users exist. Tightening that (a seed owned by the slot's root) is open and UNVERIFIED.
+  (0700) stay root-only. The seed directory is `root:<slot base gid>` 0750 and its files 0640, so
+  only root and the container's own root (which LXC bind-mounts it as) can read the user-data; no
+  other host user, another VM's dnsmasq user or slot included, can (final pass; spec-gated, the l3 lab
+  was not re-run, UNVERIFIED that LXC 5.0.3 bind-mounts it as the slot's root as section 5.1 found).
 - **The `crypt-loop` mapping stays open across a stop.** A stopped container is started again by
   `systemctl start` alone (the control plane's start and `setup-vm restart`), without the key
   encryption key, so the mapping and the ext4 mount stay until `setup-vm delete` or a host reboot,
@@ -608,15 +613,19 @@ Differences from section 5.3:
   (`lxc.console.size`, `lxc.console.rotate`), since it lives on the host's root file system outside the
   disk's quota. Both UNVERIFIED in the lab. `lxc.log` (`-l WARN`) has no bound; only LXC writes to it.
 - **The slot** is recorded only on the host (`/var/lib/ubicloud/idmap/<vm>`), not in `prep.json` or the
-  control plane.
+  control plane. Accepted: every action that needs it runs on that host and reads it there, and a
+  second record could disagree with the first.
 - **`/vm/<vm>`** stays owned by the VM's user, as for cloud-hypervisor: on a container host nothing runs
   as that user but dnsmasq, and nothing root writes for the container lives there (the console log
-  and the seed are in the root-only LXC directory).
+  and the seed are in the root-only LXC directory). Accepted.
 - **cgroups.** The unit has `Delegate=yes` and `DelegateSubgroup=supervisor` (systemd ≥ 254), and the
   LXC paths are absolute from the cgroup root (`system.slice/<vm>.service/lxc.monitor` and
   `lxc.payload`), so `<vm>.service` itself holds no process when LXC enables controllers below it. Limits
   are `cpu.max` (the VM's vCPUs), `memory.max`, `memory.swap.max = 0` and `pids.max` (2048 per vCPU);
-  `io.max` is not set (UNVERIFIED which device numbers a loop file would need).
+  `io.max` is not set (UNVERIFIED which device numbers a loop file would need). Accepted while every
+  lower tier is single-project: the tier sizes carry no IO limits (`NO_IO_LIMITS`, like the standard
+  sizes), so there is no limit to apply, and only one project's VMs share a location. It **blocks**
+  `container:multitenant`, together with the whole-core cpuset or SMT-off check.
 - **No explicit `/dev/fuse` deny.** An extra `lxc.cgroup2.devices.deny` entry made LXC 5.0.3 refuse
   `/dev/null` too (VERIFIED). The guest cannot create device files, and LXC creates none but its
   standard ones, so `/dev/fuse` is absent anyway (VERIFIED).
@@ -628,10 +637,13 @@ Differences from section 5.3:
   hooks in `/`.
 - **Rhizome stays Ruby 3.0 syntax** (hosts run the distribution's Ruby; 3.2 on 24.04): the lab caught a
   Ruby 3.4 `it` in the slot allocator.
-- **Not built in WP5**: `ByohKernelReboot` (section 10.5), the multi-tenant host checks (so
-  `container:multitenant` stays refused and every location is single-project), lxcfs-specific setup
-  (Ubuntu's `lxcfs` package hooks itself into every LXC container through `common.conf.d`), and the
-  DoS limit advice beyond this section. `container:nested-userns` lifts the `clone`/`unshare` rules and
+- **Not built in WP5**: the multi-tenant host checks and `io.max` (so `container:multitenant` stays
+  refused and every location is single-project; `ByohVirtTiers::MULTITENANT_CHECKED` is empty, and these
+  two block offering multi-project container locations), lxcfs-specific setup (accepted: Ubuntu's
+  `lxcfs` package hooks itself into every LXC container through `common.conf.d`), and per-location DoS
+  limit advice beyond this section (accepted while single-project: the tenant can only hurt its own
+  VMs and the host, which `pids.max`, `memory.max` and the core kept for the host bound).
+  `ByohKernelReboot` was added in the final pass (section 10.5). `container:nested-userns` lifts the `clone`/`unshare` rules and
   `clone3`'s ENOSYS together (one switch, simpler than 5.3's split).
 
 Lab artifacts, each said in the lab's output (`scripts/byoh/test/nokvm/l3.sh`, `fake-systemctl`,
@@ -938,8 +950,9 @@ SHIPPED (spec-gated; nothing of it run on a real host, UNVERIFIED there):
   container, the l3 lab was not re-run.
 
 Not shipped (deferred, as planned): the exit-reason diagnosis of EMULATED_HOSTS.md section 6.5, the
-admin "Create VM" size list for emulated hosts, an "Emulated" badge in the UI (no lower tier has one
-yet), per-host instead of per-location tenancy, and RSS-based tuning of the 512 MiB overhead.
+admin "Create VM" size list for emulated hosts, per-host instead of per-location tenancy (per location
+is final, section 10.6), and RSS-based tuning of the 512 MiB overhead. The VM page and the API now
+say what a lower-tier VM is (section 12).
 
 ### Options rejected
 
@@ -1079,10 +1092,13 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
   (sanitised), pages once under the same `ByohVirtTier` tag, and pops with "virt probe failed". It never
   retries forever and never blocks `wait_prep`; a later probe that finds L1 resolves the page.
   `bin/byoh-virt show` prints "the last probe failed: ..." and exits 3.
-- Not built: the `ByohKernelReboot` page of section 5.3 (WP5 left it out, section 5.5). Until it
-  exists, a container host's pending kernel update is recorded only as the probe fact
-  `vm_host.virt_probe["facts"]["reboot_required"]`; nothing pages or prints it. It matters only for
-  container and PVM hosts. Page text is sanitised.
+- SHIPPED in the final pass (spec-gated): on `container` and `pvm` hosts (`Prog::LearnVirt::KERNEL_TIERS`)
+  LearnVirt keeps `virt_probe["reboot_required_since"]`, the first probe that saw
+  `/var/run/reboot-required`, and pages `ByohKernelReboot` (with the kernel release and the fix: drain,
+  reboot, `bin/byoh-virt refresh`) once that is 7 days old; a probe without the flag clears it and
+  resolves the page. So that this happens without an operator, HostNexus `wait` starts LearnVirt on a
+  lower-tier host whose `virt_probe["probed_at"]` is older than a day; KVM hosts are never re-probed
+  and their record has neither field. Page text is sanitised.
 
 ### 10.6 What WP4 shipped, and where it differs from this plan
 
@@ -1100,9 +1116,12 @@ lower-tier path is also exercised in specs with the constant stubbed.
 Differences from sections 10.3, 10.4 and 11.2, each stricter or equal:
 - `Prog::Vm::Nexus.assemble(allowed_tiers:)` **defaults to `["kvm"]`**. Service callers (Kubernetes,
   Postgres, runners, VM pools, inference, MoveVm) pass nothing and so never get a lower tier; only
-  the VM create API passes the tier of a size the customer picked. The web form offers none.
+  the VM create API passes the tier of a size the customer picked. The web form offers none; the `ubi`
+  CLI accepts the tier sizes (`ubi vm <loc>/<name> create -s container-2 ...`) without listing them in
+  its help, and the server enforces the policy.
 - **Tenancy is per location for every lower tier**, emulated included (the plan had per host for L5):
-  the target host is unknown when `assemble` runs, and per location is the stricter rule.
+  the target host is unknown when `assemble` runs, and per location is the stricter rule. This is
+  final, not a stopgap: EMULATED_HOSTS.md's "one project per host" is satisfied by it.
 - **No lower tier can be shared between projects yet.** `<tier>:multitenant` would lift the
   per-location rule, but sharing needs per-host conditions (section 6.5 and section 12: SMT off or
   core scheduling and l1tf/mds "Not affected" for pvm; whole-core cpusets or SMT off for container)
@@ -1224,7 +1243,12 @@ Flags on `bin/register-byoh-host`:
   `bin/byoh-location set --location <loc> --virt-tiers kvm,<tier> --accept <tier>` commands.
 - A refusal prints the commands that would register the host on its fastest option only when that
   option can be registered: never for a tier missing from `ByohVirtTiers::SHIPPED`, whose text
-  says instead that fallbacks cannot be registered yet.
+  says instead that fallbacks cannot be registered yet. The platform fix of a `none` host names the
+  tiers this control plane registers (`ByohVirtLadder.fallbacks_text`, from `SHIPPED`).
+- `--default-boot-image` must name the tier's own images on a lower tier: `ByohVirtRegistration#decide!`
+  refuses e.g. `ubuntu-noble` for `container` with the right name, before anything is written. Without
+  the flag the host downloads the tier's first image; `bootstrap-data-plane.sh` prints the flag only
+  for `kvm`. (Final pass; before it, the refusal came from `HostNexus.assemble` as a backtrace.)
 
 The registration matrix (probe × declared tier). "ack" means allowed with `--accept-fallback`:
 
@@ -1308,11 +1332,21 @@ tier is registered and then held at `verify_virt_tier` until a probe agrees.
 
 Applies to every lower rung:
 - Its families and sizes are separate (`Option::TierVmSizes`) and never chosen implicitly.
+- A host must hold one VM of the tier's smallest size beside the core kept for the host
+  (`verify_tier_capacity`, and early in `bootstrap-data-plane.sh`), or it never reaches `accepting`.
+- A `container` VM is refused in a load balancer with SSL certificates (`LoadBalancer#check_cert_guard!`,
+  on attach and on enabling certificates) unless the location acknowledged `container:guest-firewall`:
+  without that the guest has no rule keeping non-root users off the cert server, which serves the load
+  balancer's private key, so rhizome also leaves the cert server address off the container's interface.
+  KVM and emulated guests keep the rule and are unaffected.
 - The label is the tier's description in `ByohVirtTiers`. As shipped, operators see it when
   `bin/byoh-location set` asks for `--accept` and when registration asks for `--accept-fallback`, and
   `bin/byoh-location show` prints `<tier> (<rung>, experimental)`; customers see the size name
-  (`container-2`, `emulated-2`) and the API's refusals. A badge with a tooltip in the UI is PLANNED,
-  not built, and the web form offers no lower-tier size (section 10.6).
+  (`container-2`, `emulated-2`) and the API's refusals. Since the final pass the API's VM object has a
+  `virt_tier` object (`tier`, `description`, `experimental: true`, and in the detailed view
+  `host_kernel` for container and PVM VMs) and the VM page shows a "Virtualization" row with the
+  description and a "Host Kernel" row; a standard VM's output is unchanged (no key, no row). No badge
+  with a tooltip in VM lists, and the web form offers no lower-tier size (section 10.6).
 - Rates: `bin/byoh-location rates --location <loc> --family F --from standard --multiplier X` (X is required).
   `byoh-location set` refuses to add a tier without rates, and `Validation.validate_billing_rate` in
   `Prog::Vm::Nexus.assemble` refuses a VM whose family has no rate in its location. Rates follow the
@@ -1557,9 +1591,11 @@ for every container it creates:
   refuse to start unless one of these holds:
   - A machine administrator has loaded the AppArmor profile `ubi-q-nokvm` (`NOKVM_L3_PROFILE=1`):
     `docker-default` plus the mounts LXC needs, with `remount` of `/sys` and `/proc/sys` denied, and
-    `sysfs` and `proc` mounts allowed only under the container rootfs. No such profile is shipped yet,
-    and loading one is host kernel policy, so the harness never loads it. UNVERIFIED: that LXC runs
-    under such a profile.
+    `sysfs` and `proc` mounts allowed only under the container rootfs. It ships as
+    `scripts/byoh/test/nokvm/ubi-q-nokvm.apparmor` (final pass); loading one is host kernel policy, so
+    the harness never loads it, and the file says how an administrator does. UNVERIFIED: it passed
+    `apparmor_parser -Q` (parse only, in a container), was never loaded, and LXC has never run under it,
+    so `run.sh l3` and `run.sh l5` have still not run under the tightened rules.
   - `BYOH_NOKVM_THROWAWAY_VM=1` declares the machine a throwaway VM, where `apparmor=unconfined` and
     `seccomp=unconfined` are accepted for `ubi-q-nokvm-l3`.
 
@@ -1718,8 +1754,22 @@ section 14). No GO has been reported, so the build below has not started and L4 
 - Status 2026-10-16: done. The plan's `proxmox-and-hypervisors.md` is the existing
   `platforms/proxmox.md` (its "Other hypervisors" section covers libvirt, ESXi, Hyper-V and XCP-ng),
   and `bare-metal-dedicated.md` got the same probe pointer as `own-hardware.md`. Not done because the
-  code does not exist: the `ByohKernelReboot` page and the PVM one-shot recovery for registered hosts
-  (TROUBLESHOOTING covers only the L4-T1 test machine).
+  code does not exist: the PVM one-shot recovery for registered hosts (TROUBLESHOOTING covers only the
+  L4-T1 test machine). The `ByohKernelReboot` page was added in the final pass.
+
+### Final pass (2026-10-16)
+
+Review findings fixed, all spec-gated and none run on a real host: the boot-image refusal at
+registration (section 11.2), the fallback text that still said nothing could be registered, the
+smallest-VM capacity check, `ubi vm create -s <tier size>`, the load balancer cert guard for
+containers (section 12), the container seed readable only by the container's root (section 5.5),
+`ByohKernelReboot` with a daily lower-tier probe (section 10.5), the tier description and host kernel
+in the API and on the VM page (section 12), a `cost_hint` on every platform row, and the `ubi-q-nokvm`
+AppArmor profile file (section 15, harness; parse-checked only). Accepted deviations: section 5.5
+(slot location, `/vm/<vm>` owner, lxcfs, DoS advice; `io.max` and the multi-tenant checks block
+multi-project container locations) and section 10.6 (per-location tenancy is final). Still not run:
+`run.sh l3` and `run.sh l5` under the tightened rules (the profile needs an administrator to load it,
+or a throwaway VM), WP7's PVM build (waits for an L4-T1 GO), and every real-host test of section 14.
 
 ## 16. Sources
 

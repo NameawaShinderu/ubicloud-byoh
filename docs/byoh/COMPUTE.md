@@ -344,7 +344,7 @@ hold a guest-RAM budget in GiB, not hugepages. No allocator change was needed fo
 |---|---|---|
 | `wait_prep` | `accepts_slices` is false on a lower-tier host (slices are cloud-hypervisor's CPU cgroups), and one core is booked for the host in `used_cores`, because the VMs' vCPUs are ordinary host threads | `prog/vm/host_nexus.rb` (`wait_prep`, the LearnCpu reaper) |
 | `verify_virt_tier` | Replaces `setup_hugepages`: the host waits until a probe agrees with its tier | `prog/vm/host_nexus.rb` |
-| `verify_tier_capacity` | Replaces `verify_hugepages` after the reboot. Fails when `MemAvailable` < 2 GiB, when the host has fewer than 2 physical cores, or when the VMs already on the host exceed the new budget; otherwise writes the budget and the VMs' memory into the two columns | `prog/vm/host_nexus.rb`, `ByohVirtTiers.memory_budget_gib` |
+| `verify_tier_capacity` | Replaces `verify_hugepages` after the reboot. Fails when `MemAvailable` < 2 GiB, when one VM of the tier's smallest size (`ByohVirtTiers.smallest_size`) does not fit beside the core kept for the host (in the allocator's cores, `max(1, vcpus * total_cores / total_cpus)`) or in the budget, or when the VMs already on the host exceed the new budget; otherwise writes the budget and the VMs' memory into the two columns | `prog/vm/host_nexus.rb`, `ByohVirtTiers.memory_budget_gib` |
 
 Budget in GiB = `((MemTotal − hugepages) × 42/43 − host_reserve − vm_overhead × total_cpus/min_vcpus) / 1024`,
 all in MiB with integer division, never below 0. Hugepages left over from an earlier configuration are

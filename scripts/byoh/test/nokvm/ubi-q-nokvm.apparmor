@@ -1,0 +1,111 @@
+# AppArmor profile for the l3 and l5 lab containers of run.sh
+# (NOKVM_L3_PROFILE=1; docs/byoh/NO_KVM.md section 8). The harness never
+# loads it: a machine administrator does, once, with
+#   sudo apparmor_parser -r scripts/byoh/test/nokvm/ubi-q-nokvm.apparmor
+# and removes it with
+#   sudo apparmor_parser -R scripts/byoh/test/nokvm/ubi-q-nokvm.apparmor
+#
+# It is docker-default (moby profiles/apparmor/template.go) plus the
+# mounts that nested LXC (l3) and rhizome's network namespaces and
+# inside.sh's fresh /proc (l3, l5) need. The l3 and l5 containers are root
+# in the host's user namespace with CAP_SYS_ADMIN, so what keeps them off
+# host-global kernel state is this profile:
+#   - the file rules deny writes to /proc/sys (but net), /proc/sysrq-
+#     trigger, /sys (but the cgroup tree) and the firmware and security
+#     trees, by path, wherever proc or sysfs is mounted at its usual
+#     place, and under LXC's rootfs mount point too;
+#   - proc may be mounted only at /proc and in LXC's rootfs, sysfs only
+#     in LXC's rootfs, so no proc or sysfs can appear at a path the file
+#     rules do not cover;
+#   - /sys and /proc/sys are never remounted read-write.
+# Status: UNVERIFIED. It was checked only with apparmor_parser's parser
+# (no kernel load); it has never been loaded, and l3 and l5 have never
+# run under it.
+
+#include <tunables/global>
+
+profile ubi-q-nokvm flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+  pivot_root,
+  signal (receive) peer=unconfined,
+  signal (send,receive) peer=ubi-q-nokvm,
+
+  # From docker-default.
+  deny @{PROC}/* w,
+  deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9][^0-9][^0-9][^0-9/]*}/** w,
+  deny @{PROC}/sys/[^kn]** w,
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+  deny ptrace (trace,read,tracedby,readby) peer=unconfined,
+
+  # The same paths under LXC's rootfs mount point, where LXC mounts the
+  # container's proc and sysfs before pivot_root.
+  deny /usr/lib/*/lxc/rootfs/proc/sys/[^n]** w,
+  deny /usr/lib/*/lxc/rootfs/proc/sysrq-trigger rwklx,
+  deny /usr/lib/*/lxc/rootfs/proc/kcore rwklx,
+  deny /usr/lib/*/lxc/rootfs/sys/[^f]*/** wklx,
+  deny /usr/lib/*/lxc/rootfs/sys/firmware/** rwklx,
+  deny /usr/lib/*/lxc/rootfs/sys/kernel/security/** rwklx,
+
+  # Never a writable /sys or /proc/sys.
+  deny mount options=(rw,remount) -> /sys/,
+  deny mount options=(rw,remount,bind) -> /sys/,
+  deny mount options=(rw,remount) -> /proc/sys/,
+  deny mount options=(rw,remount,bind) -> /proc/sys/,
+  deny mount fstype=sysfs -> /sys/,
+  deny mount fstype=securityfs,
+  deny mount fstype=debugfs,
+  deny mount fstype=tracefs,
+  deny mount fstype=configfs,
+  deny mount fstype=bpf,
+
+  # inside.sh: a fresh /proc in a private mount namespace, /proc/sys
+  # bound read-only but for /proc/sys/net.
+  mount fstype=proc -> /proc/,
+  mount options=(rw,bind) /proc/sys/ -> /proc/sys/,
+  mount options=(ro,remount,bind) -> /proc/sys/,
+  mount options=(rw,bind) /proc/sys/net/ -> /proc/sys/net/,
+  mount options=(rw,remount,bind) -> /proc/sys/net/,
+  mount options=(rw,remount) -> /sys/fs/cgroup/,
+
+  # ip netns add: /run/netns made shared, and each namespace bound there.
+  mount options=(rw,bind) -> /run/netns/,
+  mount options=(rw,make-shared) -> /run/netns/,
+  mount options=(rw,bind) /proc/*/ns/net -> /run/netns/*,
+  mount options=(rw,bind) /proc/*/task/*/ns/net -> /run/netns/*,
+  mount options=(rw,make-private) -> **,
+  mount options=(rw,make-rprivate) -> **,
+  mount options=(rw,make-slave) -> **,
+  mount options=(rw,make-rslave) -> **,
+
+  # l3.sh's scratch storage, and LXC's own setup inside its rootfs mount
+  # point: proc, sysfs, cgroup2, tmpfs, devpts, mqueue and bind mounts
+  # (the seed, /dev nodes) there, and read-only remounts of them.
+  mount options=(rw,bind) -> /var/storage/,
+  mount fstype=proc -> /usr/lib/*/lxc/rootfs/proc/,
+  mount fstype=sysfs -> /usr/lib/*/lxc/rootfs/sys/,
+  mount fstype=cgroup2 -> /usr/lib/*/lxc/rootfs/sys/fs/cgroup/,
+  mount fstype=tmpfs -> /usr/lib/*/lxc/rootfs/**,
+  mount fstype=devpts -> /usr/lib/*/lxc/rootfs/dev/pts/,
+  mount fstype=mqueue -> /usr/lib/*/lxc/rootfs/dev/mqueue/,
+  mount options=(rw,bind) -> /usr/lib/*/lxc/rootfs/,
+  mount options=(rw,rbind) -> /usr/lib/*/lxc/rootfs/,
+  mount options=(rw,bind) -> /usr/lib/*/lxc/rootfs/**,
+  mount options=(ro,remount,bind) -> /usr/lib/*/lxc/rootfs/**,
+  mount options=(ro,remount,bind,nosuid,nodev,noexec) -> /usr/lib/*/lxc/rootfs/**,
+  mount options=(rw,remount,bind,nosuid,nodev,noexec) -> /usr/lib/*/lxc/rootfs/**,
+}

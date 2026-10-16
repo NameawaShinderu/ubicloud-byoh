@@ -81,8 +81,16 @@ bin/register-byoh-host --location <loc> --main-ip <IP> ... --virt-tier auto --ac
 bin/byoh-location grant --location <loc> --project <ubid>
 ```
 
-Customers then create a `container-2` (or `emulated-2`) VM through the API; the web form offers no
-lower-tier size. Nothing on this list has run on a real VPS (UNVERIFIED; NO_KVM.md §14, L3-T1 and L5-T1).
+Leave out `--default-boot-image` for a lower tier: the host downloads its tier's image
+(`ubuntu-noble-container` for `container`), and registration refuses an image the tier cannot boot.
+Size the VPS for at least one VM of the smallest size beside the core and memory kept for the host
+(`bootstrap-data-plane.sh` and `verify_tier_capacity` check it): about 4 vCPUs without SMT and 12 GiB
+for `container` (a `container-2` VM has 8 GiB), about 4 vCPUs and 6 GiB for `emulated`. A 2-vCPU plan
+can never place a VM.
+
+Customers then create a `container-2` (or `emulated-2`) VM through the API or with
+`ubi vm <loc>/<name> create -s container-2 "<public key>"`; the web form offers no lower-tier size, and
+the VM page says what the VM is. Nothing on this list has run on a real VPS (UNVERIFIED; NO_KVM.md §14, L3-T1 and L5-T1).
 
 A VPS without KVM is also useful in two roles on any branch:
 
