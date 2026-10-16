@@ -98,6 +98,13 @@ class Vm < Sequel::Model
   # host and its provider.
   def byoh_addressing? = location.byoh? && byoh_host?
 
+  # The host kernel a container or PVM VM shares or relies on
+  # (docs/byoh/NO_KVM.md), as the host's last probe saw it; nil for
+  # every other VM.
+  def shared_host_kernel
+    vm_host&.virt_probe&.dig("facts", "kernel") if Prog::LearnVirt::KERNEL_TIERS.include?(family)
+  end
+
   # The addresses service DNS (load balancers, Postgres) publishes for
   # the VM: its public ones on a BYOH host, and its own elsewhere. An
   # internal address is reachable only from the site, so it gets no

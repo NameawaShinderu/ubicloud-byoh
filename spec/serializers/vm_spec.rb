@@ -100,6 +100,22 @@ RSpec.describe Serializers::Vm do
       end
     end
 
+    it "says what a lower-tier VM is, with the host kernel a container shares in the detailed view" do
+      location = create_byoh_location(ula48: "fd00:1:2::/48")
+      host = create_byoh_vm_host(location, virt_tier: "container", family: "container", net6: "fd00:1:2:3::/64", virt_probe: Sequel.pg_jsonb({"facts" => {"kernel" => "6.8.0-90-generic"}}))
+      container = create_vm(family: "container", location_id: location.id, vm_host_id: host.id)
+      described = {tier: "container", description: "System container: shared host kernel, near-native speed. Not a VM.", experimental: true}
+      expect(described_class.serialize_internal(container)[:virt_tier]).to eq(described)
+      expect(described_class.serialize_internal(container, {detailed: true})[:virt_tier]).to eq(described.merge(host_kernel: "6.8.0-90-generic"))
+      emulated = create_vm(name: "emu", family: "emulated", location_id: location.id)
+      expect(described_class.serialize_internal(emulated, {detailed: true})[:virt_tier]).to eq(tier: "emulated", description: "Emulated: slow, compatibility only. Not a security boundary.", experimental: true)
+      expect(described_class.serialize_internal(vm, {detailed: true}).keys).not_to include(:virt_tier)
+      # Without a host, or a host without a probe, there is no kernel to show.
+      expect(create_vm(name: "unplaced", family: "container", location_id: location.id).shared_host_kernel).to be_nil
+      host.update(virt_probe: nil)
+      expect(described_class.serialize_internal(container.reload, {detailed: true})[:virt_tier]).to eq(described)
+    end
+
     it "serializes a VM whose user_nic is gone (mid-destroy) without raising" do
       vm.user_nic.update(vm_id: nil)
       vm.reload

@@ -20,6 +20,15 @@ class Serializers::Vm < Serializers::Base
       maintenance_window_start_at: vm.maintenance_window_start_at,
     }
     base[:ip4_scope] = vm.public_ip4_scope if byoh
+    # A lower-tier VM (docs/byoh/NO_KVM.md) says what it is; a standard
+    # VM's output is as it was.
+    tier = ByohVirtTiers.tier_for_family(vm.family)
+    if ByohVirtTiers.lower?(tier)
+      base[:virt_tier] = {tier:, description: ByohVirtTiers.fetch(tier).description, experimental: true}
+      if options[:detailed] && (host_kernel = vm.shared_host_kernel)
+        base[:virt_tier][:host_kernel] = host_kernel
+      end
+    end
 
     if options[:detailed]
       base.merge!(

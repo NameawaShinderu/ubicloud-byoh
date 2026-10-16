@@ -880,6 +880,19 @@ RSpec.describe Clover, "vm" do
         page.all("dt").map(&:text).zip(page.all("dd").map(&:text)).to_h
       end
 
+      it "says what a lower-tier VM is and which host kernel a container shares" do
+        host = create_byoh_vm_host(location, virt_tier: "container", family: "container", net6: "fd00:1:2:3::/64", virt_probe: Sequel.pg_jsonb({"facts" => {"kernel" => "6.8.0-90-generic"}}))
+        vm = byoh_vm
+        vm.update(family: "container", vm_host_id: host.id)
+        rows = overview_rows(vm)
+        expect(rows["Virtualization"]).to eq "System container: shared host kernel, near-native speed. Not a VM. Experimental."
+        expect(rows["Host Kernel"]).to eq "6.8.0-90-generic"
+        vm.update(family: "emulated", vm_host_id: nil)
+        rows = overview_rows(vm)
+        expect(rows["Virtualization"]).to eq "Emulated: slow, compatibility only. Not a security boundary. Experimental."
+        expect(rows).not_to have_key("Host Kernel")
+      end
+
       it "offers the IPv4 exposures the location's pools have" do
         vm_host = create_byoh_vm_host(location)
         add_pool(vm_host, "10.98.1.128/31", "nat")

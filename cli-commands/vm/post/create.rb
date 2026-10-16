@@ -7,6 +7,11 @@ class UbiCli
     vm_sizes = Option::VmSizes.select(&:visible)
     server_sizes = vm_sizes.map(&:name).uniq.freeze
     storage_sizes = vm_sizes.map(&:storage_size_options).flatten.uniq.sort.map(&:to_s).freeze.each(&:freeze)
+    # Sizes of the lower virtualization tiers (docs/byoh/NO_KVM.md) are
+    # accepted but not listed: only BYOH locations that offer a tier take
+    # them, and the server checks that.
+    tier_sizes = Option::TierVmSizes.map(&:name).freeze
+    tier_storage_sizes = (Option::TierVmSizes.flat_map(&:storage_size_options).map(&:to_s) - storage_sizes).sort_by(&:to_i).freeze.each(&:freeze)
 
     options("ubi vm location/vm-name create [options] public-key", key: :vm_create) do
       on("-6", "--ipv6-only", "do not enable IPv4")
@@ -14,8 +19,8 @@ class UbiCli
       on("-e", "--ip4-exposure=exposure", %w[internet internal], "IPv4 exposure (internal is only in BYOH locations)")
       on("-i", "--init-script=script", "use given init script")
       on("-p", "--private-subnet-id=ps-id", "place VM into specific private subnet (also accepts ps-name)")
-      on("-s", "--size=size", server_sizes, "server size")
-      on("-S", "--storage-size=size", storage_sizes, "storage size")
+      on("-s", "--size=size", server_sizes + tier_sizes, "server size")
+      on("-S", "--storage-size=size", storage_sizes + tier_storage_sizes, "storage size")
       on("-u", "--unix-user=username", "username (default: ubi)")
     end
     help_option_values("Boot Image:", Option::BootImages.map(&:name) + ["machine-image-name@version", "machine-image-name@latest"])

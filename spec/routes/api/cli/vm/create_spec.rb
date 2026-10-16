@@ -110,6 +110,18 @@ RSpec.describe Clover, "cli vm create" do
     expect(Vm.count).to eq 0
   end
 
+  it "creates a VM of a lower virtualization tier in a BYOH location that offers it" do
+    location = create_byoh_location(ula48: "fd00:1:2::/48")
+    ship_virt_tiers("container")
+    location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container], "acks" => {"container" => []}}))
+    @project.set_ff_visible_locations([location.name])
+    allow(BillingRate).to receive(:from_resource_properties).and_call_original
+    %w[VmVCpu VmStorage].each { allow(BillingRate).to receive(:from_resource_properties).with(it, "container", location.name).and_return({"id" => "rate"}) }
+    cli(%W[vm #{location.display_name}/tiered create -6 -s container-2 -S 40] << "a a")
+    expect(Vm.first(name: "tiered")).to have_attributes(family: "container", boot_image: "ubuntu-noble-container")
+    expect(cli(%w[vm eu-central-h1/tiered2 create -s container-2] << "a a", status: 400)).to include("size: \"container-2\" is not a valid virtual machine size.")
+  end
+
   it "defaults the boot image to ubuntu-noble when -b is omitted" do
     cli(%w[vm eu-central-h1/test-vm create] << "a a")
     expect(Vm.first.boot_image).to eq "ubuntu-noble"

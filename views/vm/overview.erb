@@ -13,6 +13,14 @@
   if (gpu = @vm.display_gpu)
     data << ["GPU", gpu]
   end
+  # docs/byoh/NO_KVM.md: a VM of a lower virtualization tier says what it is.
+  virt_tier = ByohVirtTiers.tier_for_family(@vm.family)
+  if ByohVirtTiers.lower?(virt_tier)
+    data << ["Virtualization", "#{ByohVirtTiers.fetch(virt_tier).description} Experimental."]
+    if (host_kernel = @vm.shared_host_kernel)
+      data << ["Host Kernel", host_kernel]
+    end
+  end
   subnet = @vm.user_nic.private_subnet
   ssh_command = lambda do |address|
     ["SSH Command", "<span class='bg-slate-100 text-rose-500 font-mono px-2 py-1 rounded'>#{h("ssh -i <PRIVATE_KEY_PATH> #{@vm.unix_user}@#{address}")}</span>", { escape: false }]
