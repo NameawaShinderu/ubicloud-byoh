@@ -31,7 +31,10 @@ require_relative "container_idmap"
 # falls back to clone, whose CLONE_NEWUSER flag seccomp can see) unless
 # the location acknowledged "nested-userns"; no netfilter netlink socket
 # (nftables or iptables-nft in the guest) unless it acknowledged
-# "guest-firewall"; AppArmor's lxc-container-default-cgns profile; no
+# "guest-firewall"; the AppArmor profile LXC generates for the container
+# from lxc-container-default-cgns (the static profile denies the rslave
+# mount of / that systemd 255 sandboxes its generators with, so the
+# guest's init exits at once, found on the real AWS run); no
 # device but LXC's standard ones (the guest cannot create device files in
 # its user namespace, so LXC's device allowlist, which names /dev/fuse,
 # reaches no other); and cgroup limits for CPU, memory, swap and tasks.
@@ -39,7 +42,10 @@ require_relative "container_idmap"
 # verified in the l3 lab.)
 class ContainerSetup
   LXC_PATH = "/var/lib/ubicloud/lxc"
-  APPARMOR_PROFILE = "lxc-container-default-cgns"
+  APPARMOR_PROFILE = "generated"
+  # The static profile LXC builds the generated one from; its presence
+  # shows LXC's AppArmor support is installed.
+  APPARMOR_BASE = "lxc-container-default-cgns"
   LXC_START = "/usr/bin/lxc-start"
   LXC_STOP = "/usr/bin/lxc-stop"
   NSENTER = "/usr/bin/nsenter"

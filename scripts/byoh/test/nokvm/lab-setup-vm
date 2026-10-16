@@ -7,8 +7,8 @@
 #   unencrypted container disk is a plain directory here. On a host,
 #   ContainerDisk refuses a file system without prjquota. UNVERIFIED here.
 # - AppArmor: a container cannot load profiles, so the guest runs
-#   unconfined by AppArmor here; on a host it gets
-#   lxc-container-default-cgns. UNVERIFIED here.
+#   unconfined by AppArmor here; on a host it gets the profile LXC
+#   generates from lxc-container-default-cgns.
 #
 # Everything else is the real bin/setup-vm.
 require "/w/rhizome/host/lib/vm_setup"

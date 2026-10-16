@@ -231,7 +231,7 @@ module HostTier
       raise Unsupported, "containers need AppArmor enabled"
     end
 
-    profile = ContainerSetup::APPARMOR_PROFILE
+    profile = ContainerSetup::APPARMOR_BASE
     unless File.foreach(File.join(root, "sys/kernel/security/apparmor/profiles")).any? { _1.start_with?("#{profile} ") }
       raise Unsupported, "AppArmor profile #{profile} is not loaded; install lxc and run systemctl reload apparmor"
     end

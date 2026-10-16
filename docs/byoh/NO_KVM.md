@@ -491,7 +491,7 @@ the design no longer depends on it (section 5.3, "User group").
   - `socket(AF_NETLINK, *, NETLINK_NETFILTER)` denied by default: no in-guest nftables or iptables-nft,
     which also reduces nf_tables exposure. Opt-in ack `container:guest-firewall`. The guest keeps
     `CAP_NET_ADMIN` for netplan.
-  - AppArmor `lxc-container-default-cgns`; no nesting; no `/dev/kvm`, `/dev/fuse` or `/dev/net/tun`
+  - AppArmor: the profile LXC generates per container (`lxc.apparmor.profile = generated`) from `lxc-container-default-cgns`, whose static form denies the `rslave` mount of `/` that systemd 255 needs (found on the real AWS run); no nesting; no `/dev/kvm`, `/dev/fuse` or `/dev/net/tun`
     inside; lxcfs; the `cap.drop` list above.
   - Host checks at prep: `dmesg_restrict=1`, `kptr_restrict≥1`, `unprivileged_bpf_disabled≥1`,
     `perf_event_paranoid≥2`. Rhizome checks them and never sets them; a failure is a prep error that
@@ -574,7 +574,7 @@ SHIPPED, spec-gated (100% line and branch coverage for rhizome and the control p
 | The disk: `crypt-loop` (LUKS2 on a sparse file, ext4 owned by the slot's root, a random 512-bit key wrapped with the volume's KEK exactly like ubiblk's, given to `cryptsetup` on stdin) and `dir` (a project quota of the volume's size and 65,536 inodes per GiB of it, so empty files cannot exhaust the shared file system's inode table; refuses a file system without `prjquota` or mounted `nodev`/`nosuid`). The image is extracted by the container's own root (`lxc-usernsexec`, `dev/*` excluded), which also masks `sys-kernel-config.mount`, `sys-kernel-debug.mount` and `systemd-remount-fs.service`, pins every kernel package to priority -1 and limits cloud-init to NoCloud | `rhizome/host/lib/container_disk.rb` |
 | `VmSetup` for `hypervisor: "lxc"`: no tap (LXC makes a veth whose host end is the tap), `bind-dynamic` dnsmasq, network-config by interface name, seed instead of CIDATA, `growpart` and `resize_rootfs` off, the nftables bootcmd only with `container:guest-firewall`, one disk, one NIC, no swap, no PCI devices | `rhizome/host/lib/vm_setup.rb` (the CH and QEMU goldens are unchanged) |
 | `setup-vm net-up` (LXC's `script.up`), `stop-vm` (`lxc-stop --nowait` in the VM's netns), `vm-stats` from the `lxc.payload` cgroup | `rhizome/host/bin/`, `rhizome/host/lib/vm_stats.rb` |
-| Host prep `prep_host.rb <host> <env> container`: x86_64, cgroup v2, Linux ≥ 5.12, systemd ≥ 254, the packages, AppArmor with `lxc-container-default-cgns` loaded, the four kernel settings, no other subordinate id range over the slots; then root's `/etc/subuid` and `/etc/subgid` entry, `SUB_UID_COUNT`/`SUB_GID_COUNT` 0, `groupadd -f -r kvm`, `lxc-net` off | `rhizome/host/lib/host_tier.rb` |
+| Host prep `prep_host.rb <host> <env> container`: x86_64, cgroup v2, Linux ≥ 5.12, systemd ≥ 254, the packages, AppArmor with `lxc-container-default-cgns` (the base of the generated profile) loaded, the four kernel settings, no other subordinate id range over the slots; then root's `/etc/subuid` and `/etc/subgid` entry, `SUB_UID_COUNT`/`SUB_GID_COUNT` 0, `groupadd -f -r kvm`, `lxc-net` off | `rhizome/host/lib/host_tier.rb` |
 | Control plane: `container` in `ByohVirtTiers::SHIPPED` (and the bootstrap's `SHIPPED_TIERS`); prep.json `hypervisor: "lxc"` and `container: {nested_userns, guest_firewall}` for container hosts only (golden `spec/fixtures/golden/params_json_container.json`); the disk encrypted unless the location acknowledged `container:unencrypted-disk`; one disk per container VM; serial log from the console log; no hypervisor learned; `ubuntu-noble-container` 20260926 from cloud-images.ubuntu.com with its SHA256 (never from Ubicloud's blob storage, which has none) kept as `.tar.xz`; a container host downloads the tier's images unless registration names some of them, and refuses others; the API's VM create takes a `container-N` size with `boot_image` `ubuntu-noble-container`, or with none (the tier's first image), and refuses that image with any other size | `lib/byoh_virt_tiers.rb`, `helpers/vm.rb`, `lib/validation.rb`, `model/metal/vm.rb`, `prog/vm/nexus.rb`, `prog/learn_hypervisor.rb`, `prog/download_boot_image.rb`, `model/boot_image.rb`, `prog/vm/host_nexus.rb` |
 
 VERIFIED in the lab (`NOKVM_L3_UNCONFINED=1 scripts/byoh/test/nokvm/run.sh l3`, 72 checks, 2026-10-15;
@@ -669,7 +669,7 @@ under 1 GiB of scratch after the deletes. None of that has run yet (UNVERIFIED):
 profile is available here.
 
 UNVERIFIED until L3-T1 (section 14) runs on a real Ubuntu 24.04 host: the unit under systemd
-(`DelegateSubgroup=`, `NetworkNamespacePath=`, `ExecStop`), AppArmor `lxc-container-default-cgns`,
+(`DelegateSubgroup=`, `NetworkNamespacePath=`, `ExecStop`), AppArmor (the generated profile),
 lxcfs, `crypt-loop`, project quotas, the host prep steps, and the time to SSH on a disk instead of tmpfs.
 
 ## 6. L4: PVM, KVM without hardware virtualization (`pvm`)
@@ -1426,7 +1426,7 @@ bin/byoh-location rates --location $LOC --family container --from standard --mul
 bin/byoh-location set --location $LOC --virt-tiers kvm,container --accept container   # refused before the rates exist
 bin/register-byoh-host --location $LOC --main-ip $IP ... --virt-tier auto --accept-fallback   # expect: container chosen and printed
 # Create a container-2 VM, then on the host:
-sudo aa-status | grep -c lxc-container-default            # >= 1: AppArmor confines it
+sudo aa-status | grep -c 'lxc-<vm>_'                       # >= 1: the generated profile confines it
 sudo cryptsetup status ubi-<vm>-0 | grep -q LUKS2          # crypt-loop: encrypted at rest
 pid=$(sudo nsenter --net=/run/netns/<vm> lxc-info -n <vm> -P /var/lib/ubicloud/lxc -p -H)   # the container's init; lxc-start is the monitor in
                                                            #   the initial user namespace (uid_map "0 0 4294967295")
