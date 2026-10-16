@@ -78,7 +78,7 @@
 #          install.sh owns through a flag (BASE_URL, RACK_ENV, MAIL_*,
 #          SMTP_*, IP_FROM_HEADER), the secrets and keys that load code
 #          into Ruby (RUBYOPT, GEM_*, BUNDLE_*, ...) are refused.
-# run      TOOL is byoh-location, byoh-pool, byoh-host, register-byoh-host,
+# run      TOOL is byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-virt,
 #          byoh-config-check, production_check, create_prod_admin_account
 #          (bin/rake-task-runner) or m2-checks (scripts/byoh/verify, the
 #          database checks of the M2 and M4 gates). It runs in the release
@@ -1573,13 +1573,13 @@ cmd_run() {
   shift || true
   local cmd=()
   case $tool in
-    byoh-location | byoh-pool | byoh-host | register-byoh-host | byoh-config-check | production_check)
+    byoh-location | byoh-pool | byoh-host | register-byoh-host | byoh-virt | byoh-config-check | production_check)
       cmd=("bin/$tool")
       ;;
     create_prod_admin_account) cmd=(bin/rake-task-runner create_prod_admin_account) ;;
     m2-checks) cmd=(scripts/byoh/verify/m2-checks) ;;
-    "") usage_die "run needs a tool: byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-config-check, production_check, create_prod_admin_account or m2-checks" ;;
-    *) usage_die "run does not run $tool; it runs byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-config-check, production_check, create_prod_admin_account and m2-checks" ;;
+    "") usage_die "run needs a tool: byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-virt, byoh-config-check, production_check, create_prod_admin_account or m2-checks" ;;
+    *) usage_die "run does not run $tool; it runs byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-virt, byoh-config-check, production_check, create_prod_admin_account and m2-checks" ;;
   esac
   need_root
   need_release
