@@ -114,10 +114,22 @@ RSpec.describe VmSetup do
 
     it "gives the tap the addresses and routes of a cloud-hypervisor tap from the network hook" do
       expect(vs).to receive(:_run_command).with("ip", "-n", vm, "addr", "replace", "10.0.0.254/32", "dev", "nccont01").ordered
-      expect(vs).to receive(:setup_taps_6).with("fddf::/79", nics, "10.0.0.2").ordered
+      expect(vs).to receive(:setup_taps_6).with("fddf::/79", nics, "10.0.0.2", cert_address: false).ordered
       expect(vs).to receive(:_run_command).with("ip", "-n", vm, "route", "replace", "203.0.113.5/32", "dev", "nccont01").ordered
       expect(vs).to receive(:_run_command).with("ip netns exec #{vm} bash -c echo\\ 1\\ \\>\\ /proc/sys/net/ipv4/conf/nccont01/proxy_arp").ordered
       vs.container_net_up("fddf::/79", "203.0.113.5/32", nics, "10.0.0.2")
+    end
+
+    it "gives the guest the cert server address only with the guest firewall" do
+      calls = []
+      allow(vs).to receive(:_run_command) { |*args| calls << args }
+      vs.setup_taps_6("fddf::/79", nics, "10.0.0.2", cert_address: false)
+      expect(calls).to include(["ip", "-n", vm, "addr", "replace", "fd00:0b1c:100d:53::", "dev", "nccont01"])
+      expect(calls.flatten).not_to include("fd00:0b1c:100d:5AFE:CE::")
+      firewalled = described_class.new(vm, hypervisor: "lxc", hugepages: false, container: {"guest_firewall" => true})
+      expect(firewalled).to receive(:setup_taps_6).with("fddf::/79", nics, "10.0.0.2", cert_address: true)
+      allow(firewalled).to receive(:_run_command)
+      firewalled.container_net_up("fddf::/79", "", nics, "10.0.0.2")
     end
 
     it "routes a private subnet larger than /32 through its gateway, and skips the IPv4 route without a public IPv4" do
@@ -146,7 +158,9 @@ RSpec.describe VmSetup do
     end
 
     it "writes a seed instead of a CIDATA image, binds dnsmasq dynamically and keeps the root file system as it is" do
-      expect(vs.container_setup).to receive(:write_seed) do |meta_data:, user_data:, network_config:|
+      allow(ContainerIdmap).to receive(:slot).with(vm).and_return(5)
+      expect(vs.container_setup).to receive(:write_seed) do |meta_data:, user_data:, network_config:, slot:|
+        expect(slot).to eq 5
         expect(meta_data).to eq writes["meta-data"]
         expect(network_config).to eq writes["network-config"]
         expect(user_data).to eq writes["user-data"]
@@ -164,7 +178,7 @@ RSpec.describe VmSetup do
 
     it "keeps the guest's nftables rule where guest firewalls are acknowledged" do
       fw = described_class.new(vm, hypervisor: "lxc", container: {"guest_firewall" => true})
-      allow(fw).to receive(:vp).and_return(vps)
+      allow(fw).to receive_messages(vp: vps, container_slot: 5)
       expect(fw.container_setup).to receive(:write_seed)
       fw.cloudinit("ubi", ["key"], "fddf:53d2:4c89:2305:46a0::/79", nics, nil, "ubuntu-noble-container", "10.0.0.2", ipv6_disabled: false)
       expect(YAML.safe_load(writes["user-data"])["bootcmd"].size).to eq 3

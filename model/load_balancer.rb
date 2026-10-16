@@ -87,6 +87,7 @@ class LoadBalancer < Sequel::Model
 
   def add_vm(vm)
     DB.transaction do
+      check_cert_guard!([vm]) if cert_enabled
       load_balancer_vm = LoadBalancerVm.create(load_balancer_id: id, vm_id: vm.id)
       ports.each { |port|
         add_port_with_stack(port, load_balancer_vm.id)
@@ -97,6 +98,7 @@ class LoadBalancer < Sequel::Model
   end
 
   def enable_cert_server
+    check_cert_guard!(vms)
     update(cert_enabled: true)
     DB.ignore_duplicate_queries do
       vms.each { |vm| setup_cert_server(vm.id) }
@@ -130,6 +132,19 @@ class LoadBalancer < Sequel::Model
 
   def remove_cert_server(vm_id)
     Strand.create(prog: "Vnet::CertServer", label: "remove_cert_server", stack: [{subject_id: id, vm_id:}], parent_id: id)
+  end
+
+  # The cert server hands the load balancer's private key to its VMs at
+  # an address that a guest rule keeps non-root users off. A container VM
+  # (docs/byoh/NO_KVM.md) has that rule only where the location
+  # acknowledged container:guest-firewall, so elsewhere it cannot serve
+  # TLS.
+  def check_cert_guard!(vms)
+    vms.each do |vm|
+      next if ByohVirtTiers.cert_server_guarded?(vm)
+
+      fail Validation::ValidationFailed.new("vm_id" => "VM #{vm.name} is a system container without the guest firewall, so it cannot be in a load balancer with SSL certificates")
+    end
   end
 
   def setup_cert_server(vm_id)

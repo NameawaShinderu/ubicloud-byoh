@@ -526,7 +526,10 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
     r "ip", "-n", @vm_name, "route", "replace", "2000::/3", "via", vetho_ll, "dev", "vethi#{@vm_name}"
   end
 
-  def setup_taps_6(gua, nics, dns_ipv4)
+  # cert_address: whether the guest gets the load balancer cert server's
+  # address (CertServerSetup), which only a guest with the nft_bootcmd
+  # guard (non-root users kept off it) may have.
+  def setup_taps_6(gua, nics, dns_ipv4, cert_address: true)
     # Write out guest-delegated and clover infrastructure address
     # ranges, designed around non-floating IPv6 networks bound to the
     # host.
@@ -552,7 +555,7 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
       r "ip", "-n", @vm_name, "route", "replace", ip6.to_s, "via", mac_to_ipv6_link_local(nic.mac), "dev", nic.tap
     end
 
-    r "ip", "-n", @vm_name, "addr", "replace", "fd00:0b1c:100d:5AFE:CE::", "dev", nics.first.tap
+    r "ip", "-n", @vm_name, "addr", "replace", "fd00:0b1c:100d:5AFE:CE::", "dev", nics.first.tap if cert_address
     r "ip", "-n", @vm_name, "addr", "replace", "fd00:0b1c:100d:53::", "dev", nics.first.tap
   end
 
@@ -596,7 +599,11 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
   def container_net_up(gua, ip4, nics, dns_ipv4)
     ip4 = nil if ip4.empty?
     nics.each { |nic| r "ip", "-n", @vm_name, "addr", "replace", nic.private_ipv4_gateway, "dev", nic.tap }
-    setup_taps_6(gua, nics, dns_ipv4)
+    # Without the guest firewall, the guest has no rule keeping non-root
+    # users off the cert server (write_user_data), so it gets no address
+    # to reach one; the control plane refuses such VMs in TLS load
+    # balancers (LoadBalancer#check_cert_guard!).
+    setup_taps_6(gua, nics, dns_ipv4, cert_address: container_setup.guest_firewall?)
     nics.each do |nic|
       r "ip", "-n", @vm_name, "route", "replace", NetAddr::IPv4Net.parse(ip4).to_s, "dev", nic.tap if ip4
       tap_proxy_arp(nic)
@@ -868,7 +875,7 @@ DNSMASQ_CONF
 
     # A container reads the same data from a seed directory.
     if container?
-      container_setup.write_seed(meta_data: File.read(vp.meta_data), user_data: File.read(vp.user_data), network_config: File.read(vp.network_config))
+      container_setup.write_seed(meta_data: File.read(vp.meta_data), user_data: File.read(vp.user_data), network_config: File.read(vp.network_config), slot: container_slot)
       return
     end
 

@@ -32,6 +32,32 @@ RSpec.describe LoadBalancer do
     expect(ps.errors[:name]).to be_nil
   end
 
+  describe "cert server guard" do
+    let(:location) { create_byoh_location(ula48: "fd00:1:2::/48") }
+    let(:container_vm) { create_vm(name: "cont-vm", family: "container", location_id: location.id) }
+
+    def ack_guest_firewall
+      location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container], "acks" => {"container" => ["guest-firewall"]}}))
+    end
+
+    it "refuses a container VM without the guest firewall in a load balancer with certificates" do
+      expect { lb.add_vm(container_vm) }.to raise_error(Validation::ValidationFailed) { expect(it.details["vm_id"]).to start_with "VM cont-vm is a system container without the guest firewall" }
+      expect(LoadBalancerVm.count).to eq 0
+      ack_guest_firewall
+      expect { lb.add_vm(container_vm.reload) }.to change { Strand.where(prog: "Vnet::CertServer", label: "setup_cert_server").count }.from(0).to(1)
+    end
+
+    it "refuses to enable certificates while such a VM is attached" do
+      lb.update(cert_enabled: false)
+      lb.add_vm(container_vm)
+      expect { lb.enable_cert_server }.to raise_error(Validation::ValidationFailed) { expect(it.details["vm_id"]).to include "without the guest firewall" }
+      expect(lb.reload.cert_enabled).to be false
+      ack_guest_firewall
+      lb.reload.enable_cert_server
+      expect(lb.reload.cert_enabled).to be true
+    end
+  end
+
   describe "hostname" do
     before do
       allow(Config).to receive_messages(
