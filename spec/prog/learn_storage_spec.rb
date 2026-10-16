@@ -219,6 +219,7 @@ EOS
     # by-id links mounted as an extra storage device. df names the root by
     # its partition, which upstream would resolve to "".
     def expect_byoh_disks
+      expect(ls.sshable).to receive(:_cmd).with("sudo mkdir -p /var/storage")
       expect(ls.sshable).to receive(:_cmd).with("df -B1 --output=source,target,size,avail").and_return(<<~EOS)
         Filesystem     Mounted on                   1B-blocks        Avail
         /dev/root      /                         452564664320 381456842752

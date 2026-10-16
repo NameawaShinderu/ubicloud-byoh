@@ -7,6 +7,11 @@ class Prog::LearnStorage < Prog::Base
   frame_reader :format_storage
 
   def make_model_instances
+    # The Hetzner install image creates /var/storage. A BYOH host added
+    # without --storage-disk has none, and df would fail on it forever;
+    # it is then a directory on the root filesystem, as preflight PF10
+    # assumes and warns about.
+    sshable.cmd("sudo mkdir -p /var/storage") if byoh?
     devices = SystemParser.extract_disk_info_from_df(sshable.cmd("df -B1 --output=source,target,size,avail"))
     rec = SystemParser.extract_disk_info_from_df(sshable.cmd("df -B1 --output=source,target,size,avail /var/storage")).first
     sds = [StorageDevice.new(
