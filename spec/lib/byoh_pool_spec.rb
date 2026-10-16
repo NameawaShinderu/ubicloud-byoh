@@ -242,13 +242,13 @@ RSpec.describe ByohPool do
       ]
       expect(config_networks.count { (it.is_a?(Hash) ? it["cidr"] : it).start_with?("10.98.9.0") }).to eq 1
       expect(ipv4_row("10.98.9.3")[:reserved]).to be true
-      expect(pool.verify).to eq [[:unverified, "/etc/nftables.d/1-byoh-egress.conf is not checked from the database; on the host, run: sudo nft list table inet byoh_egress"]]
+      expect(pool.verify).to eq [[:unverified, "/etc/nftables.d/1-byoh-egress.conf is not checked from the database; on the host, run: sudo nft list table inet byoh_egress"], [:unverified, described_class::UNVERIFIED_CONTRACTS]]
     end
 
     it "follows verify's other advice: remove drops them" do
       pool.remove("10.98.9.0/30")
       pool.remove("10.98.8.0/30")
-      expect(pool.verify.map(&:first)).to eq [:unverified]
+      expect(pool.verify.map(&:first)).to eq [:unverified, :unverified]
     end
   end
 
@@ -512,7 +512,7 @@ RSpec.describe ByohPool do
   describe "#verify" do
     it "reports nothing but the unverified egress file for a consistent host" do
       create_vm(vm_host_id: host.id, location_id: location.id)
-      expect(pool.verify).to eq [[:unverified, "/etc/nftables.d/1-byoh-egress.conf is not checked from the database; on the host, run: sudo nft list table inet byoh_egress"]]
+      expect(pool.verify).to eq [[:unverified, "/etc/nftables.d/1-byoh-egress.conf is not checked from the database; on the host, run: sudo nft list table inet byoh_egress"], [:unverified, described_class::UNVERIFIED_CONTRACTS]]
     end
 
     it "reports drift between the declaration and the database" do
@@ -546,6 +546,7 @@ RSpec.describe ByohPool do
         [:warn, "#{vm.ubid}: its veth address 169.254.169.2/32 is in a link-local range cloud services use; recreate the VM"],
         [:warn, "#{other.ubid}: the control plane reaches it at 10.98.2.9, expected 10.98.2.1; remap or annotate refreshes it"],
         [:unverified, "/etc/nftables.d/1-byoh-egress.conf is not checked from the database; on the host, run: sudo nft list table inet byoh_egress"],
+        [:unverified, described_class::UNVERIFIED_CONTRACTS],
       ]
     end
 

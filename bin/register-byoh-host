@@ -7,14 +7,21 @@
 # Sshable/VmHost/HostProvider/Address/Strand rows that drive
 # Prog::Vm::HostNexus bootstrap.
 #
+# Once the registration key is in root's authorized_keys on the host
+# (--ssh-key, or a generated key the operator confirms installing) it
+# runs host preflight (docs/byoh/PLATFORMS.md PF1-PF21) as root over
+# that key, refuses a host that fails it, and pins the host keys it met.
+# With a generated key and --yes nothing confirms the install, so it
+# skips preflight and says so.
+#
 # Example:
 #
 #   bundle exec bin/register-byoh-host \
 #     --main-ip 192.168.1.10 \
 #     --location byoh-homelab \
+#     --ssh-key ~/.ssh/byoh_data \
 #     --routed-network 198.51.100.0/29,exposure=public \
 #     --routed-network 2001:db8:feed::/64 \
-#     --default-boot-image ubuntu-noble \
 #     --bmc-endpoint https://192.168.1.11 \
 #     --bmc-user admin \
 #     --bmc-pass-env HOMELAB_BMC_PASS \
@@ -37,5 +44,10 @@ end
 require "logger"
 require_relative "../db"
 require_relative "../loader"
+
+# Progress lines (preflight, the bring-up watch) must reach a pipe such
+# as tee, a CI log or ssh as they happen, not when the buffer fills or
+# the process exits.
+$stdout.sync = $stderr.sync = true
 
 exit ByohRegistrationCli.new.run(ARGV)

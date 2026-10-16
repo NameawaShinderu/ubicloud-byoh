@@ -1,0 +1,26 @@
+# Throwaway Ubuntu 24.04 "data-plane host" for the M4 harness
+# (scripts/byoh/test/m4-lib.sh): plain sshd, no systemd, no /dev/kvm.
+# Never used outside tests. Build context: scripts/byoh/test/fakehost.
+#
+# sshd runs in the foreground as PID 1 with -e, so every auth event is
+# in `docker logs`. Host keys are generated per container at start, and
+# the login key is generated per run and installed by m4-lib.sh; no key
+# is baked into the image.
+FROM docker.io/library/ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+      openssh-server sudo iproute2 util-linux pciutils curl ca-certificates procps && \
+    rm -rf /var/lib/apt/lists/* && \
+    rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub && \
+    mkdir -p /run/sshd && \
+    (id ubuntu >/dev/null 2>&1 || useradd -m -s /bin/bash ubuntu) && \
+    usermod -p '*' ubuntu && \
+    install -d -m 0700 -o ubuntu -g ubuntu /home/ubuntu/.ssh && \
+    echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/90-ubuntu && \
+    chmod 0440 /etc/sudoers.d/90-ubuntu
+COPY systemctl /usr/local/bin/systemctl
+COPY entrypoint /usr/local/sbin/fakehost-entrypoint
+RUN chmod 0755 /usr/local/bin/systemctl /usr/local/sbin/fakehost-entrypoint
+ENTRYPOINT ["/usr/local/sbin/fakehost-entrypoint"]
+CMD ["/usr/sbin/sshd", "-D", "-e"]

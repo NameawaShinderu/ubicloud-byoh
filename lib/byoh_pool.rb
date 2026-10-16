@@ -348,6 +348,9 @@ class ByohPool
     end
   end
 
+  # What #verify cannot check from the database (M7 makes them checks).
+  UNVERIFIED_CONTRACTS = "contracts C1-C7 of docs/byoh/NETWORKING.md are not checked from the database yet (M7)"
+
   # Database-only checks of the host's pools, as [level, message] pairs
   # with level :fail, :warn or :unverified.
   def verify
@@ -401,10 +404,11 @@ class ByohPool
       end
     end
 
-    results << if host.byoh?
-      [:unverified, "/etc/nftables.d/1-byoh-egress.conf is not checked from the database; on the host, run: sudo nft list table inet byoh_egress"]
+    if host.byoh?
+      results << [:unverified, "/etc/nftables.d/1-byoh-egress.conf is not checked from the database; on the host, run: sudo nft list table inet byoh_egress"]
+      results << [:unverified, UNVERIFIED_CONTRACTS]
     else
-      [:warn, "location #{host.location.name} is not a BYOH location, so the network contract does not apply to this host yet"]
+      results << [:warn, "location #{host.location.name} is not a BYOH location, so the network contract does not apply to this host yet"]
     end
   end
 

@@ -23,9 +23,13 @@ variable "subnet_cidr" {
 }
 
 variable "operator_ssh_cidr" {
-  description = "CIDR of the operator's workstation for SSH port 22 ingress. Default is 0.0.0.0/0 for ease of testing — you should tighten this to your /32 public IP in real usage."
+  description = "CIDR of the operator's workstation for SSH port 22 ingress, normally your public IP as a /32. Required: there is no default, so that SSH is never open to the world by accident. 0.0.0.0/0 is accepted but warned about."
   type        = string
-  default     = "0.0.0.0/0"
+
+  validation {
+    condition     = can(cidrhost(var.operator_ssh_cidr, 0)) && can(regex("^[0-9.]+/[0-9]+$", var.operator_ssh_cidr))
+    error_message = "operator_ssh_cidr must be an IPv4 CIDR such as 203.0.113.42/32."
+  }
 }
 
 variable "ctrl_plane_instance_type" {
@@ -86,9 +90,13 @@ variable "byoh_location_name" {
 }
 
 variable "web_ui_cidr" {
-  description = "CIDR allowed to reach ports 3000 (web UI) and 443 on the instances. Tighten to your /32, or keep the UI private behind a tunnel."
+  description = "CIDR allowed to reach ports 3000 (web UI) and 443 on the instances: your /32, or the range your customers come from. Required: there is no default. Keep the UI private behind a tunnel by giving your own /32."
   type        = string
-  default     = "0.0.0.0/0"
+
+  validation {
+    condition     = can(cidrhost(var.web_ui_cidr, 0)) && can(regex("^[0-9.]+/[0-9]+$", var.web_ui_cidr))
+    error_message = "web_ui_cidr must be an IPv4 CIDR such as 203.0.113.42/32."
+  }
 }
 
 variable "data_plane_nested_virtualization" {

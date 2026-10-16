@@ -1,0 +1,59 @@
+#!/bin/bash
+# systemctl shim for the M4 fakehost, which has no systemd.
+#   reload|restart ssh|ssh.service|sshd|sshd.service
+#                  as Ubuntu 24.04's ssh.service ExecReload: refuses a
+#                  non-root caller (polkit denies it over ssh), runs
+#                  `sshd -t` and fails without signalling when the
+#                  config is bad (the old sshd keeps serving), else
+#                  sends SIGHUP to the listener (it re-execs and
+#                  rereads its config); exits 1 if any step fails
+#   is-active UNIT...
+#                  "active" for each unit listed (space separated) in
+#                  /etc/fakehost-active, else "inactive"; exits 0 only
+#                  when all are active. The entrypoint writes that file
+#                  from `docker run -e FAKEHOST_ACTIVE=...`, because an
+#                  ssh session does not see the container's env.
+#   anything else  exits 0 and does nothing
+# Every call is appended to /var/log/fakehost-systemctl.log.
+echo "$(id -un): systemctl $*" >>/var/log/fakehost-systemctl.log 2>/dev/null || true
+
+args=()
+quiet=0
+for a in "$@"; do
+  case $a in
+    -q | --quiet) quiet=1 ;;
+    -*) ;;
+    *) args+=("$a") ;;
+  esac
+done
+verb=${args[0]:-}
+
+case $verb in
+  reload | restart | reload-or-restart | try-reload-or-restart)
+    case ${args[1]:-} in
+      ssh | ssh.service | sshd | sshd.service)
+        if ((EUID != 0)); then
+          echo "Failed to ${verb} ${args[1]}: Interactive authentication required." >&2
+          exit 1
+        fi
+        /usr/sbin/sshd -t || exit 1
+        pid=$(cat /run/sshd.pid 2>/dev/null || echo 1)
+        kill -HUP "$pid" || exit 1
+        ;;
+    esac
+    ;;
+  is-active)
+    rc=0
+    read -r -a actives </etc/fakehost-active 2>/dev/null || true
+    for unit in "${args[@]:1}"; do
+      state=inactive
+      for active in "${actives[@]}"; do
+        [[ ${unit%.service} == "${active%.service}" ]] && state=active
+      done
+      [[ $state == active ]] || rc=3
+      ((quiet)) || echo "$state"
+    done
+    exit "$rc"
+    ;;
+esac
+exit 0

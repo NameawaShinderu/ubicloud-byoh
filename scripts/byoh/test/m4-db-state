@@ -1,0 +1,90 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Snapshot and restore of a test database for the M4 container gate
+# (m4-host-add.sh), which runs the real CLIs against a test database
+# that the spec suite shares. Run from the repository root:
+#
+#   m4-db-state check             refuse unless the database is the gate's
+#                                 numbered test database
+#   m4-db-state snapshot FILE     write every table's row digests to FILE
+#   m4-db-state restore FILE      delete every row FILE does not hold, then
+#                                 check that every table matches FILE
+#
+# A row is told apart by the md5 of its text form, so a row the run
+# changed in place is a mismatch: restore then deletes nothing, lists
+# the tables and exits 1. Deletes run in one transaction with
+# session_replication_role = replica, so foreign keys need no order;
+# that needs a superuser, which the test database's owner is.
+#
+# The guard needs UBI_M4_GATE=1, which only m4-host-add.sh's control
+# plane container sets, and a database named *_test<n> whose <n> is
+# TEST_ENV_NUMBER. A bare *_test name is refused: the development
+# bootstrap's deployment database is clover_test.
+#
+# The file has no .rb suffix, so the coverage gate does not track it.
+
+require "json"
+
+unless ENV["UBI_M4_GATE"] == "1"
+  warn "m4-db-state: refusing: UBI_M4_GATE=1 is not set; only m4-host-add.sh runs this"
+  exit 2
+end
+
+require_relative "../../../db"
+
+def tables = DB.tables.map(&:to_s).reject { it == "schema_migrations" }.sort
+
+def digests(table)
+  DB.fetch("SELECT md5(t::text) AS h FROM #{DB.literal(Sequel.identifier(table))} t").map { it[:h] }.tally
+end
+
+def state = tables.to_h { [it, digests(it)] }
+
+number = ENV["TEST_ENV_NUMBER"].to_s
+name = DB.get(Sequel.function(:current_database))
+unless number.match?(/\A\d+\z/) && name.end_with?("_test#{number}")
+  warn "m4-db-state: refusing database #{name}: only a *_test<n> database with <n> = TEST_ENV_NUMBER (#{number.empty? ? "unset" : number}) can be snapshotted and restored"
+  exit 2
+end
+
+command, file = ARGV
+case command
+when "check"
+  puts name
+when "snapshot"
+  File.write(file, JSON.generate(state))
+  puts "snapshot of #{name}: #{tables.size} tables"
+when "restore"
+  saved = JSON.parse(File.read(file))
+  now = state
+  changed = now.filter_map do |table, rows|
+    table unless (saved.fetch(table, {}).keys - rows.keys).empty? && saved.fetch(table, {}).all? { |h, n| rows.fetch(h, 0) >= n }
+  end
+  unless changed.empty?
+    warn "m4-db-state: #{name}: rows the run did not add were changed or deleted in #{changed.join(", ")}; nothing restored"
+    exit 1
+  end
+  deleted = 0
+  DB.transaction do
+    DB.run("SET LOCAL session_replication_role = replica")
+    now.each do |table, rows|
+      rows.each do |h, n|
+        extra = n - saved.fetch(table, {}).fetch(h, 0)
+        next unless extra.positive?
+
+        ident = DB.literal(Sequel.identifier(table))
+        deleted += DB["DELETE FROM #{ident} WHERE ctid IN (SELECT ctid FROM #{ident} t WHERE md5(t::text) = ? LIMIT ?)", h, extra].delete
+      end
+    end
+  end
+  left = state.reject { |table, rows| rows == saved.fetch(table, {}) }.keys
+  unless left.empty?
+    warn "m4-db-state: #{name}: #{left.join(", ")} still differ after the restore"
+    exit 1
+  end
+  puts "restored #{name}: deleted #{deleted} rows the run added"
+else
+  warn "usage: m4-db-state check | snapshot FILE | restore FILE"
+  exit 2
+end

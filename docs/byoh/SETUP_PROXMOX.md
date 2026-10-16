@@ -6,7 +6,9 @@ This runbook turns a VM on a Proxmox VE node into a BYOH data plane, with the M2
 
 The driver code is the same on every platform. What differs on Proxmox is only the site work: the VM settings, the bridge, the router, and the shape of the pools.
 
-**Superseded material.** The previous version of this page, `SETUP_PROXMOX_LOWTIER.md` and `docs/byoh/deploy-scripts/` predate M2. They pass `--provider` (which aborts), create no BYOH location, dual-home the data plane, and declare /32 pools that M2 treats as `routed`/`internal`. Do not use them.
+**Short path.** [recipes/proxmox.md](recipes/proxmox.md) is this page in brief: the VM, a `pools.yaml`, then the three commands (`install.sh`, `ubicloud-admin site add`, `ubicloud-admin host add --ssh`). This page keeps every variant and the troubleshooting.
+
+**Deleted material.** `SETUP_PROXMOX_LOWTIER.md` and `docs/byoh/deploy-scripts/` were deleted in M4. They passed `--provider` (which aborts), created no BYOH location, dual-homed the data plane, declared /32 pools that M2 treats as `routed`/`internal`, and set `accepts_slices=false` on every host. They are in git history only.
 
 ---
 
@@ -71,8 +73,8 @@ free -g; pvesm status                            # memory and storage headroom
 ```
 
 - **Nested virtualization off.** Ask the node's owner to enable it: `options kvm-intel nested=Y` (or `options kvm-amd nested=1`) in `/etc/modprobe.d/`, then a node reboot. This affects every guest on the node.
-- **Hybrid CPUs.** Intel 12th-14th gen and Core Ultra parts with P and E cores fail every VM with `BUG` (PLATFORMS.md HW-6/VR-3). Disable E-cores in the BIOS, or use another node.
-- **SMT off (`nosmt`)** is not supported (PLATFORMS.md HW-7).
+- **Hybrid CPUs.** Intel 12th-14th gen and Core Ultra parts with P and E cores: since M4 a BYOH host counts every CPU as a core and VMs boot, with uneven core speeds (PLATFORMS.md HW-6/VR-3, FIXED IN M4 for BYOH hosts; UNVERIFIED on hybrid hardware). Preflight fails `PF8-hybrid` unless you pass `--accept-check PF8-hybrid`. A host whose CPUs were learned before M4 still fails every VM with `BUG`: re-register it.
+- **SMT off (`nosmt`) or offlined CPUs** work on a BYOH host since M4: LearnCpu keeps only online CPUs and counts every CPU as a core when thread counts differ (PLATFORMS.md HW-7). Hosts learned before M4 keep their old rows and need re-registering.
 
 ---
 
@@ -86,7 +88,7 @@ free -g; pvesm status                            # memory and storage headroom
 | Cores | 8 recommended, 4 minimum (UNVERIFIED) | Rhizome reserves cores for the host. On AWS, 8 vCPU gave 4 usable cores and room for 2-3 `standard-2` VMs. |
 | Memory | A **multiple of 1024 MiB**, 32768 recommended, 16384 minimum (UNVERIFIED) | Other sizes crash LearnMemory with "unexpected dmidecode unit" (OPS-16) on builds without a0259a997, which includes the published `byoh-driver`; `m2-network` rounds them down ([platforms/README.md](platforms/README.md) §3). Most of the memory becomes 1G hugepages for VMs; `verify_hugepages` needs MemAvailable of at least 2 GiB after that. On AWS, 32 GiB gave 26 hugepages. |
 | Ballooning | Off (`balloon: 0`) | The guest's memory is pinned as 1G hugepages; a balloon would take it back. UNVERIFIED. |
-| Disk | One `scsi0` disk on a `virtio-scsi-single` controller, on the VM's own storage, 200 GB or more | VM disks and boot images live on the root filesystem under `/var/storage`. Virtio and SCSI disks have no by-id links; IO limits fall back to the path [FIXED], but `bin/monitor` health checks do not (§4.3). |
+| Disk | One `scsi0` disk on a `virtio-scsi-single` controller, on the VM's own storage, 200 GB or more. Extra data disks: §3.4 | VM disks and boot images live on the root filesystem under `/var/storage`. Virtio and SCSI disks have no `wwn-` links; IO limits fall back to the path, and since M4 the health checks of a BYOH host identify the disk from the mount down (§4.3). |
 | NIC | **One** NIC, `virtio`, on the LAN bridge, with **`firewall=0`** | Two NICs (vmbr0 DHCP plus a BYOH bridge, as the old docs had) give asymmetric egress, and G5 flags the second address. With the Proxmox firewall on, `ipfilter` or `macfilter` can drop proxy-ARP replies and VM-sourced packets (the default is UNVERIFIED). |
 | Machine / BIOS | Defaults (i440fx or q35, SeaBIOS or OVMF) | Nothing in rhizome depends on them. UNVERIFIED for OVMF. The NIC is `ens18` on i440fx and `enp6s18` on q35; this page writes `ens18`. |
 | OS | Ubuntu 24.04 LTS server or cloud image | Upstream accepts only 24.04 for slices (`accepts_slices`). |
@@ -120,6 +122,8 @@ The node's own firewall settings stay as they are. `firewall=0` applies only to 
 
 ### 3.3 Check inside the VM
 
+`host add` runs these checks and more as host preflight (PLATFORMS.md §6); `sudo ubicloud-admin host preflight --site <site> --ssh ubuntu@10.80.0.20 --ssh-key ~/your_admin_key --pool-file pools.yaml` runs it alone, read-only. By hand:
+
 ```bash
 ssh ubuntu@10.80.0.20
 ls -l /dev/kvm                                  # must exist
@@ -129,6 +133,21 @@ ip -br -4 addr                                  # only lo and 10.80.0.20/24 on t
 curl -sI https://cloud-images.ubuntu.com >/dev/null &&
   curl -sfIL https://cloud-images.ubuntu.com/releases/noble/release-20250502.1/ubuntu-24.04-server-cloudimg-amd64.img >/dev/null && echo egress ok  # ends at http://cloud-images-archive.ubuntu.com
 ```
+
+### 3.4 Extra data disks
+
+This replaces the old storage section ("P4"), which mounted a passed-through disk over `/var/storage` after registration and hid the VM disks and boot images already there (OPS-9).
+
+- **Before `host add` only.** Prep learns the storage once; adding a disk to a registered host is not supported yet (M5).
+- **Dedicated virtual disks only.** Add a new virtual disk from the VM's own storage. Never pass through a node disk, a SAN LUN, an iSCSI target or another guest's volume: inside the guest it looks like any disk, so the shared-transport refusal of `storage-disk` cannot catch it, and two writers corrupt it.
+- Give it a serial so it has a stable by-id name, and leave it blank:
+
+  ```bash
+  qm set $VMID --virtio1 $STORAGE:500,serial=ubidata1
+  ```
+
+- Pass it to `host add --storage-disk virtio-ubidata1`. It is formatted as ext4 (label `ubi-diskN`) and mounted at `/var/storage/devices/diskN` with `nofail`, where prep counts it. A disk with any partition, signature, holder, swap or mount is refused; nothing is ever wiped. The by-id name follows udev's virtio-blk serial rule (UNVERIFIED on Proxmox): host preflight's PF11 line prints the names of the blank disks it sees.
+- **Never mount anything over `/var/storage` itself.**
 
 ---
 
@@ -166,15 +185,17 @@ export PATH=$HOME/.local/bin:$HOME/.local/share/mise/installs/ruby/4.0.7/bin:$PA
 - `~/.local/bin` (mise) must be on PATH for `bundle install`, or bundler fails with "No such file or directory - mise" (seen in the live AWS window).
 - It starts `puma` and `respirate` in tmux. Logs go to `/tmp/{puma,respirate}.{log,err}`.
 
-### 4.3 Do not start `bin/monitor` yet
+### 4.3 `bin/monitor`
 
-Virtio and SCSI disks in a Proxmox guest have no `wwn-`/`nvme-eui` by-id links and no SMART, so upstream health checks misjudge the host and may mark it `unavailable` (PLATFORMS.md F5). Keep `UBI_START_MONITOR=0` (the default) and run the gate with `GATE_EXPECT_MONITOR=0`.
+Virtio and SCSI disks in a Proxmox guest have no `wwn-`/`nvme-eui` by-id links and no SMART, so upstream's health checks marked such hosts `unavailable`. Since M4 a BYOH host has its own checks (PLATFORMS.md F5): disks are found from the mount down, SMART-less virtual disks are not SMART-checked, and `kvm-clock` passes on a virtual host. The 24-hour monitor soak on a virtio host (VERIFY.md G-M4-4) has not run, so keep `UBI_START_MONITOR=0` (the default; packaged: `ubicloud-monitor` stays disabled) and run the gate with `GATE_EXPECT_MONITOR=0`, unless you are running that soak.
 
 ---
 
 ## 5. Data-plane bootstrap and SSH key
 
-On the data plane:
+**With `host add` (M4), skip this section.** `host add --ssh ubuntu@10.80.0.20 --ssh-key ~/your_admin_key` logs in with the key you gave `--sshkeys` in §3.2, runs preflight, installs its own root key and allows root key login only where sshd does not already (§7.2). Nothing needs to be run on the data plane first. `bootstrap-data-plane.sh` remains useful to check a VM by hand: it ends with the standalone host preflight.
+
+The rest of this section is for the low-level `bin/register-byoh-host` path. On the data plane:
 
 ```bash
 git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
@@ -292,6 +313,17 @@ Run everything on the control plane, from `~/ubicloud`.
 
 ### 7.1 Create the BYOH location (once per site)
 
+Packaged control plane (it restarts the services when the rates change):
+
+```bash
+sudo ubicloud-admin site add byoh-pve-office --display "Office Proxmox (BYOH)" \
+  --underlay 10.80.0.0/24 --overlay 172.20.0.0/14 --cp-reach onhost \
+  --cp-source <control plane IP as the site sees it>/32 --mgmt-allow 10.80.0.0/24 \
+  --rates-from hetzner-fsn1
+```
+
+Development control plane, from `~/ubicloud` (`packaging/bin/ubicloud-admin --dev site add ...` runs the same):
+
 ```bash
 bundle exec bin/byoh-location create --name byoh-pve-office \
   --ui-name "Office Proxmox (BYOH)" \
@@ -314,7 +346,7 @@ The command (and gate step G2) may print two **warnings**. Neither is a failure,
 - `cp_source_cidrs <ip>/32 is not in CONTROL_PLANE_OUTBOUND_CIDRS`. To silence it, add `ENV["CONTROL_PLANE_OUTBOUND_CIDRS"] ||= "<control plane IP>/32"` to `.env.rb` (comma-separated for several).
 - `BASE_URL is http://localhost:9292`. This appears only with an `.env.rb` from an older bootstrap; set `BASE_URL` as in §4.2.
 
-Then restart `puma` and `respirate` so they load the rates. They are tmux sessions; the bootstrap restarts them and skips every finished step:
+On the development control plane, then restart `puma` and `respirate` so they load the rates. They are tmux sessions; the bootstrap restarts them and skips every finished step:
 
 ```bash
 tmux kill-session -t puma; tmux kill-session -t respirate
@@ -328,9 +360,26 @@ The location is hidden. After you create your account (§8), give your project a
 bundle exec bin/byoh-location grant --location byoh-pve-office --project pj...
 ```
 
-### 7.2 Register the host
+### 7.2 Add the host
 
-Copy your `pools.yaml` (§6) to the control plane, then:
+Copy your `pools.yaml` (§6) and the private key that matches `--sshkeys` (§3.2) to the control plane, then:
+
+```bash
+ssh-keygen -t ed25519 -N '' -f ~/.ssh/byoh_data      # the root key the control plane keeps; §7.3 and §9 log in with it
+sudo ubicloud-admin host add --site byoh-pve-office --ssh ubuntu@10.80.0.20 \
+  --ssh-key ~/your_admin_key --registration-key ~/.ssh/byoh_data --pool-file pools.yaml \
+  [--storage-disk virtio-ubidata1]
+```
+
+Without `--registration-key`, `host add` generates the root key and keeps it only in the database; then use the admin console or a key of your own for root logins.
+
+(development: `packaging/bin/ubicloud-admin --dev host add ...` from `~/ubicloud`, without `sudo`).
+
+- It runs host preflight first and stops on any `fail` before it changes anything: no `/dev/kvm` or a `kvm64` CPU model (PF3), a pool holding `10.80.0.20` or the gateway (PF17), the Proxmox node itself (PF16-pve).
+- It shows the changes and the host key fingerprints, and asks for a typed `yes`. Compare the fingerprints with the VM's console (`qm terminal <vmid>`, then `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), or pass them with `--expect-host-key SHA256:...`.
+- It installs its own root key, registers the host pinned to those host keys, follows the bring-up (one reboot of the VM), and runs `pool verify`. Exit 0 means the host accepts VMs. A re-run resumes; Ctrl-C stops only the watch (`sudo ubicloud-admin host watch 10.80.0.20` follows it again).
+
+**Low-level path** (`bin/register-byoh-host`, after §5):
 
 ```bash
 bundle exec bin/register-byoh-host \
@@ -439,13 +488,13 @@ Do not jump to the VM's IPv6 through the host. On a `ula` host it fails with "No
 | LearnMemory "unexpected dmidecode unit" | Memory is not a multiple of 1024 MiB. Fix it with `qm set <id> --memory 32768` and restart the VM from Proxmox (`qm shutdown` then `qm start`; a guest reboot does not apply the change). Do not re-register: respirate retries the failed step on its own. To re-register anyway, destroy the old VmHost first (§11). |
 | `verify_hugepages` fails | Not enough memory for 1G hugepages, or `cpu` is not `host` (no `pdpe1gb`). |
 | No `/dev/kvm` in the data plane | Nested virtualization is off on the node, or the CPU type is not `host`. |
-| VM waits for capacity ("No capacity left") | An internet VM on a host with only `internal` pools (use `-e internal`); no free address of the right exposure (`bin/byoh-pool list`); boot image not downloaded; too few cores or hugepages. On a low-core host, the slices setting may not match. Scope the fix to the one host: `DB[:vm_host].where(id: …).update(accepts_slices: false)`. Never run it unscoped, as `deploy-scripts/04` did. |
+| VM waits for capacity ("No capacity left") | An internet VM on a host with only `internal` pools (use `-e internal`); no free address of the right exposure (`bin/byoh-pool list`); boot image not downloaded; too few cores or hugepages. On a low-core host, the slices setting may not match. Scope the fix to the one host: `DB[:vm_host].where(id: …).update(accepts_slices: false)`. Never run it unscoped, as the deleted `deploy-scripts/04` did. |
 | An internal VM is unreachable from the LAN | The pool range is inside the DHCP range or used elsewhere (`arping -I <iface> 10.80.0.20x` from another LAN host shows two MACs); the Proxmox NIC firewall or ipfilter is on; a route or VPN overlaps the LAN (§6.1). |
 | VM stuck at `wait_sshable` | With `cp_reach: onhost`, the control plane cannot reach the pool address. Put it on the LAN, or switch the location to `--cp-reach public` (§4.1). |
 | A nat VM is unreachable at E from the internet | Missing pfSense 1:1 entry or WAN pass rule. From inside the site, this is expected while reflection is off (§6.3). |
 | VM has no DNS | Guest dnsmasq forwards to public resolvers (8.8.8.8 and public IPv6). The site firewall must allow outbound DNS from the data plane. Site resolvers (`dns_servers`) are PLANNED. |
 | VM cannot reach a LAN host | By design: the underlay is in the VM egress deny list. There is no exception list yet: `--egress-allow` is stored but not enforced (PLANNED P2). |
-| Host marked `unavailable` | `bin/monitor` is running with health checks that do not fit virtio disks (§4.3). |
+| Host marked `unavailable` | `bin/monitor` is running. Since M4 a BYOH host's checks fit virtio disks; a host registered before M4 needs `byoh-host relearn-device-ids --host vh... --yes` first (TROUBLESHOOTING.md §8). A generic host still in hetzner-fsn1 keeps upstream's checks (§4.3). |
 
 ---
 

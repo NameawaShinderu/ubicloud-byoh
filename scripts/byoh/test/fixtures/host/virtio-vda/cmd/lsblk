@@ -1,0 +1,3 @@
+NAME="vda" TYPE="disk" FSTYPE="" MOUNTPOINTS="" PKNAME=""
+NAME="vda1" TYPE="part" FSTYPE="ext4" MOUNTPOINTS="/" PKNAME="vda"
+NAME="vdb" TYPE="disk" FSTYPE="" MOUNTPOINTS="" PKNAME=""

@@ -433,12 +433,21 @@ class StorageVolume
 
   def write_through_device?
     st = File.stat(disk_file)
+    sysfs = "/sys/dev/block/#{st.dev_major}:#{st.dev_minor}"
 
-    rp = File.realpath("/sys/dev/block/#{st.dev_major}:#{st.dev_minor}")
-    dev = File.basename(rp)
-    base = File.exist?("/sys/block/#{dev}") ? dev : File.basename(File.dirname(rp))
-
-    File.read("/sys/block/#{base}/queue/write_cache").include?("write through")
+    begin
+      rp = File.realpath(sysfs)
+      dev = File.basename(rp)
+      base = File.exist?("/sys/block/#{dev}") ? dev : File.basename(File.dirname(rp))
+      File.read("/sys/block/#{base}/queue/write_cache").include?("write through")
+    rescue Errno::ENOENT
+      # btrfs and ZFS give files an anonymous device number (major 0)
+      # with no block device behind it. Keep flushes on, the safe
+      # choice. A real block device without the entry still raises.
+      raise unless st.dev_major.zero?
+      warn "#{disk_file}: no write cache setting at #{sysfs}; assuming a write-back cache"
+      false
+    end
   end
 
   def start(key_wrapping_secrets)

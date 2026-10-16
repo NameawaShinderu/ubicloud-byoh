@@ -12,17 +12,26 @@ class ByohHostCli
     Usage: bin/byoh-host COMMAND [options]
 
     Commands:
-      move-location     --host UBID --location NAME --empty-only
-      move-location     --host UBID --rollback-to LOCATION --empty-only
-      setup-egress-nat  --host UBID
-      export-audit      [--out FILE]
+      add                 --site NAME --ssh USER@HOST (--pool-file FILE | --routed-network CIDR ...) [--yes]
+      preflight           --site NAME --ssh USER@HOST [--pool-file FILE | --routed-network CIDR ...]
+      watch               HOST [--timeout SECONDS]
+      move-location       --host UBID --location NAME --empty-only
+      move-location       --host UBID --rollback-to LOCATION --empty-only
+      setup-egress-nat    --host UBID
+      relearn-device-ids  --host UBID [--yes]
+      relearn-pci         --host UBID
+      export-audit        [--out FILE]
 
     Run a command with --help for its options.
   USAGE
 
-  def initialize(out: $stdout, err: $stderr)
+  # device_ids is ByohDeviceIdentity.device_ids; specs pass a stand-in.
+  # host_add holds keywords for ByohHostAdd (add, preflight, watch).
+  def initialize(out: $stdout, err: $stderr, device_ids: ByohDeviceIdentity.method(:device_ids), **host_add)
     @out = out
     @err = err
+    @device_ids = device_ids
+    @host_add = host_add
   end
 
   # Returns the process exit status.
@@ -30,7 +39,9 @@ class ByohHostCli
     argv = argv.dup
     command = argv.shift
     case command
-    when "move-location", "setup-egress-nat", "export-audit"
+    when "add", "preflight", "watch"
+      return ByohHostAdd.new(out: @out, err: @err, **@host_add).run(command, argv)
+    when "move-location", "setup-egress-nat", "relearn-device-ids", "relearn-pci", "export-audit"
       send(:"cmd_#{command.tr("-", "_")}", argv)
     when nil, "help", "-h", "--help"
       @out.puts USAGE
@@ -49,8 +60,11 @@ class ByohHostCli
 
   # Whether the host's prep has started installing its egress NAT table,
   # so a later change must be installed by a SetupByohEgressNat strand.
+  # It reads the HostNexus label, not the strand's: HostNexus pushes
+  # progs such as SetupHugepages after prep, and those start at their
+  # own start label.
   def self.past_prep?(host)
-    !(host.allocation_state == "unprepared" && PRE_PREP_LABELS.include?(host.strand.label))
+    !(host.allocation_state == "unprepared" && PRE_PREP_LABELS.include?(ByohHostWatch.host_label(host.strand)))
   end
 
   private
@@ -88,7 +102,7 @@ class ByohHostCli
     from = host.location
     notes = []
     pools = 0
-    strand = DB.transaction do
+    strand, relearn = DB.transaction do
       # The row lock makes the move wait for an allocation that already
       # wrote a VM to the host, so that VM is counted here. It does not
       # stop an allocation that chose the host before the lock but writes
@@ -117,12 +131,19 @@ class ByohHostCli
       # table before it takes VMs, as it is all that keeps them off the
       # metadata service and the underlay; prep installs it only on hosts
       # that are BYOH hosts when prep runs, so a host past prep gets it
-      # here.
-      Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}]) if rollback || self.class.past_prep?(host)
+      # here. Such a host also learned its GPUs under upstream's rule,
+      # which keeps GPUs that are not on vfio-pci; LearnPci applies the
+      # BYOH rule and drops those rows (the host has no VMs to hold one).
+      past_prep = self.class.past_prep?(host)
+      [
+        (Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}]) if rollback || past_prep),
+        (start_learn_pci(host) if !rollback && past_prep),
+      ]
     end
     @out.puts "Moved host #{host.ubid} from location #{from.name} to #{target.name}."
     @out.puts "Reset #{pools} IPv4 pools to routed and public, with nothing reserved and no external IPs." if pools.positive?
     @out.puts "Started #{strand.ubid} to #{rollback ? "remove" : "install"} the egress NAT table #{rollback ? "from" : "on"} host #{host.ubid}." if strand
+    @out.puts "Started #{relearn.ubid} to relearn the GPUs of host #{host.ubid} under the BYOH vfio-pci rule." if relearn
     notes.each { @out.puts "  #{it}" }
     @out.puts "The host is #{host.allocation_state}; set it to accepting in the admin UI when it should take VMs." if host.allocation_state == "draining"
   end
@@ -157,6 +178,78 @@ class ByohHostCli
       st
     end
     @out.puts "Started #{strand.ubid} to install the egress NAT table on host #{host.ubid} from location #{host.location.name}'s profile."
+  end
+
+  # Recomputes the disk ids of a BYOH host's storage devices with
+  # ByohDeviceIdentity and, with --yes, stores them. Hosts registered
+  # before it hold "", "root" or partition names, which the health checks
+  # cannot resolve, and LearnStorage refuses to relearn once VMs have
+  # volumes.
+  # Only unix_device_list changes; capacity is left alone.
+  def cmd_relearn_device_ids(argv)
+    opts = {}
+    parse(argv, "relearn-device-ids --host UBID [--yes]") do |o|
+      host_option(o, opts)
+      o.on("--yes", "Store the new ids (without it, only show them)") { opts[:yes] = true }
+    end
+    host = find_host(opts)
+    raise Error, "host #{host.ubid} is not a BYOH host (a generic host in a BYOH location)" unless host.byoh?
+
+    devices = host.storage_devices.sort_by(&:name)
+    raise Error, "host #{host.ubid} has no storage devices yet; LearnStorage records them during prep" if devices.empty?
+
+    ids = begin
+      @device_ids.call(host.sshable, devices.map { it.path.chomp("/") })
+    rescue ByohDeviceIdentity::Error => e
+      raise Error, e.message
+    rescue Sshable::SshError => e
+      raise Error, "could not read disk ids from host #{host.ubid} over SSH: #{e.message}: #{e.stderr.to_s.strip}"
+    rescue *Sshable::SSH_CONNECTION_ERRORS => e
+      raise Error, "could not read disk ids from host #{host.ubid} over SSH: #{e.class}: #{e.message}"
+    end
+    changes = devices.filter_map do |sd|
+      new_ids = ids.fetch(sd.path.chomp("/"))
+      old_ids = sd.unix_device_list.to_a
+      @out.puts "#{sd.name} (#{sd.path.chomp("/")}): #{old_ids.inspect} -> #{new_ids.inspect}#{" (unchanged)" if old_ids == new_ids}"
+      [sd, old_ids, new_ids] unless old_ids == new_ids
+    end
+
+    if changes.empty?
+      @out.puts "Nothing to change."
+    elsif !opts[:yes]
+      @out.puts "Nothing written; re-run with --yes to store the new ids."
+    else
+      DB.transaction do
+        changes.each { |sd, _, new_ids| sd.update(unix_device_list: Sequel.pg_array(new_ids, :text)) }
+        ByohOperatorLog.record(command: "relearn-device-ids", target_id: host.id,
+          args: {devices: changes.to_h { |sd, old_ids, new_ids| [sd.name, {from: old_ids, to: new_ids}] }}, result: "ok")
+      end
+      @out.puts "Stored the new ids of #{changes.size} storage devices of host #{host.ubid}."
+    end
+  end
+
+  # Reruns LearnPci on a BYOH host past prep. Prep learns a host's GPUs
+  # once, so a host learned before the vfio-pci rule (PLATFORMS F9), or
+  # whose GPU binding changed since, keeps rows of GPUs a VM cannot
+  # open. LearnPci records the GPUs whose IOMMU group is all on vfio-pci
+  # and drops the idle rows of the others; a row a VM holds stays.
+  def cmd_relearn_pci(argv)
+    opts = {}
+    parse(argv, "relearn-pci --host UBID") { host_option(it, opts) }
+    host = find_host(opts)
+    raise Error, "host #{host.ubid} is not a BYOH host (a generic host in a BYOH location)" unless host.byoh?
+    raise Error, "host #{host.ubid} is still being prepared; its prep learns the GPUs" unless self.class.past_prep?(host)
+
+    strand = DB.transaction do
+      st = start_learn_pci(host)
+      ByohOperatorLog.record(command: "relearn-pci", target_id: host.id, args: {}, result: "started #{st.ubid}")
+      st
+    end
+    @out.puts "Started #{strand.ubid} to relearn the GPUs of host #{host.ubid}. The respirate log names each GPU it skips and why."
+  end
+
+  def start_learn_pci(host)
+    Strand.create(prog: "LearnPci", label: "start", stack: [{subject_id: host.id}])
   end
 
   # Writes every byoh_operator_action row as JSON lines and records the

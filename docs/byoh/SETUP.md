@@ -1,14 +1,14 @@
 # Ubicloud BYOH setup (any platform)
 
-This is the full runbook for a BYOH deployment with the current (M3) code: a control plane, one or more data-plane hosts, a BYOH location, address pools and VMs. The steps are the same on every platform. Only the site network work and the way you create the machines differ, and those are in the platform sections at the end.
+This is the full runbook for a BYOH deployment with the current (M4) code: a control plane, one or more data-plane hosts, a BYOH location, address pools and VMs. The steps are the same on every platform. Only the site network work and the way you create the machines differ, and those are in the platform sections at the end.
 
 | Platform | Status | Where |
 |---|---|---|
 | AWS EC2 (nested virtualization or `.metal`) | Validated (ap-south-1, 2026-10-11 and 2026-10-13) | This page, §12 "AWS-specific (optional)" |
-| Proxmox VE (a VM as the data plane) | UNVERIFIED | [SETUP_PROXMOX.md](SETUP_PROXMOX.md) |
+| Proxmox VE (a VM as the data plane) | UNVERIFIED | [recipes/proxmox.md](recipes/proxmox.md), [SETUP_PROXMOX.md](SETUP_PROXMOX.md) |
 | Rented bare metal, colo, homelab, GCP, Azure, other clouds | UNVERIFIED | §13 "Other platforms", [platforms/](platforms/README.md) and NETWORKING §9 |
 
-The shortest path is [QUICKSTART.md](QUICKSTART.md). Per-platform guides: [platforms/README.md](platforms/README.md). Problems: [TROUBLESHOOTING.md](TROUBLESHOOTING.md). The design is in [NETWORKING.md](NETWORKING.md); the platform matrix and host requirements are in [PLATFORMS.md](PLATFORMS.md).
+**The same three commands on every platform (M4):** `install.sh` once, `ubicloud-admin site add` once per site, `ubicloud-admin host add --ssh` once per host. [recipes/README.md](recipes/README.md) lists them; §6 and §8.1 below explain them. The shortest path is [QUICKSTART.md](QUICKSTART.md). Per-platform guides: [platforms/README.md](platforms/README.md). Problems: [TROUBLESHOOTING.md](TROUBLESHOOTING.md). The design is in [NETWORKING.md](NETWORKING.md); the platform matrix and host requirements are in [PLATFORMS.md](PLATFORMS.md).
 
 **Two control-plane layouts (M3).** A production control plane is installed with `scripts/byoh/install.sh` ([INSTALL.md](INSTALL.md)) and operated with `sudo ubicloud-admin` ([OPERATIONS.md](OPERATIONS.md)): systemd, database `ubicloud`, settings in `/etc/ubicloud/env`. The development bootstrap (`scripts/byoh/bootstrap-dev-ctrl-plane.sh`: tmux, `clover_test`, `trust`) is for development and labs; the live AWS control plane still runs it until its M3 window ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)). The commands below are written for the development layout (`bundle exec bin/...` in `~/ubicloud`); §4.3 gives the packaged equivalent of each. The packaged layout has run only in the container harness (UNVERIFIED on a real machine).
 
@@ -37,15 +37,17 @@ The control plane and the data plane can be on different platforms. The only cou
 | KVM | `ls /dev/kvm` | Bare metal: enable VT-x/AMD-V. Guest: nested virtualization plus a CPU model that passes `vmx`/`svm` |
 | 1G hugepages | `grep -c pdpe1gb /proc/cpuinfo` > 0 | Guest: pass the host CPU model |
 | Memory in whole GiB | `sudo dmidecode -t memory \| grep Size:` shows `GB` | On the published `byoh-driver` (17d383a9c), LearnMemory fails "unexpected dmidecode unit". `m2-network` (a0259a997) accepts kB/MB/GB/TB ([platforms/README.md](platforms/README.md) §3) |
-| Not a hybrid (P+E core) CPU, SMT on | `lscpu` | Every VM fails with `BUG` (PLATFORMS.md HW-6, HW-7) |
+| Not a hybrid (P+E core) CPU, SMT on | `lscpu` | Preflight fails `PF8-hybrid`. Since M4 a BYOH host with mixed thread counts counts every CPU as a core, so VMs boot; `--accept-check PF8-hybrid` accepts the uneven core speeds ([recipes/homelab.md](recipes/homelab.md) §2). Offline CPUs are left out (PF8 warns) |
 | Outbound internet | `curl -sI https://cloud-images.ubuntu.com` and `curl -sfIL https://cloud-images.ubuntu.com/releases/noble/release-20250502.1/ubuntu-24.04-server-cloudimg-amd64.img` (it redirects to `http://cloud-images-archive.ubuntu.com`, so port 80 too) | PrepHost and boot image downloads fail |
 | One uplink address only | `ip -br -4 addr` shows only the main IP | Pool addresses on the NIC steal VM traffic (C5) |
 | Nothing else managing nftables | no Docker, ufw, Tailscale, k3s, libvirt | Their rules are flushed on every VM create and destroy (NH-6) |
-| Disks | VM disks live under `/var/storage` on the root filesystem | Mount extra disks at `/var/storage/devices/<name>` **before** registration; never mount over `/var/storage` afterwards |
+| Disks | VM disks live under `/var/storage` on ext4 or xfs (ZFS refused, btrfs UNVERIFIED) | Give blank extra disks to `host add --storage-disk <by-id>`, which mounts each at `/var/storage/devices/diskN` before prep; never mount over `/var/storage` afterwards |
 
 Registration reboots the host once and takes it over: it recreates the `rhizome` user, rewrites the sshd config and allocates hugepages. Never register a machine that does anything else, such as a hypervisor node.
 
-`bin/monitor` health checks need `wwn-`/`nvme-eui` disk links and SMART. Hosts on cloud block storage (AWS EBS) or virtio disks (Proxmox) do not have them, so do not run the monitor for those hosts yet (PLATFORMS.md F5).
+Every row above is a host preflight check (PF1-PF21, [PLATFORMS.md](PLATFORMS.md) §6). `host add` runs preflight before it changes anything; `ubicloud-admin host preflight` runs it alone.
+
+Upstream's `bin/monitor` health checks need `wwn-`/`nvme-eui` disk links and SMART, which cloud block storage (AWS EBS) and virtio disks (Proxmox) lack. Since M4 a BYOH host gets checks that allow for that (PLATFORMS.md F5), but the 24-hour soak on EBS, virtio and LVM hosts has not run (UNVERIFIED), so leave the monitor off unless you run it.
 
 ---
 
@@ -120,6 +122,7 @@ The UI is at `http://<control plane>:3000/create-account`. In development the ac
 
 | Development (in `~/ubicloud`, mise on PATH) | Packaged |
 |---|---|
+| `packaging/bin/ubicloud-admin --dev site\|host\|pool ...` (or `bundle exec bin/byoh-location`, `bin/byoh-host`, `bin/byoh-pool`) | `sudo ubicloud-admin site\|host\|pool ...` (M4; [OPERATIONS.md](OPERATIONS.md) §4.2a) |
 | `bundle exec bin/byoh-location ...`, `bin/byoh-pool ...`, `bin/byoh-host ...`, `bin/register-byoh-host ...` | `sudo ubicloud-admin run byoh-location ...` (and `byoh-pool`, `byoh-host`, `register-byoh-host`). Files such as `--pool-file` and `--ssh-key` are copied for the tool |
 | `RACK_ENV=development bundle exec bin/pry` | `sudo ubicloud-admin console` (not audited, [OPERATIONS.md](OPERATIONS.md) §3) |
 | Restart: kill the tmux sessions, rerun the bootstrap | `sudo systemctl restart ubicloud.target` |
@@ -135,7 +138,9 @@ The UI is at `http://<control plane>:3000/create-account`. In development the ac
 
 ## 5. Data plane
 
-On each host:
+**With `host add` (§8.1), nothing has to run on the host first.** You need a login with passwordless sudo and your key on it (cloud images: `ubuntu`), and the site network work (§3 and the platform section). `bootstrap-data-plane.sh` is still useful as a check: it ends with the standalone host preflight.
+
+For the low-level `register-byoh-host` path (§8.2), on each host:
 
 ```bash
 git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
@@ -161,6 +166,15 @@ Then do the site's network work (§3, and the platform section).
 ## 6. Create the BYOH location (once per site)
 
 ```bash
+sudo ubicloud-admin site add <site> --display "<Name shown to customers>" \
+  --underlay <site LAN and management CIDRs> --overlay 172.20.0.0/14 \
+  --cp-reach onhost|public --cp-source <control plane IP as the site sees it>/32 \
+  --mgmt-allow <who may manage the hosts> --rates-from hetzner-fsn1
+```
+
+`site add NAME` is `byoh-location create --name NAME` (`--display` is `--ui-name`), and it restarts `ubicloud.target` when it wrote a rate file. Until M8 `--mgmt` takes only `direct` and `--cp-reach mgmt` is refused; `--postgres` takes only `no`. On the development layout, the same through `packaging/bin/ubicloud-admin --dev site add ...`, or:
+
+```bash
 bundle exec bin/byoh-location create --name <site> --ui-name "<Name shown to customers>" \
   --underlay <site LAN and management CIDRs> \
   --overlay 172.20.0.0/14 \
@@ -178,7 +192,7 @@ bundle exec bin/byoh-location create --name <site> --ui-name "<Name shown to cus
 | `--ula48` | Generated at random. Pass one only to fit an existing host's `net6`. |
 | `--rates-from` | Copies every billing rate of an upstream location into `$BILLING_RATES_EXTRA_DIR`; `--multiplier` scales them |
 
-Restart `puma` and `respirate` (and `bin/monitor`, if it runs) so they load the rates (packaged: `sudo systemctl restart ubicloud.target`), then check with `bundle exec bin/byoh-location show --location <site>`. The location stays hidden until `set --visible`. Give your project access after you create your account (§9):
+On the development layout, restart `puma` and `respirate` (and `bin/monitor`, if it runs) so they load the rates, then check with `bundle exec bin/byoh-location show --location <site>`. The location stays hidden until `set --visible`. Give your project access after you create your account (§9):
 
 ```bash
 bundle exec bin/byoh-location grant --location <site> --project <project ubid>
@@ -212,7 +226,28 @@ routed_networks:
 
 ---
 
-## 8. Register the host
+## 8. Add the host
+
+### 8.1 `host add` (M4)
+
+```bash
+sudo ubicloud-admin host add --site <site> --ssh <user>@<host main IP> \
+  --ssh-key <your login key> --pool-file pools.yaml \
+  [--registration-key ~/.ssh/byoh_data] [--storage-disk <by-id>] [--accept-check PF8-hybrid]
+```
+
+(development: `packaging/bin/ubicloud-admin --dev host add ...` from `~/ubicloud`, without `sudo`.)
+
+1. It checks the site, the pools and the control plane's services (PF20, PF21), then logs in as `<user>` and runs host preflight as root with the script sent on stdin: read-only, nothing is copied to the host. Any `fail` stops it before a change. [recipes/README.md](recipes/README.md) lists which fails `--accept-check` can accept.
+2. It reads the host's SSH host keys over that login, shows them as SHA256 fingerprints with the list of changes, and asks for a typed `yes`. `--yes` skips the question; `--expect-host-key SHA256:...` (repeatable) checks the key ssh met instead, for scripts.
+3. It installs its registration key for root on a tagged line, and writes `/etc/ssh/sshd_config.d/05-ubicloud-root.conf` only if sshd does not already let root log in with a key. Then it logs in as root with that key, pinned to the host keys (PF2).
+4. It formats each `--storage-disk`, registers the host pinned to the host keys, and follows the bring-up (one reboot) until the host accepts VMs, then runs `pool verify`.
+
+`--main-ip` defaults to the `--ssh` host when that is an IPv4 address; `--uplink-ip` names the uplink when there are several default routes; `--default-boot-image` (repeatable) replaces `ubuntu-noble`. Without `--registration-key` the key is generated and kept only in the database. Exit codes, resume and Ctrl-C: [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.3. `sudo ubicloud-admin host preflight` (same `--site`, `--ssh`, `--ssh-key` and pools) runs step 1 alone.
+
+### 8.2 `register-byoh-host` (low level)
+
+For a host whose root login you set up yourself (§5):
 
 ```bash
 bundle exec bin/register-byoh-host \
@@ -220,11 +255,21 @@ bundle exec bin/register-byoh-host \
   --main-ip <host management IPv4> \
   --pool-file pools.yaml \
   --ssh-key ~/.ssh/byoh_data \
-  --default-boot-image ubuntu-noble \
   --yes
 ```
 
-Other options: `--routed-network CIDR[,key=value...]` (inline pools, repeatable), `--ipv6-mode gua|ula`, `--server-identifier`, a second `--default-boot-image ubuntu-jammy` (only if customers will pick it; the default image for VMs that name none is `ubuntu-noble`), and the Redfish BMC flags (`--bmc-endpoint`, `--bmc-user`, `--bmc-pass-env`, …). There is no `--provider` flag.
+Other options: `--routed-network CIDR[,key=value...]` (inline pools, repeatable), `--ipv6-mode gua|ula`, `--server-identifier`, `--default-boot-image` (repeatable; `ubuntu-noble` when none is given, which is also the image of a VM that names none; add `ubuntu-jammy` only if customers will pick it), and the Redfish BMC flags (`--bmc-endpoint`, `--bmc-user`, `--bmc-pass-env`, …). There is no `--provider` flag.
+
+**Preflight.** Once the registration key is in root's `authorized_keys` (given with `--ssh-key`, or generated and confirmed with ENTER), the command logs in as root with it and runs host preflight (`scripts/byoh/host/ubicloud-host`, checks PF1-PF21 in `docs/byoh/PLATFORMS.md`):
+
+- PF2 (root login runs commands) comes first. The script then runs over the same connection, sent on stdin, so nothing is copied to the host and nothing on it changes.
+- Any `fail` stops the command before anything is registered, for example no `/dev/kvm`, a kvm64-class CPU model, or a pool that holds the host's uplink IP or default gateway.
+- `--accept-check ID` (repeatable) accepts one of the few fails that are a choice rather than a defect: `PF8-hybrid`, `PF10-btrfs` and the `PF16-*` firewall services other than `PF16-pve` and `PF16-rhizome-user`. Any other ID is a usage error (exit 2).
+- `--skip-preflight` registers without checking.
+- The host keys this login met are pinned, so the control plane's first root login during bring-up must meet the same key.
+- The uplink IP (the source address of the default route) is stored as `uplink_ip` in the host's provider config. `--uplink-ip IP` sets it instead, for a host with more than one default route. No pool may hand it to VMs.
+
+Without `--ssh-key` the command generates the key and waits for ENTER while you install it, then runs preflight as above. If preflight fails, the generated key is not kept: remove its line from `authorized_keys` before you run the command again, which prints a new key. With a generated key and `--yes` nothing confirms the install, so the command warns and registers without preflight; to check such a host, run `scripts/byoh/host/ubicloud-host preflight` on it.
 
 Bring-up takes 15-25 minutes on bare metal and about 4 minutes on a nested-virtualization cloud VM. It **reboots the host once**. Watch it:
 

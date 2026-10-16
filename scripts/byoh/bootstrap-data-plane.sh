@@ -17,7 +17,9 @@
 #   4. Pre-install ruby-bundler to dodge the apt-get update race in
 #      Prog::BootstrapRhizome.setup (see docs/providers/generic.md
 #      troubleshooting section)
-#   5. Print instructions for installing the control plane's SSH pubkey
+#   5. Run host preflight (scripts/byoh/host/ubicloud-host preflight
+#      --standalone, read-only) when the script is found, and print the
+#      next steps on the control plane
 #
 # What this script does NOT do:
 #   - Install cloud-hypervisor or the storage backend — rhizome does that
@@ -31,24 +33,47 @@
 #
 # Usage:
 #   ./scripts/byoh/bootstrap-data-plane.sh [--tier kvm|auto|container|pvm|emulated]
+#       [--main-ip IP] [--preflight-script PATH | --no-preflight]
 #
-# --tier picks the rung of the virtualization ladder (docs/byoh/NO_KVM.md)
-# the host will be registered on. The default, kvm, refuses a host
-# without usable KVM, as this script always did; with the probe at hand
-# it also refuses a host the probe finds kvm_blocked (KVM present but not
-# usable for cloud-hypervisor), which registration would refuse. auto
-# makes the choice bin/register-byoh-host --virt-tier auto makes: kvm on
-# a host that runs KVM (the checks below then demand 1G pages, as
-# registration does), pvm on a PVM host, the fastest fallback its kernel
-# allows (container, then emulated) on a host without hardware
-# virtualization, and a refusal with the probe's reasons otherwise, a
-# kvm_blocked host included. Never silently: it prints the choice, and
-# registration still needs --accept-fallback.
+#   --tier TIER              the rung of the virtualization ladder
+#                            (docs/byoh/NO_KVM.md) the host will be
+#                            registered on; see below. Default kvm
+#   --main-ip IP             the address the control plane will reach this
+#                            host at; preflight checks that it is on this
+#                            host (a NAT address in front of it only warns)
+#   --preflight-script PATH  the ubicloud-host script to run preflight with
+#                            (as root, as given). Default: ubicloud-host
+#                            next to this script, or host/ubicloud-host
+#                            below its directory (the repository layout),
+#                            run only when it and the directories above it
+#                            are owned by root or you and writable by no
+#                            one else; otherwise preflight is skipped with
+#                            the reason
+#   --no-preflight           skip preflight
+#
+# --tier: the default, kvm, refuses a host without usable KVM, as this
+# script always did; with the probe at hand it also refuses a host the
+# probe finds kvm_blocked (KVM present but not usable for
+# cloud-hypervisor), which registration would refuse. auto makes the
+# choice bin/register-byoh-host --virt-tier auto makes: kvm on a host that
+# runs KVM (the checks below then demand 1G pages, as registration does),
+# pvm on a PVM host, the fastest fallback its kernel allows (container,
+# then emulated) on a host without hardware virtualization, and a refusal
+# with the probe's reasons otherwise, a kvm_blocked host included. Never
+# silently: it prints the choice, and registration still needs
+# --accept-fallback.
 #
 # A lower tier is refused before anything is installed until this
 # checkout can register it (SHIPPED_TIERS below). Once shipped, a lower
 # tier skips only the KVM checks and installs only that tier's userspace
 # packages. This script never changes kernels, sysctls or GRUB.
+#
+# Exit status: 0 the host is prepared and preflight found no failing
+# check (or did not run); 1 a step failed, or preflight found a failing
+# check or could not run; 2 a usage error. The steps are done and marked
+# even when preflight fails, so a re-run after a fix only repeats the
+# checks. ubicloud-admin host add runs the full preflight again, with
+# the pools, from the control plane.
 #
 # Environment:
 #   BYOH_ALLOW_UNSHIPPED_TIER=1  prepare a lower tier that cannot be
@@ -61,44 +86,99 @@ set -euo pipefail
 SHIPPED_TIERS="container emulated"
 
 usage() {
-  echo "usage: $0 [--tier kvm|auto|container|pvm|emulated]"
+  echo "usage: bootstrap-data-plane.sh [--tier kvm|auto|container|pvm|emulated] [--main-ip IP] [--preflight-script PATH | --no-preflight]" >&2
+  echo "  (the options are described at the top of the script)" >&2
+  exit 2
+}
+usage_error() {
+  echo "bootstrap-data-plane.sh: $*" >&2
+  exit 2
+}
+# unsafe_path PATH: prints why root must not run a file reached through
+# PATH, or nothing when it may. PATH and every directory above it must
+# be owned by root or by the user running this script, and writable by
+# nobody else: never by others (a sticky /tmp too), and by the group
+# only when that is the owner's own group, root's or this user's
+# user-private group (Ubuntu's umask 002 makes clones group-writable).
+unsafe_path() {
+  local p=$1 owner group mode upg=""
+  [[ $(id -gn) != "$(id -un)" ]] || upg=$(id -g)
+  while :; do
+    read -r owner group mode < <(stat -c '%u %g %a' -- "$p" 2>/dev/null) || {
+      echo "cannot stat $p"
+      return
+    }
+    if [[ $owner != 0 && $owner != "$EUID" ]]; then
+      echo "$p is owned by uid $owner, neither root nor you"
+      return
+    fi
+    if ((8#$mode & 8#002)); then
+      echo "$p is writable by others (mode $mode)"
+      return
+    fi
+    if ((8#$mode & 8#020)) && ! [[ ($owner == 0 && $group == 0) || ($owner == "$EUID" && $group == "$upg") ]]; then
+      echo "$p is writable by group $group (mode $mode)"
+      return
+    fi
+    [[ $p != / ]] || return 0
+    p=$(dirname "$p")
+  done
 }
 
 TIER=kvm
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --tier)
-      if [ $# -lt 2 ]; then
-        echo "ERROR: --tier needs a value" >&2
-        usage >&2
-        exit 2
-      fi
-      TIER="$2"
-      shift 2
-      ;;
-    --tier=*)
-      TIER="${1#--tier=}"
+MAIN_IP=""
+PREFLIGHT_SCRIPT=""
+PREFLIGHT_FOUND=""
+PREFLIGHT_UNSAFE=""
+RUN_PREFLIGHT=1
+while (($#)); do
+  case $1 in
+    --tier | --main-ip | --preflight-script)
+      (($# >= 2)) || usage_error "$1 needs a value"
+      case $1 in
+        --tier) TIER=$2 ;;
+        --main-ip) MAIN_IP=$2 ;;
+        *) PREFLIGHT_SCRIPT=$2 ;;
+      esac
       shift
       ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "ERROR: unknown argument $1" >&2
-      usage >&2
-      exit 2
-      ;;
+    --tier=*) TIER=${1#--tier=} ;;
+    --no-preflight) RUN_PREFLIGHT=0 ;;
+    -h | --help) usage ;;
+    *) usage_error "unknown argument $1 (see --help)" ;;
   esac
+  shift
 done
-case "$TIER" in
-  kvm|auto|container|pvm|emulated) ;;
-  *)
-    echo "ERROR: unknown tier $TIER" >&2
-    usage >&2
-    exit 2
-    ;;
+case $TIER in
+  kvm | auto | container | pvm | emulated) ;;
+  *) usage_error "unknown tier $TIER" ;;
 esac
+[[ -z $MAIN_IP || $MAIN_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage_error "--main-ip must be an IPv4 address"
+if [[ -n $PREFLIGHT_SCRIPT ]]; then
+  ((RUN_PREFLIGHT)) || usage_error "--preflight-script and --no-preflight exclude each other"
+  [[ -f $PREFLIGHT_SCRIPT ]] || usage_error "--preflight-script $PREFLIGHT_SCRIPT: no such file"
+elif ((RUN_PREFLIGHT)); then
+  # Found by the script's own location, never by the working directory;
+  # piped into bash, the script has no location and preflight is skipped
+  # with a hint. A found script runs as root, so it must sit where only
+  # root or this user can change it (unsafe_path): a copy of this script
+  # in /tmp must not run whatever another user put next to it.
+  self=${BASH_SOURCE[0]:-}
+  if [[ -f $self ]]; then
+    self_dir=$(cd "$(dirname "$self")" && pwd -P)
+    for candidate in "$self_dir/ubicloud-host" "$self_dir/host/ubicloud-host"; do
+      [[ -f $candidate ]] || continue
+      PREFLIGHT_FOUND=$candidate
+      real=$(realpath -e -- "$candidate" 2>/dev/null) || real=$candidate
+      for p in "$self_dir" "$(realpath -e -- "$(dirname "$candidate")" 2>/dev/null || dirname "$candidate")" "$real"; do
+        PREFLIGHT_UNSAFE=$(unsafe_path "$p")
+        [[ -z $PREFLIGHT_UNSAFE ]] || break
+      done
+      [[ -n $PREFLIGHT_UNSAFE ]] || PREFLIGHT_SCRIPT=$real
+      break
+    done
+  fi
+fi
 
 # Refuses a lower tier this checkout cannot register yet, before any
 # package is installed for it.
@@ -369,37 +449,72 @@ else
   echo "  capacity: $cores cores, $threads threads, about $budget_gib GiB for $TIER VMs"
 fi
 
-# --- Step 5: print next steps ----------------------------------------
-step "DONE — next steps on the control plane"
-MY_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1);exit}}}')
-echo ""
-echo "This host is now ready to be registered as a BYOH data plane."
-echo ""
-echo "Primary IPv4 (for sshable.host):  ${MY_IP:-<unknown — check 'ip -4 addr'>}"
-echo ""
-echo "BEFORE running bin/register-byoh-host on the control plane, you must"
-echo "install the control plane's SSH public key here as root, so the"
-echo "control plane can SSH into this host. The register-byoh-host CLI"
-echo "prints the exact pubkey it'll use; install it with:"
-echo ""
-echo "  sudo bash -c 'echo \"<PUBKEY FROM CLI>\" >> /root/.ssh/authorized_keys'"
-echo ""
-echo "Then, on the control plane, run something like:"
-echo ""
-echo "  bundle exec bin/byoh-location create --name <site> ...   # once per site"
-echo "  bundle exec bin/register-byoh-host \\"
-echo "    --location <site> \\"
-echo "    --main-ip ${MY_IP:-<this-host-primary-ip>} \\"
-echo "    --pool-file pools.yaml \\"
-echo "    --ssh-key /path/to/ctrl-plane/privkey \\"
-if [ "$TIER" = kvm ]; then
-  echo "    --default-boot-image ubuntu-noble \\"
+# --- Step 5: preflight and next steps ---------------------------------
+step "5. host preflight (read-only)"
+MY_IP=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1);exit}}}' || true)
+PREFLIGHT_RC=0
+PREFLIGHT_FAILS=0
+if ((!RUN_PREFLIGHT)); then
+  echo "  [skip] --no-preflight"
+elif [[ -z $PREFLIGHT_SCRIPT ]]; then
+  if [[ -n $PREFLIGHT_UNSAFE ]]; then
+    echo "  [skip] not running $PREFLIGHT_FOUND as root: $PREFLIGHT_UNSAFE."
+    echo "  Keep this script in a directory only root or you can write, or pass"
+    echo "  --preflight-script with a copy you trust."
+  else
+    echo "  [skip] ubicloud-host was not found next to this script."
+  fi
+  echo "  ubicloud-admin host add runs it from the control plane anyway. To run it"
+  echo "  now, copy scripts/byoh/host/ubicloud-host here and pass --preflight-script,"
+  echo "  or from the control plane, without changing anything on this host:"
+  echo "    sudo ubicloud-admin host preflight --site <site> --ssh <user>@${MY_IP:-<this host>} \\"
+  echo "      --ssh-key <key> --pool-file pools.yaml"
 else
+  echo "  $PREFLIGHT_SCRIPT preflight --standalone${MAIN_IP:+ --main-ip $MAIN_IP}"
+  preflight_args=(preflight --standalone)
+  [[ -z $MAIN_IP ]] || preflight_args+=(--main-ip "$MAIN_IP")
+  # Captured, so that a failing run neither stops this script (set -e)
+  # nor hides what it printed.
+  as_root=(sudo)
+  [[ $EUID -ne 0 ]] || as_root=()
+  preflight_out=$("${as_root[@]}" bash "$PREFLIGHT_SCRIPT" "${preflight_args[@]}" </dev/null) || PREFLIGHT_RC=$?
+  [[ -z $preflight_out ]] || printf '%s\n' "$preflight_out" | sed 's/^/  /'
+  # Human mode prints "STATUS ID DETAIL" rows; fix lines are indented.
+  PREFLIGHT_FAILS=$(grep -c '^fail ' <<<"$preflight_out" || true)
+  PREFLIGHT_WARNS=$(grep -c '^warn ' <<<"$preflight_out" || true)
+  if ((PREFLIGHT_RC != 0)); then
+    echo "  preflight could not run (exit $PREFLIGHT_RC)." >&2
+  else
+    echo "  preflight: $PREFLIGHT_FAILS failing, $PREFLIGHT_WARNS warning (docs/byoh/PLATFORMS.md §6, docs/byoh/TROUBLESHOOTING.md)"
+  fi
+fi
+
+step "DONE — next steps on the control plane"
+echo ""
+echo "Primary IPv4 (the --main-ip, unless the control plane reaches this"
+echo "host through NAT):  ${MY_IP:-<unknown — check 'ip -4 addr'>}"
+echo ""
+echo "Packaged control plane (scripts/byoh/install.sh), from any login on"
+echo "this host with passwordless sudo, e.g. user ubuntu:"
+echo ""
+echo "  sudo ubicloud-admin site add <site> --display \"<name customers see>\" \\"
+echo "    --rates-from <location> ...                     # once per site"
+echo "  sudo ubicloud-admin host add --site <site> \\"
+echo "    --ssh <user>@${MY_IP:-<this-host-primary-ip>} --ssh-key <that user's key> \\"
+echo "    --pool-file pools.yaml"
+echo ""
+echo "host add runs preflight with the pools, installs its own root key here,"
+echo "registers the host and watches it until it accepts VMs. On a development"
+echo "control plane, run packaging/bin/ubicloud-admin --dev the same way, or"
+echo "bin/register-byoh-host with a root key you install yourself"
+echo "(docs/byoh/SETUP.md)."
+if [ "$TIER" != kvm ]; then
   # A lower tier boots only its own images, and the host downloads the
   # first of them when no --default-boot-image is given.
-  echo "    --virt-tier $TIER --accept-fallback \\"
+  echo ""
+  echo "This host was prepared for --tier $TIER: add --virt-tier $TIER --accept-fallback"
+  echo "to host add (or register-byoh-host), and leave out --default-boot-image."
 fi
-echo "    --yes"
 echo ""
 echo "How the pool addresses reach this host depends on the site"
 echo "(docs/byoh/NETWORKING.md section 9):"
@@ -411,3 +526,14 @@ echo "  • Colocation: a static route or BGP, routed + public"
 echo ""
 echo "Setup guides: docs/byoh/SETUP.md (any platform) and"
 echo "docs/byoh/SETUP_PROXMOX.md."
+
+if ((PREFLIGHT_RC != 0 || PREFLIGHT_FAILS > 0)); then
+  echo "" >&2
+  if ((PREFLIGHT_RC != 0)); then
+    echo "ERROR: preflight could not run (exit $PREFLIGHT_RC); see its output above." >&2
+  else
+    echo "ERROR: preflight found $PREFLIGHT_FAILS failing check(s), listed above with their fixes." >&2
+    echo "  Fix them and run this script again (the finished steps are skipped)." >&2
+  fi
+  exit 1
+fi

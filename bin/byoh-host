@@ -1,11 +1,17 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-# Operator commands for registered BYOH hosts: moving an empty host into or
-# out of a BYOH location, and exporting the operator audit log. The logic
-# lives in lib/byoh_host_cli.rb; run with --help for the commands.
+# Operator commands for BYOH hosts: adding one over the operator's SSH
+# login (add, preflight, watch; lib/byoh_host_add.rb), moving an empty
+# host into or out of a BYOH location, reinstalling its egress NAT
+# table, relearning its disk ids or GPUs, and exporting the operator
+# audit log. The logic lives in lib/byoh_host_cli.rb; run with --help
+# for the commands.
 #
-# Example:
+# Examples:
+#
+#   bundle exec bin/byoh-host add --site byoh-homelab --ssh ubuntu@192.168.1.10 \
+#     --ssh-key ~/.ssh/id_ed25519 --pool-file pools.yaml
 #
 #   bundle exec bin/byoh-host move-location --host vh... \
 #     --location byoh-aws-aps1 --empty-only
@@ -27,5 +33,10 @@ end
 require "logger"
 require_relative "../db"
 require_relative "../loader"
+
+# Progress lines (preflight, the bring-up watch) must reach a pipe such
+# as tee, a CI log or ssh as they happen, not when the buffer fills or
+# the process exits.
+$stdout.sync = $stderr.sync = true
 
 exit ByohHostCli.new.run(ARGV)

@@ -1,0 +1,9 @@
+nvme-eui.0025388b91b0a1f2 ../../nvme1n1
+nvme-eui.0025388b91b0a1f1 ../../nvme0n1
+nvme-eui.0025388b91b0a1f1-part1 ../../nvme0n1p1
+nvme-nvme.144d-533344-53616d73756e67-00000001 ../../nvme2n1
+nvme-Samsung_SSD_980_PRO_2TB_S6B0NL0W123456 ../../nvme2n1
+nvme-eui.002538b921b0c3d4 ../../nvme2n1
+scsi-SATA_ST4000NM0035_ZC1ABCDE ../../sdb
+wwn-0x5000c500a1b2c3d4 ../../sdb
+wwn-0x3000c500a1b2c3d4 ../../sdb

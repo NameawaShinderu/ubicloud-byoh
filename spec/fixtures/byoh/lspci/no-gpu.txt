@@ -1,0 +1,412 @@
+# fixture: AMD Zen 2 workstation without a GPU; captured with pciutils 3.10.0 (lspci -vnmmk -D) in an ubuntu:24.04 container
+Slot:	0000:00:00.0
+Class:	0600
+Vendor:	1022
+Device:	1480
+SVendor:	1849
+SDevice:	1480
+ProgIf:	00
+
+Slot:	0000:00:00.2
+Class:	0806
+Vendor:	1022
+Device:	1481
+SVendor:	1022
+SDevice:	1481
+ProgIf:	00
+
+Slot:	0000:00:01.0
+Class:	0600
+Vendor:	1022
+Device:	1482
+ProgIf:	00
+IOMMUGroup:	0
+
+Slot:	0000:00:01.1
+Class:	0604
+Vendor:	1022
+Device:	1483
+SVendor:	1022
+SDevice:	1234
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	0
+
+Slot:	0000:00:01.3
+Class:	0604
+Vendor:	1022
+Device:	1483
+SVendor:	1022
+SDevice:	1234
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	0
+
+Slot:	0000:00:02.0
+Class:	0600
+Vendor:	1022
+Device:	1482
+ProgIf:	00
+IOMMUGroup:	1
+
+Slot:	0000:00:03.0
+Class:	0600
+Vendor:	1022
+Device:	1482
+ProgIf:	00
+IOMMUGroup:	2
+
+Slot:	0000:00:03.1
+Class:	0604
+Vendor:	1022
+Device:	1483
+SVendor:	1022
+SDevice:	1234
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	2
+
+Slot:	0000:00:03.2
+Class:	0604
+Vendor:	1022
+Device:	1483
+SVendor:	1022
+SDevice:	1234
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	2
+
+Slot:	0000:00:04.0
+Class:	0600
+Vendor:	1022
+Device:	1482
+ProgIf:	00
+IOMMUGroup:	3
+
+Slot:	0000:00:05.0
+Class:	0600
+Vendor:	1022
+Device:	1482
+ProgIf:	00
+IOMMUGroup:	4
+
+Slot:	0000:00:07.0
+Class:	0600
+Vendor:	1022
+Device:	1482
+ProgIf:	00
+IOMMUGroup:	5
+
+Slot:	0000:00:07.1
+Class:	0604
+Vendor:	1022
+Device:	1484
+SVendor:	1022
+SDevice:	1484
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	5
+
+Slot:	0000:00:08.0
+Class:	0600
+Vendor:	1022
+Device:	1482
+ProgIf:	00
+IOMMUGroup:	6
+
+Slot:	0000:00:08.1
+Class:	0604
+Vendor:	1022
+Device:	1484
+SVendor:	1022
+SDevice:	1484
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	6
+
+Slot:	0000:00:14.0
+Class:	0c05
+Vendor:	1022
+Device:	790b
+SVendor:	1022
+SDevice:	c950
+Rev:	61
+ProgIf:	00
+Driver:	piix4_smbus
+IOMMUGroup:	7
+
+Slot:	0000:00:14.3
+Class:	0601
+Vendor:	1022
+Device:	790e
+SVendor:	1022
+SDevice:	c950
+Rev:	51
+ProgIf:	00
+IOMMUGroup:	7
+
+Slot:	0000:00:18.0
+Class:	0600
+Vendor:	1022
+Device:	1440
+ProgIf:	00
+IOMMUGroup:	8
+
+Slot:	0000:00:18.1
+Class:	0600
+Vendor:	1022
+Device:	1441
+ProgIf:	00
+IOMMUGroup:	8
+
+Slot:	0000:00:18.2
+Class:	0600
+Vendor:	1022
+Device:	1442
+ProgIf:	00
+IOMMUGroup:	8
+
+Slot:	0000:00:18.3
+Class:	0600
+Vendor:	1022
+Device:	1443
+ProgIf:	00
+Driver:	k10temp
+IOMMUGroup:	8
+
+Slot:	0000:00:18.4
+Class:	0600
+Vendor:	1022
+Device:	1444
+ProgIf:	00
+IOMMUGroup:	8
+
+Slot:	0000:00:18.5
+Class:	0600
+Vendor:	1022
+Device:	1445
+ProgIf:	00
+IOMMUGroup:	8
+
+Slot:	0000:00:18.6
+Class:	0600
+Vendor:	1022
+Device:	1446
+ProgIf:	00
+IOMMUGroup:	8
+
+Slot:	0000:00:18.7
+Class:	0600
+Vendor:	1022
+Device:	1447
+ProgIf:	00
+IOMMUGroup:	8
+
+Slot:	0000:01:00.0
+Class:	0200
+Vendor:	8086
+Device:	1563
+SVendor:	1849
+SDevice:	1563
+Rev:	01
+ProgIf:	00
+Driver:	ixgbe
+IOMMUGroup:	0
+
+Slot:	0000:01:00.1
+Class:	0200
+Vendor:	8086
+Device:	1563
+SVendor:	1849
+SDevice:	1563
+Rev:	01
+ProgIf:	00
+Driver:	ixgbe
+IOMMUGroup:	0
+
+Slot:	0000:03:00.0
+Class:	0c03
+Vendor:	1022
+Device:	43d0
+SVendor:	1b21
+SDevice:	1142
+Rev:	01
+ProgIf:	30
+Driver:	xhci_hcd
+IOMMUGroup:	0
+
+Slot:	0000:03:00.1
+Class:	0106
+Vendor:	1022
+Device:	43c8
+SVendor:	1b21
+SDevice:	1062
+Rev:	01
+ProgIf:	01
+Driver:	ahci
+IOMMUGroup:	0
+
+Slot:	0000:03:00.2
+Class:	0604
+Vendor:	1022
+Device:	43c6
+SVendor:	1b21
+SDevice:	0201
+Rev:	01
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	0
+
+Slot:	0000:20:00.0
+Class:	0604
+Vendor:	1022
+Device:	43c7
+SVendor:	1b21
+SDevice:	3306
+Rev:	01
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	0
+
+Slot:	0000:20:01.0
+Class:	0604
+Vendor:	1022
+Device:	43c7
+SVendor:	1b21
+SDevice:	3306
+Rev:	01
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	0
+
+Slot:	0000:20:02.0
+Class:	0604
+Vendor:	1022
+Device:	43c7
+SVendor:	1b21
+SDevice:	3306
+Rev:	01
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	0
+
+Slot:	0000:20:03.0
+Class:	0604
+Vendor:	1022
+Device:	43c7
+SVendor:	1b21
+SDevice:	3306
+Rev:	01
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	0
+
+Slot:	0000:20:04.0
+Class:	0604
+Vendor:	1022
+Device:	43c7
+SVendor:	1b21
+SDevice:	3306
+Rev:	01
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	0
+
+Slot:	0000:20:08.0
+Class:	0604
+Vendor:	1022
+Device:	43c7
+SVendor:	1b21
+SDevice:	3306
+Rev:	01
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	0
+
+Slot:	0000:21:00.0
+Class:	0604
+Vendor:	1a03
+Device:	1150
+SVendor:	1849
+SDevice:	1150
+Rev:	04
+ProgIf:	00
+IOMMUGroup:	0
+
+Slot:	0000:22:00.0
+Class:	0300
+Vendor:	1a03
+Device:	2000
+SVendor:	1849
+SDevice:	2000
+Rev:	41
+ProgIf:	00
+IOMMUGroup:	0
+
+Slot:	0000:2b:00.0
+Class:	0108
+Vendor:	144d
+Device:	a808
+SVendor:	144d
+SDevice:	a801
+ProgIf:	02
+Driver:	nvme
+IOMMUGroup:	2
+
+Slot:	0000:2c:00.0
+Class:	0108
+Vendor:	144d
+Device:	a808
+SVendor:	144d
+SDevice:	a801
+ProgIf:	02
+Driver:	nvme
+IOMMUGroup:	2
+
+Slot:	0000:2d:00.0
+Class:	1300
+Vendor:	1022
+Device:	148a
+SVendor:	1022
+SDevice:	148a
+ProgIf:	00
+IOMMUGroup:	5
+
+Slot:	0000:2e:00.0
+Class:	1300
+Vendor:	1022
+Device:	1485
+SVendor:	1022
+SDevice:	1485
+ProgIf:	00
+IOMMUGroup:	6
+
+Slot:	0000:2e:00.1
+Class:	1080
+Vendor:	1022
+Device:	1486
+SVendor:	1022
+SDevice:	1486
+ProgIf:	00
+Driver:	ccp
+IOMMUGroup:	6
+
+Slot:	0000:2e:00.3
+Class:	0c03
+Vendor:	1022
+Device:	149c
+SVendor:	1022
+SDevice:	c950
+ProgIf:	30
+Driver:	xhci_hcd
+IOMMUGroup:	6
+
+Slot:	0000:2e:00.4
+Class:	0403
+Vendor:	1022
+Device:	1487
+SVendor:	1022
+SDevice:	c950
+ProgIf:	00
+Driver:	snd_hda_intel
+IOMMUGroup:	6

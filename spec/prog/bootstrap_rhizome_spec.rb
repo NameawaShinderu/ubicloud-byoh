@@ -34,6 +34,13 @@ RSpec.describe Prog::BootstrapRhizome do
   describe "#setup" do
     before { st.update(label: "setup") }
 
+    # Serializing a private key draws a random check value, so key_data
+    # is compared by public key.
+    def expect_upstream_args(opts, **extra)
+      expect(opts.except(:key_data)).to eq(Sshable::COMMON_SSH_ARGS.merge(use_agent: false, **extra).except(:key_data))
+      expect(opts[:key_data].map { Net::SSH::KeyFactory.load_data_private_key(it).public_key.to_blob }).to eq([ssh_key.public_key.split(" ")[1].unpack1("m")])
+    end
+
     it "runs initializing shell with public keys" do
       session = Net::SSH::Connection::Session.allocate
       expect(Net::SSH).to receive(:start).and_yield(session)
@@ -94,6 +101,63 @@ echo ssh-ed25519\ AAAAC3NzaC1lZDI1NTE5AAAAIDtqJ7zOtqQtYqOo0CpvDXNlMhV3HeJDpjrASK
 sync
 FIXTURE
 
+      expect { br.setup }.to hop("start", "InstallRhizome")
+    end
+
+    describe "with pinned host keys" do
+      def server_key(pub) = Net::SSH::Buffer.new(pub.split(" ")[1].unpack1("m")).read_key
+
+      # Runs net-ssh's own verifier for the options rootish_ssh passes,
+      # against the key the host presents.
+      def expect_root_login(presented)
+        expect(Net::SSH).to receive(:start).with("192.168.1.100", "root", hash_including(verify_host_key: :always)) do |*, opts, &blk|
+          expect_upstream_args(opts.except(:known_hosts), verify_host_key: :always)
+          transport = instance_double(Net::SSH::Transport::Session, host_keys: opts[:known_hosts].search_for("192.168.1.100", opts))
+          Net::SSH::Verifiers::Always.new.verify(key: presented, key_blob: presented.to_blob, fingerprint: "SHA256:test", session: transport)
+          session = Net::SSH::Connection::Session.allocate
+          expect(session).to receive(:_exec!).and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
+          blk.call(session)
+        end
+      end
+
+      let(:pinned) { SshKey.generate.public_key }
+
+      before do
+        st.update(stack: [{"target_folder" => "host", "pin_host_keys" => true}])
+        sshable.update(host_keys: Sequel.pg_array([pinned], :text))
+      end
+
+      it "logs in when the host presents a pinned key" do
+        expect_root_login(server_key(pinned))
+        expect { br.setup }.to hop("start", "InstallRhizome")
+      end
+
+      it "refuses a host that presents another key" do
+        expect_root_login(server_key(SshKey.generate.public_key))
+        expect { br.setup }.to raise_error(Net::SSH::HostKeyMismatch)
+      end
+
+      it "fails when the sshable has no host keys to pin" do
+        sshable.update(host_keys: nil)
+        expect(Net::SSH).not_to receive(:start)
+        expect { br.setup }.to raise_error(RuntimeError, /host keys are to be pinned, but .* has none/)
+      end
+
+      it "fails when the sshable's host key list is empty" do
+        sshable.update(host_keys: Sequel.pg_array([], :text))
+        expect(Net::SSH).not_to receive(:start)
+        expect { br.setup }.to raise_error(RuntimeError, /has none/)
+      end
+    end
+
+    it "accepts any host key without the pin flag, even when the sshable has host keys" do
+      sshable.update(host_keys: Sequel.pg_array([SshKey.generate.public_key], :text))
+      expect(Net::SSH).to receive(:start).with("192.168.1.100", "root", Hash) do |*, opts, &blk|
+        expect_upstream_args(opts)
+        session = Net::SSH::Connection::Session.allocate
+        expect(session).to receive(:_exec!).and_return(Net::SSH::Connection::Session::StringWithExitstatus.new("", 0))
+        blk.call(session)
+      end
       expect { br.setup }.to hop("start", "InstallRhizome")
     end
 

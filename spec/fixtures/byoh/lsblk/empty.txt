@@ -1,0 +1,1 @@
+# fixture: no disk in the walk (a source lsblk cannot place)

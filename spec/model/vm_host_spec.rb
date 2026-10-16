@@ -803,6 +803,158 @@ RSpec.describe VmHost do
     end
   end
 
+  describe "BYOH health checks" do
+    let(:location) { Location.create(name: "byoh-hc", display_name: "byoh-hc", ui_name: "byoh-hc", visible: false, provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {}) }
+
+    before do
+      HostProvider.create do
+        it.id = vm_host.id
+        it.server_identifier = "byoh-hc"
+        it.provider_name = HostProvider::GENERIC_PROVIDER_NAME
+      end
+      vm_host.update(location_id: location.id)
+    end
+
+    def fixture(kind, name)
+      File.read(File.expand_path("../fixtures/byoh/#{kind}/#{name}.txt", __dir__)).lines.reject { it.start_with?("# fixture:") }.join
+    end
+
+    def ok(text = "")
+      Net::SSH::Connection::Session::StringWithExitstatus.new(text, 0)
+    end
+
+    def add_device(name, ids)
+      StorageDevice.create(vm_host_id: vm_host.id, name:, total_storage_gib: 100, available_storage_gib: 100, unix_device_list: ids)
+    end
+
+    # devices maps a device name to {"smartctl" => fixture, "nvme-id" =>
+    # fixture, "nvme-smart" => fixture}, as ByohHealthProbe::SCRIPT prints.
+    def stub_probe(device_names, virt:, clocksource:, devices:)
+      out = "==ubicloud-probe virt\n#{virt}\n==ubicloud-probe clocksource\n#{fixture("clocksource", clocksource)}"
+      devices.each do |device, sections|
+        sections.each { |kind, name| out << "==ubicloud-probe #{kind} #{device}\n" << fixture((kind == "smartctl") ? "smartctl" : "nvme", name) }
+      end
+      expect(ssh_session).to receive(:_exec!).with(NetSsh.command(ByohHealthProbe::SCRIPT, shelljoin_devices: device_names)).and_return(ok(out))
+    end
+
+    def lsblk_json(tree)
+      ok(JSON.generate("blockdevices" => tree))
+    end
+
+    def expect_read_write(path)
+      file_path = File.join(path, "test-file-monitor")
+      expect(ssh_session).to receive(:_exec!).with(NetSsh.command("sudo bash -c :command", command: NetSsh.command("head -c 1M </dev/zero > :file_name", file_name: file_path))).and_return(ok)
+      expect(ssh_session).to receive(:_exec!).with("sha256sum #{file_path}").and_return(ok("30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58  #{file_path}\n"))
+      expect(ssh_session).to receive(:_exec!).with("sudo rm #{file_path}").and_return(ok)
+    end
+
+    def expect_kernel_logs_clean
+      expect(ssh_session).to receive(:_exec!).with("journalctl -kS -1min --no-pager").and_return(ok)
+    end
+
+    describe "#disk_device_names" do
+      it "uses kernel names as they are and resolves by-id links" do
+        add_device("DEFAULT", ["vda", "virtio-ubi-root-0001"])
+        expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/virtio-ubi-root-0001").and_return(ok("/dev/vdb\n"))
+        expect(vm_host.disk_device_names(ssh_session)).to eq(["vda", "vdb"])
+      end
+
+      it "refuses a blank id stored before ByohDeviceIdentity, naming the fix" do
+        add_device("DEFAULT", [""])
+        expect { vm_host.disk_device_names(ssh_session) }.to raise_error(ByohDeviceIdentity::Error, "VmHost #{vm_host.ubid} has a stale storage device id \"\"; run bin/byoh-host relearn-device-ids --host #{vm_host.ubid}")
+      end
+
+      it "refuses the id root that upstream stored for a /dev/root df source, naming the fix" do
+        add_device("DEFAULT", ["root"])
+        expect { vm_host.disk_device_names(ssh_session) }.to raise_error(ByohDeviceIdentity::Error, "VmHost #{vm_host.ubid} has a stale storage device id \"root\"; run bin/byoh-host relearn-device-ids --host #{vm_host.ubid}")
+      end
+    end
+
+    describe "#perform_health_checks" do
+      it "passes an EBS host on a nested-virt guest and writes into /var/storage" do
+        add_device("DEFAULT", ["nvme-Amazon_Elastic_Block_Store_vol0a1b2c3d4e5f60718"])
+        expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol0a1b2c3d4e5f60718").and_return(ok("/dev/nvme0n1\n"))
+        stub_probe(["nvme0n1"], virt: "amazon", clocksource: "kvm-guest-no-tsc", devices: {"nvme0n1" => {"smartctl" => "ebs-nvme", "nvme-id" => "id-ctrl-ebs", "nvme-smart" => "smart-log-ok"}})
+        expect(ssh_session).to receive(:_exec!).with("lsblk --json").and_return(lsblk_json([{"name" => "nvme0n1", "mountpoints" => [nil], "children" => [{"name" => "nvme0n1p1", "mountpoints" => ["/"]}, {"name" => "nvme0n1p15", "mountpoints" => ["/boot/efi"]}]}]))
+        expect_read_write("/")
+        expect_read_write("/var/storage")
+        expect_kernel_logs_clean
+        expect(vm_host.perform_health_checks(ssh_session)).to be true
+      end
+
+      it "passes a virtio host and checks the storage path of every device" do
+        add_device("DEFAULT", ["vda"])
+        add_device("extra", ["vdb"])
+        stub_probe(["vda", "vdb"], virt: "kvm", clocksource: "kvm-guest", devices: {"vda" => {"smartctl" => "virtio-unavailable"}, "vdb" => {"smartctl" => "virtio-unavailable"}})
+        expect(ssh_session).to receive(:_exec!).with("lsblk --json").and_return(lsblk_json([
+          {"name" => "vda", "mountpoints" => [nil], "children" => [{"name" => "vda1", "mountpoints" => ["/"]}]},
+          {"name" => "vdb", "mountpoints" => ["/var/storage/devices/extra"]},
+        ]))
+        expect_read_write("/")
+        expect_read_write("/var/storage/devices/extra")
+        expect_read_write("/var/storage")
+        expect_kernel_logs_clean
+        expect(vm_host.perform_health_checks(ssh_session)).to be true
+      end
+
+      it "passes a bare-metal LVM host over two disks" do
+        add_device("DEFAULT", ["wwn-0x5002538e40000001", "ata-CT1000MX500SSD1_2001E0000002"])
+        expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/wwn-0x5002538e40000001").and_return(ok("/dev/sda\n"))
+        expect(ssh_session).to receive(:_exec!).with("readlink -f /dev/disk/by-id/ata-CT1000MX500SSD1_2001E0000002").and_return(ok("/dev/sdb\n"))
+        stub_probe(["sda", "sdb"], virt: "none", clocksource: "bare-metal-tsc", devices: {"sda" => {"smartctl" => "ata-passed"}, "sdb" => {"smartctl" => "ata-passed"}})
+        lv = {"name" => "ubuntu--vg-ubuntu--lv", "mountpoints" => ["/"]}
+        expect(ssh_session).to receive(:_exec!).with("lsblk --json").and_return(lsblk_json([
+          {"name" => "sda", "mountpoints" => [nil], "children" => [{"name" => "sda3", "mountpoints" => [nil], "children" => [lv]}]},
+          {"name" => "sdb", "mountpoints" => [nil], "children" => [{"name" => "sdb1", "mountpoints" => [nil], "children" => [lv]}]},
+        ]))
+        expect_read_write("/")
+        expect_read_write("/var/storage")
+        expect_kernel_logs_clean
+        expect(vm_host.perform_health_checks(ssh_session)).to be true
+      end
+
+      it "still writes into /var/storage when lsblk has no mount point for a stale partition id" do
+        add_device("DEFAULT", ["vda1"])
+        stub_probe(["vda1"], virt: "kvm", clocksource: "kvm-guest", devices: {"vda1" => {"smartctl" => "virtio-unavailable"}})
+        expect(ssh_session).to receive(:_exec!).with("lsblk --json").and_return(lsblk_json([{"name" => "vda", "mountpoints" => [nil], "children" => [{"name" => "vda1", "mountpoints" => ["/"]}]}]))
+        expect_read_write("/var/storage")
+        expect_kernel_logs_clean
+        expect(vm_host.perform_health_checks(ssh_session)).to be true
+      end
+
+      it "fails a real disk whose SMART fails" do
+        add_device("DEFAULT", ["sdb"])
+        stub_probe(["sdb"], virt: "none", clocksource: "bare-metal-tsc", devices: {"sdb" => {"smartctl" => "ata-failed"}})
+        expect(Clog).to receive(:emit).with("Device sdb failed its health check on VmHost #{vm_host.ubid}", {byoh_device_health: {device: "sdb", reason: "smartctl reports a failing disk"}}).and_call_original
+        expect(vm_host.perform_health_checks(ssh_session)).to be false
+      end
+
+      it "fails a partition id stored before ByohDeviceIdentity, naming the fix" do
+        add_device("DEFAULT", ["vda1"])
+        probe = "==ubicloud-probe virt\nkvm\n==ubicloud-probe clocksource\n#{fixture("clocksource", "kvm-guest-no-tsc")}==ubicloud-probe notdisk vda1\n"
+        expect(ssh_session).to receive(:_exec!).with(NetSsh.command(ByohHealthProbe::SCRIPT, shelljoin_devices: ["vda1"])).and_return(ok(probe))
+        expect(Clog).to receive(:emit).with("Device vda1 failed its health check on VmHost #{vm_host.ubid}", {byoh_device_health: {device: "vda1", reason: "/dev/vda1 is not a whole disk; run bin/byoh-host relearn-device-ids"}}).and_call_original
+        expect(vm_host.perform_health_checks(ssh_session)).to be false
+      end
+
+      it "fails a host without a usable clocksource" do
+        add_device("DEFAULT", ["vda"])
+        stub_probe(["vda"], virt: "none", clocksource: "kvm-guest-no-tsc", devices: {"vda" => {"smartctl" => "virtio-unavailable"}})
+        expect(ssh_session).to receive(:_exec!).with("lsblk --json").and_return(lsblk_json([]))
+        expect_read_write("/var/storage")
+        expect_kernel_logs_clean
+        expect(Clog).to receive(:emit).with("unexpected clock source", {unexpected_clock_source: {vm_host_ubid: vm_host.ubid, clock_source: "kvm-clock acpi_pm", virt: "none"}}).and_call_original
+        expect(vm_host.perform_health_checks(ssh_session)).to be false
+      end
+    end
+
+    it "reads a blank stored id as down in check_pulse" do
+      add_device("DEFAULT", [""])
+      allow(ssh_session).to receive(:_exec!).and_return(ok)
+      expect(vm_host.check_pulse(session:, previous_pulse: {})[:reading]).to eq("down")
+    end
+  end
+
   describe "#check_clock_source" do
     it "succeeds if arm64 machine uses arch_sys_counter" do
       vm_host.arch = "arm64"

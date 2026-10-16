@@ -146,7 +146,7 @@ These remain available as operator lab-access helpers only. They are not support
 | Jumping through the control plane | Lab access only. |
 | Per-host `cloudflared` on the data-plane host (portability F8 Tier 1) | **Replaced by the Ubicloud access tunnel (§12.4).** Also, the host cannot reach a VM's private IP without entering the VM netns (§12.1). |
 
-The old Proxmox docs (`SETUP_PROXMOX_LOWTIER.md`, `deploy-scripts/`, now marked superseded and unsupported) described several of these as setup options. The current [SETUP_PROXMOX.md](SETUP_PROXMOX.md) uses only the product modes.
+The old Proxmox docs (`SETUP_PROXMOX_LOWTIER.md` and `deploy-scripts/`, deleted in M4) described several of these as setup options. The current [SETUP_PROXMOX.md](SETUP_PROXMOX.md) and [recipes/proxmox.md](recipes/proxmox.md) use only the product modes.
 
 Sites with no public block choose one of:
 - `internal` pools;
@@ -1071,7 +1071,7 @@ Every phase ships independently. All Ruby changes keep 100% spec coverage. Every
 
 - Egress-only VMs (no pool IPv4) on BYOH hosts (pulled forward into milestone M2 with P1, ROADMAP §3.3): netns SNAT to the vethi address; host `masquerade` of 169.254.0.0/16 out the uplink, in its own file `/etc/nftables.d/1-byoh-egress.conf` until P2 folds it into `host_guard` (D-8); gated; UI text "No inbound IPv4 (outbound via shared NAT)"; conntrack log. Enables T2 (§12.3).
 - `scripts/byoh/providers/wireguard-tunnel/{vps.sh,host.sh}`; per-pool uplink and policy routing in preflight.
-- Proxmox `docs/byoh/deploy-scripts/*`: single vmbr1 uplink; emit `pools.yaml`; fix the /29 vs 3×/32 mismatch.
+- Proxmox `docs/byoh/deploy-scripts/*`: single vmbr1 uplink; emit `pools.yaml`; fix the /29 vs 3×/32 mismatch. Done differently in M4: the scripts were deleted and replaced by [recipes/proxmox.md](recipes/proxmox.md) (one vmbr1 uplink, a `pools.yaml`, then `site add` and `host add`).
 - Experimental `terraform/gcp-byoh`, `terraform/azure-byoh`.
 
 ### 14.8 Phase 7 (optional): AWS pool sync
@@ -1104,7 +1104,7 @@ Console phases (§12.7) are tested on a separate dev control plane and a canary 
 | Kind | Files |
 |---|---|
 | New | `docs/byoh/VERIFY.md`, `docs/byoh/POOL_OPERATIONS.md`, `docs/byoh/CONSOLE_AND_ACCESS.md`, `docs/byoh/platforms/{aws,proxmox-pfsense,homelab,wireguard-tunnel,hetzner,ovh,leaseweb,colo-bgp,gcp,azure}.md` |
-| Rewrite | `docs/providers/generic.md` (link here; drop single-IP, route-via-Proxmox-IP, in-VPC route-table method, ULA claims); `docs/byoh/SETUP.md` (EIP FAQ → `exposure: nat`); `docs/byoh/SETUP_PROXMOX.md`, `SETUP_PROXMOX_LOWTIER.md` (options → platform page; drop `--provider`; lab-access appendix); `docs/byoh/QUICKSTART.md` (10.99 → 10.98) |
+| Rewrite | `docs/providers/generic.md` (link here; drop single-IP, route-via-Proxmox-IP, in-VPC route-table method, ULA claims); `docs/byoh/SETUP.md` (EIP FAQ → `exposure: nat`); `docs/byoh/SETUP_PROXMOX.md`, `SETUP_PROXMOX_LOWTIER.md` (options → platform page; drop `--provider`; lab-access appendix; LOWTIER deleted in M4); `docs/byoh/QUICKSTART.md` (10.99 → 10.98) |
 | Update | CLAUDE.md §4 routing model and §10 fixed items; portability "Networking rules" (fix the `ssh -J` line, §12.1); memory note `project_byoh_routing_model` |
 
 ---

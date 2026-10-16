@@ -18,7 +18,7 @@ output "data_public_ip" {
 }
 
 output "data_private_ip" {
-  description = "Private IPv4 of the data plane (this is the main_ip4 you pass to bin/register-byoh-host)"
+  description = "Private IPv4 of the data plane: the main IP, which host_add_command logs in to"
   value       = aws_instance.data.private_ip
 }
 
@@ -53,12 +53,12 @@ output "byoh_eip_to_private_ip" {
 }
 
 output "pools_yaml_path" {
-  description = "Local path of the pools.yaml (version 2) to pass to bin/register-byoh-host --pool-file."
+  description = "Local path of the pools.yaml (version 2) for ubicloud-admin host add --pool-file (or bin/register-byoh-host --pool-file)."
   value       = local_file.pools_yaml.filename
 }
 
 locals {
-  # Workspace names may hold uppercase, _ or ., which byoh-location
+  # Workspace names may hold uppercase, _ or ., which site add
   # rejects, so the fallback maps them onto its alphabet.
   byoh_location_name       = var.byoh_location_name != "" ? var.byoh_location_name : "byoh-aws-${lower(replace(terraform.workspace, "/[^A-Za-z0-9-]/", "-"))}"
   byoh_location_name_valid = can(regex("^[a-z][a-z0-9-]{0,61}[a-z0-9]$", local.byoh_location_name))
@@ -71,15 +71,19 @@ locals {
     ["${aws_instance.ctrl.private_ip}/32"],
     local.operator_ssh_open ? [] : [var.operator_ssh_cidr]
   ))
-  byoh_rates_dir = "/etc/ubicloud/billing_rates.d"
+  # Where a packaged control plane (scripts/byoh/install.sh) keeps the
+  # billing rate overlay; ubicloud-admin site add writes there.
+  byoh_rates_dir = "/var/lib/ubicloud/billing_rates.d"
+  ssh_key_file   = local_sensitive_file.ssh_private.filename
+  ctrl_login     = "ubuntu@${aws_instance.ctrl.public_ip}"
 }
 
 output "byoh_location_create_command" {
-  description = "Commands to run on the control plane, from the repo root, to create the BYOH location for this VPC."
+  description = "Command to run on the control plane to create the BYOH location (site) for this VPC."
 
   precondition {
     condition     = local.byoh_location_name_valid
-    error_message = "The BYOH location name \"${local.byoh_location_name}\" is not valid for bin/byoh-location (2-63 lowercase letters, digits and -, ending in a letter or digit). Set byoh_location_name."
+    error_message = "The BYOH location name \"${local.byoh_location_name}\" is not valid for ubicloud-admin site add (2-63 lowercase letters, digits and -, ending in a letter or digit). Set byoh_location_name."
   }
 
   value = <<-EOT
@@ -88,15 +92,15 @@ output "byoh_location_create_command" {
     # open to the world and the operator is left out of --mgmt-allow. Set it
     # to your /32, apply, and print this command again.
     %{endif~}
-    # The rate overlay must be set for web, respirate AND monitor: add
-    #   ENV["BILLING_RATES_EXTRA_DIR"] ||= "${local.byoh_rates_dir}"
-    # to .env.rb, and keep the directory in your backups.
-    sudo install -d -o "$USER" ${local.byoh_rates_dir}
-    export BILLING_RATES_EXTRA_DIR=${local.byoh_rates_dir}
-    bundle exec bin/byoh-location create \
-      --name ${local.byoh_location_name} \
-      --display-name ${local.byoh_location_name} \
-      --ui-name "AWS ${var.aws_region} (BYOH)" \
+    # On a packaged control plane (scripts/byoh/install.sh), site add writes
+    # the rates to ${local.byoh_rates_dir} and restarts
+    # ubicloud.target so web, respirate and monitor load them.
+    # On a development control plane (bootstrap-dev-ctrl-plane.sh), run it
+    # from ~/ubicloud as packaging/bin/ubicloud-admin --dev site add ...
+    # (without sudo); the rates go to the BILLING_RATES_EXTRA_DIR of .env.rb,
+    # and you restart puma and respirate yourself.
+    sudo ubicloud-admin site add ${local.byoh_location_name} \
+      --display "AWS ${var.aws_region} (BYOH)" \
       --underlay ${var.vpc_cidr} \
       --overlay ${local.byoh_overlay_ipv4_cidr} \
       --cp-reach onhost \
@@ -104,6 +108,53 @@ output "byoh_location_create_command" {
       --mgmt-allow ${local.byoh_mgmt_allow} \
       --ula-underlay none \
       --rates-from hetzner-fsn1
+  EOT
+}
+
+output "host_add_command" {
+  description = "Commands that add the data plane as a BYOH host with ubicloud-admin host add: two on the workstation, three on the control plane."
+
+  precondition {
+    condition     = local.byoh_location_name_valid
+    error_message = "The BYOH location name \"${local.byoh_location_name}\" is not valid for ubicloud-admin site add. Set byoh_location_name."
+  }
+
+  value = <<-EOT
+    # On your workstation, in terraform/aws-byoh (the first needs the AWS CLI).
+    # 1. The data plane's SSH host key fingerprints, which cloud-init prints
+    #    to the instance console at first boot (empty until it has booted;
+    #    this parse of the console output is UNVERIFIED on current AMIs).
+    #    Prints the flags for the host add line below:
+    aws ec2 get-console-output --region ${var.aws_region} --instance-id ${aws_instance.data.id} --latest --output text | awk '/BEGIN SSH HOST KEY FINGERPRINTS/ {f = 1} /END SSH HOST KEY FINGERPRINTS/ {f = 0} f {for (i = 1; i <= NF; i++) if ($i ~ /^SHA256:/) printf "--expect-host-key %s ", $i} END {print ""}'
+    # 2. Copy the pool file and the EC2 login key to the control plane:
+    scp -i ${local.ssh_key_file} ${local_file.pools_yaml.filename} ${local.ssh_key_file} ${local.ctrl_login}:
+
+    # On the control plane (ssh -i ${local.ssh_key_file} ${local.ctrl_login}).
+    # Put the flags from step 1 in EXPECT, or set EXPECT= (empty): then host
+    # add shows the fingerprints and asks for a typed "yes"; compare them
+    # with step 1. Left as it is, EXPECT makes host add stop with a usage
+    # error before it changes anything.
+    # --ssh-key is the operator login (user ubuntu has passwordless sudo).
+    # user-data also copied this EC2 key into root's authorized_keys (for
+    # bin/register-byoh-host), and host add leaves that line; step 4
+    # removes it. host add makes and keeps its own root key, and deletes
+    # its staged copy of this one after the prepare phase. --no-wait
+    # returns once the host is registered, so the copy of the EC2 key on
+    # the control plane is shredded before the bring-up watch (about 4
+    # minutes nested, 15-25 on .metal). The three steps are chained: when
+    # host add fails, the key stays for a retry and nothing else runs.
+    # On a development control plane, run packaging/bin/ubicloud-admin --dev
+    # from ~/ubicloud, without sudo, in place of sudo ubicloud-admin.
+    EXPECT='<the --expect-host-key flags printed by step 1>'
+    sudo ubicloud-admin host add --site ${local.byoh_location_name} --ssh ubuntu@${aws_instance.data.private_ip} --ssh-key ~/byoh_ssh_key --pool-file ~/pools.yaml $EXPECT --no-wait \
+      && shred -u ~/byoh_ssh_key \
+      && sudo ubicloud-admin host watch ${aws_instance.data.private_ip}
+
+    # 4. Optional, on the workstation once host add has succeeded: drop the
+    #    EC2 key from root's logins on the data plane (it stays the ubuntu
+    #    login). It keeps every other line, and changes nothing unless host
+    #    add's own key (tagged ubicloud-byoh) would remain:
+    #   ssh -i ${local.ssh_key_file} ubuntu@${aws_instance.data.public_ip} 'sudo sh -c "grep -vxFf /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys >/root/.ssh/ak.new; if [ \$? -le 1 ] && grep -q \" # ubicloud-byoh \" /root/.ssh/ak.new; then chmod 600 /root/.ssh/ak.new && mv /root/.ssh/ak.new /root/.ssh/authorized_keys; else rm -f /root/.ssh/ak.new; echo root keys left unchanged >&2; exit 1; fi"'
   EOT
 }
 
@@ -122,7 +173,7 @@ output "handoff_instructions" {
 
     Data plane (${var.data_plane_instance_type}):
       public IP:  ${aws_instance.data.public_ip}
-      private IP: ${aws_instance.data.private_ip}  ← the --main-ip for register-byoh-host
+      private IP: ${aws_instance.data.private_ip}  ← host add --ssh ubuntu@<this>, and the main IP
       instance:   ${aws_instance.data.id}
       SSH:        ssh -i ${local_sensitive_file.ssh_private.filename} ubuntu@${aws_instance.data.public_ip}
 
@@ -136,28 +187,28 @@ output "handoff_instructions" {
 
     Next steps:
 
-      1. Copy the pool file and the host key to the control plane, then SSH in:
-         scp -i ${local_sensitive_file.ssh_private.filename} ${local_file.pools_yaml.filename} ${local_sensitive_file.ssh_private.filename} ubuntu@${aws_instance.ctrl.public_ip}:
-         ssh -i ${local_sensitive_file.ssh_private.filename} ubuntu@${aws_instance.ctrl.public_ip}
+      1. SSH in to the control plane:
+         ssh -i ${local.ssh_key_file} ${local.ctrl_login}
 
       2. Clone the BYOH fork and set up the control plane, packaged
          (sudo bash ~/ubicloud/scripts/byoh/install.sh ..., docs/byoh/INSTALL.md)
          or for development:
          git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
          bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
+         The development layout has no ubicloud-admin on PATH: in steps 3-5
+         run packaging/bin/ubicloud-admin --dev from ~/ubicloud, without
+         sudo, and restart puma and respirate yourself after step 3.
 
-      3. Create the BYOH location (cd ~/ubicloud): run the commands in
+      3. Create the BYOH location (site); run the command in
          terraform output -raw byoh_location_create_command
-         then restart web, respirate and monitor so they load the rates.
 
-      4. Register the data plane:
-         bundle exec bin/register-byoh-host --location ${local.byoh_location_name} \
-           --main-ip ${aws_instance.data.private_ip} --pool-file ~/pools.yaml \
-           --ssh-key ~/byoh_ssh_key --default-boot-image ubuntu-noble --yes
+      4. Add the data plane as a host (preflight, root key, registration,
+         bring-up); run the commands in
+         terraform output -raw host_add_command
 
       5. Create an account at http://${aws_instance.ctrl.public_ip}:3000/create-account, then
          let its project see the location:
-         bundle exec bin/byoh-location grant --location ${local.byoh_location_name} --project <project ubid>
+         sudo ubicloud-admin site grant ${local.byoh_location_name} --project <project ubid>
 
       6. Create a VM in "AWS ${var.aws_region} (BYOH)". Its Public IPv4 is the EIP:
          ssh ubi@<eip>

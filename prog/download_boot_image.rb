@@ -24,7 +24,12 @@ class Prog::DownloadBootImage < Prog::Base
   def download_from_blob_storage?
     return false if CONTAINER_IMAGES.include?(image_name)
 
-    image_name.start_with?("github", "postgres", "ai-", "kubernetes", "gpu") || production_sources?
+    self.class.blob_storage_only?(image_name) || production_sources?
+  end
+
+  # Images that only Ubicloud's blob storage serves, in every environment.
+  def self.blob_storage_only?(image_name)
+    image_name.start_with?("github", "postgres", "ai-", "kubernetes", "gpu")
   end
 
   def latest_boot_image_version(image_name)
@@ -42,9 +47,11 @@ class Prog::DownloadBootImage < Prog::Base
   # control plane without that storage (BYOH) opts out with
   # BOOT_IMAGE_SOURCE=public, which uses the public upstream mirrors for
   # images that have one; the SHA256 check stays tied to production.
-  def production_sources?
+  def self.production_sources?
     Config.production? && Config.boot_image_source != "public"
   end
+
+  def production_sources? = self.class.production_sources?
 
   UBUNTU_NICKNAME_VERSION_MAP = {"resolute" => "26.04", "noble" => "24.04", "jammy" => "22.04"}.freeze
   DEBIAN_VERSION_NICKNAME_MAP = {"13" => "trixie", "12" => "bookworm"}.freeze

@@ -91,7 +91,7 @@ timer never races a restore, an install or a release switch.
 | `env set KEY [--no-restart]`, `env unset KEY`, `env get KEY --reveal`, `env keys` | §4 |
 | `logs ...` | §1 |
 | `account create --email E [--name N] [--project P] [--password-stdin\|--password-file F]`, `account list` | §5 |
-| `run TOOL [ARGS...]` | `byoh-location`, `byoh-pool`, `byoh-host`, `register-byoh-host`, `byoh-config-check`, `production_check`, `create_prod_admin_account LOGIN` in the release as `ubicloud`. Input files (`--pool-file`, `--ssh-key`, `--external-map`, `--password-file`) are copied for it; `--out F` comes back to you (0600). `--bmc-password` in any spelling is refused |
+| `run TOOL [ARGS...]` | `byoh-location`, `byoh-pool`, `byoh-host`, `register-byoh-host`, `byoh-config-check`, `production_check`, `create_prod_admin_account LOGIN`, `m2-checks` (the database checks of the M2 and M4 gates, [VERIFY.md](VERIFY.md)) in the release as `ubicloud`. Input files (`--pool-file`, `--ssh-key`, `--registration-key`, `--external-map`, `--password-file`, `--snapshot`) are copied for it; `--out F` comes back to you (0600). `--bmc-password` in any spelling is refused |
 | `console [-e CODE\|-e -]` | §3 |
 | `release list\|check\|migrate\|use\|prune` | §7 |
 
@@ -177,12 +177,50 @@ the database. The variable is part of the secrets backup. A control plane
 moved with `migrate-from-dev.sh` already has the variables `preflight`
 found ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)).
 
+### 4.2a Sites, hosts and pools (M4)
+
+`ubicloud-admin site`, `host` and `pool` are the primary commands for
+BYOH sites. They run `bin/byoh-location`, `bin/byoh-host` and
+`bin/byoh-pool` the way `run` does: files are copied for user `ubicloud`,
+`--bmc-password` is refused, and `--help` goes to the tool.
+
+```bash
+sudo ubicloud-admin site add aws-aps1 --display "AWS Mumbai (BYOH)" \
+  --underlay 10.98.0.0/16 --cp-reach onhost --rates-from hetzner-fsn1 [--grant pj...]
+sudo ubicloud-admin site show aws-aps1          # NAME alone stands for --location NAME
+sudo ubicloud-admin host add --site aws-aps1 --ssh ubuntu@10.98.1.30 \
+  --ssh-key ~/aws.pem --pool-file pools.yaml
+sudo ubicloud-admin host watch vh...
+sudo ubicloud-admin pool verify --host vh...
+```
+
+- `site add NAME` is `byoh-location create --name NAME`.
+  - `--display` sets the name customers see (`--ui-name`). `--display-name` is still the API path name.
+  - Until M8, `--mgmt` takes only `direct`, and `--cp-reach mgmt` is refused.
+  - `--postgres` takes only `no` (ROADMAP §8.2).
+  - These refusals exit 2.
+- `host add` runs `byoh-host add` twice:
+  1. `--phase prepare`, with the staged copies of `--ssh-key` and `--registration-key`. `ubicloud-admin` deletes those copies when this phase ends.
+  2. `--phase register`, without them.
+
+  So the operator's key is gone before the bring-up watch starts, which can take hours. User `ubicloud`, which puma and respirate run as, can read it only during the prepare phase.
+
+  Between the two phases, the registration key waits in `/var/lib/ubicloud/byoh-keys` (owner `ubicloud`, mode 0700). Registration deletes it once the key is stored in the database. If you pass `--phase` yourself, the tool runs once, with that phase.
+- `UBICLOUD_ADMIN_DRYRUN=1` prints the command lines and runs nothing.
+- A development control plane (`scripts/byoh/bootstrap-dev-ctrl-plane.sh`) has neither `/etc/ubicloud` nor `/opt/ubicloud`. On one, run the checkout's own `packaging/bin/ubicloud-admin --dev site|host|pool ...`, or set `UBICLOUD_ADMIN_DEV=1`.
+  - It runs `bundle exec bin/byoh-...` in the checkout as you, or as `SUDO_USER` under sudo, with `~/.local/bin` and the mise Ruby on `PATH`.
+  - It restarts nothing; restart puma and respirate yourself after a rates change.
+  - `--dev` is refused where a packaged layout exists.
+
 ### 4.3 Billing rates
 
 `BILLING_RATES_EXTRA_DIR` is `/var/lib/ubicloud/billing_rates.d`, owned by
 `ubicloud` (never a path under `/home`: the services cannot see it). The
-services read the rates once at start, so after `ubicloud-admin run
-byoh-location create --rates-from ...` or `... rates ...`:
+services read the rates once at start. `ubicloud-admin site add ...
+--rates-from ...` and `site rates ...` restart `ubicloud.target` (when it
+runs) and wait for web whenever they changed a rate file; `site set`
+restarts nothing. After `ubicloud-admin run byoh-location create
+--rates-from ...` or `... rates ...`, restart by hand:
 
 ```bash
 sudo systemctl restart ubicloud.target
@@ -493,6 +531,32 @@ before it succeeded.
 
    This is UNVERIFIED on a packaged control plane with real hosts.
 
+9. **Disk ids, only when moving a host registered before M4 to M4 or
+   later.** Before you enable `ubicloud-monitor`, refresh each such BYOH
+   host's stored disk ids, which can be `""`, `root` or a partition name:
+
+   ```
+   sudo ubicloud-admin run byoh-host relearn-device-ids --host vh...         # shows old -> new
+   sudo ubicloud-admin run byoh-host relearn-device-ids --host vh... --yes   # stores them
+   ```
+
+   The host must be reachable over SSH. See §9 for what the ids are for.
+
+10. **GPUs, only when moving a BYOH host with an NVIDIA GPU registered
+    before M4 to M4 or later.** Its GPU rows were learned under
+    upstream's rule, which keeps a GPU whatever its driver. Rerun
+    LearnPci so a GPU that is not on `vfio-pci` stops being offered to
+    GPU VMs:
+
+    ```
+    sudo ubicloud-admin run byoh-host relearn-pci --host vh...
+    ```
+
+    It starts a `LearnPci` strand, writes a `byoh_operator_action` row,
+    and drops only idle rows; a GPU a VM holds keeps its row. The
+    respirate log names each GPU it skips. UNVERIFIED on real GPU
+    hardware.
+
 Do not flip `current` by hand with `ln -sfn`. That skips the downgrade
 guard below.
 
@@ -644,12 +708,36 @@ from the repository there.
 ## 9. Monitor
 
 `ubicloud-monitor` is installed but not enabled, and `ubicloud.target`
-does not want it. Upstream's health checks misjudge hosts without
-`wwn-`/`nvme-eui` disk links and SMART (AWS EBS, virtio; PLATFORMS F5)
-and can mark them `unavailable`. It is enabled in M9, after F5. `status`
-warns when it is enabled. Without it, an out-of-band host reboot is not
-noticed: use the admin Reboot, as [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
-§8 says.
+does not want it. It is enabled in M9. `status` warns when it is enabled.
+Without it, an out-of-band host reboot is not noticed: use the admin
+Reboot, as [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §8 says.
+
+Upstream's health checks misjudge hosts without `wwn-`/`nvme-eui` disk
+links and SMART (AWS EBS, virtio, LVM roots; PLATFORMS F5) and can mark
+them `unavailable`. Since M4, BYOH hosts (a generic host in a BYOH
+location) get their own checks: disks are identified from the mount
+point down (`findmnt`, `lsblk -s`, the best `/dev/disk/by-id` link or
+the kernel name), virtual and SMART-less disks are not SMART-checked,
+`kvm-clock` passes on a virtual host, and the read/write check always
+writes into `/var/storage`. The 24-hour monitor soak on EBS, virtio and
+LVM hosts has not been run (UNVERIFIED).
+
+Hosts registered before M4 keep the disk ids learned then, which can be
+`""`, `root` (from a `/dev/root` df source, as on Ubuntu cloud images)
+or a partition name. Before enabling the monitor, refresh them on each
+such host (§7 step 9 in a release switch):
+
+```
+bin/byoh-host relearn-device-ids --host vh...         # shows old -> new
+bin/byoh-host relearn-device-ids --host vh... --yes   # stores them
+```
+
+(packaged: `sudo ubicloud-admin run byoh-host relearn-device-ids ...`).
+It changes only `storage_device.unix_device_list`, writes a
+`byoh_operator_action` row, and needs SSH to the host. Until then the
+monitor reads such a host as down: a blank or `root` id fails with "has a
+stale storage device id", and a partition with "is not a whole disk";
+both messages name the command.
 
 ---
 

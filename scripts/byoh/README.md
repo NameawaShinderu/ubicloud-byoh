@@ -155,18 +155,26 @@ The script does not clone the repository: clone it first
 
 ```bash
 # On the BYOH target host (as a sudo-capable user):
-./scripts/byoh/bootstrap-data-plane.sh
+./scripts/byoh/bootstrap-data-plane.sh [--main-ip IP] [--preflight-script PATH | --no-preflight]
 ```
 
 Idempotent. Prepares the host for the control plane's rhizome bootstrap
 by ensuring root SSH works, pre-seeding `ruby-bundler` so Ubicloud's
-`BootstrapRhizome` doesn't race on `apt-get update`, and printing the
-operator's next step.
+`BootstrapRhizome` doesn't race on `apt-get update`, then runs host
+preflight and prints the operator's next step.
 
-You'll also need to install the control plane's SSH public key into
-`/root/.ssh/authorized_keys` on this host before running
-`bin/register-byoh-host` on the control plane — the script prints
-instructions for this step.
+Preflight is `scripts/byoh/host/ubicloud-host preflight --standalone`
+(read-only, PLATFORMS.md §6), found next to the script or at
+`host/ubicloud-host` below its directory, or given with
+`--preflight-script`. Standalone it checks what needs no pools: PF1-PF19
+plus one IPv4 default route and, with `--main-ip`, that the main IP is
+on the host. The script exits 1 when a check fails (the finished steps
+stay marked, so a re-run only repeats the checks), and prints how to run
+preflight from the control plane when the script is not found.
+`ubicloud-admin host add` runs the full preflight again with the pools
+and installs its own root key; with `bin/register-byoh-host`, install
+the control plane's public key in `/root/.ssh/authorized_keys` yourself
+first. Tested by `scripts/byoh/test/bootstrap-preflight.sh`.
 
 ## Provider-specific pre-work
 
@@ -215,4 +223,16 @@ fronts, the development shim and `migrate-from-dev.sh` in throwaway
   or aws; G0, G16 and G17 are manual.
 - `verify/m2-checks` is the read-only database half of the gate
   (`lib/byoh_gate_checks.rb`), usable on its own:
-  `bundle exec scripts/byoh/verify/m2-checks host --host vh...`.
+  `bundle exec scripts/byoh/verify/m2-checks host --host vh...`, or on a
+  packaged control plane `sudo ubicloud-admin run m2-checks host --host
+  vh...` (the gates pick that one under systemd: `GATE_CHECKS`,
+  `SOAK_CHECKS`).
+- `verify/m4-e2.sh` runs the M4 E2 gate (G-M4-1 AWS, G-M4-2 Proxmox):
+  `ubicloud-admin site add` and `host add --ssh` exactly as an operator
+  types them, with a timed transcript in `var/`, then the no-VM steps
+  of `m2-gate.sh`. `verify/m4-f5-soak.sh --host vh... --hours 24`
+  samples hosts while `bin/monitor` runs (G-M4-3 to 5) through
+  `m2-checks health --since START --probe` and reads the monitor's log
+  for down readings between samples. Both are UNVERIFIED on real
+  infrastructure; `docs/byoh/VERIFY.md` §6 has the settings and pass
+  rules, and `test/m4-gate-scripts.sh` tests them against stubs.

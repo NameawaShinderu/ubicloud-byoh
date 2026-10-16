@@ -38,6 +38,255 @@ and `ubicloud-admin`, so a change to either needs no re-prepare),
 `account EMAIL` and `as-service`/`as-migrate CMD` (a command in the
 release with exactly the units' environment, parsed by systemd).
 
+## M4 harness (`ubi-m4-*`)
+
+`lib.sh` takes its container prefix from `UBI_TEST_PREFIX` (default
+`ubi-m3`) and the systemd image from `UBI_TEST_SYSTEMD_IMAGE` (default
+`ubi-m3-systemd`). These are set by the wrapper that sources it, not a
+user override: `run.sh` pins both to the M3 values, because its
+scenarios name `ubi-m3-*` containers directly. `cleanup` removes only the
+recorded containers that carry the run's prefix and keeps the other
+records in `created`. `m4-lib.sh` sources it with prefix `ubi-m4` and
+its own state dir; only `UBI_M4_STATE`, `UBI_M4_LOGS` and `UBI_M4_KEEP`
+change that (an inherited `UBI_M3_*` is ignored). It adds a fake
+data-plane host:
+
+- `Dockerfile.fakehost` (context `fakehost/`) is ubuntu:24.04 with
+  openssh-server, sudo, iproute2, util-linux, pciutils and curl, and no
+  systemd and no `/dev/kvm`. `/usr/sbin/sshd -D -e` runs as PID 1, so
+  every auth event is in `docker logs`. Host keys are generated when each
+  container starts, never in the image.
+- User `ubuntu` has passwordless sudo. Its RSA login key is generated per
+  run in `$STATE` (`fakehost_key`) and never committed.
+- `/usr/local/bin/systemctl` is a shim: `reload`/`restart` of
+  `ssh`/`sshd` behaves like ssh.service's `ExecReload`: it fails for a
+  non-root caller (as polkit does over ssh), fails without signalling
+  when `sshd -t` rejects the config (the old sshd keeps serving), and
+  otherwise sends SIGHUP to the listener (sshd re-execs and rereads its
+  config); `is-active` answers from `/etc/fakehost-active`, which the
+  entrypoint writes from `docker run -e FAKEHOST_ACTIVE="docker ufw"`
+  (an ssh session does not see the container's env); every other verb
+  exits 0. Calls are logged to `/var/log/fakehost-systemctl.log`.
+- `start_fakehost NAME [docker run args]` runs `ubi-m4-NAME` on
+  `ubi-test-net` with no published ports, records it, installs the key
+  and waits for port 22; `fakehost_ip NAME` gives its address.
+
+```
+scripts/byoh/test/m4-fakehost-check.sh   # builds ubi-m4-fakehost, checks it, cleans up
+```
+
+The check logs in from a second fakehost as `ubuntu`, and checks sudo,
+the auth line in `docker logs`, no `/dev/kvm`, per-container host keys,
+`is-active`, that `systemctl reload ssh.service` makes sshd reread a
+drop-in (`Received SIGHUP` in `docker logs`, then `sshd -T`) and keep
+serving, that a reload without sudo or with an invalid drop-in exits
+non-zero without signalling sshd while logins still work, and that
+cleanup keeps another prefix's records in a shared state file. It fails
+if any `ubi-m4-*` container is left (not checked with `UBI_M4_KEEP=1`).
+Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): pass in about
+6 s after the image build, nothing left behind; with `UBI_M4_KEEP=1` it
+passes and keeps both containers.
+
+### Root key install cases (WP9)
+
+```
+scripts/byoh/test/m4-install-key-cases.sh
+```
+
+Runs `ByohHostAdd::INSTALL_SCRIPT`, the script `byoh-host add` runs as
+root to install the registration key, on a fakehost. The remote command
+and stdin come from `ByohOperatorSsh#run_script` itself, rendered in a
+`ubi-m4-render` container from `ubi-bundler-m1` (`UBI_M4_RUBY_IMAGE`),
+and each case sends them over ssh from a second fakehost as `ubuntu`.
+The cases: sshd already allows root key login (only `authorized_keys`
+changes; cloud-init's forced-command line, another site's line and a
+comment stay, a stale line with the same tag is replaced, and a re-run
+leaves the file as it was); `PermitRootLogin no` after the `Include`
+(the drop-in is written, sshd reloads and root logs in with the key);
+and the failures 11 (an earlier drop-in wins, named on stderr), 12
+(`sshd -T` fails), 13 (no `Include`), 10 (`sshd -t` fails) and 14 (no
+reload). 10 and 14 use per-case shims in `/usr/local/sbin`, which sudo's
+secure_path puts first. Each failure must leave no drop-in and sshd
+serving. A socket-activated `ssh.socket` is not covered (no systemd in
+the fakehost): UNVERIFIED.
+Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): all 7 cases pass
+in about 10 s after the image build, nothing left behind.
+
+### ubicloud-admin site, host and pool (WP10)
+
+```
+scripts/byoh/test/m4-admin.sh
+```
+
+Boots `ubi-m4-admin` from `ubi-m3-release` (`UBI_M4_RELEASE_IMAGE`; build
+it with `run.sh --prepare-image --prepare-tools --prepare-release`). It
+extracts the working tree over that release, which works because M4 adds
+no migration and no gem, and installs the working tree's `ubicloud-admin`
+and units. It checks:
+
+- `site add --rates-from` writes `billing_rates.d/<name>.yml` and
+  restarts `ubicloud.target` (web gets a new PID). A `site rates` that
+  changes no file, and `site set`, restart nothing.
+- `site show NAME` and `site --help` work.
+- These exit 2: `--postgres yes`, `--mgmt wireguard`, an unknown verb and
+  `--bmc-password`.
+- The `UBICLOUD_ADMIN_DRYRUN=1` mappings of `site add` and of the
+  two-phase `host add`.
+- `--dev` and `UBICLOUD_ADMIN_DEV=1` are refused on the packaged layout.
+- With the real `byoh-host` and an unknown site, the failed prepare phase
+  stops the run before register.
+- With a Ruby probe in place of `bin/byoh-host`:
+  - the register phase gets neither key option;
+  - the staged key copies are gone (a listing of the staging directory
+    holds only the two pool file copies);
+  - `byoh-keys/` was made `ubicloud` 0700, although the release's
+    `install.sh` predates it.
+
+The script does not cover the dev layout. Its runs were checked by hand
+in a throwaway `ubi-m4-devadm` ubuntu:24.04 container with a stub
+`bundle`: running as `SUDO_USER` through `runuser`, relative files made
+absolute, and the exit-2 refusal for root without `SUDO_USER`.
+
+Result (2026-10-15): passes in about 50 s, and nothing is left behind.
+
+### Host preflight fixtures (WP5)
+
+```
+scripts/byoh/test/preflight-fixtures.sh [--update-spec] [CASE...]
+```
+
+Runs `scripts/byoh/host/ubicloud-host preflight --json` once per case in
+`fixtures/host/` (a throwaway `ubi-m4-pf-<case>` container from
+ubuntu:24.04, `--rm`, no ports). It feeds the script on stdin, as
+`bash -s`, the way the control plane runs it over ssh. A case is
+`fixtures/host/base` (a sound x86 host) with the case's own files laid
+over it; `.remove` lists base files the case deletes. The script reads
+every file under the fixture root and every command's output from
+`cmd/<key>` (exit status in `cmd/<key>.rc`); `bin/<tool>` marks a tool
+as installed and `dev/kvm.chardev` stands for the `/dev/kvm` character
+device. Test mode needs both `--fixture-root` and
+`UBICLOUD_HOST_TEST_ROOT`, set to the same directory; the run checks that
+the flag alone exits 2.
+
+Each case asserts its `expect` (`ID STATUS`) and `detail` (`ID DETAIL`)
+lines. Every case must also exit 0, print each check exactly once, print
+every fact, and print nothing else under its nonce. `noisy-bashrc` runs
+with a `BASH_ENV` that prints banners, a `UBIPF:` line under another
+nonce and output with no trailing newline. The last run uses the
+`ubi-m4-fakehost` image with real commands and no fixtures, and must
+fail PF3 with `no /dev/kvm`.
+
+The fixture outputs are synthesised. In particular, `arm-biglittle`,
+`intel-hybrid`, `amd-uniform`, `ebs-nvme`, `lvm` and `gpu-nouveau` were
+not captured on such hardware, so they are UNVERIFIED as real outputs.
+The PF15 network calls are shimmed (`cmd/curl`, `cmd/apt-get`).
+
+`--update-spec` writes each raw output to
+`spec/fixtures/byoh/preflight/<case>.txt`. Two specs read those files:
+`spec/lib/byoh_host_preflight_spec.rb` parses them, and
+`rhizome/host/spec/kvm_check_parity_spec.rb` checks that `KvmCheck`, which
+PrepHost runs, gives each fixture host the same PF3 verdict as the
+script, except on kvm64-class CPU models, which only the script refuses
+(`kvm64-vmx` has /dev/kvm and vmx, so KvmCheck passes it). Rerun the script with `--update-spec` after changing it or the
+fixtures. Result (2026-10-15): 23 cases plus base, the guard and the
+live run pass in about 25 s, with nothing left behind.
+
+### Bootstrap preflight hook (WP11)
+
+```
+scripts/byoh/test/bootstrap-preflight.sh
+```
+
+Runs `scripts/byoh/bootstrap-data-plane.sh` as user `ubuntu` (passwordless
+sudo) in one `ubi-m4-bs` container of the `ubi-m4-fakehost` image
+(ubi-test-net, no ports). The install steps are pre-marked done, so
+nothing is installed, and `/dev/kvm` is a `mknod` node, enough for the
+script's own step 1b. Fixture runs put a wrapper in place of
+`ubicloud-host` that runs the real script on `fixtures/host/<case>`.
+
+| Case | Asserts |
+|---|---|
+| live | The repository layout (`host/ubicloud-host` below the script), real commands: the rows are printed, `main-ip-local` passes for the container's address, and the exit is 1 exactly when a row is `fail` (here PF5: no GRUB in the image) |
+| base | Fixture host without failures: exit 0, `preflight: 0 failing` |
+| hybrid | `--preflight-script` with `intel-hybrid`: `fail PF8-hybrid`, exit 1, the next steps still printed |
+| kvm64 | `ubicloud-host` next to the script, `kvm64-model`: `fail PF3 kvm64-class CPU model`, exit 1; without `--main-ip`, `main-ip-local` is `info` |
+| not-found | The script alone: preflight skipped with the `ubicloud-admin host preflight` hint, exit 0 |
+| no-preflight | `--no-preflight`: skipped, exit 0 |
+| broken | A preflight script that exits 3: "could not run (exit 3)", its stderr shown, exit 1 |
+| usage | Missing `--preflight-script` file, bad `--main-ip`, `--no-preflight` with `--preflight-script`, an unknown option, a missing value: exit 2 before step 1 |
+| no-kvm | `/dev/kvm` removed: the existing step 1b exit (1) stays and preflight never runs |
+| unsafe-shared, unsafe-owned, unsafe-grp | A found `ubicloud-host` that another user could have placed is skipped with the reason and never run as root: a sticky world-writable directory (like `/tmp`) with a file `nobody` planted, a `host/` directory owned by `nobody`, a directory writable by a group other than the owner's own. Exit 0, and the planted script leaves no mark |
+| upg | A copy owned by `ubuntu:ubuntu` with mode 775 (Ubuntu's umask 002, a user-private group) still runs preflight: exit 0 |
+
+Result (2026-10-15): all cases pass in about 6 s, with nothing left
+behind. The install steps themselves (apt, sshd reload) are not run
+here; they are unchanged by WP11.
+
+### Host add gate (WP12)
+
+```
+scripts/byoh/test/m4-host-add.sh
+```
+
+Runs `bin/byoh-host add` end to end, with the real ssh client, Net::SSH
+and a real database, against two fakehosts (`ubi-m4-host`,
+`ubi-m4-host2`). The control plane is `ubi-m4-cp`, a `ubi-bundler-m1`
+container (`UBI_M4_RUBY_IMAGE`) with the working tree mounted read-only
+and a tmpfs over `var/`, so the registration keys never reach the
+worktree. It runs `RACK_ENV=development`: under `RACK_ENV=test` Net::SSH
+raises MissingMock and host add refuses to reach a host.
+
+The database is the worktree `.env.rb`'s `CLOVER_DATABASE_URL` with
+`TEST_ENV_NUMBER=6` (`UBI_M4_DB_NUMBER`), `clover_m2_test6` here, which
+the spec suite shares, so **never run this while a pspec runs**.
+`m4-db-state` refuses to run without `UBI_M4_GATE=1` (set only on the
+gate's control-plane container) or on a database whose name does not end
+in `_test<n>` with `<n>` = `TEST_ENV_NUMBER`, so the development
+bootstrap's deployment database `clover_test` is always refused. It takes a snapshot (an md5 per row of every table) before the
+first command, and on exit, pass or fail, deletes every row the run
+added and checks that each table is back as it was. A row the run
+changed in place stops the restore with the table named.
+
+| Run | Asserts |
+|---|---|
+| A | No `/dev/kvm`: exit 1 at preflight with `fail PF3 no /dev/kvm`; no host row; root's `authorized_keys` and `sshd_config.d` unchanged |
+| B | A /29 holding the fakehost's own address (`--main-ip 192.0.2.10`, so registration's own main-IP check passes): exit 1 with PF17 "hands the uplink IP ... to VMs", after a read-only login that `docker logs` shows; no root login, no change. `spec/lib/byoh_host_add_spec.rb` covers an explicit `--uplink-ip` in a pool, which fails before any ssh |
+| C | `ubicloud-host preflight` on the `intel-hybrid` fixture, sent over the operator's ssh with sudo as add sends it: `ByohHostPreflight` reads PF8-hybrid as fail and blocking, and `accept(["PF8-hybrid"])` downgrades it to an accepted warn with no other fail |
+| D | `--skip-preflight --yes --no-wait` registers the host: one sshable and VmHost, `byoh?`, `uplink_ip` detected, boot images `ubuntu-noble`, `sshable.host_keys` equal to the host's `/etc/ssh/ssh_host_*_key.pub`, `pin_host_keys` in the HostNexus frame, `authorized_keys` keeping cloud-init's forced-command line and a comment next to the tagged key, no drop-in (Ubuntu's sshd already allows root key login), PF2 passed, the kept key deleted. A re-run says "Resuming" and adds nothing; a re-run with `--storage-disk` exits 2. Then `byoh-host watch --timeout 8` piped into a per-line timestamper: its first label line and its timeout line must arrive at least 5 s apart, so stdout is not block-buffered on a pipe |
+| D2 | A host with `PermitRootLogin no` after the `Include` and a `/usr/local/sbin/sshd` shim whose `sshd -t` fails: exit 1 with the rollback message and the undo line, no drop-in left, sshd serving, no host row |
+| E | `--storage-disk` naming a missing disk: exit 1 before any change. Then `storage-disk-fixtures.sh`, whose holders, partition table, backup GPT, iscsi and two-link refusals must pass |
+| D3 | The D2 host without the shim: the kept key is reused, the drop-in is written, sshd reloads (shim log), PF2 passes and the host registers |
+
+Not covered: the watch until `accepting` (no respirate runs, and the
+fakehost cannot be set up), a socket-activated `ssh.socket`, and a real
+disk for `--storage-disk`. These, and the same flow on an AWS canary and
+a Proxmox VM, are UNVERIFIED here.
+Result (2026-10-15, OpenSSH 9.6p1 Ubuntu-3ubuntu13.20): every run passes
+in about 70 s, the database is restored (35 rows deleted), and nothing
+is left behind.
+
+### Real-infrastructure gate scripts (WP13)
+
+```
+scripts/byoh/test/m4-gate-scripts.sh
+```
+
+Runs `scripts/byoh/verify/m4-e2.sh` and `m4-f5-soak.sh` as root in one
+`ubi-m4-gates` container of the `ubi-m4-fakehost` image, with the
+worktree mounted read-only, against stubs: a stub `ubicloud-admin`
+(`ADMIN`) and `m2-gate.sh` (`E2_GATE`), a stub `m2-checks`
+(`SOAK_CHECKS`) and `sleep` (`SOAK_SLEEP`), and a process named
+`ruby bin/monitor` for the monitor check. The cases pin the argument
+passing (a quoted `site add` option, fingerprints, the generated
+registration key that the gate then logs in with, `HOST_ADD_ARGS`),
+the skip of an existing site, stopping at the first failed phase, the
+timestamped transcript and verdicts, the soak's per-sample monitor check,
+per-host failure counts, the sample count from `--hours`/`--interval`,
+and the usage errors. `m2-checks health` itself is covered by
+`spec/lib/byoh_gate_checks_spec.rb`. Result (2026-10-15): 54 checks pass
+in a few seconds. Neither script has run against real infrastructure
+(UNVERIFIED; [VERIFY.md](../../../docs/byoh/VERIFY.md) section 6).
+
 ## Scenarios
 
 | Scenario | Checks |
@@ -311,3 +560,48 @@ minutes (rc 0, no `ubi-m3-*` container left). This run uses the
 `grep -q ... <<<"$(adm_last)"` form in `upgrade-manual`: the newest
 shellcheck (SC2337) flags `cmd | grep -q` under `pipefail`, because
 grep's early exit can fail the pipe with SIGPIPE.
+
+### Storage disk fixtures (WP6)
+
+```
+scripts/byoh/test/storage-disk-fixtures.sh
+```
+
+Runs `storage-disk-cases.sh` in one throwaway `ubi-m4-sd` container
+(ubuntu:24.04, `--rm`, no ports) against
+`scripts/byoh/host/ubicloud-host storage-disk`. Each case builds a
+fixture root inside the container with a root disk `sda` (`sda1` holds
+`/`) and blank disks `sdb` and `sdc`. Every block device command
+(`lsblk`, `findmnt`, `blkid`, `wipefs`, `swapon`, `blockdev`, `dd`,
+`mkfs.ext4`, `chattr`, `mount`, `multipath`, `udevadm`, `systemctl`) is
+`storage-disk-shim`, linked into `<root>/shim` and acting on fake disks
+under `<root>/fake`. In test mode the script refuses to run unless every
+one of them resolves to that shim directory, so no real device is
+touched.
+
+The cases cover these refusals:
+- the disk of `/`, `/boot` or `/boot/efi`, a btrfs `/` (`/dev/sda1[/@]`, major 0), and a ZFS `/` no disk names (a warning, then refused by the partition check)
+- a partition or device-mapper link
+- a by-id prefix that matches two links, also when one of them is an exact name (an exact name alone wins)
+- a missing link, or a link to something other than a disk
+- partitions, a mount, holders or swap
+- a `wipefs` signature, a `blkid` partition table, or a backup GPT in the last 4096-byte block
+- iSCSI (and then allowed with `--allow-shared-transport`), FCoE, NVMe whose controller transport is `tcp`, `rdma` on one path of a multipath head, or missing, and multipath (NVMe over `pcie` passes)
+- a `blkid` error, a failed or short read of the last block, and a failed `lsblk -o TRAN` (fail closed with exit 3)
+- a failed copy of `/etc/fstab` (exit 3, fstab unchanged, no temporary file)
+- an `ubi-diskN` label without its fstab line
+- a signature that appears between the checks and mkfs
+
+They also cover:
+- a blank disk: the fstab line and `disk1`, `chattr +i` before mkfs, and no temporary file left behind
+- a re-run that changes nothing
+- a re-run that mounts a disk left unmounted
+- `disk2` for the second disk, and skipping used `diskN` names
+- the guards: no shims, non-root, and usage errors
+
+One check runs the real `mkfs.ext4` on an image file. It confirms that
+mke2fs 1.47 without a tty overwrites an existing filesystem whether or not
+`-F` is given. That is why the script's own probes, repeated under the
+fstab lock, are the only guard. Result (2026-10-15): 29 checks pass in
+about 10 s, with nothing left behind. A run against a real disk or loop
+device is UNVERIFIED.

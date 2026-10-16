@@ -1,0 +1,44 @@
+# fixture: A100 on vfio-pci sharing its IOMMU group with a USB controller on xhci_hcd, an unbound A100 in group 21, and an A100 on vfio-pci in PCI domain 0001; synthesised in the pciutils 3.10.0 lspci -vnmmk -D format (UNVERIFIED against this hardware)
+Slot:	0000:21:00.0
+Class:	0302
+Vendor:	10de
+Device:	20b5
+SVendor:	10de
+SDevice:	16fa
+Rev:	a1
+ProgIf:	00
+Driver:	vfio-pci
+NUMANode:	0
+IOMMUGroup:	20
+
+Slot:	0000:21:00.3
+Class:	0c03
+Vendor:	1022
+Device:	149c
+ProgIf:	30
+Driver:	xhci_hcd
+Module:	xhci_pci
+IOMMUGroup:	20
+
+Slot:	0000:22:00.0
+Class:	0302
+Vendor:	10de
+Device:	20b5
+SVendor:	10de
+SDevice:	16fa
+Rev:	a1
+ProgIf:	00
+NUMANode:	0
+IOMMUGroup:	21
+
+Slot:	0001:01:00.0
+Class:	0302
+Vendor:	10de
+Device:	20b5
+SVendor:	10de
+SDevice:	16fa
+Rev:	a1
+ProgIf:	00
+Driver:	vfio-pci
+NUMANode:	1
+IOMMUGroup:	30

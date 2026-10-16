@@ -1,0 +1,1 @@
+# fixture: virtio disk without a serial: no /dev/disk/by-id directory, so the listing is empty

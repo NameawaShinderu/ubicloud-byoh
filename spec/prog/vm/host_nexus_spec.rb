@@ -161,6 +161,13 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(st.stack.first["vhost_block_backend_version"]).to eq(Config.vhost_block_backend_version)
     end
 
+    it "takes pinned host keys only for a generic provider host" do
+      expect {
+        described_class.assemble("1.2.3.4", provider_name: HostProvider::HETZNER_PROVIDER_NAME, pinned_host_keys: [SshKey.generate.public_key])
+      }.to raise_error(RuntimeError, "Only a generic provider host takes pinned host keys")
+      expect(Sshable.where(host: "1.2.3.4").count).to eq(0)
+    end
+
     describe "generic (BYOH) provider" do
       let(:byoh_location) do
         Prog::LocationNexus.assemble(name: "byoh-test", display_name: "byoh-test", ui_name: "BYOH test", visible: false,
@@ -196,6 +203,82 @@ RSpec.describe Prog::Vm::HostNexus do
           provider_config:)
 
         expect(st.subject.net6.to_s).to eq("fd00:feed::/64")
+      end
+
+      # format-storage-disks runs wipefs -fa on every disk but the boot
+      # disk. BYOH disks are the operator's: they reach VM storage only
+      # through `ubicloud-host storage-disk`, which never wipes.
+      it "never formats the disks of a host that BYOH registration assembles" do
+        st = ByohRegistration.new(location: byoh_location, main_ip: "203.0.113.42", routed_networks: ["10.99.0.0/29"]).register!
+        expect(st.stack.first["install_os"]).to be false
+
+        nx = described_class.new(st)
+        expect { nx.start }.to hop("setup_ssh_keys")
+        expect { nx.prep }.to hop("wait_prep")
+        learn_storage = Strand.where(parent_id: st.id, prog: "LearnStorage").first
+        expect(learn_storage.stack.first["format_storage"]).to be false
+      end
+
+      it "stores pinned host keys and flags the frame so that BootstrapRhizome verifies them" do
+        keys = [SshKey.generate.public_key, SshKey.generate.public_key]
+        st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config:,
+          pinned_host_keys: keys)
+
+        expect(st.subject.sshable.host_keys).to eq(keys)
+        expect(st.stack.first["pin_host_keys"]).to be true
+
+        nx = described_class.new(st)
+        expect { nx.bootstrap_rhizome }.to hop("start", "BootstrapRhizome") { |hop|
+          expect(hop.strand_update_args[:stack].first).to include("target_folder" => "host", "pin_host_keys" => true)
+        }
+      end
+
+      it "stores the keys ByohOperatorSsh#verified_host_keys returns as \"<type> <base64>\" lines" do
+        key = SshKey.generate.public_key
+        verified = ["#{key} root@h", "#{key} dup"].map { ByohOperatorSsh::HostKey.parse(it) }
+        st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config:,
+          pinned_host_keys: [*verified, "#{key} comment"])
+
+        expect(st.subject.sshable.host_keys).to eq([key])
+        expect(Sshable::KnownHosts.new(st.subject.sshable.host_keys, []).search_for("203.0.113.42", {}).map(&:ssh_type)).to eq(["ssh-ed25519"])
+      end
+
+      it "refuses a malformed pinned host key before storing anything" do
+        expect {
+          described_class.assemble("203.0.113.42",
+            location_id: byoh_location.id,
+            provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+            provider_config:,
+            pinned_host_keys: [SshKey.generate.public_key, "ssh-ed25519 AAAA"])
+        }.to raise_error(ArgumentError, 'not an SSH host public key: "ssh-ed25519 AAAA"')
+        expect(Sshable.where(host: "203.0.113.42").count).to eq(0)
+      end
+
+      it "leaves host keys unset and the frame unflagged without pinned host keys" do
+        st = described_class.assemble("203.0.113.42",
+          location_id: byoh_location.id,
+          provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+          provider_config:)
+
+        expect(st.subject.sshable.host_keys).to be_nil
+        expect(st.stack.first).not_to have_key("pin_host_keys")
+      end
+
+      it "refuses an empty pinned host key list" do
+        expect {
+          described_class.assemble("203.0.113.42",
+            location_id: byoh_location.id,
+            provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+            provider_config:,
+            pinned_host_keys: [])
+        }.to raise_error(RuntimeError, "pinned_host_keys is empty")
+        expect(Sshable.where(host: "203.0.113.42").count).to eq(0)
       end
 
       it "creates Address rows for declared v4 networks and auto-prepends the management /32" do
@@ -441,6 +524,7 @@ RSpec.describe Prog::Vm::HostNexus do
     it "pushes a bootstrap rhizome process" do
       expect { nx.bootstrap_rhizome }.to hop("start", "BootstrapRhizome") { |hop|
         expect(hop.strand_update_args[:stack].first).to include("target_folder" => "host")
+        expect(hop.strand_update_args[:stack].first).not_to have_key("pin_host_keys")
       }
     end
 
@@ -590,6 +674,24 @@ RSpec.describe Prog::Vm::HostNexus do
       vm_host.reload
       expect(VmHostCpu.where(vm_host_id: vm_host.id, io: true).count).to eq 0
       expect(vm_host.used_cores).to eq 0
+    end
+
+    it "creates vm_host_cpu rows for the online cpus a BYOH host reports" do
+      cpu_numbers = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15]
+      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "x64", "total_sockets" => 1, "total_dies" => 1, "total_cores" => 7, "total_cpus" => 14, "cpu_numa_nodes" => [0] * 7 + [1] * 7, "cpu_numbers" => cpu_numbers})
+      expect(vm_host).to receive(:io_cpu_count).and_return(2)
+
+      expect { nx.wait_prep }.to hop("setup_hugepages")
+
+      expect(VmHostCpu.where(vm_host_id: vm_host.id).select_order_map([:cpu_number, :io, :numa_node])).to eq(
+        cpu_numbers.each_with_index.map { |cpu, index| [cpu, index < 2, (index < 7) ? 0 : 1] },
+      )
+      expect(vm_host.reload.used_cores).to eq 1
+    end
+
+    it "crashes if LearnCpu reports cpu numbers that do not match the cpu count" do
+      Strand.create(parent_id: st.id, prog: "LearnCpu", label: "start", exitval: {"arch" => "x64", "total_sockets" => 1, "total_dies" => 1, "total_cores" => 2, "total_cpus" => 2, "cpu_numa_nodes" => [0], "cpu_numbers" => [0]})
+      expect { nx.wait_prep }.to raise_error RuntimeError, "LearnCpu reported 1 cpu numbers for 2 cpus"
     end
 
     it "crashes if an expected field is not set for LearnMemory" do
@@ -1172,6 +1274,38 @@ RSpec.describe Prog::Vm::HostNexus do
     it "returns an error trying to connect to VmHost" do
       expect(sshable).to receive(:connect).and_raise Sshable::SshError.new("ssh failed", "", "", nil, nil)
       expect(nx.available?).to be false
+    end
+
+    it "brings a healthy BYOH virtual host back from unavailable to wait" do
+      location = Location.create(name: "byoh-avail", display_name: "byoh-avail", ui_name: "byoh-avail", visible: false, provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {})
+      st = described_class.assemble("203.0.113.42", location_id: location.id, provider_name: HostProvider::GENERIC_PROVIDER_NAME,
+        provider_config: {"main_ip4" => "203.0.113.42", "location_label" => location.name, "routed_networks" => [{"cidr" => "fd00:feed::/64"}]})
+      st.update(label: "unavailable")
+      byoh_nx = described_class.new(st)
+      host = byoh_nx.vm_host
+      expect(host.byoh?).to be true
+      StorageDevice.create(vm_host_id: host.id, name: "DEFAULT", total_storage_gib: 100, available_storage_gib: 100, unix_device_list: ["vda"])
+      host.update(last_boot_id: "boot-id")
+      byoh_nx.incr_checkup
+
+      session = Net::SSH::Connection::Session.allocate
+      expect(byoh_nx.sshable).to receive(:connect).and_return(session)
+      ok = ->(text = "") { Net::SSH::Connection::Session::StringWithExitstatus.new(text, 0) }
+      smartctl = File.read(File.expand_path("../../fixtures/byoh/smartctl/virtio-unavailable.txt", __dir__)).lines.drop(1).join
+      expect(session).to receive(:_exec!).with(NetSsh.command(ByohHealthProbe::SCRIPT, shelljoin_devices: ["vda"]))
+        .and_return(ok.call("==ubicloud-probe virt\nkvm\n==ubicloud-probe clocksource\nkvm-clock acpi_pm\n==ubicloud-probe smartctl vda\n#{smartctl}"))
+      expect(session).to receive(:_exec!).with("lsblk --json").and_return(ok.call('{"blockdevices":[{"name":"vda","mountpoints":[null],"children":[{"name":"vda1","mountpoints":["/"]}]}]}'))
+      ["/", "/var/storage"].each do |path|
+        file_name = File.join(path, "test-file-respirate")
+        expect(session).to receive(:_exec!).with(NetSsh.command("sudo bash -c :command", command: NetSsh.command("head -c 1M </dev/zero > :file_name", file_name:))).and_return(ok.call)
+        expect(session).to receive(:_exec!).with("sha256sum #{file_name}").and_return(ok.call("30e14955ebf1352266dc2ff8067e68104607e750abb9d3b36582b8af909fcb58  #{file_name}\n"))
+        expect(session).to receive(:_exec!).with("sudo rm #{file_name}").and_return(ok.call)
+      end
+      expect(session).to receive(:_exec!).with("journalctl -kS -1min --no-pager").and_return(ok.call)
+      expect(byoh_nx.sshable).to receive(:_cmd).with("cat /proc/sys/kernel/random/boot_id").and_return("boot-id\n")
+
+      expect { byoh_nx.unavailable }.to hop("wait")
+      expect(byoh_nx.checkup_set?).to be false
     end
   end
 

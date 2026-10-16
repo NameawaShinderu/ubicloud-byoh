@@ -51,5 +51,34 @@ RSpec.describe Prog::LearnNumaNode do
         [[0, 0], [1, 0], [2, 1], [3, 1]],
       )
     end
+
+    it "maps the online cpu numbers of a BYOH host, which can have gaps" do
+      [0, 1, 4, 5].each { |cpu_number| VmHostCpu.create(vm_host_id: vm_host.id, cpu_number:, io: false) }
+      nx.strand.retval = {"cpu_numa_nodes" => [0, 0, 1, 1], "cpu_numbers" => [0, 1, 4, 5]}
+
+      expect { nx.start }.to exit({"msg" => "updated numa_node for 4 cpus"})
+
+      expect(VmHostCpu.where(vm_host_id: vm_host.id).select_order_map([:cpu_number, :numa_node])).to eq(
+        [[0, 0], [1, 0], [4, 1], [5, 1]],
+      )
+    end
+
+    it "leaves the rows of offline cpus alone on a BYOH host registered before offline cpus were skipped" do
+      6.times { |cpu_number| VmHostCpu.create(vm_host_id: vm_host.id, cpu_number:, io: false, numa_node: (cpu_number == 2) ? 7 : nil) }
+      nx.strand.retval = {"cpu_numa_nodes" => [0, 0, 1, 1], "cpu_numbers" => [0, 1, 4, 5]}
+
+      expect { nx.start }.to exit({"msg" => "updated numa_node for 4 cpus"})
+
+      expect(VmHostCpu.where(vm_host_id: vm_host.id).select_order_map([:cpu_number, :numa_node])).to eq(
+        [[0, 0], [1, 0], [2, 7], [3, nil], [4, 1], [5, 1]],
+      )
+    end
+
+    it "fails if a BYOH host reports cpus that have no vm_host_cpu row" do
+      [0, 1, 2, 3].each { |cpu_number| VmHostCpu.create(vm_host_id: vm_host.id, cpu_number:, io: false) }
+      nx.strand.retval = {"cpu_numa_nodes" => [0, 0, 1, 1], "cpu_numbers" => [0, 1, 4, 5]}
+      expect { nx.start }.to raise_error RuntimeError, "lscpu reported cpus 4,5 that have no vm_host_cpu row"
+      expect(VmHostCpu.where(vm_host_id: vm_host.id).exclude(numa_node: nil).count).to eq 0
+    end
   end
 end

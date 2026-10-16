@@ -13,6 +13,11 @@
 #   ubicloud-admin logs [web|respirate|monitor|backup|caddy|cloudflared]... [-f] [--since T] [-n N]
 #   ubicloud-admin account create --email E [--name N] [--project P] [--password-stdin|--password-file F]
 #   ubicloud-admin account list
+#   ubicloud-admin [--dev] site add NAME [--display TEXT] [--rates-from LOC] [--grant PROJECT]... [profile options]
+#   ubicloud-admin [--dev] site list|show|set|rates|grant|revoke|delete [NAME] [OPTIONS]
+#   ubicloud-admin [--dev] host add --site NAME --ssh USER@HOST [--ssh-key F] (--pool-file F | --routed-network CIDR ...)
+#   ubicloud-admin [--dev] host preflight|watch|move-location|setup-egress-nat|export-audit|relearn-device-ids|relearn-pci ...
+#   ubicloud-admin [--dev] pool list|export|add|remove|remap|annotate|ipv6|verify|trace ...
 #   ubicloud-admin run TOOL [ARGS...]
 #   ubicloud-admin console [-e CODE|-e -]
 #   ubicloud-admin release list
@@ -74,12 +79,43 @@
 #          SMTP_*, IP_FROM_HEADER), the secrets and keys that load code
 #          into Ruby (RUBYOPT, GEM_*, BUNDLE_*, ...) are refused.
 # run      TOOL is byoh-location, byoh-pool, byoh-host, register-byoh-host,
-#          byoh-config-check, production_check or create_prod_admin_account
-#          (bin/rake-task-runner). It runs in the release as user ubicloud;
-#          the files named by --pool-file, --ssh-key, --external-map and
-#          --password-file are copied for it, and --out FILE is written
+#          byoh-config-check, production_check, create_prod_admin_account
+#          (bin/rake-task-runner) or m2-checks (scripts/byoh/verify, the
+#          database checks of the M2 and M4 gates). It runs in the release
+#          as user ubicloud; the files named by --pool-file, --ssh-key,
+#          --registration-key, --external-map, --password-file and
+#          --snapshot are copied for it, and --out FILE is written
 #          back. --bmc-password is refused: put the password in the env
 #          file (env set BMC_PASS) and pass --bmc-pass-env BMC_PASS.
+# site     bin/byoh-location: the location (site) of BYOH hosts, its
+#          network profile, billing rates and grants. site add NAME is
+#          create --name NAME; --display TEXT is the name customers see
+#          (--display-name stays the API path name); --mgmt takes only
+#          direct and --postgres only no until M8 and ROADMAP §8.2.
+#          After site add or site rates changed a file in
+#          /var/lib/ubicloud/billing_rates.d, it restarts ubicloud.target
+#          (when it runs) and waits for web, so the services load the
+#          rates. site set restarts nothing.
+# host     bin/byoh-host. host add runs the tool twice: --phase prepare
+#          with the staged copies of --ssh-key and --registration-key,
+#          which it then deletes, and --phase register without them, so
+#          the operator's key is gone before the watch of the bring-up
+#          (hours) starts. An explicit --phase runs once, as given.
+# pool     bin/byoh-pool.
+#          site, host and pool run like run (the files are copied for
+#          user ubicloud, --bmc-password is refused) and pass --help to
+#          the tool. They do not take /run/ubicloud-admin.lock, except for
+#          the restart. UBICLOUD_ADMIN_DRYRUN=1 prints the command lines
+#          they would run and runs nothing.
+# --dev    (or UBICLOUD_ADMIN_DEV=1) For site, host and pool only: runs
+#          the tools of the development checkout this script is in
+#          (scripts/byoh/bootstrap-dev-ctrl-plane.sh), with bundle exec, as
+#          the invoking user, or as SUDO_USER under sudo, with
+#          ~/.local/bin and the mise Ruby of mise.toml on PATH. Refused
+#          when /etc/ubicloud or /opt/ubicloud exists. It restarts
+#          nothing: restart puma and respirate yourself after a rates
+#          change. As root without SUDO_USER, it prints the command to
+#          run as the checkout's owner and exits 2.
 # console  bin/pry, or the code of -e run through bin/pry, as user
 #          ubicloud. With PRY_AUDIT_BUCKET or OTEL_EXPORTER_OTLP_ENDPOINT
 #          in the env file, bin/pry sends the session and the code of -e
@@ -257,13 +293,13 @@ backup_target() {
 
 # secure_state: makes $STATE root:ubicloud 0750, as install.sh does
 # (older layouts had it owned by ubicloud, which could then swap its
-# entries for symlinks root follows), and refuses a var/ or
-# billing_rates.d/ that is not a real directory.
+# entries for symlinks root follows), and refuses a var/,
+# billing_rates.d/ or byoh-keys/ that is not a real directory.
 secure_state() {
   [[ ! -L $STATE ]] || die "$STATE is a symlink; it must be a directory"
   install -d -m 0750 -o root -g ubicloud "$STATE"
   local d
-  for d in "$STATE/var" "$STATE/billing_rates.d"; do
+  for d in "$STATE/var" "$STATE/billing_rates.d" "$STATE/byoh-keys"; do
     [[ ! -L $d && (! -e $d || -d $d) ]] ||
       die "$d is a symlink or not a directory; a process of user ubicloud may have replaced it. Inspect it and move it away"
   done
@@ -300,6 +336,8 @@ as_service() {
       done
     done
     for x in "${SERVICE_EXTRA[@]}"; do export "${x?}"; done
+    # Only in this subshell; the dev layout reads the caller's values.
+    # shellcheck disable=SC2030
     export PATH=$SERVICE_PATH HOME=$SERVICE_HOME
     umask 0007
     # fd 9 is the lock of install.sh or ubicloud-admin, which no
@@ -1423,19 +1461,25 @@ stage_dir() {
 }
 
 # stage_in FILE: copies FILE (relative to the caller's directory) for
-# ubicloud and prints the copy's path.
+# ubicloud and sets STAGED_PATH to the copy's path. It runs in the
+# caller's shell, never in $(...), so that its usage_die ends the script
+# even where errexit is off.
+STAGED_PATH=""
 stage_in() {
-  local src=$1 dest
+  local src=$1
   [[ $src == /* ]] || src=$CALLER_PWD/$src
   [[ -f $src && -r $src ]] || usage_die "$1 is not a readable file"
   stage_dir
-  dest=$(mktemp "$STAGE_DIR/in.XXXXXX")
-  install -m 0440 -o root -g ubicloud "$src" "$dest"
-  printf '%s' "$dest"
+  STAGED_PATH=$(mktemp "$STAGE_DIR/in.XXXXXX") || die "cannot create a file in $STAGE_DIR"
+  install -m 0440 -o root -g ubicloud "$src" "$STAGED_PATH" || die "cannot copy $src to $STAGED_PATH"
 }
 
 # Input file options of the tools, and the output option.
-readonly IN_FILE_OPTS='^--(pool-file|ssh-key|external-map|password-file)$'
+readonly IN_FILE_OPTS='^--(pool-file|ssh-key|registration-key|external-map|password-file|snapshot)$'
+# The staged copies of keys, which host add deletes after its prepare
+# phase.
+readonly KEY_FILE_OPTS='^--(ssh-key|registration-key)$'
+STAGED_KEYS=()
 OUT_FILE="" OUT_STAGED=""
 
 # is_bmc_password_opt ARG: whether the CLI's OptionParser (optparse
@@ -1485,7 +1529,10 @@ stage_args() {
       else
         # In this shell: its EXIT trap removes the copies.
         stage_dir
-        STAGED_ARGS+=("$opt" "$(stage_in "$val")")
+        stage_in "$val"
+        val=$STAGED_PATH
+        STAGED_ARGS+=("$opt" "$val")
+        [[ ! $opt =~ $KEY_FILE_OPTS ]] || STAGED_KEYS+=("$val")
       fi
     else
       STAGED_ARGS+=("$a")
@@ -1530,8 +1577,9 @@ cmd_run() {
       cmd=("bin/$tool")
       ;;
     create_prod_admin_account) cmd=(bin/rake-task-runner create_prod_admin_account) ;;
-    "") usage_die "run needs a tool: byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-config-check, production_check or create_prod_admin_account" ;;
-    *) usage_die "run does not run $tool; it runs byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-config-check, production_check and create_prod_admin_account" ;;
+    m2-checks) cmd=(scripts/byoh/verify/m2-checks) ;;
+    "") usage_die "run needs a tool: byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-config-check, production_check, create_prod_admin_account or m2-checks" ;;
+    *) usage_die "run does not run $tool; it runs byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-config-check, production_check, create_prod_admin_account and m2-checks" ;;
   esac
   need_root
   need_release
@@ -1541,6 +1589,296 @@ cmd_run() {
   ruby_as ubicloud "${cmd[@]}" "${STAGED_ARGS[@]}" || rc=$?
   ((rc)) || deliver_out
   return "$rc"
+}
+
+# --- site, host and pool (M4) ------------------------------------------------------------
+
+readonly SITE_VERBS=(add list show set rates grant revoke delete)
+readonly HOST_VERBS=(add preflight watch move-location setup-egress-nat export-audit relearn-device-ids relearn-pci)
+readonly POOL_VERBS=(list export add remove remap annotate ipv6 verify trace)
+DEV=0
+# packaged or dev, from byoh_layout.
+LAYOUT=""
+
+# byoh_layout: picks the layout the site, host and pool tools run in.
+byoh_layout() {
+  [[ ${UBICLOUD_ADMIN_DEV:-0} != 1 ]] || DEV=1
+  if [[ -e $ETC || -e $OPT ]]; then
+    ((DEV == 0)) || usage_die "--dev (or UBICLOUD_ADMIN_DEV=1) runs the tools of a development checkout, but $ETC or $OPT exists here (a packaged control plane); leave it out"
+    LAYOUT=packaged
+  elif ((DEV)); then
+    LAYOUT=dev
+  else
+    die "no control plane here: neither $ETC nor $OPT exists (install with scripts/byoh/install.sh); in a development checkout, pass --dev"
+  fi
+}
+
+# The development checkout this script is in.
+dev_repo() {
+  local repo
+  repo=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
+  [[ -f $repo/Gemfile && -f $repo/bin/byoh-location ]] || die "--dev: $repo is not a checkout (no Gemfile or bin/byoh-location); run the ubicloud-admin of the checkout, packaging/bin/ubicloud-admin"
+  printf '%s' "$repo"
+}
+
+# dev_args ARGS...: sets DEV_ARGS to ARGS with the file options made
+# absolute, as the tools run in the checkout, not the caller's
+# directory.
+dev_args() {
+  DEV_ARGS=()
+  local a opt val
+  while [[ $# -gt 0 ]]; do
+    a=$1
+    if [[ $a == --*=* ]]; then
+      opt=${a%%=*} val=${a#*=}
+    else
+      opt=$a val=""
+    fi
+    if [[ $opt =~ $IN_FILE_OPTS || $opt == --out ]]; then
+      if [[ $a != --*=* ]]; then
+        [[ $# -ge 2 ]] || usage_die "$opt needs a file"
+        val=$2
+        shift
+      fi
+      [[ $val == /* ]] || val=$CALLER_PWD/$val
+      DEV_ARGS+=("$opt" "$val")
+    else
+      DEV_ARGS+=("$a")
+    fi
+    shift
+  done
+}
+
+# dev_user: the user and home the dev tools run as; refuses root alone.
+DEV_USER="" DEV_HOME=""
+dev_user() {
+  if [[ $EUID != 0 ]]; then
+    DEV_USER=$(id -un)
+    # The caller's HOME; as_service changes it only in its subshell.
+    # shellcheck disable=SC2031
+    DEV_HOME=$HOME
+  elif [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    DEV_USER=$SUDO_USER
+    DEV_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    [[ -n $DEV_HOME ]] || die "--dev: no home directory for $SUDO_USER"
+  else
+    return 1
+  fi
+}
+
+# dev_path REPO: PATH for the dev tools: mise's ~/.local/bin and the
+# Ruby of the checkout's mise.toml, as scripts/byoh/bootstrap-dev-ctrl-plane.sh
+# installs them, then the caller's PATH.
+dev_path() {
+  local ruby p=$DEV_HOME/.local/bin
+  ruby=$(sed -n 's/^ruby *= *"\([^"]*\)".*/\1/p' "$1/mise.toml" 2>/dev/null | head -1)
+  [[ -z $ruby || ! -d $DEV_HOME/.local/share/mise/installs/ruby/$ruby/bin ]] || p+=:$DEV_HOME/.local/share/mise/installs/ruby/$ruby/bin
+  # The caller's PATH; as_service changes it only in its subshell.
+  # shellcheck disable=SC2031
+  printf '%s:%s' "$p" "$PATH"
+}
+
+# show_cmd ARGS...: one command line, quoted for a shell.
+show_cmd() {
+  local out
+  printf -v out ' %q' "$@"
+  printf '  %s\n' "${out# }"
+}
+
+# tool_run TOOL ARGS...: runs bin/TOOL with ARGS in the layout and sets
+# TOOL_RC to its exit status; with UBICLOUD_ADMIN_DRYRUN=1 it prints the
+# command line instead. It returns 0 itself, so that callers never put
+# it left of || or in an if: errexit would be off for the staging
+# inside, and a failed step there would go on with an empty path.
+TOOL_RC=0
+tool_run() {
+  local tool=$1
+  shift
+  TOOL_RC=0
+  if [[ $LAYOUT == dev ]]; then
+    local repo
+    repo=$(dev_repo)
+    dev_args "$@"
+    if [[ ${UBICLOUD_ADMIN_DRYRUN:-0} == 1 ]]; then
+      show_cmd bundle exec "bin/$tool" "${DEV_ARGS[@]}"
+      return 0
+    fi
+    if ! dev_user; then
+      printf 'ubicloud-admin: --dev does not run the tools as root without sudo; run as the owner of the checkout:\n' >&2
+      printf '  cd %q && bundle exec bin/%s' "$repo" "$tool" >&2
+      printf ' %q' "${DEV_ARGS[@]}" >&2
+      printf '\n' >&2
+      exit 2
+    fi
+    local cmd=(env "HOME=$DEV_HOME" "PATH=$(dev_path "$repo")" bundle exec "bin/$tool" "${DEV_ARGS[@]}")
+    (
+      cd "$repo" || exit 1
+      umask 022
+      if [[ $EUID == 0 ]]; then exec runuser -u "$DEV_USER" -- "${cmd[@]}"; else exec "${cmd[@]}"; fi
+    ) || TOOL_RC=$?
+    return 0
+  fi
+  if [[ ${UBICLOUD_ADMIN_DRYRUN:-0} == 1 ]]; then
+    show_cmd "bin/$tool" "$@"
+    return 0
+  fi
+  stage_args "$@"
+  ruby_as ubicloud "bin/$tool" "${STAGED_ARGS[@]}" || TOOL_RC=$?
+  ((TOOL_RC)) || deliver_out
+  return 0
+}
+
+# The digest of the billing rate files, to see whether a command
+# changed them. Root never opens the files, which user ubicloud writes
+# (it could swap one for a FIFO or a link to /dev/zero): find lists each
+# entry's type, size, inode and nanosecond mtime from lstat, without
+# following links. secure_state checked that the directory itself is no
+# symlink, and $STATE is root's.
+rates_digest() {
+  local d=$STATE/billing_rates.d
+  [[ -d $d && ! -L $d ]] || return 0
+  find -P "$d" -mindepth 1 -maxdepth 1 -name '*.yml' -printf '%P\t%y\t%s\t%i\t%T@\n' | LC_ALL=C sort | sha256sum
+}
+
+# restart_for_rates: restarts ubicloud.target, so web, respirate and
+# monitor load the changed rate files.
+restart_for_rates() {
+  if [[ $(unit_state ubicloud.target) != active ]]; then
+    report ok "services: ubicloud.target is not running; its next start loads the new rates"
+    return 0
+  fi
+  take_lock 60
+  systemctl try-restart ubicloud.target
+  # Back to back restarts would stop puma while it loads the app.
+  if wait_web 120; then
+    report changed "services: restarted ubicloud.target to load the new rates; web answers"
+  else
+    report fail "services: web does not answer 120 s after the restart (ubicloud-admin logs web)"
+    return 1
+  fi
+}
+
+# verb_ok VERB WORDS...: whether VERB is one of WORDS.
+verb_ok() {
+  local v=$1 w
+  shift
+  for w in "$@"; do [[ $v != "$w" ]] || return 0; done
+  return 1
+}
+
+# cmd_byoh NOUN TOOL VERB ARGS...: site, host and pool.
+cmd_byoh() {
+  local noun=$1 tool=$2 verb=${3:-}
+  shift 2
+  shift || true
+  local verbs=()
+  case $noun in
+    site) verbs=("${SITE_VERBS[@]}") ;;
+    host) verbs=("${HOST_VERBS[@]}") ;;
+    pool) verbs=("${POOL_VERBS[@]}") ;;
+  esac
+  local args=() a
+  for a in "$@"; do
+    if is_bmc_password_opt "$a"; then
+      usage_die "--bmc-password would put the BMC password on a command line and store it in plain text; set it with 'ubicloud-admin env set BMC_PASS' and pass --bmc-pass-env BMC_PASS"
+    fi
+    if [[ $a == --dev ]]; then DEV=1; else args+=("$a"); fi
+  done
+  case $verb in
+    -h | --help | help)
+      byoh_layout
+      if [[ $LAYOUT == packaged && ${UBICLOUD_ADMIN_DRYRUN:-0} != 1 ]]; then
+        need_root
+        need_release
+      fi
+      tool_run "$tool" --help
+      return "$TOOL_RC"
+      ;;
+    "") usage_die "$noun takes one of: ${verbs[*]}" ;;
+  esac
+  verb_ok "$verb" "${verbs[@]}" || usage_die "$noun does not take $verb; it takes one of: ${verbs[*]}"
+  byoh_layout
+  local dry=0
+  [[ ${UBICLOUD_ADMIN_DRYRUN:-0} != 1 ]] || dry=1
+  if [[ $LAYOUT == packaged ]] && ((!dry)); then
+    need_root
+    need_release
+  fi
+  ((dry)) || audit "$noun $verb"
+  if ((dry)); then
+    if [[ $LAYOUT == dev ]]; then
+      local repo
+      repo=$(dev_repo)
+      printf 'ubicloud-admin: dry run; in the checkout %s it would run:\n' "$repo"
+    else
+      printf 'ubicloud-admin: dry run; as user ubicloud in %s it would run:\n' "$CURRENT"
+    fi
+  fi
+  if [[ $noun == host && $verb == add ]]; then
+    host_add "${args[@]}"
+    return
+  fi
+  if [[ $noun == site && ($verb == add || $verb == rates) && $LAYOUT == packaged ]] && ((!dry)); then
+    local before rc=0
+    before=$(rates_digest)
+    SERVICE_EXTRA=(UBICLOUD_ADMIN_RESTARTS=1)
+    tool_run "$tool" "$verb" "${args[@]}"
+    rc=$TOOL_RC
+    SERVICE_EXTRA=()
+    # A run that failed after writing rates (a refused --grant) still
+    # changed what the services must load.
+    if [[ $(rates_digest) != "$before" ]]; then
+      restart_for_rates || rc=1
+    fi
+    return "$rc"
+  fi
+  tool_run "$tool" "$verb" "${args[@]}"
+  return "$TOOL_RC"
+}
+
+# host_add ARGS...: byoh-host add in two invocations, so that the
+# operator's key is gone before the watch.
+host_add() {
+  local a
+  for a in "$@"; do
+    case $a in
+      --phase | --phase=* | -h | --help)
+        tool_run byoh-host add "$@"
+        return "$TOOL_RC"
+        ;;
+    esac
+  done
+  if [[ $LAYOUT == packaged && ${UBICLOUD_ADMIN_DRYRUN:-0} != 1 ]]; then
+    # Where the prepare phase keeps the registration key for the register
+    # phase (install.sh makes it too; older layouts lack it).
+    secure_state
+    install -d -m 0700 -o ubicloud -g ubicloud "$STATE/byoh-keys"
+  fi
+  local rc=0
+  tool_run byoh-host add "$@" --phase prepare
+  rc=$TOOL_RC
+  # The staged keys go now, whatever the outcome; the EXIT trap would
+  # only remove them at the very end.
+  if ((${#STAGED_KEYS[@]})); then
+    rm -f -- "${STAGED_KEYS[@]}"
+    printf 'ubicloud-admin: deleted the staged copies of the SSH keys before the register phase\n'
+  fi
+  [[ ${UBICLOUD_ADMIN_DRYRUN:-0} != 1 ]] || printf '  (then deletes the staged --ssh-key and --registration-key copies)\n'
+  ((rc == 0)) || return "$rc"
+  local reg=() skip=0
+  for a in "$@"; do
+    if ((skip)); then
+      skip=0
+      continue
+    fi
+    case $a in
+      --ssh-key | --registration-key) skip=1 ;;
+      --ssh-key=* | --registration-key=*) ;;
+      *) reg+=("$a") ;;
+    esac
+  done
+  tool_run byoh-host add "${reg[@]}" --phase register
+  return "$TOOL_RC"
 }
 
 # --- console ----------------------------------------------------------------------------
@@ -2148,8 +2486,13 @@ main() {
   CALLER_PWD=$PWD
   local command=${1:-}
   shift || true
-  # run and account pass --help to the tool.
-  if [[ $command != run && $command != account ]]; then
+  if [[ $command == --dev ]]; then
+    DEV=1
+    command=${1:-}
+    shift || true
+  fi
+  # run, account, site, host and pool pass --help to the tool.
+  if [[ $command != run && $command != account && $command != site && $command != host && $command != pool ]]; then
     local a
     for a in "$@"; do
       if [[ $a == -h || $a == --help ]]; then
@@ -2167,6 +2510,9 @@ main() {
     logs) cmd_logs "$@" ;;
     account) cmd_account "$@" ;;
     run) cmd_run "$@" ;;
+    site) cmd_byoh site byoh-location "$@" ;;
+    host) cmd_byoh host byoh-host "$@" ;;
+    pool) cmd_byoh pool byoh-pool "$@" ;;
     console) cmd_console "$@" ;;
     release) cmd_release "$@" ;;
     -h | --help | help) usage ;;

@@ -5,7 +5,7 @@ class Prog::Vm::HostNexus < Prog::Base
   frame_reader :vhost_block_backend_version, :default_boot_images, :install_os
   frame_accessor :accepting_before_patch
 
-  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false, ipv6_mode: "gua", virt_tier: ByohVirtTiers::KVM)
+  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false, ipv6_mode: "gua", virt_tier: ByohVirtTiers::KVM, pinned_host_keys: nil)
     DB.transaction do
       unless (location = Location[location_id])
         raise "No existing Location"
@@ -49,6 +49,16 @@ class Prog::Vm::HostNexus < Prog::Base
         raise "Location #{location.name} does not offer kvm hosts"
       end
 
+      # Host keys the operator confirmed for a BYOH host. They are stored
+      # before the first connection, and BootstrapRhizome verifies even
+      # its first root login against them.
+      if pinned_host_keys
+        raise "Only a generic provider host takes pinned host keys" unless provider_name == HostProvider::GENERIC_PROVIDER_NAME
+        raise "pinned_host_keys is empty" if pinned_host_keys.empty?
+
+        pinned_host_keys = ByohOperatorSsh::HostKey.lines(pinned_host_keys)
+      end
+
       id = VmHost.generate_uuid
       # Preloading raw_private_key_1 at creation time is the supported path
       # for BYOH hosts: the operator installs the matching public key on the
@@ -58,6 +68,7 @@ class Prog::Vm::HostNexus < Prog::Base
       # and the CLI storing the key.
       sshable_args = {host: sshable_hostname}
       sshable_args[:raw_private_key_1] = ssh_private_key if ssh_private_key
+      sshable_args[:host_keys] = Sequel.pg_array(pinned_host_keys, :text) if pinned_host_keys
       Sshable.create_with_id(id, **sshable_args)
       vmh = VmHost.create_with_id(id, **host_args)
 
@@ -91,10 +102,12 @@ class Prog::Vm::HostNexus < Prog::Base
         AssignedHostAddress.create(ip: sshable_hostname, address_id: id, host_id: id)
       end
 
+      frame = {"vhost_block_backend_version" => vhost_block_backend_version, "default_boot_images" => default_boot_images, "install_os" => install_os}
+      frame["pin_host_keys"] = true if pinned_host_keys
       Strand.create_with_id(id,
         prog: "Vm::HostNexus",
         label: "start",
-        stack: [{"vhost_block_backend_version" => vhost_block_backend_version, "default_boot_images" => default_boot_images, "install_os" => install_os}])
+        stack: [frame])
     end
   end
 
@@ -137,7 +150,9 @@ class Prog::Vm::HostNexus < Prog::Base
     register_deadline("download_boot_images", 10 * 60)
     hop_check_ip_reachability if retval&.dig("msg") == "rhizome user bootstrapped and source installed"
 
-    push Prog::BootstrapRhizome, {"target_folder" => "host"}
+    bootstrap_frame = {"target_folder" => "host"}
+    bootstrap_frame["pin_host_keys"] = true if frame["pin_host_keys"]
+    push Prog::BootstrapRhizome, bootstrap_frame
   end
 
   label def check_ip_reachability
@@ -206,12 +221,16 @@ class Prog::Vm::HostNexus < Prog::Base
         # vCPUs are host threads that may use all of their cores
         # (docs/byoh/EMULATED_HOSTS.md section 6.4).
         reserved_cores = ByohVirtTiers.lower?(vm_host.virt_tier) ? 1 : 0
-        (0..total_cpus - 1).each do |cpu|
+        # LearnCpu reports the online CPU numbers of a BYOH host, which can
+        # have gaps; cpu_numa_nodes is aligned with them by position.
+        cpu_numbers = st.exitval["cpu_numbers"] || (0..total_cpus - 1).to_a
+        fail "LearnCpu reported #{cpu_numbers.size} cpu numbers for #{total_cpus} cpus" unless cpu_numbers.size == total_cpus
+        cpu_numbers.each_with_index do |cpu, index|
           VmHostCpu.create(
             vm_host_id: vm_host.id,
             cpu_number: cpu,
-            io: cpu < io_cpu_count,
-            numa_node: cpu_numa_nodes[cpu],
+            io: index < io_cpu_count,
+            numa_node: cpu_numa_nodes[index],
           )
         end
         vm_host.update(used_cores: io_cpu_count * total_cores / total_cpus + reserved_cores)

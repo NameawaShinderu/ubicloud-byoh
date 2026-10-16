@@ -1,0 +1,6 @@
+# fixture: md RAID1 over two NVMe partitions; synthesised in the format util-linux 2.39.3 prints for lsblk -nP -s -o NAME,TYPE (UNVERIFIED)
+NAME="md2" TYPE="raid1"
+NAME="nvme0n1p3" TYPE="part"
+NAME="nvme0n1" TYPE="disk"
+NAME="nvme1n1p3" TYPE="part"
+NAME="nvme1n1" TYPE="disk"

@@ -1,0 +1,2 @@
+# fixture: nvme id-ctrl of a Samsung datacenter NVMe; synthesised in the nvme-cli 2.8 -o json format (UNVERIFIED)
+{"vid":5197,"ssvid":5197,"sn":"S437NA0N000001","mn":"SAMSUNG MZQLB960HAJR-00007","fr":"EDA5402Q","rab":2,"ieee":9528,"cmic":0,"mdts":9,"cntlid":4,"ver":66048,"nn":32}

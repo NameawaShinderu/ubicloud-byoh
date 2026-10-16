@@ -1,0 +1,9 @@
+# fixture: 4-vCPU KVM guest, 2 cores with 2 threads, no NUMA; synthesised in the format util-linux 2.39.3 prints for lscpu -a -p=CPU,NODE,SOCKET,CORE,ONLINE (UNVERIFIED against this hardware)
+# The following is the parsable format, which can be fed to other
+# programs. Each different item in every column has an unique ID
+# starting usually from zero.
+# CPU,Node,Socket,Core,Online
+0,,0,0,Y
+1,,0,0,Y
+2,,0,1,Y
+3,,0,1,Y

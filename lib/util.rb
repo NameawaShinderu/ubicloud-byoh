@@ -13,10 +13,13 @@ module Util
   # which typically includes the "root" account reflexively.  The
   # ssh-agent is employed by default here, since personnel are thought
   # to be involved with preparing new VmHosts.
-  def self.rootish_ssh(host, user, keys, cmd, **)
-    Net::SSH.start(host, user,
-      Sshable::COMMON_SSH_ARGS.merge(key_data: keys,
-        use_agent: Config.development?)) do |ssh|
+  #
+  # With known_hosts (a Sshable::KnownHosts), the host must present one
+  # of its keys; without it, any host key is accepted.
+  def self.rootish_ssh(host, user, keys, cmd, known_hosts: nil, **)
+    args = Sshable::COMMON_SSH_ARGS.merge(key_data: keys, use_agent: Config.development?)
+    args = args.merge(known_hosts:, verify_host_key: :always) if known_hosts
+    Net::SSH.start(host, user, args) do |ssh|
       ret = ssh.exec!(cmd, **)
       fail "Ssh command failed: #{ret}" unless ret.exitstatus.zero?
 

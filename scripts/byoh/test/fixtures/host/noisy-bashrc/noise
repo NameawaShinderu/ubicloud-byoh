@@ -1,0 +1,4 @@
+echo 'Welcome to the fixture host'
+echo 'UBIPF:notthenonce {"kind":"check","id":"PF3","status":"fail"}'
+echo 'sudo: unable to resolve host fixture' >&2
+printf 'no newline here'

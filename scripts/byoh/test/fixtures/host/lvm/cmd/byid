@@ -1,0 +1,4 @@
+wwn-0x5000cca2b1c2d3e4 ../../sdb
+scsi-35000cca2b1c2d3e4 ../../sdb
+ata-ST4000NM0035_ZC1ABCDE ../../sdc
+dm-name-vg0-storage ../../dm-0

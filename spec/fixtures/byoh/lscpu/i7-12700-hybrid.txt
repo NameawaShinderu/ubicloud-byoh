@@ -1,0 +1,25 @@
+# fixture: Intel i7-12700, 8 P-cores with 2 threads and 4 E-cores with 1; synthesised in the format util-linux 2.39.3 prints for lscpu -a -p=CPU,NODE,SOCKET,CORE,ONLINE (UNVERIFIED against this hardware)
+# The following is the parsable format, which can be fed to other
+# programs. Each different item in every column has an unique ID
+# starting usually from zero.
+# CPU,Node,Socket,Core,Online
+0,0,0,0,Y
+1,0,0,0,Y
+2,0,0,1,Y
+3,0,0,1,Y
+4,0,0,2,Y
+5,0,0,2,Y
+6,0,0,3,Y
+7,0,0,3,Y
+8,0,0,4,Y
+9,0,0,4,Y
+10,0,0,5,Y
+11,0,0,5,Y
+12,0,0,6,Y
+13,0,0,6,Y
+14,0,0,7,Y
+15,0,0,7,Y
+16,0,0,8,Y
+17,0,0,9,Y
+18,0,0,10,Y
+19,0,0,11,Y

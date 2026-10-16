@@ -1,0 +1,2 @@
+# fixture: nested KVM guest without a stable TSC (UNVERIFIED)
+kvm-clock acpi_pm 

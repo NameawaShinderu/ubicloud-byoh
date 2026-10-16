@@ -1,0 +1,216 @@
+#!/bin/bash
+# A stand-in for the block device commands `ubicloud-host storage-disk`
+# runs, for scripts/byoh/test/storage-disk-cases.sh. It is linked as
+# $R/shim/<command> and acts on the fake disks under
+# $UBICLOUD_HOST_TEST_ROOT/fake, never on a real device:
+#
+#   fake/disk/<name>/  type (default disk), tran, size, model, serial,
+#                      sig (wipefs -n lines), pttype, fstype, label,
+#                      uuid, mounts, parts ("<name> [mountpoint]" lines),
+#                      ss, bytes, lastblock (its first bytes, padded
+#                      with zeros to the block size), lastblock.len
+#                      (a short read: bytes dd returns), dd.rc and
+#                      blkid.rc (force an exit status), tran.rc (forces
+#                      the exit status of lsblk -o TRAN)
+#   fake/mnt/<key>     "SOURCE MAJ:MIN" of mount point <key> (/ as _)
+#   fake/block/<key>   lsblk -nPso NAME,TYPE lines for device <key>
+#   fake/mounted       "target device" lines that mount added
+#   fake/swaps         swapon --show lines
+#   fake/multipath     device paths that multipath -c accepts
+#   fake/log           every call, one per line
+#
+# Only the option shapes storage-disk uses are understood; anything else
+# exits 99 so that a new call shows up in the tests.
+set -uo pipefail
+
+R=${UBICLOUD_HOST_TEST_ROOT:?}
+F=$R/fake
+cmd=${0##*/}
+echo "$cmd $*" >>"$F/log"
+
+unknown() {
+  echo "storage-disk-shim: $cmd: unsupported call: $*" >&2
+  exit 99
+}
+
+key() {
+  local k=${1//\//_}
+  echo "${k:-_}"
+}
+
+# disk_of /dev/NAME: the fake disk directory, or exit 32 (not a device).
+disk_of() {
+  local d=$F/disk/${1#/dev/}
+  [[ $1 == /dev/* && -d $d ]] || {
+    echo "$cmd: $1: not a block device" >&2
+    exit 32
+  }
+  echo "$d"
+}
+
+val() {
+  [[ -f $1/$2 ]] && cat "$1/$2"
+  return 0
+}
+
+# One lsblk row: column values for the disk directory $1 or, with a
+# partition name and mountpoint, for that partition.
+column() {
+  local d=$1 col=$2 part=${3:-} pmount=${4:-}
+  if [[ -n $part ]]; then
+    case $col in
+      NAME) echo "$part" ;;
+      TYPE) echo part ;;
+      MOUNTPOINTS) echo "$pmount" ;;
+      *) echo "" ;;
+    esac
+    return
+  fi
+  case $col in
+    NAME) echo "${d##*/}" ;;
+    TYPE) if [[ -f $d/type ]]; then cat "$d/type"; else echo disk; fi ;;
+    SIZE) if [[ -f $d/size ]]; then cat "$d/size"; else echo 10G; fi ;;
+    MOUNTPOINTS) val "$d" mounts | head -1 ;;
+    TRAN | MODEL | SERIAL) val "$d" "${col,,}" ;;
+    *) unknown "column $col" ;;
+  esac
+}
+
+shim_lsblk() {
+  local flags=$1 cols=$2 dev=$3 mode=r d part pmount
+  [[ $flags == -n* ]] || unknown "$@"
+  [[ $flags == *P* ]] && mode=P
+  if [[ $flags == *s* ]]; then
+    [[ -f $F/block/$(key "$dev") ]] || exit 32
+    cat "$F/block/$(key "$dev")"
+    return
+  fi
+  d=$(disk_of "$dev") || exit 32
+  [[ ,$cols, == *,TRAN,* && -f $d/tran.rc ]] && exit "$(<"$d/tran.rc")"
+  local IFS=,
+  local cs
+  read -ra cs <<<"$cols"
+  unset IFS
+  local line="" c
+  for c in "${cs[@]}"; do
+    if [[ $mode == P ]]; then
+      line+="${line:+ }$c=\"$(column "$d" "$c")\""
+    else
+      line+="${line:+ }$(column "$d" "$c")"
+    fi
+  done
+  echo "$line"
+  [[ $flags == *d* ]] && return
+  [[ -f $d/parts ]] || return 0
+  while read -r part pmount; do
+    line=""
+    for c in "${cs[@]}"; do
+      if [[ $mode == P ]]; then
+        line+="${line:+ }$c=\"$(column "$d" "$c" "$part" "$pmount")\""
+      else
+        line+="${line:+ }$(column "$d" "$c" "$part" "$pmount")"
+      fi
+    done
+    echo "$line"
+  done <"$d/parts"
+}
+
+case $cmd in
+  lsblk)
+    # lsblk -n[d][s](P|r)o COLS DEV
+    (($# == 3)) || unknown "$@"
+    shim_lsblk "${1%o}" "$2" "$3"
+    ;;
+  findmnt)
+    [[ $# == 4 && $1 == -nro && $3 == --mountpoint ]] || unknown "$@"
+    case $2 in
+      SOURCE,MAJ:MIN)
+        [[ -f $F/mnt/$(key "$4") ]] || exit 1
+        cat "$F/mnt/$(key "$4")"
+        ;;
+      TARGET)
+        awk -v t="$4" '$1 == t { print $1; f = 1 } END { exit !f }' "$F/mounted" 2>/dev/null
+        ;;
+      *) unknown "$@" ;;
+    esac
+    ;;
+  blkid)
+    d=$(disk_of "${!#}")
+    [[ -f $d/blkid.rc ]] && exit "$(<"$d/blkid.rc")"
+    if [[ $* == "-p -o export /dev/"* ]]; then
+      out=""
+      [[ -f $d/fstype ]] && out+="TYPE=$(<"$d/fstype")"$'\n'
+      [[ -f $d/pttype ]] && out+="PTTYPE=$(<"$d/pttype")"$'\n'
+      [[ -f $d/label ]] && out+="LABEL=$(<"$d/label")"$'\n'
+      [[ -f $d/uuid ]] && out+="UUID=$(<"$d/uuid")"$'\n'
+      [[ -z $out ]] && exit 2
+      printf 'DEVNAME=%s\n%s' "${!#}" "$out"
+    elif [[ $* == "-p -s UUID -o value /dev/"* ]]; then
+      [[ -f $d/uuid ]] || exit 2
+      cat "$d/uuid"
+    else
+      unknown "$@"
+    fi
+    ;;
+  wipefs)
+    [[ $# == 3 && $1 == -n && $2 == -i ]] || unknown "$@"
+    d=$(disk_of "$3")
+    val "$d" sig
+    ;;
+  swapon)
+    [[ $* == "--show=NAME --noheadings --raw" ]] || unknown "$@"
+    val "$F" swaps
+    ;;
+  blockdev)
+    (($# == 2)) || unknown "$@"
+    d=$(disk_of "$2")
+    case $1 in
+      --getss) if [[ -f $d/ss ]]; then cat "$d/ss"; else echo 512; fi ;;
+      --getsize64) if [[ -f $d/bytes ]]; then cat "$d/bytes"; else echo 10737418240; fi ;;
+      *) unknown "$@" ;;
+    esac
+    ;;
+  dd)
+    [[ $1 == if=/dev/* && $# == 5 ]] || unknown "$@"
+    d=$(disk_of "${1#if=}")
+    bs=${2#bs=}
+    [[ -f $d/lastblock.len ]] && bs=$(<"$d/lastblock.len")
+    { val "$d" lastblock; head -c "$bs" /dev/zero; } | head -c "$bs"
+    if [[ -f $d/dd.rc ]]; then exit "$(<"$d/dd.rc")"; fi
+    ;;
+  mkfs.ext4)
+    [[ $# == 4 && $1 == -q && $2 == -L ]] || unknown "$@"
+    d=$(disk_of "$4")
+    # As the real mke2fs without a tty: it overwrites whatever is there.
+    echo ext4 >"$d/fstype"
+    echo "$3" >"$d/label"
+    printf '0b5e%04x-0000-4000-8000-%012x\n' "$(wc -l <"$F/log")" "$RANDOM" >"$d/uuid"
+    echo "0x438 ext4 $3 $(<"$d/uuid")" >"$d/sig"
+    ;;
+  chattr)
+    [[ $# == 2 && $1 == +i && -d $2 ]] || unknown "$@"
+    ;;
+  mount)
+    (($# == 1)) || unknown "$@"
+    uuid=$(awk -v t="$1" '$1 !~ /^#/ && $2 == t { sub(/^UUID=/, "", $1); print $1; exit }' "$R/etc/fstab")
+    [[ -n $uuid ]] || {
+      echo "mount: $1: can't find in /etc/fstab." >&2
+      exit 1
+    }
+    for d in "$F"/disk/*; do
+      if [[ $(val "$d" uuid) == "$uuid" ]]; then
+        echo "$1" >"$d/mounts"
+        echo "$1 /dev/${d##*/}" >>"$F/mounted"
+        exit 0
+      fi
+    done
+    echo "mount: $1: special device UUID=$uuid does not exist." >&2
+    exit 32
+    ;;
+  multipath)
+    [[ $# == 2 && $1 == -c ]] || unknown "$@"
+    grep -qxF "$2" "$F/multipath" 2>/dev/null
+    ;;
+  udevadm | systemctl) ;;
+  *) unknown "$@" ;;
+esac

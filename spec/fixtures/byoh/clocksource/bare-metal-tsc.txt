@@ -1,0 +1,2 @@
+# fixture: captured on an x86 bare-metal host
+tsc hpet acpi_pm 

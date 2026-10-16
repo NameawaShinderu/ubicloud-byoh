@@ -1,0 +1,3 @@
+# fixture: QEMU SCSI disk without wwn; synthesised in the format of find /dev/disk/by-id -printf '%f %l\n' under systemd 255 udev rules (UNVERIFIED)
+scsi-0QEMU_QEMU_HARDDISK_drive-scsi0 ../../sda
+scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-part1 ../../sda1

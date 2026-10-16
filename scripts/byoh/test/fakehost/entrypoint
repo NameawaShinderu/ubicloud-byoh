@@ -1,0 +1,11 @@
+#!/bin/bash
+# Fakehost entrypoint: fresh host keys per container, then sshd (CMD)
+# as PID 1. sshd re-execs itself on SIGHUP, which needs the absolute
+# path the CMD gives.
+set -euo pipefail
+mkdir -p /run/sshd
+ssh-keygen -A >/dev/null
+# Units the systemctl shim reports as active (see its header).
+printf '%s\n' "${FAKEHOST_ACTIVE:-}" >/etc/fakehost-active
+install -m 0666 /dev/null /var/log/fakehost-systemctl.log
+exec "$@"

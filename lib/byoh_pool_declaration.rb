@@ -135,7 +135,10 @@ class ByohPoolDeclaration
   # overlap with the new ones: they were accepted under the rules of their
   # time. host excludes the host's own database rows from the overlap and
   # external IP checks, so re-declaring an existing pool is not a conflict.
-  def self.validate_set!(entries, main_ip:, location:, host: nil, stored: [], ipv6_mode: nil)
+  #
+  # uplink_ip, gateway and local_ips are what host preflight learned about
+  # the host (ByohHostPreflight); see .host_address_errors.
+  def self.validate_set!(entries, main_ip:, location:, host: nil, stored: [], ipv6_mode: nil, uplink_ip: nil, gateway: nil, local_ips: [])
     errors = []
     notes = []
     all = stored + entries
@@ -187,6 +190,7 @@ class ByohPoolDeclaration
       end
     end
 
+    errors.concat(host_address_errors(entries, main_ip:, uplink_ip:, gateway:, local_ips:))
     errors.concat(external_ip_errors(entries, all, host))
 
     _, error = derive_ipv6_mode(all, ipv6_mode)
@@ -194,6 +198,28 @@ class ByohPoolDeclaration
 
     raise ValidationError, errors.join("\n") unless errors.empty?
     notes
+  end
+
+  # PF17 and contract C5 (docs/byoh/PLATFORMS.md, NETWORKING.md): a pool
+  # may not hand VMs the address the host's default route leaves from, the
+  # default gateway, or any address configured on the host, or the host
+  # answers for a VM's address. Reserved addresses, and those an onlink
+  # pool keeps back for its segment, are never handed out, so they may
+  # be any of these. The main IP's own /32 is the host-only management
+  # address, not a VM pool.
+  def self.host_address_errors(entries, main_ip:, uplink_ip: nil, gateway: nil, local_ips: [])
+    named = {"uplink IP" => uplink_ip, "default gateway" => gateway}.compact
+    entries.select(&:ipv4?).reject { it.cidr.to_s == "#{main_ip}/32" }.flat_map do |entry|
+      usable = entry.usable_ips
+      errors = named.filter_map do |what, ip|
+        "#{entry.cidr} hands the #{what} #{ip} to VMs; declare pools without it, or reserve it" if usable.include?(ip)
+      end
+      local = (usable & local_ips) - named.values
+      unless local.empty?
+        errors << "#{entry.cidr}: #{local.join(", ")} is configured on the host; remove it from the interface, since the host must not answer for a VM address (contract C5)"
+      end
+      errors
+    end
   end
 
   def self.parse_inline(text)

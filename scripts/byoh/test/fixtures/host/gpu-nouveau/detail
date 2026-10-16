@@ -1,0 +1,1 @@
+PF19 NVIDIA device(s) 0000:17:00.0 0000:17:00.1 not passable to VMs (their IOMMU group is not all on vfio-pci); the host takes only non-GPU VMs

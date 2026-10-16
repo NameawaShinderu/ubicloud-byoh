@@ -1,0 +1,4 @@
+# fixture: captured: nvme-cli 2.8 smart-log -o json on a device it may not open (ubuntu:24.04 container)
+{
+  "error":"/dev/nvme0n1: Operation not permitted"
+}

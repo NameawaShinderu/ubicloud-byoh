@@ -1,6 +1,7 @@
 # shellcheck shell=bash
-# Helpers for the BYOH container harness. Sourced by run.sh on the
-# docker host. Every container is named ubi-m3-*, joins only the
+# Helpers for the BYOH container harness. Sourced by run.sh (M3) and
+# m4-lib.sh (M4) on the docker host. Every container is named
+# $PREFIX-* (UBI_TEST_PREFIX, default ubi-m3), joins only the
 # ubi-test-net network, publishes no ports, and is removed on exit only
 # if this run created it.
 #
@@ -8,8 +9,10 @@
 
 HARNESS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WT=$(git -C "$HARNESS_DIR" rev-parse --show-toplevel)
+PREFIX=${UBI_TEST_PREFIX:-ubi-m3}
+IMAGE=${UBI_TEST_SYSTEMD_IMAGE:-ubi-m3-systemd}
 NET=${UBI_M3_NET:-ubi-test-net}
-STATE=${UBI_M3_STATE:-$(mktemp -d "${TMPDIR:-/tmp}/ubi-m3.XXXXXX")}
+STATE=${UBI_M3_STATE:-$(mktemp -d "${TMPDIR:-/tmp}/$PREFIX.XXXXXX")}
 ART=$STATE/art
 LOGS=${UBI_M3_LOGS:-$STATE/logs}
 mkdir -p "$ART" "$LOGS"
@@ -21,12 +24,12 @@ fail() {
   exit 1
 }
 
-# start_sys NAME [IMAGE]: boots systemd as PID 1 in ubi-m3-NAME.
+# start_sys NAME [IMAGE]: boots systemd as PID 1 in $PREFIX-NAME.
 # systemd 255 does not boot without --privileged under a private cgroup
 # namespace (it exits 255 with a read-only cgroup tree), so the harness
 # needs it; it never bind mounts /sys/fs/cgroup.
 start_sys() {
-  local name=ubi-m3-$1 image=${2:-ubi-m3-systemd}
+  local name=$PREFIX-$1 image=${2:-$IMAGE}
   docker run -d --name "$name" --network "$NET" --privileged --cgroupns=private \
     --tmpfs /run --tmpfs /run/lock -v "$ART:/art:ro" "$image" /sbin/init >/dev/null
   echo "$name" >>"$STATE/created"
@@ -45,27 +48,28 @@ start_sys() {
 wait_booted() {
   local s
   for _ in $(seq 120); do
-    s=$(docker exec "ubi-m3-$1" systemctl is-system-running 2>/dev/null) || true
+    s=$(docker exec "$PREFIX-$1" systemctl is-system-running 2>/dev/null) || true
     case $s in
       running) return 0 ;;
       degraded)
-        docker exec "ubi-m3-$1" systemctl --failed --no-legend | tee -a "$LOGS/harness.log"
+        docker exec "$PREFIX-$1" systemctl --failed --no-legend | tee -a "$LOGS/harness.log"
         return 0
         ;;
     esac
     sleep 1
   done
-  fail "ubi-m3-$1 did not boot (state: ${s:-none})"
+  fail "$PREFIX-$1 did not boot (state: ${s:-none})"
 }
 
-# dx NAME CMD...: runs CMD as root in ubi-m3-NAME.
+# dx NAME CMD...: runs CMD as root in $PREFIX-NAME.
 dx() {
-  local name=ubi-m3-$1
+  local name=$PREFIX-$1
   shift
   docker exec -i "$name" "$@"
 }
 
-# Removes only the containers this run created.
+# Removes only the containers this run created, and only those that
+# carry this run's prefix; other prefixes' records stay in the file.
 cleanup() {
   local name
   if [[ ${UBI_M3_KEEP:-0} == 1 ]]; then
@@ -73,9 +77,12 @@ cleanup() {
     return
   fi
   while read -r name; do
-    [[ $name == ubi-m3-* ]] && docker rm -f "$name" >/dev/null 2>&1
+    [[ $name == "$PREFIX"-* ]] && docker rm -f "$name" >/dev/null 2>&1
   done <"$STATE/created"
-  : >"$STATE/created"
+  # Keeps the records of another prefix sharing this state dir, so that
+  # run's own cleanup still removes them.
+  grep -v "^$PREFIX-" "$STATE/created" >"$STATE/created.tmp" || true
+  mv "$STATE/created.tmp" "$STATE/created"
 }
 
 # Archives the working tree, untracked but not ignored files included,

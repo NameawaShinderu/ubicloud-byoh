@@ -91,6 +91,19 @@ These are checked for every newly declared entry, by registration and by `add`, 
 
 **Network and broadcast addresses.** `routed` and `fabric` pools use every address, because each VM address is a /32 route. `onlink` pools reserve the segment's network, broadcast and gateway when they fall inside the pool (`usable: auto`).
 
+### 1.4 `uplink` (an interface) and `--uplink-ip` (an address)
+
+Two different things, both about the host's uplink:
+
+| | `uplink:` in pools.yaml | `--uplink-ip` of `host add` / `register-byoh-host` |
+|---|---|---|
+| What | The uplink **interface name** (`ens5`, `ens18`) | The uplink **IPv4 address**: the source address of the default route |
+| Default | none | detected by host preflight from `ip route show default` |
+| Stored | in the host's provider config | `provider_config["uplink_ip"]` |
+| Used for | Nothing is configured from it. Since M4 host preflight warns (`PF17-uplink`) when it is not an interface of the host or not the one the default route leaves by | PF17 (contract C5): no pool may contain the uplink IP, the main IP or the default gateway, a failure that cannot be accepted. Give it only for a host with more than one default route, where preflight cannot tell (`PF17-route`) |
+
+The main IP (`--main-ip`, the address the control plane logs in to) is usually the uplink IP. They differ behind NAT, for example a host reached at a public address its router forwards. `GenericApis#pull_ips` still skips only the main IP when it builds the host's own address (until M8).
+
 ---
 
 ## 2. Commands

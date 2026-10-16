@@ -1,0 +1,34 @@
+# fixture: RTX 4000 SFF Ada on the nvidia driver, its audio on snd_hda_intel; synthesised in the pciutils 3.10.0 lspci -vnmmk -D format (UNVERIFIED against this hardware)
+Slot:	0000:00:01.0
+Class:	0604
+Vendor:	8086
+Device:	352a
+Rev:	04
+ProgIf:	00
+Driver:	pcieport
+IOMMUGroup:	2
+
+Slot:	0000:01:00.0
+Class:	0300
+Vendor:	10de
+Device:	27b0
+SVendor:	10de
+SDevice:	16fa
+Rev:	a1
+ProgIf:	00
+Driver:	nvidia
+Module:	nvidia
+NUMANode:	0
+IOMMUGroup:	13
+
+Slot:	0000:01:00.1
+Class:	0403
+Vendor:	10de
+Device:	22bc
+SVendor:	10de
+SDevice:	16fa
+Rev:	a1
+ProgIf:	00
+Driver:	snd_hda_intel
+Module:	snd_hda_intel
+IOMMUGroup:	13

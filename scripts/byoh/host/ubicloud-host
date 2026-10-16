@@ -1,0 +1,1111 @@
+#!/bin/bash
+# ubicloud-host: runs on a would-be BYOH data-plane host and reports what
+# the control plane needs to know before registering it.
+#
+#   ubicloud-host preflight [--json] [--nonce N] [--main-ip IP] [--cp-ip IP]
+#                           [--boot-image-url URL]... [--images N]
+#                           [--vm-disk-gib N] [--standalone]
+#   ubicloud-host storage-disk --by-id ID [--allow-shared-transport]
+#   ubicloud-host version
+#
+# preflight gathers facts and gives verdicts only for the host-local
+# checks of docs/byoh/PLATFORMS.md (PF1-PF21) that need no pool or
+# control-plane knowledge. The control plane (lib/byoh_host_preflight.rb)
+# judges the rest from the facts: PF17 and contract C5 against the pools,
+# PF20 boot images, PF21 services. --standalone adds two checks for a run
+# without a control plane: the main IP is local, and there is exactly one
+# IPv4 default route.
+#
+# It is strictly read-only: no apt-get update, no mkdir, no sudo that can
+# prompt (only `sudo -n`, for dmidecode, sshd -T and smartctl). Every
+# external command reads /dev/null, so `ssh host bash -s < ubicloud-host`
+# works.
+#
+# --json prints one line per check or fact:
+#   UBIPF:<nonce> {"kind":"check","id":"PF3","status":"fail","detail":"...","fix":"..."}
+#   UBIPF:<nonce> {"kind":"fact","id":"arch","value":"x86_64"}
+# The control plane ignores lines without its nonce (.bashrc noise, sudo
+# warnings). Statuses are pass, info, warn and fail.
+#
+# Exit status: 0 when the checks ran (verdicts are in the output), 2 on a
+# usage error, 3 on an internal error.
+#
+# storage-disk formats one blank whole disk, named by its
+# /dev/disk/by-id link, as ext4 and mounts it at the next free
+# /var/storage/devices/diskN, where LearnStorage finds it. It runs as
+# root and never wipes: a disk with any partition, signature (a backup
+# GPT included), holder, swap or mount is refused, as are the disks of /,
+# /boot and /boot/efi. iSCSI, FC, FCoE, NVMe over fabrics and multipath
+# disks are refused unless --allow-shared-transport, since another
+# machine may write to them. A
+# re-run on a disk it set up passes. The last stdout line on success is
+#   storage-disk: ok /var/storage/devices/diskN UUID=<uuid>
+# Exit status: 0 done, 1 refused, 2 usage error, 3 internal error.
+#
+# Test mode: --fixture-root DIR together with UBICLOUD_HOST_TEST_ROOT=DIR
+# (the same value) reads every file under DIR and every command's output
+# from DIR/cmd/<key> (exit status in DIR/cmd/<key>.rc, default 0; a
+# missing key is a missing command). DIR/bin/<name> marks a tool as
+# installed. See scripts/byoh/test/preflight-fixtures.sh. storage-disk in
+# test mode reads and writes its files under DIR and runs every block
+# device command from DIR/shim (scripts/byoh/test/storage-disk-fixtures.sh).
+
+VERSION=1
+
+# Bring-up installs these (prog/bootstrap_rhizome.rb,
+# rhizome/host/bin/prep_host.rb, prog/install_dnsmasq.rb,
+# rhizome/host/bin/setup-sysstat; rhizome/host/spec/ubicloud_host_parity_spec.rb
+# keeps the list complete): the apt simulation proves the archive serves
+# them.
+PREP_PACKAGES=(ruby-bundler qemu-utils mtools acl smartmontools nvme-cli systemd-coredump jq ethtool make gcc libaio-dev sysstat nftables dmidecode pciutils)
+# PrepHost's first download (rhizome/host/lib/htcat_setup.rb). GitHub
+# redirects release downloads to release-assets.githubusercontent.com, so
+# following the redirect proves egress to both hosts.
+HTCAT_VERSION=2.0.0-ubi1
+# Units whose firewall rules or bridges collide with the nftables rules
+# rhizome installs (PLATFORMS.md PF16).
+CONFLICTING_UNITS=(docker ufw tailscaled k3s libvirtd)
+PF3_FIX="enable hardware virtualization (VT-x/AMD-V) for this machine, or nested virtualization with a host-passthrough CPU model if it is a VM; see docs/byoh/TROUBLESHOOTING.md#pf3"
+
+R=""
+JSON=0
+NONCE=""
+MAIN_IP=""
+CP_IP=""
+STANDALONE=0
+IMAGES=1
+VM_DISK_GIB=0
+URLS=()
+
+usage() {
+  echo "usage: ubicloud-host preflight [--json] [--nonce N] [--main-ip IP] [--cp-ip IP] [--boot-image-url URL]... [--images N] [--vm-disk-gib N] [--standalone]" >&2
+  echo "       ubicloud-host storage-disk --by-id ID [--allow-shared-transport]" >&2
+  echo "       ubicloud-host version" >&2
+  exit 2
+}
+
+usage_error() {
+  echo "ubicloud-host: $*" >&2
+  exit 2
+}
+
+internal_error() {
+  echo "ubicloud-host: internal error: $*" >&2
+  exit 3
+}
+
+# --- input helpers ---------------------------------------------------
+
+# Reads a file (under the fixture root in test mode).
+rd() {
+  cat -- "$R$1" 2>/dev/null
+}
+
+# Is the named tool installed?
+have() {
+  if [[ -n $R ]]; then
+    [[ -e $R/bin/$1 ]]
+  else
+    command -v "$1" >/dev/null 2>&1
+  fi
+}
+
+# run_cmd KEY CMD [ARG...]: the command's stdout (stderr dropped). In
+# test mode, DIR/cmd/KEY instead. Returns 127 when it is missing.
+run_cmd() {
+  local key=$1
+  shift
+  if [[ -n $R ]]; then
+    [[ -f $R/cmd/$key ]] || return 127
+    cat -- "$R/cmd/$key"
+    local rc=0
+    [[ -f $R/cmd/$key.rc ]] && rc=$(<"$R/cmd/$key.rc")
+    return "$rc"
+  fi
+  command -v "$1" >/dev/null 2>&1 || return 127
+  "$@" </dev/null 2>/dev/null
+}
+
+# As run_cmd, as root: directly when root, else `sudo -n`, which fails
+# rather than prompts.
+run_root() {
+  local key=$1
+  shift
+  if [[ -n $R ]] || ((EUID == 0)); then
+    run_cmd "$key" "$@"
+  else
+    command -v "$1" >/dev/null 2>&1 || return 127
+    run_cmd "$key" sudo -n "$@"
+  fi
+}
+
+# Is PATH a character device? A fixture marks one with PATH.chardev.
+chardev() {
+  if [[ -n $R ]]; then
+    [[ -e $R$1.chardev ]]
+  else
+    [[ -c $1 ]]
+  fi
+}
+
+# kv KEY LINE: the value of KEY="..." in an lsblk -P line.
+kv() {
+  sed -nE "s/(^|.* )$1=\"([^\"]*)\".*/\2/p" <<<"$2"
+}
+
+# --- output ----------------------------------------------------------
+
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')
+  printf '"%s"' "$s"
+}
+
+ROWS=()
+
+check() {
+  local id=$1 status=$2 detail=$3 fix=${4:-}
+  if ((JSON)); then
+    printf 'UBIPF:%s {"kind":"check","id":%s,"status":%s,"detail":%s,"fix":%s}\n' \
+      "$NONCE" "$(json_str "$id")" "$(json_str "$status")" "$(json_str "$detail")" "$(json_str "$fix")"
+  else
+    ROWS+=("$(printf '%-5s %-18s %s' "$status" "$id" "$detail")")
+    [[ -n $fix ]] && ROWS+=("$(printf '%24s fix: %s' "" "$fix")")
+  fi
+}
+
+# fact ID JSON-VALUE
+fact() {
+  if ((JSON)); then
+    printf 'UBIPF:%s {"kind":"fact","id":%s,"value":%s}\n' "$NONCE" "$(json_str "$1")" "$2"
+  fi
+}
+
+fact_str() {
+  fact "$1" "$(json_str "$2")"
+}
+
+# A raw JSON document from a command, or null when it printed nothing
+# that looks like one. ip -j prints a single line.
+fact_json() {
+  local id=$1 value=$2
+  value=${value//$'\n'/}
+  if [[ $value == \[* || $value == \{* ]]; then
+    fact "$id" "$value"
+  else
+    fact "$id" null
+  fi
+}
+
+# --- checks ----------------------------------------------------------
+
+ARCH=""
+CPUINFO=""
+
+pf1_os() {
+  local id version
+  ARCH=$(run_cmd uname-m uname -m)
+  id=$(rd /etc/os-release | sed -n 's/^ID=//p' | tr -d '"')
+  version=$(rd /etc/os-release | sed -n 's/^VERSION_ID=//p' | tr -d '"')
+  fact_str arch "$ARCH"
+  fact_str os_version "$id $version"
+  if [[ $id != ubuntu || $version != 24.04 ]]; then
+    check PF1 fail "OS is ${id:-unknown} ${version:-unknown}, not Ubuntu 24.04" "reinstall the host with Ubuntu 24.04 LTS"
+  elif [[ $ARCH != x86_64 && $ARCH != aarch64 ]]; then
+    check PF1 fail "architecture ${ARCH:-unknown} is not x86_64 or aarch64"
+  else
+    check PF1 pass "Ubuntu 24.04 on $ARCH"
+  fi
+}
+
+# Mirrors rhizome/host/lib/kvm_check.rb (PrepHost runs it after
+# registration), and also refuses the generic kvm64/qemu64 CPU models,
+# which lack features guests built for x86-64-v2 need.
+pf3_kvm() {
+  local model
+  CPUINFO=$(rd /proc/cpuinfo)
+  model=$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' <<<"$CPUINFO" | head -1)
+  if [[ $ARCH == x86_64 ]] && grep -Eq '^(Common KVM processor|QEMU Virtual CPU|kvm64|qemu64)' <<<"$model"; then
+    check PF3 fail "kvm64-class CPU model ($model)" "$PF3_FIX"
+  elif ! chardev /dev/kvm; then
+    check PF3 fail "no /dev/kvm" "$PF3_FIX"
+  elif [[ $ARCH == x86_64 ]] && ! grep -Eq '^flags[[:space:]]*:.*\b(vmx|svm)\b' <<<"$CPUINFO"; then
+    check PF3 fail "the CPU has neither the vmx nor the svm flag" "$PF3_FIX"
+  else
+    check PF3 pass "/dev/kvm present${model:+ ($model)}"
+  fi
+}
+
+pf4_pdpe1gb() {
+  if [[ $ARCH != x86_64 ]]; then
+    check PF4 pass "1G pages need no CPU flag on $ARCH"
+  elif grep -Eq '^flags[[:space:]]*:.*\bpdpe1gb\b' <<<"$CPUINFO"; then
+    check PF4 pass "pdpe1gb flag present"
+  else
+    check PF4 fail "the CPU lacks the pdpe1gb flag, so it cannot use 1G hugepages" "another machine, or a VM CPU model that passes pdpe1gb through (host-passthrough)"
+  fi
+}
+
+pf5_grub() {
+  if [[ -f $R/etc/default/grub ]] && have update-grub; then
+    check PF5 pass "/etc/default/grub and update-grub present"
+  else
+    check PF5 fail "/etc/default/grub or update-grub is missing; the host must boot with GRUB" "hugepages are set on the kernel command line through GRUB (prog/setup_hugepages.rb)"
+  fi
+}
+
+MEM_GIB=0
+
+# The memory LearnMemory records: the dmidecode device sizes in whole
+# GiB, else MemTotal rounded up. Then the hugepage count SetupHugepages
+# reserves from it.
+pf6_pf7_memory() {
+  local out rc lines line n unit mib=0 bad="" kib
+  out=$(run_root dmidecode dmidecode -t 17)
+  rc=$?
+  lines=$(grep -E '^[[:space:]]*Size: [0-9]' <<<"$out")
+  if ((rc != 0)) || [[ -z $lines ]]; then
+    if ((rc == 127)); then
+      check PF6 info "dmidecode is not installed; using MemTotal"
+    elif ((rc != 0)); then
+      check PF6 info "dmidecode failed (it needs root); using MemTotal"
+    else
+      check PF6 info "dmidecode lists no memory device; using MemTotal"
+    fi
+  else
+    while read -r line; do
+      n=$(awk '{print $2}' <<<"$line")
+      unit=$(awk '{print $3}' <<<"$line")
+      case $unit in
+        kB) mib=$((mib + n / 1024)) ;;
+        MB) mib=$((mib + n)) ;;
+        GB) mib=$((mib + n * 1024)) ;;
+        TB) mib=$((mib + n * 1024 * 1024)) ;;
+        *) bad="$bad $unit" ;;
+      esac
+    done <<<"$lines"
+    if [[ -n $bad ]]; then
+      check PF6 fail "dmidecode reports a memory size in an unknown unit:$bad" "LearnMemory refuses it; report the dmidecode -t 17 output"
+    else
+      MEM_GIB=$((mib / 1024))
+      check PF6 pass "dmidecode: $MEM_GIB GiB installed"
+    fi
+  fi
+
+  if ((MEM_GIB == 0)); then
+    kib=$(rd /proc/meminfo | sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\) kB$/\1/p')
+    MEM_GIB=$(((${kib:-0} + 1048575) / 1048576))
+  fi
+  fact mem_gib "$MEM_GIB"
+
+  local pages=$((MEM_GIB * 42 / 43 - 5))
+  ((pages < 0)) && pages=0
+  if ((pages < 8)); then
+    check PF7 fail "$MEM_GIB GiB of memory gives $pages 1G hugepages; at least 8 are needed" "a host with at least 15 GiB of memory"
+  elif ((pages < 16)); then
+    check PF7 warn "$MEM_GIB GiB of memory gives $pages 1G hugepages, room for few VMs"
+  else
+    check PF7 pass "$MEM_GIB GiB of memory gives $pages 1G hugepages"
+  fi
+}
+
+# Two groups of CPUs whose cpu_capacity or cpuinfo_max_freq differ by
+# more than 20% are performance and efficiency cores (arm big.LITTLE,
+# AMD Zen 5 with Zen 5c). The margin ignores the few percent Intel Turbo
+# Boost Max 3.0 gives its favoured cores.
+spread() {
+  local min="" max="" v
+  for v in "$@"; do
+    [[ $v =~ ^[0-9]+$ ]] || continue
+    if [[ -z $min ]] || ((v < min)); then min=$v; fi
+    if [[ -z $max ]] || ((v > max)); then max=$v; fi
+  done
+  [[ -n $min ]] && ((min > 0 && max * 5 > min * 6))
+}
+
+pf8_cpu() {
+  local out rc online=() offline=() line cpu socket core on hybrid="" caps=() freqs=() c
+  out=$(run_cmd lscpu lscpu -a -p=CPU,NODE,SOCKET,CORE,ONLINE)
+  rc=$?
+  if ((rc != 0)); then
+    check PF-min-cpu fail "lscpu failed (exit $rc)"
+    check PF8 fail "lscpu failed (exit $rc)"
+    check PF8-hybrid fail "lscpu failed (exit $rc)"
+    fact cpus_online 0
+    return
+  fi
+  # Threads per core count online CPUs only: lscpu gives an offline CPU
+  # no socket or core. With any CPU offline the thread-count rule is
+  # skipped, since an offline sibling would look like a smaller core;
+  # PF8 warns about offline CPUs instead.
+  local -A threads=()
+  while IFS=, read -r cpu _ socket core on; do
+    [[ $cpu == \#* || -z $cpu ]] && continue
+    if [[ $on == Y ]]; then
+      online+=("$cpu")
+      threads["$socket,$core"]=$((${threads["$socket,$core"]:-0} + 1))
+    else
+      offline+=("$cpu")
+    fi
+  done <<<"$out"
+  fact cpus_online "${#online[@]}"
+
+  if ((${#online[@]} < 2)); then
+    check PF-min-cpu fail "${#online[@]} online CPU(s); at least 2 are needed" "give the machine at least 2 CPUs"
+  else
+    check PF-min-cpu pass "${#online[@]} online CPUs"
+  fi
+
+  if ((${#offline[@]})); then
+    check PF8 warn "${#offline[@]} CPU(s) offline (${offline[*]}); only online CPUs are used"
+  else
+    check PF8 pass "all CPUs online"
+  fi
+
+  if [[ -e $R/sys/devices/cpu_atom || -e $R/sys/devices/cpu_core ]]; then
+    hybrid="Intel hybrid CPU (cpu_core and cpu_atom PMUs)"
+  elif ((${#offline[@]} == 0)) && (($(printf '%s\n' "${threads[@]}" | sort -u | wc -l) > 1)); then
+    hybrid="cores have different thread counts ($(printf '%s\n' "${threads[@]}" | sort -nu | tr '\n' ' ' | sed 's/ $//') threads)"
+  else
+    for c in "${online[@]}"; do
+      caps+=("$(rd "/sys/devices/system/cpu/cpu$c/cpu_capacity")")
+      freqs+=("$(rd "/sys/devices/system/cpu/cpu$c/cpufreq/cpuinfo_max_freq")")
+    done
+    if spread "${caps[@]}"; then
+      hybrid="CPUs have different cpu_capacity (performance and efficiency cores)"
+    elif spread "${freqs[@]}"; then
+      hybrid="CPUs have maximum frequencies more than 20% apart (performance and efficiency cores)"
+    fi
+  fi
+  if [[ -n $hybrid ]]; then
+    check PF8-hybrid fail "$hybrid" "VMs would get a mix of fast and slow cores; pass --accept-check PF8-hybrid to use the host anyway"
+  else
+    check PF8-hybrid pass "uniform cores"
+  fi
+}
+
+pf9_cgroup() {
+  local fs
+  fs=$(run_cmd stat-cgroup stat -fc %T /sys/fs/cgroup)
+  if [[ $fs != cgroup2fs ]]; then
+    check PF9 fail "/sys/fs/cgroup is ${fs:-unknown}, not cgroup v2" "boot with the unified cgroup hierarchy (the Ubuntu 24.04 default)"
+  elif ! grep -qw cpuset <<<"$(rd /sys/fs/cgroup/cgroup.controllers)"; then
+    check PF9 fail "the cpuset controller is not available in cgroup v2"
+  else
+    check PF9 pass "cgroup v2 with cpuset"
+  fi
+}
+
+STORAGE_DISKS=()
+
+# /var/storage need not exist yet; judge the filesystem it will be on.
+storage_path() {
+  local p=/var/storage
+  while [[ $p != / && ! -e $R$p ]]; do
+    p=$(dirname "$p")
+  done
+  echo "$p"
+}
+
+pf10_storage() {
+  local path src fstype majmin rootsrc avail need dev
+  path=$(storage_path)
+  read -r src fstype majmin <<<"$(run_cmd findmnt-storage findmnt -nro SOURCE,FSTYPE,MAJ:MIN --target "$path")"
+  read -r rootsrc _ <<<"$(run_cmd findmnt-root findmnt -nro SOURCE,FSTYPE --target /)"
+  fact_str storage_fstype "${fstype:-}"
+
+  if [[ $fstype == zfs ]]; then
+    check PF10-zfs fail "/var/storage would be on ZFS ($src), which BYOH storage does not support" "mount an ext4 or xfs filesystem at /var/storage, or give host add a blank disk with --storage-disk <by-id>"
+  else
+    check PF10-zfs pass "not ZFS"
+  fi
+  if [[ $fstype == btrfs ]]; then
+    check PF10-btrfs fail "/var/storage would be on btrfs ($src); write-through detection does not work there (UNVERIFIED)" "mount an ext4 or xfs filesystem at /var/storage, or pass --accept-check PF10-btrfs"
+  else
+    check PF10-btrfs pass "not btrfs"
+  fi
+
+  avail=$(run_cmd df-storage df -BG --output=avail "$path" | tail -1 | tr -dc 0-9)
+  need=$((5 + 4 * IMAGES + VM_DISK_GIB))
+  if [[ -z $src || -z $avail ]]; then
+    check PF10 fail "cannot find the filesystem of $path"
+  elif ((avail < need)); then
+    check PF10 fail "$path has ${avail}G free; $need G are needed (5 + 4 per boot image + VM disks)" "grow the filesystem or mount a larger one at /var/storage"
+  elif [[ $src == "$rootsrc" ]]; then
+    check PF10 warn "/var/storage shares the root filesystem ($src, ${avail}G free); a full disk stops the host"
+  else
+    check PF10 pass "$src ($fstype), ${avail}G free"
+  fi
+
+  # As lib/byoh_device_identity.rb: /dev/root resolves through its device
+  # number; btrfs has an anonymous one (major 0) and a [/subvolume] suffix.
+  if [[ $majmin =~ ^[1-9][0-9]*:[0-9]+$ ]]; then
+    dev=/dev/block/$majmin
+  else
+    dev=${src%%\[*}
+  fi
+  local line name type
+  while read -r line; do
+    name=$(kv NAME "$line")
+    type=$(kv TYPE "$line")
+    [[ $type == disk && -n $name ]] && STORAGE_DISKS+=("$name")
+  done <<<"$(run_cmd lsblk-storage lsblk -nPso NAME,TYPE "$dev")"
+}
+
+BYID=""
+
+# The /dev/disk/by-id name of disk $1 that ByohDeviceIdentity.pick
+# (lib/byoh_device_identity.rb) gives: the first by PREFERENCE, the
+# bytewise smallest within one; nothing when it has none.
+byid_name() {
+  local disk=$1 name target rank best="" best_rank=9 LC_ALL=C
+  while read -r name target; do
+    [[ ${target##*/} == "$disk" ]] || continue
+    case $name in
+      wwn-*) rank=0 ;;
+      nvme-eui.*) rank=1 ;;
+      nvme-nvme.*) continue ;;
+      nvme-*) rank=2 ;;
+      ata-* | scsi-* | virtio-*) rank=3 ;;
+      *) continue ;;
+    esac
+    if ((rank < best_rank)) || { ((rank == best_rank)) && [[ $name < $best ]]; }; then
+      best=$name
+      best_rank=$rank
+    fi
+  done <<<"$BYID"
+  echo "$best"
+}
+
+pf11_blank_disks() {
+  local out line name type fstype mounts pkname blank=() id named="" example=""
+  local -A parents=()
+  out=$(run_cmd lsblk lsblk -nPo NAME,TYPE,FSTYPE,MOUNTPOINTS,PKNAME)
+  while read -r line; do
+    pkname=$(kv PKNAME "$line")
+    [[ -n $pkname ]] && parents[$pkname]=1
+  done <<<"$out"
+  while read -r line; do
+    name=$(kv NAME "$line")
+    type=$(kv TYPE "$line")
+    fstype=$(kv FSTYPE "$line")
+    mounts=$(kv MOUNTPOINTS "$line")
+    [[ $type == disk && -z $fstype && -z $mounts && -z ${parents[$name]:-} ]] && blank+=("$name")
+  done <<<"$out"
+  if ((${#blank[@]})); then
+    BYID=$(run_cmd byid find /dev/disk/by-id -mindepth 1 -maxdepth 1 -type l -printf '%f %l\n')
+    for name in "${blank[@]}"; do
+      id=$(byid_name "$name")
+      named+="${named:+, }$name (${id:-no by-id link})"
+      [[ -z $example && -n $id ]] && example=$id
+    done
+    if [[ -n $example ]]; then
+      check PF11 info "blank disk(s) not used for VM storage: $named" "to use one, pass its by-id name to host add, e.g. --storage-disk $example"
+    else
+      check PF11 info "blank disk(s) not used for VM storage: $named" "host add --storage-disk takes a disk by its /dev/disk/by-id name; these disks have none (give the virtual disk a serial)"
+    fi
+  else
+    check PF11 pass "no blank unused disk"
+  fi
+}
+
+pf12_pf13_disks() {
+  local links d missing=() smart rc failing=() unknown=()
+  links=${BYID:-$(run_cmd byid find /dev/disk/by-id -mindepth 1 -maxdepth 1 -type l -printf '%f %l\n')}
+  for d in "${STORAGE_DISKS[@]}"; do
+    grep -Eq "^(wwn-|nvme-eui\.|nvme-|ata-|scsi-|virtio-)[^ ]* (\.\./)*$d\$" <<<"$links" || missing+=("$d")
+  done
+  if ((${#STORAGE_DISKS[@]} == 0)); then
+    check PF12 info "no disk found under /var/storage"
+  elif ((${#missing[@]})); then
+    check PF12 info "no /dev/disk/by-id link for ${missing[*]}; the host records the kernel name, which can change across reboots"
+  else
+    check PF12 pass "storage disk(s) ${STORAGE_DISKS[*]} have by-id links"
+  fi
+
+  if ! have smartctl; then
+    check PF13 info "smartctl is not installed yet (PrepHost installs it)"
+    return
+  fi
+  for d in "${STORAGE_DISKS[@]}"; do
+    smart=$(run_root "smartctl-$d" smartctl -j -H "/dev/$d")
+    rc=$?
+    if grep -A2 '"smart_status"' <<<"$smart" | grep -Eq '"passed": *false'; then
+      failing+=("$d")
+    elif ((rc == 127)) || [[ -z $smart ]]; then
+      unknown+=("$d")
+    fi
+  done
+  if ((${#failing[@]})); then
+    check PF13 fail "SMART reports a failing disk: ${failing[*]}" "replace the disk"
+  elif ((${#unknown[@]})); then
+    check PF13 info "no SMART data for ${unknown[*]} (smartctl needs root)"
+  else
+    check PF13 pass "no failing disk"
+  fi
+}
+
+# As lib/byoh_health_probe.rb clock_ok?.
+pf14_clock() {
+  local cs virt
+  cs=$(rd /sys/devices/system/clocksource/clocksource0/available_clocksource)
+  virt=$(run_cmd virt systemd-detect-virt)
+  if [[ $ARCH == aarch64 ]]; then
+    if grep -qw arch_sys_counter <<<"$cs"; then
+      check PF14 pass "arch_sys_counter available"
+      return
+    fi
+  elif grep -qw tsc <<<"$cs"; then
+    check PF14 pass "tsc available"
+    return
+  elif grep -Eqw 'kvm-clock|hyperv_clocksource_tsc_page' <<<"$cs" && [[ -n $virt && $virt != none ]]; then
+    check PF14 pass "paravirtual clocksource on a $virt guest"
+    return
+  fi
+  check PF14 warn "clocksources '${cs% }' include no stable one; bin/monitor would mark the host down"
+}
+
+pf15_egress() {
+  local lists out rc url failed=() urls
+  lists=$(find "$R/var/lib/apt/lists" -maxdepth 1 -name '*_Packages' 2>/dev/null | head -1)
+  if [[ -z $lists ]]; then
+    check PF15-apt warn "the apt package lists are empty, so the packages could not be checked" "PrepHost runs apt-get update; or run it now"
+  else
+    # A simulation takes no dpkg or apt lock, as root too, so it neither
+    # waits for nor blocks cloud-init or unattended-upgrades.
+    out=$(run_cmd apt-get apt-get -s install "${PREP_PACKAGES[@]}")
+    rc=$?
+    if ((rc == 0)); then
+      check PF15-apt pass "the archive serves the PrepHost packages"
+    else
+      check PF15-apt fail "apt-get -s install failed: $(grep -m1 '^E:' <<<"$out")" "fix the apt sources, or run apt-get update"
+    fi
+  fi
+
+  local deb_arch=amd64
+  [[ $ARCH == aarch64 ]] && deb_arch=arm64
+  urls=("https://github.com/ubicloud/htcat/releases/download/v${HTCAT_VERSION}/htcat_${HTCAT_VERSION}_linux_${deb_arch}.tar.gz"
+    https://cloud-images.ubuntu.com "${URLS[@]}")
+  for url in "${urls[@]}"; do
+    run_cmd curl curl -sfIL --max-time 20 -o /dev/null "$url" >/dev/null || failed+=("$url")
+  done
+  if ((${#failed[@]})); then
+    check PF15-egress fail "cannot reach ${failed[*]}" "the host needs outbound HTTPS to GitHub release downloads (github.com and release-assets.githubusercontent.com) and the boot image mirrors"
+  else
+    check PF15-egress pass "reached ${#urls[@]} URL(s)"
+  fi
+}
+
+pf16_coexistence() {
+  local unit active
+  active=$(run_cmd systemctl-active systemctl is-active "${CONFLICTING_UNITS[@]}")
+  local i=0 states=()
+  mapfile -t states <<<"$active"
+  for unit in "${CONFLICTING_UNITS[@]}"; do
+    if [[ $unit == ufw ]]; then
+      # ufw.service is a oneshot that stays active even when it skipped
+      # loading rules; ENABLED in ufw.conf decides whether it loads them.
+      if grep -Eqi '^[[:space:]]*ENABLED[[:space:]]*=[[:space:]]*"?yes"?[[:space:]]*$' <<<"$(rd /etc/ufw/ufw.conf)"; then
+        check PF16-ufw fail "ufw is enabled (ENABLED=yes in /etc/ufw/ufw.conf); its firewall rules can conflict with the host's nftables rules" "ufw disable, or pass --accept-check PF16-ufw"
+      else
+        check PF16-ufw pass "ufw not enabled"
+      fi
+    elif [[ ${states[$i]:-} == active ]]; then
+      check "PF16-$unit" fail "$unit is active; its firewall rules can conflict with the host's nftables rules" "stop and disable $unit, or pass --accept-check PF16-$unit"
+    else
+      check "PF16-$unit" pass "$unit not active"
+    fi
+    i=$((i + 1))
+  done
+
+  if [[ -e $R/etc/pve ]] || have pveversion; then
+    check PF16-pve fail "this looks like a Proxmox node; point --ssh at the data-plane VM" "run the data plane in a VM on the node (docs/byoh/platforms/proxmox.md)"
+  else
+    check PF16-pve pass "not a Proxmox node"
+  fi
+
+  local user
+  if [[ -n $R ]]; then
+    user=$(grep '^rhizome:' "$R/etc/passwd" 2>/dev/null)
+  else
+    user=$(getent passwd rhizome </dev/null)
+  fi
+  if [[ -n $user ]]; then
+    check PF16-rhizome-user fail "a rhizome user exists; registration deletes it with its home directory" "use a host without a rhizome user"
+  else
+    check PF16-rhizome-user pass "no rhizome user"
+  fi
+}
+
+# As Prog::LearnPci#byoh_records: an NVIDIA device is used only when
+# every member of its IOMMU group is on vfio-pci, pci-stub, no driver, or
+# a PCI bridge.
+pf19_gpu() {
+  local out rc
+  out=$(run_cmd lspci lspci -vnmmk -D)
+  rc=$?
+  if ((rc == 127)); then
+    check PF19 info "lspci is not installed (PrepHost installs pciutils)"
+    return
+  fi
+  local blocked
+  blocked=$(awk -F'\t' '
+    function flush() {
+      if (slot != "" && group != "") {
+        n[group]++; s[group, n[group]] = slot; v[group, n[group]] = vendor
+        c[group, n[group]] = class; d[group, n[group]] = driver
+      }
+      slot = ""; group = ""; vendor = ""; class = ""; driver = ""
+    }
+    /^$/ { flush(); next }
+    $1 == "Slot:" { slot = $2 } $1 == "Vendor:" { vendor = $2 } $1 == "Class:" { class = $2 }
+    $1 == "Driver:" { driver = $2 } $1 == "IOMMUGroup:" { group = $2 }
+    END {
+      flush()
+      for (g in n) for (i = 1; i <= n[g]; i++) {
+        if (v[g, i] != "10de" || c[g, i] == "0604") continue
+        ok = 1
+        for (j = 1; j <= n[g]; j++) {
+          if (d[g, j] == "vfio-pci" || c[g, j] == "0604") continue
+          if (v[g, j] == "10de" || (d[g, j] != "" && d[g, j] != "pci-stub")) ok = 0
+        }
+        if (!ok) printf "%s ", s[g, i]
+      }
+    }' <<<"$out")
+  if [[ -n $blocked ]]; then
+    check PF19 info "NVIDIA device(s) ${blocked% } not passable to VMs (their IOMMU group is not all on vfio-pci); the host takes only non-GPU VMs" "bind the whole IOMMU group to vfio-pci (docs/byoh/platforms/own-hardware.md)"
+  else
+    check PF19 pass "no NVIDIA device held by a host driver"
+  fi
+}
+
+facts_network() {
+  local addr route keys=() f
+  addr=$(run_cmd ip-addr ip -j addr show)
+  route=$(run_cmd ip-route ip -j -4 route show default)
+  fact_json ip_addr "$addr"
+  fact_json ip_route "$route"
+  fact_str netplan "$(rd /etc/netplan/50-cloud-init.yaml)"
+
+  for f in "$R"/etc/ssh/ssh_host_*_key.pub; do
+    [[ -f $f ]] && keys+=("$(json_str "$(<"$f")")")
+  done
+  fact host_keys "[$(
+    IFS=,
+    echo "${keys[*]}"
+  )]"
+
+  # The settings a root login from the control plane gets. host= is the
+  # address too, as sshd sees it with the default UseDNS no; without it
+  # `Match Host` blocks are skipped. null when sshd -T fails (no sudo, a
+  # broken config), so that it never reads as the defaults.
+  local sshd rc
+  sshd=$(run_root sshd-T sshd -T -C "user=root,host=${CP_IP:-127.0.0.1},addr=${CP_IP:-127.0.0.1}")
+  rc=$?
+  if ((rc != 0)); then
+    fact sshd null
+  else
+    fact sshd "{$(grep -Ei '^(permitrootlogin|authenticationmethods|allowusers|denyusers|pubkeyauthentication) ' <<<"$sshd" |
+      while read -r k v; do printf '%s:%s,' "$(json_str "${k,,}")" "$(json_str "$v")"; done | sed 's/,$//')}"
+  fi
+
+  if ((STANDALONE)); then
+    local count
+    count=$(grep -o '"dst":"default"' <<<"$route" | wc -l)
+    if ((count == 1)); then
+      check default-route pass "one IPv4 default route"
+    else
+      check default-route fail "$count IPv4 default routes; the host needs exactly one uplink"
+    fi
+    if [[ -z $MAIN_IP ]]; then
+      check main-ip-local info "no --main-ip given"
+    elif grep -q "\"local\":\"$MAIN_IP\"" <<<"$addr"; then
+      check main-ip-local pass "$MAIN_IP is on this host"
+    else
+      check main-ip-local warn "$MAIN_IP is not on this host; fine only when it is a NAT address in front of it"
+    fi
+  fi
+}
+
+preflight() {
+  pf1_os
+  pf3_kvm
+  pf4_pdpe1gb
+  pf5_grub
+  pf6_pf7_memory
+  pf8_cpu
+  pf9_cgroup
+  pf10_storage
+  pf11_blank_disks
+  pf12_pf13_disks
+  pf14_clock
+  pf15_egress
+  pf16_coexistence
+  pf19_gpu
+  facts_network
+  if ((!JSON)); then
+    printf '%s\n' "${ROWS[@]}"
+  fi
+}
+
+# --- storage-disk ----------------------------------------------------
+
+STORAGE_DEVICES=/var/storage/devices
+# The block device commands storage-disk runs. In test mode each must be
+# a shim under the fixture root, so that no real disk is touched.
+SD_COMMANDS=(lsblk findmnt blkid wipefs swapon blockdev dd mkfs.ext4 chattr mount multipath udevadm systemctl)
+
+refuse() {
+  echo "ubicloud-host storage-disk: refused: $*" >&2
+  exit 1
+}
+
+say_sd() {
+  echo "storage-disk: $*"
+}
+
+# sd_resolve ID: sets SD_LINK (the by-id name) and SD_NAME (the kernel
+# name). An exact link name wins; otherwise ID must be the prefix of
+# exactly one whole-disk link.
+sd_resolve() {
+  local id=${1#/dev/disk/by-id/} dir=$R/dev/disk/by-id f n matches=()
+  [[ -n $id && $id != */* && $id != .* ]] || usage_error "--by-id takes a name from /dev/disk/by-id"
+  case $id in
+    dm-* | lvm-* | md-*) refuse "$id is a device-mapper, LVM or md link; give the by-id name of a whole disk" ;;
+  esac
+  if [[ -L $dir/$id ]]; then
+    matches=("$id")
+  else
+    for f in "$dir/$id"*; do
+      [[ -L $f ]] || continue
+      n=${f##*/}
+      [[ $n =~ -part[0-9]+$ || $n == dm-* || $n == lvm-* || $n == md-* ]] && continue
+      matches+=("$n")
+    done
+  fi
+  if ((${#matches[@]} == 0)); then
+    refuse "no /dev/disk/by-id link named $id"
+  elif ((${#matches[@]} > 1)); then
+    refuse "$id matches ${#matches[@]} links (${matches[*]}); give the full name"
+  fi
+  SD_LINK=${matches[0]}
+  SD_NAME=$(readlink "$dir/$SD_LINK") || internal_error "cannot read the link $SD_LINK"
+  SD_NAME=${SD_NAME##*/}
+  [[ $SD_NAME =~ ^[A-Za-z0-9._-]+$ ]] || internal_error "the link $SD_LINK points at an odd name ($SD_NAME)"
+}
+
+# The kernel names of the disks under the filesystem mounted at $1, or
+# nothing when $1 is not a mount point. Returns 1 when they cannot be
+# told.
+sd_disks_of_mount() {
+  local src majmin dev out line
+  read -r src majmin <<<"$(findmnt -nro SOURCE,MAJ:MIN --mountpoint "$1")" || true
+  [[ -z $src ]] && return 0
+  if [[ $majmin =~ ^[1-9][0-9]*:[0-9]+$ ]]; then
+    dev=/dev/block/$majmin
+  else
+    dev=${src%%\[*}
+  fi
+  out=$(lsblk -nPso NAME,TYPE "$dev" 2>/dev/null) || return 1
+  while read -r line; do
+    [[ $(kv TYPE "$line") == disk ]] && kv NAME "$line"
+  done <<<"$out"
+}
+
+# Ours already: an ext4 labelled ubi-diskN with its fstab line at
+# diskN. Mounts it when it is not mounted yet (a run cut short after the
+# fstab write). Returns 1 when the disk is not ours.
+sd_already_ours() {
+  local probe=$1 label uuid fstype n target mounts
+  label=$(sed -n 's/^LABEL=//p' <<<"$probe")
+  uuid=$(sed -n 's/^UUID=//p' <<<"$probe")
+  fstype=$(sed -n 's/^TYPE=//p' <<<"$probe")
+  [[ $label =~ ^ubi-disk([0-9]+)$ && $fstype == ext4 && -n $uuid ]] || return 1
+  n=${BASH_REMATCH[1]}
+  target=$STORAGE_DEVICES/disk$n
+  if ! awk -v u="UUID=$uuid" -v t="$target" '$1 == u && $2 == t { f = 1 } END { exit !f }' "$R/etc/fstab"; then
+    refuse "$SD_LINK carries the label $label but /etc/fstab does not mount UUID=$uuid at $target; either a run stopped before its fstab write, or the disk came from another host or lost its fstab line and may hold VM data. Mount it read-only to check before any wipefs -a /dev/$SD_NAME"
+  fi
+  mounts=$(lsblk -nro MOUNTPOINTS "/dev/$SD_NAME")
+  if [[ -z ${mounts//[[:space:]]/} ]]; then
+    mount "$target" || internal_error "mount $target failed"
+    mounts=$(lsblk -nro MOUNTPOINTS "/dev/$SD_NAME")
+  fi
+  grep -qxF "$target" <<<"$mounts" || refuse "$SD_LINK is ours ($label) but mounted at ${mounts//$'\n'/ }, not $target"
+  say_sd "$SD_LINK (/dev/$SD_NAME) is already set up"
+  say_sd "ok $target UUID=$uuid"
+  return 0
+}
+
+# sd_shared_transport TRAN: prints TRAN when it is a transport another
+# machine may share, nothing for a local one. lsblk (util-linux 2.39)
+# says nvme for every namespace, fabrics included, so for nvme the
+# controller's sysfs transport decides: the namespace's device, or the
+# controllers of its subsystem with native multipath. Anything but pcie
+# on all of them, or none found, counts as shared.
+sd_shared_transport() {
+  local f t found=0
+  case $1 in
+    iscsi | fc | fcoe) echo "$1" ;;
+    nvme)
+      for f in "$R/sys/block/$SD_NAME/device/transport" "$R/sys/block/$SD_NAME/device"/nvme*/transport; do
+        [[ -f $f ]] || continue
+        found=1
+        t=$(<"$f") || internal_error "cannot read $f"
+        if [[ $t != pcie ]]; then
+          echo "nvme-${t:-unknown}"
+          return
+        fi
+      done
+      ((found)) || echo "nvme-unknown"
+      ;;
+  esac
+}
+
+sd_refusals() {
+  local allow_shared=$1 dev=/dev/$SD_NAME m disks out rc line ss bytes hex tran swaps
+  for m in / /boot /boot/efi; do
+    if ! disks=$(sd_disks_of_mount "$m"); then
+      echo "ubicloud-host storage-disk: warning: cannot tell which disk holds $m; relying on the other checks" >&2
+    elif grep -qxF "$SD_NAME" <<<"$disks"; then
+      refuse "$SD_LINK is the disk of $m"
+    fi
+  done
+
+  out=$(lsblk -nPo NAME,TYPE,MOUNTPOINTS "$dev") || internal_error "lsblk $dev failed"
+  while read -r line; do
+    [[ -z $line ]] && continue
+    [[ $(kv TYPE "$line") == part ]] && refuse "$SD_LINK has partitions (/dev/$(kv NAME "$line"))"
+    [[ -n $(kv MOUNTPOINTS "$line") ]] && refuse "$SD_LINK is mounted (/dev/$(kv NAME "$line") at $(kv MOUNTPOINTS "$line"))"
+  done <<<"$out"
+
+  if compgen -G "$R/sys/block/$SD_NAME/holders/*" >/dev/null; then
+    refuse "$SD_LINK is held by $(cd "$R/sys/block/$SD_NAME/holders" && echo *) (LVM, md, multipath or dm-crypt)"
+  fi
+
+  swaps=$(swapon --show=NAME --noheadings --raw) || internal_error "swapon --show failed"
+  grep -qxF "$dev" <<<"$swaps" && refuse "$SD_LINK is in use as swap"
+
+  out=$(wipefs -n -i "$dev") || internal_error "wipefs -n $dev failed"
+  [[ -n ${out//[[:space:]]/} ]] && refuse "$SD_LINK carries a signature: $(head -1 <<<"$out")"
+
+  rc=0
+  out=$(blkid -p -o export "$dev") || rc=$?
+  if ((rc == 0)); then
+    refuse "$SD_LINK carries a signature: $(grep -E '^(TYPE|PTTYPE)=' <<<"$out" | tr '\n' ' ')"
+  elif ((rc != 2)); then
+    internal_error "blkid -p $dev failed (exit $rc)"
+  fi
+
+  # A GPT whose primary header is gone still has its backup in the last
+  # block, which neither probe above reports without a protective MBR.
+  ss=$(blockdev --getss "$dev") || internal_error "blockdev --getss $dev failed"
+  bytes=$(blockdev --getsize64 "$dev") || internal_error "blockdev --getsize64 $dev failed"
+  if ! [[ $ss =~ ^[1-9][0-9]*$ && $bytes =~ ^[0-9]+$ ]] || ((bytes < ss)); then
+    internal_error "odd size of $dev ($bytes bytes, $ss-byte blocks)"
+  fi
+  # od reads the whole block, so dd never sees a closed pipe and its
+  # status counts: a failed or short read is an error, not "no header".
+  hex=$(
+    dd if="$dev" bs="$ss" skip=$((bytes / ss - 1)) count=1 status=none | od -An -v -tx1 | tr -d ' \n'
+    st=("${PIPESTATUS[@]}")
+    [[ ${st[*]} == "0 0 0" ]]
+  ) || internal_error "cannot read the last block of $dev"
+  ((${#hex} == 2 * ss)) || internal_error "short read of the last block of $dev ($((${#hex} / 2)) of $ss bytes)"
+  # "EFI PART"
+  [[ ${hex:0:16} == 4546492050415254 ]] && refuse "$SD_LINK carries a backup GPT header in its last block"
+
+  tran=$(lsblk -ndro TRAN "$dev") || internal_error "lsblk -o TRAN $dev failed"
+  tran=$(sd_shared_transport "$tran")
+  if [[ -n $tran ]] || multipath -c "$dev" >/dev/null 2>&1; then
+    if ((allow_shared)); then
+      echo "ubicloud-host storage-disk: warning: $SD_LINK is shared storage (${tran:-multipath}); allowed by --allow-shared-transport" >&2
+    else
+      refuse "$SD_LINK is shared storage (${tran:-multipath}) another machine may write to; pass --allow-shared-transport if only this host uses it"
+    fi
+  fi
+}
+
+sd_still_blank() {
+  local out rc=0
+  out=$(wipefs -n -i "$1") || internal_error "wipefs -n $1 failed"
+  [[ -n ${out//[[:space:]]/} ]] && refuse "$SD_LINK gained a signature while being checked: $(head -1 <<<"$out")"
+  blkid -p -o export "$1" >/dev/null || rc=$?
+  ((rc == 2)) || refuse "$SD_LINK gained a signature while being checked (blkid exit $rc)"
+}
+
+# The next diskN no fstab line, mount or file uses. Caller holds the
+# fstab lock.
+sd_next_mount() {
+  local n=1 target
+  while :; do
+    target=$STORAGE_DEVICES/disk$n
+    if ! awk -v t="$target" '$1 !~ /^#/ && $2 == t { f = 1 } END { exit !f }' "$R/etc/fstab" &&
+      [[ -z $(findmnt -nro TARGET --mountpoint "$target") ]] &&
+      { [[ ! -e $R$target ]] || [[ -d $R$target && -z $(ls -A "$R$target") ]]; }; then
+      echo "$n"
+      return
+    fi
+    n=$((n + 1))
+  done
+}
+
+# sd_fstab_error TMP MESSAGE: drops the temporary fstab, leaving
+# /etc/fstab as it was.
+sd_fstab_error() {
+  rm -f "$1"
+  internal_error "$2"
+}
+
+storage_disk() {
+  local by_id=$1 allow_shared=$2 dev info probe rc n target label uuid tmp last
+  sd_resolve "$by_id"
+  dev=/dev/$SD_NAME
+  [[ -e $R/sys/block/$SD_NAME ]] || refuse "$SD_LINK points at $SD_NAME, which is not a whole disk"
+  info=$(lsblk -ndPo TYPE,SIZE,MODEL,SERIAL "$dev") || internal_error "lsblk $dev failed"
+  [[ $(kv TYPE "$info") == disk ]] || refuse "$SD_LINK is a $(kv TYPE "$info"), not a disk"
+  say_sd "$SD_LINK is /dev/$SD_NAME: $(kv SIZE "$info"), model '$(kv MODEL "$info")', serial '$(kv SERIAL "$info")'"
+
+  rc=0
+  probe=$(blkid -p -o export "$dev") || rc=$?
+  ((rc == 0)) && sd_already_ours "$probe" && return 0
+
+  sd_refusals "$allow_shared"
+
+  [[ -f $R/etc/fstab ]] || internal_error "/etc/fstab is missing"
+  exec 9<"$R/etc/fstab"
+  flock -w 60 9 || internal_error "cannot lock /etc/fstab"
+  # mke2fs looks for an existing filesystem only when it runs on a tty,
+  # so below it would overwrite one, -F or not. Probe again under the
+  # lock, just before.
+  sd_still_blank "$dev"
+  n=$(sd_next_mount)
+  target=$STORAGE_DEVICES/disk$n
+  label=ubi-disk$n
+
+  # An empty, immutable mount point: while the disk is missing, writes
+  # fail rather than fill the root filesystem.
+  mkdir -p "$R$target" || internal_error "mkdir $target failed"
+  chattr +i "$R$target" || internal_error "chattr +i $target failed"
+
+  trap '' HUP INT
+  mkfs.ext4 -q -L "$label" "$dev" || internal_error "mkfs.ext4 $dev failed"
+  udevadm settle >/dev/null 2>&1 || true
+  uuid=$(blkid -p -s UUID -o value "$dev") || internal_error "blkid cannot read the new filesystem on $dev"
+  [[ $uuid =~ ^[0-9a-fA-F-]+$ ]] || internal_error "odd UUID '$uuid' on $dev"
+  # Each step is checked on its own: a group's status is its last
+  # command's, and a failed cat would leave a file holding only our line.
+  tmp=$R/etc/.fstab.ubicloud-host.$$
+  last=$(tail -c 1 "$R/etc/fstab") || sd_fstab_error "$tmp" "cannot read /etc/fstab"
+  cat "$R/etc/fstab" >"$tmp" || sd_fstab_error "$tmp" "cannot copy /etc/fstab to $tmp"
+  if [[ -n $last ]]; then
+    echo >>"$tmp" || sd_fstab_error "$tmp" "cannot write $tmp"
+  fi
+  printf '# ubicloud-host storage-disk %s\nUUID=%s %s ext4 defaults,nofail 0 2\n' "$SD_LINK" "$uuid" "$target" >>"$tmp" ||
+    sd_fstab_error "$tmp" "cannot write $tmp"
+  [[ $(wc -l <"$tmp") -gt $(wc -l <"$R/etc/fstab") ]] || sd_fstab_error "$tmp" "$tmp came out shorter than /etc/fstab"
+  chmod --reference="$R/etc/fstab" "$tmp" || sd_fstab_error "$tmp" "cannot set the mode of $tmp"
+  mv -f "$tmp" "$R/etc/fstab" || sd_fstab_error "$tmp" "cannot replace /etc/fstab"
+  trap - HUP INT
+  exec 9<&-
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  mount "$target" || internal_error "mount $target failed; the fstab line is in place, so a re-run mounts it"
+  grep -qxF "$target" <<<"$(lsblk -nro MOUNTPOINTS "$dev")" || internal_error "$dev is not mounted at $target after mount"
+  say_sd "formatted $SD_LINK as ext4 ($label) and mounted it at $target"
+  say_sd "ok $target UUID=$uuid"
+}
+
+# test_root DIR: enters test mode when DIR or UBICLOUD_HOST_TEST_ROOT is
+# set, which needs both, alike.
+test_root() {
+  local fixture=$1
+  if [[ -n $fixture || -n ${UBICLOUD_HOST_TEST_ROOT:-} ]]; then
+    [[ $fixture == "${UBICLOUD_HOST_TEST_ROOT:-}" ]] ||
+      usage_error "test mode needs --fixture-root and UBICLOUD_HOST_TEST_ROOT set to the same directory"
+    [[ -d $fixture ]] || internal_error "fixture root $fixture is not a directory"
+    R=${fixture%/}
+  fi
+}
+
+storage_disk_main() {
+  local by_id="" allow_shared=0 fixture="" c
+  while (($#)); do
+    case $1 in
+      --allow-shared-transport) allow_shared=1 ;;
+      --by-id | --fixture-root)
+        (($# >= 2)) || usage_error "$1 needs a value"
+        if [[ $1 == --by-id ]]; then by_id=$2; else fixture=$2; fi
+        shift
+        ;;
+      *) usage_error "unknown argument $1" ;;
+    esac
+    shift
+  done
+  [[ -n $by_id ]] || usage_error "storage-disk needs --by-id"
+  test_root "$fixture"
+  if [[ -n $R ]]; then
+    for c in "${SD_COMMANDS[@]}"; do
+      [[ $(command -v "$c") == "$R/shim/$c" ]] || internal_error "test mode: $c is not the shim $R/shim/$c"
+    done
+  elif ((EUID != 0)); then
+    usage_error "storage-disk must run as root"
+  fi
+  storage_disk "$by_id" "$allow_shared"
+}
+
+main() {
+  exec </dev/null
+  local cmd=${1:-}
+  shift || true
+  local fixture=""
+  case $cmd in
+    version)
+      echo "ubicloud-host $VERSION"
+      return 0
+      ;;
+    storage-disk)
+      storage_disk_main "$@"
+      return
+      ;;
+    preflight) ;;
+    *) usage ;;
+  esac
+  while (($#)); do
+    case $1 in
+      --json) JSON=1 ;;
+      --standalone) STANDALONE=1 ;;
+      --nonce | --main-ip | --cp-ip | --boot-image-url | --images | --vm-disk-gib | --fixture-root)
+        (($# >= 2)) || usage_error "$1 needs a value"
+        case $1 in
+          --nonce) NONCE=$2 ;;
+          --main-ip) MAIN_IP=$2 ;;
+          --cp-ip) CP_IP=$2 ;;
+          --boot-image-url) URLS+=("$2") ;;
+          --images) IMAGES=$2 ;;
+          --vm-disk-gib) VM_DISK_GIB=$2 ;;
+          --fixture-root) fixture=$2 ;;
+        esac
+        shift
+        ;;
+      *) usage_error "unknown argument $1" ;;
+    esac
+    shift
+  done
+  [[ $IMAGES =~ ^[0-9]+$ ]] || usage_error "--images must be a number"
+  [[ $VM_DISK_GIB =~ ^[0-9]+$ ]] || usage_error "--vm-disk-gib must be a number"
+  [[ $NONCE =~ ^[A-Za-z0-9]*$ ]] || usage_error "--nonce must be alphanumeric"
+  [[ -z $MAIN_IP || $MAIN_IP =~ ^[0-9.]+$ ]] || usage_error "--main-ip must be an IPv4 address"
+  test_root "$fixture"
+  if [[ -z $NONCE ]]; then
+    NONCE=$(tr -d - </proc/sys/kernel/random/uuid 2>/dev/null) || internal_error "no random source"
+  fi
+  preflight
+}
+
+main "$@"

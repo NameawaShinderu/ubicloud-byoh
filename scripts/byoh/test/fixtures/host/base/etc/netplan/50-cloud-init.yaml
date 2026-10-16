@@ -1,0 +1,6 @@
+network:
+  version: 2
+  ethernets:
+    eno1:
+      addresses: [203.0.113.10/26]
+      routes: [{to: default, via: 203.0.113.1}]

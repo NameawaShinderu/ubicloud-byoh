@@ -1,0 +1,2 @@
+# fixture: Ubuntu installer LVM root; synthesised in the format util-linux 2.39.3 prints (UNVERIFIED)
+SOURCE="/dev/mapper/ubuntu--vg-ubuntu--lv" MAJ:MIN="252:0" FSTYPE="ext4"
