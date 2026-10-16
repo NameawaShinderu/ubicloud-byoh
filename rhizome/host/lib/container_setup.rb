@@ -211,7 +211,9 @@ class ContainerSetup
   # can move its monitor and the guest into lxc.monitor and lxc.payload
   # under the unit's cgroup, and a stop of the unit stops everything in
   # it. LXC's command socket is an abstract socket, which belongs to the
-  # VM's network namespace, so lxc-stop runs there too.
+  # VM's network namespace, so lxc-stop runs there too. When the guest
+  # shut down first (stop-vm's clean shutdown), lxc-stop finds nothing
+  # running and exits 2; the "-" keeps that from failing the unit.
   def unit(slice_name:)
     <<~UNIT
       [Unit]
@@ -226,7 +228,7 @@ class ContainerSetup
       Delegate=yes
       DelegateSubgroup=supervisor
       ExecStart=#{LXC_START} -F -n #{@vm_name} -P #{@lxc_path} -o #{lxc_log} -l WARN
-      ExecStop=#{LXC_STOP} -n #{@vm_name} -P #{@lxc_path} -t #{STOP_TIMEOUT_SECONDS}
+      ExecStop=-#{LXC_STOP} -n #{@vm_name} -P #{@lxc_path} -t #{STOP_TIMEOUT_SECONDS}
       TimeoutStopSec=#{STOP_TIMEOUT_SECONDS + 30}s
       Restart=no
       LimitNOFILE=500000
