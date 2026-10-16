@@ -67,6 +67,67 @@ RSpec.describe Prog::LearnVirt do
     end
   end
 
+  describe "on a container host" do
+    let(:vm_host) { create_byoh_vm_host(create_byoh_location, virt_tier: "container", family: "container") }
+    let(:no_virt) { {cpu_flags: %w[hypervisor pdpe1gb], dev_kvm: false, kvm_api: nil, modules: [], virt_vm: "kvm"} }
+
+    def kernel_page = Page.from_tag_parts("ByohKernelReboot", vm_host.ubid)
+
+    it "records when a pending reboot was first seen, and when it was probed" do
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**no_virt, reboot_required: true))
+      expect { lv.start }.to exit({"msg" => "virt tier none"})
+      record = vm_host.reload.virt_probe.to_h
+      expect(Time.now - Time.parse(record["reboot_required_since"])).to be < 60
+      expect(Time.now - Time.parse(record["probed_at"])).to be < 60
+      expect(kernel_page).to be_nil
+      expect(described_class.stale?(vm_host)).to be false
+    end
+
+    it "pages when the host has waited a week for a reboot, keeping the first sighting" do
+      since = (Time.now - 8 * 24 * 60 * 60).utc.iso8601
+      vm_host.update(virt_probe: Sequel.pg_jsonb({"reboot_required_since" => since}))
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**no_virt, reboot_required: true, kernel: "6.8.0-40-generic"))
+      expect { lv.start }.to exit({"msg" => "virt tier none"})
+      expect(vm_host.reload.virt_probe["reboot_required_since"]).to eq since
+      expect(kernel_page.summary).to eq "#{vm_host.ubid} has waited for a reboot since #{since}; its container guests share kernel 6.8.0-40-generic"
+      expect(kernel_page.details.to_h).to include("kernel" => "6.8.0-40-generic", "fix" => start_with("Drain the host"))
+    end
+
+    it "resolves the page once the reboot happened" do
+      Prog::PageNexus.assemble("old", ["ByohKernelReboot", vm_host.ubid], vm_host.ubid, resource_id: vm_host.id)
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**no_virt))
+      expect { lv.start }.to exit({"msg" => "virt tier none"})
+      expect(vm_host.reload.virt_probe.to_h).to include("reboot_required_since" => nil)
+      expect(kernel_page.resolve_set?).to be true
+    end
+
+    it "pages nothing without a pending reboot" do
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**no_virt))
+      expect { lv.start }.to exit({"msg" => "virt tier none"})
+      expect(kernel_page).to be_nil
+    end
+
+    it "records when a failed probe ran" do
+      expect(lv.sshable).to receive(:_cmd).and_return("ruby: not found")
+      expect { lv.start }.to exit({"msg" => "virt probe failed"})
+      expect(vm_host.reload.virt_probe.to_h.keys).to eq %w[error probed_at]
+    end
+  end
+
+  it "is stale without a probe time or after a day" do
+    expect(described_class.stale?(vm_host)).to be true
+    vm_host.update(virt_probe: Sequel.pg_jsonb({"probed_at" => (Time.now - 25 * 60 * 60).utc.iso8601}))
+    expect(described_class.stale?(vm_host)).to be true
+    vm_host.update(virt_probe: Sequel.pg_jsonb({"probed_at" => Time.now.utc.iso8601}))
+    expect(described_class.stale?(vm_host)).to be false
+  end
+
+  it "keeps a kvm host's record without probe times" do
+    expect(lv.sshable).to receive(:_cmd).and_return(probe_output(reboot_required: true))
+    expect { lv.start }.to exit({"msg" => "virt tier kvm"})
+    expect(vm_host.reload.virt_probe.to_h.keys).not_to include("probed_at", "reboot_required_since")
+  end
+
   it "fails open on output it cannot read: records it, pages once and pops" do
     expect(lv.sshable).to receive(:_cmd).and_return("ruby: not found")
     expect { lv.start }.to exit({"msg" => "virt probe failed"})

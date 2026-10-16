@@ -17,8 +17,27 @@
 # today's VMs, a lower-tier host must have its tier's prerequisites. The
 # page is raised on disagreement and resolved on agreement. HostNexus
 # holds a lower-tier host at verify_virt_tier until a probe agrees.
+#
+# On a lower-tier host the probe also runs once a day from HostNexus#wait
+# (stale?), and on a tier whose guests rely on the host kernel
+# (KERNEL_TIERS: containers share it, PVM guests run on its kvm_pvm) a
+# pending reboot (/var/run/reboot-required) that lasts REBOOT_GRACE pages
+# ByohKernelReboot, since every tenant shares that unpatched kernel. The
+# page resolves once the flag clears.
 class Prog::LearnVirt < Prog::Base
   subject_is :sshable, :vm_host
+
+  KERNEL_TIERS = %w[container pvm].freeze
+
+  REBOOT_GRACE = 7 * 24 * 60 * 60
+
+  PROBE_INTERVAL = 24 * 60 * 60
+
+  # Whether a lower-tier host's last probe is older than PROBE_INTERVAL.
+  def self.stale?(vm_host)
+    probed_at = vm_host.virt_probe&.[]("probed_at")
+    probed_at.nil? || Time.now - Time.parse(probed_at) >= PROBE_INTERVAL
+  end
 
   def self.assemble(vm_host_id)
     Strand.create(prog: "LearnVirt", label: "start", stack: [{"subject_id" => vm_host_id}])
@@ -29,13 +48,18 @@ class Prog::LearnVirt < Prog::Base
       ByohVirtLadder.parse(sshable.cmd("sudo host/bin/virt-probe --json"))
     rescue => e
       error = ByohVirtLadder.sanitize("#{e.class}: #{e.message}")
-      vm_host.update(virt_probe: Sequel.pg_jsonb({"error" => error}))
+      vm_host.update(virt_probe: Sequel.pg_jsonb({"error" => error, **probed_at}))
       page("the virtualization probe failed: #{error}", {error:, fix: "Check that rhizome is installed (vm_host.install_rhizome) and that ruby runs on the host, then bin/byoh-virt refresh --host #{vm_host.ubid}."})
       pop "virt probe failed"
     end
 
-    vm_host.update(virt_probe: Sequel.pg_jsonb(verdict.record))
     tier = vm_host.virt_tier
+    record = verdict.record.merge(probed_at)
+    if KERNEL_TIERS.include?(tier)
+      since = record["reboot_required_since"] = reboot_required_since(verdict)
+      check_kernel_reboot(since, verdict)
+    end
+    vm_host.update(virt_probe: Sequel.pg_jsonb(record))
     if ByohVirtTiers.accepts_probe?(tier, verdict)
       Page.from_tag_parts("ByohVirtTier", vm_host.ubid)&.incr_resolve
     elsif ByohVirtTiers.lower?(tier)
@@ -50,6 +74,30 @@ class Prog::LearnVirt < Prog::Base
     end
 
     pop "virt tier #{verdict.tier}"
+  end
+
+  # What a lower-tier host records of when it was probed (stale?); a KVM
+  # host's record stays as it was.
+  def probed_at
+    ByohVirtTiers.lower?(vm_host.virt_tier) ? {"probed_at" => Time.now.utc.iso8601} : {}
+  end
+
+  # When the host was first seen waiting for a reboot, kept across probes.
+  def reboot_required_since(verdict)
+    return unless verdict.report.dig("facts", "reboot_required")
+
+    vm_host.virt_probe&.[]("reboot_required_since") || Time.now.utc.iso8601
+  end
+
+  def check_kernel_reboot(since, verdict)
+    if since && Time.now - Time.parse(since) >= REBOOT_GRACE
+      kernel = verdict.report.dig("facts", "kernel")
+      Prog::PageNexus.assemble("#{vm_host.ubid} has waited for a reboot since #{since}; its #{vm_host.virt_tier} guests share kernel #{kernel}",
+        ["ByohKernelReboot", vm_host.ubid], vm_host.ubid, resource_id: vm_host.id,
+        extra_data: {kernel:, since:, fix: "Drain the host (its guests stop), reboot it into the updated kernel, then bin/byoh-virt refresh --host #{vm_host.ubid}."})
+    else
+      Page.from_tag_parts("ByohKernelReboot", vm_host.ubid)&.incr_resolve unless since
+    end
   end
 
   def page(summary, extra_data)
