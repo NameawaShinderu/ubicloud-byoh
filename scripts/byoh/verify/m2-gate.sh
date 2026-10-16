@@ -92,6 +92,18 @@ else
   GATE_CHECKS=${GATE_CHECKS:-bundle exec scripts/byoh/verify/m2-checks}
 fi
 read -ra CHECKS_CMD <<<"$GATE_CHECKS"
+
+# A BYOH tool of bin/: in the release through ubicloud-admin on a packaged
+# control plane, where there is no bundle on PATH, else from this checkout.
+tool() {
+  if [[ $GATE_SERVICES == systemd ]]; then
+    sudo ubicloud-admin run "$@"
+  else
+    local name=$1
+    shift
+    bundle exec "bin/$name" "$@"
+  fi
+}
 GATE_EXPECT_MONITOR=${GATE_EXPECT_MONITOR:-0}
 GATE_VM_A_EXPOSURE=${GATE_VM_A_EXPOSURE:-nat}
 
@@ -289,7 +301,7 @@ g3() {
   local a b c d out status
   IFS=. read -r a b c d <<<"$GATE_MAIN_IP"
   set +e
-  out=$(bundle exec bin/register-byoh-host --location "$GATE_LOCATION" --main-ip "$GATE_MAIN_IP" \
+  out=$(tool register-byoh-host --location "$GATE_LOCATION" --main-ip "$GATE_MAIN_IP" \
     --routed-network "$a.$b.$c.$((d & ~7))/29" --ssh-key "$GATE_HOST_KEY" --yes </dev/null 2>&1)
   status=$?
   set -e
@@ -467,15 +479,15 @@ g13() {
   need GATE_HOST
   mkdir -p "$GATE_STATE_DIR"
   local first=$GATE_STATE_DIR/export-1.yaml second=$GATE_STATE_DIR/export-2.yaml
-  bundle exec bin/byoh-pool export --host "$GATE_HOST" >"$first"
-  if bundle exec bin/byoh-pool annotate --host "$GATE_HOST" --pool-file "$first"; then
+  tool byoh-pool export --host "$GATE_HOST" >"$first"
+  if tool byoh-pool annotate --host "$GATE_HOST" --pool-file "$first"; then
     pass "annotate accepts the host's own export"
   else
     fail "annotate refused the host's own export"
   fi
-  bundle exec bin/byoh-pool export --host "$GATE_HOST" >"$second"
+  tool byoh-pool export --host "$GATE_HOST" >"$second"
   if cmp -s "$first" "$second"; then pass "annotate with the export changed nothing"; else fail "export changed: diff $first $second"; fi
-  if bundle exec bin/byoh-pool verify --host "$GATE_HOST"; then pass "byoh-pool verify"; else fail "byoh-pool verify"; fi
+  if tool byoh-pool verify --host "$GATE_HOST"; then pass "byoh-pool verify"; else fail "byoh-pool verify"; fi
   info "add and remove --drain need a spare address; run them by hand as VERIFY.md G13 describes"
 }
 
