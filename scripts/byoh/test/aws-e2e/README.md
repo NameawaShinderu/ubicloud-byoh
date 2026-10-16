@@ -16,7 +16,7 @@ nothing else. The run reuses an existing VPC, subnet and key pair.
 | ctrl | t3.large, EIP | M3 install.sh, production mode, ACME on `<eip>.sslip.io` |
 | kvm | m8i.2xlarge, nested virtualization, +50 GiB EBS, 2 secondary IPs, 1 EIP | L1 KVM host; M4 host add, `--storage-disk`, E1 canary, M2 gate |
 | ct | t3.xlarge (no nested), 1 secondary IP, 1 EIP | L2 detection on AWS; L3 system containers |
-| emu | t3.large (no nested), 1 secondary IP | L5 emulated |
+| emu | t3.xlarge (no nested; an emulated host needs 2 cores), 1 secondary IP | L5 emulated |
 | pvm | m6i.large (no nested) | L4 PVM go/no-go, `scripts/byoh/test/real/pvm-go-no-go.sh` |
 
 Data planes take no traffic from the internet (no host_guard yet, M7);

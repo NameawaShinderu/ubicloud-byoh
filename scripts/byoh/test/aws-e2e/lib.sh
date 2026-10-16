@@ -30,7 +30,7 @@ ROLE_TABLE=(
   "ctrl:t3.large:40:no:0:primary:0:none"
   "kvm:m8i.2xlarge:120:yes:2:secondary:50:data"
   "ct:t3.xlarge:100:no:1:secondary:0:data"
-  "emu:t3.large:60:no:1:none:0:data"
+  "emu:t3.xlarge:60:no:1:none:0:data"
   "pvm:m6i.large:60:no:0:none:0:none"
 )
 
