@@ -17,8 +17,11 @@
 # checks that each table is back as it was.
 #
 # Runs (each asserts its exit status and output):
-#   A  no /dev/kvm: add stops at preflight with PF3 "no /dev/kvm"; no
-#      host row, root's authorized_keys and sshd untouched
+#   A  no /dev/kvm: add stops at preflight with PF3 "no /dev/kvm" and
+#      the virtualization ladder's verdict; no host row, root's
+#      authorized_keys and sshd untouched
+#   A2 the same host with --virt-tier container --accept-fallback in a
+#      site that does not offer the tier: PF3-tier fails, nothing changed
 #   B  a /29 that holds the fakehost's uplink address: PF17 fails after
 #      the read-only login (docker logs show it), nothing changed
 #   C  ubicloud-host preflight over the operator's ssh on the
@@ -169,12 +172,23 @@ say "site $SITE created; hosts $ip and $ip2"
 before=$(host_state host)
 add --ssh "ubuntu@$ip" --routed-network 10.77.9.0/29 --yes
 expect_rc 1 "A"
-has A "^fail +PF3 +no /dev/kvm$"
+has A "^fail +PF3 +no /dev/kvm; ladder: "
 has A "preflight failed: .*nothing on the host was changed"
 lacks A "installed the registration key"
 [[ $(rows "$ip") == "0 0" ]] || fail "A: rows at $ip: $(rows "$ip")"
 [[ $(host_state host) == "$before" ]] || fail "A: root's authorized_keys or sshd_config.d changed"
-say "PASS A: no /dev/kvm stops add at PF3, nothing changed"
+say "PASS A: no /dev/kvm stops add at PF3 with the ladder's verdict, nothing changed"
+
+# --- A2: a lower tier the site does not offer ---------------------------------
+
+add --ssh "ubuntu@$ip" --routed-network 10.77.9.0/29 --virt-tier container --accept-fallback --yes
+expect_rc 1 "A2"
+has A2 "^fail +PF3-tier +location $SITE does not offer container hosts$"
+has A2 "^info +PF4 +not needed by a container host: "
+lacks A2 "installed the registration key"
+[[ $(rows "$ip") == "0 0" ]] || fail "A2: rows at $ip: $(rows "$ip")"
+[[ $(host_state host) == "$before" ]] || fail "A2: root's authorized_keys or sshd_config.d changed"
+say "PASS A2: --virt-tier container reaches preflight; PF3-tier refuses a site without the tier"
 
 # --- B: a pool that holds the uplink IP -----------------------------------
 
@@ -219,7 +233,7 @@ say "PASS C: PF8-hybrid fails and blocks on intel-hybrid, --accept-check PF8-hyb
 
 add --ssh "ubuntu@$ip" --routed-network 10.77.9.0/29 --skip-preflight --yes --no-wait
 expect_rc 0 "D"
-has D "^fail +PF3 +no /dev/kvm$"
+has D "^fail +PF3 +no /dev/kvm; ladder: "
 has D "warning: preflight failed, but --skip-preflight goes on"
 has D "sshd already lets root log in with a key; no drop-in written"
 has D "^pass +PF2 "

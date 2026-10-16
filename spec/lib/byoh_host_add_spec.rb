@@ -272,7 +272,8 @@ RSpec.describe ByohHostAdd do
       expect(Dir.exist?(key_dir)).to be false
 
       status, _, err = cli(*base, "--yes", "--skip-preflight", "--no-wait")
-      expect([status, err]).to eq [0, "warning: preflight failed, but --skip-preflight goes on\n"]
+      expect([status, err]).to eq [0, "warning: preflight failed, but --skip-preflight goes on\n" \
+        "note: the host was not probed (preflight was skipped); prep goes on, and Prog::LearnVirt pages there if the host cannot run VMs\n"]
       expect(host.provider.config["uplink_ip"]).to eq "203.0.113.10"
       expect(host.sshable.host_keys).to eq pinned
     end
@@ -572,10 +573,66 @@ RSpec.describe ByohHostAdd do
     end
   end
 
+  describe "virtualization tier" do
+    let(:container) { [*base, "--virt-tier", "auto", "--accept-fallback"] }
+
+    before do
+      ship_virt_tiers("container")
+      replies["sudo -n bash -s -- preflight"] = [preflight_fixture("no-kvm-container"), "", 0]
+    end
+
+    def offer_container = location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container], "acks" => {"container" => []}}))
+
+    it "adds a host without KVM on the lower tier prepare decided, in two phases" do
+      offer_container
+      status, out, err = cli(*container, "--yes", "--phase", "prepare")
+      expect([status, err]).to eq [0, ""]
+      expect(out).to match(/^pass +PF3 +container: none \(L3-L5\)/)
+      expect(out).to include "Virt tier: container (container (L3, experimental), accepted with --accept-fallback)\n"
+      expect(remote_commands.grep(/preflight/).first).to include "--boot-image-url https://cloud-images.ubuntu.com/releases/noble/"
+
+      expect(cli(*base, "--virt-tier", "container", "--accept-fallback", "--phase", "register", runner: nil, starter: nil))
+        .to eq [2, "", "! the arguments differ from those the host was prepared with; prepare it again with these\n"]
+      status, out, err = cli(*container, "--phase", "register", "--no-wait", runner: nil, starter: nil)
+      expect([status, err]).to eq [0, ""]
+      expect(out).to include "Registered host #{host.ubid}"
+      expect(host.values.slice(:virt_tier, :family)).to eq(virt_tier: "container", family: "container")
+      expect(host.strand.stack.last["default_boot_images"]).to eq ["ubuntu-noble-container"]
+      expect(DB[:byoh_operator_action].where(command: "register-byoh-host").first[:args]["virt"])
+        .to eq("declared" => "auto", "tier" => "container", "probe" => "none", "accepted_fallback" => true)
+
+      # A re-run resumes: the host's tier brings its boot images.
+      expect(cli(*container, "--no-wait")[0]).to eq 0
+      status, _, err = cli(*base, "--virt-tier", "kvm", "--no-wait")
+      expect(status).to eq 2
+      expect(err).to include "virt tier: registered container, given kvm"
+    end
+
+    it "refuses a lower tier without --accept-fallback before changing anything" do
+      offer_container
+      status, _, err = cli(*base, "--virt-tier", "container", "--yes")
+      expect(status).to eq 1
+      expect(err).to start_with("! refused: the probe found none (L3-L5)").and include("Pass --accept-fallback")
+      expect(remote_commands.grep(/ssh-ed25519/)).to be_empty
+      expect(Dir.exist?(key_dir)).to be false
+    end
+
+    it "fails preflight on a lower tier the site does not offer" do
+      status, out, _ = cli(*base, "--virt-tier", "container", "--accept-fallback", command: "preflight")
+      expect(status).to eq 1
+      expect(out).to match(/^fail +PF3-tier +location byoh-add does not offer container hosts$/)
+    end
+
+    it "takes an unknown tier as a usage error" do
+      expect(cli(*base, "--virt-tier", "tcg")).to eq [2, "", "! invalid argument: --virt-tier tcg is not one of kvm, auto, container, pvm, emulated\n"]
+    end
+  end
+
   describe "preflight" do
     it "checks the host read-only" do
       status, out, err = cli(*base, command: "preflight")
       expect([status, err]).to eq [0, ""]
+      expect(out).to include "Virt tier: kvm\n"
       expect(out).to include row("info", "PF2", "not run (no root key yet); sshd lets root log in with a key")
       expect(out).to end_with "Preflight passed; nothing on the host was changed.\n"
       expect(kinds).to eq ["sudo -n true", "uname -m; echo \"$SSH_CONNECTION\"", "script preflight"]

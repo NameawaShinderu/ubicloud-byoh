@@ -20,7 +20,9 @@ require "shellwords"
 #   2. Logs in as the operator, checks passwordless sudo, runs
 #      ubicloud-host preflight as root with the script on stdin, and
 #      cross-checks the host keys ssh met with the host's own
-#      /etc/ssh/ssh_host_*_key.pub.
+#      /etc/ssh/ssh_host_*_key.pub. The virtualization tier is decided
+#      from the same preflight (PF3, ByohVirtRegistration), as
+#      register-byoh-host decides it: --virt-tier, --accept-fallback.
 #   3. Shows what it will change and the host-key fingerprints, and
 #      needs --yes, --expect-host-key or a typed "yes". --expect-host-key
 #      is checked against the key ssh met, which only the real host can
@@ -206,6 +208,9 @@ class ByohHostAdd
   rescue ByohRegistration::ValidationError => ex
     @err.puts "! validation failed: #{ex.message}"
     1
+  rescue ByohVirtRegistration::Refused => ex
+    @err.puts "! refused: #{ex.message}"
+    1
   rescue Interrupt
     @err.puts "! interrupted"
     130
@@ -232,8 +237,9 @@ class ByohHostAdd
       p.on("--routed-network CIDR[,KEY=VALUE...]", "Address pool of the host, as for register-byoh-host (repeatable)") { o[:pools] << it }
       p.on("--pool-file FILE", "pools.yaml (version 2)") { o[:pool_file] = it }
       p.on("--ipv6-mode MODE", "gua or ula (default: derived from the IPv6 pool)") { o[:ipv6_mode] = it }
-      p.on("--default-boot-image NAME", "Boot image to download (repeatable; default: #{ByohRegistration::DEFAULT_BOOT_IMAGES.join(", ")})") { o[:default_boot_images] << it }
+      p.on("--default-boot-image NAME", "Boot image to download (repeatable; default: #{ByohRegistration::DEFAULT_BOOT_IMAGES.join(", ")}, or the first image of a lower --virt-tier)") { o[:default_boot_images] << it }
       p.on("--accept-check ID", "Accept an overridable failed check, such as PF8-hybrid (repeatable)") { o[:accept_checks] << it }
+      ByohVirtRegistration.add_options(p, o)
       if command == :add
         p.on("--registration-key FILE", "Unencrypted OpenSSH Ed25519 key the control plane keeps (default: generate one)") { o[:registration_key] = it }
         p.on("--storage-disk BYID", "Format this blank disk (a /dev/disk/by-id name) for VM storage (repeatable)") { o[:storage_disks] << it }
@@ -279,17 +285,27 @@ class ByohHostAdd
       raise OptionParser::InvalidArgument, "--expect-host-key takes a SHA256:... fingerprint, not #{fp}" unless fp.match?(%r{\ASHA256:[A-Za-z0-9+/]{43}\z})
     end
     o[:bmc]["verify_ssl"] = false if o[:bmc] && !o[:bmc]["verify_ssl"]
-    o[:default_boot_images] = ByohRegistration::DEFAULT_BOOT_IMAGES if o[:default_boot_images].empty?
+    # nil: ByohRegistration picks the default, which depends on the tier.
+    o[:default_boot_images] = nil if o[:default_boot_images].empty?
     ByohHostPreflight.validate_accept!(o[:accept_checks])
+    o[:virt] = begin
+      ByohVirtRegistration.new(declared: o[:virt_tier], accept_fallback: o[:accept_fallback], probe: o[:virt_probe] != false)
+    rescue ByohVirtRegistration::Refused => ex
+      raise OptionParser::InvalidArgument, ex.message
+    end
     o
   end
 
   def bmc(o) = (o[:bmc] ||= {"protocol" => "redfish"})
 
-  def registration(o, ssh_key_source: :generate)
-    ByohRegistration.new(main_ip: o[:main_ip], location: o[:site], pools: o[:pools], pool_file: o[:pool_file], ipv6_mode: o[:ipv6_mode],
+  # tier: the virtualization tier the host is registered on, when known;
+  # else the declared one, unless that is auto.
+  def registration(o, ssh_key_source: :generate, tier: o[:virt].declared)
+    reg = ByohRegistration.new(main_ip: o[:main_ip], location: o[:site], pools: o[:pools], pool_file: o[:pool_file], ipv6_mode: o[:ipv6_mode],
       ssh_key_source:, server_identifier: o[:server_identifier], bmc_config: o[:bmc], default_boot_images: o[:default_boot_images],
       uplink_ip: o[:uplink_ip])
+    reg.boot_images_for!(tier) unless tier == "auto"
+    reg
   end
 
   # Refuses to reach a host in the test environment unless specs injected
@@ -305,10 +321,12 @@ class ByohHostAdd
 
   def add(o)
     refuse_in_tests(@runner, @starter) unless o[:phase] == "register"
-    requested = registration(o).requested_config
     if (host = registered_host(o[:main_ip]))
-      return resume(o, host, requested)
+      # The boot images a host of its tier was registered with.
+      return resume(o, host, registration(o, tier: host.virt_tier).requested_config)
     end
+
+    requested = registration(o).requested_config
 
     prepare(o, requested) unless o[:phase] == "register"
     return 0 if o[:phase] == "prepare"
@@ -342,7 +360,7 @@ class ByohHostAdd
       ByohOperatorSsh.open(o[:ssh], port: o[:ssh_port], key: o[:ssh_key], runner: @runner || ByohOperatorSsh::OPEN3_RUNNER) do |ssh|
         @out.puts "Checking #{o[:ssh]} (preflight, read-only)"
         sudo!(ssh)
-        keys, cp_ip = host_preflight(ssh, reg, o, services, adding: true)
+        keys, cp_ip, decision = host_preflight(ssh, reg, o, services, adding: true)
         print_fingerprints(keys, ssh)
         expected!(o[:expect_host_keys], keys, ssh)
         confirm!(o, mutation_summary(ssh, o, site))
@@ -358,7 +376,8 @@ class ByohHostAdd
         rescue Interrupt
           raise Failure.new("interrupted\n  #{undo_hint(site, o[:main_ip])}", 130)
         end
-        write_state(site, o[:main_ip], requested, host_keys: keys.map(&:to_s), uplink_ip: reg.uplink_ip, gateway: reg.gateway)
+        write_state(site, o[:main_ip], requested, o[:virt], host_keys: keys.map(&:to_s), uplink_ip: reg.uplink_ip, gateway: reg.gateway,
+          virt: decision.record)
       end
     end
     @out.puts "Prepared #{o[:main_ip]} for site #{site}."
@@ -393,14 +412,15 @@ class ByohHostAdd
     raise Failure, "#{ssh.user} on #{ssh.host} cannot run sudo without a password; give it passwordless sudo (NOPASSWD), or use a user that has it"
   end
 
-  # Runs ubicloud-host preflight as root, verifies the host keys, and
-  # evaluates the report. Returns [host keys, the control plane's address
-  # as the host sees it].
+  # Runs ubicloud-host preflight as root, verifies the host keys,
+  # evaluates the report, and decides the virtualization tier from it.
+  # Returns [host keys, the control plane's address as the host sees it,
+  # the ByohVirtRegistration::Decision].
   def host_preflight(ssh, reg, o, services, adding:)
     facts = ssh.run("uname -m; echo \"$SSH_CONNECTION\"").stdout
     arch, connection = facts.lines.map(&:strip)
     cp_ip = connection.to_s.split(" ").first.to_s
-    script = read_host_script
+    script = ByohHostPreflight.script(read_host_script)
     result = ssh.run_script(script, ["preflight", *reg.host_script_args(@nonce, arch, connection)])
     report = if result.success?
       ByohHostPreflight.parse(result.stdout, @nonce)
@@ -411,7 +431,7 @@ class ByohHostAdd
     end
     keys = report.readable? ? ssh.verified_host_keys(report.host_keys) : host_keys_of(ssh)
     report.checks.unshift(pf2_stand_in(report.facts["sshd"], adding))
-    reg.evaluate_preflight(report, accept_checks: o[:accept_checks], services:, host_keys: keys)
+    reg.evaluate_preflight(report, accept_checks: o[:accept_checks], services:, host_keys: keys, virt: o[:virt])
     @out.print report.to_table
     if report.blocking?
       raise Failure, "preflight failed: fix the checks marked fail, or accept an overridable one with --accept-check; nothing on the host was changed" unless o[:skip_preflight]
@@ -419,7 +439,14 @@ class ByohHostAdd
       @err.puts "warning: preflight failed, but --skip-preflight goes on"
       reg.adopt_preflight(host_keys: keys, uplink_ip: report.uplink_ip, gateway: report.gateway)
     end
-    [keys, cp_ip]
+    # --skip-preflight decides as register-byoh-host does without
+    # preflight: on the declared tier, which LearnVirt checks at prep.
+    seen = report unless o[:skip_preflight]
+    decision = o[:virt].decide!(seen&.virt_verdict, location: reg.location, main_ip: o[:main_ip],
+      unprobed_reason: o[:virt].unprobed_reason(seen), boot_images: reg.default_boot_images)
+    decision.notes.each { @err.puts "note: #{it}" }
+    @out.puts "Virt tier: #{decision.tier}#{" (#{ByohVirtTiers.fetch(decision.tier).label}, accepted with --accept-fallback)" if ByohVirtTiers.lower?(decision.tier)}"
+    [keys, cp_ip, decision]
   end
 
   def read_host_script
@@ -558,12 +585,14 @@ class ByohHostAdd
     @out.puts "  #{result.stdout.lines.last.to_s.strip}"
   end
 
-  def args_digest(requested)
-    Digest::SHA256.hexdigest(JSON.generate(requested.merge(location: requested[:location].name)))
+  # Of the requested settings and the virtualization options, which
+  # the register phase must repeat as prepare got them.
+  def args_digest(requested, virt)
+    Digest::SHA256.hexdigest(JSON.generate(requested.merge(location: requested[:location].name, virt: [virt.declared, virt.accept_fallback, virt.probe_enabled])))
   end
 
-  def write_state(site, main_ip, requested, **state)
-    write_private("#{state_path(site, main_ip)}.new", JSON.generate(state.merge(args: args_digest(requested))))
+  def write_state(site, main_ip, requested, virt_options, **state)
+    write_private("#{state_path(site, main_ip)}.new", JSON.generate(state.merge(args: args_digest(requested, virt_options))))
     File.rename("#{state_path(site, main_ip)}.new", state_path(site, main_ip))
   end
 
@@ -592,12 +621,15 @@ class ByohHostAdd
     rescue SystemCallError, JSON::ParserError
       raise Failure, "#{o[:main_ip]} has not been prepared for site #{site} (no #{state_path(site, o[:main_ip])}); run add with --phase prepare (or all) first"
     end
-    raise Failure.new("the arguments differ from those the host was prepared with; prepare it again with these", 2) unless state["args"] == args_digest(requested)
+    raise Failure.new("the arguments differ from those the host was prepared with; prepare it again with these", 2) unless state["args"] == args_digest(requested, o[:virt])
 
-    reg = registration(o, ssh_key_source: path)
+    # The tier prepare decided, which an auto tier cannot repeat without
+    # the host.
+    virt = ByohVirtRegistration::Recorded.new(tier: state["virt"]["tier"], record: state["virt"])
+    reg = registration(o, ssh_key_source: path, tier: virt.tier)
     reg.validate!
     reg.adopt_preflight(host_keys: state["host_keys"], uplink_ip: state["uplink_ip"], gateway: state["gateway"])
-    strand = reg.register!
+    strand = reg.register!(virt:)
     FileUtils.rm_f([path, state_path(site, o[:main_ip])])
     host = VmHost[strand.id]
     @out.puts "Registered host #{host.ubid} in site #{site}."
@@ -617,7 +649,7 @@ class ByohHostAdd
     end
     raise Failure.new("host #{host.ubid} is being destroyed; add it again once it is gone", 2) if host.destroy_set?
 
-    diff = config_diff(host, requested)
+    diff = config_diff(host, requested, o[:virt])
     raise Failure.new("host #{host.ubid} is registered with other settings:\n  #{diff.join("\n  ")}", 2) unless diff.empty?
     unless o[:storage_disks].empty?
       raise Failure.new("host #{host.ubid} is registered already, and add formats storage disks only before it registers a host, " \
@@ -654,9 +686,12 @@ class ByohHostAdd
   end
 
   # How the registered host's settings differ from the requested ones.
-  def config_diff(host, requested)
+  def config_diff(host, requested, virt)
     stored = host.provider.config.to_h
     diff = []
+    unless ["auto", host.virt_tier].include?(virt.declared)
+      diff << "virt tier: registered #{host.virt_tier}, given #{virt.declared}"
+    end
     # Hosts registered before M2 keep legacy entries; compare them as
     # every other reader of the config sees them.
     networks = Array(stored["routed_networks"]).map { ByohPoolDeclaration.parse(it, legacy: true).to_config }

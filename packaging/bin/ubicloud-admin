@@ -15,7 +15,7 @@
 #   ubicloud-admin account list
 #   ubicloud-admin [--dev] site add NAME [--display TEXT] [--rates-from LOC] [--grant PROJECT]... [profile options]
 #   ubicloud-admin [--dev] site list|show|set|rates|grant|revoke|delete [NAME] [OPTIONS]
-#   ubicloud-admin [--dev] host add --site NAME --ssh USER@HOST [--ssh-key F] (--pool-file F | --routed-network CIDR ...)
+#   ubicloud-admin [--dev] host add --site NAME --ssh USER@HOST [--ssh-key F] (--pool-file F | --routed-network CIDR ...) [--virt-tier T [--accept-fallback]]
 #   ubicloud-admin [--dev] host preflight|watch|move-location|setup-egress-nat|export-audit|relearn-device-ids|relearn-pci ...
 #   ubicloud-admin [--dev] pool list|export|add|remove|remap|annotate|ipv6|verify|trace ...
 #   ubicloud-admin run TOOL [ARGS...]
