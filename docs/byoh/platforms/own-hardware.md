@@ -65,7 +65,7 @@ Menu names differ by vendor; these are the usual ones. UNVERIFIED on any specifi
 
 | Setting | Value | Why |
 |---|---|---|
-| Intel Virtualization Technology (VT-x) / AMD SVM Mode | **Enabled** | Without it there is no `/dev/kvm`, and the bootstrap stops with "/dev/kvm is missing" or "the CPU has neither the vmx nor the svm flag". On AMD the `svm` flag can stay visible while the firmware has it off; `bin/byoh-virt probe` and host preflight (PF3) read the kernel log ("SVM disabled (by BIOS)", "VMX ... disabled by BIOS") and says it is the firmware setting, not a missing module (kernel-log wording UNVERIFIED on real boards) |
+| Intel Virtualization Technology (VT-x) / AMD SVM Mode | **Enabled** | Without it there is no `/dev/kvm`, and the bootstrap stops with "/dev/kvm is missing" or "the CPU has neither the vmx nor the svm flag". On AMD the `svm` flag can stay visible while the firmware has it off; `bin/byoh-virt probe` and host preflight (PF3) read the kernel log ("SVM disabled (by BIOS)", "VMX ... disabled by BIOS") and say it is the firmware setting, not a missing module (kernel-log wording UNVERIFIED on real boards) |
 | VT-d / AMD-Vi / IOMMU | Not needed for normal VMs. Turn it on only to pass an NVIDIA GPU through. | For GPU VMs, turn the IOMMU on and bind every function of the GPU's IOMMU group to `vfio-pci` before registration (§2.1). A GPU left on `nouveau` or `nvidia` is not recorded, and the host serves only normal VMs. After binding it later, run `bin/byoh-host relearn-pci --host vh...`, as prep learns the GPUs only once. UNVERIFIED on real GPU hardware. |
 | Hyper-Threading / SMT | **Enabled** | §2.1 |
 | E-cores (hybrid Intel) | Disabled, if the board offers it | §2.1 |

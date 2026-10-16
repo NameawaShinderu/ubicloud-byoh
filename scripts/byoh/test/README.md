@@ -191,6 +191,19 @@ script, except on kvm64-class CPU models, which only the script refuses
 fixtures. Result (2026-10-15): 23 cases plus base, the guard and the
 live run pass in about 25 s, with nothing left behind.
 
+Since the no-kvm merge every case must also print the fact `virt`, the
+virtualization ladder's facts. `base/cmd/virt-probe` stands in for the
+probe's report (as `virt_probe.rb` prints it on a host with ruby), so
+the other cases inherit a working L1 host; `no-kvm`, `kvm64-*`,
+`arm-biglittle` and `amd-uniform` remove it and report the facts the
+script gathers in shell. `<case>/args` adds preflight arguments:
+`no-kvm-container` (a VM without hardware virtualization, with the
+container tier's commands) runs with `--virt-tier container`, so PF3,
+PF4, PF5 and PF7 are info. `spec/fixtures/byoh/preflight/old-script.txt`
+is `base.txt` without the `virt` fact, written by hand for the specs of a
+script that predates it. Result (2026-10-16): 24 cases plus base, the
+guard and the live run pass.
+
 ### Bootstrap preflight hook (WP11)
 
 ```
@@ -249,7 +262,8 @@ changed in place stops the restore with the table named.
 
 | Run | Asserts |
 |---|---|
-| A | No `/dev/kvm`: exit 1 at preflight with `fail PF3 no /dev/kvm`; no host row; root's `authorized_keys` and `sshd_config.d` unchanged |
+| A | No `/dev/kvm`: exit 1 at preflight with `fail PF3 no /dev/kvm; ladder: ...` (the virtualization ladder's verdict from the shell facts, since the fakehost has no ruby); no host row; root's `authorized_keys` and `sshd_config.d` unchanged |
+| A2 | The same host with `--virt-tier container --accept-fallback` in a site that does not offer the tier: exit 1 with `fail PF3-tier`, PF4 info; no host row, nothing changed |
 | B | A /29 holding the fakehost's own address (`--main-ip 192.0.2.10`, so registration's own main-IP check passes): exit 1 with PF17 "hands the uplink IP ... to VMs", after a read-only login that `docker logs` shows; no root login, no change. `spec/lib/byoh_host_add_spec.rb` covers an explicit `--uplink-ip` in a pool, which fails before any ssh |
 | C | `ubicloud-host preflight` on the `intel-hybrid` fixture, sent over the operator's ssh with sudo as add sends it: `ByohHostPreflight` reads PF8-hybrid as fail and blocking, and `accept(["PF8-hybrid"])` downgrades it to an accepted warn with no other fail |
 | D | `--skip-preflight --yes --no-wait` registers the host: one sshable and VmHost, `byoh?`, `uplink_ip` detected, boot images `ubuntu-noble`, `sshable.host_keys` equal to the host's `/etc/ssh/ssh_host_*_key.pub`, `pin_host_keys` in the HostNexus frame, `authorized_keys` keeping cloud-init's forced-command line and a comment next to the tagged key, no drop-in (Ubuntu's sshd already allows root key login), PF2 passed, the kept key deleted. A re-run says "Resuming" and adds nothing; a re-run with `--storage-disk` exits 2. Then `byoh-host watch --timeout 8` piped into a per-line timestamper: its first label line and its timeout line must arrive at least 5 s apart, so stdout is not block-buffered on a pipe |

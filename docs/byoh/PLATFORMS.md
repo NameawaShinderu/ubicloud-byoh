@@ -166,21 +166,26 @@ The networking contract checks (C1-C7, `host_guard`, inbound probes) are **not**
 
 The PF3 fix text is neutral ("enable hardware virtualization ... or nested virtualization with a host-passthrough CPU model"); the per-vendor hints are in [TROUBLESHOOTING.md](TROUBLESHOOTING.md#pf3).
 
-**PF3 delegation (the hook for M4, [no-kvm]).** PF3 does not keep its own KVM rule. It calls
-`ByohVirtLadder.preflight_check(facts, declared_tier:)` and prints its `status` (`pass`, `fail`, or `info`
-when a fact was not gathered), its `fix` as the fail hint and its `caveats` as INFO lines. The facts
-come from M4's own pinned SSH session: the probe script (`ByohVirtLadder.remote_script` piped to
-`ruby - --json`) or the shell-gathered keys listed in NO_KVM.md §2.3. The ladder refuses `kvm64`/`qemu64`
-CPU models as `kvm_blocked`, so PF3 and the ladder never disagree. For a host declared `container`,
-`pvm` or `emulated`, the KVM result becomes INFO, the PF-V row of that tier gates instead, and PF4,
-PF5 and PF7 (hugepages and GRUB) are skipped. Until M4 merges, registration runs the same check itself
-(`lib/byoh_virt_registration.rb`).
+**PF3 delegation (as built in the no-kvm merge).** PF3 does not keep its own KVM rule on the control
+plane. `ubicloud-host` reports the ladder's facts as the fact `virt`: the probe itself
+(`rhizome/host/lib/virt_probe.rb`, sent ahead of the script by `ByohHostPreflight.script` and run with
+the host's ruby), or, on a host without ruby, the same keys gathered in shell (no `/dev/kvm` ioctls; a
+parity spec keeps the lists equal). `ByohHostPreflight#evaluate` then sets PF3 to
+`ByohVirtLadder.preflight_check(facts, declared_tier:)`: the detail is the script's own words followed by
+`ladder: <tier> (<rung>) on <platform>: <reasons>`, the fix is the ladder's (the platform's fix and the
+fallbacks), and the caveats follow in the detail. For `kvm`, facts the shell could not gather leave the
+script's own status standing (so a working KVM host without ruby still passes). The ladder refuses
+`kvm64`/`qemu64` CPU models as `kvm_blocked`, cause `cpu_model`, so PF3 and the ladder never disagree.
+For a host declared `container`, `pvm` or `emulated` (or picked by `--virt-tier auto`), PF3 is the tier's
+readiness (PF-V1 below), `PF3-tier` checks that the location offers the tier, and PF4, PF5 and PF7
+(hugepages and GRUB) become info. `--no-virt-probe` leaves the facts unused and keeps the script's PF3.
 
 | # | Check | Where | Pass rule | Status when not met | Rule changes when | Derived from |
 |---|---|---|---|---|---|---|
 | PF1 | OS | host | Ubuntu `24.04`; `x86_64` or `aarch64` | fail | — | LearnOs; `prog/learn_cpu.rb` |
 | PF2 | Root SSH | control plane (`ByohRootProbe`) | root login with the registration key runs a command, host key matches the pin | fail | — | `bootstrap_rhizome` |
-| PF3 | KVM | host | `/dev/kvm` is a char device, a `vmx`/`svm` flag, and the CPU model is not kvm64-class (`kvm64`, `qemu64`, "Common KVM processor", "QEMU Virtual CPU") | fail, never acceptable | — | HW-4; `rhizome/host/lib/kvm_check.rb` |
+| PF3 | KVM | host facts, judged on the control plane | the ladder's verdict for the declared tier (above): for kvm, usable KVM with what cloud-hypervisor needs; the script alone checks `/dev/kvm`, a `vmx`/`svm` flag and a CPU model that is not kvm64-class (`kvm64`, `qemu64`, "Common KVM processor", "QEMU Virtual CPU") | fail, never acceptable | — | HW-4; `rhizome/host/lib/kvm_check.rb`; `lib/byoh_virt_ladder.rb` |
+| PF3-tier | Tier offered | control plane | a lower declared tier is shipped and the location offers and acknowledged it | fail, never acceptable | — | `lib/byoh_virt_tiers.rb` |
 | PF4 | 1G pages (x86) | host | `pdpe1gb` flag; always passes on aarch64 | fail | warn only on a `flexible` profile host [CMP-P1] | `prog/vm/host_nexus.rb` |
 | PF5 | GRUB | host | `/etc/default/grub` and `update-grub` | fail | — | `prog/setup_hugepages.rb` |
 | PF6 | RAM units | host (`sudo -n dmidecode`) | every size in kB/MB/GB/TB; `info` and MemTotal when dmidecode is missing or fails | fail on an unknown unit | — | `prog/learn_memory.rb` (a0259a997) |

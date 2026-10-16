@@ -82,7 +82,7 @@ What the user gets on each kind of machine, fastest option first:
 | Piece | File | What it does |
 |---|---|---|
 | Probe | `rhizome/host/lib/virt_probe.rb`, `rhizome/host/bin/virt-probe` | Read-only fact collector (report v2). It also classifies, for the on-host text output. It needs no gems, no rhizome and no Ruby newer than 3.0, so it can be piped to a fresh host. `--root DIR` reads a fixture tree instead of the machine (below). |
-| Ladder | `lib/byoh_virt_ladder.rb` | Parses a v1 or v2 report, **classifies the facts again** (never trusting the host's tier), maps the tier to a rung, matches the platform, and builds the fix, the cost hint, the caveats, the fallbacks and the recommendation. `preflight_check` is the M4 hook (section 2.3). |
+| Ladder | `lib/byoh_virt_ladder.rb` | Parses a v1 or v2 report, **classifies the facts again** (never trusting the host's tier), maps the tier to a rung, matches the platform, and builds the fix, the cost hint, the caveats, the fallbacks and the recommendation. `preflight_check` is M4's PF3 (section 2.3). |
 | Platforms | `lib/byoh_virt_platforms.rb` | Data table: DMI and `systemd-detect-virt` patterns, nested support, fix text, `cost_hint`, and per-platform `rules` (the AWS instance families). |
 | Record | `migrate/20261015_vm_host_virt_probe.rb` | `vm_host.virt_probe jsonb` holds the sanitised report plus the verdict, or `{"error": ...}` when the probe failed. |
 | Automatic probe | `prog/learn_virt.rb`; `prog/vm/host_nexus.rb` `prep` | BYOH hosts (`VmHost#byoh?`) probe at prep. A host off L1 gets a page (`ByohVirtTier`) carrying the fix; the page resolves when a later probe finds L1. **Fail-open:** any error is recorded, paged once, and the strand pops (section 10.5). |
@@ -274,45 +274,53 @@ Platform table changes (`lib/byoh_virt_platforms.rb`, SHIPPED):
 Rungs as printed: `kvm` L1, `kvm_blocked` L2, `container` (the data plane) refused, `unknown_permission`
 and `unknown` unknown, `none` and `pvm_blocked` L3-L5, `pvm` L4.
 
-### 2.3 Hook for M4's host preflight
+### 2.3 M4's host preflight (PF3), as merged
 
-M4 owns host preflight (`scripts/byoh/host/ubicloud-host`, `lib/byoh_host_preflight.rb`, PF3). The
-contract between them:
+M4 owns host preflight (`scripts/byoh/host/ubicloud-host`, `lib/byoh_host_preflight.rb`, PF3). Since
+the merge of M4 (2026-10-16) PF3 is the ladder's verdict (spec-covered and run on the container
+fixtures; not on real hardware, UNVERIFIED there):
 
-- **The hook (SHIPPED, WP3):** PF3 delegates the virtualization verdict to
-  `ByohVirtLadder.preflight_check(facts, declared_tier: "kvm")`, which returns
-  `{status:, tier:, rung:, platform:, checks:, fix:, caveats:}`:
-  - `status` is `"pass"`, `"fail"`, or `"info"` (passes, but some facts were not gathered).
-  - `checks` maps `kvm_device kvm_open kvm_create_vm kvm_capabilities cpu_model pdpe1gb firmware` to
-    `pass`, `fail`, `unknown` (not gathered) or `skip` (nothing to check). Use `fix` as PF3's fix text
-    and `caveats` as INFO lines.
-  - Two ways to get `facts`, both in M4's own pinned SSH session:
-    - pipe `ByohVirtLadder.remote_script` to `ruby - --json` (under `sudo -n` when not root) and take
-      the report's `"facts"`;
-    - or gather them in shell with the keys of `VirtProbe.facts`: `arch`, `cpu_model`, `cpu_flags`
-      (the subset `vmx svm hypervisor pdpe1gb`), `dev_kvm`, `modules`, `virt_vm`, `virt_container`,
-      `dmi`, and `bios_log` if M4 reads the kernel log.
-  - Facts a shell does not gather (the ioctl results, the capabilities) give `unknown` for that check,
-    never L2, and `status: "info"`; LearnVirt checks them at prep. For `bios_log`, a key present with
-    `nil` means "read the kernel log, found nothing", so leave the key out when the log was not read.
-  - The ladder applies M4's `kvm64`/`qemu64` refusal as `kvm_blocked`, cause `cpu_model`, so PF3 and the
-    ladder never disagree. The same function also refuses a missing `pdpe1gb`, which PF4 (hugepages)
-    would otherwise catch later.
-  - `declared_tier` other than `kvm` (`container`, `pvm`, `emulated`): the KVM verdict becomes an INFO
-    line (`"KVM: ..."`, followed by the KVM fix as advice), and the tier's own readiness decides. That
-    means `pass` when it is `ready`, `fail` with what to install when it is only `possible`, and
-    `info` when it is `unchecked` or the KVM tier is `unknown`. It fails, with a reason, on an L1 host
-    ("register it as kvm"), on a PVM host for another tier, in a container, without permission, or
-    when the kernel cannot run that tier. PF4 (hugepages) should be skipped for those tiers.
-    Registration uses this check (ByohVirtRegistration, SHIPPED in WP4).
-  - Where `KvmCheck` and the ladder still differ: `KvmCheck` checks only the character device and the
-    CPU flag, so it passes a host that the ladder refuses for a generic CPU model, a missing
-    capability, a refused `KVM_CREATE_VM` or a missing `pdpe1gb`. On a PVM host, `KvmCheck` refuses for
-    lacking `vmx`/`svm` and the ladder says `pvm`, which cannot take VMs yet.
-- **Expected merge conflicts with M4**, each planned as additive hunks: `bin/register-byoh-host`, the
-  registration files (section 11.4), `lib/byoh_location_cli.rb`, `model/vm_host.rb`,
-  `prog/vm/host_nexus.rb` (`assemble`, `prep`, `wait_prep`), `scheduling/allocator.rb`, PLATFORMS.md,
-  TROUBLESHOOTING.md, and `cache/schema.cache` (regenerate it; never merge the binary).
+- **Facts, in the preflight's own session.** `ubicloud-host preflight` prints the fact `virt`:
+  - `{"source":"probe","report":...}` when the host has ruby: the control plane sends
+    `virt_probe.rb` ahead of the script (`ByohHostPreflight.script`, a quoted heredoc in
+    `UBICLOUD_VIRT_PROBE`), and the script pipes it to `ruby - --json`. Every fact is there, the
+    `/dev/kvm` ioctls and cloud-hypervisor's capabilities included. Tried in a container with ruby
+    (the probe reported, the output parsed); never on a real host.
+  - `{"source":"shell","facts":...}` otherwise (a fresh Ubuntu has no ruby): `arch`, `kernel`,
+    `cpu_model`, `cpu_flags` (`vmx svm hypervisor pdpe1gb`), `dev_kvm`, `modules`, `virt_vm`,
+    `virt_container` (systemd-detect-virt), `dmi`, `pvm_module_available`, `cgroup2`, `apparmor`,
+    `commands`, `ovmf`, and the kernel log lines naming the BIOS as `bios_lines`, from which the
+    control plane takes `bios_log` with the probe's own rule (`VirtProbe.bios_line`); the key is left
+    out when neither journald nor dmesg could be read. `rhizome/host/spec/ubicloud_host_parity_spec.rb`
+    keeps the lists equal to the probe's. The ioctl results are missing, so those checks are
+    `unknown` and LearnVirt checks them at prep.
+- **The check.** `ByohHostPreflight#evaluate(virt_tier:)` sets PF3 to
+  `ByohVirtLadder.preflight_check(facts, declared_tier:)`:
+  - `kvm`: pass or fail on the ladder; the detail is the script's words plus
+    `ladder: <tier> (<rung>) on <platform>: <reasons>` and the caveats; the fix is the ladder's (the
+    platform's fix, then the fallbacks). Where the ladder only says `info` (facts not gathered), the
+    script's own status stands, so a working KVM host without ruby still passes and non-BYOH and KVM
+    hosts register as before.
+  - `container`, `pvm`, `emulated` (declared, or picked by `auto` from the same facts): the tier's
+    readiness decides PF3 (PF-V1), `PF3-tier` fails unless the tier is shipped and the location
+    offers and acknowledged it (with the `rates`/`set` commands as the fix), and PF4, PF5 and PF7 are
+    info. `ubicloud-host --virt-tier <tier>` gives the same info lines on the host itself, which
+    `bootstrap-data-plane.sh --tier` uses for its standalone preflight.
+  - `--no-virt-probe` leaves the facts unused: PF3 is the script's, and registration notes that the
+    host was not probed.
+- **The decision.** `register-byoh-host` and `byoh-host add` (`ubicloud-admin host add`) pass
+  preflight's verdict to `ByohVirtRegistration#decide!` (section 11.4); `--virt-tier`,
+  `--accept-fallback` and `--no-virt-probe` mean the same in both. `--skip-preflight` registers on the
+  declared tier with a note. `host add` keeps the decision in its state file between the prepare and
+  register phases, and puts the three options in the arguments digest, so the register phase cannot
+  change them.
+- The ladder applies M4's `kvm64`/`qemu64` refusal as `kvm_blocked`, cause `cpu_model`, so PF3 and the
+  ladder never disagree. It also refuses a missing `pdpe1gb` for `kvm`, which PF4 reports too.
+- Where `KvmCheck` (PrepHost) and the ladder still differ: `KvmCheck` checks only the character device
+  and the CPU flag, so it passes a host that the ladder refuses for a generic CPU model, a missing
+  capability, a refused `KVM_CREATE_VM` or a missing `pdpe1gb`. On a PVM host, `KvmCheck` refuses for
+  lacking `vmx`/`svm` and the ladder says `pvm`, which cannot take VMs yet.
+- The merge's conflicts and their resolutions are in the merge commit message.
 
 ## 3. L1 and nested virtualization
 
@@ -1299,21 +1307,22 @@ refuses the unshipped pvm and container before any `apt-get`; `--tier emulated` 
 container and emulated; the emulated additions of section 8.1 are UNVERIFIED); `--tier pvm` refuses without `kvm_pvm`;
 `auto` outside a checkout and bad arguments are refused. On a real VM without KVM it is UNVERIFIED.
 
-### 11.4 Where the registration code lives (M4 collision)
+### 11.4 Where the registration code lives
 
-SHIPPED (WP4). All logic is in `lib/byoh_virt_registration.rb`: `add_options(parser, options)`,
-`probe(main_ip, private_key)` (the probe piped to `ruby - --json` over `Util.rootish_ssh` as root with
-the registration key, after the operator confirmed the key is installed), `decide!(verdict, location:,
-main_ip:, unprobed_reason:)` (the matrix of section 11.2, built on `ByohVirtLadder.preflight_check`) and
-`recommended_commands`. `lib/byoh_registration_cli.rb` and `lib/byoh_registration.rb` got one isolated
-commit with the minimum hunks: register the options, probe and decide, pass `virt_tier:` to
-`assemble` and the decision to the operator log. On the M4 merge that commit is re-applied on top of
-M4's `#preflight`, which passes its pinned session's facts (`ByohVirtLadder.from_facts`) to `decide!`
-instead of a second SSH session.
+SHIPPED (WP4), rewired in the M4 merge. All logic is in `lib/byoh_virt_registration.rb`:
+`add_options(parser, options)`, `preflight_tier(facts)` (the tier PF3 judges: the declared one, or for
+`auto` what the facts say), `unprobed_reason(report)`, `decide!(verdict, location:, main_ip:,
+unprobed_reason:, boot_images:)` (the matrix of section 11.2, built on `ByohVirtLadder.preflight_check`)
+and `recommended_commands`. The verdict is the one host preflight built from its own facts
+(section 2.3), so no second SSH session opens; the separate `probe` over `Util.rootish_ssh` is gone.
+`ByohRegistration#evaluate_preflight(virt:)` judges PF3 for the tier and switches the default boot image
+to the tier's first image (`boot_images_for!`); `register!` passes `virt_tier:` to `assemble` and the
+decision to the operator log.
 
-A probe that fails (no ruby, SSH refused) does not block a `kvm` registration: it is printed as a note,
-and LearnVirt checks the host at prep, as before WP4. `auto` refuses without a probe; a declared lower
-tier is registered and then held at `verify_virt_tier` until a probe agrees.
+Without a verdict (`--skip-preflight`, `--no-virt-probe`, a generated key with `--yes`, or a script
+that reported no facts) a `kvm` registration goes on with a note, and LearnVirt checks the host at prep,
+as before WP4. `auto` refuses without a verdict; a declared lower tier is registered and then held at
+`verify_virt_tier` until a probe agrees.
 
 ### 11.5 After registration
 
@@ -1369,8 +1378,8 @@ Applies to every lower rung:
 | 7 | WP7 | PVM: the go/no-go script always; the tier only on a reported GO | L4-T1 GO, then L4-T2 | Script done, never run on a real host; no GO, so L4 is "detected, not offered" |
 | 8 | WP8 | Docs final: this file, EMULATED_HOSTS, PLATFORMS, the platform guides, TROUBLESHOOTING, COMPUTE, ROADMAP, CLAUDE.md | Every claim labelled; full gate | Done (the gate result is in the WP8 commit message) |
 
-Nothing on this branch is pushed or merged. The branch must merge after M4 or rebase onto it (section 2.3
-lists the expected conflicts); ROADMAP.md places it.
+M4 (`byoh-driver` 14c5ddad5) was merged into this branch on 2026-10-16, and PF3 now takes the ladder's
+verdict (section 2.3). Nothing is pushed; ROADMAP.md places the branch.
 
 Upgrading the live control plane follows the existing window (CLAUDE.md §8): stop the services;
 `pg_dump`; migrate (the `virt_probe` and `virt_tier` columns are additive, and their defaults keep

@@ -233,7 +233,8 @@ routed_networks:
 ```bash
 sudo ubicloud-admin host add --site <site> --ssh <user>@<host main IP> \
   --ssh-key <your login key> --pool-file pools.yaml \
-  [--registration-key ~/.ssh/byoh_data] [--storage-disk <by-id>] [--accept-check PF8-hybrid]
+  [--registration-key ~/.ssh/byoh_data] [--storage-disk <by-id>] [--accept-check PF8-hybrid] \
+  [--virt-tier kvm|auto|container|emulated [--accept-fallback]]
 ```
 
 (development: `packaging/bin/ubicloud-admin --dev host add ...` from `~/ubicloud`, without `sudo`.)
@@ -242,6 +243,8 @@ sudo ubicloud-admin host add --site <site> --ssh <user>@<host main IP> \
 2. It reads the host's SSH host keys over that login, shows them as SHA256 fingerprints with the list of changes, and asks for a typed `yes`. `--yes` skips the question; `--expect-host-key SHA256:...` (repeatable) checks the key ssh met instead, for scripts.
 3. It installs its registration key for root on a tagged line, and writes `/etc/ssh/sshd_config.d/05-ubicloud-root.conf` only if sshd does not already let root log in with a key. Then it logs in as root with that key, pinned to the host keys (PF2).
 4. It formats each `--storage-disk`, registers the host pinned to the host keys, and follows the bring-up (one reboot) until the host accepts VMs, then runs `pool verify`.
+
+**Without KVM.** PF3 gives the host's rung on the virtualization ladder and the platform's fix ([NO_KVM.md](NO_KVM.md)). To add a host that cannot run KVM on the experimental `container` or `emulated` tier, offer the tier in the site first (`site rates <site> --family <tier> --from standard --multiplier <X>`, `site set <site> --virt-tiers kvm,<tier> --accept <tier>`), then pass `--virt-tier <tier>` (or `auto`) and `--accept-fallback`. Preflight then checks the tier's packages instead of KVM and hugepages, and the host downloads the tier's own image (`ubuntu-noble-container` for `container`) unless `--default-boot-image` names one. `--no-virt-probe` leaves the ladder out of preflight.
 
 `--main-ip` defaults to the `--ssh` host when that is an IPv4 address; `--uplink-ip` names the uplink when there are several default routes; `--default-boot-image` (repeatable) replaces `ubuntu-noble`. Without `--registration-key` the key is generated and kept only in the database. Exit codes, resume and Ctrl-C: [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.3. `sudo ubicloud-admin host preflight` (same `--site`, `--ssh`, `--ssh-key` and pools) runs step 1 alone.
 
@@ -266,6 +269,7 @@ Other options: `--routed-network CIDR[,key=value...]` (inline pools, repeatable)
 - Any `fail` stops the command before anything is registered, for example no `/dev/kvm`, a kvm64-class CPU model, or a pool that holds the host's uplink IP or default gateway.
 - `--accept-check ID` (repeatable) accepts one of the few fails that are a choice rather than a defect: `PF8-hybrid`, `PF10-btrfs` and the `PF16-*` firewall services other than `PF16-pve` and `PF16-rhizome-user`. Any other ID is a usage error (exit 2).
 - `--skip-preflight` registers without checking.
+- `--virt-tier`, `--accept-fallback` and `--no-virt-probe` work as for `host add` (§8.1): the tier is decided from this preflight's facts, with no second login.
 - The host keys this login met are pinned, so the control plane's first root login during bring-up must meet the same key.
 - The uplink IP (the source address of the default route) is stored as `uplink_ip` in the host's provider config. `--uplink-ip IP` sets it instead, for a host with more than one default route. No pool may hand it to VMs.
 

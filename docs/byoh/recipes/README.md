@@ -89,7 +89,7 @@ root login you have already set up ([SETUP.md](../SETUP.md) §8.2).
 |---|---|---|
 | Ubuntu 24.04, x86_64 or aarch64 | LearnOs; only 24.04 takes VM slices | PF1 |
 | A login with passwordless `sudo` (`ubuntu` on cloud images) | `host add` runs preflight and installs its root key through it | `host add` step 2 |
-| `/dev/kvm` from real VT-x/AMD-V or nested virtualization, and a host-passthrough CPU model | No KVM, no VMs; a kvm64-class model hides `vmx`/`svm` and the CPU features x86-64-v2 guests need | PF3, never acceptable |
+| `/dev/kvm` from real VT-x/AMD-V or nested virtualization, and a host-passthrough CPU model | No KVM, no standard VMs (only the experimental lower tiers of [NO_KVM.md](../NO_KVM.md), with `--virt-tier` and `--accept-fallback`); a kvm64-class model hides `vmx`/`svm` and the CPU features x86-64-v2 guests need | PF3, never acceptable |
 | At least 2 online CPUs and about 16 GiB of memory | Hugepages and host CPUs | PF-min-cpu, PF7 |
 | `/var/storage` on ext4 or xfs | btrfs is UNVERIFIED (`PF10-btrfs`), ZFS is refused | PF10 |
 | Exactly one IPv4 default route, and only the main IP on the uplink | Pool addresses on the host's own NIC steal VM traffic (contract C5) | PF17 |

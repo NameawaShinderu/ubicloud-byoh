@@ -127,6 +127,8 @@ The control plane cannot log in as root with the registration key, or root's log
 
 Host preflight (`ubicloud-host preflight`, PLATFORMS.md PF3) fails PF3 for any of three reasons. Each reason needs its own fix, and accepting the failure is not possible (`--accept-check PF3` is refused). PrepHost applies the same rules after registration (`rhizome/host/lib/kvm_check.rb`). A spec runs both on the same fixture hosts.
 
+From the control plane (`host add`, `host preflight`, `register-byoh-host`) the PF3 line goes on with the virtualization ladder's verdict, `...; ladder: <tier> (<rung>) on <platform>: <why>`, and its `fix:` line is the ladder's: the platform's own fix (instance type, CPU type `host`, firmware setting) followed by the fallback tiers (NO_KVM.md). `kvm_blocked (L2)` means KVM can be switched on; `none (L3-L5)` means only a lower tier can run here. To use one: offer it in the site (`bin/byoh-location rates --family <tier> ...`, `set --virt-tiers kvm,<tier> --accept <tier>`), then add the host with `--virt-tier <tier>` (or `auto`) and `--accept-fallback`. On such a host PF3 checks the tier's readiness instead, `PF3-tier` says whether the site offers it, and PF4, PF5 and PF7 are info.
+
 | PF3 detail | Meaning |
 |---|---|
 | `no /dev/kvm` | The KVM module is not loaded. Either the firmware has VT-x/AMD-V off, or the machine is a VM without nested virtualization |
@@ -140,7 +142,7 @@ Fixes by platform, from the platform guides:
 - **Amazon EC2:** use a `.metal` instance, or m8i/c8i/r8i with nested virtualization (`data_plane_nested_virtualization = true` in `terraform/aws-byoh`).
 - **Google Cloud:** `--enable-nested-virtualization` on N2/C3 (UNVERIFIED).
 - **Microsoft Azure:** a size that supports nested virtualization, with security type Standard (UNVERIFIED).
-- **VPS without KVM:** not possible ([other-clouds-vps.md](platforms/other-clouds-vps.md) §1.3).
+- **VPS without KVM:** no standard VMs ([other-clouds-vps.md](platforms/other-clouds-vps.md) §1.3); the experimental `container` or `emulated` tier can run there (`--virt-tier auto --accept-fallback`, NO_KVM.md).
 
 #### PF4
 
