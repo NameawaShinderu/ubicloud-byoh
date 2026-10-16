@@ -543,7 +543,7 @@ The fork's `docs/byoh/deploy-scripts/` (06f359de4) and `SETUP_PROXMOX_LOWTIER.md
 
 ## 10a. Validated deployment: AWS with nested virtualization (2026-10-11)
 
-**Live environment now (2026-10-13):** the control plane runs `byoh-driver` 17d383a9c (M1 + M2, Ruby 4.0.7). The host is in BYOH location `byoh-aws-aps1` (`--ula48 fd1b:3821:6123::/48`), with `fabric`/`nat` pools carrying the EIPs. `BILLING_RATES_EXTRA_DIR=/home/ubuntu/ubicloud-billing-rates.d`. **The data-plane instance is stopped to save cost**; start it before any work. Window results are in VERIFY.md §5.
+**No live environment since 2026-10-15:** the long-lived AWS control plane and data plane were torn down to save cost (backups in `backups/teardown-20261015/`; the test VPC, subnet and key pair remain). Real-machine runs use `scripts/byoh/test/aws-e2e/` (`up.sh`, `ssh.sh`, `down.sh`; everything tagged `Project=ubicloud-byoh-test` and `E2E=<run>`), which creates throwaway instances in that VPC and removes them; run e2e1 (2026-10-16) is VERIFY.md §7. The 2026-10-13 window results are in VERIFY.md §5.
 
 The full flow was proven on non-metal EC2: register → `accepting` in about 4 minutes, VM create and destroy, host reboot recovery, Elastic IP ingress, egress, DNS, apt, and web login.
 
