@@ -23,12 +23,14 @@ class ByohHostWatch
   # download_boot_images, download_boot_images' deadline to reach
   # prep_reboot, and prep_reboot's deadline to reach wait, which
   # prep_hardware_reset replaces with its own when reboot fails over to
-  # a hardware reset. A host of a lower virtualization tier passes
+  # a hardware reset. wait_download_boot_images reaps into patch (an apt
+  # full-upgrade) on the way to prep_reboot, under the download's
+  # deadline. A host of a lower virtualization tier passes
   # verify_virt_tier in place of setup_hugepages, and verify_tier_capacity
   # in place of verify_hugepages (docs/byoh/NO_KVM.md).
   PHASES = {
     "bootstrap" => [600, %w[start install_host_os setup_ssh_keys bootstrap_rhizome check_ip_reachability prep wait_prep setup_hugepages verify_virt_tier setup_storage_backend]],
-    "boot image download" => [4 * 60 * 60, %w[download_boot_images wait_download_boot_images]],
+    "boot image download" => [4 * 60 * 60, %w[download_boot_images wait_download_boot_images patch]],
     "reboot" => [15 * 60, %w[prep_reboot reboot verify_spdk verify_hugepages verify_tier_capacity start_slices start_vms]],
     "hardware reset" => [20 * 60, %w[prep_hardware_reset hardware_reset]],
   }.freeze

@@ -91,6 +91,15 @@ RSpec.describe ByohHostWatch do
     expect(out.string).to include "! host #{host.ubid} is not accepting VMs after 1000 s (--timeout)"
   end
 
+  it "follows the bring-up through patch, which comes after the boot image download" do
+    strand.update(label: "wait_download_boot_images")
+    steps << -> { strand.update(label: "patch") }
+    steps << -> { strand.update(label: "prep_reboot") }
+    steps << -> { host.update(allocation_state: "accepting") }
+    expect(watch.run).to eq :accepting
+    expect(out.string).to include "host Vm::HostNexus.patch\n"
+  end
+
   it "stops at once on a host outside the bring-up that is not accepting" do
     strand.update(label: "wait")
     host.update(allocation_state: "draining")
