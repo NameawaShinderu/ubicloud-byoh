@@ -1,8 +1,14 @@
 # The virtualization ladder: fast first, emulation last
 
-Status: 2026-10-15, branch `no-kvm` (from `byoh-driver` 9e22d71ec plus the QEMU-TCG work), design
-revision 2. This document replaces [EMULATED_HOSTS.md](EMULATED_HOSTS.md) as the entry point for hosts
-without KVM. That file stays as the detailed reference for rung L5.
+Status: 2026-10-16, branch `no-kvm` (from `byoh-driver` 9e22d71ec plus the QEMU-TCG work), design
+revision 2, build plan WP1-WP8 done (section 15). Nothing is pushed or merged. This document replaces
+[EMULATED_HOSTS.md](EMULATED_HOSTS.md) as the entry point for hosts without KVM. That file stays as the
+detailed reference for rung L5.
+
+What is offered at the end of the plan, in one line per rung: L1 as today; L2 detected and refused
+with the fix; L3 `container` and L5 `emulated` registrable, experimental, opt-in per location, project
+and VM size; L4 `pvm` **detected, not offered** (its build waits for a GO from the L4-T1 script).
+Nothing below L1 has run on a real host yet (section 14).
 
 Labels used throughout:
 - **SHIPPED**: code on this branch, covered by the spec gate.
@@ -11,7 +17,8 @@ Labels used throughout:
   `ubi-q-*` container without `/dev/kvm` and without `--privileged`.
 - **SOURCE**: read in a cited document, with a confidence (high, medium, low). "From memory" means
   recalled, not checked against a document here.
-- **PLANNED**: specified in the build plan (section 15), not written yet.
+- **PLANNED**: specified, not written. After WP8 this covers only the PVM build (sections 6.7, 6.8,
+  waiting for an L4-T1 GO) and the items listed as "not built" in sections 5.5, 10.5 and 10.6.
 - **UNVERIFIED**: not executed anywhere. Every real-infrastructure test in section 14 is UNVERIFIED.
 
 Rung numbers changed in revision 2: the rungs are now ordered by **measured speed**, so system
@@ -1072,7 +1079,10 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
   (sanitised), pages once under the same `ByohVirtTier` tag, and pops with "virt probe failed". It never
   retries forever and never blocks `wait_prep`; a later probe that finds L1 resolves the page.
   `bin/byoh-virt show` prints "the last probe failed: ..." and exits 3.
-- It will page `ByohKernelReboot` per section 5.3 (PLANNED: WP5 did not build it, section 5.5; it only matters for container and PVM hosts). Page text is sanitised.
+- Not built: the `ByohKernelReboot` page of section 5.3 (WP5 left it out, section 5.5). Until it
+  exists, a container host's pending kernel update is recorded only as the probe fact
+  `vm_host.virt_probe["facts"]["reboot_required"]`; nothing pages or prints it. It matters only for
+  container and PVM hosts. Page text is sanitised.
 
 ### 10.6 What WP4 shipped, and where it differs from this plan
 
@@ -1179,14 +1189,20 @@ fix: Run the data plane on a VM or bare metal, not in a container.
 recommended: use a VM or bare metal as the data plane
 ```
 
-PLANNED (WP4): once fallback tiers can be registered, the recommendation becomes the exact commands:
+SHIPPED (WP4): `bin/register-byoh-host` refuses such a host with the probe's text, a `refused:` line
+and, when the fastest option is a shipped tier, the exact commands in the order they must run (`set`
+refuses a tier that has no rates yet). The format comes from `ByohVirtRegistration#refusal` and is
+spec-covered; the location and address here are examples:
 
 ```
-recommended:
-  bin/byoh-location set fsn-cloud --virt-tiers kvm,container --accept container
-  bin/byoh-location rates fsn-cloud --family container --from standard --multiplier <X>
+refused: <the probe's fix>
+to register it on its fastest option:
+  bin/byoh-location rates --location fsn-cloud --family container --from standard --multiplier <X>
+  bin/byoh-location set --location fsn-cloud --virt-tiers kvm,container --accept container
   bin/register-byoh-host --location fsn-cloud --main-ip 203.0.113.10 ... --virt-tier auto --accept-fallback
 ```
+
+The two `bin/byoh-location` lines are left out when the location already offers the tier.
 
 ### 11.2 At registration (SHIPPED, WP4)
 
@@ -1194,13 +1210,16 @@ Flags on `bin/register-byoh-host`:
 - `--virt-tier kvm|auto|container|pvm|emulated`. The default is `kvm`, so today's commands behave as
   today on an L1 host; a non-L1 host is refused, now with the fix and a recommended command line.
 - `--accept-fallback`: required whenever the resulting tier is not `kvm`, including through `auto`.
-- `--install-pvm-kernel`: only if WP7 goes ahead.
+- `--install-pvm-kernel`: not built (WP7 stopped at the go/no-go script). Since `pvm` is not in
+  `ByohVirtTiers::SHIPPED`, `--virt-tier pvm` (and `auto` on a PVM host) is refused with "pvm hosts
+  are not available yet"; the `pvm` column of the matrix below describes the design after a GO.
 - `--no-virt-probe`: skip the pre-registration probe; LearnVirt checks at prep. A lower-tier host
   waits at `verify_virt_tier` until a probe agrees with its tier. A `kvm` host is not held: LearnVirt
   fails open, prep goes on, and LearnVirt pages with the fix if the host cannot run VMs (PrepHost
   then refuses a host without KVM as before).
 - The location must already allow the tier. Otherwise the message prints the exact
-  `bin/byoh-location set <loc> --virt-tiers kvm,<tier> --accept <tier>` command.
+  `bin/byoh-location rates --location <loc> --family <tier> ...` and
+  `bin/byoh-location set --location <loc> --virt-tiers kvm,<tier> --accept <tier>` commands.
 - A refusal prints the commands that would register the host on its fastest option only when that
   option can be registered: never for a tier missing from `ByohVirtTiers::SHIPPED`, whose text
   says instead that fallbacks cannot be registered yet.
@@ -1274,11 +1293,11 @@ tier is registered and then held at `verify_virt_tier` until a probe agrees.
 
 - `bin/byoh-virt show --host vh...` prints both the declared tier and the latest probe.
 - A `ByohVirtTier` page opens when the probe disagrees with the declared tier, and resolves when they agree.
-- `bin/byoh-virt refresh --host vh...` (or `--all`, PLANNED) re-probes.
+- `bin/byoh-virt refresh --host vh...` (or `--all`, every BYOH host with rhizome installed) re-probes (SHIPPED).
 
 ## 12. Security policy, labels and billing per rung
 
-| Rung | Customer label (UI and API family description) | Default tenancy | Location acks (`bin/byoh-location set --accept`) | Hard refusals |
+| Rung | Label (`ByohVirtTiers` description) | Default tenancy | Location acks (`bin/byoh-location set --accept`) | Hard refusals |
 |---|---|---|---|---|
 | L1 | as today | as today | — | — |
 | L3 `container` | "System container: shared host kernel, near-native speed. Not a VM." | One project per location | `container`; options `container:multitenant` (needs whole-core cpusets or SMT off; refused until that is checked, section 10.6), `container:unencrypted-disk`, `container:nested-userns`, `container:guest-firewall` | Host sysctl checks fail; `dir` driver without `prjquota` (any location) |
@@ -1287,8 +1306,12 @@ tier is registered and then held at `verify_virt_tier` until a probe agrees.
 
 Applies to every lower rung:
 - Its families and sizes are separate (`Option::TierVmSizes`) and never chosen implicitly.
-- The VM overview shows the label as a badge with a tooltip.
-- Rates: `bin/byoh-location rates <loc> --family F --from standard --multiplier X` (X is required).
+- The label is the tier's description in `ByohVirtTiers`. As shipped, operators see it when
+  `bin/byoh-location set` asks for `--accept` and when registration asks for `--accept-fallback`, and
+  `bin/byoh-location show` prints `<tier> (<rung>, experimental)`; customers see the size name
+  (`container-2`, `emulated-2`) and the API's refusals. A badge with a tooltip in the UI is PLANNED,
+  not built, and the web form offers no lower-tier size (section 10.6).
+- Rates: `bin/byoh-location rates --location <loc> --family F --from standard --multiplier X` (X is required).
   `byoh-location set` refuses to add a tier without rates, and `Validation.validate_billing_rate` in
   `Prog::Vm::Nexus.assemble` refuses a VM whose family has no rate in its location. Rates follow the
   `resource_name` rule in POOL_OPERATIONS.md. Container rates may be lower than `standard` (about 35 MB
@@ -1298,17 +1321,20 @@ Applies to every lower rung:
 
 ## 13. Rollout
 
-| Phase | WP | What changes for whom | Gate to move on |
-|---|---|---|---|
-| 0 | done | BYOH hosts are probed at prep; a page explains a host without KVM | SHIPPED, full spec gate green |
-| 1 | WP1 | This document | — |
-| 2 | WP2 | The QEMU-KVM-without-hugepages unit returns to its 9e22d71ec form; goldens for every L1 output | Full gate; `git diff 9e22d71ec` over the golden directories shows only added files |
-| 3 | WP3 | Detection v2: the probe identifies more causes, prints a recommended plan, `refresh --all` back-fills | L1-T1, L2-T1..T3 (section 14) on at least one cloud |
-| 4 | WP4 | `virt_tier` and the location policy; every existing host becomes `kvm` by the column default; registration refuses with the plan | Full gate; goldens unchanged; an upgrade rehearsal on a copy of the live DB |
-| 5 | WP5 | `container` tier, experimental | The lab harness (dir driver); L3-T1 on a real Ubuntu 24.04 host (crypt-loop, AppArmor, lxcfs, escape probes) before the family is granted outside the operator's own org |
-| 6 | WP6 | `emulated` tier end to end, experimental (SHIPPED, section 8.1) | The L5 harness (written, not run here: it needs a throwaway VM) and L5-T1 |
-| 7 | WP7 | PVM: the go/no-go script always; the tier only on a reported GO | L4-T1 GO, then L4-T2 |
-| 8 | WP8 | Docs final | Every claim labelled; full gate |
+| Phase | WP | What changes for whom | Gate to move on | State (2026-10-16) |
+|---|---|---|---|---|
+| 0 | done | BYOH hosts are probed at prep; a page explains a host without KVM | SHIPPED, full spec gate green | Done |
+| 1 | WP1 | This document | — | Done |
+| 2 | WP2 | The QEMU-KVM-without-hugepages unit returns to its 9e22d71ec form; goldens for every L1 output | Full gate; `git diff 9e22d71ec` over the golden directories shows only added files | Done, gate green |
+| 3 | WP3 | Detection v2: the probe identifies more causes, prints a recommended plan, `refresh --all` back-fills | L1-T1, L2-T1..T3 (section 14) on at least one cloud | Code done, spec gate green; the real-cloud gate is UNVERIFIED (not run) |
+| 4 | WP4 | `virt_tier` and the location policy; every existing host becomes `kvm` by the column default; registration refuses with the plan | Full gate; goldens unchanged; an upgrade rehearsal on a copy of the live DB | Code done, gate green, goldens unchanged; the rehearsal on a live DB copy is UNVERIFIED (not run) |
+| 5 | WP5 | `container` tier, experimental | The lab harness (dir driver); L3-T1 on a real Ubuntu 24.04 host (crypt-loop, AppArmor, lxcfs, escape probes) before the family is granted outside the operator's own org | Code done, gate green; the lab ran once before its safety rules were tightened (section 5.5); L3-T1 UNVERIFIED |
+| 6 | WP6 | `emulated` tier end to end, experimental (SHIPPED, section 8.1) | The L5 harness (written, not run here: it needs a throwaway VM) and L5-T1 | Code done, gate green; `run.sh l5` and L5-T1 UNVERIFIED |
+| 7 | WP7 | PVM: the go/no-go script always; the tier only on a reported GO | L4-T1 GO, then L4-T2 | Script done, never run on a real host; no GO, so L4 is "detected, not offered" |
+| 8 | WP8 | Docs final: this file, EMULATED_HOSTS, PLATFORMS, the platform guides, TROUBLESHOOTING, COMPUTE, ROADMAP, CLAUDE.md | Every claim labelled; full gate | Done (the gate result is in the WP8 commit message) |
+
+Nothing on this branch is pushed or merged. The branch must merge after M4 or rebase onto it (section 2.3
+lists the expected conflicts); ROADMAP.md places it.
 
 Upgrading the live control plane follows the existing window (CLAUDE.md §8): stop the services;
 `pg_dump`; migrate (the `virt_probe` and `virt_tier` columns are additive, and their defaults keep
@@ -1351,8 +1377,8 @@ ssh ubuntu@$IP 'sudo apt-get install -y ruby' && bin/byoh-virt probe --main-ip $
 
 ```bash
 # L3-T1 a real Ubuntu 24.04 host (any cloud VM without nested), after WP5:
-bin/byoh-location set $LOC --virt-tiers kvm,container --accept container
-bin/byoh-location rates $LOC --family container --from standard --multiplier 1
+bin/byoh-location rates --location $LOC --family container --from standard --multiplier 1
+bin/byoh-location set --location $LOC --virt-tiers kvm,container --accept container   # refused before the rates exist
 bin/register-byoh-host --location $LOC --main-ip $IP ... --virt-tier auto --accept-fallback   # expect: container chosen and printed
 # Create a container-2 VM, then on the host:
 sudo aa-status | grep -c lxc-container-default            # >= 1: AppArmor confines it
@@ -1376,7 +1402,8 @@ python3 -c 'import ctypes,os; l=ctypes.CDLL(None,use_errno=True); r=l.syscall(56
                                                            # "-1 ...": clone (syscall 56) with CLONE_NEWUSER is denied
 sudo nft list ruleset; echo $?                             # != 0 (no guest firewall without the ack)
 ls /dev/kvm /dev/fuse /dev/sda 2>&1 | grep -c 'No such'    # 3
-# Two containers of two projects (multitenant ack) must not see each other's processes, files or traffic.
+# Two containers of two projects must not see each other's processes, files or traffic. This needs
+#   container:multitenant, which is refused until its host checks exist (section 10.6), so it waits for them.
 # Speed: the section 5.1 set, on crypt-loop and on dir, compared with the host.
 ```
 
@@ -1570,13 +1597,13 @@ for every container it creates:
 
 A WP may add fixtures but never edit these.
 
-### WP1: this document (docs only)
+### WP1: this document (docs only) (DONE)
 
 The revised ladder: renumbered by speed, research and citations kept, measurements, cost table, PVM
 lifecycle, gVisor rejected, registration matrix, security table, M4 hook, tests, build plan, critique
 dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 
-### WP2: U1 repair, goldens first
+### WP2: U1 repair, goldens first (DONE)
 
 1. Goldens from 9e22d71ec, no code change, generated from a `git worktree` of 9e22d71ec:
    `qemu_kvm_nohugepages.service`; `params_json_qemu_gpu.json` (the B200/B300 path in
@@ -1610,7 +1637,7 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 - Result: shipped as section 2.1 describes, with the differences of section 2.2. Gate and harness
   results are in the WP3 commit message.
 
-### WP4: the tier framework
+### WP4: the tier framework (DONE)
 
 - The migration (section 10.1) with the schema cache and annotations; `lib/byoh_virt_tiers.rb`;
   `Option::TierVmSizes`; `Validation.validate_vm_size(extra_families:)`; the policy gate; R2 in
@@ -1631,7 +1658,7 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 - Done: the full gate; goldens unchanged; in a spec, `wait_prep` of a kvm BYOH host with a crashing
   probe still reaches `setup_hugepages`.
 
-### WP5: L3 system containers
+### WP5: L3 system containers (DONE; real-host checks UNVERIFIED)
 
 - 5a rhizome: `container_setup.rb` (lifecycle, the idmap slot allocator, the root-owned config dir, the
   seed bind mount, cgroup dirs, seccomp/AppArmor/caps config), `container_net.rb` (the veth hook reusing
@@ -1649,7 +1676,7 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 - Done: the full gate and the harness; crypt-loop, AppArmor, lxcfs and the sysctl checks marked
   UNVERIFIED; the family experimental.
 
-### WP6: L5 emulated hookup (slim)
+### WP6: L5 emulated hookup (slim) (DONE; lab and real host UNVERIFIED)
 
 - The family and sizes in `TierVmSizes`, the policy gate rows, the `verify_tier_capacity` budget, the
   30-minute deadline and 180 s soft stop, refusal of the CH and firmware downloads on emulated hosts,
@@ -1658,7 +1685,7 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 - Harness `run.sh l5`: SSH within 420 s, `query-kvm` false, symlink and chown-race probes, delete twice.
 - Done: the full gate and the harness; the family experimental.
 
-### WP7: PVM, go/no-go first (blocked on L4-T1)
+### WP7: PVM, go/no-go first (script DONE; build blocked on L4-T1)
 
 Status 2026-10-15: the "always" part is SHIPPED (the script, `spec/lib/byoh_virt_tiers_pvm_spec.rb`,
 section 14). No GO has been reported, so the build below has not started and L4 is
@@ -1674,7 +1701,7 @@ section 14). No GO has been reported, so the build below has not started and L4 
   refusals, lifecycle pages. Optional: `run.sh pvm-hostside` (about 140 MB, disk-checked).
 - On NO-GO, or no report: stop after the script and the docs; L4 is "detected, not offered".
 
-### WP8: docs and final gate
+### WP8: docs and final gate (DONE)
 
 - This file: each PLANNED becomes SHIPPED or VERIFIED as it lands. EMULATED_HOSTS.md: a header pointer,
   and its `accel` plan marked superseded by section 10.
@@ -1686,6 +1713,11 @@ section 14). No GO has been reported, so the build below has not started and L4 
 - COMPUTE.md (the capacity overload), ROADMAP.md (a row and the M4 dependency), CLAUDE.md (code map and
   symptom rows).
 - Done: the full gate; every claim labelled; nothing pushed.
+- Status 2026-10-16: done. The plan's `proxmox-and-hypervisors.md` is the existing
+  `platforms/proxmox.md` (its "Other hypervisors" section covers libvirt, ESXi, Hyper-V and XCP-ng),
+  and `bare-metal-dedicated.md` got the same probe pointer as `own-hardware.md`. Not done because the
+  code does not exist: the `ByohKernelReboot` page and the PVM one-shot recovery for registered hosts
+  (TROUBLESHOOTING covers only the L4-T1 test machine).
 
 ## 16. Sources
 

@@ -18,7 +18,7 @@ Related pages:
 
 ### 1.1 Two questions decide everything
 
-1. **Does the machine have KVM?** cloud-hypervisor requires `/dev/kvm`. There is no software-emulation fallback. `scripts/byoh/bootstrap-data-plane.sh` refuses a host without `/dev/kvm`, without the `vmx`/`svm` flag or without `pdpe1gb`. PrepHost refuses it again after registration (`rhizome/host/lib/kvm_check.rb`). A VPS qualifies only when the provider exposes nested virtualization. A bare-metal server always qualifies once VT-x/AMD-V is on.
+1. **Does the machine have KVM?** cloud-hypervisor requires `/dev/kvm`, and so do Firecracker, crosvm and QEMU-KVM. On `byoh-driver` there is no fallback; branch `no-kvm` adds experimental, opt-in ones (§1.3). `scripts/byoh/bootstrap-data-plane.sh` refuses a host without `/dev/kvm`, without the `vmx`/`svm` flag or without `pdpe1gb`. PrepHost refuses it again after registration (`rhizome/host/lib/kvm_check.rb`). A VPS qualifies only when the provider exposes nested virtualization. A bare-metal server always qualifies once VT-x/AMD-V is on.
 2. **How do extra IPv4 addresses reach the machine?** Rhizome routes every VM behind the host's own MAC address (NETWORKING §9.5):
    - Addresses **routed** to the host's main IP work (`routed`).
    - Addresses that a cloud SDN delivers to the host's NIC work (`fabric`).
@@ -42,25 +42,56 @@ Related pages:
 | **Linode / Akamai compute instances** | Staff replies say nested virtualization is not supported, because it breaks live migration; they point to bare metal instead *(community report, UNVERIFIED here)* | IPv4: not researched. IPv6: a routed /64 or /56 per data center, which needs Network Helper disabled *(provider docs, UNVERIFIED here)* | IPv6 routed /64 → `gua` | **Not possible** as a data plane unless `/dev/kvm` is present | No KVM. A routed IPv6 /64 would fit if KVM were available. |
 | **Hetzner Cloud** | Community reports say Cloud servers expose no KVM *(community report, UNVERIFIED here)* | Floating IPs, assigned to one server at a time and configured as /32 on `eth0` *(provider docs, UNVERIFIED here)* | n/a as data plane; `routed` (WireGuard) as a tunnel endpoint | **Not possible** as a data plane | No KVM. Hetzner dedicated servers (Robot, including the server auction) are the Hetzner data-plane option (NETWORKING §9.5). Hetzner Cloud is still a good **control plane** or **tunnel VPS** (§1.3). |
 | **Scaleway Dedibox / Online** | Native (dedicated servers) | Not researched | probably `routed` + `public` | **UNVERIFIED** | Not researched. Apply the bare-metal rules in NETWORKING §9.5. |
-| **Any VPS without `/dev/kvm`** | none | — | — | **Not possible** | §1.3 |
+| **Any VPS without `/dev/kvm`** | none | as the provider allows | as the provider allows | **Not possible** for standard VMs; experimental `container` or `emulated` tier on branch `no-kvm` | §1.3 |
+| **OpenVZ, LXC or Docker "VPS"** (a container, not a VM) | none | — | — | **Not possible**, on any branch: the probe refuses a data plane that is itself a container | §1.3 |
 
 "Works with caveats" means the code path exists and matches a shape that was validated elsewhere, but on this provider nothing has been run.
 
 ### 1.3 The KVM-less VPS
 
-A VPS that shows no `/dev/kvm` cannot be a data plane. There is no flag, emulation mode or workaround in Ubicloud for this.
+A VPS that shows no `/dev/kvm` cannot run standard Ubicloud VMs.
 
 - `bootstrap-data-plane.sh` stops with `ERROR: /dev/kvm is missing, so KVM is unavailable.` (or the `vmx`/`svm` or `pdpe1gb` errors).
 - If you register it anyway, PrepHost fails its KVM check and the host never reaches `accepting`.
 
-A VPS like that is still useful in two roles:
+**First, find out why** (branch `no-kvm`): `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` on the
+control plane. It names the provider when it can (the DMI strings for Linode, Vultr and Scaleway are
+guesses, UNVERIFIED), says whether that provider offers nested virtualization, and prints the fix: often
+a different plan or the provider's bare-metal line. Prefer that: every option below is slower or
+isolates less.
+
+**If KVM is impossible there** (branch `no-kvm`, experimental, never chosen silently; [NO_KVM.md](../NO_KVM.md)):
+
+| Tier | What customers get | Speed (lab, VERIFIED) | Isolation | Status |
+|---|---|---|---|---|
+| `container` (L3) | Unprivileged LXC system containers with systemd, SSH and cloud-init, as `container-2..16` sizes | CPU 95-99%, memory bandwidth 91-98% of native, SSH in 3.6-5.4 s | Shared host kernel: not a VM | Registrable; one project per location; real-host checks UNVERIFIED |
+| `pvm` (L4) | VMs on KVM in software (PVM kernel) | not measured here | VM, weaker than hardware | Detected, **not offered** (waits for the go/no-go test) |
+| `emulated` (L5) | QEMU TCG VMs, as `emulated-2/4` sizes | CPU 26-29%, memory bandwidth about 2.5%, 64-96 s to SSH | Not a security boundary | Registrable; one project per location; real host UNVERIFIED |
+
+The commands, in order (the probe and a refused registration print them with your names filled in):
+
+```bash
+# data plane: install the tier's packages; --tier auto picks container before emulated
+sudo scripts/byoh/bootstrap-data-plane.sh --tier auto
+# control plane: price the tier, then offer it (set refuses a tier without rates)
+bin/byoh-location rates --location <loc> --family container --from standard --multiplier <X>
+bin/byoh-location set --location <loc> --virt-tiers kvm,container --accept container
+#   restart web, respirate and monitor after a rates change (CLAUDE.md §8a)
+bin/register-byoh-host --location <loc> --main-ip <IP> ... --virt-tier auto --accept-fallback --yes
+bin/byoh-location grant --location <loc> --project <ubid>
+```
+
+Customers then create a `container-2` (or `emulated-2`) VM through the API; the web form offers no
+lower-tier size. Nothing on this list has run on a real VPS (UNVERIFIED; NO_KVM.md §14, L3-T1 and L5-T1).
+
+A VPS without KVM is also useful in two roles on any branch:
 
 | Role | Works? | Notes |
 |---|---|---|
 | **Control plane** | Yes, in principle | The control plane needs no KVM: Ubuntu 24.04, Postgres, `puma`, `respirate` ([SETUP.md](../SETUP.md) §4). It must reach every data-plane host's main IP over SSH (C0). The live AWS environment uses a t3.large (terraform default t3.medium). |
 | **Tunnel endpoint** for a data plane behind CGNAT or with a single IP | Recipe only | NETWORKING §9.4: the VPS gets a routed block or floating IPs and routes them into a WireGuard `wg0` to the data plane. The data plane declares the block `routed` + `public`. The scripts `scripts/byoh/providers/wireguard-tunnel/*` are **PLANNED and do not exist**, so you set up WireGuard yourself. The pools file `uplink: wg0` key is stored but never used. Pool-sourced traffic needs your own policy routing on the data plane (`ip rule add to <block> lookup main priority 999`, `ip rule add from <block> lookup 100 priority 1000`, `default dev wg0` in table 100), and it must survive reboots. UNVERIFIED end to end. |
 
-To run VMs, move the data plane to a provider with nested virtualization (AWS m8i/c8i/r8i, GCP N2/C3, some Azure sizes, OCI E5/Standard3 VMs) or to bare metal (OCI bare metal, Scaleway Elastic Metal, Vultr Bare Metal, Hetzner Robot, OVH dedicated).
+To run standard VMs, move the data plane to a provider with nested virtualization (AWS m8i/c8i/r8i, GCP N2/C3, some Azure sizes, OCI E5/Standard3 VMs) or to bare metal (OCI bare metal, Scaleway Elastic Metal, Vultr Bare Metal, Hetzner Robot, OVH dedicated).
 
 ### 1.4 Nested virtualization and live migration
 
@@ -131,7 +162,7 @@ git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/
 bash ~/ubicloud/scripts/byoh/bootstrap-data-plane.sh
 ```
 
-Which branch carries the code this page describes: [README.md](README.md) "Which branch". Step "1b. hardware virtualization" is the KVM test. If it prints `ERROR: /dev/kvm is missing`, stop here (§1.3). The script also enables root public-key login and installs `ruby-bundler` and `netcat-openbsd`. It does not touch the network.
+Which branch carries the code this page describes: [README.md](README.md) "Which branch". Step "1b. hardware virtualization" is the KVM test. If it prints `ERROR: /dev/kvm is missing`, stop here (§1.3); on branch `no-kvm`, `--tier auto` prepares the fastest fallback instead. The script also enables root public-key login and installs `ruby-bundler` and `netcat-openbsd`. It does not touch the network.
 
 Then check that the host has only its main IPv4:
 
@@ -336,9 +367,9 @@ Then G12-G15 ([VERIFY.md](../VERIFY.md) §2.5): `g12 g13`, `g15-before`/`g15-aft
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `bootstrap-data-plane.sh` stops: `ERROR: /dev/kvm is missing, so KVM is unavailable.` | The VPS plan exposes no nested virtualization (Hetzner Cloud, Linode, most VPS plans) | Not fixable in Ubicloud. Use bare metal or a nested-virt instance type (§1.3). Keep the VPS as control plane or tunnel endpoint. |
+| `bootstrap-data-plane.sh` stops: `ERROR: /dev/kvm is missing, so KVM is unavailable.` | The VPS plan exposes no nested virtualization (Hetzner Cloud, Linode, most VPS plans) | Use bare metal or a nested-virt instance type (§1.3), or keep the VPS as control plane or tunnel endpoint. On branch `no-kvm`: `bin/byoh-virt probe` for the provider's fix, or the experimental `container`/`emulated` tiers (§1.3) |
 | `ERROR: the CPU has neither the vmx nor the svm flag.` although `/dev/kvm` exists | The plan or the CPU vendor lacks nested support (DigitalOcean AMD hosts per a feature request, UNVERIFIED) | Pick an Intel plan or another family; on DigitalOcean check `cat /sys/module/kvm_intel/parameters/nested` |
-| `ERROR: the CPU lacks the pdpe1gb flag` | The virtual CPU model hides 1G pages | Pick a newer instance family. There is no workaround until the `flexible` host profile (COMPUTE.md, PLANNED). |
+| `ERROR: the CPU lacks the pdpe1gb flag` | The virtual CPU model hides 1G pages | Pick a newer instance family. For standard VMs there is no workaround until the `flexible` host profile (COMPUTE.md, PLANNED). The `container` and `emulated` tiers (branch `no-kvm`) use no hugepages |
 | Host and all VMs vanish, then the host comes back rebooted | The provider live-migrated a nested-virt guest, which can panic the kernel (OVH Public Cloud FAQ) | Expected on nested-virt VPS. Use bare metal for real workloads (§1.4). |
 | VM setup fails: "X is a local address of this host, so the host answers for the VM" | The provider's agent, cloud-init or your netplan put the pool IP on the NIC (OVH, Hetzner Cloud and Vultr IP guides all add it) | Remove the address from netplan and the interface, stop the agent from re-adding it, then retry. `ip -br -4 addr` must show only the main IP. |
 | SSH to a VM's public IP gives "Permission denied (publickey)" | As above, on a VM created before M2 | As above, then recreate the VM |
@@ -366,6 +397,7 @@ Common problems that are not specific to these providers are in NETWORKING.md §
   - How each provider delivers extra IPs (routed or on-link).
   - The DigitalOcean anchor-IP mapping.
   - The tunnel recipe.
+  - Branch `no-kvm` on any of these providers: the probe's provider rows (L2-T6) and the `container` and `emulated` tiers on a real VPS (NO_KVM.md §14, L3-T1, L5-T1).
 - **Known gaps:**
   - Virtual/separate MACs are not supported.
   - The pools file `uplink` key is stored but never used, so pools on a second interface or `wg0` need operator policy routing.

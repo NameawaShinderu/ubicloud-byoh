@@ -332,6 +332,38 @@ Notes:
 
 ---
 
+## 9a. Lower virtualization tiers: the hugepage columns as a memory budget [no-kvm]
+
+True on branch `no-kvm` (milestone MV, [NO_KVM.md](NO_KVM.md)), not on `byoh-driver`. A host registered
+on the `container` (L3) or `emulated` (L5) tier has no 1G hugepages for its VMs: system containers use
+ordinary host memory, and QEMU TCG uses a shared memfd. The allocator still books memory in
+`total_hugepages_1g` / `used_hugepages_1g`, so on these hosts the two columns are **overloaded**: they
+hold a guest-RAM budget in GiB, not hugepages. No allocator change was needed for that.
+
+| Step | What happens | Code |
+|---|---|---|
+| `wait_prep` | `accepts_slices` is false on a lower-tier host (slices are cloud-hypervisor's CPU cgroups), and one core is booked for the host in `used_cores`, because the VMs' vCPUs are ordinary host threads | `prog/vm/host_nexus.rb` (`wait_prep`, the LearnCpu reaper) |
+| `verify_virt_tier` | Replaces `setup_hugepages`: the host waits until a probe agrees with its tier | `prog/vm/host_nexus.rb` |
+| `verify_tier_capacity` | Replaces `verify_hugepages` after the reboot. Fails when `MemAvailable` < 2 GiB, when the host has fewer than 2 physical cores, or when the VMs already on the host exceed the new budget; otherwise writes the budget and the VMs' memory into the two columns | `prog/vm/host_nexus.rb`, `ByohVirtTiers.memory_budget_gib` |
+
+Budget in GiB = `((MemTotal − hugepages) × 42/43 − host_reserve − vm_overhead × total_cpus/min_vcpus) / 1024`,
+all in MiB with integer division, never below 0. Hugepages left over from an earlier configuration are
+subtracted and logged, not freed. The constants are per tier in `lib/byoh_virt_tiers.rb` and are
+provisional (UNVERIFIED on a real host):
+
+| Tier | `host_reserve_mib` | `vm_overhead_mib` per possible VM | `min_vcpus` | Example: MemTotal 32,768 MiB, 8 CPUs | Example: 8,192 MiB, 4 CPUs |
+|---|---|---|---|---|---|
+| `container` | 2048 | 128 (lxc monitor, lxcfs share, dnsmasq) | 2 | 28 GiB | 5 GiB |
+| `emulated` | 2048 | 512 (QEMU's 256 MiB translation cache, QEMU itself, ubiblk, dnsmasq; 384 MiB measured, EMULATED_HOSTS.md §6.4) | 2 | 27 GiB | 4 GiB |
+| `pvm` | 2048 | 384 | 2 | not offered (NO_KVM.md §6) | |
+
+Sizes (`Option::TierVmSizes`, reachable only through the VM create API in a location that offers the
+tier): `container-2/4/8/16` and `pvm-2/4/8/16` with 4 GiB per vCPU like `standard`; `emulated-2/4` with
+1 GiB per vCPU, because each emulated vCPU is a host thread running flat out. Cores are booked like
+`standard`. Overcommit, balloon and the `flexible` profile (P1 onward) do not apply to these tiers.
+When P1 introduces hosts without hugepages, the lower tiers should move to its memory accounting and
+the overload should go; until then [NO_KVM.md](NO_KVM.md) §10.4 and this section are the record of it.
+
 ## 10. Guardrails
 
 | Area | Guardrail | Phase |

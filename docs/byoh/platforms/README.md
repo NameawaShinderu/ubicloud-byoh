@@ -30,9 +30,14 @@ Problems on any platform: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
 | Scaleway Elastic Metal, Vultr Bare Metal | `routed` + `public` | Native | Flexible / reserved IPs | UNVERIFIED (Vultr delivery not researched) | [other-clouds-vps.md](other-clouds-vps.md) |
 | OVHcloud Public Cloud | `routed` + `public` (assumed) | `vmx` exposed; a live migration can kill the host | Additional IPs | UNVERIFIED, lab only | [other-clouds-vps.md](other-clouds-vps.md) |
 | DigitalOcean Droplet | `onlink` + `nat` for one VM (theory), or single IP | Nested on Intel, not officially supported | One reserved IP per Droplet | UNVERIFIED, lab only | [other-clouds-vps.md](other-clouds-vps.md) |
-| Hetzner Cloud, Linode/Akamai, any VPS without `/dev/kvm` | — | None | — | **Not possible** as a data plane; fine as control plane or tunnel endpoint | [other-clouds-vps.md](other-clouds-vps.md) §1.3 |
+| Hetzner Cloud, Linode/Akamai, any VPS without `/dev/kvm` | as the provider allows | None | — | **Not possible** for standard VMs; fine as control plane or tunnel endpoint. On branch `no-kvm`: experimental opt-in tiers, system containers (`container`, near native, shared kernel) or emulation (`emulated`: CPU about a quarter of native, memory bandwidth about 2.5%), never chosen silently | [other-clouds-vps.md](other-clouds-vps.md) §1.3; [NO_KVM.md](../NO_KVM.md) |
 
-Not sure whether a machine has usable KVM? Run `bin/byoh-virt probe --main-ip <IP>` from the control plane before registering. It prints the machine's rung on the virtualization ladder and the fix for its platform. Machines without hardware virtualization have slower, opt-in fallbacks: [NO_KVM.md](../NO_KVM.md).
+Not sure whether a machine has usable KVM? Run `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` from the control plane before registering (branch `no-kvm`; the host needs `ruby`). It prints the machine's rung on the virtualization ladder, why, the fix for its platform and, for clouds, whether a nested-capable type of the same size costs about the same ([NO_KVM.md](../NO_KVM.md) §4 fixes, §7 costs). Exit 0 means standard VMs will run.
+
+**Fastest first.** Every fast VM monitor (Cloud Hypervisor, Firecracker, crosvm, QEMU-KVM) needs `/dev/kvm`, so the order is always:
+1. KVM is there (bare metal, or nested virtualization on): register as today.
+2. KVM can be switched on (firmware setting, CPU type `host`, the cloud's nested option, a nested-capable instance type): do that; the probe prints how. On AWS, GCP and Azure this is almost always the answer, at about the same price.
+3. Neither (most VPS plans, Hetzner Cloud, AWS types without nested): on branch `no-kvm`, register with `--virt-tier auto --accept-fallback` into a location that offers a lower tier. `auto` picks system containers before emulation. Both are experimental, single-project and visible to customers as separate sizes ([NO_KVM.md](../NO_KVM.md) §1, §12). PVM (KVM in software) is detected but not offered.
 
 Rules of thumb:
 - Public IPv4 per VM without NAT or a cloud SDN: rented bare metal or a colo with a routed block.
@@ -68,6 +73,8 @@ The guides describe branch `m2-network`. It is **not pushed yet**: the published
 | c73f96ddc | The uplink MAC pin skips NICs named by a VLAN, bond, bridge or VRF | PrepHost can break such a netplan. Keep VLANs and bonds off the data-plane host's uplink (tag on the hypervisor or switch) |
 | 9d85a6e3c | VMs cannot reach `168.63.129.16`, `fd00:ec2::254` and `fd20:ce::254` | Only `169.254.0.0/16` is dropped |
 | 105b6439b | `bootstrap-data-plane.sh` checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` | Run those checks by hand (PLATFORMS PF3, PF4); PrepHost still aborts without KVM |
+
+Branch `no-kvm` (the virtualization ladder: `bin/byoh-virt`, `--virt-tier`, `bootstrap-data-plane.sh --tier`, the `container` and `emulated` tiers) is built on top of `byoh-driver` and is not merged or pushed. Without it, a machine without KVM cannot be a data plane, and the probe and fallback commands in these guides do not exist.
 | 237202b07, 8a9b271c7 | The control-plane bootstrap writes `BILLING_RATES_EXTRA_DIR` and `BASE_URL`, and knows `UBI_START_MONITOR` and `UBI_BASE_URL` | Add both lines to `.env.rb` by hand (VERIFY.md §1.1, SETUP.md §4) |
 | 71988157c, 3774f5837, 04f4f7ddc, a75747755 | Gate reaches VMs through their namespace; G9 without internet pools; `GATE_EXTERNAL_SSH_VIA`; clearer `verify` warning | The gate jumps to VMs over IPv6, which fails on ULA hosts |
 

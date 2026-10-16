@@ -9,7 +9,12 @@
 > `byoh_virt` policy): see NO_KVM.md sections 8.1 and 10. The rhizome side (section 6.5), the security
 > model (section 4) and the memory budget (section 6.4) hold as written.
 
-Status: DESIGN (revision 2), 2026-10-15. Branch `qemu-tcg`, starting from `byoh-driver` 9e22d71ec (M0-M3).
+Status: 2026-10-16. This was the DESIGN (revision 2) of 2026-10-15 on branch `qemu-tcg`, from
+`byoh-driver` 9e22d71ec (M0-M3); that work continues on branch `no-kvm`. What shipped: the rhizome side
+(section 6.5: the TCG unit, its hardening, `QmpClient`, `EmulatedStop`) and the hookup through the
+tier framework (NO_KVM.md sections 8.1 and 10, WP6), spec-gated. The container gate (section 7 item 2)
+and the live gate L-Q (item 3) have not run: UNVERIFIED. Read the sections marked SUPERSEDED for their
+reasoning only; NO_KVM.md is the current design.
 File:line references are to 9e22d71ec. Re-read a file before relying on a line number.
 
 Evidence labels:
@@ -198,7 +203,7 @@ Upstream commits 37e37caa9 (2025-10-22, "Add QEMU hypervisor support to data pla
 
 ## 6. Architecture
 
-### 6.1 Host attribute and the family tie
+### 6.1 Host attribute and the family tie (SUPERSEDED by NO_KVM.md §10)
 
 Migration `migrate/20261015_emulated_hosts.rb` (WP5):
 
@@ -218,7 +223,7 @@ end
 - The `down` migration refuses while any `tcg` host exists.
 - `accel` is immutable after registration; `bin/byoh-host` says so.
 
-### 6.2 Registration and detection
+### 6.2 Registration and detection (SUPERSEDED by NO_KVM.md §10)
 
 - `bin/register-byoh-host --accel kvm|tcg` (default `kvm`).
   - `lib/byoh_registration_cli.rb` gains the flag. `lib/byoh_registration.rb` validates it and passes `accel:` to `HostNexus.assemble`, which gains `accel: "kvm"` (`prog/vm/host_nexus.rb:8,39`), forces family `emulated` for `tcg`, and refuses any other family with it.
@@ -357,7 +362,7 @@ Notes on the argv:
 - QEMU exits with Result=`success` both on guest poweroff and on `systemctl stop`, so a guest poweroff is logged as "VM stopped by operator".
 - v1 adds, only for VMs on emulated hosts, a journal grep for `terminating on signal`: with it the operator stopped the VM, without it the guest shut itself down. **It only picks the log message.** It never pages and never affects billing.
 
-### 6.6 Control-plane VM path
+### 6.6 Control-plane VM path (SUPERSEDED by NO_KVM.md §10)
 
 - **`Metal::Vm#params_json`** (`model/metal/vm.rb:85-127`): when `vm_host.emulated?`, force `hypervisor = "qemu"` and `hugepages = false` before the hash is built, then add `params[:accel] = "tcg"` after it, using the same pattern as `byoh_host` (`:124`). For every other host the JSON is byte-identical (WP1 golden spec). Because the value comes from `vm_host`, `prog/vm/update_ipv6.rb:54` is covered too.
 - **`create_unix_user`** (`prog/vm/metal/nexus.rb:194-217`): on emulated hosts, the heredoc omits `usermod -a -G kvm` and creates the root-owned home (4.2 item 5). The KVM heredoc is unchanged (WP1 golden pin).
@@ -372,7 +377,7 @@ Notes on the argv:
   - **Services** (Postgres, Kubernetes, MinIO, VictoriaMetrics, inference endpoints, load-balancer VMs, GitHub runners, VM pools): they never request family `emulated`, `validate_vm_size` refuses emulated sizes for them (6.8), and the allocator guards keep them off emulated hosts (6.7).
   - MinIO net-thread pinning (`rhizome/host/lib/vm_net_pinner.rb`) is CH-only and stays that way.
 
-### 6.7 Allocator and the placement guards
+### 6.7 Allocator and the placement guards (SUPERSEDED by NO_KVM.md §10)
 
 **Family isolation** already exists for normal placement: `family_filter = [vm.family]` (`prog/vm/metal/nexus.rb:138`; `scheduling/allocator.rb:337-338`). But `metal/nexus.rb:115` sends an **empty** family filter together with `force_host_id`, and `allocator.rb:399` copies the host's family onto the VM. So family alone does not stop a forced placement.
 
@@ -400,7 +405,7 @@ A BEFORE UPDATE trigger on `vm.vm_host_id` was considered and rejected: the guar
 
 **Memory:** see 6.4 (no change).
 
-### 6.8 Customer opt-in, labels, billing
+### 6.8 Customer opt-in, labels, billing (SUPERSEDED by NO_KVM.md §10)
 
 - **`lib/option.rb:220-238`:**
   - A family `VmFamily.new(name: "emulated", display_name: "Emulated (no hardware virtualization; not an isolation boundary; typically 4-20× slower)", …)` inside the existing literal, with `visible: false`. The display name carries the caveat into the API and CLI.
@@ -444,6 +449,12 @@ It is useful only where CH misbehaves. It is **not in the MQ gate** and stays UN
 
 ## 7. Rollout and gates
 
+> The commands in item 3 use the superseded flags (`--emulated`, `--emulated-hosts`, `--accel tcg`,
+> `--accept-no-guest-isolation`). The shipped equivalents are in NO_KVM.md section 14, L5-T1:
+> `bootstrap-data-plane.sh --tier emulated`, `bin/byoh-location rates ... --family emulated`,
+> `set --virt-tiers kvm,emulated --accept emulated`, and `register-byoh-host --virt-tier emulated --accept-fallback`.
+> Item 4's docs landed in NO_KVM WP8 (2026-10-16), without the PF-Q rows: PLATFORMS.md uses PF-V rows instead.
+
 1. **Code gate** (every WP): the full Ruby gate with 100% line and branch coverage, frozen specs, rubocop, rhizome specs, shellcheck. The WP1 golden fixtures (CH units, QEMU+KVM unit, CH `params_json`, PrepHost command, `create_unix_user` heredoc) and the WP1 pins (timings; `validate_vm_size` errors) must pass unchanged from WP2 on. The size-error pin computes the list from `Option::VmSizes` without family `emulated`, so an upstream merge that adds or renames a size does not break it, but an emulated size leaking into any caller does.
 2. **Container gate** (`scripts/byoh/test/qemu/run.sh all`, WP10). In an `ubi-q-*` container with no `--privileged`, no `/dev/kvm` and no `/dev/vhost-net`, the **real** `host/bin/setup-vm prep` boots an `emulated-2` VM under TCG from the server cloud image, with ubiblk encryption, rhizome networking (including the real ByohEgressNat config) and cloud-init. It then checks:
    - SSH within 420 s, DNS and egress (`apt-get update`, timed); the guest cannot reach the test database
@@ -467,7 +478,11 @@ It is useful only where CH misbehaves. It is **not in the MQ gate** and stays UN
    - Stop (not terminate) the instance afterwards.
 4. **Docs before release:** the ROADMAP MQ track, additive PLATFORMS rows (PF-Q1, PF-Q2, and an "emulated" note next to #18, F9 and PF3), the platform guides (aws, gcp-azure, other-clouds-vps, README chooser) with price/performance tables that say emulated mode wins **only** where nested virtualization is unavailable (the strongest case is a VPS without `/dev/kvm`: Hetzner Cloud, Linode, GCP E2, Azure B-series, quota-bound fleets; not AWS regions that offer m7i or m8i), T-types listed as "demo only; unlimited-mode credit cost", the 100 GiB data-volume minimum, TROUBLESHOOTING, COMPUTE, and CLAUDE.md.
 
-## 8. Work packages (summary)
+## 8. Work packages (summary) (SUPERSEDED)
+
+> These were the `qemu-tcg` work packages. WP1-WP4 shipped in that form; WP5-WP11 were replaced by
+> NO_KVM.md WP4 and WP6 (the tier framework instead of `accel`). The MQ section of ROADMAP.md was never
+> written; ROADMAP.md has the ladder's row instead.
 
 The full plan, with files, tests and done-checks, is in the MQ section of `docs/byoh/ROADMAP.md`, added in WP11.
 

@@ -9,6 +9,7 @@ This page ties the other BYOH design pages into one ordered build plan. It does 
 | [NETWORKING.md](NETWORKING.md) | Host network contract, pools, exposure, `host_guard`, IPv6, verification, networking phases **NET-P0..P7**, live steps **L0..L10**, access tiers (§12) |
 | [COMPUTE.md](COMPUTE.md) | Capacity accounting, tiers, overcommit, gates **G0..G6**, compute phases **CMP-P0..P5** |
 | [PLATFORMS.md](PLATFORMS.md) | Per-platform support, ranked findings, fix groups **F1..F10**, host preflight **PF1..PF21** |
+| [NO_KVM.md](NO_KVM.md) | The virtualization ladder (**L1..L5**, tiers `kvm`/`container`/`pvm`/`emulated`), detection, the per-platform KVM fix, its build plan **WP1..WP8** (milestone MV) |
 | this page | Goals, current state, milestones **M0..M12**, console and access (**C0..C5**), OpenStack map, easy deployment (**E0..E5**), rebase strategy, decisions |
 | [QUICKSTART.md](QUICKSTART.md) | Today's manual AWS setup, step by step |
 
@@ -104,6 +105,7 @@ Full per-commit detail: [PLATFORMS.md §3](PLATFORMS.md).
 | B. Easy-deploy foundations | M3 packaged control plane, M4 one-command site and host + preflight | Systemd, production mode, real locations in the CLI, preflight. |
 | C. Flexible tier | M5 | Core user ask (custom shapes, overcommit groundwork). |
 | D. Console and access | M6 | User ask; needs no Cloud Hypervisor change for its first phases. |
+| V. Virtualization ladder (side track) | MV, branch `no-kvm` | "Fast first, fall back only when needed": detect what a machine can virtualize, refuse fixable machines with the per-platform fix, and offer opt-in experimental tiers (system containers, QEMU TCG) where KVM cannot exist. Built in parallel with M4; merges after it. |
 | E. The rest | M7 host security + verification, M8 management overlay, M9 usage and monitoring, M10 private networking, M11 balloon/resize + interactive console, M12 images/backups/move + releases | Production hardening and OpenStack-gap features. |
 
 **Dependency graph** (an arrow means "needs"):
@@ -116,6 +118,9 @@ M0 ──► M1 ──► M2 ──► M4 ──► M7 ──► M8
               ├──► M6 (C1,C2,C4) ──► M11 (C3)
               └──► M12 (images, MoveVm, releases; also needs M3)
 ```
+
+MV (virtualization ladder, `no-kvm`) needs M2 (BYOH locations) and merges **after** M4, because both
+change host preflight and registration (NO_KVM.md §2.3 lists the expected conflicts). Nothing else needs MV.
 
 M3 does not depend on the rebase and can start in parallel with M0 (E0 note in §6). M6 (C1/C2) only needs M1 for the C0 snapshot tab; C1/C2 themselves could start after M0.
 
@@ -198,8 +203,19 @@ Not done in M0:
 | Scope | `ubicloud-admin site add` (NET `byoh-location` logic, billing overlay in `/var/lib/ubicloud/billing_rates.d/` (M3-n), visibility and Postgres choice) and `host add --ssh` (form A): preflight PF1-PF21 → register → stream HostNexus labels → `pool verify` (prints UNVERIFIED for pool checks until M7). Register CLI: `--location` resolution, `--uplink-ip`, `--pool-file`, default boot image `ubuntu-noble`, preflight by default. Remaining portability fixes: F4 CPU topology (online CPUs, non-uniform SMT), F5 control-plane device identity and health checks, F6 storage safety (`--storage-disk`, btrfs/ZFS error), F9 GPU `vfio-pci` filter and LearnMemory units, F10 Proxmox recipe rewrite (delete `deploy-scripts/02-05,99`), terraform `host_add_command` output. |
 | Docs | [PLATFORMS.md §5, §6](PLATFORMS.md); §6.2-§6.3 of this page |
 | Key files | `bin/register-byoh-host:60-157`; `lib/byoh_registration.rb`; `lib/billing_rate.rb:14`; `scripts/byoh/host/ubicloud-host` (`preflight`); `prog/learn_cpu.rb`; `prog/learn_pci.rb`; `model/storage_device.rb:24-33`; `model/vm_host.rb:286-296,351-361,383-394`; `model/location.rb:36-38`; `terraform/aws-byoh/*`; `docs/byoh/recipes/*` |
-| Gates | E2 exit test: AWS canary and one Proxmox VM with the **same three commands**. Preflight catches `kvm64` (no `/dev/kvm`), a pool containing the uplink IP, and a hybrid CPU. F5: health checks pass on EBS, virtio and LVM for 24 h with `bin/monitor` run by hand. |
+| Gates | E2 exit test: AWS canary and one Proxmox VM with the **same three commands**. Preflight catches `kvm64` (with or without `vmx`; PF3 takes the verdict from MV's `ByohVirtLadder.preflight_check` once MV is merged), a pool containing the uplink IP, and a hybrid CPU. F5: health checks pass on EBS, virtio and LVM for 24 h with `bin/monitor` run by hand. |
 | Customer can | Nothing directly; operators add sites and hosts in minutes on any platform. |
+
+#### MV. Virtualization ladder: fast first, fall back only when needed (branch `no-kvm`) [CODE DONE 2026-10-16, not merged]
+
+| Item | Detail |
+|---|---|
+| Scope | Detection over SSH (`bin/byoh-virt probe/explain/show/refresh`, `rhizome/host/bin/virt-probe`, `Prog::LearnVirt`, `vm_host.virt_probe`); the per-platform fix and cost tables (`lib/byoh_virt_platforms.rb`); a declared, immutable `vm_host.virt_tier` (`kvm`, `container`, `pvm`, `emulated`) with a location policy `location.byoh_virt`, acks, rates and single-project tenancy; registration with `--virt-tier kvm\|auto\|...` and `--accept-fallback`; tier sizes in `Option::TierVmSizes`, API only. Rungs: L1 KVM (today), L2 fixable (refused with the fix), L3 system containers (LXC), L4 PVM (detected, not offered), L5 QEMU TCG. |
+| Docs | [NO_KVM.md](NO_KVM.md) (design, status, tests); [EMULATED_HOSTS.md](EMULATED_HOSTS.md) (L5 detail) |
+| Key files | `lib/byoh_virt_{ladder,platforms,tiers,registration,cli}.rb`; `prog/learn_virt.rb`; `migrate/20261015_vm_host_virt_probe.rb`, `migrate/20261016_byoh_virt_tier.rb`; `prog/vm/host_nexus.rb` (`verify_virt_tier`, `verify_tier_capacity`); `prog/vm/nexus.rb` (policy gate); `scheduling/allocator.rb` (tier guard); `rhizome/host/lib/{virt_probe,host_tier,container_*,qemu_tcg,qmp_client,emulated_stop}.rb` |
+| M4 dependency | M4's PF3 delegates the virtualization verdict to `ByohVirtLadder.preflight_check(facts, declared_tier:)` and passes its pinned session's facts to `ByohVirtRegistration#decide!` (NO_KVM.md §2.3, §11.4). On the merge, re-apply the isolated registration wiring commit on top of M4's preflight and regenerate `cache/schema.cache`. |
+| Gates | Spec gate green, U1 goldens unchanged from 9e22d71ec. Not run (UNVERIFIED): L1-T2 nested benchmarks, L2-T1..T10 on real clouds, L3-T1 on a real host, L4-T1 PVM go/no-go, L5-T1 (NO_KVM.md §14). The container and emulated families stay experimental until their real-host test passes. |
+| Customer can | Nothing by default. In a location whose operator offers a lower tier and grants the project: create `container-*` or `emulated-*` VMs through the API. |
 
 #### M5. Flexible tier (CMP-P1) [PLANNED M5]
 

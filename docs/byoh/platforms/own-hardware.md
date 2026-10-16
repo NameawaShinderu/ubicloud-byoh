@@ -65,7 +65,7 @@ Menu names differ by vendor; these are the usual ones. UNVERIFIED on any specifi
 
 | Setting | Value | Why |
 |---|---|---|
-| Intel Virtualization Technology (VT-x) / AMD SVM Mode | **Enabled** | Without it there is no `/dev/kvm`, and the bootstrap stops with "/dev/kvm is missing" or "the CPU has neither the vmx nor the svm flag" |
+| Intel Virtualization Technology (VT-x) / AMD SVM Mode | **Enabled** | Without it there is no `/dev/kvm`, and the bootstrap stops with "/dev/kvm is missing" or "the CPU has neither the vmx nor the svm flag". On AMD the `svm` flag can stay visible while the firmware has it off; on branch `no-kvm`, `bin/byoh-virt probe` reads the kernel log ("SVM disabled (by BIOS)", "VMX ... disabled by BIOS") and says it is the firmware setting, not a missing module (kernel-log wording UNVERIFIED on real boards) |
 | VT-d / AMD-Vi / IOMMU | Not needed for normal VMs. Leave it at the default unless the host has an NVIDIA GPU. | With an NVIDIA GPU, an IOMMU group removes the host from non-GPU placement (§2.1). To use such a host for normal VMs, remove the GPU or turn the IOMMU off (firmware, or a GRUB drop-in with `intel_iommu=off` / `amd_iommu=off`), then confirm `lspci -vnmm -d 10de::` shows no `IOMMUGroup` line before registration. UNVERIFIED. |
 | Hyper-Threading / SMT | **Enabled** | §2.1 |
 | E-cores (hybrid Intel) | Disabled, if the board offers it | §2.1 |
@@ -465,7 +465,7 @@ ssh -o "ProxyCommand=ssh -i ~/.ssh/byoh_data root@<main IP> ip netns exec <inhos
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `bootstrap-data-plane.sh`: "/dev/kvm is missing" or "neither the vmx nor the svm flag" | VT-x / AMD SVM disabled in the firmware | Enable it (§2.2), power-cycle, rerun the bootstrap |
+| `bootstrap-data-plane.sh`: "/dev/kvm is missing" or "neither the vmx nor the svm flag" | VT-x / AMD SVM disabled in the firmware | Enable it (§2.2), power-cycle (a warm reboot may not apply it), rerun the bootstrap. A CPU without VT-x/AMD-V at all (some Atom and very old CPUs) cannot run standard VMs; on branch `no-kvm` it can still run the experimental `container` or `emulated` tier ([NO_KVM.md](../NO_KVM.md)) |
 | Bootstrap: "the CPU lacks the pdpe1gb flag" | Very old CPU | Use another machine; a `flexible` profile without hugepages is PLANNED ([COMPUTE.md](../COMPUTE.md)) |
 | Every VM fails with `RuntimeError BUG` in `write_params_json` | Hybrid Intel CPU (P+E cores), or SMT off / CPUs offline | Disable E-cores in the firmware, enable SMT, remove `nosmt`; then re-register (PLATFORMS HW-6, HW-7) |
 | Internet and internal VMs wait for capacity on a host with an NVIDIA GPU | GPU in an IOMMU group; the allocator excludes the host from non-GPU VMs | Remove the GPU or turn the IOMMU off, then re-register (§2.2); UNVERIFIED |

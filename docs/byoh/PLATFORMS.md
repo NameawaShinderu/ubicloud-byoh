@@ -18,6 +18,7 @@ Base: branch `byoh-driver` at e6f5e328e. `origin/main:` means upstream Ubicloud.
 | **[PLANNED NET-Pn]** | Owned by phase *n* of the networking plan ([NETWORKING.md](NETWORKING.md) §14, where it is written `Pn`) |
 | **[PLANNED CMP-Pn]** | Owned by phase *n* of the compute plan ([COMPUTE.md](COMPUTE.md) §12, where it is written `Pn`) |
 | **[PLANNED F*n*]** | Owned by this page's fix group F*n* (section 5), with no networking or compute phase |
+| **[no-kvm]** | True on branch `no-kvm` (the virtualization ladder, milestone MV in [ROADMAP.md](ROADMAP.md); design and status in [NO_KVM.md](NO_KVM.md)), not merged into `byoh-driver` |
 | **UNVERIFIED** | Not proven in code or on a live host |
 
 Preflight checks are numbered **PF1–PF21** on this page so they do not clash with phase numbers. They are the checks P1–P21 of the portability plan.
@@ -35,8 +36,8 @@ These are the rules a host must meet **today**. The right-hand column shows how 
 | Requirement | How to check | Why (code) | Changes later |
 |---|---|---|---|
 | Ubuntu 24.04, x86_64 or aarch64 | `lsb_release -rs`; `uname -m` | `wait_prep` sets `accepts_slices = (os == "ubuntu-24.04")`; LearnOs | none |
-| KVM present | `test -c /dev/kvm` and `vmx` or `svm` in `/proc/cpuinfo` | cloud-hypervisor needs it. `scripts/byoh/bootstrap-data-plane.sh` refuses the host before registration, and PrepHost aborts with the same reason after it (`rhizome/host/lib/kvm_check.rb`, [FIXED 05f1eefb2]). A VPS without nested virtualization fails here | none |
-| 1 GiB hugepage CPU flag (x86) | `grep -qw pdpe1gb /proc/cpuinfo` | dedicated VMs are backed by 1G hugepages (`prog/setup_hugepages.rb:16`) | not needed for a `flexible` profile host [PLANNED CMP-P1] |
+| KVM present | `test -c /dev/kvm` and `vmx` or `svm` in `/proc/cpuinfo` | cloud-hypervisor needs it. `scripts/byoh/bootstrap-data-plane.sh` refuses the host before registration, and PrepHost aborts with the same reason after it (`rhizome/host/lib/kvm_check.rb`, [FIXED 05f1eefb2]). A VPS without nested virtualization fails here | [no-kvm] `bin/byoh-virt probe` names the cause and the platform's fix; a host registered on the `container` or `emulated` tier needs no KVM (PF-V rows, section 6.2) |
+| 1 GiB hugepage CPU flag (x86) | `grep -qw pdpe1gb /proc/cpuinfo` | dedicated VMs are backed by 1G hugepages (`prog/setup_hugepages.rb:16`) | not needed for a `flexible` profile host [PLANNED CMP-P1]; not needed on a `container` or `emulated` host [no-kvm] ([COMPUTE.md](COMPUTE.md) §9a) |
 | RAM ≥ 14 GiB (16+ recommended) | sum of `dmidecode -t memory` sizes | hugepages = `total_mem_gib*42/43 - 5` (`prog/setup_hugepages.rb:14`); the smallest slice books 8 | `flexible` profile uses 0 hugepages, so smaller hosts become usable [PLANNED CMP-P1] |
 | DIMM sizes readable | `dmidecode -t memory \| grep -E '^\s+Size: [0-9]'` | LearnMemory sums kB/MB/GB/TB sizes and rounds down to whole GiB; with no SMBIOS memory device it uses `MemTotal` rounded up. Only an unknown unit fails (`prog/learn_memory.rb`) [FIXED IN M2] | none |
 | ≥ 2 physical cores **beyond** CPUs 0-1 | `lscpu -e` | CPUs 0-1 are marked `spdk` on every host with ≤ 64 CPUs (`model/vm_host.rb:173-178`, `prog/vm/host_nexus.rb:154-160`), even though SPDK is never installed | generic hosts get 0 IO CPUs [PLANNED CMP-P0 step 3] |
@@ -105,7 +106,7 @@ Duplicates are merged; the canonical ID comes first. Severity is for BYOH hosts.
 | 15 | major | OPS-5, OPS-6 | `scripts/byoh/providers/aws-routed-network-setup.sh:134-150`; `terraform/aws-byoh/user-data-data.sh:29,47` | AWS | pool IPs on the host NIC | F7 + NET L10 (retire the script) + PF17/PF18 | PARTLY FIXED (terraform path: 003f2800d) |
 | 16 | major | OPS-11 | `docs/byoh/deploy-scripts/04-register-host.sh:14-22` | Proxmox automated deploy | `Permission denied (publickey)` ctrl→data | F10 | OPEN |
 | 17 | major | OPS-14 (+ location) | `bin/register-byoh-host:125-155`; `lib/byoh_registration.rb:51-57`; `prog/vm/host_nexus.rb:6` | all | no host preflight; every host lands in `HETZNER_FSN1_ID` | preflight: F10 (section 6). Location: NET-P1 (`bin/byoh-location`) and CMP-P1 (registration) | PARTLY FIXED (location: m2-network ca8e608fe, 9ecea1072, `bin/byoh-location` and a required `--location`; preflight still F10) |
-| 18 | major/mod | HW-4, VR-6 | `rhizome/host/bin/prep_host.rb` | AWS without nested, GCP without nested, Proxmox `kvm64`, BIOS VT off | host reaches `accepting`; VMs never boot | F9 + PF3 | FIXED (05f1eefb2: PrepHost aborts; M2: `bootstrap-data-plane.sh` also checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` before registration) |
+| 18 | major/mod | HW-4, VR-6 | `rhizome/host/bin/prep_host.rb` | AWS without nested, GCP without nested, Proxmox `kvm64`, BIOS VT off | host reaches `accepting`; VMs never boot | F9 + PF3 | FIXED (05f1eefb2: PrepHost aborts; M2: `bootstrap-data-plane.sh` also checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` before registration). [no-kvm]: registration probes the host and refuses it with the platform's fix; `kvm64`-class CPU models and missing KVM capabilities are caught too |
 | 19 | major (small) | HW-8, OPS-12 | `prog/setup_hugepages.rb:14` | hosts under 14 GiB | 0-7 hugepages, host still `accepting`, nothing fits | F3 → CMP-P0 step 5 (upstream MemAvailable clamp) + CMP-P1 (profile) | OPEN |
 | 20 | medium | OPS-9 | `docs/byoh/SETUP_PROXMOX.md:2132-2142` | Proxmox disk passthrough | mount hides `/var/storage/images`; capacity stale | F6 (docs) | OPEN |
 | 21 | medium | OPS-17 | `scripts/byoh/bootstrap-dev-ctrl-plane.sh` (was `bootstrap-ctrl-plane.sh:217-242`) | all | no `bin/monitor`, no restarter | F10; monitor only after F5 and with compute critic hole 5 resolved | PARTLY FIXED (M3 `install.sh`: systemd units with `bin/restarter bin/respirate`, `ubicloud-monitor` installed but disabled until M9; the development bootstrap is unchanged) |
@@ -136,7 +137,7 @@ Duplicates are merged; the canonical ID comes first. Severity is for BYOH hosts.
 | **F6** Storage safety | #20, #25, #26, #27 | split | CMP-P0 step 7 (LearnStorage refuses to run with volumes) and CMP-P1 (physical guard, ballast, thresholds) replace the "proportional reserve" idea. Still here [PLANNED F6]: `write_through_device?` rescues `SystemCallError` → false; opt-in `--storage-disk <by-id>` that mounts at `/var/storage/devices/<n>` with `UUID=…,nofail`, refuses root/boot/signature-bearing disks, never wipes; fix SETUP_PROXMOX P4 |
 | **F7** Host network safety | #1, #11, #15, #32 | **NET-P0** (upstream host-address exclusion in `SetupNftables`, management IP never allocatable), **NET-P1** (registration validation, `reserved` rows), **NET-P2** (`check-pool-not-local`, `host_guard`), **NET L10** (retire `aws-routed-network-setup.sh`) | NH-6 (`flush ruleset`) is assigned to NET-P2 with `host_guard` (section 8 item 4) |
 | **F8** VM reachability without a public IP | #7, #8, #9, #10 | 8.1 egress → **NET-P6**; 8.2 readiness → **NET-P1** (`cp_reach_ip4`); 8.4 display → **NET-P1**; 8.5 VM-to-VM → **NET-P4/P5** | 8.3 access: the old Tier 0 `ssh -J root@<host> ubi@<vm-private-ipv4>` does **not** work: the host root namespace has no route to a VM's private IPv4 (`rhizome/host/lib/vm_setup.rb:330-352`). Working operator forms [TODAY]: `ssh -J <host> ubi@<pool IPv4>`, or `ProxyCommand="ssh root@<host> ip netns exec <inhost> nc %h 22"`. Per-host `cloudflared` (old Tier 1) is replaced by the access tunnel (console phase C4, milestone M6); in-guest `cloudflared` (Tier 2) needs egress-only NAT (milestone M2). Browser console → console phases C0-C3 ([ROADMAP.md](ROADMAP.md) §4), not a compute phase |
-| **F9** KVM, GPU, memory units | #12, #18, OPS-16 | this page | `prep_host.rb` KVM check (`File.chardev?("/dev/kvm")` + `vmx`/`svm`); LearnPci records only `vfio-pci`-bound GPUs (backport 2bf64a34c, extend to `generic`); LearnMemory accepts kB/MB/GB/TB and sums in MiB [PLANNED F9] |
+| **F9** KVM, GPU, memory units | #12, #18, OPS-16 | this page | `prep_host.rb` KVM check (`File.chardev?("/dev/kvm")` + `vmx`/`svm`; [no-kvm] the full verdict is `ByohVirtLadder`, see PF3); LearnPci records only `vfio-pci`-bound GPUs (backport 2bf64a34c, extend to `generic`); LearnMemory accepts kB/MB/GB/TB and sums in MiB [PLANNED F9] |
 | **F10** Ops scripts and docs | #13-17, #21, #33 | split | Location → NET-P1 / CMP-P1. Still here [PLANNED F10]: remove the `accepts_slices` hack; default boot image `ubuntu-noble`; the preflight (section 6); systemd units for web, `bin/restarter bin/respirate` and monitor (monitor enabled only after F5); Proxmox key distribution; terraform `host_add_command` output (ROADMAP §6.6); decouple R2 from `RACK_ENV` |
 
 **Order.** CMP-P0 (F1, F2, part of F3) first: it is the most likely reason a second or fourth VM fails on the live host. Then F3 remainder, F9 KVM check and the preflight (cheap, prevent bad hosts). F5 before anything starts `bin/monitor`. Networking items follow NET-P0..P6.
@@ -157,13 +158,23 @@ The networking contract checks (C1-C7, `host_guard`, inbound probes) are **not**
 
 ### 6.2 Checks
 
-Each `fail` prints a platform hint: Proxmox `qm set <id> --cpu host`; AWS a nested-virt instance type or `.metal`; GCP `--enable-nested-virtualization`; bare metal "enable VT-x / AMD-V in BIOS".
+Each `fail` prints a platform hint: Proxmox `qm set <id> --cpu host`; AWS a nested-virt instance type or `.metal`; GCP `--enable-nested-virtualization`; bare metal "enable VT-x / AMD-V in BIOS". [no-kvm] For PF3 the hint is not written here: it comes from the platform table `lib/byoh_virt_platforms.rb` (NO_KVM.md §4), which also covers Azure, Hyper-V, VMware, VirtualBox, OCI, Xen and the providers without nested virtualization.
+
+**PF3 delegation (the hook for M4, [no-kvm]).** PF3 does not keep its own KVM rule. It calls
+`ByohVirtLadder.preflight_check(facts, declared_tier:)` and prints its `status` (`pass`, `fail`, or `info`
+when a fact was not gathered), its `fix` as the fail hint and its `caveats` as INFO lines. The facts
+come from M4's own pinned SSH session: the probe script (`ByohVirtLadder.remote_script` piped to
+`ruby - --json`) or the shell-gathered keys listed in NO_KVM.md §2.3. The ladder refuses `kvm64`/`qemu64`
+CPU models as `kvm_blocked`, so PF3 and the ladder never disagree. For a host declared `container`,
+`pvm` or `emulated`, the KVM result becomes INFO, the PF-V row of that tier gates instead, and PF4,
+PF5 and PF7 (hugepages and GRUB) are skipped. Until M4 merges, registration runs the same check itself
+(`lib/byoh_virt_registration.rb`).
 
 | # | Check | Command | Pass rule | Fail / warn | Rule changes when | Derived from |
 |---|---|---|---|---|---|---|
 | PF1 | OS | `lsb_release -rs`; `uname -m` | `24.04`; `x86_64` or `aarch64` | fail | — | LearnOs; `prog/learn_cpu.rb:9` |
 | PF2 | Root SSH | from the CLI: `ssh -i KEY -o BatchMode=yes root@IP true` | exit 0, no forced command | fail | — | `bootstrap_rhizome` |
-| PF3 | KVM | `test -c /dev/kvm`; `grep -Ewo 'vmx\|svm' /proc/cpuinfo \| head -1`; `cat /sys/module/kvm_{intel,amd}/parameters/nested 2>/dev/null` | char device present and a flag found | fail | — | HW-4 |
+| PF3 | KVM | `test -c /dev/kvm`; `grep -Ewo 'vmx\|svm' /proc/cpuinfo \| head -1`; `cat /sys/module/kvm_{intel,amd}/parameters/nested 2>/dev/null` | char device present and a flag found | fail | [no-kvm] delegated to `ByohVirtLadder.preflight_check` (above); also fails on a `kvm64`-class CPU model, a `KVM_CREATE_VM` refusal, a missing KVM capability, the firmware lock seen in the kernel log, and a missing `pdpe1gb` | HW-4 |
 | PF4 | 1G pages (x86) | `grep -qw pdpe1gb /proc/cpuinfo` | present | fail | warn only on a `flexible` profile host [CMP-P1] | `prog/vm/host_nexus.rb:272` |
 | PF5 | GRUB | `grep -Eq '^GRUB_CMDLINE_LINUX=".*"$' /etc/default/grub && command -v update-grub && test -d /boot/grub` | all true | fail | — | `prog/setup_hugepages.rb:16-17` |
 | PF6 | RAM units | `dmidecode -t memory \| grep -E '^\s+Size: [0-9]'` | every line ends in `kB`, `MB`, `GB` or `TB` | fail | — (MB units accepted in M2) | `prog/learn_memory.rb` |
@@ -183,13 +194,25 @@ Each `fail` prints a platform hint: Proxmox `qm set <id> --cpu host`; AWS a nest
 | PF20 | CLI arguments | — | `--default-boot-image` non-empty; `--location` resolves to an existing Location id | fail | NET-P1 makes `--location` a real Location (`bin/byoh-location`) | OPS-3, OPS-14 |
 | PF21 | Control plane | on the control plane: units exist for `bin/monitor` and `bin/restarter bin/respirate` | present | warn | do not enable `bin/monitor` before F5; CMP-P2 must also stop `bin/monitor` from deleting the metric files that HostUsageMonitor reads (compute critic hole 5) | OPS-17 |
 
+**PF-V: checks for a host declared on a lower tier [no-kvm].** They replace PF3 (now INFO), PF4, PF5 and
+PF7 for that host. PF-V1 runs before registration (the probe's facts); PF-V2 and PF-V3 are what
+rhizome's `prep_host.rb <host> <env> <tier>` checks at prep, never installing anything
+(`rhizome/host/lib/host_tier.rb`). Every row is spec-covered; none has run on a real host (UNVERIFIED).
+
+| # | Check | Facts or command | Pass rule | Fail fix | Derived from |
+|---|---|---|---|---|---|
+| PF-V1 | Ladder verdict for the declared tier | `ByohVirtLadder.preflight_check(facts, declared_tier:)` | the tier is `ready` | `possible`: install its packages (`apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs`; `apt-get install qemu-system-x86 ovmf`); fails on an L1 host ("register it as kvm"), in a container, without permission, or on a kernel that cannot run the tier | NO_KVM.md §2.3, §11.2 |
+| PF-V2 | Container host (`container`) | `uname -m`, `/sys/fs/cgroup/cgroup.controllers`, kernel release, systemd version, `dpkg-query`, `aa-status`, four sysctls, `/etc/subuid` and `/etc/subgid` | x86_64; cgroup v2; Linux ≥ 5.12; systemd ≥ 254; the packages; AppArmor profile `lxc-container-default-cgns` loaded; `kernel.dmesg_restrict` ≥ 1, `kptr_restrict` ≥ 1, `unprivileged_bpf_disabled` ≥ 1, `perf_event_paranoid` ≥ 2 (Ubuntu's defaults pass); no subordinate id range reaching 1,000,000,000 | `bootstrap-data-plane.sh --tier container`; the sysctl lines in `/etc/sysctl.d/`; remove the overlapping range ([TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.2) | NO_KVM.md §5.5 |
+| PF-V3 | Emulated host (`emulated`) | `uname -m`; `dpkg-query -W -f='${Package} ${db:Status-Abbrev}' qemu-system-x86 ovmf`; `qemu-system-x86_64 -accel help` | x86_64; both packages `ii`; `tcg` listed | `bootstrap-data-plane.sh --tier emulated` | NO_KVM.md §8.1; EMULATED_HOSTS.md §6.3 |
+| PF-V4 | PVM host (`pvm`) | `kvm_pvm` loaded, Secure Boot, CPU vulnerabilities | — | Not offered: `--virt-tier pvm` is refused until the PVM build (NO_KVM.md §6.7) | NO_KVM.md §6 |
+
 ### 6.3 Running the host-side checks by hand [TODAY]
 
 There is no preflight script yet. These commands are read-only; run them as root on the candidate host. The block as a whole is UNVERIFIED as a script; each command is standard.
 
 ```bash
 lsb_release -rs; uname -m                                                    # PF1
-test -c /dev/kvm && echo kvm-ok; grep -Ewo 'vmx|svm' /proc/cpuinfo | head -1 # PF3
+test -c /dev/kvm && echo kvm-ok; grep -Ewo 'vmx|svm' /proc/cpuinfo | head -1 # PF3 ([no-kvm]: run bin/byoh-virt probe from the control plane instead)
 grep -qw pdpe1gb /proc/cpuinfo && echo pdpe1gb-ok                            # PF4
 grep -E '^GRUB_CMDLINE_LINUX=".*"$' /etc/default/grub; command -v update-grub # PF5
 dmidecode -t memory | grep -E '^\s+Size: [0-9]'                              # PF6 (kB/MB/GB/TB)

@@ -59,7 +59,7 @@ Avoid AWS when:
 | **m8i.2xlarge**, nested virtualization | **Verified** (ap-south-1, 2026-10-11 and 2026-10-13) | 8 vCPU / 32 GiB. Gives 4 usable cores and 26 × 1G hugepages, enough for 2-3 `standard-2` VMs. About $0.45/h in ap-south-1 (CLAUDE.md §10a). Register → `accepting` took about 4 minutes. |
 | Other m8i/c8i/r8i sizes | UNVERIFIED | AWS docs list C8i, M8i and R8i for nested virtualization. A newer version of the docs lists more families (C7i/M7i/R7i, the `-flex` and `d` variants, X8i, I7i) (provider docs, UNVERIFIED here). Check the [AWS nested virtualization page](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html) for your region. |
 | **m5d.metal** | Verified earlier (tag `aws-mumbai-working-v1`) | Native VT-x, 96 vCPU. About $5.86/h (ROADMAP.md §8, CLAUDE.md §10a). The 4 instance-store NVMe disks are **not** used (STOR-3). Needs vCPU quota (§2.3). |
-| Any type without nested-virtualization support (or with it off), or any AMD/Graviton type, unless it is `.metal` | Will not work | No `/dev/kvm`. `bootstrap-data-plane.sh` and PrepHost both refuse such a host. |
+| Any type without nested-virtualization support (or with it off), or any AMD/Graviton type, unless it is `.metal` | Will not work for standard VMs | No `/dev/kvm`. `bootstrap-data-plane.sh` and PrepHost both refuse such a host. On branch `no-kvm`, `bin/byoh-virt probe` names the fix for the exact type (switch the option on for c8i/m8i/r8i; move other Nitro types to C8i/M8i/R8i or `.metal`; move Xen types such as t2/m4 to a Nitro type), and the type can still run the experimental `container` or `emulated` tier ([NO_KVM.md](../NO_KVM.md)). Moving to an m8i of the same size is the better answer: similar per-vCPU price (UNVERIFIED, NO_KVM.md §7) at full KVM speed. |
 
 Changing `cpu_options` needs a stopped instance (provider docs, UNVERIFIED here). Choose the type before you register.
 
@@ -177,6 +177,11 @@ test -f /var/log/user-data.done && echo user-data ok
 ls -l /dev/kvm && grep -cw vmx /proc/cpuinfo && grep -cw pdpe1gb /proc/cpuinfo
 ip -br -4 addr          # only the primary IP (e.g. ens5 10.98.1.x/24) and lo
 ```
+
+On branch `no-kvm` the control plane can do the KVM part for you, with more detail (the KVM capabilities
+cloud-hypervisor needs, the instance type's rule and the fix): `bin/byoh-virt probe --main-ip <data_private_ip> --ssh-key <key>`.
+It needs `ruby` on the host, which `bootstrap-data-plane.sh` installs (user-data installs `ruby-bundler`).
+UNVERIFIED on AWS.
 
 Running `bootstrap-data-plane.sh` on top of user-data is harmless. Its marker steps are idempotent, and it also does the KVM check. The script is self-contained: copy it to the host (scp) or clone the repo.
 
@@ -414,7 +419,8 @@ Common, platform-neutral problems are in [TROUBLESHOOTING.md](../TROUBLESHOOTING
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `bootstrap-data-plane.sh`: `/dev/kvm is missing`; or PrepHost fails with `/dev/kvm is not a character device` | Instance type without nested virtualization, or `data_plane_nested_virtualization` left `false` (the default) | Use m8i/c8i/r8i with `data_plane_nested_virtualization = true` (AWS provider ≥ 6), or a `.metal` type. Changing `cpu_options` needs a stopped instance; do it before registering. |
+| `bootstrap-data-plane.sh`: `/dev/kvm is missing`; or PrepHost fails with `/dev/kvm is not a character device` | Instance type without nested virtualization, or `data_plane_nested_virtualization` left `false` (the default) | Use m8i/c8i/r8i with `data_plane_nested_virtualization = true` (AWS provider ≥ 6), or a `.metal` type. Changing `cpu_options` needs a stopped instance; do it before registering. `bin/byoh-virt probe` (branch `no-kvm`) prints the rule for the exact type; [NO_KVM.md](../NO_KVM.md) §4 and §7 (cost). |
+| `bin/byoh-virt probe`: `tier: none`, `platform: aws_xen` | A Xen-based type (t2, m4 and older) | Move to a Nitro type: C8i/M8i/R8i with nested virtualization, or `.metal`. The DMI strings that identify Xen types are UNVERIFIED |
 | Customers get `Permission denied (publickey)` on a VM; `wait_sshable` passed anyway | ENI secondary IPs configured on the host NIC by cloud-init: the host answers instead of the VM (C5) | `ip -br -4 addr` on the host. Check `/etc/cloud/cloud.cfg.d/99-ubi-byoh-no-secondary-ips.cfg` exists, strip `addresses:` from `/etc/netplan/50-cloud-init.yaml`, `ip addr del <ip>/<len> dev ens5`. Never use `aws-routed-network-setup.sh`. |
 | VM create fails: `<ip> is a local address of this host, so the host answers for the VM` | Same cause, caught by the a092f1b8b check | As above, then recreate the VM |
 | `ssh ubi@<EIP>` times out, while egress from the VM works | Data plane SG: `data_plane_open_ingress = false` and the client is outside `operator_ssh_cidr`, or the port is not 22 | Test from `operator_ssh_cidr`. Open ingress only after `host_guard` (§3.10). `bin/byoh-pool trace <EIP>` shows which VM owns the address. |
@@ -481,4 +487,5 @@ aws ec2 describe-addresses --region <aws_region from mysite.tfvars> \
 - Single AZ, single control plane, nothing restarts after a control plane reboot.
 - `variables.tf` defaults (m5d.metal, nested off) and the `terraform.tfvars.example` comment that `.metal` is required are stale.
 - `aws-routed-network-setup.sh` is broken and retired.
+- Not run on AWS (branch `no-kvm`, UNVERIFIED): the probe on m8i with nested on and off, m6i/m7i, t3 and a Xen type (NO_KVM.md §14, L1-T2, L2-T1, L2-T2, L2-T9); the `container` and `emulated` tiers on a non-nested type (L3-T1, L5-T1); the PVM go/no-go on m6i.large (L4-T1).
 - Changes to EIPs in AWS are not synced automatically; `bin/byoh-pool sync-aws` is PLANNED P7.

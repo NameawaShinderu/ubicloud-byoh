@@ -45,6 +45,14 @@ Pick something else when:
 
 `scripts/byoh/bootstrap-data-plane.sh` refuses a host without `/dev/kvm`, without `vmx`/`svm`, or without `pdpe1gb`, before you register it (105b6439b). PrepHost checks KVM again after registration.
 
+On branch `no-kvm`, `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` on the control plane tells you
+before registering whether the VM has usable KVM and, if not, the fix for GCP (`--enable-nested-virtualization`
+on an Intel series or N4D, the org policy) or Azure (a Dv3/Ev3-or-newer size, security type Standard),
+with a cost line: on GCP the nested option costs nothing extra, on Azure a Dv5/Ev5 of the same size is
+about the same price (UNVERIFIED; [NO_KVM.md](../NO_KVM.md) §4, §7). Changing the type is almost always
+better than the experimental `container` or `emulated` tiers that a VM without KVM can still run.
+The probe's GCP and Azure rows are UNVERIFIED (never run on either).
+
 ### 2.2 Network
 
 | Item | GCP | Azure |
@@ -376,7 +384,7 @@ A GCP site with only variant B has no VM-A or VM-D: run `m2-gate.sh g1 g2 g3 g4 
 
 | # | Platform | Symptom | Cause | Fix |
 |---|---|---|---|---|
-| G1 | GCP | `bootstrap-data-plane.sh` stops: "/dev/kvm is missing" | Created without `--enable-nested-virtualization`, on E2/Arm/memory-optimized/AMD (not N4D), or the org policy `constraints/compute.disableNestedVirtualization` is enforced | Recreate on N2 or C3 with the flag. Ask the org admin about the policy. |
+| G1 | GCP | `bootstrap-data-plane.sh` stops: "/dev/kvm is missing" | Created without `--enable-nested-virtualization`, on E2/Arm/memory-optimized/AMD (not N4D), or the org policy `constraints/compute.disableNestedVirtualization` is enforced | Recreate on N2 or C3 with the flag. Ask the org admin about the policy. `bin/byoh-virt probe` (branch `no-kvm`) prints the same fix with the reason |
 | G2 | GCP | VM SSH gives "Permission denied (publickey)", or `wait_sshable` passes but customers cannot log in; or VM create fails with "is a local address of this host" | The guest agent put the alias range or forwarding-rule IP into `table local` (C5) | §3.2. Then `ip route show table local` and `sudo ip route del local <range> dev ens4 table local` for each leftover (the agent tags them `proto 66`), and recreate the VM |
 | G3 | GCP A | VM stuck at `wait_sshable` | `cp_reach: onhost` makes the control plane dial the forwarding-rule IP. Its traffic leaves through its own external IP or Cloud NAT, which the `byoh-pool-in` rule may not cover, or the control plane has no internet egress. | `nc -vz <forwarding-rule IP> 22` from the control plane. Give the control plane egress and allow its egress IP. |
 | G4 | GCP A | Inbound works for TCP but not ping, or IPsec between hosts fails | Forwarding rules created with `--ip-protocol=TCP`/`UDP` instead of `L3_DEFAULT` | Recreate the rule with `L3_DEFAULT` if your project accepts it (§3.6) |
@@ -384,7 +392,7 @@ A GCP site with only variant B has no VM-A or VM-D: run `m2-gate.sh g1 g2 g3 g4 
 | G6 | GCP B | Internal VM unreachable from the rest of the VPC | The alias range is not on the NIC (`--aliases` replaced the list), or the firewall does not allow the VPC to it | `gcloud compute instances describe byoh-data-1 --zone=<zone> --format='value(networkInterfaces[0].aliasIpRanges)'`; add a rule for the alias CIDR |
 | G7 | GCP | Internal VM cannot reach other machines in the VPC | By design: the underlay (every VPC subnet, §3.5) is in `deny4`, so VM-opened connections into it are dropped | Expected (NETWORKING §6.5). There is no allow override today: `vm_egress_allow` (`--egress-allow`) is stored but nothing reads it (PLANNED). The only lever is to leave that range out of `--underlay`, `--cp-source` and `--mgmt-allow`. |
 | G8 | GCP | Large transfers stall | Guest MTU above the 1460 path | Guests get 1400 through DHCP. Check that the guest image did not override it (`ip link` in the VM). |
-| Z1 | Azure | `bootstrap-data-plane.sh` stops: "/dev/kvm is missing" | Trusted Launch on a size older than v5, or a size without nested virtualization (some AMD `as` sizes) | Recreate with `--security-type Standard` on a size that lists nested virtualization. The portal may switch the security type back when you change other Basics fields (Microsoft Q&A). |
+| Z1 | Azure | `bootstrap-data-plane.sh` stops: "/dev/kvm is missing" | Trusted Launch on a size older than v5, or a size without nested virtualization (some AMD `as` sizes) | Recreate with `--security-type Standard` on a size that lists nested virtualization. The portal may switch the security type back when you change other Basics fields (Microsoft Q&A). B-series and A-series sizes have no nested virtualization; `bin/byoh-virt probe` (branch `no-kvm`) prints the fix for the size |
 | Z2 | Azure | SSH to the VM reaches the host ("Permission denied (publickey)"), or VM create fails with "is a local address of this host" | cloud-init applied the secondary ipconfigs to `eth0`, often on the registration reboot | §3.2: the cloud-init drop-in, remove `addresses:` from the netplan, `ip addr del`, then recreate the VM |
 | Z3 | Azure | PrepHost fails downloading cloud-hypervisor; boot images never download | No outbound access: VNet created after 2025-09-30 without a NAT gateway or Public IP | Attach a NAT gateway to the subnet, or a Public IP to the primary ipconfig |
 | Z4 | Azure | VM shows its Public IP but inbound times out | The NSG rule names the Public IP instead of the private pool IP, or the Public IP is not associated with that ipconfig | NSG rules match the private address (§3.8); `az network nic ip-config list -g <rg> --nic-name <nic> -o table` |
@@ -415,6 +423,8 @@ Common problems that are not specific to GCP or Azure (bootstrap SSH, outbound i
 - Accelerated Networking with BYOH is untested.
 - IPv6 is `ula` only.
 - There is no terraform module (`terraform/azure-byoh` is PLANNED).
+
+Not run on either cloud (branch `no-kvm`, UNVERIFIED): the probe on GCP n2 with nested (NO_KVM.md §14 L1-T3) and on E2, Azure sizes with and without nested, and the PVM go/no-go on a GCP e2-standard-4 (L4-T1).
 
 Code paths these pages rely on are covered by unit specs only (a0259a997, 9d85a6e3c, c73f96ddc, a092f1b8b, 105b6439b). The common flow (location, pools, registration, egress NAT, gate) is validated on AWS only.
 
