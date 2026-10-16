@@ -190,7 +190,7 @@ if [ -f "$probe" ] && { [ "$TIER" = auto ] || [ "$TIER" = kvm ]; }; then
     require_shipped_tier "$TIER"
   fi
 fi
-virt_hint="For the fix on this platform run, on the control plane: bin/byoh-virt probe --main-ip <this host>. Enable VT-x/AMD-V in the firmware on bare metal. On a cloud VM, use an instance type with nested virtualization enabled (AWS m8i/c8i/r8i with nested virtualization, GCP --enable-nested-virtualization, an Azure size that supports nested virtualization) or a bare-metal type. On Proxmox: qm set <vmid> --cpu host. A VPS without nested virtualization cannot be a data plane."
+virt_hint="For the fix on this platform run, on the control plane: bin/byoh-virt probe --main-ip <this host>. Enable VT-x/AMD-V in the firmware on bare metal. On a cloud VM, use an instance type with nested virtualization enabled (AWS m8i/c8i/r8i with nested virtualization, GCP --enable-nested-virtualization, an Azure size that supports nested virtualization) or a bare-metal type. On Proxmox: qm set <vmid> --cpu host. A VPS without nested virtualization can still be a data plane on a slower fallback tier: rerun with --tier auto (or --tier container or emulated); see docs/byoh/NO_KVM.md."
 if [ "$TIER" = kvm ]; then
   if [ ! -c /dev/kvm ]; then
     echo "ERROR: /dev/kvm is missing, so KVM is unavailable." >&2
@@ -277,7 +277,7 @@ else
   # The check prep runs (HostTier.check_emulator!), made here so a broken
   # QEMU is found before registration.
   if [ "$TIER" = emulated ]; then
-    if ! qemu-system-x86_64 -accel help 2>/dev/null | grep -qx tcg; then
+    if ! grep -qx tcg <<<"$(qemu-system-x86_64 -accel help 2>/dev/null)"; then
       echo "ERROR: qemu-system-x86_64 does not list the tcg accelerator." >&2
       exit 1
     fi
@@ -342,6 +342,31 @@ else
   sudo apt-get install -y ruby-bundler netcat-openbsd
   which bundle
   done_marker bundler-preinstalled
+
+  # Prog::Vm::HostNexus#verify_tier_capacity, early: one VM of the
+  # tier's smallest size (Option::TierVmSizes) must fit beside the core
+  # kept for the host, within the memory budget of
+  # ByohVirtTiers.memory_budget_gib (hugepages taken as none).
+  case "$TIER" in
+    container) min_gib=8 overhead_mib=128 ;;
+    pvm) min_gib=8 overhead_mib=384 ;;
+    *) min_gib=2 overhead_mib=512 ;;
+  esac
+  cores=$(lscpu -p=core,socket | grep -v '^#' | sort -u | wc -l)
+  threads=$(nproc --all)
+  cores_needed=$((2 * cores / threads))
+  [ "$cores_needed" -ge 1 ] || cores_needed=1
+  if [ $((cores - 1)) -lt "$cores_needed" ]; then
+    echo "ERROR: a $TIER host needs $((cores_needed + 1)) physical cores, one for the host and $cores_needed for a $TIER-2 VM; this host has $cores cores and $threads threads." >&2
+    exit 1
+  fi
+  mem_mib=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+  budget_gib=$(((mem_mib * 42 / 43 - 2048 - overhead_mib * (threads / 2)) / 1024))
+  if [ "$budget_gib" -lt "$min_gib" ]; then
+    echo "ERROR: a $TIER host with $mem_mib MiB of memory has a VM memory budget of about $budget_gib GiB, less than the $min_gib GiB of a $TIER-2 VM; give it more memory." >&2
+    exit 1
+  fi
+  echo "  capacity: $cores cores, $threads threads, about $budget_gib GiB for $TIER VMs"
 fi
 
 # --- Step 5: print next steps ----------------------------------------
@@ -367,8 +392,11 @@ echo "    --location <site> \\"
 echo "    --main-ip ${MY_IP:-<this-host-primary-ip>} \\"
 echo "    --pool-file pools.yaml \\"
 echo "    --ssh-key /path/to/ctrl-plane/privkey \\"
-echo "    --default-boot-image ubuntu-noble \\"
-if [ "$TIER" != kvm ]; then
+if [ "$TIER" = kvm ]; then
+  echo "    --default-boot-image ubuntu-noble \\"
+else
+  # A lower tier boots only its own images, and the host downloads the
+  # first of them when no --default-boot-image is given.
   echo "    --virt-tier $TIER --accept-fallback \\"
 fi
 echo "    --yes"

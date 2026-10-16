@@ -245,6 +245,14 @@ module ByohVirtTiers
     {"nested_userns" => acked?(location, "container", "nested-userns"), "guest_firewall" => acked?(location, "container", "guest-firewall")}
   end
 
+  # Whether the VM keeps non-root users off the load balancer cert
+  # server address: every VM but a container one in a location that did
+  # not acknowledge container:guest-firewall (rhizome drops the guard and
+  # the address there).
+  def self.cert_server_guarded?(vm)
+    vm.family != "container" || acked?(vm.location, "container", "guest-firewall")
+  end
+
   # One project per location for every lower tier, unless the tier is
   # shared (shared?). Takes a lock on the location row, so two creates
   # for different projects cannot both pass; call it inside the create
@@ -255,6 +263,12 @@ module ByohVirtTiers
 
     others = Vm.where(location_id: location.id, family: TIERS.values.map(&:family)).exclude(project_id:)
     refuse "location #{location.display_name} already runs lower-tier VMs of another project, and its #{tier} tier is single-project" unless others.empty?
+  end
+
+  # The tier's smallest VM size: what a host must hold at least one of.
+  def self.smallest_size(tier)
+    family = fetch(tier).family
+    Option::TierVmSizes.select { it.family == family }.min_by(&:vcpus)
   end
 
   # The guest memory budget in GiB of a lower-tier host

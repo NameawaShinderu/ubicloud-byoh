@@ -396,7 +396,14 @@ class Prog::Vm::HostNexus < Prog::Base
     hugepage_kib = host_meminfo[/^Hugepagesize:\s+(\d+) kB$/, 1]
     fail "Couldn't parse /proc/meminfo" unless mem_total && available && hugepages && hugepage_kib
     fail "Insufficient memory left for the host OS" if Integer(available) < 2 * 1024 * 1024
-    fail "#{vm_host.virt_tier} hosts need at least 2 physical cores" if vm_host.total_cores < 2
+    # One VM of the tier's smallest size must fit beside the core kept
+    # for the host (wait_prep), in the allocator's terms
+    # (scheduling/allocator.rb), or the host would accept and never place.
+    smallest = ByohVirtTiers.smallest_size(vm_host.virt_tier)
+    cores_needed = [1, smallest.vcpus * vm_host.total_cores / vm_host.total_cpus].max
+    if vm_host.total_cores - 1 < cores_needed
+      fail "#{vm_host.virt_tier} hosts need #{cores_needed + 1} physical cores, one for the host and #{cores_needed} for a #{smallest.name} VM; this host has #{vm_host.total_cores} cores and #{vm_host.total_cpus} threads"
+    end
 
     hugepages_mib = Integer(hugepages) * Integer(hugepage_kib) / 1024
     Clog.emit("lower-tier host keeps hugepages", {tier_capacity: {vm_host_id: vm_host.id, hugepages_mib:}}) if hugepages_mib > 0
@@ -405,6 +412,7 @@ class Prog::Vm::HostNexus < Prog::Base
     vm_host.lock!
     used = vm_host.active_vms_dataset.sum(:memory_gib) || 0
     fail "Not enough memory budget for VMs (#{budget} GiB for #{used} GiB of VMs)" if used > budget
+    fail "A #{budget} GiB memory budget cannot hold a #{smallest.name} VM (#{smallest.memory_gib} GiB); give the host more memory" if budget < smallest.memory_gib
 
     vm_host.update(total_hugepages_1g: budget, used_hugepages_1g: used)
     hop_start_slices
@@ -545,6 +553,10 @@ TIMER
 
       nap 60
     end
+
+    # A lower-tier host is probed again once a day, for the pages of
+    # Prog::LearnVirt (a pending kernel reboot); KVM hosts are not.
+    Prog::LearnVirt.assemble(vm_host.id) if ByohVirtTiers.lower?(vm_host.virt_tier) && Prog::LearnVirt.stale?(vm_host)
 
     nap 6 * 60 * 60
   end
