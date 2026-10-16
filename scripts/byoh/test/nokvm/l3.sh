@@ -13,7 +13,7 @@
 # scratch tmpfs must hold under 1 GiB (the image and nothing of the VMs).
 #
 # What it cannot do, and fakes (each says so in the log): systemd
-# (fake-systemctl), project quotas and AppArmor (lab-setup-vm.rb),
+# (fake-systemctl), project quotas and AppArmor (lab-setup-vm),
 # lxcfs (needs /dev/fuse). crypt-loop disks need loop and device-mapper
 # devices, so only the dir driver runs.
 set -euo pipefail
@@ -50,7 +50,7 @@ check_not() { # check_not DESC CMD...: CMD must fail
   else ok "$desc"; fi
 }
 
-setup_vm() { (cd /home/rhizome && ruby "$W/lab-setup-vm.rb" "$@"); }
+setup_vm() { (cd /home/rhizome && ruby "$W/lab-setup-vm" "$@"); }
 ssh_vm() { # ssh_vm IP CMD...
   local ip=$1
   shift
@@ -278,12 +278,12 @@ symlink_probe() {
   check "$vm: nothing of the container is left after the stop" bash -c "! ps -eo uid= | awk '\$1 >= $base && \$1 < $base + 65536' | grep -q . && test -z \"\$(cat /sys/fs/cgroup/system.slice/$vm.service/*/cgroup.procs 2>/dev/null)\""
   # A host reboot: nothing of the VM runs when recreate-unpersisted does.
   systemctl stop "$vm-dnsmasq"
-  check "$vm: recreate-unpersisted brings it back" bash -c "echo '{\"storage\":{}}' | (cd /home/rhizome && ruby $W/lab-setup-vm.rb recreate-unpersisted $vm)"
+  check "$vm: recreate-unpersisted brings it back" bash -c "echo '{\"storage\":{}}' | (cd /home/rhizome && ruby $W/lab-setup-vm recreate-unpersisted $vm)"
   local i
   for ((i = 0; i < 120; i++)); do ssh_vm "$ip" true 2>/dev/null && break; sleep 0.25; done
   check "$vm: SSH again after the restart" ssh_vm "$ip" true || true
   ssh_vm "$ip" true 2>/dev/null || dump_vm "$vm"
-  check "$vm: restart through setup-vm" bash -c "cd /home/rhizome && ruby $W/lab-setup-vm.rb restart $vm"
+  check "$vm: restart through setup-vm" bash -c "cd /home/rhizome && ruby $W/lab-setup-vm restart $vm"
   for ((i = 0; i < 120; i++)); do ssh_vm "$ip" true 2>/dev/null && break; sleep 0.25; done
   check "$vm: SSH again after setup-vm restart" ssh_vm "$ip" true
   after=$(sha256sum /etc/passwd /etc/shadow /etc/subuid /root/.ssh/authorized_keys 2>/dev/null; ls -la /etc /root)

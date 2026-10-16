@@ -655,7 +655,7 @@ Differences from section 5.3:
   `clone3`'s ENOSYS together (one switch, simpler than 5.3's split).
 
 Lab artifacts, each said in the lab's output (`scripts/byoh/test/nokvm/l3.sh`, `fake-systemctl`,
-`lab-setup-vm.rb`): no systemd (a shell emulation of the two units; `ip netns exec` instead of
+`lab-setup-vm`): no systemd (a shell emulation of the two units; `ip netns exec` instead of
 `NetworkNamespacePath=`, because docker masks parts of `/sys` and LXC's sysfs mount needs a fully
 visible one); no project quota (tmpfs) and no AppArmor (a container cannot load profiles); no lxcfs
 (`/dev/fuse` is a host device); no `crypt-loop` (loop and device-mapper devices); the lab container runs
