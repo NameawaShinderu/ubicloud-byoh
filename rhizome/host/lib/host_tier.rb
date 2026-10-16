@@ -113,7 +113,9 @@ module HostTier
   # --tier container installs them): LXC, lxcfs, newuidmap, xz for the root
   # tarballs, setquota for unencrypted disks, cryptsetup and mkfs.ext4 for
   # encrypted ones.
-  CONTAINER_PACKAGES = %w[lxc-utils lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs].freeze
+  # "a|b" takes either package: Ubuntu 24.04 ships the LXC tools in lxc,
+  # later releases in lxc-utils.
+  CONTAINER_PACKAGES = %w[lxc|lxc-utils lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs].freeze
 
   CONTAINER_INSTALL_HINT = "run scripts/byoh/bootstrap-data-plane.sh --tier container (or apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs)"
 
@@ -165,11 +167,12 @@ module HostTier
   # error instead of a backtrace.
   def self.missing_packages(packages = PACKAGES, hint = INSTALL_HINT)
     out = begin
-      r("dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", *packages, expect: [0, 1])
+      r("dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", *packages.flat_map { |spec| spec.split("|") }, expect: [0, 1])
     rescue CommandFail, SystemCallError => e
       raise Unsupported, "dpkg-query failed: #{e.message.strip}; #{hint}"
     end
-    packages - out.scan(/^(\S+) [uih]i $/).flatten
+    installed = out.scan(/^(\S+) [uih]i $/).flatten
+    packages.reject { |spec| spec.split("|").any? { |name| installed.include?(name) } }
   end
 
   # Whether QEMU runs and was built with the TCG accelerator.

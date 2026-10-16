@@ -189,7 +189,7 @@ RSpec.describe HostTier do
       end
     end
 
-    let(:container_dpkg) { ["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", *HostTier::CONTAINER_PACKAGES] }
+    let(:container_dpkg) { ["dpkg-query", "-W", "-f=${Package} ${db:Status-Abbrev}\n", "lxc", "lxc-utils", *HostTier::CONTAINER_PACKAGES.drop(1)] }
 
     def put(path, content)
       full = File.join(@root, path)
@@ -203,8 +203,17 @@ RSpec.describe HostTier do
       put("sys/kernel/security/apparmor/profiles", "lxc-container-default-cgns (enforce)\nlsb_release (enforce)\n")
     end
 
-    def installed
-      HostTier::CONTAINER_PACKAGES.map { "#{_1} ii \n" }.join
+    def installed(lxc: "lxc-utils")
+      [lxc, *HostTier::CONTAINER_PACKAGES.drop(1)].map { "#{_1} ii \n" }.join
+    end
+
+    it "takes either lxc or lxc-utils for the LXC tools" do
+      ready_root
+      allow(described_class).to receive(:_run_command).with("systemctl", "--version").and_return("systemd 255\n")
+      %w[lxc lxc-utils].each do |lxc|
+        expect(described_class).to receive(:_run_command).with(*container_dpkg, expect: [0, 1]).and_return(installed(lxc: lxc))
+        expect(described_class.missing_packages(HostTier::CONTAINER_PACKAGES)).to eq([])
+      end
     end
 
     it "names the tier when refusing another architecture" do
@@ -237,7 +246,7 @@ RSpec.describe HostTier do
     it "refuses missing packages with the install hint" do
       ready_root
       expect(described_class).to receive(:_run_command).with("systemctl", "--version").and_return("systemd 255\n")
-      expect(described_class).to receive(:_run_command).with(*container_dpkg, expect: [0, 1]).and_return("lxc-utils ii \n")
+      expect(described_class).to receive(:_run_command).with(*container_dpkg, expect: [0, 1]).and_return("lxc ii \n")
       expect { described_class.check_container_runtime!(root: @root, release: "6.8.0") }.to raise_error(HostTier::Unsupported, /\Amissing packages: lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs; run scripts\/byoh\/bootstrap-data-plane.sh --tier container/)
     end
 
