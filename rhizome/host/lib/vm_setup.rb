@@ -538,25 +538,25 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
     # Allocate ::1 in the guest network for DHCPv6.
     guest_intrusion = guest_ephemeral.nth(1).to_s + "/" + guest_ephemeral.netmask.prefix_len.to_s
     nics.each do |nic|
-      r "ip", "-n", @vm_name, "addr", "replace", guest_intrusion, "dev", nic.tap
+      r "ip", *ip_netns_args, "addr", "replace", guest_intrusion, "dev", nic.tap
 
-      r "ip", "-n", @vm_name, "addr", "replace", dns_ipv4, "dev", nic.tap
+      r "ip", *ip_netns_args, "addr", "replace", dns_ipv4, "dev", nic.tap
 
       # Route ephemeral address to tap.
-      r "ip", "-n", @vm_name, "link", "set", "dev", nic.tap, "up"
-      r "ip", "-n", @vm_name, "route", "replace", guest_ephemeral.to_s, "via", mac_to_ipv6_link_local(nic.mac), "dev", nic.tap
-      r "ip", "-n", @vm_name, "route", "del", guest_ephemeral.to_s, "dev", nic.tap
+      r "ip", *ip_netns_args, "link", "set", "dev", nic.tap, "up"
+      r "ip", *ip_netns_args, "route", "replace", guest_ephemeral.to_s, "via", mac_to_ipv6_link_local(nic.mac), "dev", nic.tap
+      r "ip", *ip_netns_args, "route", "del", guest_ephemeral.to_s, "dev", nic.tap
 
       # Route private subnet addresses to tap.
       ip6 = NetAddr::IPv6Net.parse(nic.net6)
 
       # Allocate ::1 in the guest network for DHCPv6.
-      r "ip", "-n", @vm_name, "addr", "replace", "#{ip6.nth(1)}/#{ip6.netmask.prefix_len}", "dev", nic.tap, "noprefixroute"
-      r "ip", "-n", @vm_name, "route", "replace", ip6.to_s, "via", mac_to_ipv6_link_local(nic.mac), "dev", nic.tap
+      r "ip", *ip_netns_args, "addr", "replace", "#{ip6.nth(1)}/#{ip6.netmask.prefix_len}", "dev", nic.tap, "noprefixroute"
+      r "ip", *ip_netns_args, "route", "replace", ip6.to_s, "via", mac_to_ipv6_link_local(nic.mac), "dev", nic.tap
     end
 
-    r "ip", "-n", @vm_name, "addr", "replace", "fd00:0b1c:100d:5AFE:CE::", "dev", nics.first.tap if cert_address
-    r "ip", "-n", @vm_name, "addr", "replace", "fd00:0b1c:100d:53::", "dev", nics.first.tap
+    r "ip", *ip_netns_args, "addr", "replace", "fd00:0b1c:100d:5AFE:CE::", "dev", nics.first.tap if cert_address
+    r "ip", *ip_netns_args, "addr", "replace", "fd00:0b1c:100d:53::", "dev", nics.first.tap
   end
 
   def routes4(ip4, ip4_local, nics)
@@ -589,7 +589,20 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
 
   def tap_proxy_arp(nic)
     inner = cmd("echo 1 > :path", path: "/proc/sys/net/ipv4/conf/#{nic.tap}/proxy_arp")
-    r "ip netns exec :vm bash -c :inner", vm: @vm_name, inner: inner
+    if @in_vm_netns
+      r "bash -c :inner", inner: inner
+    else
+      r "ip netns exec :vm bash -c :inner", vm: @vm_name, inner: inner
+    end
+  end
+
+  # How ip reaches the VM's network namespace: by name, except in LXC's
+  # network hook (container_net_up). The hook already runs in that
+  # namespace, as the unit sets NetworkNamespacePath, and Ubuntu's
+  # AppArmor profile for lxc-start denies the /sys mount that switching
+  # namespaces (ip -n, ip netns exec) needs.
+  def ip_netns_args
+    @in_vm_netns ? [] : ["-n", @vm_name]
   end
 
   # The network hook of a container (setup-vm net-up), run by LXC once it
@@ -597,18 +610,19 @@ add element inet drop_unused_ip_packets allowed_ipv4_addresses { #{ip_net} }
   # interfaces, setup_taps_6, routes4 and update_via_routes do for a
   # cloud-hypervisor VM's tap.
   def container_net_up(gua, ip4, nics, dns_ipv4)
+    @in_vm_netns = true
     ip4 = nil if ip4.empty?
-    nics.each { |nic| r "ip", "-n", @vm_name, "addr", "replace", nic.private_ipv4_gateway, "dev", nic.tap }
+    nics.each { |nic| r "ip", *ip_netns_args, "addr", "replace", nic.private_ipv4_gateway, "dev", nic.tap }
     # Without the guest firewall, the guest has no rule keeping non-root
     # users off the cert server (write_user_data), so it gets no address
     # to reach one; the control plane refuses such VMs in TLS load
     # balancers (LoadBalancer#check_cert_guard!).
     setup_taps_6(gua, nics, dns_ipv4, cert_address: container_setup.guest_firewall?)
     nics.each do |nic|
-      r "ip", "-n", @vm_name, "route", "replace", NetAddr::IPv4Net.parse(ip4).to_s, "dev", nic.tap if ip4
+      r "ip", *ip_netns_args, "route", "replace", NetAddr::IPv4Net.parse(ip4).to_s, "dev", nic.tap if ip4
       tap_proxy_arp(nic)
       local_ip4 = NetAddr::IPv4Net.parse(nic.net4)
-      r "ip", "-n", @vm_name, "route", "replace", local_ip4.to_s, "via", local_ip4.nth(1).to_s, "dev", nic.tap unless local_ip4.netmask.prefix_len == 32
+      r "ip", *ip_netns_args, "route", "replace", local_ip4.to_s, "via", local_ip4.nth(1).to_s, "dev", nic.tap unless local_ip4.netmask.prefix_len == 32
     end
   end
 

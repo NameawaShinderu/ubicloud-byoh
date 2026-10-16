@@ -113,11 +113,21 @@ RSpec.describe VmSetup do
     end
 
     it "gives the tap the addresses and routes of a cloud-hypervisor tap from the network hook" do
-      expect(vs).to receive(:_run_command).with("ip", "-n", vm, "addr", "replace", "10.0.0.254/32", "dev", "nccont01").ordered
+      expect(vs).to receive(:_run_command).with("ip", "addr", "replace", "10.0.0.254/32", "dev", "nccont01").ordered
       expect(vs).to receive(:setup_taps_6).with("fddf::/79", nics, "10.0.0.2", cert_address: false).ordered
-      expect(vs).to receive(:_run_command).with("ip", "-n", vm, "route", "replace", "203.0.113.5/32", "dev", "nccont01").ordered
-      expect(vs).to receive(:_run_command).with("ip netns exec #{vm} bash -c echo\\ 1\\ \\>\\ /proc/sys/net/ipv4/conf/nccont01/proxy_arp").ordered
+      expect(vs).to receive(:_run_command).with("ip", "route", "replace", "203.0.113.5/32", "dev", "nccont01").ordered
+      expect(vs).to receive(:_run_command).with("bash -c echo\\ 1\\ \\>\\ /proc/sys/net/ipv4/conf/nccont01/proxy_arp").ordered
       vs.container_net_up("fddf::/79", "203.0.113.5/32", nics, "10.0.0.2")
+    end
+
+    # The hook runs in the VM's namespace already, and lxc-start's
+    # AppArmor profile denies the /sys mount a namespace switch needs.
+    it "never switches network namespaces from the network hook" do
+      calls = []
+      allow(vs).to receive(:_run_command) { |*args| calls << args.join(" ") }
+      vs.container_net_up("fddf::/79", "203.0.113.5/32", nics, "10.0.0.2")
+      expect(calls).not_to be_empty
+      expect(calls.grep(/ -n |netns/)).to eq([])
     end
 
     it "gives the guest the cert server address only with the guest firewall" do
@@ -134,10 +144,10 @@ RSpec.describe VmSetup do
 
     it "routes a private subnet larger than /32 through its gateway, and skips the IPv4 route without a public IPv4" do
       subnet_nic = VmSetup::Nic.new("fd48::/79", "10.5.0.0/30", "nccont01", "3e:bd:a5:96:f7:b9", "10.5.0.1/32")
-      expect(vs).to receive(:_run_command).with("ip", "-n", vm, "addr", "replace", "10.5.0.1/32", "dev", "nccont01")
+      expect(vs).to receive(:_run_command).with("ip", "addr", "replace", "10.5.0.1/32", "dev", "nccont01")
       expect(vs).to receive(:setup_taps_6)
-      expect(vs).to receive(:_run_command).with("ip netns exec #{vm} bash -c echo\\ 1\\ \\>\\ /proc/sys/net/ipv4/conf/nccont01/proxy_arp")
-      expect(vs).to receive(:_run_command).with("ip", "-n", vm, "route", "replace", "10.5.0.0/30", "via", "10.5.0.1", "dev", "nccont01")
+      expect(vs).to receive(:_run_command).with("bash -c echo\\ 1\\ \\>\\ /proc/sys/net/ipv4/conf/nccont01/proxy_arp")
+      expect(vs).to receive(:_run_command).with("ip", "route", "replace", "10.5.0.0/30", "via", "10.5.0.1", "dev", "nccont01")
       vs.container_net_up("fddf::/79", "", [subnet_nic], "10.0.0.2")
     end
   end
