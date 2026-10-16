@@ -241,12 +241,16 @@ class ContainerSetup
   end
 
   # The NoCloud seed, from the cloud-init data VmSetup wrote for the VM.
-  def write_seed(meta_data:, user_data:, network_config:)
+  # The seed holds the customer's user data (keys, init script), so only
+  # root and the container's own root (the slot's base gid, which LXC
+  # bind-mounts it as) may read it; no other host user can.
+  def write_seed(meta_data:, user_data:, network_config:, slot:)
     make_dir
-    r "install", "-d", "-o", "root", "-g", "root", "-m", "0755", seed_dir
-    write(File.join(seed_dir, "meta-data"), meta_data, 0o644)
-    write(File.join(seed_dir, "user-data"), user_data, 0o644)
-    write(File.join(seed_dir, "network-config"), network_config, 0o644)
+    gid = ContainerIdmap.base(slot)
+    r "install", "-d", "-o", "root", "-g", gid.to_s, "-m", "0750", seed_dir
+    write(File.join(seed_dir, "meta-data"), meta_data, 0o640, gid: gid)
+    write(File.join(seed_dir, "user-data"), user_data, 0o640, gid: gid)
+    write(File.join(seed_dir, "network-config"), network_config, 0o640, gid: gid)
   end
 
   def purge
@@ -260,8 +264,9 @@ class ContainerSetup
     r "install", "-d", "-o", "root", "-g", "root", "-m", "0711", dir
   end
 
-  def write(path, content, perm)
+  def write(path, content, perm, gid: nil)
     File.write("#{path}.tmp", content, perm: perm)
+    File.chown(nil, gid, "#{path}.tmp") if gid
     File.chmod(perm, "#{path}.tmp")
     File.rename("#{path}.tmp", path)
   end

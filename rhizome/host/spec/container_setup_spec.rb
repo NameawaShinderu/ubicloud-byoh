@@ -75,13 +75,15 @@ RSpec.describe ContainerSetup do
       expect(File.stat(setup.net_up_path).mode & 0o777).to eq 0o700
     end
 
-    it "writes the seed readable for the container and purges the directory" do
+    it "writes the seed readable only for root and the container's root, and purges the directory" do
       expect_dirs
-      expect(setup).to receive(:r).with("install", "-d", "-o", "root", "-g", "root", "-m", "0755", setup.seed_dir) { FileUtils.mkdir_p(setup.seed_dir) }
-      setup.write_seed(meta_data: "m\n", user_data: "u\n", network_config: "n\n")
+      gid = ContainerIdmap.base(3)
+      expect(setup).to receive(:r).with("install", "-d", "-o", "root", "-g", gid.to_s, "-m", "0750", setup.seed_dir) { FileUtils.mkdir_p(setup.seed_dir) }
+      %w[meta-data user-data network-config].each { |f| expect(File).to receive(:chown).with(nil, gid, File.join(setup.seed_dir, "#{f}.tmp")) }
+      setup.write_seed(meta_data: "m\n", user_data: "u\n", network_config: "n\n", slot: 3)
       expect(File.read(File.join(setup.seed_dir, "user-data"))).to eq "u\n"
       expect(File.read(File.join(setup.seed_dir, "meta-data"))).to eq "m\n"
-      expect(File.stat(File.join(setup.seed_dir, "network-config")).mode & 0o777).to eq 0o644
+      expect(File.stat(File.join(setup.seed_dir, "network-config")).mode & 0o777).to eq 0o640
       setup.purge
       expect(File.exist?(setup.dir)).to be false
     end
