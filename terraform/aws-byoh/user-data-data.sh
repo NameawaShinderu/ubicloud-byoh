@@ -46,7 +46,11 @@ if [ -f /home/ubuntu/.ssh/authorized_keys ]; then
   chmod 600 /root/.ssh/authorized_keys
 fi
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
-systemctl reload ssh
+# Ubuntu 24.04 starts sshd from ssh.socket, so ssh.service is inactive and
+# a plain reload fails, which under set -e would end this script before
+# the pool IPs come off the NIC. A socket-started sshd reads the config
+# on every connection anyway.
+systemctl try-reload-or-restart ssh.service
 
 # --- keep the BYOH pool IPs OFF the host NIC --------------------
 # cloud-init's EC2 datasource configures every secondary private IP

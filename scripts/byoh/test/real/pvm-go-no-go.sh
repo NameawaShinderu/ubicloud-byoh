@@ -375,8 +375,8 @@ install_phase() {
   preflight || die "preflight failed; nothing was changed"
   require_pins
   [ "$(uname -r)" != "$(state_get kver)" ] || die "already running the PVM kernel; run boot-test"
-  : >"$REPORT"
   mkdir -p "$ART"
+  : >"$REPORT"
 
   echo "downloading $PVM_RELEASE_URL ..."
   local f
@@ -393,9 +393,20 @@ install_phase() {
   # The guest kernel has no modules and no initramfs: rhizome's CIDATA
   # seed is vfat, and the image root is ext4 on virtio-blk.
   local c missing=""
-  for c in VFAT_FS NLS_CODEPAGE_437 NLS_ISO8859_1 PVM_GUEST X86_PIE VIRTIO_BLK VIRTIO_NET VIRTIO_PCI EXT4_FS SERIAL_8250_CONSOLE; do
+  for c in VFAT_FS NLS_CODEPAGE_437 NLS_ISO8859_1 PVM_GUEST X86_PIE VIRTIO_BLK VIRTIO_NET VIRTIO_PCI EXT4_FS; do
     grep -qx "CONFIG_$c=y" "$ART/$PVM_GUEST_CONFIG" || missing="$missing $c"
   done
+  # The boot test reads the guest's console: the 8250 serial port
+  # (ttyS0), or else the virtio console (hvc0), which some PVM guest
+  # kernels have instead.
+  local guest_console
+  if grep -qx "CONFIG_SERIAL_8250_CONSOLE=y" "$ART/$PVM_GUEST_CONFIG"; then
+    guest_console=ttyS0
+  elif grep -qx "CONFIG_VIRTIO_CONSOLE=y" "$ART/$PVM_GUEST_CONFIG"; then
+    guest_console=hvc0
+  else
+    missing="$missing SERIAL_8250_CONSOLE|VIRTIO_CONSOLE"
+  fi
   [ -z "$missing" ] || die "guest kernel config lacks (=y):$missing"
 
   local pkg kver
@@ -437,6 +448,7 @@ install_phase() {
   state_set stock "$stock"
   state_set stock_kver "$(uname -r)"
   state_set kver "$kver"
+  state_set guest_console "$guest_console"
   state_set pkg "$pkg"
 
   # 2. Keep the stock kernel installed while saved_entry names it: under
@@ -639,6 +651,14 @@ verdict() {
 # vmlinux, the root on virtio-blk, a vfat CIDATA seed like rhizome's.
 boot_guest() {
   local v=$1 dir=$PVM_WORK/guest-$1
+  local console console_args
+  console=$(state_get guest_console)
+  console=${console:-ttyS0}
+  if [ "$console" = hvc0 ]; then
+    console_args=(--console "file=$dir/serial.log" --serial off)
+  else
+    console_args=(--serial "file=$dir/serial.log" --console off)
+  fi
   rm -rf "$dir"
   mkdir -p "$dir"
   cp --sparse=always "$ART/base.raw" "$dir/disk.raw"
@@ -653,7 +673,7 @@ boot_guest() {
     echo '    content: |'
     sed 's/^/      /' "$PVM_WORK/bench.sh"
     echo 'runcmd:'
-    echo "  - [sh, -c, 'exec >/dev/ttyS0 2>&1; echo BYOH_PVM_GUEST_UP \$(uname -r); dmesg | grep -i pvm | head -20; /usr/local/sbin/byoh-pvm-bench; echo BYOH_PVM_DONE; poweroff']"
+    echo "  - [sh, -c, 'exec >/dev/$console 2>&1; echo BYOH_PVM_GUEST_UP \$(uname -r); dmesg | grep -i pvm | head -20; /usr/local/sbin/byoh-pvm-bench; echo BYOH_PVM_DONE; poweroff']"
   } >"$dir/user-data"
   printf 'instance-id: byoh-pvm-%s-%s\nlocal-hostname: byoh-pvm\n' "${v%%.*}" "$(date +%s)" >"$dir/meta-data"
   mkdosfs -n CIDATA -C "$dir/seed.img" 1024 >/dev/null
@@ -663,9 +683,9 @@ boot_guest() {
   local t0 pid
   t0=$(date +%s)
   "$ART/ch-$v" -v --kernel "$ART/$PVM_GUEST_KERNEL" \
-    --cmdline "console=ttyS0 root=/dev/vda1 rw" \
+    --cmdline "console=$console root=/dev/vda1 rw" \
     --disk "path=$dir/disk.raw" "path=$dir/seed.img,readonly=on" \
-    --serial "file=$dir/serial.log" --console off \
+    "${console_args[@]}" \
     --cpus boot=2 --memory size=2048M >"$dir/ch.log" 2>&1 &
   pid=$!
   local up="" login=""
