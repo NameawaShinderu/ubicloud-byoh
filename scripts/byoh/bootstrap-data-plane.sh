@@ -470,8 +470,10 @@ elif [[ -z $PREFLIGHT_SCRIPT ]]; then
   echo "    sudo ubicloud-admin host preflight --site <site> --ssh <user>@${MY_IP:-<this host>} \\"
   echo "      --ssh-key <key> --pool-file pools.yaml"
 else
-  echo "  $PREFLIGHT_SCRIPT preflight --standalone${MAIN_IP:+ --main-ip $MAIN_IP}"
-  preflight_args=(preflight --standalone)
+  echo "  $PREFLIGHT_SCRIPT preflight --standalone --virt-tier $TIER${MAIN_IP:+ --main-ip $MAIN_IP}"
+  # A lower tier needs neither KVM nor 1G hugepages: their checks are
+  # info there (ubicloud-host --virt-tier).
+  preflight_args=(preflight --standalone --virt-tier "$TIER")
   [[ -z $MAIN_IP ]] || preflight_args+=(--main-ip "$MAIN_IP")
   # Captured, so that a failing run neither stops this script (set -e)
   # nor hides what it printed.

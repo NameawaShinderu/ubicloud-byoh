@@ -1,19 +1,20 @@
 # frozen_string_literal: true
 
 # Which virtualization tier (docs/byoh/NO_KVM.md) bin/register-byoh-host
-# registers a host on: the registration matrix of section 3.2, from the
-# probe verdict, the declared --virt-tier and the operator's
-# --accept-fallback. It decides and explains; ByohRegistration passes
-# the tier to Prog::Vm::HostNexus.assemble and records the decision.
+# and byoh-host add register a host on: the registration matrix of
+# section 3.2, from the probe verdict, the declared --virt-tier and the
+# operator's --accept-fallback. It decides and explains; ByohRegistration
+# passes the tier to Prog::Vm::HostNexus.assemble and records the
+# decision.
 #
 # Nothing falls back silently: a tier below kvm needs --accept-fallback
 # even when "auto" picked it, the location must offer the tier
 # (bin/byoh-location set --virt-tiers), and every refusal prints the fix
 # and the commands that would register the host on its fastest option.
 #
-# Hook for M4: once host preflight owns the pinned SSH session, it passes
-# its facts here (ByohVirtLadder.from_facts) instead of #probe opening a
-# second session.
+# The verdict comes from host preflight (ByohHostPreflight): its virt
+# fact, gathered in the preflight's own session, is what PF3 judges and
+# what #decide! takes, so the host is probed once.
 class ByohVirtRegistration
   class Refused < StandardError; end
 
@@ -26,6 +27,10 @@ class ByohVirtRegistration
     end
   end
 
+  # A decision kept between byoh-host add's prepare and register phases,
+  # which may run in different processes: its tier and its record.
+  Recorded = Data.define(:tier, :record)
+
   attr_reader :declared, :accept_fallback, :probe_enabled
 
   def self.add_options(parser, options)
@@ -33,7 +38,7 @@ class ByohVirtRegistration
     parser.separator "Virtualization tier (docs/byoh/NO_KVM.md):"
     parser.on("--virt-tier TIER", "#{DECLARED.join(", ")} (default kvm). auto picks kvm when the host has usable KVM, else the fastest fallback the probe recommends") { options[:virt_tier] = it }
     parser.on("--accept-fallback", "Accept a tier below kvm: slower or weaker isolation; required for every lower tier, auto included") { options[:accept_fallback] = true }
-    parser.on("--no-virt-probe", "Skip the probe at registration; Prog::LearnVirt checks the host at prep") { options[:virt_probe] = false }
+    parser.on("--no-virt-probe", "Leave the virtualization facts of preflight unused (PF3 then checks only /dev/kvm); Prog::LearnVirt checks the host at prep") { options[:virt_probe] = false }
   end
 
   def initialize(declared: "kvm", accept_fallback: false, probe: true)
@@ -44,17 +49,26 @@ class ByohVirtRegistration
     raise Refused, "--virt-tier auto needs the probe; drop --no-virt-probe or declare a tier" if @declared == "auto" && !probe
   end
 
-  # Probes the host over SSH as root with the registration key: the probe
-  # script piped to "ruby - --json" (ruby is on every host that
-  # scripts/byoh/bootstrap-data-plane.sh prepared). Returns the verdict,
-  # or [nil, why] when the host could not be probed.
-  def probe(main_ip, private_key)
-    return [nil, "the probe was skipped (--no-virt-probe)"] unless @probe_enabled
+  # The tier host preflight judges the host for (PF3): the declared one,
+  # or for auto what #decide! will pick from the same facts (kvm when
+  # they are missing or name no fallback; #decide! then refuses).
+  def preflight_tier(facts)
+    return @declared unless @declared == "auto"
+    return ByohVirtTiers::KVM unless facts
 
-    output = Util.rootish_ssh(main_ip, "root", [private_key], "ruby - --json", stdin: ByohVirtLadder.remote_script)
-    [ByohVirtLadder.parse(output.to_s), nil]
-  rescue => e
-    [nil, ByohVirtLadder.sanitize("#{e.class}: #{e.message}")]
+    verdict = ByohVirtLadder.from_facts(facts)
+    verdict.standard_vms? ? ByohVirtTiers::KVM : verdict.recommended || ByohVirtTiers::KVM
+  end
+
+  # The reason #decide! gets when preflight gave no verdict.
+  def unprobed_reason(report)
+    if !@probe_enabled
+      "the probe was skipped (--no-virt-probe)"
+    elsif report.nil?
+      "preflight was skipped"
+    else
+      "preflight reported no virtualization facts"
+    end
   end
 
   # The tier to register on, or Refused with the fix. verdict is nil when

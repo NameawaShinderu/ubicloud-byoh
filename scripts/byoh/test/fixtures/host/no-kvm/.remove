@@ -1,1 +1,2 @@
 dev/kvm.chardev
+cmd/virt-probe

@@ -549,7 +549,7 @@ RSpec.describe ByohRegistration do
       expect(opts[:key_data].map { Net::SSH::Authentication::ED25519::PrivKey.read(it, nil).sign_key.keypair }).to eq [reg.keypair]
       expect(channels.first.command).to eq "uname -m && echo \"$SSH_CONNECTION\""
       expect(channels.last.command).to start_with "bash -s -- preflight --json --nonce f1x7ure --main-ip 203.0.113.10 --images 1 --cp-ip 203.0.113.200 --boot-image-url https://cloud-images.ubuntu.com/"
-      expect(channels.last.stdin).to eq File.read(described_class::HOST_SCRIPT)
+      expect(channels.last.stdin).to eq ByohHostPreflight.script(File.read(described_class::HOST_SCRIPT))
 
       expect(reg.pinned_host_keys).to eq [ByohFakeRootLogin::FIXTURE_HOST_KEY]
       expect(reg.uplink_ip).to eq "203.0.113.10"
@@ -576,7 +576,7 @@ RSpec.describe ByohRegistration do
       reg = registration
       report = preflight(reg, "no-kvm")
       expect(report).to be_blocking
-      expect(report.checks.find { it.id == "PF3" }.detail).to eq "no /dev/kvm"
+      expect(report.checks.find { it.id == "PF3" }.detail).to start_with "no /dev/kvm; ladder: kvm_blocked (L2) on unknown platform: the CPU has vmx but kvm_intel is not loaded"
       expect([reg.pinned_host_keys, reg.uplink_ip]).to eq [nil, nil]
       expect(reg.provider_config).not_to have_key "uplink_ip"
     end
@@ -585,6 +585,41 @@ RSpec.describe ByohRegistration do
       expect { preflight(registration, "kvm64-model", accept_checks: ["PF3"]) }.to raise_error(ByohHostPreflight::UsageError, /PF3: this check cannot be accepted/)
       expect(starts).to be_empty
       expect(statuses(preflight(registration, "kvm64-model"))["PF3"]).to eq "fail"
+    end
+
+    describe "with the virtualization tier" do
+      def virt_preflight(reg, fixture, **virt)
+        reg.preflight(starter: fake_root_starter(channels: preflight_channels(preflight_fixture(fixture)), starts:), nonce: "f1x7ure", services: nil,
+          virt: ByohVirtRegistration.new(**virt))
+      end
+
+      before do
+        ship_virt_tiers("container")
+        location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container], "acks" => {"container" => []}}))
+      end
+
+      it "judges a host without KVM for the lower tier it is declared on, with that tier's images" do
+        reg = registration
+        report = virt_preflight(reg, "no-kvm-container", declared: "container")
+        checks = report.checks.to_h { [it.id, it] }
+        expect(checks["PF3"].status).to eq "pass"
+        expect(checks["PF3"].detail).to start_with "container: none (L3-L5) on unknown platform: this VM (kvm) gets no hardware virtualization"
+        expect(checks["PF3-tier"].to_h).to include(status: "pass", detail: "location byoh-test offers container (L3, experimental)")
+        expect(checks.values_at("PF4", "PF5", "PF7").map(&:status)).to eq %w[info info info]
+        expect(report.virt_tier).to eq "container"
+        expect(reg.default_boot_images).to eq ["ubuntu-noble-container"]
+        expect(report).not_to be_blocking
+      end
+
+      it "picks the tier for auto from the facts, and keeps kvm without them" do
+        reg = registration
+        expect(virt_preflight(reg, "base", declared: "auto").virt_tier).to eq "kvm"
+        expect(reg.default_boot_images).to eq ["ubuntu-noble"]
+        reg = registration
+        expect(virt_preflight(reg, "no-kvm-container", declared: "auto").virt_tier).to eq "container"
+        expect(reg.default_boot_images).to eq ["ubuntu-noble-container"]
+        expect(virt_preflight(registration, "base", declared: "kvm", probe: false).virt_verdict).to be_nil
+      end
     end
 
     it "blocks a hybrid CPU unless the operator accepts it" do

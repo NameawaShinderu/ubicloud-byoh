@@ -52,16 +52,17 @@ class ByohRegistration
   # @param server_identifier [String, nil] operator-chosen HostProvider
   #   identifier. Defaults to `byoh-<vm_host uuid>` if nil.
   # @param bmc_config [Hash, nil] optional BMC section (see #validate_bmc!).
-  # @param default_boot_images [Array<String>] Ubicloud boot image names to
-  #   download on the host at registration time, ubuntu-noble unless
-  #   given. With an empty list the host comes up with an empty
+  # @param default_boot_images [Array<String>, nil] Ubicloud boot image
+  #   names to download on the host at registration time; nil for
+  #   ubuntu-noble, or the first image of a lower virtualization tier
+  #   (#boot_images_for!). With an empty list the host comes up with an empty
   #   boot_image table and the VM allocator can't match anything,
   #   causing "no space left on any eligible host" at first VM create.
   # @param uplink_ip [String, nil] the address the host's default route
   #   leaves from, when preflight should not detect it; stored as
   #   host_provider.config uplink_ip, and no pool may hand it to VMs.
   def initialize(main_ip:, location:, pools: [], routed_networks: [], pool_file: nil, ipv6_mode: nil,
-    ssh_key_source: :generate, server_identifier: nil, bmc_config: nil, default_boot_images: DEFAULT_BOOT_IMAGES, uplink_ip: nil, random: SecureRandom)
+    ssh_key_source: :generate, server_identifier: nil, bmc_config: nil, default_boot_images: nil, uplink_ip: nil, random: SecureRandom)
     @main_ip = main_ip
     @uplink_ip = uplink_ip
     @explicit_uplink_ip = uplink_ip
@@ -72,7 +73,8 @@ class ByohRegistration
     @ssh_key_source = ssh_key_source
     @server_identifier = server_identifier
     @bmc_config = bmc_config
-    @default_boot_images = Array(default_boot_images)
+    @boot_images_default = default_boot_images.nil?
+    @default_boot_images = default_boot_images ? Array(default_boot_images) : DEFAULT_BOOT_IMAGES
     @random = random
   end
 
@@ -182,14 +184,17 @@ class ByohRegistration
   # Raises ByohHostPreflight::UsageError for an --accept-check id that
   # names no overridable check, and refuses to log in to a host in the
   # test environment, where only an injected starter may stand in.
+  #
+  # virt is the ByohVirtRegistration of the run: PF3 then judges the host
+  # for the tier it is meant for (ByohHostPreflight#evaluate).
   def preflight(accept_checks: [], starter: nil, services: ByohHostPreflight.service_states, nonce: ByohHostPreflight.nonce,
-    host_script: HOST_SCRIPT, timeout: PREFLIGHT_TIMEOUT)
+    host_script: HOST_SCRIPT, timeout: PREFLIGHT_TIMEOUT, virt: nil)
     validate!
     ByohHostPreflight.validate_accept!(accept_checks)
     raise ValidationError, "refusing to log in to #{@main_ip} under RACK_ENV=test; inject a starter" if starter.nil? && Config.test?
 
     begin
-      script = File.read(host_script)
+      script = ByohHostPreflight.script(File.read(host_script))
     rescue SystemCallError => ex
       return script_failure("cannot read #{host_script} on the control plane (#{ex.class}: #{ex.message})",
         "reinstall the control plane, whose checkout or package lacks scripts/byoh/host/ubicloud-host")
@@ -208,7 +213,7 @@ class ByohRegistration
       ByohHostPreflight.parse(out, nonce)
     end
     report.checks.unshift(result.check)
-    evaluate_preflight(report, accept_checks:, services:, host_keys: result.host_keys)
+    evaluate_preflight(report, accept_checks:, services:, host_keys: result.host_keys, virt:)
   end
 
   # Adds the control-plane checks to report, the output of
@@ -216,12 +221,29 @@ class ByohRegistration
   # then blocks, host_keys become the pin of #register!, and the
   # detected uplink IP and gateway are stored and checked again there.
   # Returns report.
-  def evaluate_preflight(report, accept_checks:, services:, host_keys:)
+  #
+  # With virt (a ByohVirtRegistration), PF3 is judged for the tier the
+  # host is meant for, which for --virt-tier auto the virt facts decide;
+  # a lower tier also brings its boot images (#boot_images_for!).
+  # Without it, or with --no-virt-probe, the host is meant for kvm.
+  def evaluate_preflight(report, accept_checks:, services:, host_keys:, virt: nil)
+    ladder = virt.nil? || virt.probe_enabled
+    facts = report.virt_facts if ladder
+    tier = virt ? virt.preflight_tier(facts) : ByohVirtTiers::KVM
+    boot_images_for!(tier)
     report.evaluate(main_ip: @main_ip, pools: entries, uplink: @uplink, uplink_ip: @explicit_uplink_ip, location:,
-      location_name: location.name, boot_images: @default_boot_images, services:)
+      location_name: location.name, boot_images: @default_boot_images, services:, virt_tier: tier, ladder:)
     report.accept(accept_checks)
     adopt_preflight(host_keys:, uplink_ip: report.uplink_ip, gateway: report.gateway) unless report.blocking?
     report
+  end
+
+  # A host of a lower virtualization tier boots only the tier's images
+  # (ByohVirtTiers): without --default-boot-image it downloads the first
+  # of them, not DEFAULT_BOOT_IMAGES. Returns the images.
+  def boot_images_for!(tier)
+    @default_boot_images = ByohVirtTiers.fetch(tier).boot_images.first(1) if @boot_images_default && ByohVirtTiers.lower?(tier)
+    @default_boot_images
   end
 
   # What a passing preflight learned, for #register!: byoh-host add

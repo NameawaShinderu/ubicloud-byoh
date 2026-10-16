@@ -2,7 +2,6 @@
 
 require "stringio"
 require "tmpdir"
-require_relative "../../rhizome/host/lib/virt_probe"
 require_relative "byoh_fake_root_login"
 
 RSpec.describe ByohRegistrationCli do
@@ -20,24 +19,9 @@ RSpec.describe ByohRegistrationCli do
   # address.
   let(:installed) { ["--main-ip", "203.0.113.10", "--location", "byoh-test", "--ssh-key", key_path, "--routed-network", "fd00:feed::/64", "--yes"] }
 
-  # The virt-probe report of a bare-metal host with working KVM (L1).
-  def l1_probe(**over)
-    facts = {
-      "arch" => "x86_64", "kernel" => "6.8.0-1-generic", "cpu_vendor" => "GenuineIntel", "cpu_model" => "Intel Xeon",
-      "cpu_flags" => %w[vmx pdpe1gb], "tdp" => true, "dev_kvm" => true, "kvm_api" => 12, "kvm_errno" => nil,
-      "kvm_create_vm" => true, "kvm_caps_missing" => [], "modules" => %w[kvm kvm_intel], "nested_param" => true,
-      "pvm_module_available" => false, "bios_log" => nil, "virt_vm" => "none", "virt_container" => "none",
-      "dmi" => {"sys_vendor" => "Dell Inc.", "product_name" => "PowerEdge R650"}, "cgroup2" => true, "apparmor" => true,
-      "commands" => {"lxc-start" => false, "lxcfs" => false, "qemu-system-x86_64" => false}, "ovmf" => false,
-    }.merge(over.transform_keys(&:to_s))
-    JSON.generate(VirtProbe.report(facts))
-  end
-
   before do
     Location.create(name: "byoh-test", display_name: "byoh-test", ui_name: "BYOH test", visible: false,
       provider: HostProvider::GENERIC_PROVIDER_NAME, byoh_network: {"ula48" => "fd00:1:2::/48"})
-    # Registration probes the host over SSH once the key is installed.
-    allow(Util).to receive(:rootish_ssh).with(String, "root", [String], "ruby - --json", stdin: ByohVirtLadder.remote_script).and_return(l1_probe)
   end
 
   after { FileUtils.rm_rf(dir) }
@@ -99,7 +83,8 @@ RSpec.describe ByohRegistrationCli do
     expect(err).to eq "note: 10.99.0.0/29: no exposure given, using internal because it is not globally routable\n" \
       "warning: preflight skipped: this run generated the registration key and --yes skipped the step that installs it, " \
       "so the login cannot work yet; check the host by running scripts/byoh/host/ubicloud-host preflight on it, " \
-      "or install a key first and pass --ssh-key\n"
+      "or install a key first and pass --ssh-key\n" \
+      "note: the host was not probed (preflight was skipped); prep goes on, and Prog::LearnVirt pages there if the host cannot run VMs\n"
     expect(starts).to be_empty
 
     vm_host = VmHost.first
@@ -136,7 +121,7 @@ RSpec.describe ByohRegistrationCli do
   it "refuses a host that fails preflight with a generated key, and says the key was not kept" do
     status, out, err = cli("--main-ip", "203.0.113.10", "--location", "byoh-test", "--routed-network", "fd00:feed::/64", input: "\n", fixture: "no-kvm")
     expect(status).to eq 1
-    expect(out).to match(/^fail +PF3 +no \/dev\/kvm$/)
+    expect(out).to match(/^fail +PF3 +no \/dev\/kvm; ladder: kvm_blocked \(L2\)/)
     expect(err).to eq "! preflight failed: fix the checks marked fail, or accept an overridable one with --accept-check; nothing was registered\n" \
       "  The generated key was not kept: remove its line from root's authorized_keys on the host. The next run prints a new key, or pass --ssh-key with one you keep.\n"
     expect(VmHost.count).to eq 0
@@ -171,41 +156,71 @@ RSpec.describe ByohRegistrationCli do
   end
 
   describe "virtualization tier" do
-    let(:no_virt) { {cpu_flags: %w[hypervisor pdpe1gb], dev_kvm: false, kvm_api: nil, kvm_create_vm: nil, kvm_caps_missing: nil, modules: [], virt_vm: "kvm"} }
+    before do
+      ship_virt_tiers("container")
+    end
 
-    it "probes the host and records the tier" do
+    def offer_container
+      Location.first(name: "byoh-test").update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container], "acks" => {"container" => []}}))
+    end
+
+    it "takes the tier from the facts preflight gathered, and records it" do
       status, out, err = cli(*installed)
       expect([status, err]).to eq [0, ""]
+      expect(out).to match(/^pass +PF3 +\/dev\/kvm present \(Intel\(R\) Xeon\(R\) Gold 6338 CPU @ 2\.00GHz\); ladder: kvm \(L1\) on unknown platform: \/dev\/kvm answers KVM_GET_API_VERSION 12$/)
       expect(out).to include "Virt tier        kvm\n"
       expect(VmHost.first.virt_tier).to eq "kvm"
       expect(DB[:byoh_operator_action].first[:args]["virt"]).to eq("declared" => "kvm", "tier" => "kvm", "probe" => "kvm", "accepted_fallback" => false)
     end
 
-    it "refuses a host without KVM, with the fix" do
-      allow(Util).to receive(:rootish_ssh).and_return(l1_probe(**no_virt))
-      status, out, err = cli(*installed)
+    it "refuses a host without KVM in preflight, with its rung and the fix" do
+      status, out, err = cli(*installed, fixture: "no-kvm")
       expect(status).to eq 1
-      expect(out).not_to include "Step 2/2"
-      expect(err).to start_with("! refused: tier: none (L3-L5)").and include("refused: ")
+      expect(out).to match(/^fail +PF3 +no \/dev\/kvm; ladder: kvm_blocked \(L2\) on unknown platform: the CPU has vmx but kvm_intel is not loaded/)
+      expect(out).to include "fix: Load the KVM module (modprobe kvm_intel"
+      expect(out).not_to include "Step 3/3"
+      expect(err).to start_with "! preflight failed"
       expect(VmHost.count).to eq 0
     end
 
-    it "registers a fallback tier the operator accepted" do
-      ship_virt_tiers("emulated")
-      Location.first(name: "byoh-test").update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm emulated], "acks" => {"emulated" => []}}))
-      allow(Util).to receive(:rootish_ssh).and_return(l1_probe(**no_virt, commands: {"qemu-system-x86_64" => true}, ovmf: true))
-      status, out, err = cli(*installed, "--virt-tier", "emulated", "--accept-fallback")
+    it "registers a host without KVM on a lower tier the location offers, with the tier's image" do
+      offer_container
+      status, out, err = cli(*installed, "--virt-tier", "container", "--accept-fallback", fixture: "no-kvm-container")
       expect([status, err]).to eq [0, ""]
-      expect(out).to include "Virt tier        emulated (emulated (L5, experimental), accepted with --accept-fallback)\n"
-      expect(VmHost.first.values.slice(:virt_tier, :family)).to eq(virt_tier: "emulated", family: "emulated")
-      expect(DB[:byoh_operator_action].first[:args]["virt"]).to eq("declared" => "emulated", "tier" => "emulated", "probe" => "none", "accepted_fallback" => true)
+      expect(out).to match(/^pass +PF3 +container: none \(L3-L5\) on unknown platform: this VM \(kvm\) gets no hardware virtualization/)
+      expect(out).to match(/^pass +PF3-tier +location byoh-test offers container \(L3, experimental\)$/)
+      expect(out).to match(/^info +PF4 +not needed by a container host: /)
+      expect(out).to include "Virt tier        container (container (L3, experimental), accepted with --accept-fallback)\n"
+      vm_host = VmHost.first
+      expect(vm_host.values.slice(:virt_tier, :family)).to eq(virt_tier: "container", family: "container")
+      expect(Strand[vm_host.id].stack.first["default_boot_images"]).to eq ["ubuntu-noble-container"]
+      expect(DB[:byoh_operator_action].first[:args]["virt"]).to eq("declared" => "container", "tier" => "container", "probe" => "none", "accepted_fallback" => true)
     end
 
-    it "registers without the probe when asked, with a note" do
-      expect(Util).not_to receive(:rootish_ssh)
-      status, _, err = cli(*installed, "--no-virt-probe")
+    it "picks the lower tier for auto, and refuses it without --accept-fallback" do
+      offer_container
+      status, _, err = cli(*installed, "--virt-tier", "auto", fixture: "no-kvm-container")
+      expect(status).to eq 1
+      expect(err).to start_with("! refused: the probe found none (L3-L5) on unknown platform").and include("Pass --accept-fallback")
+      expect(VmHost.count).to eq 0
+    end
+
+    it "fails PF3-tier in a location that does not offer the declared tier" do
+      status, out, _ = cli(*installed, "--virt-tier", "container", "--accept-fallback", fixture: "no-kvm-container")
+      expect(status).to eq 1
+      expect(out).to match(/^fail +PF3-tier +location byoh-test does not offer container hosts$/)
+      expect(out).to include "fix: bin/byoh-location rates --location byoh-test --family container --from standard --multiplier <X>"
+    end
+
+    it "leaves the virtualization facts unused with --no-virt-probe, with a note" do
+      status, out, err = cli(*installed, "--no-virt-probe")
       expect(status).to eq 0
+      expect(out).to match(/^pass +PF3 +\/dev\/kvm present \(Intel\(R\) Xeon\(R\) Gold 6338 CPU @ 2\.00GHz\)$/)
       expect(err).to eq "note: the host was not probed (the probe was skipped (--no-virt-probe)); prep goes on, and Prog::LearnVirt pages there if the host cannot run VMs\n"
+    end
+
+    it "notes a script that reported no virtualization facts" do
+      expect(cli(*installed, fixture: "old-script").last).to eq "note: the host was not probed (preflight reported no virtualization facts); prep goes on, and Prog::LearnVirt pages there if the host cannot run VMs\n"
     end
 
     it "refuses an unknown tier before anything else" do
@@ -238,7 +253,7 @@ RSpec.describe ByohRegistrationCli do
     it "refuses a host without /dev/kvm" do
       status, out, err = cli(*installed, fixture: "no-kvm")
       expect(status).to eq 1
-      expect(out).to match(/^fail +PF3 +no \/dev\/kvm$/)
+      expect(out).to match(/^fail +PF3 +no \/dev\/kvm; ladder: /)
       expect(out).not_to include "Step 3/3"
       expect(err).to eq "! preflight failed: fix the checks marked fail, or accept an overridable one with --accept-check; nothing was registered\n"
       expect(VmHost.count).to eq 0
@@ -274,7 +289,8 @@ RSpec.describe ByohRegistrationCli do
     it "skips preflight with --skip-preflight" do
       status, _, err = cli(*installed, "--skip-preflight")
       expect(status).to eq 0
-      expect(err).to eq "warning: preflight skipped (--skip-preflight); the host was not checked\n"
+      expect(err).to eq "warning: preflight skipped (--skip-preflight); the host was not checked\n" \
+        "note: the host was not probed (preflight was skipped); prep goes on, and Prog::LearnVirt pages there if the host cannot run VMs\n"
       expect(starts).to be_empty
       expect(VmHost.first.sshable.host_keys).to be_nil
     end

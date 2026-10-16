@@ -12,6 +12,16 @@ require "yaml"
 # location, PF21 the control-plane services, and a cross-check of the
 # CPU count. #accept lets the operator downgrade the few fails that are
 # a choice rather than a defect.
+#
+# PF3 is the virtualization ladder's (docs/byoh/NO_KVM.md): the script
+# reports the ladder's facts as "virt", gathered by the probe itself
+# (rhizome/host/lib/virt_probe.rb, which .script puts ahead of the
+# script) when the host has ruby, else in shell, and #evaluate replaces
+# the script's own KVM verdict with ByohVirtLadder.preflight_check for
+# the tier the host is meant for. A host without usable KVM so gets its
+# rung and the platform's fix, and passes PF3 when declared on a lower
+# tier it can run; PF4, PF5 and PF7 (1G hugepages through GRUB) are then
+# info, and PF3-tier says whether the location offers that tier.
 class ByohHostPreflight
   class UsageError < StandardError; end
 
@@ -43,6 +53,17 @@ class ByohHostPreflight
     "host_keys" => [Array],
     "sshd" => [Hash, NilClass],
   }.freeze
+  # Facts an older script does not print.
+  OPTIONAL_FACTS = {
+    "virt" => [Hash],
+  }.freeze
+
+  # The checks only a kvm host needs (the KVM device and 1G hugepages).
+  KVM_ONLY_CHECKS = %w[PF4 PF5 PF7].freeze
+
+  # Ends the heredoc that carries the probe ahead of the script; the
+  # probe never contains it (spec/lib/byoh_host_preflight_spec.rb).
+  PROBE_END = "UBICLOUD_VIRT_PROBE_END"
 
   # The fails an operator may accept, and what accepting one means.
   OVERRIDABLE = {
@@ -60,9 +81,16 @@ class ByohHostPreflight
   # The services that must run for a registered host to be set up.
   SERVICES = %w[ubicloud-web ubicloud-respirate].freeze
 
-  attr_reader :checks, :facts, :uplink_ip, :gateway
+  attr_reader :checks, :facts, :uplink_ip, :gateway, :virt_tier, :virt_verdict
 
   def self.nonce = SecureRandom.hex(8)
+
+  # The script as the control plane sends it: the virtualization probe
+  # first, in UBICLOUD_VIRT_PROBE, which the script runs with the host's
+  # ruby when it has one (facts_virt).
+  def self.script(text)
+    "UBICLOUD_VIRT_PROBE=$(cat <<'#{PROBE_END}'\n#{ByohVirtLadder.remote_script}#{PROBE_END}\n)\n#{text}"
+  end
 
   # Reads the script's --json output. Lines without "UBIPF:<nonce> " are
   # noise (a .bashrc, sudo warnings) and skipped; the marker may follow
@@ -114,7 +142,7 @@ class ByohHostPreflight
         "check #{record["id"]} has no detail or fix text"
       end
     when "fact"
-      types = FACTS[record["id"]]
+      types = FACTS[record["id"]] || OPTIONAL_FACTS[record["id"]]
       if types.nil?
         "unknown fact #{record["id"].inspect}"
       elsif types.none? { record["value"].is_a?(it) }
@@ -136,7 +164,7 @@ class ByohHostPreflight
   def self.accept_targets(id)
     targets = OVERRIDABLE.keys.select { it == id || it.start_with?("#{id}-") }
     if targets.empty?
-      known = (HOST_CHECKS + %w[PF2 PF17 PF20 PF21]).any? { it == id || it.start_with?("#{id}-") }
+      known = (HOST_CHECKS + %w[PF2 PF3-tier PF17 PF20 PF21]).any? { it == id || it.start_with?("#{id}-") }
       raise UsageError, "--accept-check #{id}: #{known ? "this check cannot be accepted" : "no such check"}; only #{OVERRIDABLE.keys.join(", ")} can"
     end
     targets
@@ -153,13 +181,41 @@ class ByohHostPreflight
 
   def host_keys = @facts.fetch("host_keys", [])
 
+  # The ladder's facts from the virt fact, or nil when the script did not
+  # report them in a form this control plane reads. The shell form gives
+  # the kernel log lines that name the BIOS; the probe's own rule picks
+  # the firmware lock out of them.
+  def virt_facts
+    virt = @facts["virt"]
+    return unless virt.is_a?(Hash)
+
+    case virt["source"]
+    when "probe"
+      report = virt["report"]
+      report["facts"] if report.is_a?(Hash) && report["facts"].is_a?(Hash)
+    when "shell"
+      facts = virt["facts"]
+      return unless facts.is_a?(Hash)
+
+      lines = facts["bios_lines"]
+      facts = facts.except("bios_lines")
+      facts["bios_log"] = VirtProbe.bios_line(lines.join("\n")) if lines.is_a?(Array)
+      facts
+    end
+  end
+
   # Adds the control-plane checks. pools are ByohPoolDeclaration entries,
   # uplink the pools file's uplink interface, uplink_ip an explicit
   # --uplink-ip; location is the resolved Location or nil, location_name
   # what the operator asked for; services as from .service_states.
-  def evaluate(main_ip:, pools: [], uplink: nil, uplink_ip: nil, location: nil, location_name: nil, boot_images: [], services: nil)
+  # virt_tier is the tier the host is meant for (ByohVirtTiers); with
+  # ladder false the virt fact is left unused (--no-virt-probe) and the
+  # script's own PF3 stands.
+  def evaluate(main_ip:, pools: [], uplink: nil, uplink_ip: nil, location: nil, location_name: nil, boot_images: [], services: nil,
+    virt_tier: ByohVirtTiers::KVM, ladder: true)
     return self unless readable?
 
+    virt_checks(virt_tier, ladder ? virt_facts : nil, location)
     route = default_route(uplink_ip)
     addressing(route, main_ip:, pools:, uplink:, explicit_uplink_ip: uplink_ip, location:)
     boot_images_check(boot_images, location:, location_name:)
@@ -215,6 +271,66 @@ class ByohHostPreflight
 
   def add(id, status, detail, fix = "")
     @checks << Check.new(id:, status:, detail:, fix:, accepted: false)
+  end
+
+  # Replaces a check the script printed, in its place.
+  def update_check(id, status, detail, fix = "")
+    @checks[@checks.index { it.id == id }] = Check.new(id:, status:, detail:, fix:, accepted: false)
+  end
+
+  # The script prints every check, so each one named here exists.
+  def virt_checks(tier, facts, location)
+    @virt_tier = tier
+    lower = ByohVirtTiers.lower?(tier)
+    (lower ? KVM_ONLY_CHECKS : []).each { not_needed(it, tier) }
+    if facts
+      ladder_check(tier, facts)
+    elsif lower
+      not_needed("PF3", tier, "; the host reported no virtualization facts, so Prog::LearnVirt checks the tier at prep")
+    end
+    tier_check(tier, location) if lower
+  end
+
+  # A kvm-only check as info, for a host meant for a lower tier (the
+  # script says so itself when it ran with --virt-tier).
+  def not_needed(id, tier, more = "")
+    prefix = "not needed by a #{tier} host: "
+    update_check(id, "info", "#{prefix}#{@checks.find { it.id == id }.detail.delete_prefix(prefix)}#{more}")
+  end
+
+  # PF3 from the ladder. For kvm, facts the script could not gather (the
+  # /dev/kvm ioctls without ruby) leave the script's verdict standing,
+  # with the ladder's view beside it.
+  def ladder_check(tier, facts)
+    @virt_verdict = ByohVirtLadder.from_facts(facts)
+    result = ByohVirtLadder.preflight_check(facts, declared_tier: tier)
+    status = result[:status]
+    if tier == ByohVirtTiers::KVM
+      script = @checks.find { it.id == "PF3" }
+      status = script.status if status == "info"
+      detail = "#{script.detail}; ladder: #{@virt_verdict.summary}"
+    else
+      detail = "#{tier}: #{@virt_verdict.summary}"
+      detail += "; #{result[:fix]}" if status != "fail" && result[:fix]
+    end
+    detail += "; #{result[:caveats].join("; ")}" unless result[:caveats].empty?
+    update_check("PF3", status, detail, (status == "fail") ? result[:fix].to_s : "")
+  end
+
+  # Whether the location offers the lower tier the host is meant for.
+  def tier_check(tier, location)
+    return unless location
+
+    spec = ByohVirtTiers.fetch(tier)
+    if !ByohVirtTiers.shipped?(tier)
+      add("PF3-tier", "fail", "#{tier} hosts are not available yet (docs/byoh/NO_KVM.md section 11)", "register the host on another tier")
+    elsif ByohVirtTiers.allows?(location, tier) && ByohVirtTiers.acked?(location, tier)
+      add("PF3-tier", "pass", "location #{location.name} offers #{spec.label}")
+    else
+      add("PF3-tier", "fail", "location #{location.name} does not offer #{tier} hosts",
+        "bin/byoh-location rates --location #{location.name} --family #{spec.family} --from standard --multiplier <X>; " \
+        "bin/byoh-location set --location #{location.name} --virt-tiers #{(ByohVirtTiers.tiers(location) | [tier]).join(",")} --accept #{tier}")
+    end
   end
 
   def replace(id, status, detail, fix = "")

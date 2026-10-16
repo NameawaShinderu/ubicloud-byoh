@@ -180,20 +180,22 @@ RSpec.describe ByohVirtRegistration do
       .to eq ["bin/register-byoh-host --location byoh-test --main-ip x ..."]
   end
 
-  describe "#probe" do
-    it "runs the probe over SSH as root" do
-      out = JSON.generate(VirtProbe.report(facts))
-      expect(Util).to receive(:rootish_ssh).with("203.0.113.42", "root", ["KEY"], "ruby - --json", stdin: ByohVirtLadder.remote_script).and_return(out)
-      verdict, why = described_class.new.probe("203.0.113.42", "KEY")
-      expect([verdict.tier, why]).to eq ["kvm", nil]
+  describe "#preflight_tier" do
+    it "is the declared tier, or for auto what the facts say" do
+      expect(described_class.new(declared: "container").preflight_tier(nil)).to eq "container"
+      auto = described_class.new(declared: "auto")
+      expect(auto.preflight_tier(nil)).to eq "kvm"
+      expect(auto.preflight_tier(facts)).to eq "kvm"
+      expect(auto.preflight_tier(facts(**no_virt))).to eq "container"
+      expect(auto.preflight_tier(facts(virt_container: "docker"))).to eq "kvm"
     end
+  end
 
-    it "says why the host could not be probed" do
-      expect(Util).to receive(:rootish_ssh).and_raise(RuntimeError, "Ssh command failed: ruby: not found\e[0m")
-      expect(described_class.new.probe("203.0.113.42", "KEY")).to eq [nil, "RuntimeError: Ssh command failed: ruby: not found[0m"]
-      expect(Util).to receive(:rootish_ssh).and_return("garbage")
-      expect(described_class.new.probe("203.0.113.42", "KEY")).to eq [nil, "ByohVirtLadder::ParseError: virt-probe output is not JSON"]
-      expect(described_class.new(probe: false).probe("203.0.113.42", "KEY")).to eq [nil, "the probe was skipped (--no-virt-probe)"]
+  describe "#unprobed_reason" do
+    it "says why preflight gave no verdict" do
+      expect(described_class.new(probe: false).unprobed_reason(nil)).to eq "the probe was skipped (--no-virt-probe)"
+      expect(described_class.new.unprobed_reason(nil)).to eq "preflight was skipped"
+      expect(described_class.new.unprobed_reason(Object.new)).to eq "preflight reported no virtualization facts"
     end
   end
 

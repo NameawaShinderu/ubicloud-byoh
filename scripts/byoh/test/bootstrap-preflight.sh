@@ -141,7 +141,7 @@ rc=0
 OUT=$(docker exec -u ubuntu -e HOME=/home/ubuntu -w /home/ubuntu "$CTR" \
   bash /t/live/bootstrap-data-plane.sh --main-ip "$LIVE_IP" 2>&1) || rc=$?
 printf '%s\n' "$OUT" >"$LOGS/bs-live.out"
-has live "/t/live/host/ubicloud-host preflight --standalone --main-ip $LIVE_IP"
+has live "/t/live/host/ubicloud-host preflight --standalone --virt-tier kvm --main-ip $LIVE_IP"
 has live "^  pass  main-ip-local +$LIVE_IP is on this host"
 has live "^  [a-z]+ +PF1 "
 fails=$(grep -c '^  fail ' <<<"$OUT" || true)
@@ -155,7 +155,7 @@ has live "sudo ubicloud-admin host add --site <site>"
 say "pass live (exit $rc, $fails failing)"
 
 bs base 0 /t/base/bootstrap-data-plane.sh --main-ip "$MAIN_IP"
-has base "/t/base/host/ubicloud-host preflight --standalone --main-ip $MAIN_IP"
+has base "/t/base/host/ubicloud-host preflight --standalone --virt-tier kvm --main-ip $MAIN_IP"
 has base "^  pass  PF3 "
 has base "^  pass  main-ip-local "
 has base "preflight: 0 failing"
@@ -169,7 +169,7 @@ has hybrid "Primary IPv4"
 say "pass hybrid"
 
 bs kvm64 1 /t/next/bootstrap-data-plane.sh
-has kvm64 "/t/next/ubicloud-host preflight --standalone$"
+has kvm64 "/t/next/ubicloud-host preflight --standalone --virt-tier kvm$"
 has kvm64 "^  fail  PF3 +kvm64-class CPU model"
 has kvm64 "^  info  main-ip-local +no --main-ip given"
 has kvm64 "ERROR: preflight found [0-9]+ failing check"
@@ -219,7 +219,7 @@ unsafe unsafe-owned owned "/t/owned/host is owned by uid 65534, neither root nor
 unsafe unsafe-grp grp "/t/grp is writable by group [0-9]+ \(mode 775\)"
 
 bs upg 0 /t/upg/bootstrap-data-plane.sh --main-ip "$MAIN_IP"
-has upg "/t/upg/ubicloud-host preflight --standalone --main-ip $MAIN_IP"
+has upg "/t/upg/ubicloud-host preflight --standalone --virt-tier kvm --main-ip $MAIN_IP"
 has upg "preflight: 0 failing"
 say "pass upg"
 

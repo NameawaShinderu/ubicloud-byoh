@@ -5,6 +5,7 @@
 #   ubicloud-host preflight [--json] [--nonce N] [--main-ip IP] [--cp-ip IP]
 #                           [--boot-image-url URL]... [--images N]
 #                           [--vm-disk-gib N] [--standalone]
+#                           [--virt-tier kvm|container|pvm|emulated]
 #   ubicloud-host storage-disk --by-id ID [--allow-shared-transport]
 #   ubicloud-host version
 #
@@ -15,6 +16,12 @@
 # PF20 boot images, PF21 services. --standalone adds two checks for a run
 # without a control plane: the main IP is local, and there is exactly one
 # IPv4 default route.
+#
+# It also reports the facts of the virtualization ladder
+# (docs/byoh/NO_KVM.md) as the fact "virt"; the control plane takes PF3's
+# verdict from them (ByohVirtLadder.preflight_check). --virt-tier names
+# the tier the host is meant for: below kvm, PF3 (KVM), PF4, PF5 and PF7
+# (1G hugepages through GRUB) become info, as such a host needs neither.
 #
 # It is strictly read-only: no apt-get update, no mkdir, no sudo that can
 # prompt (only `sudo -n`, for dmidecode, sshd -T and smartctl). Every
@@ -73,12 +80,13 @@ NONCE=""
 MAIN_IP=""
 CP_IP=""
 STANDALONE=0
+VIRT_TIER=kvm
 IMAGES=1
 VM_DISK_GIB=0
 URLS=()
 
 usage() {
-  echo "usage: ubicloud-host preflight [--json] [--nonce N] [--main-ip IP] [--cp-ip IP] [--boot-image-url URL]... [--images N] [--vm-disk-gib N] [--standalone]" >&2
+  echo "usage: ubicloud-host preflight [--json] [--nonce N] [--main-ip IP] [--cp-ip IP] [--boot-image-url URL]... [--images N] [--vm-disk-gib N] [--standalone] [--virt-tier TIER]" >&2
   echo "       ubicloud-host storage-disk --by-id ID [--allow-shared-transport]" >&2
   echo "       ubicloud-host version" >&2
   exit 2
@@ -179,6 +187,17 @@ check() {
   fi
 }
 
+# A check that only a kvm host needs: on a host meant for a lower tier
+# (--virt-tier) it is info, whatever it found.
+kvm_only_check() {
+  local id=$1 status=$2 detail=$3 fix=${4:-}
+  if [[ $VIRT_TIER != kvm ]]; then
+    check "$id" info "not needed by a $VIRT_TIER host: $detail"
+  else
+    check "$id" "$status" "$detail" "$fix"
+  fi
+}
+
 # fact ID JSON-VALUE
 fact() {
   if ((JSON)); then
@@ -231,31 +250,137 @@ pf3_kvm() {
   CPUINFO=$(rd /proc/cpuinfo)
   model=$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' <<<"$CPUINFO" | head -1)
   if [[ $ARCH == x86_64 ]] && grep -Eq '^(Common KVM processor|QEMU Virtual CPU|kvm64|qemu64)' <<<"$model"; then
-    check PF3 fail "kvm64-class CPU model ($model)" "$PF3_FIX"
+    kvm_only_check PF3 fail "kvm64-class CPU model ($model)" "$PF3_FIX"
   elif ! chardev /dev/kvm; then
-    check PF3 fail "no /dev/kvm" "$PF3_FIX"
+    kvm_only_check PF3 fail "no /dev/kvm" "$PF3_FIX"
   elif [[ $ARCH == x86_64 ]] && ! grep -Eq '^flags[[:space:]]*:.*\b(vmx|svm)\b' <<<"$CPUINFO"; then
-    check PF3 fail "the CPU has neither the vmx nor the svm flag" "$PF3_FIX"
+    kvm_only_check PF3 fail "the CPU has neither the vmx nor the svm flag" "$PF3_FIX"
   else
-    check PF3 pass "/dev/kvm present${model:+ ($model)}"
+    kvm_only_check PF3 pass "/dev/kvm present${model:+ ($model)}"
   fi
+}
+
+# The facts of the virtualization ladder (lib/byoh_virt_ladder.rb) as
+# one fact, "virt". The control plane puts rhizome/host/lib/virt_probe.rb
+# in UBICLOUD_VIRT_PROBE ahead of this script (ByohHostPreflight.script).
+# On a host with ruby the probe itself runs and gathers every fact, the
+# /dev/kvm ioctls and the capabilities cloud-hypervisor needs included:
+#   {"source":"probe","report":<virt-probe --json>}
+# Otherwise (no ruby yet, a run without the control plane, test mode) the
+# facts read here stand in, under the probe's own keys, and the ladder
+# takes each fact left out as unknown; Prog::LearnVirt probes again at
+# prep:
+#   {"source":"shell","facts":{...}}
+# Kernel log lines that name the BIOS go as bios_lines; the control plane
+# picks the firmware lock out of them with the probe's own rule.
+# rhizome/host/spec/ubicloud_host_parity_spec.rb keeps these lists equal
+# to the probe's.
+VIRT_FLAGS=(vmx svm hypervisor pdpe1gb)
+VIRT_MODULES=(kvm kvm_intel kvm_amd kvm_pvm)
+VIRT_DMI=(sys_vendor product_name product_version bios_vendor board_vendor chassis_vendor chassis_asset_tag)
+VIRT_COMMANDS=(lxc-start lxcfs newuidmap xz setquota cryptsetup mkfs.ext4 qemu-system-x86_64)
+VIRT_OVMF=(/usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd)
+
+virt_probe_rb() {
+  [[ -n ${UBICLOUD_VIRT_PROBE:-} ]] && command -v ruby >/dev/null 2>&1 || return 127
+  printf '%s\n' "$UBICLOUD_VIRT_PROBE" | ruby - --json 2>/dev/null
+}
+
+# A JSON array of strings, one per argument.
+json_list() {
+  local out="" a
+  for a in "$@"; do
+    out+=${out:+,}$(json_str "$a")
+  done
+  printf '[%s]' "$out"
+}
+
+# A JSON string, or null when it is empty.
+json_str_or_null() {
+  if [[ -n $1 ]]; then json_str "$1"; else printf null; fi
+}
+
+facts_virt() {
+  local report f fields=() list=() kernel log dmi="" value commands="" ovmf=false
+  report=$(run_cmd virt-probe virt_probe_rb | tail -n 1)
+  if [[ $report == '{"version":'*'}' ]]; then
+    fact virt "{\"source\":\"probe\",\"report\":$report}"
+    return
+  fi
+
+  kernel=$(run_cmd uname-r uname -r)
+  fields+=("\"arch\":$(json_str_or_null "$ARCH")" "\"kernel\":$(json_str_or_null "$kernel")")
+  fields+=("\"cpu_model\":$(json_str_or_null "$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' <<<"$CPUINFO" | head -1)")")
+  for f in "${VIRT_FLAGS[@]}"; do
+    grep -Eq "^flags[[:space:]]*:.*\b$f\b" <<<"$CPUINFO" && list+=("$f")
+  done
+  fields+=("\"cpu_flags\":$(json_list "${list[@]}")")
+  if chardev /dev/kvm; then fields+=('"dev_kvm":true'); else fields+=('"dev_kvm":false'); fi
+  list=()
+  for f in "${VIRT_MODULES[@]}"; do
+    [[ -d $R/sys/module/$f ]] && list+=("$f")
+  done
+  fields+=("\"modules\":$(json_list "${list[@]}")")
+  # systemd-detect-virt prints "none" and exits 1 when it finds nothing.
+  fields+=("\"virt_vm\":$(json_str_or_null "$(run_cmd detect-virt-vm systemd-detect-virt --vm)")")
+  fields+=("\"virt_container\":$(json_str_or_null "$(run_cmd detect-virt-container systemd-detect-virt --container)")")
+  for f in "${VIRT_DMI[@]}"; do
+    if [[ -f $R/sys/class/dmi/id/$f ]]; then
+      value=$(json_str "$(rd "/sys/class/dmi/id/$f")")
+    else
+      value=null
+    fi
+    dmi+=${dmi:+,}$(json_str "$f"):$value
+  done
+  fields+=("\"dmi\":{$dmi}")
+  # Left out when neither journald nor dmesg could be read, so that the
+  # firmware stays unknown rather than cleared.
+  log=$(run_root kernel-log journalctl -k -b -q --no-pager -o cat) || log=""
+  [[ -n $log ]] || log=$(run_root dmesg dmesg) || log=""
+  if [[ -n $log ]]; then
+    list=()
+    while IFS= read -r f; do
+      list+=("$f")
+    done < <(grep -i 'disabled.*bios' <<<"$log" | head -n 5)
+    fields+=("\"bios_lines\":$(json_list "${list[@]}")")
+  fi
+  if grep -Eq '(^|/)kvm-pvm\.ko' "$R/lib/modules/$kernel/modules.dep" 2>/dev/null; then
+    fields+=('"pvm_module_available":true')
+  else
+    fields+=('"pvm_module_available":false')
+  fi
+  if [[ -f $R/sys/fs/cgroup/cgroup.controllers ]]; then fields+=('"cgroup2":true'); else fields+=('"cgroup2":false'); fi
+  if [[ $(rd /sys/module/apparmor/parameters/enabled) == Y* ]]; then fields+=('"apparmor":true'); else fields+=('"apparmor":false'); fi
+  for f in "${VIRT_COMMANDS[@]}"; do
+    if have "$f"; then value=true; else value=false; fi
+    commands+=${commands:+,}$(json_str "$f"):$value
+  done
+  fields+=("\"commands\":{$commands}")
+  for f in "${VIRT_OVMF[@]}"; do
+    [[ -e $R$f ]] && ovmf=true
+  done
+  fields+=("\"ovmf\":$ovmf")
+  fact virt "{\"source\":\"shell\",\"facts\":{$(
+    IFS=,
+    echo "${fields[*]}"
+  )}}"
 }
 
 pf4_pdpe1gb() {
   if [[ $ARCH != x86_64 ]]; then
-    check PF4 pass "1G pages need no CPU flag on $ARCH"
+    kvm_only_check PF4 pass "1G pages need no CPU flag on $ARCH"
   elif grep -Eq '^flags[[:space:]]*:.*\bpdpe1gb\b' <<<"$CPUINFO"; then
-    check PF4 pass "pdpe1gb flag present"
+    kvm_only_check PF4 pass "pdpe1gb flag present"
   else
-    check PF4 fail "the CPU lacks the pdpe1gb flag, so it cannot use 1G hugepages" "another machine, or a VM CPU model that passes pdpe1gb through (host-passthrough)"
+    kvm_only_check PF4 fail "the CPU lacks the pdpe1gb flag, so it cannot use 1G hugepages" "another machine, or a VM CPU model that passes pdpe1gb through (host-passthrough)"
   fi
 }
 
 pf5_grub() {
   if [[ -f $R/etc/default/grub ]] && have update-grub; then
-    check PF5 pass "/etc/default/grub and update-grub present"
+    kvm_only_check PF5 pass "/etc/default/grub and update-grub present"
   else
-    check PF5 fail "/etc/default/grub or update-grub is missing; the host must boot with GRUB" "hugepages are set on the kernel command line through GRUB (prog/setup_hugepages.rb)"
+    kvm_only_check PF5 fail "/etc/default/grub or update-grub is missing; the host must boot with GRUB" "hugepages are set on the kernel command line through GRUB (prog/setup_hugepages.rb)"
   fi
 }
 
@@ -306,11 +431,11 @@ pf6_pf7_memory() {
   local pages=$((MEM_GIB * 42 / 43 - 5))
   ((pages < 0)) && pages=0
   if ((pages < 8)); then
-    check PF7 fail "$MEM_GIB GiB of memory gives $pages 1G hugepages; at least 8 are needed" "a host with at least 15 GiB of memory"
+    kvm_only_check PF7 fail "$MEM_GIB GiB of memory gives $pages 1G hugepages; at least 8 are needed" "a host with at least 15 GiB of memory"
   elif ((pages < 16)); then
-    check PF7 warn "$MEM_GIB GiB of memory gives $pages 1G hugepages, room for few VMs"
+    kvm_only_check PF7 warn "$MEM_GIB GiB of memory gives $pages 1G hugepages, room for few VMs"
   else
-    check PF7 pass "$MEM_GIB GiB of memory gives $pages 1G hugepages"
+    kvm_only_check PF7 pass "$MEM_GIB GiB of memory gives $pages 1G hugepages"
   fi
 }
 
@@ -735,6 +860,7 @@ facts_network() {
 preflight() {
   pf1_os
   pf3_kvm
+  facts_virt
   pf4_pdpe1gb
   pf5_grub
   pf6_pf7_memory
@@ -1080,7 +1206,7 @@ main() {
     case $1 in
       --json) JSON=1 ;;
       --standalone) STANDALONE=1 ;;
-      --nonce | --main-ip | --cp-ip | --boot-image-url | --images | --vm-disk-gib | --fixture-root)
+      --nonce | --main-ip | --cp-ip | --boot-image-url | --images | --vm-disk-gib | --virt-tier | --fixture-root)
         (($# >= 2)) || usage_error "$1 needs a value"
         case $1 in
           --nonce) NONCE=$2 ;;
@@ -1089,6 +1215,7 @@ main() {
           --boot-image-url) URLS+=("$2") ;;
           --images) IMAGES=$2 ;;
           --vm-disk-gib) VM_DISK_GIB=$2 ;;
+          --virt-tier) VIRT_TIER=$2 ;;
           --fixture-root) fixture=$2 ;;
         esac
         shift
@@ -1100,6 +1227,7 @@ main() {
   [[ $IMAGES =~ ^[0-9]+$ ]] || usage_error "--images must be a number"
   [[ $VM_DISK_GIB =~ ^[0-9]+$ ]] || usage_error "--vm-disk-gib must be a number"
   [[ $NONCE =~ ^[A-Za-z0-9]*$ ]] || usage_error "--nonce must be alphanumeric"
+  [[ $VIRT_TIER =~ ^(kvm|container|pvm|emulated)$ ]] || usage_error "--virt-tier must be kvm, container, pvm or emulated"
   [[ -z $MAIN_IP || $MAIN_IP =~ ^[0-9.]+$ ]] || usage_error "--main-ip must be an IPv4 address"
   test_root "$fixture"
   if [[ -z $NONCE ]]; then

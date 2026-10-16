@@ -2,6 +2,7 @@ UBIPF:f1x7ure {"kind":"fact","id":"arch","value":"aarch64"}
 UBIPF:f1x7ure {"kind":"fact","id":"os_version","value":"ubuntu 24.04"}
 UBIPF:f1x7ure {"kind":"check","id":"PF1","status":"pass","detail":"Ubuntu 24.04 on aarch64","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF3","status":"pass","detail":"/dev/kvm present","fix":""}
+UBIPF:f1x7ure {"kind":"fact","id":"virt","value":{"source":"shell","facts":{"arch":"aarch64","kernel":null,"cpu_model":null,"cpu_flags":[],"dev_kvm":true,"modules":[],"virt_vm":null,"virt_container":null,"dmi":{"sys_vendor":null,"product_name":null,"product_version":null,"bios_vendor":null,"board_vendor":null,"chassis_vendor":null,"chassis_asset_tag":null},"pvm_module_available":false,"cgroup2":true,"apparmor":false,"commands":{"lxc-start":false,"lxcfs":false,"newuidmap":false,"xz":false,"setquota":false,"cryptsetup":false,"mkfs.ext4":false,"qemu-system-x86_64":false},"ovmf":false}}}
 UBIPF:f1x7ure {"kind":"check","id":"PF4","status":"pass","detail":"1G pages need no CPU flag on aarch64","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF5","status":"pass","detail":"/etc/default/grub and update-grub present","fix":""}
 UBIPF:f1x7ure {"kind":"check","id":"PF6","status":"pass","detail":"dmidecode: 64 GiB installed","fix":""}

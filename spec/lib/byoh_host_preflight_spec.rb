@@ -59,7 +59,8 @@ RSpec.describe ByohHostPreflight do
   describe ".parse" do
     it "reads every fixture host's real output" do
       %w[base amd-uniform arm-biglittle btrfs ebs-nvme gpu-nouveau intel-hybrid kvm64-model kvm64-vmx lvm no-kvm noisy-bashrc
-        offline-cpus one-cpu pve-node blank-disk rhizome-user smt-offline sshd-broken two-default-routes ufw-off ufw-on virtio-vda zfs].each do |name|
+        offline-cpus one-cpu pve-node blank-disk rhizome-user smt-offline sshd-broken two-default-routes ufw-off ufw-on virtio-vda zfs
+        no-kvm-container old-script].each do |name|
         preflight = from_fixture(name)
         expect(preflight).to be_readable, name
         expect(preflight.checks.map(&:id)).to include(*described_class::HOST_CHECKS, *described_class::STANDALONE_CHECKS)
@@ -139,6 +140,113 @@ RSpec.describe ByohHostPreflight do
       preflight = from_fixture("sshd-broken")
       expect(preflight).to be_readable
       expect(preflight.facts).to include("sshd" => nil)
+    end
+  end
+
+  describe ".script" do
+    it "puts the virtualization probe ahead of the script, in a heredoc the probe never ends" do
+      script = described_class.script("main \"$@\"\n")
+      expect(script).to start_with("UBICLOUD_VIRT_PROBE=$(cat <<'UBICLOUD_VIRT_PROBE_END'\n# frozen_string_literal: true\n")
+      expect(script).to end_with("exit VirtProbe.main(ARGV)\nUBICLOUD_VIRT_PROBE_END\n)\nmain \"$@\"\n")
+      expect(ByohVirtLadder.remote_script).not_to include described_class::PROBE_END
+    end
+  end
+
+  describe "#virt_facts" do
+    it "reads the probe's report, the shell's facts with the BIOS lines, and nothing else" do
+      expect(from_fixture("base").virt_facts).to include("dev_kvm" => true, "kvm_caps_missing" => [], "bios_log" => nil)
+      expect(from_fixture("no-kvm").virt_facts).to include("dev_kvm" => false, "cpu_flags" => %w[vmx pdpe1gb])
+      expect(from_fixture("no-kvm").virt_facts).not_to have_key "bios_log"
+      shell = ->(facts) { parse({}, "virt" => {"source" => "shell", "facts" => facts}).virt_facts }
+      expect(shell.call({"bios_lines" => ["kvm: disabled by bios", "x"]})).to eq("bios_log" => "kvm: disabled by bios")
+      expect(shell.call({"bios_lines" => ["SGX disabled by BIOS"]})).to eq("bios_log" => nil)
+      expect(shell.call({"bios_lines" => "junk"})).to eq({})
+      expect(shell.call([])).to be_nil
+      expect(parse({}, "virt" => {"source" => "probe", "report" => {"facts" => []}}).virt_facts).to be_nil
+      expect(parse({}, "virt" => {"source" => "probe", "report" => []}).virt_facts).to be_nil
+      expect(parse({}, "virt" => {"source" => "other"}).virt_facts).to be_nil
+      expect(from_fixture("old-script").virt_facts).to be_nil
+    end
+
+    it "refuses a virt fact that is not an object" do
+      expect(check(parse({}, "virt" => "kvm"), "preflight").detail).to eq "preflight output unreadable: fact virt is not a Hash"
+    end
+  end
+
+  describe "PF3 from the virtualization ladder" do
+    def offer(tier)
+      ship_virt_tiers(tier)
+      location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => ["kvm", tier], "acks" => {tier => []}}))
+    end
+
+    it "passes a KVM host on the probe's verdict, keeping the script's words" do
+      preflight = evaluate(from_fixture("base"), main_ip: "203.0.113.10")
+      expect(check(preflight, "PF3").to_h).to include(status: "pass", fix: "",
+        detail: "/dev/kvm present (Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz); ladder: kvm (L1) on unknown platform: /dev/kvm answers KVM_GET_API_VERSION 12")
+      expect(preflight.virt_tier).to eq "kvm"
+      expect(preflight.virt_verdict.tier).to eq "kvm"
+      expect(check(preflight, "PF3-tier")).to be_nil
+    end
+
+    it "fails a host without usable KVM with its rung and the fix" do
+      preflight = evaluate(from_fixture("kvm64-model"), main_ip: "203.0.113.10")
+      expect(check(preflight, "PF3")).to have_attributes(status: "fail",
+        detail: start_with("kvm64-class CPU model (Common KVM processor); ladder: kvm_blocked (L2) on unknown platform: the CPU model is the hypervisor's generic"),
+        fix: start_with("Give this VM the host's CPU model"))
+      expect(preflight).to be_blocking
+    end
+
+    it "keeps the script's verdict, with the caveat, when the ladder lacks KVM facts" do
+      facts = {"virt" => {"source" => "shell", "facts" => {"arch" => "x86_64", "cpu_model" => "Xeon", "cpu_flags" => %w[vmx pdpe1gb], "dev_kvm" => true}}}
+      preflight = evaluate(parse({}, facts))
+      expect(check(preflight, "PF3")).to have_attributes(status: "pass",
+        detail: "PF3 detail; ladder: kvm (L1) on unknown platform: /dev/kvm exists (not opened); some KVM facts were not gathered (kvm_open, kvm_create_vm, kvm_capabilities, firmware); Prog::LearnVirt checks them at prep")
+    end
+
+    it "keeps the script's PF3 without facts, or when told to leave them unused" do
+      expect(check(evaluate(from_fixture("old-script"), main_ip: "203.0.113.10"), "PF3").detail).to eq "/dev/kvm present (Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz)"
+      preflight = evaluate(from_fixture("no-kvm"), main_ip: "203.0.113.10", ladder: false)
+      expect(check(preflight, "PF3").detail).to eq "no /dev/kvm"
+      expect(preflight.virt_verdict).to be_nil
+    end
+
+    it "passes a host without KVM on a lower tier it is ready for, in a location that offers it" do
+      offer("container")
+      preflight = evaluate(from_fixture("no-kvm-container"), main_ip: "203.0.113.10", virt_tier: "container")
+      expect(check(preflight, "PF3")).to have_attributes(status: "pass", fix: "", detail: start_with("container: none (L3-L5) on unknown platform: this VM (kvm) gets no hardware virtualization"))
+      expect(check(preflight, "PF3-tier").to_h).to include(status: "pass", detail: "location byoh-pf offers container (L3, experimental)")
+      expect(%w[PF4 PF5 PF7].map { check(preflight, it).to_h.values_at(:status, :detail) }).to eq [
+        ["info", "not needed by a container host: pdpe1gb flag present"],
+        ["info", "not needed by a container host: /etc/default/grub and update-grub present"],
+        ["info", "not needed by a container host: 64 GiB of memory gives 57 1G hugepages"],
+      ]
+      expect(preflight).not_to be_blocking
+    end
+
+    it "fails a lower tier the host cannot run, or a location does not offer" do
+      preflight = evaluate(from_fixture("no-kvm"), main_ip: "203.0.113.10", virt_tier: "container")
+      expect(check(preflight, "PF3")).to have_attributes(status: "fail", detail: start_with("container: kvm_blocked (L2)"), fix: start_with("This host cannot run container"))
+      expect(check(preflight, "PF3-tier")).to have_attributes(status: "fail", detail: "location byoh-pf does not offer container hosts",
+        fix: "bin/byoh-location rates --location byoh-pf --family container --from standard --multiplier <X>; bin/byoh-location set --location byoh-pf --virt-tiers kvm,container --accept container")
+      expect(check(evaluate(from_fixture("base"), main_ip: "203.0.113.10", virt_tier: "container"), "PF3").fix).to eq "This host runs KVM (L1); register it as kvm."
+    end
+
+    it "says a lower tier with an unchecked need is checked at prep, and notes a script without facts" do
+      offer("emulated")
+      facts = {"virt" => {"source" => "shell", "facts" => {"arch" => "x86_64", "cpu_flags" => [], "dev_kvm" => false, "virt_vm" => "kvm", "commands" => {}}}}
+      preflight = evaluate(parse({}, facts), virt_tier: "container")
+      expect(check(preflight, "PF3")).to have_attributes(status: "info", detail: include("; Could not check that this host has an x86_64 CPU, cgroup v2"))
+      preflight = evaluate(from_fixture("old-script"), main_ip: "203.0.113.10", virt_tier: "emulated")
+      expect(check(preflight, "PF3").to_h).to include(status: "info",
+        detail: "not needed by a emulated host: /dev/kvm present (Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz); the host reported no virtualization facts, so Prog::LearnVirt checks the tier at prep")
+      expect(status(preflight, "PF3-tier")).to eq "pass"
+    end
+
+    it "fails a tier this control plane cannot register, and skips the location check without a location" do
+      preflight = evaluate(from_fixture("no-kvm"), main_ip: "203.0.113.10", virt_tier: "pvm")
+      expect(check(preflight, "PF3-tier").to_h).to include(status: "fail", detail: "pvm hosts are not available yet (docs/byoh/NO_KVM.md section 11)")
+      preflight = from_fixture("no-kvm").evaluate(main_ip: "203.0.113.10", virt_tier: "container")
+      expect(check(preflight, "PF3-tier")).to be_nil
     end
   end
 

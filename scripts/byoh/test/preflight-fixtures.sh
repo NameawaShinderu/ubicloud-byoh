@@ -12,6 +12,7 @@
 #   <case>/expect   "ID STATUS" lines that must match
 #   <case>/detail   "ID DETAIL" lines that must match exactly
 #   <case>/noise    sourced first (BASH_ENV), as a noisy .bashrc would be
+#   <case>/args     more preflight arguments, one per line (--virt-tier)
 # and in every case: exit 0, each check id exactly once, nothing printed
 # with the nonce that is not a check or a fact.
 #
@@ -48,14 +49,15 @@ fi
 
 # run_case CASE: prints the script's stdout; fails on a non-zero exit.
 run_case() {
-  local dir name=$PREFIX-pf-$1 env=() rc=0
+  local dir name=$PREFIX-pf-$1 env=() args=() rc=0
   dir=$(pf_fixture "$1")
   [[ -f $dir/noise ]] && env=(-e BASH_ENV=/fx/noise)
+  [[ -f $dir/args ]] && mapfile -t args <"$dir/args"
   echo "$name" >>"$STATE/created"
   docker run --rm --name "$name" --network "$NET" -i \
     -v "$HOST_DIR:/h:ro" -v "$dir:/fx:ro" -e UBICLOUD_HOST_TEST_ROOT=/fx "${env[@]}" \
     docker.io/library/ubuntu:24.04 \
-    bash -s preflight --json --nonce "$NONCE" --standalone --main-ip 203.0.113.10 --fixture-root /fx \
+    bash -s preflight --json --nonce "$NONCE" --standalone --main-ip 203.0.113.10 --fixture-root /fx "${args[@]}" \
     <"$HOST_DIR/ubicloud-host" 2>"$LOGS/$1.err" || rc=$?
   ((rc == 0)) || fail "$1: exit $rc ($(tail -2 "$LOGS/$1.err" | tr '\n' ' '))"
 }
@@ -81,7 +83,7 @@ check_output() {
   ((n == ${#CHECK_IDS[@]})) || fail "$case: $n checks, expected ${#CHECK_IDS[@]}"
   n=$(grep -o "UBIPF:$NONCE .*" <<<"$out" | grep -cvE "^UBIPF:$NONCE \{\"kind\":\"(check|fact)\"," || true)
   ((n == 0)) || fail "$case: $n nonce lines are neither checks nor facts"
-  for id in arch os_version mem_gib cpus_online storage_fstype ip_addr ip_route netplan host_keys sshd; do
+  for id in arch os_version mem_gib cpus_online storage_fstype ip_addr ip_route netplan host_keys sshd virt; do
     grep -q "UBIPF:$NONCE {\"kind\":\"fact\",\"id\":\"$id\"" <<<"$out" || fail "$case: no fact $id"
   done
   while read -r id want; do

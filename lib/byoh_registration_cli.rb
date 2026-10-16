@@ -5,8 +5,9 @@ require "optparse"
 # bin/register-byoh-host: registers a bring-your-own host in a BYOH
 # location. Parses the options, shows the SSH key the operator installs
 # on the host, runs host preflight once that key is installed (given
-# with --ssh-key, or confirmed by the operator), and hands the rest to
-# ByohRegistration.
+# with --ssh-key, or confirmed by the operator), decides the
+# virtualization tier from what preflight found (ByohVirtRegistration),
+# and hands the rest to ByohRegistration.
 class ByohRegistrationCli
   class Error < StandardError; end
 
@@ -39,6 +40,7 @@ class ByohRegistrationCli
     registration.validate!
     ByohHostPreflight.validate_accept!(options[:accept_checks])
     virt = ByohVirtRegistration.new(declared: options[:virt_tier], accept_fallback: options[:accept_fallback], probe: options[:virt_probe] != false)
+    registration.boot_images_for!(virt.declared) unless virt.declared == "auto"
     registration.provider_config
     registration.notes.each { @err.puts "note: #{it}" }
 
@@ -53,15 +55,16 @@ class ByohRegistrationCli
       @input.readline
     end
 
-    # The host can be probed only once the key is installed.
-    verdict, unprobed = virt.probe(options[:main_ip], SshKey.from_binary(registration.keypair).private_key)
-    decision = virt.decide!(verdict, location: registration.location, main_ip: options[:main_ip], unprobed_reason: unprobed, boot_images: registration.default_boot_images)
-    decision.notes.each { @err.puts "note: #{it}" }
-
     @out.puts
     @out.puts "Step 2/3 — Host preflight"
     @out.puts "────────────────────────────────"
-    return 1 unless preflight(registration, options)
+    passed, report = preflight(registration, options, virt)
+    return 1 unless passed
+
+    # The tier, from the virt facts preflight gathered (PF3).
+    decision = virt.decide!(report&.virt_verdict, location: registration.location, main_ip: options[:main_ip],
+      unprobed_reason: virt.unprobed_reason(report), boot_images: registration.default_boot_images)
+    decision.notes.each { @err.puts "note: #{it}" }
 
     @out.puts
     @out.puts "Step 3/3 — Registering host with control plane"
@@ -128,7 +131,7 @@ class ByohRegistrationCli
       o.separator "Optional:"
       o.on("--server-identifier ID", "Operator-assigned identifier (default: byoh-<vm_host uuid>)") { options[:server_identifier] = it }
       o.on("--yes", "Skip interactive confirmation") { options[:assume_yes] = true }
-      o.on("--default-boot-image NAME", "Boot image to download on this host at registration time (repeatable; default: #{ByohRegistration::DEFAULT_BOOT_IMAGES.join(", ")})") do
+      o.on("--default-boot-image NAME", "Boot image to download on this host at registration time (repeatable; default: #{ByohRegistration::DEFAULT_BOOT_IMAGES.join(", ")}, or the first image of a lower --virt-tier)") do
         options[:default_boot_images] << it
       end
       o.separator ""
@@ -154,34 +157,36 @@ class ByohRegistrationCli
     raise Error, "--location is required\n#{parser}" unless options[:location]
 
     options[:bmc]["verify_ssl"] = false if options[:bmc] && !options[:bmc]["verify_ssl"]
-    options[:default_boot_images] = ByohRegistration::DEFAULT_BOOT_IMAGES if options[:default_boot_images].empty?
+    # nil: ByohRegistration picks the default, which depends on the tier.
+    options[:default_boot_images] = nil if options[:default_boot_images].empty?
     options
   end
 
-  # Runs preflight when it can work; returns whether to register.
-  def preflight(registration, options)
+  # Runs preflight when it can work; returns whether to register, and
+  # the report (nil when preflight was skipped).
+  def preflight(registration, options, virt)
     if options[:skip_preflight]
       @err.puts "warning: preflight skipped (--skip-preflight); the host was not checked"
-      return true
+      return [true, nil]
     end
     generated = options[:ssh_key_source] == :generate
     if generated && options[:assume_yes]
       @err.puts "warning: preflight skipped: this run generated the registration key and --yes skipped the step that installs it, " \
         "so the login cannot work yet; check the host by running scripts/byoh/host/ubicloud-host preflight on it, " \
         "or install a key first and pass --ssh-key"
-      return true
+      return [true, nil]
     end
 
-    report = registration.preflight(accept_checks: options[:accept_checks], **@preflight)
+    report = registration.preflight(accept_checks: options[:accept_checks], virt:, **@preflight)
     @out.print report.to_table
-    return true unless report.blocking?
+    return [true, report] unless report.blocking?
 
     @err.puts "! preflight failed: fix the checks marked fail, or accept an overridable one with --accept-check; nothing was registered"
     if generated
       @err.puts "  The generated key was not kept: remove its line from root's authorized_keys on the host. " \
         "The next run prints a new key, or pass --ssh-key with one you keep."
     end
-    false
+    [false, report]
   end
 
   def bmc(options)
