@@ -73,12 +73,12 @@ The guides describe branch `m2-network`. It is **not pushed yet**: the published
 | c73f96ddc | The uplink MAC pin skips NICs named by a VLAN, bond, bridge or VRF | PrepHost can break such a netplan. Keep VLANs and bonds off the data-plane host's uplink (tag on the hypervisor or switch) |
 | 9d85a6e3c | VMs cannot reach `168.63.129.16`, `fd00:ec2::254` and `fd20:ce::254` | Only `169.254.0.0/16` is dropped |
 | 105b6439b | `bootstrap-data-plane.sh` checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` | Run those checks by hand (PLATFORMS PF3, PF4); PrepHost still aborts without KVM |
-
-Branch `no-kvm` (the virtualization ladder: `bin/byoh-virt`, `--virt-tier`, `bootstrap-data-plane.sh --tier`, the `container` and `emulated` tiers) is built on top of `byoh-driver` and is not merged or pushed. Without it, a machine without KVM cannot be a data plane, and the probe and fallback commands in these guides do not exist.
 | 237202b07, 8a9b271c7 | The control-plane bootstrap writes `BILLING_RATES_EXTRA_DIR` and `BASE_URL`, and knows `UBI_START_MONITOR` and `UBI_BASE_URL` | Add both lines to `.env.rb` by hand (VERIFY.md §1.1, SETUP.md §4) |
 | 71988157c, 3774f5837, 04f4f7ddc, a75747755 | Gate reaches VMs through their namespace; G9 without internet pools; `GATE_EXTERNAL_SSH_VIA`; clearer `verify` warning | The gate jumps to VMs over IPv6, which fails on ULA hosts |
 
 The commits after 29fe8c799 (the first five rows) are covered by unit specs only and have not run on a host.
+
+Branch `no-kvm` (the virtualization ladder: `bin/byoh-virt`, `--virt-tier`, `bootstrap-data-plane.sh --tier`, the `container` and `emulated` tiers) is built on top of `byoh-driver` and is not merged or pushed. Without it, a machine without KVM cannot be a data plane, and the probe and fallback commands in these guides do not exist.
 
 ---
 

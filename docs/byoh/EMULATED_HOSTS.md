@@ -453,10 +453,16 @@ It is useful only where CH misbehaves. It is **not in the MQ gate** and stays UN
 > `--accept-no-guest-isolation`). The shipped equivalents are in NO_KVM.md section 14, L5-T1:
 > `bootstrap-data-plane.sh --tier emulated`, `bin/byoh-location rates ... --family emulated`,
 > `set --virt-tiers kvm,emulated --accept emulated`, and `register-byoh-host --virt-tier emulated --accept-fallback`.
+>
+> Item 2's harness path `scripts/byoh/test/qemu/` is superseded too; that directory was never built.
+> The shipped L5 harness is `scripts/byoh/test/nokvm/run.sh l5` (`l5.sh`, the fail-closed `ubi-q-nokvm-l5`
+> container), described in NO_KVM.md section 8.1 "Lab" and section 13 row 6. Like `l3`, it needs mounts,
+> so it runs only on a throwaway VM (`BYOH_NOKVM_THROWAWAY_VM=1`) or under the admin-loaded profile.
+> It has not run: UNVERIFIED.
 > Item 4's docs landed in NO_KVM WP8 (2026-10-16), without the PF-Q rows: PLATFORMS.md uses PF-V rows instead.
 
 1. **Code gate** (every WP): the full Ruby gate with 100% line and branch coverage, frozen specs, rubocop, rhizome specs, shellcheck. The WP1 golden fixtures (CH units, QEMU+KVM unit, CH `params_json`, PrepHost command, `create_unix_user` heredoc) and the WP1 pins (timings; `validate_vm_size` errors) must pass unchanged from WP2 on. The size-error pin computes the list from `Option::VmSizes` without family `emulated`, so an upstream merge that adds or renames a size does not break it, but an emulated size leaking into any caller does.
-2. **Container gate** (`scripts/byoh/test/qemu/run.sh all`, WP10). In an `ubi-q-*` container with no `--privileged`, no `/dev/kvm` and no `/dev/vhost-net`, the **real** `host/bin/setup-vm prep` boots an `emulated-2` VM under TCG from the server cloud image, with ubiblk encryption, rhizome networking (including the real ByohEgressNat config) and cloud-init. It then checks:
+2. **Container gate** (planned as `scripts/byoh/test/qemu/run.sh all`, WP10; SUPERSEDED by `scripts/byoh/test/nokvm/run.sh l5`, see the note above). In an `ubi-q-*` container with no `--privileged`, no `/dev/kvm` and no `/dev/vhost-net`, the **real** `host/bin/setup-vm prep` boots an `emulated-2` VM under TCG from the server cloud image, with ubiblk encryption, rhizome networking (including the real ByohEgressNat config) and cloud-init. It then checks:
    - SSH within 420 s, DNS and egress (`apt-get update`, timed); the guest cannot reach the test database
    - `query-kvm` enabled=false, no `/dev/kvm` among QEMU's file descriptors, guest `systemd-detect-virt` = `qemu`, no `svm`/`vmx` flags (proves `-cpu max,-svm,-vmx` boots)
    - `systemd-analyze verify` and `security --offline=yes` on the unit, with the score recorded
@@ -497,5 +503,5 @@ The full plan, with files, tests and done-checks, is in the MQ section of `docs/
 | WP7 | VM path: `params_json`, `create_unix_user`, timings, the four placement guards, exit-diagnosis label, GPU refusal |
 | WP8 | Location, registration and host CLIs (dedicated locations, ack flag, rates), preflight warnings, `m2-checks emulated`, bootstrap `--emulated` |
 | WP9 | Product surface: family and sizes, `extra_families`, gated form/API, labels, badge |
-| WP10 | Container e2e harness `scripts/byoh/test/qemu/` |
+| WP10 | Container e2e harness `scripts/byoh/test/qemu/` (SUPERSEDED: shipped as `scripts/byoh/test/nokvm/run.sh l5`) |
 | WP11 | Docs, CLAUDE.md, M4 hook note; final full gate |
