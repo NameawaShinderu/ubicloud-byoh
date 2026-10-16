@@ -421,7 +421,7 @@ class Prog::Vm::HostNexus < Prog::Base
     smallest = ByohVirtTiers.smallest_size(vm_host.virt_tier)
     cores_needed = [1, smallest.vcpus * vm_host.total_cores / vm_host.total_cpus].max
     if vm_host.total_cores - 1 < cores_needed
-      fail "#{vm_host.virt_tier} hosts need #{cores_needed + 1} physical cores, one for the host and #{cores_needed} for a #{smallest.name} VM; this host has #{vm_host.total_cores} cores and #{vm_host.total_cpus} threads"
+      fail "#{vm_host.virt_tier} hosts need #{cores_needed + 1} physical cores, one for the host and #{cores_needed} for one #{smallest.name} VM; this host has #{vm_host.total_cores} cores and #{vm_host.total_cpus} threads"
     end
 
     hugepages_mib = Integer(hugepages) * Integer(hugepage_kib) / 1024

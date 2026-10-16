@@ -159,7 +159,7 @@ RSpec.describe Prog::Vm::HostNexus do
         it "fails without the cores or the memory budget for its VMs" do
           expect(nx.sshable).to receive(:_cmd).and_return(meminfo, meminfo(total: 4194304))
           nx.vm_host.update(total_cores: 1, used_cores: 0)
-          expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "#{tier} hosts need 2 physical cores, one for the host and 1 for a #{tier}-2 VM; this host has 1 cores and 8 threads")
+          expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "#{tier} hosts need 2 physical cores, one for the host and 1 for one #{tier}-2 VM; this host has 1 cores and 8 threads")
           nx.vm_host.update(total_cores: 4)
           create_vm(vm_host_id: vm_host.id, family: tier, memory_gib: 4, location_id: location.id)
           expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, /\ANot enough memory budget for VMs \([01] GiB for 4 GiB of VMs\)\z/)
@@ -172,7 +172,7 @@ RSpec.describe Prog::Vm::HostNexus do
       # and an emulated-2 VM needs two.
       vm_host.update(total_cores: 2, total_cpus: 2)
       expect(nx.sshable).to receive(:_cmd).and_return(meminfo)
-      expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "emulated hosts need 3 physical cores, one for the host and 2 for a emulated-2 VM; this host has 2 cores and 2 threads")
+      expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "emulated hosts need 3 physical cores, one for the host and 2 for one emulated-2 VM; this host has 2 cores and 2 threads")
     end
 
     context "with a container host short of memory" do
@@ -197,7 +197,7 @@ RSpec.describe Prog::Vm::HostNexus do
       expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "Couldn't parse /proc/meminfo")
       expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "Insufficient memory left for the host OS")
       nx.vm_host.update(total_cores: 1, used_cores: 0)
-      expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "emulated hosts need 2 physical cores, one for the host and 1 for a emulated-2 VM; this host has 1 cores and 8 threads")
+      expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "emulated hosts need 2 physical cores, one for the host and 1 for one emulated-2 VM; this host has 1 cores and 8 threads")
       nx.vm_host.update(total_cores: 4)
       create_vm(vm_host_id: vm_host.id, family: "emulated", memory_gib: 4, location_id: location.id)
       expect { nx.verify_tier_capacity }.to raise_error(RuntimeError, "Not enough memory budget for VMs (0 GiB for 4 GiB of VMs)")

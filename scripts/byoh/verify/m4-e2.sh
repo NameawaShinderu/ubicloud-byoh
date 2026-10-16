@@ -221,7 +221,7 @@ fi
 
 if ! phase "host add" "${ADMIN_CMD[@]}" host add --site "$SITE" --ssh "$HOST_SSH" --ssh-key "$HOST_KEY" \
   --pool-file "$POOL_FILE" "${EXPECT_ARGS[@]}" "${REG_ARGS[@]}" "${EXTRA_ARGS[@]}"; then
-  summary "FAIL host add (resume with the same command; the bring-up keeps running)"
+  summary "FAIL host add (resume with the same command, without --storage-disk once the host is registered; the bring-up keeps running)"
   key_note
   exit 1
 fi

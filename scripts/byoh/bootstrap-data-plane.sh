@@ -437,13 +437,13 @@ else
   cores_needed=$((2 * cores / threads))
   [ "$cores_needed" -ge 1 ] || cores_needed=1
   if [ $((cores - 1)) -lt "$cores_needed" ]; then
-    echo "ERROR: a $TIER host needs $((cores_needed + 1)) physical cores, one for the host and $cores_needed for a $TIER-2 VM; this host has $cores cores and $threads threads." >&2
+    echo "ERROR: $TIER hosts need $((cores_needed + 1)) physical cores, one for the host and $cores_needed for one $TIER-2 VM; this host has $cores cores and $threads threads." >&2
     exit 1
   fi
   mem_mib=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
   budget_gib=$(((mem_mib * 42 / 43 - 2048 - overhead_mib * (threads / 2)) / 1024))
   if [ "$budget_gib" -lt "$min_gib" ]; then
-    echo "ERROR: a $TIER host with $mem_mib MiB of memory has a VM memory budget of about $budget_gib GiB, less than the $min_gib GiB of a $TIER-2 VM; give it more memory." >&2
+    echo "ERROR: this $TIER host, with $mem_mib MiB of memory, has a VM memory budget of about $budget_gib GiB, less than the $min_gib GiB of one $TIER-2 VM; give it more memory." >&2
     exit 1
   fi
   echo "  capacity: $cores cores, $threads threads, about $budget_gib GiB for $TIER VMs"
