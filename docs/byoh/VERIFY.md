@@ -315,7 +315,43 @@ Afterwards stop the monitor again (it stays disabled until M9, [OPERATIONS.md](O
 
 | Gate | Date | Result | Notes |
 |---|---|---|---|
-| G-M4-1 | — | not run | needs an AWS canary |
+| G-M4-1 | 2026-10-16 | pass (AWS, run e2e1, §7) | `m4-e2.sh` on m8i.2xlarge with nested virtualization: site add, host add with `--expect-host-key` and `--storage-disk`, bring-up to `accepting`, m2 gate G1 G2 G4 G5; then G3, G7-G9b, G12-G14 with three VMs |
 | G-M4-2 | — | not run | needs a Proxmox VM |
 | G-M4-3, 4, 5 | — | not run | need G-M4-1, G-M4-2 and an LVM-root host, 24 h each |
 | G-M4-6 | 2026-10-15 | pass (fixtures and containers) | `m4-host-add.sh` runs A (no `/dev/kvm`: exit 1 at preflight, no change), B (a /29 holding the uplink IP: exit 1 with PF17), C (the `intel-hybrid` fixture: `PF8-hybrid` blocks, `--accept-check PF8-hybrid` downgrades it) |
+
+## 7. Real-infrastructure run e2e1 (AWS ap-south-1, 2026-10-16)
+
+`scripts/byoh/test/aws-e2e/` created five tagged instances in the test VPC and tore them down afterwards (about 2.5 hours, roughly $3). Branch `aws-e2e`, starting from `byoh-driver` 0f671401e; the fixes below were built into releases v0.1.0-e2e2 to e2e4 on the control plane with the manual release switch and pushed to hosts with `install_rhizome`.
+
+| What | Instance | Result |
+|---|---|---|
+| M3 `install.sh`, production mode, `--tls acme` on `<eip>.sslip.io` | t3.large | pass: smoke ok, a Let's Encrypt certificate (issuer YE1), services as systemd units, database role checks ok |
+| M3 re-run of `install.sh` with `--backup-recipient` | ctrl | pass: idempotent; `status: ok` |
+| M3 account, web login over HTTPS | ctrl | pass: `ubicloud-admin account create`, two-step login, project listed |
+| M3 real reboot | ctrl | pass: every unit back, `status: ok` |
+| M3 manual release switch (three times) | ctrl | pass: stage, backup, migrate, use, start; previous release kept |
+| M3 backup then restore | ctrl | pass: restored into `ubicloud_restore` and swapped; host and VM counts unchanged; `status: ok` |
+| E1 canary: production-mode boot image from the public mirror, VM boot | m8i.2xlarge | pass: `ubuntu-noble` downloaded with `BOOT_IMAGE_SOURCE=public`; three VMs running about a minute after create |
+| M4 G-M4-1 (`m4-e2.sh`) | m8i.2xlarge | pass after the fixes below |
+| M2 gate G3, G7, G8, G9, G9b, G12, G13, G14 (after a host reboot) | m8i.2xlarge | pass; VM-A leaves as its EIP; IMDS blocked; SMTP and the underlay blocked. G6, G10, G11 not run (no data-plane ingress before M7; no spare EIP) |
+| Ladder detection, PF3 | t3.xlarge, t3.large | pass: "none (L3-L5) on AWS EC2", the move-to-C8i/M8i/R8i fix and the fallbacks; nothing changed on the host |
+| L4 PVM go/no-go (`pvm-go-no-go.sh`) | m6i.large | **GO** with Cloud Hypervisor 46.0 and 53.0 (cocoonstack/pvm v0.1.0); guest vs host: CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32%, login prompt 140 s; recovery-check PASS on the stock kernel |
+| L3 container host and VM | t3.xlarge | pass after the fixes below: CPU 99.8% and memory 99.9% of the host; EIP egress; IMDS blocked; modprobe, mount, kernel sysctl writes, user namespaces and nft refused; no `/dev/kvm`, `/dev/fuse` or host disks; LUKS2 disk; uid map 0 -> 1000000000; stop, start, delete, billing family `container` |
+| L5 emulated host and VM | t3.xlarge | pass: `-accel tcg,thread=multi,tb-size=256`, create to running 2 min 16 s; CPU 29% and memory 2% of the host; egress, DNS, apt; stop, start, delete; billing family `emulated`. A t3.large (one core) is refused by bootstrap, as designed |
+
+Bugs the run found, each fixed on `aws-e2e` with a spec where code changed:
+
+1. `terraform/aws-byoh/user-data-data.sh`: `systemctl reload ssh` fails under socket activation on current 24.04 images, so `set -e` ended the script before the pool IPs came off the NIC.
+2. `ByohHostWatch` did not count upstream's `patch` label (after the boot image download), so host add exited 3 on a healthy bring-up.
+3. `ubicloud-admin run` did not allow `byoh-virt`.
+4. `m2-gate.sh` G3 and G13 called `bundle` directly, which a packaged control plane does not have.
+5. Container prep asked dpkg for `lxc-utils`; Ubuntu 24.04 ships the tools in `lxc`.
+6. LearnStorage failed forever on a BYOH host without `--storage-disk`: nothing created `/var/storage`.
+7. The container network hook switched namespaces (`ip -n`), which remounts `/sys`; Ubuntu's AppArmor profile for `lxc-start` denies that.
+8. The static `lxc-container-default-cgns` profile denies the `rslave` mount of `/` that systemd 255 needs, so container guests' init exited at once; containers now use LXC's generated profile.
+9. A stopped container's unit ended `failed`: ExecStop's `lxc-stop` exits 2 after the clean shutdown.
+10. Wording: the tier capacity refusals ("a emulated") and the m4-e2 resume hint.
+
+Still not run on real machines: Proxmox (G-M4-2), the F5 24 h soak (G-M4-3 to 5), a real Cloudflare tunnel, G6/G10/G11, and the PVM build (WP7), which the GO now allows. Open gaps seen but not fixed: a container guest's `nproc` shows the host's CPUs (the cgroup limit holds; lxcfs does not virtualize the count), and `byoh-location rates` prints the development-layout restart hint on a packaged control plane.
+

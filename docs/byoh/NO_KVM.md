@@ -1386,7 +1386,20 @@ Upgrading the live control plane follows the existing window (CLAUDE.md §8): st
 every host on L1); `install_rhizome` on every host, which ships `virt-probe`; `bin/byoh-virt refresh`.
 Rollback: the WP4 migration's `down` refuses while it holds data; run `bin/byoh-host export-audit` first.
 
-## 14. Real-infrastructure tests (runnable, all UNVERIFIED)
+## 14. Real-infrastructure tests
+
+**Run e2e1 on AWS, 2026-10-16** ([VERIFY.md](VERIFY.md) §7, harness `scripts/byoh/test/aws-e2e/`):
+
+| Test | Instance | Result |
+|---|---|---|
+| L1-T2 | m8i.2xlarge, nested on | kvm; the host reached `accepting` and ran three VMs |
+| L2 on AWS without nested | t3.xlarge, t3.large | `none (L3-L5) on AWS EC2`, with the move-to-C8i/M8i/R8i fix and the fallbacks |
+| L3-T1 | t3.xlarge | pass: CPU 99.8%, memory 99.9% of the host; the guest-side refusals below; LUKS2; uid map; the generated AppArmor profile |
+| L4-T1 | m6i.large | **GO** on CH 46.0 and 53.0: CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32%, login prompt 140 s; recovery-check PASS. WP7 may now be built |
+| L5 | t3.xlarge | pass: TCG confirmed, CPU 29%, memory 2%, create to running 2 min 16 s |
+
+The tests below that are not in that table stay UNVERIFIED (GCP, Proxmox, VMware, Hyper-V, bare metal, other VPS).
+
 
 These need machines the lab cannot provide. Each is a script to paste; record the results here.
 They need `$IP`, `$KEY` and a throwaway machine, and never touch a registered host unless the test says so.
@@ -1426,7 +1439,7 @@ bin/byoh-location rates --location $LOC --family container --from standard --mul
 bin/byoh-location set --location $LOC --virt-tiers kvm,container --accept container   # refused before the rates exist
 bin/register-byoh-host --location $LOC --main-ip $IP ... --virt-tier auto --accept-fallback   # expect: container chosen and printed
 # Create a container-2 VM, then on the host:
-sudo aa-status | grep -c 'lxc-<vm>_'                       # >= 1: the generated profile confines it
+sudo aa-status | grep -c 'lxc-<vm>_'                       # >= 1: the generated profile confines it (19 on e2e1)
 sudo cryptsetup status ubi-<vm>-0 | grep -q LUKS2          # crypt-loop: encrypted at rest
 pid=$(sudo nsenter --net=/run/netns/<vm> lxc-info -n <vm> -P /var/lib/ubicloud/lxc -p -H)   # the container's init; lxc-start is the monitor in
                                                            #   the initial user namespace (uid_map "0 0 4294967295")
