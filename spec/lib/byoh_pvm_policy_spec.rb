@@ -140,6 +140,18 @@ RSpec.describe ByohPvmPolicy do
       expect { described_class.verify(nil, pins.merge("host_deb" => pin("h.deb", "other")), fetcher: fetcher(files), dir:) }
         .to raise_error(ByohArtifactFetch::Refused, /has sha256 .*, not the pinned/)
     end
+
+    it "refuses a guest kernel that is not an ELF vmlinux, even with a pinned config" do
+      config = hvc_config
+      bz = "MZ\xEA\x07 bzImage".b
+      with_config = pins.except("guest_unchecked").merge("guest_kernel" => pin("vmlinux", bz), "guest_config" => pin("config", config))
+      served = fetcher(files.merge("https://example.com/vmlinux" => bz, "https://example.com/config" => config))
+      expect { described_class.verify(nil, with_config, fetcher: served, dir:) }
+        .to raise_error(described_class::Refused, "the guest kernel https://example.com/vmlinux is not an ELF vmlinux (cloud-hypervisor boots it directly; a bzImage will not do)")
+      empty = pins.merge("guest_kernel" => pin("vmlinux", ""), "guest_unchecked" => true)
+      expect { described_class.verify(nil, empty, fetcher: fetcher(files.merge("https://example.com/vmlinux" => "")), dir:) }
+        .to raise_error(described_class::Refused, /is not an ELF vmlinux/)
+    end
   end
 
   it "summarizes the pins" do

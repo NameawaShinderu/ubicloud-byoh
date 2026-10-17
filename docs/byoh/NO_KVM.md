@@ -859,7 +859,8 @@ fact, "detected, not offered".
   --pvm-host-deb ... --pvm-guest-kernel ...`); the guest config URL and sha256 are optional. `set`
   downloads every changed pin over https, refuses a sha256 mismatch before it stores anything, and
   reads the guest config (or the config embedded in the vmlinux, `CONFIG_IKCONFIG`); without either it
-  refuses unless `--pvm-guest-unchecked`. `set --no-verify-download` skips all of that: it stores the
+  refuses unless `--pvm-guest-unchecked`. It also refuses a guest kernel that is not an ELF `vmlinux`
+  (a `bzImage`, say), the same rule as each host's download, whether or not a config is pinned. `set --no-verify-download` skips all of that: it stores the
   pins without downloading them and records a changed guest kernel as unchecked (`config_checked`
   false in the location policy), so the hosts are then the only gate. Each pvm host's download checks
   the guest kernel's sha256 and config and records its console; a bad pin is refused there, after it

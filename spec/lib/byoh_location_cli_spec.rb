@@ -756,6 +756,13 @@ RSpec.describe ByohLocationCli do
         expect(location.reload.byoh_virt).to be_nil
       end
 
+      it "refuses a guest kernel that is not an ELF vmlinux, even with a pinned config" do
+        files["https://example.com/vmlinux"] = "MZ bzImage".b
+        args = [*pin_args, "--pvm-guest-config", "https://example.com/config", "--pvm-guest-config-sha256", sha("https://example.com/config")]
+        expect(cli("set", "--location", location.name, *args)[2]).to eq "! the guest kernel https://example.com/vmlinux is not an ELF vmlinux (cloud-hypervisor boots it directly; a bzImage will not do)\n"
+        expect(location.reload.byoh_virt).to be_nil
+      end
+
       it "takes a guest kernel without a readable config only when accepted unchecked" do
         files["https://example.com/vmlinux"] = "\x7FELF no config".b
         expect(cli("set", "--location", location.name, *pin_args)[2]).to start_with "! the guest kernel has no embedded config (CONFIG_IKCONFIG)"

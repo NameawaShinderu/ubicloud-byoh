@@ -39,6 +39,10 @@ module ByohPvmPolicy
   # kernel/configs.c): this marker, then the config gzipped.
   IKCONFIG_MAGIC = "IKCFG_ST\x1f\x8b\x08".b
 
+  # Cloud Hypervisor boots the guest kernel directly, so it must be an
+  # ELF vmlinux; rhizome's PvmGuestKernel refuses anything else.
+  ELF_MAGIC = "\x7fELF".b
+
   # What the operator acknowledges by pinning PVM kernels.
   ACK = "PVM kernels are third-party builds: you own watching them for CVEs and pinning fixed builds " \
     "(docs/byoh/NO_KVM.md section 6.8). pvm stays single project: keep the location hidden and grant it to one project."
@@ -84,6 +88,9 @@ module ByohPvmPolicy
     needed = FILES.keys.select { new[it] && new[it] != old&.dig(it) }
     needed |= [new["guest_config"] ? "guest_config" : "guest_kernel"] if guest_changed?(old, new)
     paths = needed.to_h { [it, fetcher.fetch(new[it]["url"], new[it]["sha256"], File.join(dir, it))] }
+    if paths["guest_kernel"] && !File.binread(paths["guest_kernel"], ELF_MAGIC.bytesize).to_s.start_with?(ELF_MAGIC)
+      raise Refused, "the guest kernel #{new["guest_kernel"]["url"]} is not an ELF vmlinux (cloud-hypervisor boots it directly; a bzImage will not do)"
+    end
     return new unless guest_changed?(old, new)
 
     config = new["guest_config"] ? File.binread(paths["guest_config"]) : extract_ikconfig(paths["guest_kernel"])
