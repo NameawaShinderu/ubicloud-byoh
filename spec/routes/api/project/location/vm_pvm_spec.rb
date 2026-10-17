@@ -54,6 +54,20 @@ RSpec.describe Clover, "vm pvm sizes" do
     expect(Vm.count).to eq 0
   end
 
+  it "boots ubuntu-noble when the create names no image" do
+    create(project, boot_image: nil)
+    expect(last_response.status).to eq 200
+    expect(Vm.first(name: "pvm")).to have_attributes(family: "pvm", boot_image: "ubuntu-noble")
+  end
+
+  # No API case for a location that lists pvm without its acknowledgement
+  # or its kernel pins: location_byoh_virt_check refuses such a policy
+  # however it is written (spec/migrate/byoh_pvm_spec.rb).
+
+  # The route answers 404 for a hidden location the project is not
+  # granted, as it does for every size, before any size check; that
+  # replaces the plan's 400 here. check_vm!'s "not available to this
+  # project" refusal covers Ruby callers (spec/lib/byoh_virt_tiers_spec.rb).
   it "refuses a project the hidden location is not granted to" do
     project.set_ff_visible_locations([])
     create(project)
