@@ -225,6 +225,43 @@ RSpec.describe PvmHostKernel do
     end
   end
 
+  describe "#prep_problem" do
+    it "passes an EC2-like stock host, reading only" do
+      expect(kernel.prep_problem).to be_nil
+      expect(mutating).to eq []
+    end
+
+    it "leaves the driver walk to the control plane's preflight" do
+      fake
+      driver = File.join(root, "sys/devices/pci0000:00/0000:00:01.0/0000:00:00.0/driver")
+      File.delete(driver)
+      File.symlink("/sys/bus/drivers/foo_nic", driver)
+      expect(kernel.preflight({})["result"]).to eq "refused"
+      expect(kernel.prep_problem).to be_nil
+    end
+
+    it "joins every preflight refusal" do
+      fake.write("sys/devices/system/cpu/vulnerabilities/meltdown", "Mitigation: PTI\n")
+      fake.write("etc/os-release", "VERSION_ID=\"22.04\"\n")
+      expect(kernel.prep_problem).to eq "PVM hosts run Ubuntu 24.04; this CPU's Meltdown status is \"Mitigation: PTI\", not \"Not affected\": the PVM kernel runs with pti=off, so a guest could read host memory"
+      expect(mutating).to eq []
+    end
+
+    it "passes a host that already runs the PVM kernel with kvm_pvm loaded" do
+      fake.boot(FakePvmHost::PVM, pti_off: true)
+      chardevs << "/dev/kvm"
+      expect(kernel.prep_problem).to be_nil
+      expect(commands).to eq ["uname -r"]
+    end
+
+    it "refuses the PVM kernel without kvm_pvm" do
+      fake.write(described_class::STATE_FILE, JSON.generate("state" => "armed", "kver" => FakePvmHost::PVM))
+      fake.boot(FakePvmHost::PVM)
+      expect(kernel.prep_problem).to eq "the PVM kernel #{FakePvmHost::PVM} is running but kvm_pvm is not loaded; see install-pvm-host-kernel status"
+      expect(mutating).to eq []
+    end
+  end
+
   describe "#install" do
     it "installs, pins the stock kernel and arms one PVM boot" do
       result = install

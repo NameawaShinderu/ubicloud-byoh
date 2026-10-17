@@ -47,8 +47,82 @@ RSpec.describe HostTier do
         (described_class.prep_steps("kvm") - %i[kvm_check hostname prompt motd timezone download_ch download_firmware]))
     end
 
-    it "refuses the tiers it cannot prepare yet" do
-      expect { described_class.prep_steps("pvm") }.to raise_error(HostTier::Unsupported, "pvm hosts are not supported by this rhizome yet (docs/byoh/NO_KVM.md section 11)")
+    # Literal goldens: adding the pvm steps must leave every other tier's
+    # list exactly as it was before pvm hosts existed.
+    it "keeps the emulated and container step lists" do
+      expect(described_class::EMULATED_STEPS).to eq(%i[
+        check_arch
+        check_emulator
+        kvm_hint
+        hostname
+        prompt
+        motd
+        timezone
+        needrestart
+        forwarding_sysctls
+        blacklist_irdma
+        unload_irdma
+        image_packages
+        prod_packages
+        disk_probe_packages
+        uplink_mac_pin
+        htcat
+        spdk
+        crypt_swap
+        serial_log_cron
+      ])
+      expect(described_class::CONTAINER_STEPS).to eq(%i[
+        check_container_arch
+        check_container_runtime
+        check_container_sysctls
+        check_idmap_range
+        kvm_hint
+        hostname
+        prompt
+        motd
+        timezone
+        container_host_setup
+        needrestart
+        forwarding_sysctls
+        blacklist_irdma
+        unload_irdma
+        image_packages
+        prod_packages
+        disk_probe_packages
+        uplink_mac_pin
+        htcat
+        spdk
+        crypt_swap
+        serial_log_cron
+      ])
+      expect([described_class::KVM_STEPS, described_class::EMULATED_STEPS, described_class::CONTAINER_STEPS]).to all(be_frozen)
+    end
+
+    it "checks first, then runs the kvm steps without the KVM check and the firmware, plus the pvm setup, for pvm" do
+      expect(described_class.prep_steps("pvm")).to eq(%i[
+        check_pvm_arch
+        check_pvm_host
+        hostname
+        prompt
+        motd
+        timezone
+        pvm_host_setup
+        download_ch
+        needrestart
+        forwarding_sysctls
+        blacklist_irdma
+        unload_irdma
+        image_packages
+        prod_packages
+        disk_probe_packages
+        uplink_mac_pin
+        htcat
+        spdk
+        crypt_swap
+        serial_log_cron
+      ])
+      expect(described_class.prep_steps("pvm")).to be_frozen
+      expect(described_class.prep_steps("pvm")).not_to include(:kvm_check, :download_firmware, :kvm_hint)
     end
 
     it "refuses an unknown tier" do
@@ -64,6 +138,35 @@ RSpec.describe HostTier do
 
     it "refuses arm64" do
       expect { described_class.check_arch!(arch: arm64) }.to raise_error(HostTier::Unsupported, "emulated hosts must be x86_64; this host is arm64")
+    end
+
+    it "names the pvm tier when it refuses a pvm host" do
+      expect { described_class.check_arch!(arch: arm64, tier: "pvm") }.to raise_error(HostTier::Unsupported, "pvm hosts must be x86_64; this host is arm64")
+    end
+  end
+
+  describe ".check_pvm_host!" do
+    it "accepts a host PvmHostKernel can prepare" do
+      kernel = instance_double(PvmHostKernel, prep_problem: nil)
+      expect(described_class.check_pvm_host!(kernel: kernel)).to be_nil
+    end
+
+    it "refuses a host PvmHostKernel cannot prepare, with why" do
+      kernel = instance_double(PvmHostKernel, prep_problem: "Secure Boot is on, and the PVM kernel is not signed; turn Secure Boot off")
+      expect { described_class.check_pvm_host!(kernel: kernel) }.to raise_error(HostTier::Unsupported, "this host cannot run pvm VMs: Secure Boot is on, and the PVM kernel is not signed; turn Secure Boot off")
+    end
+
+    it "checks the real host by default" do
+      kernel = instance_double(PvmHostKernel, prep_problem: nil)
+      expect(PvmHostKernel).to receive(:new).with(no_args).and_return(kernel)
+      expect(described_class.check_pvm_host!).to be_nil
+    end
+  end
+
+  describe ".pvm_host_setup" do
+    it "creates the kvm group and nothing else" do
+      expect(described_class).to receive(:_run_command).with("groupadd", "-f", "-r", "kvm").once
+      described_class.pvm_host_setup
     end
   end
 

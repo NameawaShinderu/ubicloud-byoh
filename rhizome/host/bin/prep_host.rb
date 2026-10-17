@@ -61,6 +61,10 @@ step_actions = {
   check_container_sysctls: -> { HostTier.check_container_sysctls! },
   check_idmap_range: -> { HostTier.check_idmap_range! },
   container_host_setup: -> { HostTier.container_host_setup },
+  # The same, for a pvm host (HostTier::PVM_STEPS).
+  check_pvm_arch: -> { HostTier.check_arch!(tier: "pvm") },
+  check_pvm_host: -> { HostTier.check_pvm_host! },
+  pvm_host_setup: -> { HostTier.pvm_host_setup },
   kvm_hint: -> {
     if (hint = HostTier.kvm_hint)
       puts hint

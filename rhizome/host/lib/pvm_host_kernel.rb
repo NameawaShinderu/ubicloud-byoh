@@ -152,6 +152,21 @@ class PvmHostKernel
     {"result" => refusals.empty? ? "ok" : "refused", "refusals" => refusals, "facts" => facts}
   end
 
+  # Read-only, for bin/prep_host.rb (HostTier.check_pvm_host!): why
+  # this host cannot be prepared as a pvm host, or nil. On the PVM kernel
+  # kvm_pvm must be loaded. On the stock kernel it is preflight without
+  # the driver walk: the drivers the operator vouches for (the policy's
+  # unchecked_drivers) are known only to the control plane, which runs
+  # the full preflight again before install.
+  def prep_problem
+    kernel = run("uname", "-r").strip
+    return nil if kvm_pvm_loaded?
+    return "the PVM kernel #{kernel} is running but kvm_pvm is not loaded; see install-pvm-host-kernel status" if running_pvm?(load_state, kernel)
+
+    refusals = preflight_checks({}, drivers: false).first
+    refusals.empty? ? nil : refusals.join("; ")
+  end
+
   def install(params)
     @host_deb = host_deb_param(params)
     with_lock do
@@ -432,7 +447,7 @@ class PvmHostKernel
     end
   end
 
-  def preflight_checks(params)
+  def preflight_checks(params, drivers: true)
     allowed = unchecked_drivers(params)
     refusals = []
     kernel = run("uname", "-r").strip
@@ -468,15 +483,19 @@ class PvmHostKernel
     facts["stock_entry"] = stock_entry_for(kernel)
     refusals << "grub.cfg has no entry for the running kernel #{kernel}" unless facts["stock_entry"]
 
+    refusals.concat(driver_refusals(kernel, allowed, facts)) if drivers
+    refusals.concat(space_refusals)
+    [refusals, facts]
+  end
+
+  def driver_refusals(kernel, allowed, facts)
     drivers = drivers_in_use
     unmapped = drivers.reject { |d| kernel_has_driver?(kernel, d) || allowed.include?(d) }
     facts["drivers"] = drivers
     facts["unchecked_drivers"] = drivers & allowed
-    unless unmapped.empty?
-      refusals << "cannot check the PVM kernel for the drivers this host's disks and NICs use: #{unmapped.join(" ")} (no module of that name in #{kernel}); check by hand that the PVM kernel has them, then pass them as unchecked_drivers"
-    end
-    refusals.concat(space_refusals)
-    [refusals, facts]
+    return [] if unmapped.empty?
+
+    ["cannot check the PVM kernel for the drivers this host's disks and NICs use: #{unmapped.join(" ")} (no module of that name in #{kernel}); check by hand that the PVM kernel has them, then pass them as unchecked_drivers"]
   end
 
   def container_refusals

@@ -189,8 +189,30 @@ RSpec.describe "bin/prep_host.rb" do
     expect(events).to eq([])
   end
 
-  it "aborts a tier this rhizome cannot prepare yet before changing anything" do
-    expect { expect(prep_host("vhtest", "production", "pvm")).to eq(1) }.to output(/\Apvm hosts are not supported by this rhizome yet/).to_stderr
+  it "prepares a pvm host: checks first, then the common steps, the kvm group, cloud-hypervisor and the late steps" do
+    expect(HostTier).to receive(:check_arch!).with(tier: "pvm") { events << [:check_arch] }
+    expect(HostTier).to receive(:check_pvm_host!) { events << [:check_pvm_host] }
+    allow(HostTier).to receive(:_run_command) { |*command, **kw| events << [:run, command, kw] && "" }
+    expect(KvmCheck).not_to receive(:problem)
+    expect(CloudHypervisor::Firmware).not_to receive(:download)
+    expect { expect(prep_host("vhtest", "production", "pvm")).to be_nil }.to output("uplink mac pinned\n").to_stdout
+    common = kvm_trace[1, 6]
+    expect(events).to eq([[:check_arch], [:check_pvm_host]] + common + [run("groupadd", "-f", "-r", "kvm"), [:download_ch]] +
+      (kvm_trace - [[:kvm_check], [:download_ch], [:download_firmware], run("modprobe -r irdma")] - common))
+  end
+
+  it "aborts a pvm host that cannot take the PVM kernel before changing anything" do
+    expect(HostTier).to receive(:check_arch!).with(tier: "pvm")
+    kernel = instance_double(PvmHostKernel, prep_problem: "Secure Boot is on, and the PVM kernel is not signed; turn Secure Boot off")
+    expect(PvmHostKernel).to receive(:new).and_return(kernel)
+    expect { expect(prep_host("vhtest", "production", "pvm")).to eq(1) }.to output("this host cannot run pvm VMs: Secure Boot is on, and the PVM kernel is not signed; turn Secure Boot off\n").to_stderr
+    expect(events).to eq([])
+  end
+
+  it "aborts an arm64 pvm host before changing anything" do
+    expect(HostTier).to receive(:check_arch!).with(tier: "pvm").and_raise(HostTier::Unsupported, "pvm hosts must be x86_64; this host is arm64")
+    expect(HostTier).not_to receive(:check_pvm_host!)
+    expect { expect(prep_host("vhtest", "production", "pvm")).to eq(1) }.to output("pvm hosts must be x86_64; this host is arm64\n").to_stderr
     expect(events).to eq([])
   end
 

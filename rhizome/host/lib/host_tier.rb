@@ -6,6 +6,7 @@ require_relative "kvm_check"
 require_relative "qemu_tcg"
 require_relative "container_idmap"
 require_relative "container_setup"
+require_relative "pvm_host_kernel"
 require "etc"
 
 # Host preparation per virtualization tier (docs/byoh/NO_KVM.md; the
@@ -16,9 +17,9 @@ require "etc"
 #
 # The emulated tier runs VMs under QEMU's software translator on hosts
 # without KVM (docs/byoh/EMULATED_HOSTS.md section 6.3). The container
-# tier runs system containers (ContainerSetup). The pvm tier has no host
-# support in this rhizome yet, so prep refuses it before changing
-# anything.
+# tier runs system containers (ContainerSetup). The pvm tier runs
+# cloud-hypervisor VMs on the PVM host kernel (PvmHostKernel), which the
+# control plane installs after prep; prep itself never changes kernels.
 #
 # An emulated host differs in three ways:
 # - It is not refused for lacking KVM.
@@ -109,6 +110,21 @@ module HostTier
     *LATE_STEPS,
   ].freeze
 
+  # A pvm host is checked first too: x86_64, then that it can take the
+  # PVM host kernel, or already runs it. It has no KVM check, since the
+  # stock kernel has no /dev/kvm, and downloads no firmware, since pvm VMs
+  # boot the guest kernel directly. pvm_host_setup creates the kvm group
+  # now, before the PVM boot: the boot unit checks that /dev/kvm belongs
+  # to it.
+  PVM_STEPS = [
+    :check_pvm_arch,
+    :check_pvm_host,
+    *COMMON_STEPS,
+    :pvm_host_setup,
+    :download_ch,
+    *LATE_STEPS,
+  ].freeze
+
   # The packages a container host needs (scripts/byoh/bootstrap-data-plane.sh
   # --tier container installs them): LXC, lxcfs, newuidmap, xz for the root
   # tarballs, setquota for unencrypted disks, cryptsetup and mkfs.ext4 for
@@ -137,7 +153,7 @@ module HostTier
     when "kvm" then KVM_STEPS
     when "emulated" then EMULATED_STEPS
     when "container" then CONTAINER_STEPS
-    when *TIERS then raise Unsupported, "#{tier} hosts are not supported by this rhizome yet (docs/byoh/NO_KVM.md section 11)"
+    when "pvm" then PVM_STEPS
     else raise Unsupported, "unknown tier #{tier.inspect}, expected one of #{TIERS.join(", ")}"
     end
   end
@@ -148,6 +164,21 @@ module HostTier
     return if arch.x64?
 
     raise Unsupported, "#{tier} hosts must be x86_64; this host is #{arch.sym}"
+  end
+
+  # Raises Unsupported unless this host can be prepared as a pvm host
+  # (PvmHostKernel#prep_problem). Reads only.
+  def self.check_pvm_host!(kernel: PvmHostKernel.new)
+    return unless (problem = kernel.prep_problem)
+
+    raise Unsupported, "this host cannot run pvm VMs: #{problem}"
+  end
+
+  # What a pvm host needs before the PVM boot: the kvm group, which
+  # /dev/kvm gets on the PVM kernel and which create_unix_user adds each
+  # VM's user to.
+  def self.pvm_host_setup
+    r "groupadd", "-f", "-r", "kvm"
   end
 
   # The PACKAGES that dpkg does not list as installed. dpkg-query exits 1
