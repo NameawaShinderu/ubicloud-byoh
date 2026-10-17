@@ -373,6 +373,8 @@ cmd_ssh() {
     "systemctl cat "*"--kernel"*) has vm && echo "/opt/pvm-guest/$(get vm_unit_sha)/vmlinux" ;;
     *boot_id) echo "boot-$(get boot)" ;;
     "uname -r") get kernel && echo ;;
+    # The fake instance never keeps a rhizome user between registrations.
+    "getent passwd rhizome >/dev/null") return 1 ;;
     *"grub-editenv list"*) printf 'saved_entry=%s\nnext_entry=%s\n' "$(get saved_entry)" "$(get next_entry)" ;;
     "grub-editenv - unset next_entry") put next_entry "" ;;
     "systemctl reboot") host_boot ;;

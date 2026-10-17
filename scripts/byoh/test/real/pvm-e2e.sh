@@ -559,6 +559,20 @@ host_add_args() {
   ((n)) || ADD_ARGS+=(--yes)
 }
 
+# The rhizome user a destroyed registration leaves on the instance.
+# Preflight refuses any rhizome user (PF16-rhizome-user, never
+# accepted), so an operator registering the same machine again deletes
+# it first; this run registers the instance up to three times.
+forget_rhizome_user() {
+  op_ssh 'getent passwd rhizome >/dev/null' || return 0
+  op_ssh 'sudo -n pkill -u rhizome; sleep 1; sudo -n userdel -r rhizome' >/dev/null 2>&1 || true
+  if op_ssh 'getent passwd rhizome >/dev/null'; then
+    fail "the rhizome user of an earlier registration is still on the instance"
+    return 1
+  fi
+  info "deleted the rhizome user of an earlier registration"
+}
+
 destroy_host() { # ubid
   echo "VmHost[\"$1\"].incr_destroy" | cp_ruby >/dev/null
   wait_until 900 "host $1 is destroyed" host_gone "$1" || return 1
@@ -595,6 +609,7 @@ phase_neg_sha() {
   registration_key
   host_snapshot "$WORK/neg-before.txt" || true
   host_add_args
+  forget_rhizome_user || return 0
   out=$(cpadmin host add --site "$SCRATCH" "${ADD_ARGS[@]}" --no-wait 2>&1) || true
   printf '%s\n' "$out" >>"$REPORT"
   local host
@@ -623,6 +638,7 @@ phase_neg_sha() {
   check "scratch site takes a wrong guest kernel sha256 with --no-verify-download" \
     cpadmin site set "$SCRATCH" "${PIN_ARGS[@]}" --no-verify-download
   host_snapshot "$WORK/neg-guest-before.txt" || true
+  forget_rhizome_user || return 0
   out=$(cpadmin host add --site "$SCRATCH" "${ADD_ARGS[@]}" --no-wait 2>&1) || true
   printf '%s\n' "$out" >>"$REPORT"
   host=$(grep -oE 'host vh[0-9a-z]{24}' <<<"$out" | tail -1 | cut -d' ' -f2 || true)
@@ -648,6 +664,7 @@ phase_host_add() {
     info "host $(state_get host) was added already; host add resumes its watch"
   else
     state_set stock_kver "$(op_ssh uname -r)"
+    forget_rhizome_user || return 0
   fi
   info "stock kernel before host add: $(state_get stock_kver)"
   local boots_before t0=$SECONDS out rc=0
