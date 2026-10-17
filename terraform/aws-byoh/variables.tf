@@ -39,7 +39,7 @@ variable "ctrl_plane_instance_type" {
 }
 
 variable "data_plane_instance_type" {
-  description = "Instance type for the BYOH data plane. MUST be a bare-metal type (.metal suffix) for SPDK + cloud-hypervisor to work properly. m5d.metal (96 vCPU, 384 GB RAM, 4×900 GB NVMe instance store) is the cheapest real-NVMe option in ap-south-1."
+  description = "Instance type for the BYOH data plane. For standard (KVM) VMs: an 8th-gen Intel type with nested virtualization (m8i/c8i/r8i; set data_plane_nested_virtualization = true), or a .metal type. A plain type without nested virtualization (m6i/m7i, xlarge or larger) works only with the experimental container or pvm tiers (or the slow emulated tier) (docs/byoh/NO_KVM.md, docs/byoh/platforms/aws.md section 2.1a). The default (m5d.metal) predates nested-virtualization support."
   type        = string
   default     = "m5d.metal"
 }
