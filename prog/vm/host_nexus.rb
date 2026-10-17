@@ -1086,6 +1086,15 @@ TIMER
 
   def resolve_pvm_page(type) = Page.from_tag_parts(type, vm_host.ubid)&.incr_resolve
 
+  # Dispatches the host strand of vm_host_id now if it is at wait, which
+  # naps 6 hours, so that check_pvm_guest_kernels runs at once. A wait
+  # that runs at this moment keeps the wake: the write differs from the
+  # schedule its lease set, so the nap's compare-and-set leaves it
+  # (Strand::SCHEDULE_NO_LATER_THAN_NOW, as Semaphore.incr wakes).
+  def self.wake_wait(vm_host_id)
+    Strand.where(id: vm_host_id, label: "wait").update(schedule: Strand::SCHEDULE_NO_LATER_THAN_NOW)
+  end
+
   # A new guest kernel pin applies to a VM at its next stop and start
   # (docs/byoh/NO_KVM.md section 6.8): the page lists the VMs that still
   # boot another kernel than the host's current one.

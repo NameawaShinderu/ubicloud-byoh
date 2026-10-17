@@ -848,6 +848,28 @@ RSpec.describe Prog::Vm::HostNexus do
       expect { nx.wait }.to nap(6 * 60 * 60)
       expect(stale_page).to be_nil
     end
+
+    # A guest kernel download (or a VM start) that wakes the host while
+    # its wait runs: the nap of that run keeps the wake.
+    it "keeps a wake that arrives while the wait runs" do
+      st.update(schedule: Time.now + 6 * 60 * 60)
+      prog = described_class.new(st)
+      expect(st).to receive(:load).and_return(prog)
+      expect(prog).to receive(:wait).and_wrap_original do |original|
+        described_class.wake_wait(vm_host.id)
+        original.call
+      end
+      st.take_lease_and_reload do
+        expect(st.unsynchronized_run).to be_a(Prog::Base::Nap)
+      end
+      expect(st.reload.schedule).to be <= Time.now
+    end
+
+    it "wakes only a host strand at wait" do
+      st.update(label: "verify_pvm_boot", schedule: Time.now + 60 * 60)
+      described_class.wake_wait(vm_host.id)
+      expect(st.reload.schedule).to be > Time.now + 30 * 60
+    end
   end
 
   describe "an out-of-band reboot" do

@@ -542,7 +542,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
           # HostNexus#wait naps 6 hours; woken now, it resolves the
           # ByohPvmGuestKernelStale page once no VM is left on an older
           # kernel.
-          Strand.where(id: host.id, label: "wait").update(schedule: Sequel::CURRENT_TIMESTAMP)
+          Prog::Vm::HostNexus.wake_wait(host.id)
         end
         # Through rhizome, which checks that the host still runs its PVM
         # kernel safely (VmSetup#check_pvm_host) before it starts the VM.

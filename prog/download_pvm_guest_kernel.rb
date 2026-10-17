@@ -91,7 +91,7 @@ class Prog::DownloadPvmGuestKernel < Prog::Base
       # HostNexus#wait naps 6 hours; woken now, it pages the VMs that
       # still boot an older guest kernel (ByohPvmGuestKernelStale) at
       # once rather than hours after the rollout.
-      Strand.where(id: vm_host.id, label: "wait").update(schedule: Sequel::CURRENT_TIMESTAMP)
+      Prog::Vm::HostNexus.wake_wait(vm_host.id)
     end
     resolve_failing
     collect_garbage
