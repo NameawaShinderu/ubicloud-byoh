@@ -1,0 +1,10 @@
+#!/bin/env ruby
+# frozen_string_literal: true
+
+require_relative "../lib/pvm_guest_kernel"
+
+# download-pvm-guest-kernel download|show|gc
+# Parameters as JSON on stdin; prints one JSON object. Exit 0 ok, 2
+# refused (the pin cannot work), 3 failed (try again), 1 an unexpected
+# error. See PvmGuestKernel.
+exit PvmGuestKernel.main(ARGV)
