@@ -308,6 +308,30 @@ and the usage errors. `m2-checks health` itself is covered by
 in a few seconds. Neither script has run against real infrastructure
 (UNVERIFIED; [VERIFY.md](../../../docs/byoh/VERIFY.md) section 6).
 
+### PVM tier real-run script (PVM plan WP10)
+
+```
+scripts/byoh/test/pvm-e2e-stubs.sh
+```
+
+Runs `scripts/byoh/test/real/pvm-e2e.sh` in one `ubi-q-pvm-e2e`
+container (`ubi-bundler-m1`, on `ubi-test-net`, no ports, the worktree
+read-only) against `pvm-e2e-fake.sh`: one fake installed as `admin`
+(`ADMIN`), `bundle` (the bin tools, `m2-checks` and the console), `ubi`,
+`ssh`, `sleep` and `pgrep`, which keeps a fake control plane, PVM host
+and VM as files. The cases run all 19 phases to PASS, including the
+MANUAL power cycle (the fake `sleep` does it), and check that a wrong
+guest sha256 that `set` accepts, a refused install that touched GRUB and
+a VM started on a stock boot each fail their phase with exit 1 and stop
+the run; that `guest-pin-rollout` without a second build is NOT RUN; and
+the usage errors. It proves the script's flow and checks, not the
+product: what the fake answers stands in for the real host. The real run
+is the lead's, on AWS (`scripts/byoh/test/aws-e2e/README.md` phase 7),
+and stays UNVERIFIED until then. `spec/lib/byoh_pvm_e2e_script_spec.rb`
+keeps its phases, the README's list, the go/no-go's bench body and pins,
+and the `m2-checks pvm-host`/`pvm-vm` keys it reads in step. Result
+(2026-10-17): 50 checks pass in about 30 s.
+
 ## Scenarios
 
 | Scenario | Checks |

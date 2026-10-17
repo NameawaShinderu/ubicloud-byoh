@@ -916,7 +916,9 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
     the `ByohPvmBoot` page and `pvm retry` apply as after a first install. `bin/byoh-host watch` follows
     `pvm_upgrade` in the "pvm install" phase.
   - `wait` pages `ByohPvmGuestKernelStale` (warning) with the VMs whose guest kernel is not the host's
-    current one; the fix is to stop and start each (section 6.8).
+    current one; the fix is to stop and start each (section 6.8). `wait` naps 6 hours, so the guest
+    kernel download that makes a new pin ready, and a VM start that moves a VM to it, wake the host
+    strand's `wait`: the page opens and resolves within seconds, not hours later.
   - `bin/byoh-host watch` knows the new labels: phase "pvm install" (45 minutes) for
     `install_pvm_host_kernel`, `pvm_install_failed` and `pvm_retry`; `verify_pvm_boot` and
     `pvm_boot_failed` in "reboot". `pvm_uninstall` ends a bring-up. A spec fails when a HostNexus label
@@ -1690,9 +1692,23 @@ UNVERIFIED, to watch on the first real run:
   kernel config; the config check requires VFAT for this reason.
 
 ```bash
-# L4-T2 (only after a GO and the WP7 build) the same kind of VM registered with --virt-tier pvm --install-pvm-kernel
-#   --accept-fallback into a location with --virt-tiers kvm,pvm --accept pvm: the host reaches accepting
-#   after one reboot, a pvm-2 VM reaches running, SSH works, and destroy cleans up.
+# L4-T2 (after the GO, on pvm-build): scripts/byoh/test/real/pvm-e2e.sh on the control plane against one
+#   throwaway AWS m6i.2xlarge (scripts/byoh/test/aws-e2e role pvme, README phase 7):
+BYOH_REAL_E2E=1 scripts/byoh/test/real/pvm-e2e.sh all   # settings: the script's header
+#   Phases: location (pvm rates, set with the pins), neg-sha (a wrong guest sha256 refused by set; a wrong
+#   host-deb sha256 refused on the host before any change, then destroyed), host-add (--virt-tier pvm
+#   --install-pvm-kernel to accepting; minutes and reboots), patch-kernel, host-check, vm (pvm-2 noble: SSH,
+#   DNS, egress, apt, serial log), prod-path (fio through ubiblk, download speed, host memory against
+#   vm_overhead_mib), bench (the go/no-go's), lifecycle, host-reboot, oob-reboot, power-cycle (MANUAL),
+#   tenancy, guest-pin-rollout (needs a second guest build), refusals (pvm-2 jammy), stock-return
+#   (unset next_entry and reboot: ByohPvmBoot, then pvm retry), delete, billing, teardown (pvm uninstall,
+#   destroy, reboot to a clean stock host). Report: var/pvm-e2e/pvm-e2e-report.txt. UNVERIFIED until run;
+#   its flow runs against a fake world in scripts/byoh/test/pvm-e2e-stubs.sh.
+#   Two things the run leans on: a BYOH control plane runs no bin/monitor (until M9), and only the
+#   monitor's checkup makes HostNexus notice an out-of-band boot (check_boot_id), so oob-reboot,
+#   power-cycle and stock-return set checkup themselves when no monitor runs and say so. Without the
+#   monitor, a host rebooted behind the control plane's back keeps its VMs down until something sets
+#   checkup (UNVERIFIED whether that is acceptable for production; M9).
 ```
 
 ### L5 emulated

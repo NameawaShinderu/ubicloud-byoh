@@ -32,6 +32,7 @@ ROLE_TABLE=(
   "ct:t3.xlarge:100:no:1:secondary:0:data"
   "emu:t3.xlarge:60:no:1:none:0:data"
   "pvm:m6i.large:60:no:0:none:0:none"
+  "pvme:m6i.2xlarge:80:no:0:none:0:data"
 )
 
 role_field() { # role field-index

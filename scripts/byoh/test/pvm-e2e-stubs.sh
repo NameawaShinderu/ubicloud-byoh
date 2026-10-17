@@ -1,0 +1,128 @@
+#!/bin/bash
+# Runs scripts/byoh/test/real/pvm-e2e.sh (the PVM tier's real-run script,
+# PVM plan WP10) against the fake world of pvm-e2e-fake.sh: admin, bundle,
+# ubi, ssh, sleep and pgrep are that one fake, so every phase runs its
+# real logic against answers like the real ones, and nothing reaches a
+# host. It proves the phases' flow, their checks and their failure paths,
+# not the product: the real run stays UNVERIFIED until the lead runs it.
+#
+# One ubi-q-pvm-e2e container (ruby:alpine-based ubi-bundler-m1 or IMG,
+# on ubi-test-net, no ports) with the worktree mounted read-only.
+#
+#   scripts/byoh/test/pvm-e2e-stubs.sh
+set -euo pipefail
+
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+NAME=ubi-q-pvm-e2e
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
+
+docker run -i --rm --name "$NAME" --network ubi-test-net -v "$WT:/w:ro" -w /w "${IMG:-ubi-bundler-m1}" sh -c '
+apk add --quiet bash openssh-client coreutils >/dev/null 2>&1 || exit 9
+exec bash -s' <<'INNER'
+set -euo pipefail
+T=/tmp/t
+fails=0
+ok() { echo "ok   $*"; }
+bad() {
+  echo "FAIL $*"
+  fails=$((fails + 1))
+}
+
+GUEST2=1111111111111111111111111111111111111111111111111111111111111111
+# run NAME [ENV=VALUE...] -- PHASE...: a fresh fake world and work dir.
+run() {
+  local name=$1
+  shift
+  local envs=()
+  while [[ $1 != -- ]]; do
+    envs+=("$1")
+    shift
+  done
+  shift
+  rm -rf "$T"
+  mkdir -p "$T/bin" "$T/fake" "$T/work"
+  for b in admin bundle ubi ssh sleep pgrep; do ln -s /w/scripts/byoh/test/pvm-e2e-fake.sh "$T/bin/$b"; done
+  echo "operator key" >"$T/opkey"
+  set +e
+  env PATH="$T/bin:$PATH" FAKE="$T/fake" FAKE_WORK="$T/work" FAKE_SCRATCH=byoh-pvm-e2e-neg FAKE_GUEST2=$GUEST2 FAKE_PROJECT2=pj2 \
+    BYOH_REAL_E2E=1 PVM_E2E_HOST_SSH=ubuntu@10.0.0.5 PVM_E2E_HOST_KEY="$T/opkey" PVM_E2E_YES=1 \
+    PVM_E2E_SITE_ARGS="--rates-from hetzner-fsn1" PVM_E2E_PROJECT=pj1 PVM_E2E_PROJECT2=pj2 \
+    UBI_TOKEN=t UBI_URL=http://127.0.0.1:3000/cli PVM_E2E_UBI=ubi ADMIN=admin PVM_E2E_WORK="$T/work" \
+    PVM_E2E_GUEST2_URL=https://example.com/vmlinux2 PVM_E2E_GUEST2_SHA256=$GUEST2 \
+    "${envs[@]}" timeout 300 scripts/byoh/test/real/pvm-e2e.sh "$@" >"$T/out" 2>&1
+  RC=$?
+  set -e
+  cp "$T/out" "/tmp/out-$name"
+}
+report_has() {
+  if grep -qF -- "$2" "$T/work/pvm-e2e-report.txt"; then ok "$1"; else
+    bad "$1: no '$2' in the report"
+    sed 's/^/     | /' "$T/out" | tail -40
+  fi
+}
+rc_is() {
+  if [[ $RC == "$2" ]]; then ok "$1 (exit $RC)"; else
+    bad "$1: exit $RC, wanted $2"
+    sed 's/^/     | /' "$T/out" | tail -60
+  fi
+}
+
+# The happy path: every phase passes, in order.
+run all -- all
+rc_is "all phases pass against the fake" 0
+for p in location neg-sha host-add patch-kernel host-check vm prod-path bench lifecycle host-reboot oob-reboot \
+  power-cycle tenancy guest-pin-rollout refusals stock-return delete billing teardown; do
+  report_has "phase $p passed" "== $p: PASS"
+done
+report_has "the example pins carry their label" "third party; Januscape fix inclusion UNVERIFIED"
+report_has "the wrong guest sha256 is refused" "PASS  set with a wrong guest kernel sha256 is refused"
+report_has "the neg-sha install is refused before any change" "PASS  GRUB (saved_entry, next_entry), the kernel packages and /etc/grub.d are unchanged"
+report_has "the power cycle is a MANUAL step" "MANUAL stop the instance"
+report_has "the monitor's checkup is set by the run" "setting checkup on vh0000000000000000000000ab"
+report_has "the bench prints ratios" "ratio cpu_sha256_1g: guest 1200 ms, host 1000 ms"
+report_has "a restart keeps the guest kernel" "PASS  a restart keeps the VM's guest kernel"
+report_has "stop and start moves to the new guest kernel" "PASS  after stop and start the VM boots the new guest kernel"
+report_has "the stock return pages" "PASS  ByohPvmBoot pages the stock boot"
+report_has "jammy is refused" "PASS  a pvm-2 ubuntu-jammy VM is refused"
+report_has "billing is closed" "PASS  every record is closed"
+report_has "teardown returns to stock" "PASS  the stock kernel 7.0.0-1014-aws runs"
+grep -q 'unhandled' "$T/out" && bad "the fake met a command it does not know: $(grep unhandled "$T/out" | head -3)" || ok "the fake knew every command"
+
+# Failures stop the run with exit 1 at the phase that failed.
+run accept FAKE_ACCEPT_WRONG_GUEST=1 -- location neg-sha host-add
+rc_is "a wrong guest sha256 that set accepts fails neg-sha" 1
+report_has "neg-sha reports it" "FAIL  set with a wrong guest kernel sha256 was accepted"
+report_has "neg-sha fails" "== neg-sha: FAIL"
+grep -q '== host-add' "$T/work/pvm-e2e-report.txt" && bad "host-add ran after a failed phase" || ok "no phase runs after a failure"
+
+run grub FAKE_NEG_CHANGES_GRUB=1 -- location neg-sha
+rc_is "a refused install that touched GRUB fails neg-sha" 1
+report_has "neg-sha names the change" "FAIL  GRUB (saved_entry, next_entry), the kernel packages and /etc/grub.d are unchanged"
+
+run vmstart FAKE_STOCK_RETURN_STARTS_VM=1 -- location neg-sha host-add vm stock-return
+rc_is "a VM started on a stock boot fails stock-return" 1
+report_has "stock-return names it" "FAIL  no VM was started (no cloud-hypervisor)"
+
+# Without a second guest build the rollout is reported as not run.
+run noguest PVM_E2E_GUEST2_URL= -- location neg-sha host-add vm guest-pin-rollout
+rc_is "guest-pin-rollout without a second build passes as NOT RUN" 0
+report_has "it says so" "guest-pin-rollout is NOT RUN (UNVERIFIED)"
+
+# Usage and refusals.
+run refuse BYOH_REAL_E2E=0 -- all
+rc_is "refuses without BYOH_REAL_E2E=1" 2
+grep -q "refusing: this installs a custom kernel" "$T/out" && ok "says why" || bad "no refusal text"
+run nophase -- frob
+rc_is "an unknown phase is a usage error" 2
+run nohost PVM_E2E_HOST_SSH= -- location
+rc_is "PVM_E2E_HOST_SSH is required" 2
+run nokey PVM_E2E_YES=0 -- location
+rc_is "a host key fingerprint or PVM_E2E_YES=1 is required" 2
+run nostate -- vm
+rc_is "a phase whose host is not recorded is a usage error" 2
+grep -q "run host-add first" "$T/out" && ok "it names the phase to run" || bad "no hint: $(cat "$T/out")"
+
+echo "$fails failed"
+((fails == 0))
+INNER

@@ -1,4 +1,4 @@
-# AWS end-to-end run (M3, M4, no-KVM ladder)
+# AWS end-to-end run (M3, M4, no-KVM ladder, PVM tier)
 
 One run proves on real machines what the lab could only approximate:
 the packaged control plane (M3), one-command host add (M4) and the
@@ -18,6 +18,7 @@ nothing else. The run reuses an existing VPC, subnet and key pair.
 | ct | t3.xlarge (no nested), 1 secondary IP, 1 EIP | L2 detection on AWS; L3 system containers |
 | emu | t3.xlarge (no nested; an emulated host needs 2 cores), 1 secondary IP | L5 emulated |
 | pvm | m6i.large (no nested) | L4 PVM go/no-go, `scripts/byoh/test/real/pvm-go-no-go.sh` |
+| pvme | m6i.2xlarge (no nested), +80 GiB root | L4 PVM tier end to end, `scripts/byoh/test/real/pvm-e2e.sh` (4 cores and 32 GiB: two pvm-2 VMs; an m6i.large fails `verify_tier_capacity`) |
 
 Data planes take no traffic from the internet (no host_guard yet, M7);
 they reach the internet out and are reached through the control plane.
@@ -53,4 +54,24 @@ State (instance ids and addresses) is in `var/aws-e2e/<run>/state`.
    DNS, egress, stop/start, delete.
 6. **L4 PVM go/no-go** (pvm): preflight, install, reboot, boot-test,
    reboot, recovery-check; the verdict decides whether WP7 is built.
-7. **Teardown**: `down.sh`; nothing of the run is left.
+7. **L4 PVM tier end to end** (pvme, after the go/no-go's GO): on the
+   control plane, from the repository root, `BYOH_REAL_E2E=1
+   scripts/byoh/test/real/pvm-e2e.sh all` with `PVM_E2E_HOST_SSH=ubuntu@<pvme
+   private IP>`, the e2e key, a personal access token (`UBI_TOKEN`,
+   `UBI_URL=https://<eip>.sslip.io/cli`) and `PVM_E2E_PROJECT` (the
+   script's header lists every setting). It stops at the first phase that
+   fails and resumes from any phase. Its one MANUAL step, `power-cycle`,
+   asks for `aws ec2 stop-instances` and `start-instances` of the pvme
+   instance (`PVM_E2E_INSTANCE`). Phases of `pvm-e2e.sh`, in order:
+   `location`, `neg-sha`, `host-add`, `patch-kernel`, `host-check`, `vm`,
+   `prod-path`, `bench`, `lifecycle`, `host-reboot`, `oob-reboot`,
+   `power-cycle`, `tenancy`, `guest-pin-rollout`, `refusals`,
+   `stock-return`, `delete`, `billing`, `teardown`. The report is
+   `var/pvm-e2e/pvm-e2e-report.txt` on the control plane; the default pins
+   are the cocoonstack/pvm v0.1.0 example (third party; Januscape fix
+   inclusion UNVERIFIED; for testing only, not a recommended production
+   pin). `guest-pin-rollout` needs a second guest kernel build
+   (`PVM_E2E_GUEST2_URL`, `PVM_E2E_GUEST2_SHA256`) and is reported NOT RUN
+   without one. `scripts/byoh/test/pvm-e2e-stubs.sh` runs the script
+   against a fake world (no host) to check its flow before the real run.
+8. **Teardown**: `down.sh`; nothing of the run is left.
