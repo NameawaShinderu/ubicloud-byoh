@@ -16,6 +16,7 @@ Problems on any platform: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
 |---|---|---|---|---|---|
 | AWS EC2, m8i/c8i/r8i | `fabric` + `nat`; `fabric` + `internal` | Nested virtualization (`cpu_options`, AWS provider ≥ 6) | ENI secondary private IPs, each with a 1:1 Elastic IP | **Tested** 2026-10-11 and 2026-10-13 | [aws.md](aws.md) |
 | AWS EC2 `.metal` | as above | Native | as above | Tested earlier (m5d.metal, tag `aws-mumbai-working-v1`) | [aws.md](aws.md) |
+| AWS EC2 m6i/m7i (xlarge or larger) without nested, with PVM | as above | None: PVM, KVM in software on a third-party host kernel the control plane installs (branch `pvm-build`, experimental) | as above | Guest boot verified by hand on m6i.large (L4-T1, 2026-10-16); the product path UNVERIFIED | [aws.md](aws.md) §2.1a |
 | Rented dedicated server (Hetzner Robot, OVH / So you Start, Leaseweb) | `routed` + `public`; Hetzner vSwitch `onlink` + `public` | Native (VT-x/AMD-V in firmware) | A block or single IPs routed to the main IP; no virtual MACs | UNVERIFIED | [bare-metal-dedicated.md](bare-metal-dedicated.md) |
 | Dedicated server with one IP (Kimsufi, no extra IPs) | none, or `routed` + `internal` | Native | None from the provider; `-6` or internal VMs only | UNVERIFIED | [bare-metal-dedicated.md](bare-metal-dedicated.md) §3.7 |
 | Homelab or office LAN | `onlink` + `internal`; `routed` + `internal`; `onlink` + `nat` (router 1:1 NAT); `routed` + `public` (ISP block) | Native | LAN addresses outside DHCP, a routed RFC 1918 block, or public IPs on the firewall | UNVERIFIED | [own-hardware.md](own-hardware.md) |
@@ -30,14 +31,14 @@ Problems on any platform: [TROUBLESHOOTING.md](../TROUBLESHOOTING.md).
 | Scaleway Elastic Metal, Vultr Bare Metal | `routed` + `public` | Native | Flexible / reserved IPs | UNVERIFIED (Vultr delivery not researched) | [other-clouds-vps.md](other-clouds-vps.md) |
 | OVHcloud Public Cloud | `routed` + `public` (assumed) | `vmx` exposed; a live migration can kill the host | Additional IPs | UNVERIFIED, lab only | [other-clouds-vps.md](other-clouds-vps.md) |
 | DigitalOcean Droplet | `onlink` + `nat` for one VM (theory), or single IP | Nested on Intel, not officially supported | One reserved IP per Droplet | UNVERIFIED, lab only | [other-clouds-vps.md](other-clouds-vps.md) |
-| Hetzner Cloud, Linode/Akamai, any VPS without `/dev/kvm` | as the provider allows | None | — | **Not possible** for standard VMs; fine as control plane or tunnel endpoint. On branch `no-kvm`: experimental opt-in tiers, system containers (`container`, near native, shared kernel) or emulation (`emulated`: CPU about a quarter of native, memory bandwidth about 2.5%), never chosen silently | [other-clouds-vps.md](other-clouds-vps.md) §1.3; [NO_KVM.md](../NO_KVM.md) |
+| Hetzner Cloud, Linode/Akamai, any VPS without `/dev/kvm` | as the provider allows | None | — | **Not possible** for standard VMs; fine as control plane or tunnel endpoint. On branch `no-kvm`: experimental opt-in tiers, system containers (`container`, near native, shared kernel) or emulation (`emulated`: CPU about a quarter of native, memory bandwidth about 2.5%), never chosen silently; on branch `pvm-build` also PVM (`pvm`, VMs at CPU 87% of the host, a custom host kernel) | [other-clouds-vps.md](other-clouds-vps.md) §1.3; [NO_KVM.md](../NO_KVM.md) |
 
 Not sure whether a machine has usable KVM? Run `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` from the control plane before registering (branch `no-kvm`; the host needs `ruby`). It prints the machine's rung on the virtualization ladder, why, the fix for its platform and, for clouds, whether a nested-capable type of the same size costs about the same ([NO_KVM.md](../NO_KVM.md) §4 fixes, §7 costs). Exit 0 means standard VMs will run.
 
 **Fastest first.** Every fast VM monitor (Cloud Hypervisor, Firecracker, crosvm, QEMU-KVM) needs `/dev/kvm`, so the order is always:
 1. KVM is there (bare metal, or nested virtualization on): register as today.
 2. KVM can be switched on (firmware setting, CPU type `host`, the cloud's nested option, a nested-capable instance type): do that; the probe prints how. On AWS, GCP and Azure this is almost always the answer, at about the same price.
-3. Neither (most VPS plans, Hetzner Cloud, AWS types without nested): on branch `no-kvm`, register with `--virt-tier auto --accept-fallback` into a location that offers a lower tier. `auto` picks system containers before emulation. Both are experimental, single-project and visible to customers as separate sizes ([NO_KVM.md](../NO_KVM.md) §1, §12). PVM (KVM in software) is detected but not offered.
+3. Neither (most VPS plans, Hetzner Cloud, AWS types without nested): on branch `no-kvm`, register with `--virt-tier auto --accept-fallback` into a location that offers a lower tier. `auto` picks system containers before emulation. Both are experimental, single-project and visible to customers as separate sizes ([NO_KVM.md](../NO_KVM.md) §1, §12). Where VM isolation is required, branch `pvm-build` adds PVM (KVM in software, real Cloud Hypervisor VMs on a third-party host kernel the control plane installs): `--virt-tier pvm --install-pvm-kernel --accept-fallback`, experimental, x86_64 CPUs that Meltdown does not affect only ([NO_KVM.md](../NO_KVM.md) §6.7; on AWS: [aws.md](aws.md) §2.1a).
 
 Rules of thumb:
 - Public IPv4 per VM without NAT or a cloud SDN: rented bare metal or a colo with a routed block.
@@ -81,6 +82,8 @@ The guides describe branch `m2-network`. It is **not pushed yet**: the published
 The commits after 29fe8c799 (the first five rows) are covered by unit specs only and have not run on a host.
 
 Branch `no-kvm` (the virtualization ladder: `bin/byoh-virt`, `--virt-tier`, `bootstrap-data-plane.sh --tier`, the `container` and `emulated` tiers) is built on top of `byoh-driver` and is not merged or pushed. Without it, a machine without KVM cannot be a data plane, and the probe and fallback commands in these guides do not exist.
+
+Branch `pvm-build` (from `byoh-driver` f515eb9e8, which already carries the ladder) adds the `pvm` tier: `--install-pvm-kernel`, the PVM kernel pins on `bin/byoh-location set`, `bin/byoh-virt pvm retry|uninstall|upgrade` and `pvm-*` sizes ([NO_KVM.md](../NO_KVM.md) §6.7). It is pushed to `byoh-fork` but not merged; its guest boot is verified by hand on AWS, its product path is UNVERIFIED until `scripts/byoh/test/real/pvm-e2e.sh` runs.
 
 ---
 

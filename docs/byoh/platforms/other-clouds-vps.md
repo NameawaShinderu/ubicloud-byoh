@@ -65,7 +65,7 @@ isolates less.
 | Tier | What customers get | Speed (lab, VERIFIED) | Isolation | Status |
 |---|---|---|---|---|
 | `container` (L3) | Unprivileged LXC system containers with systemd, SSH and cloud-init, as `container-2..16` sizes | CPU 95-99%, memory bandwidth 91-98% of native, SSH in 3.6-5.4 s | Shared host kernel: not a VM | Registrable; one project per location; real-host checks UNVERIFIED |
-| `pvm` (L4) | VMs on KVM in software (PVM kernel) | not measured here | VM, weaker than hardware | Detected, **not offered** (waits for the go/no-go test) |
+| `pvm` (L4) | Cloud Hypervisor VMs on KVM in software (a PVM host kernel the control plane installs), as `pvm-2..16` sizes, `ubuntu-noble` only | CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32% of the host (AWS m6i.large by hand, L4-T1) | VM, weaker than hardware | Branch `pvm-build`: registrable with `--virt-tier pvm --install-pvm-kernel`; x86_64 CPUs Meltdown does not affect, Secure Boot off, a plain (not md or LVM) `/boot`; one project per location; the product path UNVERIFIED (L4-T2) |
 | `emulated` (L5) | QEMU TCG VMs, as `emulated-2/4` sizes | CPU 26-29%, memory bandwidth about 2.5%, 64-96 s to SSH | Not a security boundary | Registrable; one project per location; real host UNVERIFIED |
 
 The commands, in order (the probe and a refused registration print them with your names filled in):

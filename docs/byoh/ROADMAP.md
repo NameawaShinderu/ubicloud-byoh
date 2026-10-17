@@ -9,7 +9,7 @@ This page ties the other BYOH design pages into one ordered build plan. It does 
 | [NETWORKING.md](NETWORKING.md) | Host network contract, pools, exposure, `host_guard`, IPv6, verification, networking phases **NET-P0..P7**, live steps **L0..L10**, access tiers (§12) |
 | [COMPUTE.md](COMPUTE.md) | Capacity accounting, tiers, overcommit, gates **G0..G6**, compute phases **CMP-P0..P5** |
 | [PLATFORMS.md](PLATFORMS.md) | Per-platform support, ranked findings, fix groups **F1..F10**, host preflight **PF1..PF21** |
-| [NO_KVM.md](NO_KVM.md) | The virtualization ladder (**L1..L5**, tiers `kvm`/`container`/`pvm`/`emulated`), detection, the per-platform KVM fix, its build plan **WP1..WP8** (milestone MV) |
+| [NO_KVM.md](NO_KVM.md) | The virtualization ladder (**L1..L5**, tiers `kvm`/`container`/`pvm`/`emulated`), detection, the per-platform KVM fix, its build plan **WP1..WP8** (milestone MV) and the PVM tier built on `pvm-build` (§6.7, §6.8; milestone MV-P) |
 | this page | Goals, current state, milestones **M0..M12**, console and access (**C0..C5**), OpenStack map, easy deployment (**E0..E5**), rebase strategy, decisions |
 | [QUICKSTART.md](QUICKSTART.md) | Today's manual AWS setup, step by step |
 
@@ -105,7 +105,7 @@ Full per-commit detail: [PLATFORMS.md §3](PLATFORMS.md).
 | B. Easy-deploy foundations | M3 packaged control plane, M4 one-command site and host + preflight | Systemd, production mode, real locations in the CLI, preflight. |
 | C. Flexible tier | M5 | Core user ask (custom shapes, overcommit groundwork). |
 | D. Console and access | M6 | User ask; needs no Cloud Hypervisor change for its first phases. |
-| V. Virtualization ladder (side track) | MV, branch `no-kvm` | "Fast first, fall back only when needed": detect what a machine can virtualize, refuse fixable machines with the per-platform fix, and offer opt-in experimental tiers (system containers, QEMU TCG) where KVM cannot exist. Built in parallel with M4; merges after it. |
+| V. Virtualization ladder (side track) | MV, branch `no-kvm`; MV-P, branch `pvm-build` | "Fast first, fall back only when needed": detect what a machine can virtualize, refuse fixable machines with the per-platform fix, and offer opt-in experimental tiers (system containers, QEMU TCG, and on `pvm-build` PVM) where KVM cannot exist. Built in parallel with M4; merges after it. |
 | E. The rest | M7 host security + verification, M8 management overlay, M9 usage and monitoring, M10 private networking, M11 balloon/resize + interactive console, M12 images/backups/move + releases | Production hardening and OpenStack-gap features. |
 
 **Dependency graph** (an arrow means "needs"):
@@ -120,7 +120,7 @@ M0 ──► M1 ──► M2 ──► M4 ──► M7 ──► M8
 ```
 
 MV (virtualization ladder, `no-kvm`) needs M2 (BYOH locations) and merges **after** M4, because both
-change host preflight and registration (NO_KVM.md §2.3 lists the expected conflicts). Nothing else needs MV.
+change host preflight and registration (NO_KVM.md §2.3 lists the expected conflicts). MV-P (PVM, `pvm-build`) needs MV and was built on `byoh-driver` f515eb9e8, which carries both. Nothing else needs MV or MV-P.
 
 M3 does not depend on the rebase and can start in parallel with M0 (E0 note in §6). M6 (C1/C2) only needs M1 for the C0 snapshot tab; C1/C2 themselves could start after M0.
 
@@ -211,12 +211,22 @@ Not done in M0:
 
 | Item | Detail |
 |---|---|
-| Scope | Detection over SSH (`bin/byoh-virt probe/explain/show/refresh`, `rhizome/host/bin/virt-probe`, `Prog::LearnVirt`, `vm_host.virt_probe`); the per-platform fix and cost tables (`lib/byoh_virt_platforms.rb`); a declared, immutable `vm_host.virt_tier` (`kvm`, `container`, `pvm`, `emulated`) with a location policy `location.byoh_virt`, acks, rates and single-project tenancy; registration with `--virt-tier kvm\|auto\|...` and `--accept-fallback`; tier sizes in `Option::TierVmSizes`, API only. Rungs: L1 KVM (today), L2 fixable (refused with the fix), L3 system containers (LXC), L4 PVM (detected, not offered), L5 QEMU TCG. |
+| Scope | Detection over SSH (`bin/byoh-virt probe/explain/show/refresh`, `rhizome/host/bin/virt-probe`, `Prog::LearnVirt`, `vm_host.virt_probe`); the per-platform fix and cost tables (`lib/byoh_virt_platforms.rb`); a declared, immutable `vm_host.virt_tier` (`kvm`, `container`, `pvm`, `emulated`) with a location policy `location.byoh_virt`, acks, rates and single-project tenancy; registration with `--virt-tier kvm\|auto\|...` and `--accept-fallback`; tier sizes in `Option::TierVmSizes`, API only. Rungs: L1 KVM (today), L2 fixable (refused with the fix), L3 system containers (LXC), L4 PVM (detected, not offered on `no-kvm`; offered on `pvm-build`, MV-P below), L5 QEMU TCG. |
 | Docs | [NO_KVM.md](NO_KVM.md) (design, status, tests); [EMULATED_HOSTS.md](EMULATED_HOSTS.md) (L5 detail) |
 | Key files | `lib/byoh_virt_{ladder,platforms,tiers,registration,cli}.rb`; `prog/learn_virt.rb`; `migrate/20261015_vm_host_virt_probe.rb`, `migrate/20261016_byoh_virt_tier.rb`; `prog/vm/host_nexus.rb` (`verify_virt_tier`, `verify_tier_capacity`); `prog/vm/nexus.rb` (policy gate); `scheduling/allocator.rb` (tier guard); `rhizome/host/lib/{virt_probe,host_tier,container_*,qemu_tcg,qmp_client,emulated_stop}.rb` |
 | M4 dependency | DONE in the merge (2026-10-16): M4's PF3 delegates the virtualization verdict to `ByohVirtLadder.preflight_check(facts, declared_tier:)`, `ubicloud-host` reports the ladder's facts (the probe itself when the host has ruby), and preflight's facts feed `ByohVirtRegistration#decide!` for both `register-byoh-host` and `host add`, so the host is probed once (NO_KVM.md §2.3, §11.4). M4 adds no migration, so `cache/schema.cache` is unchanged. |
 | Gates | Spec gate green, U1 goldens unchanged from 9e22d71ec. Not run (UNVERIFIED): L1-T2 nested benchmarks, L2-T1..T10 on real clouds, L3-T1 on a real host, L4-T1 PVM go/no-go, L5-T1 (NO_KVM.md §14). The container and emulated families stay experimental until their real-host test passes. |
 | Customer can | Nothing by default. In a location whose operator offers a lower tier and grants the project: create `container-*` or `emulated-*` VMs through the API. |
+
+#### MV-P. PVM tier: real VMs without hardware virtualization (branch `pvm-build`) [CODE DONE 2026-10-17; L4-T1 GO VERIFIED on AWS 2026-10-16; L4-T2 UNVERIFIED]
+
+| Item | Detail |
+|---|---|
+| Scope | L4 `pvm`, offered and experimental: per-location PVM kernel pins (operator-chosen https URLs with sha256; no default pin in code), `--install-pvm-kernel` as a per-host ack on `register-byoh-host`, `host add` and `bootstrap-data-plane.sh --tier pvm`; the daemonized host-kernel install after `patch`, GRUB's default kept on the stock kernel with a boot-success re-arm (`ubicloud-pvm-boot.service`), `verify_pvm_boot`; the guest kernel downloaded and checked per host; `pvm-2/4/8/16` VMs that boot the guest kernel directly (`ubuntu-noble`, console `hvc0` or `ttyS0` from the guest config, the serial log as a console file, no hugepages); `bin/byoh-virt pvm retry\|uninstall\|upgrade`; guest-pin rollout at stop/start; the API, CLI and VM page show the tier and the guest kernel. Single project per location: keep the location hidden and grant it. |
+| Docs | [NO_KVM.md](NO_KVM.md) §6.4-§6.8, §10, §12-§15; [platforms/aws.md](platforms/aws.md) §2.1a; [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.1, §2.2 (PVM rows), §3 |
+| Key files | `lib/byoh_pvm_policy.rb`, `lib/byoh_artifact_fetch.rb`, `migrate/20261017_byoh_pvm{,_upgrade}.rb`, `model/byoh_{pvm_host,pvm_guest_kernel,vm_guest_kernel}.rb`, `prog/download_pvm_guest_kernel.rb`, `prog/vm/host_nexus.rb` (the `pvm_*` labels), `prog/learn_virt.rb` (`ByohPvmHostKernel`), `prog/vm/metal/nexus.rb`, `rhizome/host/lib/{pvm_host_kernel,pvm_guest_kernel,vm_setup,host_tier}.rb`, `scripts/byoh/test/real/pvm-e2e.sh` |
+| Gates | Spec gate green with U1 goldens unchanged (kvm, the QEMU-GPU path, container and emulated). L4-T1 (`pvm-go-no-go.sh`) **GO** on AWS m6i.large: CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32% of the host, recovery-check pass. L4-T2 (`pvm-e2e.sh` on an m6i.2xlarge: host add, VMs, lifecycle, reboots, a power cycle, guest-pin rollout, refusals, stock return, delete, billing, teardown) **UNVERIFIED**, not run. |
+| Customer can | In a hidden location whose operator offers `pvm` and grants the project: create `pvm-*` VMs (`ubuntu-noble`) with VM isolation on cloud instances without nested virtualization. |
 
 #### M5. Flexible tier (CMP-P1) [PLANNED M5]
 

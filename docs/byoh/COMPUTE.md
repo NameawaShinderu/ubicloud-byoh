@@ -355,7 +355,7 @@ provisional (UNVERIFIED on a real host):
 |---|---|---|---|---|---|
 | `container` | 2048 | 128 (lxc monitor, lxcfs share, dnsmasq) | 2 | 28 GiB | 5 GiB |
 | `emulated` | 2048 | 512 (QEMU's 256 MiB translation cache, QEMU itself, ubiblk, dnsmasq; 384 MiB measured, EMULATED_HOSTS.md §6.4) | 2 | 27 GiB | 4 GiB |
-| `pvm` | 2048 | 384 | 2 | not offered (NO_KVM.md §6) | |
+| `pvm` | 2048 | 384 (cloud-hypervisor, ubiblk, dnsmasq, shadow page tables; not measured) | 2 | 27 GiB | 5 GiB, below one `pvm-2` (8 GiB), so such a host never accepts (branch `pvm-build`, NO_KVM.md §6.7) |
 
 Sizes (`Option::TierVmSizes`, reachable only through the VM create API in a location that offers the
 tier): `container-2/4/8/16` and `pvm-2/4/8/16` with 4 GiB per vCPU like `standard`; `emulated-2/4` with

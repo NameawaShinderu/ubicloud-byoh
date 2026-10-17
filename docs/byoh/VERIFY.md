@@ -353,5 +353,5 @@ Bugs the run found, each fixed on `aws-e2e` with a spec where code changed:
 9. A stopped container's unit ended `failed`: ExecStop's `lxc-stop` exits 2 after the clean shutdown.
 10. Wording: the tier capacity refusals ("a emulated") and the m4-e2 resume hint.
 
-Still not run on real machines: Proxmox (G-M4-2), the F5 24 h soak (G-M4-3 to 5), a real Cloudflare tunnel, G6/G10/G11, and the PVM build (WP7), which the GO now allows. Open gaps seen but not fixed: a container guest's `nproc` shows the host's CPUs (the cgroup limit holds; lxcfs does not virtualize the count), and `byoh-location rates` prints the development-layout restart hint on a packaged control plane.
+Still not run on real machines: Proxmox (G-M4-2), the F5 24 h soak (G-M4-3 to 5), a real Cloudflare tunnel, G6/G10/G11, and the PVM tier end to end (L4-T2, `scripts/byoh/test/real/pvm-e2e.sh`): the GO allowed the build, which branch `pvm-build` has since done (spec-gated only; NO_KVM.md §6.7). Open gaps seen but not fixed: a container guest's `nproc` shows the host's CPUs (the cgroup limit holds; lxcfs does not virtualize the count), and `byoh-location rates` prints the development-layout restart hint on a packaged control plane.
 

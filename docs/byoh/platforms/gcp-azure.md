@@ -424,7 +424,7 @@ Common problems that are not specific to GCP or Azure (bootstrap SSH, outbound i
 - IPv6 is `ula` only.
 - There is no terraform module (`terraform/azure-byoh` is PLANNED).
 
-Not run on either cloud (branch `no-kvm`, UNVERIFIED): the probe on GCP n2 with nested (NO_KVM.md §14 L1-T3) and on E2, Azure sizes with and without nested, and the PVM go/no-go on a GCP e2-standard-4 (L4-T1).
+Not run on either cloud (branch `no-kvm`, UNVERIFIED): the probe on GCP n2 with nested (NO_KVM.md §14 L1-T3) and on E2, Azure sizes with and without nested, and the PVM go/no-go on a GCP e2-standard-4 (L4-T1; it reported a GO on AWS m6i.large, NO_KVM.md §14) and the PVM tier end to end (L4-T2, branch `pvm-build`).
 
 Code paths these pages rely on are covered by unit specs only (a0259a997, 9d85a6e3c, c73f96ddc, a092f1b8b, 105b6439b). The common flow (location, pools, registration, egress NAT, gate) is validated on AWS only.
 

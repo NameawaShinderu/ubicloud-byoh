@@ -59,9 +59,45 @@ Avoid AWS when:
 | **m8i.2xlarge**, nested virtualization | **Verified** (ap-south-1, 2026-10-11 and 2026-10-13) | 8 vCPU / 32 GiB. Gives 4 usable cores and 26 × 1G hugepages, enough for 2-3 `standard-2` VMs. About $0.45/h in ap-south-1 (CLAUDE.md §10a). Register → `accepting` took about 4 minutes. |
 | Other m8i/c8i/r8i sizes | UNVERIFIED | AWS docs list C8i, M8i and R8i for nested virtualization. A newer version of the docs lists more families (C7i/M7i/R7i, the `-flex` and `d` variants, X8i, I7i) (provider docs, UNVERIFIED here). Check the [AWS nested virtualization page](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html) for your region. |
 | **m5d.metal** | Verified earlier (tag `aws-mumbai-working-v1`) | Native VT-x, 96 vCPU. About $5.86/h (ROADMAP.md §8, CLAUDE.md §10a). The 4 instance-store NVMe disks are **not** used (STOR-3). Needs vCPU quota (§2.3). |
-| Any type without nested-virtualization support (or with it off), or any AMD/Graviton type, unless it is `.metal` | Will not work for standard VMs | No `/dev/kvm`. `bootstrap-data-plane.sh` and PrepHost both refuse such a host. On branch `no-kvm`, `bin/byoh-virt probe` names the fix for the exact type (switch the option on for c8i/m8i/r8i; move other Nitro types to C8i/M8i/R8i or `.metal`; move Xen types such as t2/m4 to a Nitro type), and the type can still run the experimental `container` or `emulated` tier ([NO_KVM.md](../NO_KVM.md)). Moving to an m8i of the same size is the better answer: similar per-vCPU price (UNVERIFIED, NO_KVM.md §7) at full KVM speed. |
+| Any type without nested-virtualization support (or with it off), or any AMD/Graviton type, unless it is `.metal` | Will not work for standard VMs | No `/dev/kvm`. `bootstrap-data-plane.sh` and PrepHost both refuse such a host. On branch `no-kvm`, `bin/byoh-virt probe` names the fix for the exact type (switch the option on for c8i/m8i/r8i; move other Nitro types to C8i/M8i/R8i or `.metal`; move Xen types such as t2/m4 to a Nitro type), and the type can still run the experimental `container` or `emulated` tier, or on branch `pvm-build` the `pvm` tier (next row) ([NO_KVM.md](../NO_KVM.md)). Moving to an m8i of the same size is the better answer: similar per-vCPU price (UNVERIFIED, NO_KVM.md §7) at full KVM speed. |
+| m6i/m7i, **xlarge or larger** (2xlarge to run two VMs or to test tenancy), without nested virtualization, with PVM (`--virt-tier pvm --install-pvm-kernel`, branch `pvm-build`) | Experimental. Guest boot **verified by hand** on m6i.large (L4-T1, 2026-10-16); the product path UNVERIFIED (L4-T2) | Real Cloud Hypervisor VMs on a PVM host kernel, without hardware virtualization: CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32% of the host in L4-T1. An m6i.large (one core) fails `verify_tier_capacity`; an m6i.xlarge fits one `pvm-2`. t3 only if the probe passes: PVM refuses CPUs that Meltdown affects (`pti=off`), so a t3 on a Skylake 8175M is refused and one on a Cascade Lake 8259CL passes (Intel's published Meltdown status; the probe on a t3 is UNVERIFIED), and you cannot choose which you get; t3 CPU credits also apply, so it is not near-native. Secure Boot must be off (the default for Ubuntu AMIs on AWS, UNVERIFIED for every AMI). See §2.1a |
 
 Changing `cpu_options` needs a stopped instance (provider docs, UNVERIFIED here). Choose the type before you register.
+
+### 2.1a PVM on a plain m6i/m7i (branch `pvm-build`, experimental)
+
+Use this only when you need VM isolation on an instance type without nested virtualization; an m8i
+with nested virtualization is faster and needs no custom kernel ([NO_KVM.md](../NO_KVM.md) §6, §7).
+The control plane installs a third-party PVM host kernel on the instance and boots it with `pti=off`.
+GRUB's default stays the stock kernel, so a PVM boot that fails returns to stock at the next stop
+and start of the instance.
+
+1. Pick m6i/m7i **xlarge or larger** (`m6i.2xlarge` for two `pvm-2` VMs), Ubuntu 24.04, nested
+   virtualization off. Keep the EC2 serial console enabled for the account: it is the recovery path
+   when even the stock kernel does not come back (TROUBLESHOOTING.md §2.2).
+2. On the instance: `sudo scripts/byoh/bootstrap-data-plane.sh --tier pvm` (read-only checks: x86_64,
+   no `vmx`/`svm`, Secure Boot off, Meltdown "Not affected", GRUB; it creates the `kvm` group).
+3. On the control plane, pin the kernels in the location, then add the host:
+
+   ```bash
+   ubicloud-admin site rates <site> --family pvm --from standard --multiplier <X>
+   ubicloud-admin site set <site> --virt-tiers kvm,pvm --accept pvm \
+     --pvm-host-deb <URL> --pvm-host-deb-sha256 <hex> \
+     --pvm-guest-kernel <URL> --pvm-guest-kernel-sha256 <hex> \
+     --pvm-guest-config <URL> --pvm-guest-config-sha256 <hex>
+   ubicloud-admin site grant <site> --project <ubid>     # keep the site hidden: pvm is single-project
+   ubicloud-admin host add --site <site> ... --virt-tier pvm --install-pvm-kernel --accept-fallback
+   ```
+
+   The code has no default pin. The cocoonstack/pvm v0.1.0 release that L4-T1 booted is listed in
+   [NO_KVM.md](../NO_KVM.md) §6.7 as an example: **third party; Januscape fix inclusion UNVERIFIED;
+   for testing only, not a recommended production pin.**
+4. `host add` follows the bring-up: `patch`, then the "pvm install" phase (the kernel install, up to
+   45 minutes), one reboot into the PVM kernel, `verify_pvm_boot`, then `accepting`. Customers create
+   `pvm-2/4/8/16` VMs with boot image `ubuntu-noble` through the API or `ubi`.
+
+The whole flow is scripted as L4-T2, `BYOH_REAL_E2E=1 scripts/byoh/test/real/pvm-e2e.sh all`, against
+one throwaway m6i.2xlarge (`scripts/byoh/test/aws-e2e` role `pvme`). It has not run yet (UNVERIFIED).
 
 ### 2.2 Network
 
@@ -515,5 +551,5 @@ aws ec2 describe-addresses --region <aws_region from mysite.tfvars> \
 - Single AZ, single control plane, nothing restarts after a control plane reboot.
 - `variables.tf` defaults (m5d.metal, nested off) and the `terraform.tfvars.example` comment that `.metal` is required are stale.
 - `aws-routed-network-setup.sh` is broken and retired.
-- Not run on AWS (branch `no-kvm`, UNVERIFIED): the probe on m8i with nested on and off, m6i/m7i, t3 and a Xen type (NO_KVM.md §14, L1-T2, L2-T1, L2-T2, L2-T9); the `container` and `emulated` tiers on a non-nested type (L3-T1, L5-T1); the PVM go/no-go on m6i.large (L4-T1).
+- Not run on AWS (branch `no-kvm`, UNVERIFIED): the probe on m8i with nested on and off, m6i/m7i, t3 and a Xen type (NO_KVM.md §14, L1-T2, L2-T1, L2-T2, L2-T9); the `container` and `emulated` tiers on a non-nested type (L3-T1, L5-T1). (The e2e1 run of 2026-10-16 then ran L1-T2, L3-T1, L4-T1 and L5 on AWS; NO_KVM.md §14 has the results.) The PVM tier end to end (L4-T2, `pvm-e2e.sh`, branch `pvm-build`) has not run.
 - Changes to EIPs in AWS are not synced automatically; `bin/byoh-pool sync-aws` is PLANNED P7.
