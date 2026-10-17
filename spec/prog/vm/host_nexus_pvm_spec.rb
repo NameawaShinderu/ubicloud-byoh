@@ -501,9 +501,11 @@ RSpec.describe Prog::Vm::HostNexus do
       vm_host.incr_pvm_uninstall
     end
 
-    it "waits while the host has VMs" do
+    it "waits while the host has VMs, taking no new ones meanwhile" do
+      vm_host.update(allocation_state: "accepting")
       create_vm(vm_host_id: vm_host.id, family: "pvm", location_id: location.id)
       expect { nx.pvm_uninstall }.to nap(60)
+      expect(vm_host.reload.allocation_state).to eq "draining"
     end
 
     it "disarms a host on its PVM kernel and reboots it to the stock kernel first" do

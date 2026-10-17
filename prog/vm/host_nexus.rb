@@ -744,11 +744,11 @@ TIMER
   # pvm_uninstall semaphore stays set across that reboot.
   label def pvm_uninstall
     register_deadline("pvm_uninstalled", 45 * 60) unless pvm_reinstall
+    vm_host.update(allocation_state: "draining") if vm_host.allocation_state == "accepting"
     unless vm_host.vms_dataset.empty?
       Clog.emit("pvm uninstall waits for the host's VMs to be deleted", {pvm_uninstall_waits: {vm_host_ubid: vm_host.ubid, vms: vm_host.vms_dataset.count}})
       nap 60
     end
-    vm_host.update(allocation_state: "draining") if vm_host.allocation_state == "accepting"
 
     case sshable.d_check(PVM_UNINSTALL_UNIT)
     when "Succeeded"

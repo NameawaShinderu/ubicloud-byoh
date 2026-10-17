@@ -872,8 +872,9 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
     HostNexus acts on only on pvm hosts: `bin/byoh-virt pvm retry --host <vh>` installs again after a
     failed install (uninstalling first what a failed one left), or arms one more PVM boot and reboots
     after a failed boot. It refuses elsewhere. `bin/byoh-virt pvm uninstall --host <vh>` refuses while
-    the host has VMs; HostNexus disarms and reboots a host on its PVM kernel to stock first, runs the
-    daemonized `uninstall`, records `uninstalled`, pages `ByohPvmUninstalled` ("destroy and register it
+    the host has VMs; HostNexus drains an accepting host at once (so no VM lands while it waits for the
+    VMs to go), disarms and reboots a host on its PVM kernel to stock first, runs the daemonized
+    `uninstall`, records `uninstalled`, pages `ByohPvmUninstalled` ("destroy and register it
     again as kvm, container or emulated") and stays at `pvm_uninstalled`. A stock kernel with `pti=off`
     on its own command line is not rebooted again (no reboot clears it, and rhizome's uninstall refuses
     it): HostNexus disarms, pages `ByohPvmInstall` with the fix (remove `pti=off` from
