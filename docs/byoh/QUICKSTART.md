@@ -1,10 +1,10 @@
 # Ubicloud BYOH quickstart
 
-The shortest path from two Ubuntu 24.04 machines to a running VM. It works the same on any platform. The details behind each step are in [SETUP.md](SETUP.md). The only platform-specific parts are how you create the machines and how pool addresses reach the host:
+The shortest path from two Ubuntu 24.04 machines to a running VM, with the packaged control plane. It is the same on every platform; only how you create the machines and how pool addresses reach the host differ. The overview and the virtualization choice are in [README.md](README.md), the details behind each step in [SETUP.md](SETUP.md).
 
-- AWS with terraform: the "AWS-specific (optional)" section below, and [platforms/aws.md](platforms/aws.md). **Validated.**
-- Proxmox VE: [recipes/proxmox.md](recipes/proxmox.md), [platforms/proxmox.md](platforms/proxmox.md) and [SETUP_PROXMOX.md](SETUP_PROXMOX.md). UNVERIFIED.
-- Anything else: pick your platform in [platforms/README.md](platforms/README.md). UNVERIFIED.
+- AWS: the "AWS" section below and [platforms/aws.md](platforms/aws.md). **Validated.**
+- Proxmox VE: [recipes/proxmox.md](recipes/proxmox.md), [platforms/proxmox.md](platforms/proxmox.md). UNVERIFIED.
+- Anything else: [platforms/README.md](platforms/README.md). UNVERIFIED.
 
 When something goes wrong: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
@@ -12,109 +12,146 @@ When something goes wrong: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## You need
 
-- **Control plane:** Ubuntu 24.04, 2 vCPU, 4 GB RAM or more, and a sudo user.
-- **Data plane:** Ubuntu 24.04 with KVM and 1G pages. On a VM, that means nested virtualization and a host CPU model.
-  - Memory must be a whole number of GiB on the published `byoh-driver`; 32 GiB is a good size.
-  - It needs outbound internet.
-  - It must be a dedicated machine; registration reboots it.
-- **SSH** from the control plane to the data plane's management IP, and a login there with passwordless `sudo`.
-- **At least one pool**, unless every VM will be IPv6-only:
-  - addresses that reach the data plane and are **not** configured on its NIC;
-  - their `delivery` and `exposure` (SETUP.md §3).
+- **Control plane:** Ubuntu 24.04 x86_64, about 4 GiB of memory, root through `sudo`, outbound internet, and a DNS name for it (for `--tls acme`, also `api.<name>`; `<ip>.sslip.io` names need no DNS work).
+- **Data plane:** Ubuntu 24.04 x86_64, a dedicated machine (registration reboots it and takes it over), outbound internet, and only its main address on the NIC. KVM is best; without it see step 5.
+- **SSH** from the control plane to the data plane, with a login there that has passwordless `sudo` (`ubuntu` on cloud images).
+- **A pool**, unless every VM will be IPv6-only: addresses that reach the data plane and are **not** configured on its NIC, with their `delivery` and `exposure` (SETUP.md §3).
+- An [age](https://age-encryption.org) public key for the backups, whose secret key lives off the machine.
 
 ---
 
 ## 1. Control plane
 
-This is the development bootstrap (tmux, `clover_test`), which the live environment runs. A packaged control plane (systemd, TLS, backups) is installed with `scripts/byoh/install.sh` instead: [INSTALL.md](INSTALL.md).
-
 ```bash
 git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/ubicloud
-bash ~/ubicloud/scripts/byoh/bootstrap-dev-ctrl-plane.sh
-export PATH=$HOME/.local/bin:$HOME/.local/share/mise/installs/ruby/4.0.7/bin:$PATH
-cd ~/ubicloud
-curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://localhost:3000/login     # HTTP 200
+sudo bash ~/ubicloud/scripts/byoh/install.sh --version v0.1.0 \
+  --source-git ~/ubicloud --ref HEAD \
+  --url https://cloud.example.com --tls acme --admin-email ops@example.com \
+  --backup-recipient age1...
+sudo ubicloud-admin status
 ```
 
-## 2. Data plane
+- `--tls` picks the front: `acme` (Let's Encrypt; ports 80 and 443 and public DNS), `provided --cert F --key F`, `tunnel` (cloudflared, `--cloudflared-token-file F`) or `none` (`--url http://localhost:3000`, reached over `ssh -L`). [INSTALL.md](INSTALL.md) §3.
+- The front also serves the API on `api.<host>` (`--api-host` to change it, `--no-api` to leave it out). The `ubi` CLI needs it (step 6).
+- `--rack-env production` is the default; boot images then come from the public Ubuntu mirror. The other flags: [INSTALL.md](INSTALL.md) §2.
 
-Nothing to run on it. You need a login with passwordless `sudo` and your SSH key (`ubuntu` on cloud images), and the site network work for your pools (SETUP.md §3). `host add` in step 4 checks the rest.
+## 2. First account
+
+```bash
+sudo ubicloud-admin account create --email you@example.com --name "Your Name"
+```
+
+It prints a generated password once (`--password-stdin` or `--password-file F` to give one) and `Created account ... with project pj... (Default)`. Keep the `pj...` ubid for step 3. No mail is needed.
 
 ## 3. Site
 
-The development control plane has no `ubicloud-admin` on PATH; run the checkout's own with `--dev`, from `~/ubicloud`, without `sudo` (packaged: `sudo ubicloud-admin site add ...`):
-
 ```bash
-packaging/bin/ubicloud-admin --dev site add byoh-site1 --display "Site 1 (BYOH)" \
+sudo ubicloud-admin site add byoh-site1 --display "Site 1 (BYOH)" \
   --underlay <site CIDRs> --overlay 172.20.0.0/14 --cp-reach onhost \
-  --cp-source <control plane IP>/32 --rates-from hetzner-fsn1
+  --cp-source <control plane IP as the site sees it>/32 --mgmt-allow <admin CIDRs> \
+  --rates-from hetzner-fsn1 --grant pj...
 ```
 
-Restart the services so they load the rates (a packaged control plane restarts itself):
+`--cp-reach public` when the control plane is not on the site network. The site stays hidden; `--grant` lets your project use it. `site add` restarts the services so they load the rates. Options: [SETUP.md](SETUP.md) §6.
+
+## 4. Pools
+
+Write `pools.yaml` for the site ([POOL_OPERATIONS.md](POOL_OPERATIONS.md) §1, examples in [recipes/](recipes/README.md) and SETUP.md §7), then check the host without changing it:
 
 ```bash
-tmux kill-session -t puma; tmux kill-session -t respirate
-bash scripts/byoh/bootstrap-dev-ctrl-plane.sh    # restarts them; every other step is skipped
+sudo ubicloud-admin host preflight --site byoh-site1 --ssh ubuntu@<host> \
+  --ssh-key ~/.ssh/<your login key> --pool-file pools.yaml
 ```
 
-## 4. Pools and the host
+Its PF3 line names the host's virtualization rung and, when KVM can be switched on, the fix.
 
-Write `pools.yaml` for your site. Examples are in [recipes/](recipes/README.md), SETUP.md §7, SETUP_PROXMOX.md §6 and POOL_OPERATIONS.md §1. Then:
+## 5. Host
+
+Pick one option ([README.md](README.md) §2 compares them). Every lower tier is experimental and single-project, and its VMs come in their own sizes.
+
+**KVM** (PF3 passes):
 
 ```bash
-ssh-keygen -t ed25519 -N '' -f ~/.ssh/byoh_data      # root key the control plane keeps; the gate in step 6 uses it
-packaging/bin/ubicloud-admin --dev host add --site byoh-site1 --ssh <user>@<data main IP> \
-  --ssh-key <your login key> --registration-key ~/.ssh/byoh_data --pool-file pools.yaml
+sudo ubicloud-admin host add --site byoh-site1 --ssh ubuntu@<host> \
+  --ssh-key ~/.ssh/<your login key> --pool-file pools.yaml
 ```
 
-It runs host preflight (read-only; any failed check stops it before a change), shows the changes and the host's key fingerprints and asks for `yes`, installs the root key, registers the host and waits until it accepts VMs, then runs `pool verify`. That takes about 4 minutes on a nested-virtualization VM and 15-25 minutes on bare metal, including one reboot. Exit 0 means done; Ctrl-C stops only the watch (`packaging/bin/ubicloud-admin --dev host watch <data main IP>` resumes it). `bundle exec bin/register-byoh-host` remains as the low-level path (SETUP.md §8.2).
-
-## 5. First VM
-
-1. Sign up at `http://<control plane>:3000/create-account`. The verification email is in `/tmp/puma.log`; if its link starts with `http://localhost:9292` (an `.env.rb` without `BASE_URL`), replace that part with `http://<control plane>:3000`.
-2. Grant the project access to the location:
-   ```bash
-   packaging/bin/ubicloud-admin --dev site grant byoh-site1 --project pj...    # the project ubid, from the UI's /project/pj… address
-   ```
-3. Add an SSH key.
-4. Create a VM in "Site 1 (BYOH)" with `ubuntu-noble`:
-   - IPv4 exposure **internet** needs a `public` or `nat` pool.
-   - **internal** needs an `internal` pool.
-   - With IPv4 off, the VM needs no pool.
-5. Connect with `ssh ubi@<address shown in the UI>`. The user is `ubi`, not `ubuntu`.
-
-## 6. Check
+**No KVM, containers first** (`auto` picks the fallback the probe recommends, `container` before `emulated`; the site must offer it). Install the tier's packages on the host, offer the tier in the site, then add the host:
 
 ```bash
-GATE_LOCATION=byoh-site1 GATE_HOST=vh... GATE_MAIN_IP=<data main IP> \
-  scripts/byoh/verify/m2-gate.sh g1 g2 g4 g5
+# on the host
+sudo apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs   # emulated: qemu-system-x86 ovmf
+# on the control plane
+sudo ubicloud-admin site rates byoh-site1 --family container --from standard --multiplier 1.0
+sudo ubicloud-admin site set byoh-site1 --virt-tiers kvm,container --accept container
+sudo ubicloud-admin host add --site byoh-site1 --ssh ubuntu@<host> \
+  --ssh-key ~/.ssh/<your login key> --pool-file pools.yaml \
+  --virt-tier auto --accept-fallback
 ```
 
-[VERIFY.md](VERIFY.md) §1.4 lists the settings for the VM checks.
+For `emulated` alone, use `--family emulated`, `--virt-tiers kvm,emulated --accept emulated` and `--virt-tier emulated --accept-fallback`.
+
+**No KVM, VM isolation required: PVM.** x86_64 only, a CPU that Meltdown does not affect, Secure Boot off. The control plane installs a third-party PVM host kernel that you pin by URL and sha256; the code has no default pin ([NO_KVM.md](NO_KVM.md) §6.7, which lists the example build used for testing):
+
+```bash
+sudo ubicloud-admin site rates byoh-site1 --family pvm --from standard --multiplier 1.0
+sudo ubicloud-admin site set byoh-site1 --virt-tiers kvm,pvm --accept pvm \
+  --pvm-host-deb <https URL> --pvm-host-deb-sha256 <hex> \
+  --pvm-guest-kernel <https URL> --pvm-guest-kernel-sha256 <hex> \
+  --pvm-guest-config <https URL> --pvm-guest-config-sha256 <hex>
+sudo ubicloud-admin host add --site byoh-site1 --ssh ubuntu@<host> \
+  --ssh-key ~/.ssh/<your login key> --pool-file pools.yaml \
+  --virt-tier pvm --install-pvm-kernel --accept-fallback
+```
+
+`--pvm-guest-unchecked` replaces the guest-config pair when the guest kernel's config cannot be read. `site set` downloads each pin and checks its sha256. `scripts/byoh/bootstrap-data-plane.sh --tier pvm` on the host runs the same refusals read-only beforehand.
+
+**What `host add` does:** preflight (read-only; a `fail` stops it before any change), shows the changes and the host's key fingerprints and asks for `yes`, installs its own root key, registers the host, follows the bring-up (one reboot; PVM: the kernel install and a second boot) until the host accepts VMs, then runs `pool verify`. About 4 minutes on a nested-virtualization VM, 15-25 on bare metal, and 184 s for PVM on an m6i.2xlarge (VERIFY.md §8). Exit 0 means done; Ctrl-C stops only the watch, and `sudo ubicloud-admin host watch <host>` resumes it. Exit codes: [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.3.
+
+## 6. First VM
+
+**Web UI.** Log in at the `--url` with the account of step 2, add an SSH key, and create a VM in "Site 1 (BYOH)" with `ubuntu-noble`. With IPv4, exposure **internet** needs a `public` or `nat` pool and **internal** an `internal` pool; with IPv4 off the VM needs no pool. The web form offers only the standard (KVM) sizes.
+
+**`ubi` CLI.** Create a personal access token in the web UI (the project's Tokens page), then, from any machine with Ruby and a clone of this repository:
+
+```bash
+export UBI_TOKEN=pat-... UBI_URL=https://api.cloud.example.com/cli
+~/ubicloud/bin/ubi vm list
+~/ubicloud/bin/ubi vm byoh-site1/vm1 create -b ubuntu-noble "$(cat ~/.ssh/id_ed25519.pub)"
+~/ubicloud/bin/ubi vm byoh-site1/vm1 ssh
+```
+
+Lower tiers take their own size and image: `-s container-2 -b ubuntu-noble-container`, `-s pvm-2 -b ubuntu-noble`, `-s emulated-2 -b ubuntu-noble`. `-e internal` asks for an internal address, `-6` for no IPv4. The VM user is `ubi`. Under `--tls none`, use `UBI_URL=http://api.localhost:3000/cli` over `ssh -L 3000:127.0.0.1:3000` ([INSTALL.md](INSTALL.md) §3.1).
 
 ---
 
-## AWS-specific (optional)
+## Development control plane
 
-This is the validated path. It uses `terraform/aws-byoh` to create the machines, the network and the pools. Nothing else in the steps above changes. Everything AWS-only is listed in SETUP.md §12.
+For labs, `scripts/byoh/bootstrap-dev-ctrl-plane.sh` runs the same code in tmux ([SETUP.md](SETUP.md) §4.2). Run `packaging/bin/ubicloud-admin --dev site|host|pool ...` from `~/ubicloud` without `sudo` in place of `sudo ubicloud-admin`, create the account at `http://<control plane>:3000/create-account` or with `bundle exec bin/byoh-account create --email ...`, and restart `puma` and `respirate` yourself after `site add` or `site rates`.
 
-1. **Quota.** You need enough vCPU quota for the data plane and one free EIP per pool address. The default EIP quota is 5 per region.
-2. **Terraform.** Run it on your workstation:
+---
+
+## AWS
+
+This is the validated path. `terraform/aws-byoh` creates the machines, the network and the pools; the steps above do not change. AWS-only details: [platforms/aws.md](platforms/aws.md) and SETUP.md §12.
+
+1. **Quota.** Enough vCPU quota for the data plane, and one free EIP per pool address (the default is 5 per region).
+2. **Terraform**, on your workstation:
    ```bash
    cd terraform/aws-byoh
-   terraform workspace new mysite          # one workspace + one mysite.tfvars per environment
+   terraform workspace new mysite          # one workspace and one mysite.tfvars per environment
    $EDITOR mysite.tfvars
    terraform apply -var-file=mysite.tfvars
    ```
-   Set these variables:
-   - `data_plane_instance_type = "m8i.2xlarge"` and `data_plane_nested_virtualization = true`. The defaults (m5d.metal, nested off) are stale.
-   - `operator_ssh_cidr` and `web_ui_cidr` set to your /32. Both are required since M4.
-   - `byoh_secondary_private_ips`, which get EIPs and become `nat`, and optionally `byoh_internal_private_ips`, which become `internal`.
-3. **Outputs.** Terraform prints `handoff_instructions`. It also writes `.generated/<workspace>/pools.yaml` (`fabric` + `nat`, with the EIPs as `external`), and `byoh_location_create_command` prints the step 3 command for this VPC (`sudo ubicloud-admin site add ...`). `host_add_command` prints how to copy `pools.yaml` and the generated SSH key to the control plane and add the host with `ubicloud-admin host add` (platforms/aws.md §3.7; UNVERIFIED on AWS). On a development control plane, run `packaging/bin/ubicloud-admin --dev` from `~/ubicloud` in place of `sudo ubicloud-admin`.
-4. **Data plane.** Terraform's `user-data-data.sh` replaces `bootstrap-data-plane.sh`, and it also applies the cloud-init secondary-IP fix. Check that `ip -br -4 addr` on the data plane shows only the primary IP. `--main-ip` is the data plane's **private** IP.
-5. **Monitor.** Leave `bin/monitor` off for EBS-backed hosts until the F5 soak has run (VERIFY.md G-M4-3), and run the gate with `GATE_EXPECT_MONITOR=0`.
+   - KVM: `data_plane_instance_type = "m8i.2xlarge"` and `data_plane_nested_virtualization = true`. The defaults (m5d.metal, nested off) are stale.
+   - PVM instead: an m6i/m7i **xlarge or larger** with nested virtualization off ([platforms/aws.md](platforms/aws.md) §2.1a).
+   - `operator_ssh_cidr` and `web_ui_cidr` set to your /32.
+   - `byoh_secondary_private_ips` get EIPs and become `nat`; optional `byoh_internal_private_ips` become `internal`.
+3. **Outputs.** `byoh_location_create_command` prints step 3's `site add` for this VPC. `host_add_command` prints how to copy `.generated/<workspace>/pools.yaml` and the login key to the control plane and run step 5's `host add` with `--expect-host-key`. `handoff_instructions` lists the rest.
+4. **Data plane.** Terraform's `user-data-data.sh` keeps the pool IPs off the NIC. Check that `ip -br -4 addr` on the data plane shows only the primary IP. The main IP is the data plane's **private** IP.
+5. **Monitor.** Leave it off on EBS-backed hosts until the F5 soak has run (VERIFY.md G-M4-3).
 6. **SSH.** A `nat` VM is reached at its EIP: `ssh ubi@<EIP>`.
-7. **Teardown.** Run `terraform destroy -var-file=mysite.tfvars` in the same workspace. Then check that `aws ec2 describe-addresses` lists no leftover EIPs.
+7. **Teardown.** `terraform destroy -var-file=mysite.tfvars` in the same workspace, then check that `aws ec2 describe-addresses` lists no leftover EIPs.
 
 ---
 
@@ -124,21 +161,10 @@ The full catalogue is [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 | Symptom | Fix |
 |---|---|
-| `bundle install` fails with "No such file or directory - mise" | Put `~/.local/bin` on PATH |
-| `bundle` uses the system Ruby | Put `~/.local/share/mise/installs/ruby/4.0.7/bin` on PATH |
-| `host add` stops at preflight | The `fail` line names the check and the fix; [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.1 |
-| `register-byoh-host` aborts on `--provider` | There is no such flag; use `--location` |
-| Strands fail with `NetSsh::MissingMock` | `RACK_ENV=test` on a control plane. Use `development`. |
-| VM waits for capacity | No free address of the requested exposure, or no boot image (`--default-boot-image`) |
-| VM stuck at `wait_sshable` | The control plane cannot reach the VM's pool address; use `--cp-reach public` when it is off-site |
-| `Permission denied (publickey)` on a VM | Use `ubi@`. On AWS, also check that the pool IPs are not on the host's NIC (C5). |
-
-## See also
-
-- [SETUP.md](SETUP.md): the full runbook.
-- [platforms/README.md](platforms/README.md): one guide per platform.
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md): symptoms, causes and fixes.
-- [SETUP_PROXMOX.md](SETUP_PROXMOX.md): Proxmox.
-- [POOL_OPERATIONS.md](POOL_OPERATIONS.md): changing pools.
-- [VERIFY.md](VERIFY.md): the gate and the live window.
-- [NETWORKING.md](NETWORKING.md), [PLATFORMS.md](PLATFORMS.md), [ROADMAP.md](ROADMAP.md).
+| `host add` stops at preflight | The `fail` line names the check and the fix; [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.1a |
+| PF3 fails: no usable KVM | Apply the printed fix, or pick a lower tier (step 5, [NO_KVM.md](NO_KVM.md)) |
+| `host add` refuses a lower tier: the location does not offer it | Run the `rates` and `set` commands it prints, as `sudo ubicloud-admin site rates` and `site set` |
+| `ubi` prints an HTML login page | `UBI_URL` points at the web host; use `https://api.<host>/cli` |
+| VM waits for capacity | No free address of the requested exposure, no boot image of that name, or a lower-tier size on a site or host without that tier |
+| VM stuck at `wait_sshable` | The control plane cannot reach the VM's pool address; `--cp-reach public` when it is off-site |
+| `Permission denied (publickey)` on a VM | Use `ubi@`. On AWS, also check that the pool IPs are not on the host's NIC (C5) |
