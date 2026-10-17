@@ -23,11 +23,13 @@ class ByohVirtCli
       refresh  --host UBID | --all
                Probe a registered host again, or every BYOH host (generic
                provider in a BYOH location) whose rhizome is installed
-      pvm retry --host UBID [--accept-host-deb SHA256]
+      pvm retry --host UBID [--accept-host-deb SHA256] [--reboot-vms]
                After a failed PVM host kernel install: install it again
                (--accept-host-deb takes the location's new host-deb pin
                for this host). After a failed PVM kernel boot: arm one
-               more PVM boot and reboot the host.
+               more PVM boot and reboot the host (a host whose boot could
+               not be armed still runs its VMs: --reboot-vms reboots it
+               under them).
       pvm uninstall --host UBID
                Take the PVM host kernel the control plane installed off a
                pvm host without VMs; then destroy the host and register
@@ -222,13 +224,20 @@ class ByohVirtCli
   def pvm_retry(argv)
     key = nil
     accept = nil
-    parse(argv, "pvm retry --host UBID [--accept-host-deb SHA256]") do |o|
+    reboot_vms = false
+    parse(argv, "pvm retry --host UBID [--accept-host-deb SHA256] [--reboot-vms]") do |o|
       o.on("--host UBID", "VmHost ubid") { key = it }
       o.on("--accept-host-deb SHA256", "Install the location's current host-deb pin, which this host's registration did not acknowledge") { accept = it }
+      o.on("--reboot-vms", "Reboot a host whose PVM boot could not be armed although its VMs still run") { reboot_vms = true }
     end
     host, row = pvm_host(key)
     label = host.strand&.label || "no strand"
     raise Error, "host #{host.ubid} is at #{label}; pvm retry acts only where a PVM kernel install or boot failed (#{PVM_WAIT_LABELS.join(", ")})" unless PVM_WAIT_LABELS.include?(label)
+    running = (label == "pvm_boot_failed" && host.strand.stack.first["pvm_not_rebooted"]) ? host.vms_dataset.count : 0
+    if running > 0 && !reboot_vms
+      raise Error, "host #{host.ubid} was not rebooted (its PVM boot could not be armed), so its #{running} VMs still run, and a retry reboots it under them; " \
+        "delete them first, or pass --reboot-vms to reboot them with the host"
+    end
 
     pin = ByohPvmPolicy.pins(ByohVirtTiers.policy(host.location))&.dig("host_deb", "sha256")
     if accept
@@ -243,6 +252,7 @@ class ByohVirtCli
       host.incr_pvm_retry
       args = {from: label}
       args[:accept_host_deb] = accept if accept
+      args[:reboot_vms] = running if running > 0
       ByohOperatorLog.record(command: "virt-pvm-retry", target_id: host.id, args:, result: "requested")
     end
     what = (label == "pvm_install_failed") ? "install the PVM host kernel again" : "arm one more PVM kernel boot and reboot it"

@@ -871,13 +871,15 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
   - Operator actions, each an operator-action row and a semaphore (`pvm_retry`, `pvm_uninstall`) that
     HostNexus acts on only on pvm hosts: `bin/byoh-virt pvm retry --host <vh>` installs again after a
     failed install (uninstalling first what a failed one left), or arms one more PVM boot and reboots
-    after a failed boot. It refuses elsewhere. `bin/byoh-virt pvm uninstall --host <vh>` refuses while
-    the host has VMs; HostNexus drains an accepting host at once (so no VM lands while it waits for the
-    VMs to go), disarms and reboots a host on its PVM kernel to stock first, runs the daemonized
-    `uninstall`, records `uninstalled`, pages `ByohPvmUninstalled` ("destroy and register it
-    again as kvm, container or emulated") and stays at `pvm_uninstalled`. A stock kernel with `pti=off`
-    on its own command line is not rebooted again (no reboot clears it, and rhizome's uninstall refuses
-    it): HostNexus disarms, pages `ByohPvmInstall` with the fix (remove `pti=off` from
+    after a failed boot. It refuses elsewhere. A host whose boot could not be armed was never rebooted
+    and still runs its VMs (`pvm_not_rebooted` in the frame), so retry refuses there while the host has
+    VMs unless the operator passes `--reboot-vms`. `bin/byoh-virt pvm uninstall --host <vh>` refuses
+    while the host has VMs; HostNexus drains an accepting host at once (so no VM lands while it waits
+    for the VMs to go), disarms and reboots a host on its PVM kernel to stock first, runs the daemonized
+    `uninstall`, records `uninstalled`, pages `ByohPvmUninstalled` ("destroy and register it again as
+    kvm, container or emulated") and stays at `pvm_uninstalled`. A stock kernel with `pti=off` on its
+    own command line is not rebooted again (no reboot clears it, and rhizome's uninstall refuses it):
+    HostNexus disarms, pages `ByohPvmInstall` with the fix (remove `pti=off` from
     `GRUB_CMDLINE_LINUX*`, `update-grub`, reboot, uninstall again) and waits at `pvm_install_failed`.
   - LearnVirt passes the install state, so a host on its stock kernel before the PVM boot gets no
     false `ByohVirtTier` page. On pvm the `ByohKernelReboot` page is replaced by `ByohPvmHostKernel`

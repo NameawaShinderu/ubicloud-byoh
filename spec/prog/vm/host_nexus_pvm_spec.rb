@@ -315,6 +315,7 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(row.reload.last_error).to eq "arm: the stock entry no longer matches"
       expect(page("ByohPvmBoot").summary).to eq "#{vm_host.ubid} was not rebooted: its PVM kernel boot could not be armed: the stock entry no longer matches"
       expect(vm_host.reboot_set?(cached: false)).to be true
+      expect(st.stack.first["pvm_not_rebooted"]).to be true
     end
 
     it "does not arm a host rebooted for an uninstall, nor one it did not install" do
@@ -481,14 +482,16 @@ RSpec.describe Prog::Vm::HostNexus do
 
     it "arms one more boot and reboots on a retry" do
       vm_host.incr_pvm_retry
-      refresh_frame(nx, new_values: {"deadline_target" => "wait", "deadline_at" => (Time.now + 60).to_s})
+      refresh_frame(nx, new_values: {"deadline_target" => "wait", "deadline_at" => (Time.now + 60).to_s, "pvm_not_rebooted" => true})
       expect { nx.pvm_boot_failed }.to hop("prep_reboot")
-      expect(st.stack.first.key?("deadline_at")).to be false
+      expect(st.stack.first.keys).not_to include("deadline_at", "pvm_not_rebooted")
     end
 
     it "uninstalls when asked" do
       vm_host.incr_pvm_uninstall
+      refresh_frame(nx, new_values: {"pvm_not_rebooted" => true})
       expect { nx.pvm_boot_failed }.to hop("pvm_uninstall")
+      expect(st.stack.first.key?("pvm_not_rebooted")).to be false
     end
   end
 

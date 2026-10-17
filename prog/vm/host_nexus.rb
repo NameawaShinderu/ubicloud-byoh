@@ -3,7 +3,7 @@
 class Prog::Vm::HostNexus < Prog::Base
   subject_is :sshable, :vm_host
   frame_reader :vhost_block_backend_version, :default_boot_images, :install_os
-  frame_accessor :accepting_before_patch, :pvm_patch_kernels, :pvm_status, :pvm_reinstall, :pvm_drained, :pvm_boot_waits
+  frame_accessor :accepting_before_patch, :pvm_patch_kernels, :pvm_status, :pvm_reinstall, :pvm_drained, :pvm_boot_waits, :pvm_not_rebooted
 
   def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false, ipv6_mode: "gua", virt_tier: ByohVirtTiers::KVM, pinned_host_keys: nil, pvm_install: nil, pvm_facts: {})
     DB.transaction do
@@ -725,12 +725,19 @@ TIMER
 
   # A pvm host whose PVM kernel boot failed waits here, with its VMs
   # stopped and its page open, for the operator: pvm retry arms one more
-  # PVM boot and reboots the host; pvm uninstall abandons PVM.
+  # PVM boot and reboots the host; pvm uninstall abandons PVM. A host
+  # whose boot could not be armed was not rebooted and its VMs still run
+  # (pvm_not_rebooted), so pvm retry reboots it under them only when the
+  # operator says so.
   label def pvm_boot_failed
     unregister_deadline(deadline_target) if deadline_at
-    when_pvm_uninstall_set? { hop_pvm_uninstall }
+    when_pvm_uninstall_set? do
+      delete_from_stack("pvm_not_rebooted")
+      hop_pvm_uninstall
+    end
     when_pvm_retry_set? do
       decr_pvm_retry
+      delete_from_stack("pvm_not_rebooted")
       hop_prep_reboot
     end
 
@@ -903,9 +910,10 @@ TIMER
     error = result["error"]
     pvm_row.update(last_error: "arm: #{error}", updated_at: Time.now)
     drain_pvm_host
+    self.pvm_not_rebooted = true
     pvm_page("ByohPvmBoot", "was not rebooted: its PVM kernel boot could not be armed: #{error}", error:,
       fix: "The host was not rebooted, so VMs it runs keep running, but it takes no new ones and boots the stock kernel next. " \
-        "Fix the cause (install-pvm-host-kernel status on the host), then bin/byoh-virt pvm retry --host #{vm_host.ubid}, which arms the boot again and reboots the host.")
+        "Fix the cause (install-pvm-host-kernel status on the host), then bin/byoh-virt pvm retry --host #{vm_host.ubid}, which arms the boot again and reboots the host (with --reboot-vms while it has VMs).")
     hop_pvm_boot_failed
   end
 

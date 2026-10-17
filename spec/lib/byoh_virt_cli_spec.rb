@@ -241,6 +241,20 @@ RSpec.describe ByohVirtCli do
         expect(cli("pvm", "retry", "--host", pvm_host.ubid, "--accept-host-deb", "a" * 64)[2]).to eq "! --accept-host-deb is for a failed install; this host's PVM kernel is installed\n"
       end
 
+      it "reboots a host whose PVM boot could not be armed under its running VMs only when told to" do
+        strand.update(label: "pvm_boot_failed", stack: [{"pvm_not_rebooted" => true}])
+        row.update(state: "committed")
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid)[0]).to eq 0
+        Semaphore.where(strand_id: pvm_host.id).destroy
+        create_vm(vm_host_id: pvm_host.id, family: "pvm", location_id: location.id)
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid)).to eq [1, "", "! host #{pvm_host.ubid} was not rebooted (its PVM boot could not be armed), so its 1 VMs still run, and a retry reboots it under them; " \
+          "delete them first, or pass --reboot-vms to reboot them with the host\n"]
+        expect(semaphores).to eq []
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid, "--reboot-vms")[0]).to eq 0
+        expect(semaphores).to eq ["pvm_retry"]
+        expect(actions).to contain_exactly(["virt-pvm-retry", {"from" => "pvm_boot_failed"}, "requested"], ["virt-pvm-retry", {"from" => "pvm_boot_failed", "reboot_vms" => 1}, "requested"])
+      end
+
       it "refuses a host where nothing failed" do
         strand.update(label: "wait")
         expect(cli("pvm", "retry", "--host", pvm_host.ubid)).to eq [1, "", "! host #{pvm_host.ubid} is at wait; pvm retry acts only where a PVM kernel install or boot failed (pvm_install_failed, pvm_boot_failed)\n"]
