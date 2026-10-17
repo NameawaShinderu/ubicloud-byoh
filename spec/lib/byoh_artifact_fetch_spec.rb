@@ -31,7 +31,8 @@ RSpec.describe ByohArtifactFetch do
     expect(File.read(dest)).to eq content
     argv = calls.first
     tmp = argv[argv.index("-o") + 1]
-    expect(argv.values_at(0..7)).to eq ["curl", "--proto", "=https", "--proto-redir", "=https", "-fsSL", "--max-filesize", described_class::MAX_BYTES.to_s]
+    expect(argv.values_at(0..13)).to eq ["curl", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
+      "--connect-timeout", "10", "--speed-limit", "1024", "--speed-time", "60", "--max-filesize", described_class::MAX_BYTES.to_s]
     expect(argv.last).to eq "https://example.com/f"
     expect(File.dirname(tmp)).to start_with File.join(dir, "byoh-fetch-")
     expect(Dir.children(dir)).to eq ["file"]
@@ -67,6 +68,8 @@ RSpec.describe ByohArtifactFetch do
       .to raise_error(described_class::Refused, "downloading https://example.com/f failed (curl exit 1; an http:// URL or redirect is refused, only https is fetched): curl: (1) Protocol \"http\" not supported")
     expect { fetch(body: nil, code: 63, out: "curl: (63) Maximum file size exceeded") }
       .to raise_error(described_class::Refused, /\(curl exit 63; the file is larger than the cap\)/)
+    expect { fetch(body: nil, code: 28, out: "curl: (28) Operation too slow") }
+      .to raise_error(described_class::Refused, /\(curl exit 28; the server stalled: no connection within 10s, or under 1 KiB\/s for 60s\)/)
     expect { fetch(body: nil, code: 6, out: "curl: (6) Could not resolve host") }
       .to raise_error(described_class::Refused, "downloading https://example.com/f failed (curl exit 6): curl: (6) Could not resolve host")
     expect(Dir.children(dir)).to eq []

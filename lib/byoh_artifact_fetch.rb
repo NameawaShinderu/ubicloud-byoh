@@ -23,8 +23,12 @@ class ByohArtifactFetch
   # What some curl exit codes mean here.
   CURL_ERRORS = {
     1 => "an http:// URL or redirect is refused, only https is fetched",
+    28 => "the server stalled: no connection within 10s, or under 1 KiB/s for 60s",
     63 => "the file is larger than the cap",
   }.freeze
+
+  # A server that accepts and then stalls would hang the caller forever.
+  TIMEOUT_ARGS = ["--connect-timeout", "10", "--speed-limit", "1024", "--speed-time", "60"].freeze
 
   # The scheme must be lower case: the location CHECK compares it with
   # LIKE 'https://_%', which is case sensitive.
@@ -54,7 +58,7 @@ class ByohArtifactFetch
     begin
       tmp = File.join(dir, "download")
       out, status = @runner.call("curl", "--proto", "=https", "--proto-redir", "=https", "-fsSL",
-        "--max-filesize", @max_bytes.to_s, "-o", tmp, url)
+        *TIMEOUT_ARGS, "--max-filesize", @max_bytes.to_s, "-o", tmp, url)
       unless status.success?
         why = CURL_ERRORS[status.exitstatus]
         raise Refused, "downloading #{url} failed (curl exit #{status.exitstatus}#{"; #{why}" if why}): #{out.strip}"
