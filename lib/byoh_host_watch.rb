@@ -33,12 +33,14 @@ class ByohHostWatch
   # plane installs does so after patch, under the install's own deadline
   # (pvm install, where a failed install waits for bin/byoh-virt pvm
   # retry), and checks its PVM kernel boot at verify_pvm_boot (where a
-  # failed boot waits at pvm_boot_failed). Uninstalling the PVM kernel
-  # (pvm_uninstall) ends a bring-up.
+  # failed boot waits at pvm_boot_failed). Moving such a host to a new
+  # host-deb pin (pvm_upgrade, bin/byoh-virt pvm upgrade) runs under the
+  # same limit, then reboots like a bring-up until the host accepts VMs
+  # again. Uninstalling the PVM kernel (pvm_uninstall) ends a bring-up.
   PHASES = {
     "bootstrap" => [600, %w[start install_host_os setup_ssh_keys bootstrap_rhizome check_ip_reachability prep wait_prep setup_hugepages verify_virt_tier setup_storage_backend]],
     "boot image download" => [4 * 60 * 60, %w[download_boot_images wait_download_boot_images pvm_guest_kernel_refused patch]],
-    "pvm install" => [45 * 60, %w[install_pvm_host_kernel pvm_install_failed pvm_retry]],
+    "pvm install" => [45 * 60, %w[install_pvm_host_kernel pvm_install_failed pvm_retry pvm_upgrade]],
     "reboot" => [15 * 60, %w[prep_reboot reboot verify_spdk verify_hugepages verify_pvm_boot pvm_boot_failed verify_tier_capacity start_slices start_vms]],
     "hardware reset" => [20 * 60, %w[prep_hardware_reset hardware_reset]],
   }.freeze

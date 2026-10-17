@@ -210,9 +210,9 @@ RSpec.describe ByohVirtCli do
     def actions = DB[:byoh_operator_action].order(:id).select_map([:command, :args, :result]).map { |c, a, r| [c, a.to_h, r] }
 
     it "refuses an unknown subcommand, a missing host and a host of another tier" do
-      expect(cli("pvm")).to eq [1, "", "! usage: bin/byoh-virt pvm retry|uninstall --host UBID
+      expect(cli("pvm")).to eq [1, "", "! usage: bin/byoh-virt pvm retry|uninstall|upgrade --host UBID
 "]
-      expect(cli("pvm", "frob")[2]).to eq "! usage: bin/byoh-virt pvm retry|uninstall --host UBID
+      expect(cli("pvm", "frob")[2]).to eq "! usage: bin/byoh-virt pvm retry|uninstall|upgrade --host UBID
 "
       expect(cli("pvm", "retry")).to eq [1, "", "! --host is required
 "]
@@ -299,6 +299,68 @@ RSpec.describe ByohVirtCli do
         expect(cli("pvm", "uninstall", "--host", pvm_host.ubid)[2]).to start_with "! the control plane did not install the PVM kernel of host #{pvm_host.ubid}"
         expect(semaphores).to eq []
         expect(actions).to eq []
+      end
+    end
+
+    describe "upgrade" do
+      let(:new_pin) { "c" * 64 }
+
+      before do
+        row.update(state: "committed", host_kver: "6.12.33-pvm", last_error: nil)
+        strand.update(label: "wait")
+        location.update(byoh_virt: Sequel.pg_jsonb(location.byoh_virt.to_h.merge("pvm_kernel" => pvm_test_pins.merge("host_deb" => {"url" => "https://example.com/new.deb", "sha256" => new_pin}))))
+      end
+
+      it "asks a committed host without VMs to move to the location's new host-deb pin, and records it" do
+        status, out, err = cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)
+        expect([status, err]).to eq [0, ""]
+        expect(out).to eq "Asked host #{pvm_host.ubid} to move to the PVM host kernel of host-deb sha256 #{new_pin}; follow it with bin/byoh-host watch #{pvm_host.ubid}.\n"
+        expect(row.reload.values.slice(:state, :host_deb_sha256)).to eq(state: "upgrade_pending", host_deb_sha256: new_pin)
+        expect(semaphores).to eq ["pvm_upgrade"]
+        expect(actions).to eq [["virt-pvm-upgrade", {"from_host_deb" => "a" * 64, "accept_host_deb" => new_pin}, "requested"]]
+      end
+
+      it "says that a host drained beforehand stays draining" do
+        pvm_host.update(allocation_state: "draining")
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)[1]).to end_with "The host is draining; set it to accepting in the admin UI when it should take VMs.\n"
+      end
+
+      it "refuses without the operator's acceptance of the location's pin, changing nothing" do
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid)).to eq [1, "", "! --accept-host-deb is required: check the new build, then pass the location's host-deb pin #{new_pin}\n"]
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", "d" * 64)[2]).to eq "! location byoh-v pins host-deb sha256 #{new_pin}, not #{"d" * 64}\n"
+        location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm], "acks" => {}}))
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid)[2]).to eq "! --accept-host-deb is required: check the new build, then pass the location's host-deb pin (none; pin one with bin/byoh-location set)\n"
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)[2]).to eq "! location byoh-v pins host-deb sha256 none, not #{new_pin}\n"
+        expect(row.reload.values.slice(:state, :host_deb_sha256)).to eq(state: "committed", host_deb_sha256: "a" * 64)
+        expect(semaphores).to eq []
+        expect(actions).to eq []
+      end
+
+      it "refuses a host on the location's pin, one with VMs, one not committed, one at work elsewhere and one it did not install" do
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", "a" * 64)[2]).to eq "! location byoh-v pins host-deb sha256 #{new_pin}, not #{"a" * 64}\n"
+        row.update(host_deb_sha256: new_pin)
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)[2]).to eq "! host #{pvm_host.ubid} runs the location's host-deb pin #{new_pin} already\n"
+        row.update(host_deb_sha256: "a" * 64)
+        create_vm(vm_host_id: pvm_host.id, family: "pvm", location_id: location.id)
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)[2]).to eq "! host #{pvm_host.ubid} has 1 VMs, and the upgrade reboots it; " \
+          "move it to draining (admin \"Move to Draining\") so no VM is placed on it, delete or move its VMs, then run pvm upgrade again\n"
+        strand.update(label: "pvm_boot_failed")
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)[2]).to eq "! host #{pvm_host.ubid} is at pvm_boot_failed; pvm upgrade starts only at wait\n"
+        strand.destroy
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)[2]).to eq "! host #{pvm_host.ubid} is at no strand; pvm upgrade starts only at wait\n"
+        row.update(state: "failed")
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)[2]).to eq "! host #{pvm_host.ubid}'s PVM kernel is failed; pvm upgrade moves only a host that booted its PVM kernel (committed)\n"
+        row.update(install: false)
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)[2]).to eq "! the control plane did not install the PVM kernel of host #{pvm_host.ubid}; upgrade it by hand\n"
+        expect(semaphores).to eq []
+        expect(actions).to eq []
+      end
+
+      it "shows the command on a committed host the location pins another build for" do
+        out = cli("show", "--host", pvm_host.ubid)[1]
+        expect(out).to include "  the location pins another host-deb build: move the host to it with bin/byoh-virt pvm upgrade --host #{pvm_host.ubid} --accept-host-deb #{new_pin}\n"
+        row.update(host_deb_sha256: new_pin)
+        expect(cli("show", "--host", pvm_host.ubid)[1]).not_to include "pvm upgrade"
       end
     end
 

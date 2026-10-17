@@ -287,6 +287,7 @@ class ByohLocationCli
     strands.each { |host, strand| @out.puts "Started #{strand.ubid} to install the new egress NAT settings on host #{host.ubid}." }
     downloads.each { |host, strand| @out.puts "Started #{strand.ubid} to download the new PVM guest kernel on host #{host.ubid}; its VMs boot it from their next stop and start." }
     @out.puts ByohPvmPolicy::ACK if pins_changed
+    print_pvm_host_kernels(location, old_pins, new_virt["pvm_kernel"]) if pins_changed
     update_visibility(location, opts[:visible]) unless opts[:visible].nil?
     print_warnings
   end
@@ -435,6 +436,25 @@ class ByohLocationCli
 
     start_on_hosts(location, "DownloadPvmGuestKernel", VmHost.where(location_id: location.id, virt_tier: "pvm")) do |host|
       {subject_id: host.id, pin: new_pins.slice(*ByohPvmPolicy::GUEST_KEYS)}
+    end
+  end
+
+  # A new host-deb pin is not rolled out by itself (docs/byoh/NO_KVM.md
+  # section 6.8): the hosts the control plane installed another build on,
+  # with how each one moves to the new pin.
+  def print_pvm_host_kernels(location, old_pins, new_pins)
+    sha256 = new_pins.dig("host_deb", "sha256")
+    return if sha256 == old_pins&.dig("host_deb", "sha256")
+
+    ByohPvmHost.where(vm_host_id: VmHost.where(location_id: location.id).select(:id), install: true)
+      .exclude(state: "uninstalled").exclude(host_deb_sha256: sha256).order(:vm_host_id).all.each do |row|
+      ubid = row.vm_host.ubid
+      how = if row.state == "committed"
+        "move it with bin/byoh-virt pvm upgrade --host #{ubid} --accept-host-deb #{sha256} once it has no VMs (UNVERIFIED on a real host)"
+      else
+        "its install stays on the build it acknowledged; see bin/byoh-virt show --host #{ubid}"
+      end
+      @out.puts "Host #{ubid} (PVM kernel #{row.state}) has host-deb sha256 #{row.host_deb_sha256}, not the new pin: #{how}."
     end
   end
 

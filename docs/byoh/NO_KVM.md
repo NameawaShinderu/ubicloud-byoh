@@ -884,8 +884,31 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
   - LearnVirt passes the install state, so a host on its stock kernel before the PVM boot gets no
     false `ByohVirtTier` page. On pvm the `ByohKernelReboot` page is replaced by `ByohPvmHostKernel`
     (warning): a committed host runs another kernel than its PVM kernel, or its PVM kernel is not the
-    location's current host-deb pin. Moving a host to a new pin is plan WP9 (not built). Container
+    location's current host-deb pin; its fix names `bin/byoh-virt pvm upgrade` (below). Container
     keeps `ByohKernelReboot` unchanged.
+  - **Host-kernel upgrade** (plan WP9; specs only, UNVERIFIED on a real host and never run with a
+    second build). `bin/byoh-location set --pvm-host-deb ...` starts nothing on the hosts; it names each
+    host the control plane installed another build on, with the command that moves it, and
+    `bin/byoh-virt show` prints the same line for a committed host. `bin/byoh-virt pvm upgrade --host <vh>
+    --accept-host-deb <sha256>` takes only the location's current pin, only on a committed install host
+    at `wait`, and refuses while the host has VMs (move it to draining in the admin UI first, so none is
+    placed meanwhile); it records the accepted pin in `byoh_pvm_host.host_deb_sha256`, sets
+    `upgrade_pending` and writes an operator-action row. HostNexus' `pvm_upgrade` (deadline 45 minutes to
+    `prep_reboot`) drains an accepting host, waits for any VM placed in between, compares the location's
+    pin with the accepted one again, then runs rhizome's `install-pvm-host-kernel upgrade` daemonized. That
+    runs on the PVM kernel, installs and holds the new build beside the running one, keeps the stock pin
+    stored at install (`saved_entry` never changes), rewrites the `pti=off` entry and the boot unit for the
+    new build and arms one boot of it. Success records `armed` and the new kernel, then
+    `prep_reboot → reboot → verify_pvm_boot` boot and check it as after an install; the host takes VMs
+    again once it is `committed`. A refusal (nothing changed: a wrong sha256, too little space, a pin that
+    moved again) restores the running build's sha256, pages `ByohPvmUpgrade` and returns the host to work
+    on its PVM kernel. A failure after a change (rhizome un-armed the host, which still runs the old PVM
+    kernel but boots stock next) records `failed`, pages `ByohPvmUpgrade` and waits at
+    `pvm_install_failed`; `pvm retry` then disarms, reboots to stock, uninstalls both builds and installs
+    the location's pin, and `pvm uninstall` abandons PVM. A new build that fails to boot returns to the
+    **stock** kernel on the next power cycle, not to the previous PVM build (its `pti=off` entry is gone):
+    the `ByohPvmBoot` page and `pvm retry` apply as after a first install. `bin/byoh-host watch` follows
+    `pvm_upgrade` in the "pvm install" phase.
   - `wait` pages `ByohPvmGuestKernelStale` (warning) with the VMs whose guest kernel is not the host's
     current one; the fix is to stop and start each (section 6.8).
   - `bin/byoh-host watch` knows the new labels: phase "pvm install" (45 minutes) for
@@ -912,7 +935,8 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
   branch, its issues, and kernel CVEs against 6.12) for both kernels. The docs name this in the
   location ack text; Ubicloud ships no feed.
 - **Host-kernel rollout:** drain the host, then a per-host reboot through HostNexus (the same one-shot
-  boot and `verify_virt_tier`), one host at a time.
+  boot and `verify_pvm_boot`), one host at a time: `bin/byoh-virt pvm upgrade` (section 6.7; built,
+  UNVERIFIED on a real host).
 - **Guest-kernel rollout:** a new pin applies at the VM's next stop/start. A page lists the VMs still on
   an old kernel. The guest kernel version is shown on the VM.
 - **Patch cadence:** the `ByohKernelReboot` page of section 5.3 covers L4 hosts too.

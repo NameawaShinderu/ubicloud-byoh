@@ -614,6 +614,7 @@ TIMER
   PVM_KERNEL_TOOL = "host/bin/install-pvm-host-kernel"
   PVM_INSTALL_UNIT = "install_pvm_host_kernel"
   PVM_UNINSTALL_UNIT = "uninstall_pvm_host_kernel"
+  PVM_UPGRADE_UNIT = "upgrade_pvm_host_kernel"
 
   # The states of the host's state.json in which nothing of an install
   # is on the host: none, a refused install, or an uninstall.
@@ -681,7 +682,61 @@ TIMER
     end
 
     self.pvm_reinstall = true
+    # A host still on its PVM kernel (an upgrade that failed there) is
+    # disarmed and rebooted to stock for the uninstall; the semaphore
+    # keeps prep_reboot from arming it and brings verify_pvm_boot back.
+    incr_pvm_uninstall if status["running_pvm"]
     hop_pvm_uninstall
+  end
+
+  # Moves a committed install host to the location's new host-deb pin
+  # (bin/byoh-virt pvm upgrade, which refuses while the host has VMs and
+  # records the pin the operator accepted in byoh_pvm_host). UNVERIFIED
+  # on a real host. Rhizome's upgrade runs on the PVM kernel, installs
+  # the new build beside the running one, keeps the stock pin it stored
+  # at install and arms one boot of the new build; prep_reboot, reboot
+  # and verify_pvm_boot then boot and check it as after an install. GRUB's
+  # default stays the stock kernel, so a new build that fails to boot
+  # returns the host to stock on the next power cycle, not to the
+  # previous PVM kernel. A refused upgrade changed nothing: the host goes
+  # back to work on its PVM kernel. A failed one was un-armed by rhizome
+  # and waits at pvm_install_failed, where pvm retry installs again from
+  # the stock kernel.
+  label def pvm_upgrade
+    decr_pvm_upgrade
+    row = pvm_row
+    hop_wait unless row&.state == "upgrade_pending"
+
+    register_deadline("prep_reboot", 45 * 60)
+    drain_pvm_host
+    unless vm_host.vms_dataset.empty?
+      Clog.emit("pvm upgrade waits for the host's VMs to be deleted", {pvm_upgrade_waits: {vm_host_ubid: vm_host.ubid, vms: vm_host.vms_dataset.count}})
+      nap 60
+    end
+
+    case sshable.d_check(PVM_UPGRADE_UNIT)
+    when "Succeeded"
+      status = pvm_kernel("status")
+      sshable.d_clean(PVM_UPGRADE_UNIT)
+      row.update(state: "armed", host_kver: status.dig("state", "kver"), last_error: nil, updated_at: Time.now)
+      record_pvm_status(status)
+      %w[ByohPvmUpgrade ByohPvmHostKernel].each { resolve_pvm_page(it) }
+      hop_prep_reboot
+    when "Failed"
+      status = pvm_kernel("status")
+      logs = sshable.d_logs(PVM_UPGRADE_UNIT, lines: 20).strip
+      sshable.d_clean(PVM_UPGRADE_UNIT)
+      record_pvm_status(status)
+      pvm_upgrade_failed!(row, status, logs)
+    when "NotStarted"
+      pin = ByohPvmPolicy.pins(ByohVirtTiers.policy(vm_host.location))&.dig("host_deb")
+      unless pin && pin["sha256"] == row.host_deb_sha256
+        pvm_upgrade_refused!(row, pvm_kernel("status"), "location #{vm_host.location.name} pins #{pin ? "host-deb sha256 #{pin["sha256"]}" : "no PVM host kernel"}, but the operator accepted sha256 #{row.host_deb_sha256} for this host's upgrade")
+      end
+      sshable.d_run(PVM_UPGRADE_UNIT, "sudo", PVM_KERNEL_TOOL, "upgrade", stdin: JSON.generate("host_deb" => pin))
+    end
+
+    nap 30
   end
 
   # Checks each boot of a pvm host: after prep_reboot's reboot and after
@@ -768,7 +823,7 @@ TIMER
         hop_install_pvm_host_kernel
       end
       pvm_row.update(state: "uninstalled", last_error: nil, updated_at: Time.now)
-      %w[ByohPvmInstall ByohPvmBoot ByohPvmHostKernel].each { resolve_pvm_page(it) }
+      %w[ByohPvmInstall ByohPvmBoot ByohPvmHostKernel ByohPvmUpgrade].each { resolve_pvm_page(it) }
       Prog::PageNexus.assemble("#{vm_host.ubid} had its PVM host kernel uninstalled and cannot run VMs", ["ByohPvmUninstalled", vm_host.ubid], vm_host.ubid,
         resource_id: vm_host.id, severity: "info",
         extra_data: {fix: "The host runs its stock kernel again. Destroy the host and register it again as kvm, container or emulated (bin/byoh-virt probe says which it can run)."})
@@ -882,6 +937,35 @@ TIMER
     end
     pvm_page("ByohPvmInstall", "#{unchanged ? "refused" : "failed"} to install the PVM host kernel: #{error}", error:, step: result["step"], last_log_lines: logs, fix:)
     hop_pvm_install_failed
+  end
+
+  # An upgrade that failed or was refused, from the host's state: a
+  # refused one left the installed build armed or disarmed as it was.
+  def pvm_upgrade_failed!(row, status, logs)
+    state = status["state"] || {}
+    result = last_json(logs) || {}
+    error = result["error"] || state.dig("last_result", "error") || "see the log lines"
+    pvm_upgrade_refused!(row, status, error, logs) if %w[armed disarmed].include?(state["state"])
+
+    row.update(state: "failed", last_error: "upgrade: #{error}", updated_at: Time.now)
+    pvm_page("ByohPvmUpgrade", "failed to upgrade its PVM host kernel: #{error}", error:, step: result["step"], last_log_lines: logs,
+      fix: "The upgrade failed after step #{state["upgrade_steps"]&.last || "none"}; rhizome un-armed the host, which still runs its PVM kernel #{status["kernel"]} but boots the stock kernel next, and takes no VMs. " \
+        "bin/byoh-virt pvm retry --host #{vm_host.ubid} reboots it to the stock kernel, uninstalls its PVM kernels and installs the location's pin; bin/byoh-virt pvm uninstall --host #{vm_host.ubid} abandons PVM.")
+    hop_pvm_install_failed
+  end
+
+  # Nothing of the upgrade is on the host: it keeps the build it runs
+  # (the one rhizome's state names) and goes back to work.
+  def pvm_upgrade_refused!(row, status, error, logs = nil)
+    running = status.dig("state", "host_deb_sha256") || row.host_deb_sha256
+    row.update(state: "committed", host_deb_sha256: running, last_error: "upgrade: #{error}", updated_at: Time.now)
+    pin = ByohPvmPolicy.pins(ByohVirtTiers.policy(vm_host.location))&.dig("host_deb", "sha256")
+    pvm_page("ByohPvmUpgrade", "refused to upgrade its PVM host kernel: #{error}", error:, **{last_log_lines: logs}.compact,
+      fix: "Nothing was changed on the host; it keeps its PVM kernel #{row.host_kver} (host-deb sha256 #{running}) and takes VMs again. " \
+        "Fix the cause, then bin/byoh-virt pvm upgrade --host #{vm_host.ubid} --accept-host-deb #{pin || "SHA256"} again.")
+    unregister_deadline("prep_reboot")
+    undrain_pvm_host
+    hop_wait
   end
 
   # The last JSON object in a daemon's log lines: the tool's result.
@@ -1041,6 +1125,7 @@ TIMER
 
     if pvm_host?
       when_pvm_uninstall_set? { hop_pvm_uninstall }
+      when_pvm_upgrade_set? { hop_pvm_upgrade }
       check_pvm_guest_kernels
     end
 

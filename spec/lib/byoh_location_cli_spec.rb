@@ -816,6 +816,30 @@ RSpec.describe ByohLocationCli do
         expect(strand.stack).to eq [{"subject_id" => pvm.id, "pin" => {"guest_kernel" => {"url" => "https://example.com/vmlinux2", "sha256" => sha("https://example.com/vmlinux2")}, "guest_unchecked" => false}}]
         expect(output).to include "Started #{strand.ubid} to download the new PVM guest kernel on host #{pvm.ubid}; its VMs boot it from their next stop and start.\n"
       end
+
+      describe "a new PVM host kernel pin" do
+        it "names the hosts on another build and how each moves to the new pin" do
+          expect(cli("set", "--location", location.name, *pin_args)[0]).to eq 0
+          old_sha = sha("https://example.com/h.deb")
+          files["https://example.com/h2.deb"] = "newer package"
+          new_sha = sha("https://example.com/h2.deb")
+          hosts = %w[committed install_pending uninstalled committed committed].map { create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm") }
+          hosts.zip(%w[committed install_pending uninstalled committed committed], [old_sha, old_sha, old_sha, new_sha, old_sha], [true, true, true, true, false]).each do |host, state, deb, install|
+            ByohPvmHost.create(vm_host_id: host.id, state:, install:, host_deb_sha256: deb)
+          end
+          ByohPvmHost.create(vm_host_id: create_byoh_vm_host(create_byoh_location(name: "byoh-other", ui_name: "Other"), virt_tier: "pvm", family: "pvm").id, state: "committed", install: true, host_deb_sha256: old_sha)
+          lines = cli("set", "--location", location.name, "--pvm-host-deb", "https://example.com/h2.deb", "--pvm-host-deb-sha256", new_sha)[1].lines.grep(/\AHost /)
+          expect(lines).to eq [
+            [hosts[0], "Host #{hosts[0].ubid} (PVM kernel committed) has host-deb sha256 #{old_sha}, not the new pin: move it with bin/byoh-virt pvm upgrade --host #{hosts[0].ubid} --accept-host-deb #{new_sha} once it has no VMs (UNVERIFIED on a real host).\n"],
+            [hosts[1], "Host #{hosts[1].ubid} (PVM kernel install_pending) has host-deb sha256 #{old_sha}, not the new pin: its install stays on the build it acknowledged; see bin/byoh-virt show --host #{hosts[1].ubid}.\n"],
+          ].sort_by { it[0].id }.map(&:last)
+
+          # A guest kernel change alone names no host.
+          files["https://example.com/vmlinux2"] = vmlinux + "newer".b
+          output = cli("set", "--location", location.name, "--pvm-guest-kernel", "https://example.com/vmlinux2", "--pvm-guest-kernel-sha256", sha("https://example.com/vmlinux2"))[1]
+          expect(output).not_to include "Host "
+        end
+      end
     end
 
     describe "rates --family" do

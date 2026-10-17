@@ -152,6 +152,7 @@ RSpec.describe Prog::LearnVirt do
       expect { lv.start }.to exit({"msg" => "virt tier pvm"})
       expect(kernel_page.summary).to eq "#{vm_host.ubid} runs the PVM host kernel 6.12.33-pvm (host-deb sha256 #{"c" * 64}), but location byoh-test pins sha256 #{"a" * 64}"
       expect(kernel_page.details.to_h).to include("pinned_sha256" => "a" * 64, "fix" => start_with("A PVM host kernel is never replaced in place"))
+      expect(kernel_page.details["fix"]).to include("bin/byoh-virt pvm upgrade --host #{vm_host.ubid} --accept-host-deb #{"a" * 64}: it drains the host")
       expect(Page.from_tag_parts("ByohVirtTier", vm_host.ubid)).to be_nil
 
       ByohPvmHost[vm_host.id].update(host_deb_sha256: "a" * 64)
@@ -167,6 +168,7 @@ RSpec.describe Prog::LearnVirt do
       expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**pvm))
       expect { lv.start }.to exit({"msg" => "virt tier pvm"})
       expect(kernel_page.summary).to end_with "but location byoh-test pins no host kernel"
+      expect(kernel_page.details["fix"]).to include("--accept-host-deb SHA256:")
     end
 
     it "judges a pvm host without a PVM kernel record by its probe alone" do

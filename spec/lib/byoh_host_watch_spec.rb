@@ -109,7 +109,7 @@ RSpec.describe ByohHostWatch do
     expect(labels - outside - described_class::PHASE_OF.keys).to eq []
     expect(described_class::PHASE_OF.keys - labels).to eq []
     expect(described_class::PHASE_OF.keys & outside).to eq []
-    expect(described_class::PHASE_OF.values_at("install_pvm_host_kernel", "pvm_install_failed", "pvm_retry")).to eq ["pvm install"] * 3
+    expect(described_class::PHASE_OF.values_at("install_pvm_host_kernel", "pvm_install_failed", "pvm_retry", "pvm_upgrade")).to eq ["pvm install"] * 4
     expect(described_class::PHASE_OF.values_at("verify_pvm_boot", "pvm_boot_failed", "verify_tier_capacity", "verify_virt_tier", "pvm_guest_kernel_refused")).to eq ["reboot", "reboot", "reboot", "bootstrap", "boot image download"]
   end
 
@@ -118,6 +118,13 @@ RSpec.describe ByohHostWatch do
     expect(watch.run).to eq :timeout
     expect(now[0]).to eq 2705
     expect(out.string).to include "has been in its pvm install phase (at Vm::HostNexus.pvm_install_failed) for 2705 s, over its 2700 s limit"
+  end
+
+  it "follows a PVM host kernel upgrade of a draining host under the install's limit" do
+    strand.update(label: "pvm_upgrade")
+    host.update(allocation_state: "draining")
+    expect(watch.run).to eq :timeout
+    expect(out.string).to include "has been in its pvm install phase (at Vm::HostNexus.pvm_upgrade)"
   end
 
   it "stops at once on a host whose PVM kernel is being uninstalled" do

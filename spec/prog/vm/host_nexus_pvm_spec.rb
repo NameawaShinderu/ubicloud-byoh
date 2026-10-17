@@ -17,6 +17,7 @@ RSpec.describe Prog::Vm::HostNexus do
   let(:sshable) { nx.sshable }
   let(:stock) { "7.0.0-1014-aws" }
   let(:pvm) { "6.12.33-pvm" }
+  let(:new_pvm) { "6.12.40-pvm" }
   let(:stock_entry) { "Advanced options for Ubuntu>Ubuntu, with Linux #{stock}" }
   let(:row) { ByohPvmHost.create(vm_host_id: vm_host.id, state: "install_pending", install: true, host_deb_sha256: "a" * 64, lockdown: "none", meltdown: "Not affected") }
   let(:tool) { "sudo host/bin/install-pvm-host-kernel" }
@@ -289,6 +290,14 @@ RSpec.describe Prog::Vm::HostNexus do
       expect_tool("status", stock_status(state: {"state" => "failed"}))
       expect { nx.pvm_retry }.to hop("pvm_uninstall")
       expect(st.stack.first["pvm_reinstall"]).to be true
+      expect(vm_host.pvm_uninstall_set?(cached: false)).to be false
+    end
+
+    it "reboots a host still on its PVM kernel to stock for the uninstall, unarmed" do
+      expect_tool("status", status(state: {"state" => "failed", "kver" => new_pvm, "prev_kvers" => [pvm]}))
+      expect { nx.pvm_retry }.to hop("pvm_uninstall")
+      expect(st.stack.first["pvm_reinstall"]).to be true
+      expect(vm_host.pvm_uninstall_set?(cached: false)).to be true
     end
   end
 
@@ -551,7 +560,7 @@ RSpec.describe Prog::Vm::HostNexus do
     end
 
     it "records the uninstall and pages to register the host again" do
-      %w[ByohPvmBoot ByohPvmHostKernel].each { Prog::PageNexus.assemble("old", [it, vm_host.ubid], vm_host.ubid, resource_id: vm_host.id) }
+      %w[ByohPvmBoot ByohPvmHostKernel ByohPvmUpgrade].each { Prog::PageNexus.assemble("old", [it, vm_host.ubid], vm_host.ubid, resource_id: vm_host.id) }
       expect(sshable).to receive(:d_check).with(unit).and_return("Succeeded")
       expect(sshable).to receive(:d_clean).with(unit)
       expect_tool("status", stock_status(state: {"state" => "uninstalled"}))
@@ -559,6 +568,7 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(row.reload.state).to eq "uninstalled"
       expect(vm_host.pvm_uninstall_set?(cached: false)).to be false
       expect(page("ByohPvmBoot").resolve_set?).to be true
+      expect(page("ByohPvmUpgrade").resolve_set?).to be true
       expect(page("ByohPvmUninstalled").details["fix"]).to start_with "The host runs its stock kernel again. Destroy the host and register it again"
     end
 
@@ -599,6 +609,130 @@ RSpec.describe Prog::Vm::HostNexus do
     end
   end
 
+  # bin/byoh-virt pvm upgrade (WP9): a committed host moves to the
+  # location's new host-deb pin. UNVERIFIED on a real host.
+  describe "#pvm_upgrade" do
+    let(:unit) { "upgrade_pvm_host_kernel" }
+    let(:new_deb) { {"url" => "https://example.com/pvm/linux-image-pvm-2.deb", "sha256" => "c" * 64} }
+
+    def pin_new_deb = location.update(byoh_virt: Sequel.pg_jsonb(location.byoh_virt.to_h.merge("pvm_kernel" => pvm_test_pins.merge("host_deb" => new_deb))))
+
+    before do
+      st.update(label: "pvm_upgrade")
+      pin_new_deb
+      row.update(state: "upgrade_pending", host_kver: pvm, stock_kver: stock, stock_entry:, host_deb_sha256: "c" * 64)
+      vm_host.update(allocation_state: "accepting")
+      vm_host.incr_pvm_upgrade
+    end
+
+    it "goes back to wait on a request that no longer applies" do
+      row.update(state: "committed")
+      expect { nx.pvm_upgrade }.to hop("wait")
+      expect(vm_host.pvm_upgrade_set?(cached: false)).to be false
+      row.destroy
+      expect { described_class.new(st).pvm_upgrade }.to hop("wait")
+      expect(vm_host.reload.allocation_state).to eq "accepting"
+    end
+
+    it "drains the host and waits while it has VMs" do
+      create_vm(vm_host_id: vm_host.id, family: "pvm", location_id: location.id)
+      expect { nx.pvm_upgrade }.to nap(60)
+      expect(vm_host.reload.allocation_state).to eq "draining"
+      expect(st.stack.first).to include("pvm_drained" => true, "deadline_target" => "prep_reboot")
+      expect(Time.parse(st.stack.first["deadline_at"]) - Time.now).to be_within(60).of(45 * 60)
+    end
+
+    it "starts the daemonized upgrade with the location's host-deb pin" do
+      expect(sshable).to receive(:d_check).with(unit).and_return("NotStarted")
+      expect(sshable).to receive(:d_run).with(unit, "sudo", "host/bin/install-pvm-host-kernel", "upgrade", stdin: JSON.generate("host_deb" => new_deb))
+      expect { nx.pvm_upgrade }.to nap(30)
+      expect(row.reload.state).to eq "upgrade_pending"
+    end
+
+    it "waits while it runs" do
+      expect(sshable).to receive(:d_check).with(unit).and_return("InProgress")
+      expect { nx.pvm_upgrade }.to nap(30)
+    end
+
+    it "refuses, before any change, a pin other than the one the operator accepted, and puts the host back to work" do
+      location.update(byoh_virt: Sequel.pg_jsonb(location.byoh_virt.to_h.merge("pvm_kernel" => pvm_test_pins.merge("host_deb" => new_deb.merge("sha256" => "d" * 64)))))
+      expect(sshable).to receive(:d_check).with(unit).and_return("NotStarted")
+      expect_tool("status", status(state: {"state" => "armed", "kver" => pvm, "host_deb_sha256" => "a" * 64}))
+      expect { nx.pvm_upgrade }.to hop("wait")
+      expect(row.reload.values.slice(:state, :host_deb_sha256, :host_kver, :last_error)).to eq(state: "committed", host_deb_sha256: "a" * 64, host_kver: pvm,
+        last_error: "upgrade: location byoh-test pins host-deb sha256 #{"d" * 64}, but the operator accepted sha256 #{"c" * 64} for this host's upgrade")
+      expect(page("ByohPvmUpgrade").summary).to start_with "#{vm_host.ubid} refused to upgrade its PVM host kernel: location byoh-test pins"
+      expect(page("ByohPvmUpgrade").details.to_h).not_to have_key("last_log_lines")
+      expect(page("ByohPvmUpgrade").details["fix"]).to eq "Nothing was changed on the host; it keeps its PVM kernel #{pvm} (host-deb sha256 #{"a" * 64}) and takes VMs again. " \
+        "Fix the cause, then bin/byoh-virt pvm upgrade --host #{vm_host.ubid} --accept-host-deb #{"d" * 64} again."
+      expect(vm_host.reload.allocation_state).to eq "accepting"
+      expect(st.stack.first.keys).not_to include("pvm_drained", "deadline_target", "deadline_at")
+    end
+
+    it "refuses in a location that pins no host kernel any more, keeping a draining host draining" do
+      vm_host.update(allocation_state: "draining")
+      location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm], "acks" => {}}))
+      expect(sshable).to receive(:d_check).with(unit).and_return("NotStarted")
+      expect_tool("status", status(state: nil))
+      expect { nx.pvm_upgrade }.to hop("wait")
+      expect(row.reload.values.slice(:state, :host_deb_sha256)).to eq(state: "committed", host_deb_sha256: "c" * 64)
+      expect(row.last_error).to start_with "upgrade: location byoh-test pins no PVM host kernel"
+      expect(page("ByohPvmUpgrade").details["fix"]).to end_with "--accept-host-deb SHA256 again."
+      expect(vm_host.reload.allocation_state).to eq "draining"
+    end
+
+    it "records the armed new build and reboots the host into it" do
+      %w[ByohPvmUpgrade ByohPvmHostKernel].each { Prog::PageNexus.assemble("old", [it, vm_host.ubid], vm_host.ubid, resource_id: vm_host.id) }
+      expect(sshable).to receive(:d_check).with(unit).and_return("Succeeded")
+      expect_tool("status", status(state: {"state" => "armed", "kver" => new_pvm, "prev_kvers" => [pvm], "host_deb_sha256" => "c" * 64, "stock_entry" => stock_entry}))
+      expect(sshable).to receive(:d_clean).with(unit)
+      expect { nx.pvm_upgrade }.to hop("prep_reboot")
+      expect(row.reload.values.slice(:state, :host_kver, :stock_kver, :stock_entry, :host_deb_sha256, :last_error)).to eq(state: "armed", host_kver: new_pvm, stock_kver: stock, stock_entry:, host_deb_sha256: "c" * 64, last_error: nil)
+      expect(page("ByohPvmUpgrade").resolve_set?).to be true
+      expect(page("ByohPvmHostKernel").resolve_set?).to be true
+      expect(st.stack.first).to include("pvm_drained" => true)
+    end
+
+    it "puts the host back to work after an upgrade rhizome refused, which changed nothing" do
+      expect(sshable).to receive(:d_check).with(unit).and_return("Failed")
+      expect_tool("status", status(state: {"state" => "armed", "kver" => pvm, "host_deb_sha256" => "a" * 64, "last_result" => {"result" => "refused", "step" => "verify", "error" => "the host kernel package has sha256 0, not the pinned c"}}))
+      expect(sshable).to receive(:d_logs).with(unit, lines: 20).and_return("{\"result\":\"refused\",\"step\":\"verify\",\"error\":\"the host kernel package has sha256 0, not the pinned c\"}\n")
+      expect(sshable).to receive(:d_clean).with(unit)
+      expect { nx.pvm_upgrade }.to hop("wait")
+      expect(row.reload.values.slice(:state, :host_deb_sha256, :last_error)).to eq(state: "committed", host_deb_sha256: "a" * 64, last_error: "upgrade: the host kernel package has sha256 0, not the pinned c")
+      expect(page("ByohPvmUpgrade").details["last_log_lines"]).to start_with "{\"result\":\"refused\""
+      expect(vm_host.reload.allocation_state).to eq "accepting"
+    end
+
+    it "pages an upgrade that failed after a change, which rhizome un-armed, for pvm retry" do
+      expect(sshable).to receive(:d_check).with(unit).and_return("Failed")
+      expect_tool("status", status(state: {"state" => "failed", "kver" => new_pvm, "prev_kvers" => [pvm], "upgrade_steps" => %w[fetch verify], "last_result" => {"result" => "failed", "error" => "apt-get failed"}}))
+      expect(sshable).to receive(:d_logs).with(unit, lines: 20).and_return("{\"result\":\"failed\",\"step\":\"install_deb\",\"error\":\"apt-get install failed\"}\n")
+      expect(sshable).to receive(:d_clean).with(unit)
+      expect { nx.pvm_upgrade }.to hop("pvm_install_failed")
+      expect(row.reload.values.slice(:state, :host_deb_sha256, :last_error)).to eq(state: "failed", host_deb_sha256: "c" * 64, last_error: "upgrade: apt-get install failed")
+      details = page("ByohPvmUpgrade").details.to_h
+      expect(details).to include("step" => "install_deb")
+      expect(details["fix"]).to start_with "The upgrade failed after step verify; rhizome un-armed the host, which still runs its PVM kernel #{pvm} but boots the stock kernel next"
+      expect(details["fix"]).to include "bin/byoh-virt pvm retry --host #{vm_host.ubid} reboots it to the stock kernel"
+      expect(vm_host.reload.allocation_state).to eq "draining"
+    end
+
+    it "pages a failure from the host's record, or the log lines" do
+      expect(sshable).to receive(:d_check).with(unit).and_return("Failed").twice
+      expect(sshable).to receive(:d_logs).with(unit, lines: 20).and_return("Killed\n").twice
+      expect(sshable).to receive(:d_clean).with(unit).twice
+      expect(sshable).to receive(:_cmd).with("#{tool} status", stdin: "{}")
+        .and_return(JSON.generate(status(state: {"state" => "failed", "last_result" => {"error" => "update-grub failed"}})), JSON.generate(status(state: nil)))
+      expect { nx.pvm_upgrade }.to hop("pvm_install_failed")
+      expect(row.reload.last_error).to eq "upgrade: update-grub failed"
+      expect(page("ByohPvmUpgrade").details["fix"]).to start_with "The upgrade failed after step none;"
+      row.update(state: "upgrade_pending")
+      expect { described_class.new(st).tap { allow(it).to receive(:sshable).and_return(sshable) }.pvm_upgrade }.to hop("pvm_install_failed")
+      expect(row.reload.last_error).to eq "upgrade: see the log lines"
+    end
+  end
+
   describe "#pvm_uninstalled" do
     it "waits for the host to be destroyed" do
       expect { nx.pvm_uninstalled }.to nap(6 * 60 * 60)
@@ -613,6 +747,11 @@ RSpec.describe Prog::Vm::HostNexus do
     it "goes to the uninstall the operator asked for" do
       vm_host.incr_pvm_uninstall
       expect { nx.wait }.to hop("pvm_uninstall")
+    end
+
+    it "goes to the upgrade the operator asked for" do
+      vm_host.incr_pvm_upgrade
+      expect { nx.wait }.to hop("pvm_upgrade")
     end
 
     it "pages the VMs that boot another guest kernel than the host's current one, until they are stopped and started" do
@@ -726,6 +865,51 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(commands).to be_empty
       expect(row.reload.state).to eq "committed"
       expect(vm_host.reload.values.slice(:allocation_state, :total_hugepages_1g)).to eq(allocation_state: "accepting", total_hugepages_1g: 27)
+      expect(Page.active.all.map(&:tag)).to eq []
+    end
+
+    # WP9, UNVERIFIED on a real host: the commands an upgrade runs, from
+    # the operator's request to the host taking VMs again on the new build.
+    it "moves a committed host to the location's new host-deb pin and boots the new build once before it takes VMs again" do
+      new_deb = {"url" => "https://example.com/pvm/linux-image-pvm-2.deb", "sha256" => "c" * 64}
+      location.update(byoh_virt: Sequel.pg_jsonb(location.byoh_virt.to_h.merge("pvm_kernel" => pvm_test_pins.merge("host_deb" => new_deb))))
+      row.update(state: "upgrade_pending", host_kver: pvm, stock_kver: stock, stock_entry:, host_deb_sha256: "c" * 64)
+      vm_host.update(allocation_state: "accepting", virt_probe: Sequel.pg_jsonb(record(pvm_probe)), last_boot_id: "b0")
+      vm_host.incr_pvm_upgrade
+      upgraded = status(state: {"state" => "armed", "kver" => new_pvm, "prev_kvers" => [pvm], "host_deb_sha256" => "c" * 64, "stock_entry" => stock_entry})
+
+      queue("common/bin/daemonizer2 check upgrade_pvm_host_kernel", "NotStarted")
+      queue(/\Acommon\/bin\/daemonizer2 run upgrade_pvm_host_kernel sudo host\/bin\/install-pvm-host-kernel upgrade\z/, "", stdin: JSON.generate("host_deb" => new_deb))
+      queue("common/bin/daemonizer2 check upgrade_pvm_host_kernel", "Succeeded")
+      queue("#{tool} status", JSON.generate(upgraded), stdin: "{}")
+      queue("common/bin/daemonizer2 clean upgrade_pvm_host_kernel")
+      queue("#{tool} arm", JSON.generate("result" => "ok", "grubenv" => {}), stdin: "{}")
+      queue("cat /proc/sys/kernel/random/boot_id", "b0\n")
+      queue("sudo host/bin/reboot-host b0", "b1\n")
+      queue("sudo host/bin/virt-probe --json", pvm_probe(kernel: new_pvm))
+      queue("#{tool} status", JSON.generate(status(kernel: new_pvm, state: upgraded["state"])), stdin: "{}")
+      queue("cat /proc/meminfo", "MemTotal:       33554432 kB\nMemAvailable:   30000000 kB\nHugePages_Total:    0\nHugePages_Free:     0\nHugepagesize:    1048576 kB\n")
+
+      labels = []
+      label = "wait"
+      until label == "configure_metrics"
+        st.update(label:)
+        prog = described_class.new(st.reload)
+        allow(prog.sshable).to receive(:_cmd) { |cmd, **kw| respond(cmd, **kw) }
+        allow(prog.vm_host).to receive(:sshable).and_return(prog.sshable)
+        allow(prog.sshable).to receive(:available?).and_return(true)
+        result = catch(:prog_return) { prog.public_send(label) }
+        st.modified!(:stack)
+        st.save_changes
+        labels << label
+        label = result.new_label if result.is_a?(Prog::Base::Hop)
+      end
+
+      expect(labels).to eq %w[wait pvm_upgrade pvm_upgrade prep_reboot reboot verify_pvm_boot verify_tier_capacity start_slices start_vms]
+      expect(commands).to be_empty
+      expect(row.reload.values.slice(:state, :host_kver, :stock_kver, :host_deb_sha256)).to eq(state: "committed", host_kver: new_pvm, stock_kver: stock, host_deb_sha256: "c" * 64)
+      expect(vm_host.reload.allocation_state).to eq "accepting"
+      expect(st.reload.stack.first.keys).not_to include("pvm_drained")
       expect(Page.active.all.map(&:tag)).to eq []
     end
   end

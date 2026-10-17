@@ -131,8 +131,8 @@ class Prog::LearnVirt < Prog::Base
 
     Prog::PageNexus.assemble("#{vm_host.ubid} #{problem}", tag, vm_host.ubid, resource_id: vm_host.id, severity: "warning",
       extra_data: {kernel:, pvm_kernel: row.host_kver, host_deb_sha256: row.host_deb_sha256, pinned_sha256: pin,
-                   fix: "A PVM host kernel is never replaced in place, and moving a host to a new host-deb pin (bin/byoh-virt pvm upgrade, WP9) is not built yet. " \
-                     "Keep the host on its kernel, or drain it, destroy it and register it again (--install-pvm-kernel installs the current pin). " \
+                   fix: "A PVM host kernel is never replaced in place. To move the host to the location's host-deb pin, delete or move its VMs, then " \
+                     "bin/byoh-virt pvm upgrade --host #{vm_host.ubid} --accept-host-deb #{pin || "SHA256"}: it drains the host, installs the new build beside the running one and boots it once (UNVERIFIED on a real host). " \
                      "A host that runs another kernel booted outside the control plane; see bin/byoh-virt show --host #{vm_host.ubid}."})
   end
 

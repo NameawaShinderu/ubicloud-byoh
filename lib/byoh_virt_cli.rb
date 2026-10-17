@@ -34,6 +34,11 @@ class ByohVirtCli
                Take the PVM host kernel the control plane installed off a
                pvm host without VMs; then destroy the host and register
                it again on another tier
+      pvm upgrade --host UBID --accept-host-deb SHA256
+               Move a pvm host without VMs that runs its PVM kernel to the
+               location's new host-deb pin: it drains, installs the new
+               build beside the running one and reboots into it once
+               (UNVERIFIED on a real host)
 
     probe, explain and show exit 0 when the host can run VMs (L1), 3 when
     not; show judges a host registered on a lower tier by that tier's
@@ -184,6 +189,9 @@ class ByohVirtCli
       if row.host_deb_sha256
         @out.puts "  host-deb sha256 #{row.host_deb_sha256} (#{(pin == row.host_deb_sha256) ? "the location's pin" : "the location pins #{pin || "none"}"})"
       end
+      if row.install && row.state == "committed" && pin && pin != row.host_deb_sha256
+        @out.puts "  the location pins another host-deb build: move the host to it with bin/byoh-virt pvm upgrade --host #{host.ubid} --accept-host-deb #{pin}"
+      end
       @out.puts "  lockdown #{row.lockdown || "-"}, Meltdown #{row.meltdown || "-"}"
       @out.puts "  last error: #{row.last_error}" if row.last_error
     else
@@ -216,7 +224,7 @@ class ByohVirtCli
 
   def cmd_pvm(argv)
     sub = argv.shift
-    raise Error, "usage: bin/byoh-virt pvm retry|uninstall --host UBID" unless %w[retry uninstall].include?(sub)
+    raise Error, "usage: bin/byoh-virt pvm retry|uninstall|upgrade --host UBID" unless %w[retry uninstall upgrade].include?(sub)
 
     send(:"pvm_#{sub}", argv)
   end
@@ -278,6 +286,41 @@ class ByohVirtCli
     end
     @out.puts "Asked host #{host.ubid} to uninstall its PVM host kernel (it reboots to its stock kernel first if it runs the PVM one)."
     @out.puts "Then destroy it and register it again on another tier; bin/byoh-virt show --host #{host.ubid} shows where it stands."
+    nil
+  end
+
+  # Asks a committed install host to move to the location's current
+  # host-deb pin, which the operator names (as pvm retry
+  # --accept-host-deb): HostNexus' pvm_upgrade. The upgrade reboots the
+  # host, so it refuses while the host has VMs.
+  def pvm_upgrade(argv)
+    key = nil
+    accept = nil
+    parse(argv, "pvm upgrade --host UBID --accept-host-deb SHA256") do |o|
+      o.on("--host UBID", "VmHost ubid") { key = it }
+      o.on("--accept-host-deb SHA256", "The location's host-deb pin, which the host moves to") { accept = it }
+    end
+    host, row = pvm_host(key)
+    raise Error, "the control plane did not install the PVM kernel of host #{host.ubid}; upgrade it by hand" unless row.install
+    raise Error, "host #{host.ubid}'s PVM kernel is #{row.state}; pvm upgrade moves only a host that booted its PVM kernel (committed)" unless row.state == "committed"
+    label = host.strand&.label || "no strand"
+    raise Error, "host #{host.ubid} is at #{label}; pvm upgrade starts only at wait" unless label == "wait"
+    pin = ByohPvmPolicy.pins(ByohVirtTiers.policy(host.location))&.dig("host_deb", "sha256")
+    raise Error, "host #{host.ubid} runs the location's host-deb pin #{pin} already" if pin && pin == row.host_deb_sha256
+    raise Error, "--accept-host-deb is required: check the new build, then pass the location's host-deb pin #{pin || "(none; pin one with bin/byoh-location set)"}" unless accept
+    raise Error, "location #{host.location.name} pins host-deb sha256 #{pin || "none"}, not #{accept}" unless accept == pin
+    unless (count = host.vms_dataset.count).zero?
+      raise Error, "host #{host.ubid} has #{count} VMs, and the upgrade reboots it; move it to draining (admin \"Move to Draining\") so no VM is placed on it, delete or move its VMs, then run pvm upgrade again"
+    end
+
+    DB.transaction do
+      args = {from_host_deb: row.host_deb_sha256, accept_host_deb: accept}
+      row.update(state: "upgrade_pending", host_deb_sha256: accept, last_error: nil, updated_at: Time.now)
+      host.incr_pvm_upgrade
+      ByohOperatorLog.record(command: "virt-pvm-upgrade", target_id: host.id, args:, result: "requested")
+    end
+    @out.puts "Asked host #{host.ubid} to move to the PVM host kernel of host-deb sha256 #{accept}; follow it with bin/byoh-host watch #{host.ubid}."
+    @out.puts "The host is draining; set it to accepting in the admin UI when it should take VMs." if host.allocation_state == "draining"
     nil
   end
 
