@@ -228,6 +228,17 @@ module ByohVirtTiers
     PVM_ROOT.fetch(boot_image) { raise Refused, "pvm VMs boot #{PVM_ROOT.keys.join(", ")} only (direct kernel boot), not #{boot_image}" }
   end
 
+  # The guest kernel a PVM VM placed on the host now boots: the
+  # location's pin once the host holds it ready, else the host's newest
+  # ready kernel (a new pin still downloading, or refused, never stops
+  # VMs). nil when the host holds none ready, which the allocator
+  # refuses (Scheduling::Allocator).
+  def self.pvm_guest_kernel(vm_host)
+    ready = ByohPvmGuestKernel.where(vm_host_id: vm_host.id, state: "ready")
+    pin = ByohPvmPolicy.pins(policy(vm_host.location))&.dig("guest_kernel", "sha256")
+    (pin && ready.first(sha256: pin)) || ready.reverse(:updated_at, :sha256).first
+  end
+
   def self.refuse(message)
     raise Validation::ValidationFailed.new({size: message})
   end

@@ -63,6 +63,29 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     host.virt_tier == "emulated"
   end
 
+  # A PVM host's VM: cloud-hypervisor boots a PVM guest kernel the host
+  # holds (docs/byoh/NO_KVM.md section 6.7).
+  def pvm_host?
+    host.virt_tier == "pvm"
+  end
+
+  # Records the guest kernel the VM boots from now on: the one the host
+  # gives new VMs (ByohVirtTiers.pvm_guest_kernel). Its prep.json and
+  # unit name it; the host keeps every kernel a VM records.
+  def record_pvm_guest_kernel
+    kernel = ByohVirtTiers.pvm_guest_kernel(host) || fail("host #{host.ubid} holds no ready PVM guest kernel")
+    values = {sha256: kernel.sha256, release: kernel.release, console: kernel.console}
+    ByohVmGuestKernel.dataset.insert_conflict(target: :vm_id, update: values).insert(vm_id: vm.id, **values)
+  end
+
+  # Whether a stopped PVM VM boots another kernel than the host gives
+  # new VMs, which a new location pin does (section 6.8): its next start
+  # applies it.
+  def pvm_guest_kernel_stale?
+    kernel = ByohVirtTiers.pvm_guest_kernel(host)
+    !kernel.nil? && ByohVmGuestKernel[vm.id]&.sha256 != kernel.sha256
+  end
+
   def vm_home
     File.join("", "vm", vm_name)
   end
@@ -274,7 +297,7 @@ class Prog::Vm::Metal::Nexus < Prog::Base
         storage: vm.storage_secrets,
       })
 
-      write_params_json
+      write_params_json(pvm_kernel: true)
 
       d_command = NetSsh.command("sudo host/bin/setup-vm prep :vm_name", vm_name:)
       host.sshable.cmd("common/bin/daemonizer :d_command prep_:vm_name", d_command:, vm_name:, stdin: secrets_json, log: :on_error)
@@ -283,7 +306,10 @@ class Prog::Vm::Metal::Nexus < Prog::Base
     nap 1
   end
 
-  def write_params_json
+  # pvm_kernel: whether a PVM VM moves to the guest kernel the host gives
+  # new VMs; otherwise it keeps the one it boots.
+  def write_params_json(pvm_kernel: false)
+    record_pvm_guest_kernel if pvm_host? && (pvm_kernel || !ByohVmGuestKernel[vm.id])
     # An emulated VM's home is root's (EMULATED_UNIX_USER), so root writes
     # its prep.json there.
     tee = emulated_host? ? "sudo tee :params_path > /dev/null" : "sudo -u :vm_name tee :params_path > /dev/null"
@@ -507,7 +533,17 @@ class Prog::Vm::Metal::Nexus < Prog::Base
   label def start_after_stop
     when_start_set? do
       decr_start
-      if emulated_host?
+      if pvm_host?
+        # A new guest kernel pin applies at the VM's next start
+        # (docs/byoh/NO_KVM.md section 6.8): its unit is written again.
+        if pvm_guest_kernel_stale?
+          write_params_json(pvm_kernel: true)
+          host.sshable.cmd("sudo host/bin/setup-vm reinstall-systemd-units :vm_name", vm_name:)
+        end
+        # Through rhizome, which checks that the host still runs its PVM
+        # kernel safely (VmSetup#check_pvm_host) before it starts the VM.
+        host.sshable.cmd("sudo host/bin/setup-vm start :vm_name", vm_name:)
+      elsif emulated_host?
         # Through rhizome, which refuses a unit that lost its hardening
         # (VmSetup#check_emulated_unit) before it starts QEMU.
         host.sshable.cmd("sudo host/bin/setup-vm start :vm_name", vm_name:)

@@ -136,6 +136,16 @@ class Vm < Sequel::Model
         params[:hugepages] = false
         params[:accel] = "tcg"
       end
+      # A PVM VM (docs/byoh/NO_KVM.md section 6.7): cloud-hypervisor boots
+      # the guest kernel recorded for the VM (Prog::Vm::Metal::Nexus)
+      # directly, with no firmware and no hugepages.
+      if vm_host.virt_tier == "pvm"
+        kernel = ByohVmGuestKernel[id] || fail("BUG: #{ubid} has no PVM guest kernel recorded")
+        params[:hypervisor] = "ch"
+        params[:hugepages] = false
+        params[:firmware_version] = nil
+        params[:pvm] = {kernel_sha256: kernel.sha256, root: ByohVirtTiers.pvm_root(boot_image)}
+      end
       params[:egress_nat4] = vm_host.location.byoh_profile.egress_nat4_params if byoh_egress_nat4?
       JSON.pretty_generate(params)
     end

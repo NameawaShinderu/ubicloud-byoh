@@ -48,6 +48,14 @@ RSpec.describe Prog::Vm::Metal::Nexus do
         expect { nx.start_after_stop }.to nap(5)
       end
 
+      it "writes prep.json as the VM user and records no PVM guest kernel" do
+        expect(vm).to receive(:params_json).with(no_args).twice.and_return("{}")
+        2.times { expect(sshable).to receive(:_cmd).with("sudo -u #{vm.inhost_name} tee /vm/#{vm.inhost_name}/prep.json > /dev/null", stdin: "{}", log: :on_error) }
+        nx.write_params_json
+        nx.write_params_json(pvm_kernel: true)
+        expect(ByohVmGuestKernel.count).to eq 0
+      end
+
       it "gives a newly allocated VM 10 minutes to reach wait" do
         st.stack = [{"storage_volumes" => [{"use_bdev_ubi" => false, "size_gib" => 11, "boot" => true}]}]
         allow(Config).to receive(:machine_images_service_project_id).and_return(Project.create(name: "machine-images").id)

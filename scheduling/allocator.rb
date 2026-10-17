@@ -344,6 +344,13 @@ module Scheduling::Allocator
         if request.os_filter
           apply_filter(:os) { ds = ds.where(Sequel[:vm_host][:os_version] => request.os_filter) }
         end
+        # A PVM VM boots a guest kernel its host holds ready
+        # (ByohVirtTiers.pvm_guest_kernel). Other families keep their query.
+        if request.family == "pvm"
+          apply_filter(:pvm_guest_kernel) do
+            ds = ds.where(DB[:byoh_pvm_guest_kernel].where(vm_host_id: Sequel[:vm_host][:id], state: "ready").select(1).exists)
+          end
+        end
         unless request.gpu_count > 0 || request.host_filter.any? || request.single_ubicloud_location?
           apply_filter(:non_gpu) { ds = ds.exclude { Sequel.function(:coalesce, num_gpus, 0) > 0 } }
         end
