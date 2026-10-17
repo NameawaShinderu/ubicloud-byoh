@@ -77,7 +77,7 @@ RSpec.describe PvmGuestKernel do
       kernel = pin(kernel_url, vmlinux)
       status, result = run_main("download", "guest_kernel" => kernel, "guest_config" => pin(config_url, hvc_config), "guest_unchecked" => false)
       expect(status).to eq 0
-      meta = {"sha256" => kernel["sha256"], "url" => kernel_url, "release" => "6.12.33-pvm", "console" => "hvc0", "config_checked" => true, "downloaded_at" => "2026-10-17T00:00:00Z"}
+      meta = {"sha256" => kernel["sha256"], "url" => kernel_url, "release" => "6.12.33-pvm", "console" => "hvc0", "config_checked" => true, "config_sha256" => sha(hvc_config), "unchecked" => false, "downloaded_at" => "2026-10-17T00:00:00Z"}
       expect(result).to eq("result" => "ok", "meta" => meta)
       expect(entries).to eq [".lock", kernel["sha256"]]
       expect(Dir.children(dir(kernel["sha256"])).sort).to eq %w[config meta.json vmlinux]
@@ -193,19 +193,72 @@ RSpec.describe PvmGuestKernel do
       expect(log.size).to eq 2
     end
 
+    it "checks a kernel it holds again, without downloading it, when its config is to be checked another way" do
+      kernel = pin(kernel_url, vmlinux)
+      expect(guest.download("guest_kernel" => kernel, "guest_unchecked" => true)["meta"]).to include("console" => "hvc0", "config_checked" => false, "config_sha256" => nil, "unchecked" => true)
+      log.clear
+
+      config = pin(config_url, serial_config)
+      result = guest.download("guest_kernel" => kernel, "guest_config" => config, "guest_unchecked" => false)
+      expect(result).not_to include("note")
+      expect(result["meta"]).to include("console" => "ttyS0", "config_checked" => true, "config_sha256" => config["sha256"], "unchecked" => false)
+      expect(log).to eq [[*described_class::CURL, "-o", dir("#{kernel["sha256"]}.tmp", "config"), config_url]]
+      expect(guest.show("sha256" => kernel["sha256"])).to eq("result" => "ok", "state" => "ready", "meta" => result["meta"])
+      expect(entries).to eq [".lock", kernel["sha256"]]
+      expect(Dir.children(dir(kernel["sha256"])).sort).to eq %w[config meta.json vmlinux]
+      expect(File.binread(dir(kernel["sha256"], "vmlinux"))).to eq vmlinux
+      log.clear
+      expect(guest.download("guest_kernel" => kernel, "guest_config" => config, "guest_unchecked" => false)).to include("note" => "already downloaded")
+      expect(log).to eq []
+    end
+
+    it "keeps a held kernel for its VMs when checking it another way refuses it, and says it was refused" do
+      kernel = pin(kernel_url, vmlinux)
+      held = guest.download("guest_kernel" => kernel, "guest_unchecked" => true)["meta"]
+      expect { guest.download("guest_kernel" => kernel, "guest_unchecked" => false) }
+        .to raise_error(described_class::Refused, /has no embedded config/)
+      expect(entries).to eq [".lock", kernel["sha256"], "#{kernel["sha256"]}.refused"]
+      expect(JSON.parse(File.read(dir(kernel["sha256"], "meta.json")))).to eq held
+      expect(guest.show("sha256" => kernel["sha256"])).to include("state" => "refused", "error" => /has no embedded config/)
+
+      # Asking for it as it is held again clears the refusal.
+      expect(guest.download("guest_kernel" => kernel, "guest_unchecked" => true)).to include("note" => "already downloaded")
+      expect(guest.show("sha256" => kernel["sha256"])).to eq("result" => "ok", "state" => "ready", "meta" => held)
+    end
+
     it "refuses parameters it cannot use before downloading anything" do
-      good = {"url" => kernel_url, "sha256" => "a" * 64}
       {
         {} => "guest_kernel {url, sha256} is required",
-        {"guest_kernel" => good.merge("url" => "http://example.com/vmlinux")} => "guest_kernel url must be an https URL",
-        {"guest_kernel" => good.merge("url" => 7)} => "guest_kernel url must be an https URL",
-        {"guest_kernel" => good.merge("sha256" => "A" * 64)} => "guest_kernel sha256 must be 64 lowercase hex digits",
-        {"guest_kernel" => good, "guest_config" => "https://example.com/config"} => "guest_config {url, sha256} is required",
+        {"guest_kernel" => "x"} => "guest_kernel {url, sha256} is required",
+        {"guest_kernel" => {"url" => kernel_url, "sha256" => "A" * 64}} => "guest_kernel sha256 must be 64 lowercase hex digits",
       }.each do |params, error|
         expect(run_main("download", params)).to eq [2, {"result" => "refused", "error" => error}]
       end
-      expect(log).to eq []
       expect(File.exist?(dir)).to be false
+
+      # With a usable sha256 the refusal is noted, for show.
+      good = {"url" => kernel_url, "sha256" => "a" * 64}
+      {
+        {"guest_kernel" => good.merge("url" => "http://example.com/vmlinux")} => "guest_kernel url must be an https URL",
+        {"guest_kernel" => good.merge("url" => "HTTPS://example.com/vmlinux")} => "guest_kernel url must be an https URL",
+        {"guest_kernel" => good.merge("url" => "https://")} => "guest_kernel url must be an https URL",
+        {"guest_kernel" => good.merge("url" => "https://exa mple.com/vmlinux")} => "guest_kernel url must be an https URL",
+        {"guest_kernel" => good.merge("url" => 7)} => "guest_kernel url must be an https URL",
+        {"guest_kernel" => good, "guest_config" => "https://example.com/config"} => "guest_config {url, sha256} is required",
+      }.each do |params, error|
+        expect(run_main("download", params)).to eq [2, {"result" => "refused", "error" => error}]
+        expect(guest.show("sha256" => "a" * 64)).to eq("result" => "ok", "state" => "refused", "error" => error)
+      end
+      expect(log).to eq []
+      expect(entries).to eq [".lock", "#{"a" * 64}.refused"]
+    end
+
+    it "takes the https URLs the control plane takes" do
+      ["https://example.com", "https://example.com?file=vmlinux", "https://user@example.com:8443/k/vmlinux"].each_with_index do |url, i|
+        kernel = pin(url, vmlinux(banner: "Linux version 6.12.#{i}-pvm (b) #1"))
+        expect(guest.download("guest_kernel" => kernel, "guest_unchecked" => true)["result"]).to eq "ok"
+      end
+      expect(log.map(&:last)).to eq ["https://example.com", "https://example.com?file=vmlinux", "https://user@example.com:8443/k/vmlinux"]
     end
   end
 

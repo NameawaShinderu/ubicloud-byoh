@@ -5,6 +5,7 @@ require "fileutils"
 require "json"
 require "time"
 require_relative "../../common/lib/util"
+require_relative "pvm_guest_kernel"
 require_relative "virt_probe"
 
 # The PVM host kernel of a pvm-tier host (docs/byoh/NO_KVM.md section
@@ -400,7 +401,7 @@ class PvmHostKernel
   def host_deb_param(params)
     deb = params["host_deb"]
     raise Refused, "host_deb {url, sha256} is required" unless deb.is_a?(Hash)
-    raise Refused, "host_deb url must be an https URL" unless deb["url"].is_a?(String) && deb["url"].match?(%r{\Ahttps://[^\s/]+/\S*\z})
+    raise Refused, "host_deb url must be an https URL" unless PvmGuestKernel.https_url?(deb["url"])
     raise Refused, "host_deb sha256 must be 64 lowercase hex digits" unless SHA256_FORMAT.match?(deb["sha256"].to_s)
 
     deb

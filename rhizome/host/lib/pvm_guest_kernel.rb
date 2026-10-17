@@ -6,6 +6,7 @@ require "json"
 require "open3"
 require "stringio"
 require "time"
+require "uri"
 require "zlib"
 
 # The guest kernels (vmlinux) that PVM VMs boot directly
@@ -14,7 +15,9 @@ require "zlib"
 #   /opt/pvm-guest/<sha256>/vmlinux     the kernel, checked against the pin
 #   /opt/pvm-guest/<sha256>/config      the pinned .config, when one is
 #   /opt/pvm-guest/<sha256>/meta.json   sha256, release, console,
-#                                       config_checked
+#                                       config_checked, and how the
+#                                       config was checked
+#                                       (config_sha256, unchecked)
 #   /opt/pvm-guest/<sha256>.refused     why the last download of that pin
 #                                       was refused
 #
@@ -29,9 +32,13 @@ require "zlib"
 #             guest_unchecked}: downloads into <sha256>.tmp and renames it
 #             to <sha256> only once the kernel matches its pin and its
 #             config has what PVM VMs need. An existing verified directory
-#             is kept as it is.
-#   show      {sha256}: state ready (with meta), refused (with the
-#             error) or absent.
+#             is kept as it is when its config was checked the way the
+#             parameters ask (the same config pin, the same unchecked
+#             flag); otherwise its kernel is checked again against them
+#             without downloading it again.
+#   show      {sha256}: state refused (with the error) when the last
+#             download of that pin was refused, else ready (with meta)
+#             or absent.
 #   gc        {keep [sha256...]}: removes the kernels not kept and not
 #             referenced by a VM's prep.json or by a systemd unit.
 #
@@ -87,7 +94,14 @@ class PvmGuestKernel
   }.freeze
 
   SHA256_FORMAT = /\A[0-9a-f]{64}\z/
-  HTTPS_URL = %r{\Ahttps://[^\s/]+/\S*\z}
+
+  # The control plane's rule (ByohArtifactFetch.https_url?), so that a
+  # pin bin/byoh-location stored is never refused here for its form.
+  def self.https_url?(url)
+    url.is_a?(String) && url.start_with?("https://") && (uri = URI.parse(url)).is_a?(URI::HTTPS) && !uri.host.to_s.empty?
+  rescue URI::InvalidURIError
+    false
+  end
 
   def self.main(argv, stdin: $stdin, out: $stdout, **kw)
     command = argv.first
@@ -126,42 +140,53 @@ class PvmGuestKernel
     @now = now
   end
 
+  # A refusal of a pin with a usable sha256 leaves <sha256>.refused, so
+  # that show tells the control plane it cannot work.
   def download(params)
-    kernel = pin_param(params, "guest_kernel")
-    config_pin = params["guest_config"] && pin_param(params, "guest_config")
-    unchecked = params["guest_unchecked"] == true
-    sha = kernel["sha256"]
+    kernel = params["guest_kernel"]
+    raise Refused, "guest_kernel {url, sha256} is required" unless kernel.is_a?(Hash)
+
+    sha = sha_param(kernel["sha256"], "guest_kernel sha256")
+    note = path("#{DIR}/#{sha}.refused")
 
     with_lock(wait: true) do
-      if (meta = verified_meta(sha))
-        return {"result" => "ok", "meta" => meta, "note" => "already downloaded"}
+      FileUtils.rm_f(note)
+      pin_param(params, "guest_kernel")
+      config_pin = params["guest_config"] && pin_param(params, "guest_config")
+      unchecked = params["guest_unchecked"] == true
+
+      held = verified_meta(sha)
+      if held && held["config_sha256"] == config_pin&.fetch("sha256") && held["unchecked"] == unchecked
+        return {"result" => "ok", "meta" => held, "note" => "already downloaded"}
       end
 
       tmp = path("#{DIR}/#{sha}.tmp")
       FileUtils.rm_rf(tmp)
-      FileUtils.rm_f(path("#{DIR}/#{sha}.refused"))
       FileUtils.mkdir_p(tmp, mode: 0o755)
       begin
-        meta = fetch_and_check(tmp, kernel, config_pin, unchecked)
+        # A kernel already here is checked again as it is: VMs may boot
+        # it, and it matched its sha256 a moment ago.
+        File.link(path("#{DIR}/#{sha}/vmlinux"), File.join(tmp, "vmlinux")) if held
+        meta = fetch_and_check(tmp, kernel, config_pin, unchecked, fetch_kernel: !held)
         final = path("#{DIR}/#{sha}")
         FileUtils.rm_rf(final)
         File.rename(tmp, final)
         {"result" => "ok", "meta" => meta}
-      rescue Refused => e
-        write(path("#{DIR}/#{sha}.refused"), JSON.generate("sha256" => sha, "error" => e.message, "at" => @now.call.utc.iso8601) + "\n")
-        raise
       ensure
         FileUtils.rm_rf(tmp)
       end
+    rescue Refused => e
+      write(note, JSON.generate("sha256" => sha, "error" => e.message, "at" => @now.call.utc.iso8601) + "\n")
+      raise
     end
   end
 
   def show(params)
     sha = sha_param(params["sha256"], "sha256")
-    if (meta = read_meta(sha))
-      {"result" => "ok", "state" => "ready", "meta" => meta}
-    elsif (refused = read_json(path("#{DIR}/#{sha}.refused")))
+    if (refused = read_json(path("#{DIR}/#{sha}.refused")))
       {"result" => "ok", "state" => "refused", "error" => refused["error"]}
+    elsif (meta = read_meta(sha))
+      {"result" => "ok", "state" => "ready", "meta" => meta}
     else
       {"result" => "ok", "state" => "absent"}
     end
@@ -233,7 +258,7 @@ class PvmGuestKernel
   def pin_param(params, key)
     pin = params[key]
     raise Refused, "#{key} {url, sha256} is required" unless pin.is_a?(Hash)
-    raise Refused, "#{key} url must be an https URL" unless pin["url"].is_a?(String) && HTTPS_URL.match?(pin["url"])
+    raise Refused, "#{key} url must be an https URL" unless self.class.https_url?(pin["url"])
 
     sha_param(pin["sha256"], "#{key} sha256")
     pin
@@ -259,9 +284,9 @@ class PvmGuestKernel
     end
   end
 
-  def fetch_and_check(tmp, kernel, config_pin, unchecked)
+  def fetch_and_check(tmp, kernel, config_pin, unchecked, fetch_kernel:)
     vmlinux = File.join(tmp, "vmlinux")
-    fetch(kernel, vmlinux, "guest kernel")
+    fetch(kernel, vmlinux, "guest kernel") if fetch_kernel
     data = File.binread(vmlinux)
     raise Refused, "the guest kernel is not an ELF vmlinux (cloud-hypervisor boots it directly)" unless data.start_with?(ELF_MAGIC)
 
@@ -289,6 +314,8 @@ class PvmGuestKernel
       "release" => data[BANNER, 1]&.encode(Encoding::UTF_8),
       "console" => console,
       "config_checked" => !config.nil?,
+      "config_sha256" => config_pin&.fetch("sha256"),
+      "unchecked" => unchecked,
       "downloaded_at" => @now.call.utc.iso8601,
     }
     write(File.join(tmp, "meta.json"), JSON.pretty_generate(meta) + "\n")

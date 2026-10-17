@@ -341,6 +341,8 @@ RSpec.describe PvmHostKernel do
         {"host_deb" => deb.merge("url" => "http://example.com/k.deb")} => "host_deb url must be an https URL",
         {"host_deb" => deb.merge("url" => "HTTPS://example.com/k.deb")} => "host_deb url must be an https URL",
         {"host_deb" => deb.merge("url" => 1)} => "host_deb url must be an https URL",
+        {"host_deb" => deb.merge("url" => "https://")} => "host_deb url must be an https URL",
+        {"host_deb" => deb.merge("url" => "https://exa mple.com/k.deb")} => "host_deb url must be an https URL",
         {"host_deb" => deb.merge("sha256" => "A" * 64)} => "host_deb sha256 must be 64 lowercase hex digits",
       }.each do |params, error|
         expect { kernel.install(params) }.to raise_error(described_class::Refused, error)
