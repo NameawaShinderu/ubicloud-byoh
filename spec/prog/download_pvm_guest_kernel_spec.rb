@@ -175,6 +175,22 @@ RSpec.describe Prog::DownloadPvmGuestKernel do
       expect(refused_page.reload.resolve_set?).to be true
     end
 
+    it "wakes the host's wait so that it pages the VMs on an older guest kernel at once" do
+      host_strand = Strand.create_with_id(vm_host, prog: "Vm::HostNexus", label: "wait", stack: [{}], schedule: Time.now + 6 * 60 * 60)
+      expect_show("result" => "ok", "state" => "ready", "meta" => meta)
+      expect_gc(["b" * 64], "result" => "ok", "removed" => [], "kept" => ["b" * 64])
+      expect { dl.record }.to exit({"msg" => "ready"})
+      expect(host_strand.reload.schedule).to be <= Time.now
+    end
+
+    it "does not wake a host strand that is not at wait" do
+      host_strand = Strand.create_with_id(vm_host, prog: "Vm::HostNexus", label: "download_boot_images", stack: [{}], schedule: Time.now + 60 * 60)
+      expect_show("result" => "ok", "state" => "ready", "meta" => meta)
+      expect_gc(["b" * 64], "result" => "ok", "removed" => [], "kept" => ["b" * 64])
+      expect { dl.record }.to exit({"msg" => "ready"})
+      expect(host_strand.reload.schedule).to be > Time.now + 30 * 60
+    end
+
     it "keeps the page open when the kernel is not the location's current pin" do
       Prog::PageNexus.assemble("refused", ["ByohPvmGuestKernel", vm_host.ubid], vm_host.ubid, resource_id: vm_host.id)
       refresh_frame(dl, new_values: {"pin" => pin.merge("guest_kernel" => {"url" => "https://example.com/old", "sha256" => "c" * 64})})

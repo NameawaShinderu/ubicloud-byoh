@@ -183,6 +183,18 @@ RSpec.describe ByohVirtTiers do
           expect(vm_kernel.values.slice(:sha256, :console)).to eq(sha256: pin_sha, console: "ttyS0")
         end
 
+        it "wakes the host's wait, which resolves the stale guest kernel page" do
+          host_strand = Strand.create_with_id(vm_host, prog: "Vm::HostNexus", label: "wait", stack: [{}], schedule: Time.now + 6 * 60 * 60)
+          ByohVmGuestKernel.create(vm_id: vm.id, sha256: old_sha, console: "hvc0")
+          guest_kernel(old_sha, updated_at: Time.now - 60)
+          guest_kernel(pin_sha, console: "ttyS0")
+          expect_params_written
+          expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm reinstall-systemd-units #{vm.inhost_name}")
+          expect(sshable).to receive(:_cmd).with("sudo host/bin/setup-vm start #{vm.inhost_name}")
+          expect { nx.start_after_stop }.to nap(5)
+          expect(host_strand.reload.schedule).to be <= Time.now
+        end
+
         it "records a kernel for a VM that has none before starting it" do
           guest_kernel(pin_sha)
           expect_params_written

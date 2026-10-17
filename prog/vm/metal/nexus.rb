@@ -539,6 +539,10 @@ class Prog::Vm::Metal::Nexus < Prog::Base
         if pvm_guest_kernel_stale?
           write_params_json(pvm_kernel: true)
           host.sshable.cmd("sudo host/bin/setup-vm reinstall-systemd-units :vm_name", vm_name:)
+          # HostNexus#wait naps 6 hours; woken now, it resolves the
+          # ByohPvmGuestKernelStale page once no VM is left on an older
+          # kernel.
+          Strand.where(id: host.id, label: "wait").update(schedule: Sequel::CURRENT_TIMESTAMP)
         end
         # Through rhizome, which checks that the host still runs its PVM
         # kernel safely (VmSetup#check_pvm_host) before it starts the VM.

@@ -17,8 +17,9 @@
 # 15 seconds, and after MAX_RESTARTS failures every RETRY_NAP seconds
 # with a ByohPvmGuestKernelFailing page open, until it succeeds or the
 # location pins another kernel ("superseded"). Once the location's
-# current pin is ready the refusal page resolves, and the host drops the
-# kernels that neither the location nor any of its VMs use.
+# current pin is ready the refusal page resolves, the host strand's wait
+# is woken (so it pages the VMs still on an older kernel), and the host
+# drops the kernels that neither the location nor any of its VMs use.
 class Prog::DownloadPvmGuestKernel < Prog::Base
   subject_is :sshable, :vm_host
   frame_reader :pin
@@ -87,6 +88,10 @@ class Prog::DownloadPvmGuestKernel < Prog::Base
     kernel.update(state: "ready", release: meta["release"], console: meta["console"], config_checked: meta["config_checked"], updated_at: Time.now)
     if pinned_sha == sha256
       Page.from_tag_parts("ByohPvmGuestKernel", vm_host.ubid)&.incr_resolve
+      # HostNexus#wait naps 6 hours; woken now, it pages the VMs that
+      # still boot an older guest kernel (ByohPvmGuestKernelStale) at
+      # once rather than hours after the rollout.
+      Strand.where(id: vm_host.id, label: "wait").update(schedule: Sequel::CURRENT_TIMESTAMP)
     end
     resolve_failing
     collect_garbage
