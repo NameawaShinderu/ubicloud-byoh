@@ -321,16 +321,22 @@ read-only) against `pvm-e2e-fake.sh`: one fake installed as `admin`
 `ssh`, `sleep` and `pgrep`, which keeps a fake control plane, PVM host
 and VM as files. The cases run all 19 phases to PASS, including the
 MANUAL power cycle (the fake `sleep` does it), and check that a wrong
-guest sha256 that `set` accepts, a refused install that touched GRUB and
-a VM started on a stock boot each fail their phase with exit 1 and stop
-the run; that `guest-pin-rollout` without a second build is NOT RUN; and
-the usage errors. It proves the script's flow and checks, not the
+guest sha256 that `set` accepts, a refused install that touched GRUB, a
+guest kernel refusal in bring-up that touched GRUB, a VM started on a
+stock boot, an out-of-band boot the host strand does not notice by
+itself, and a stop and start that leaves the old `--kernel` in the VM's
+unit each fail their phase with exit 1 and stop the run; that
+`PVM_E2E_SET_CHECKUP=1` passes oob-reboot marked as simulated; that
+`guest-pin-rollout` without a second build is NOT RUN, and the
+second-project grant of `tenancy` a note, both in the closing summary;
+that teardown accepts the newer stock kernel patch added; and the usage
+errors. It proves the script's flow and checks, not the
 product: what the fake answers stands in for the real host. The real run
 is the lead's, on AWS (`scripts/byoh/test/aws-e2e/README.md` phase 7),
 and stays UNVERIFIED until then. `spec/lib/byoh_pvm_e2e_script_spec.rb`
 keeps its phases, the README's list, the go/no-go's bench body and pins,
 and the `m2-checks pvm-host`/`pvm-vm` keys it reads in step. Result
-(2026-10-17): 50 checks pass in about 30 s.
+(2026-10-17): 81 checks pass in about 90 s.
 
 ## Scenarios
 

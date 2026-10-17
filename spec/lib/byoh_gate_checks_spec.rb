@@ -525,6 +525,7 @@ RSpec.describe ByohGateChecks do
         label=
         allocation_state=accepting
         virt_tier=pvm
+        last_boot_id=
         pvm_state=
         host_kver=
         stock_kver=
@@ -539,7 +540,7 @@ RSpec.describe ByohGateChecks do
 
     it "prints the host's PVM state, VMs, guest kernels and open pages by type" do
       Strand.create_with_id(pvm_host, prog: "Vm::HostNexus", label: "pvm_install_failed", stack: [{}])
-      pvm_host.update(allocation_state: "draining")
+      pvm_host.update(allocation_state: "draining", last_boot_id: "b1")
       ByohPvmHost.create(vm_host_id: pvm_host.id, state: "failed", install: true, host_kver: "6.12.33-pvm", stock_kver: "7.0.0-1014-aws",
         stock_entry: "Advanced options for Ubuntu>Ubuntu, with Linux 7.0.0-1014-aws", host_deb_sha256: "a" * 64, last_error: "sha256 mismatch")
       ByohPvmGuestKernel.create(vm_host_id: pvm_host.id, sha256: "b" * 64, state: "ready", release: "6.12.33-pvm", console: "hvc0", config_checked: true)
@@ -556,6 +557,7 @@ RSpec.describe ByohGateChecks do
         label=pvm_install_failed
         allocation_state=draining
         virt_tier=pvm
+        last_boot_id=b1
         pvm_state=failed
         host_kver=6.12.33-pvm
         stock_kver=7.0.0-1014-aws
@@ -565,6 +567,7 @@ RSpec.describe ByohGateChecks do
         vms=#{vm.ubid}
         guest_kernels=#{"b" * 64}:ready,#{"c" * 64}:refused
         current_guest_kernel=#{"b" * 64}
+        guest_release_#{"b" * 64}=6.12.33-pvm
         page=ByohPvmInstall #{pvm_host.ubid} refused to install the PVM host kernel: sha256 mismatch
         page=other #{pvm_host.ubid} cannot download
       OUT

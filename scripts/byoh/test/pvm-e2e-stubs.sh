@@ -79,14 +79,25 @@ report_has "the example pins carry their label" "third party; Januscape fix incl
 report_has "the wrong guest sha256 is refused" "PASS  set with a wrong guest kernel sha256 is refused"
 report_has "the neg-sha install is refused before any change" "PASS  GRUB (saved_entry, next_entry), the kernel packages and /etc/grub.d are unchanged"
 report_has "the power cycle is a MANUAL step" "MANUAL stop the instance"
-report_has "the monitor's checkup is set by the run" "setting checkup on vh0000000000000000000000ab"
+report_has "without a monitor the host notices the boot itself" "no bin/monitor (the BYOH default): HostNexus#wait on the pvm host compares its boot id itself"
+report_has "the out-of-band boot is noticed by its boot id" "PASS  HostNexus recorded the new boot id boot-"
+grep -q 'setting checkup' "$T/work/pvm-e2e-report.txt" && bad "the run set checkup without PVM_E2E_SET_CHECKUP=1" || ok "the run sets no checkup by default"
+report_has "the guest kernel is checked in the running unit" "PASS  the VM boots the pinned guest kernel: its running cloud-hypervisor has --kernel /opt/pvm-guest/84dcf08143ce7e945a770ff1b6d25e0505c1da69d674831b470cabc139598acb/vmlinux"
+report_has "the guest's uname -r is checked" "PASS  the VM boots the pinned guest kernel: the guest runs 6.12.33-pvm"
+report_has "a restart keeps the unit's kernel" "PASS  after a restart: its unit boots /opt/pvm-guest/84dcf08143ce7e945a770ff1b6d25e0505c1da69d674831b470cabc139598acb/vmlinux"
+report_has "stop and start boots the new kernel" "PASS  after stop and start: the guest runs 6.12.34-pvm"
+report_has "the host refuses a wrong guest kernel in bring-up" "PASS  the host waits at pvm_guest_kernel_refused"
+report_has "the guest refusal changes nothing" "PASS  GRUB, the kernel packages and /etc/grub.d are unchanged by the guest refusal"
+report_has "every phase ran" "== summary: every phase given passed"
 report_has "the bench prints ratios" "ratio cpu_sha256_1g: guest 1200 ms, host 1000 ms"
 report_has "a restart keeps the guest kernel" "PASS  a restart keeps the VM's guest kernel"
 report_has "stop and start moves to the new guest kernel" "PASS  after stop and start the VM boots the new guest kernel"
 report_has "the stock return pages" "PASS  ByohPvmBoot pages the stock boot"
 report_has "jammy is refused" "PASS  a pvm-2 ubuntu-jammy VM is refused"
 report_has "billing is closed" "PASS  every record is closed"
-report_has "teardown returns to stock" "PASS  the stock kernel 7.0.0-1014-aws runs"
+report_has "teardown returns to a stock kernel" "PASS  a stock kernel runs, not a PVM one (7.0.0-1015-aws)"
+report_has "teardown accepts the newer stock kernel patch added" "PASS  it is the newest stock kernel after patch (7.0.0-1015-aws) or the pinned one (7.0.0-1014-aws)"
+report_has "teardown checks the running kernel's package" "PASS  the running kernel is an installed stock package (linux-image-7.0.0-1015-aws)"
 report_has "the scratch site is added without the main site's ula48" "PASS  site add byoh-pvm-e2e-neg"
 report_has "the host-check probe goes over the run's own connection" "PASS  the probe says pvm"
 report_has "teardown leaves no page of the host open" "PASS  no page of host vh0000000000000000000000ab is left open"
@@ -113,9 +124,33 @@ rc_is "a destroy that leaves the scratch host's page open fails neg-sha" 1
 report_has "neg-sha names the page" "FAIL  no page of host vh0000000000000000000000cd is left open"
 
 # Without a second guest build the rollout is reported as not run.
-run noguest PVM_E2E_GUEST2_URL= -- location neg-sha host-add vm guest-pin-rollout
-rc_is "guest-pin-rollout without a second build passes as NOT RUN" 0
-report_has "it says so" "guest-pin-rollout is NOT RUN (UNVERIFIED)"
+run noguest PVM_E2E_GUEST2_URL= PVM_E2E_PROJECT2= -- location neg-sha host-add vm tenancy guest-pin-rollout
+rc_is "guest-pin-rollout without a second build is NOT RUN, not a failure" 0
+report_has "it skips the rollout" "SKIP  guest-pin-rollout (PVM_E2E_GUEST2_URL and PVM_E2E_GUEST2_SHA256 are unset) (NOT RUN, UNVERIFIED)"
+report_has "the phase line says NOT RUN" "== guest-pin-rollout: NOT RUN (UNVERIFIED)"
+report_has "tenancy without a second project passes with a note" "== tenancy: PASS with 1 note(s)"
+report_has "the summary lists the skips" "== summary: no phase failed, but not every check ran"
+report_has "the summary names the rollout" "  guest-pin-rollout: NOT RUN (UNVERIFIED)"
+report_has "the summary names the grant" "  tenancy: NOT RUN: a grant to a second project is refused (PVM_E2E_PROJECT2 is unset)"
+
+# An out-of-band boot the host strand does not notice by itself fails;
+# PVM_E2E_SET_CHECKUP=1 passes it, marked as simulated.
+run noself FAKE_NO_SELF_CHECK=1 PVM_E2E_BOOT_WAIT=0 -- location neg-sha host-add vm oob-reboot
+rc_is "an out-of-band boot the host does not notice fails oob-reboot" 1
+report_has "oob-reboot names it" "FAIL  HostNexus recorded the new boot id boot-"
+run setcheckup FAKE_NO_SELF_CHECK=1 PVM_E2E_SET_CHECKUP=1 -- location neg-sha host-add vm oob-reboot
+rc_is "PVM_E2E_SET_CHECKUP=1 passes oob-reboot" 0
+report_has "the checkup is set by the run" "setting checkup on vh0000000000000000000000ab"
+report_has "the summary says it was simulated" "  oob-reboot: detection simulated: checkup set by the script"
+
+# A start that moves the guest kernel row but not the unit fails the rollout.
+run unit FAKE_UNIT_NOT_REWRITTEN=1 -- location neg-sha host-add vm guest-pin-rollout
+rc_is "a unit that keeps the old kernel fails guest-pin-rollout" 1
+report_has "guest-pin-rollout names the unit" "FAIL  after stop and start: its unit boots /opt/pvm-guest/$GUEST2/vmlinux"
+
+run guestgrub FAKE_NEG_GUEST_CHANGES_GRUB=1 -- location neg-sha
+rc_is "a guest kernel refusal that touched GRUB fails neg-sha" 1
+report_has "neg-sha names the change" "FAIL  GRUB, the kernel packages and /etc/grub.d are unchanged by the guest refusal"
 
 # Usage and refusals.
 run refuse BYOH_REAL_E2E=0 -- all

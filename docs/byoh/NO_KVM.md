@@ -951,7 +951,11 @@ fact, "detected, not offered".
     arm`, which also checks that the stock entry still boots). A host that cannot be armed is not
     rebooted: it pages `ByohPvmBoot`, stops taking VMs and waits at `pvm_boot_failed`.
   - `verify_pvm_boot` runs after `reboot` and after an out-of-band reboot (`check_boot_id` from `wait`
-    and `unavailable`). It records a fresh probe and requires all of: the probe says `pvm` with none of
+    and `unavailable`). A pvm host does not wait for `bin/monitor`'s checkup, which a BYOH control plane
+    does not run by default: its `wait` naps 5 minutes, not 6 hours, and compares the boot id itself
+    each time (`check_pvm_boot_id`, no health checks; a host it cannot reach is tried at the next wake).
+    Without that, a host back on its stock kernel would stay `accepting` with its VMs down, and new
+    `pvm-*` VMs placed on it would fail to start. Other tiers are unchanged (golden spec). It records a fresh probe and requires all of: the probe says `pvm` with none of
     PVM's hard refusals, KVM API 12, the running kernel is the installed PVM kernel, the boot unit is
     active and succeeded (it waits up to 5 minutes for a unit that has not run yet, since SSH comes up
     before `multi-user.target`), and `/dev/kvm` is a 0660 character device of group `kvm`. Then the
@@ -1828,7 +1832,8 @@ questions this section listed beforehand:
 #   throwaway AWS m6i.2xlarge (scripts/byoh/test/aws-e2e role pvme, README phase 7):
 BYOH_REAL_E2E=1 scripts/byoh/test/real/pvm-e2e.sh all   # settings: the script's header
 #   Phases: location (pvm rates, set with the pins), neg-sha (a wrong guest sha256 refused by set; a wrong
-#   host-deb sha256 refused on the host before any change, then destroyed), host-add (--virt-tier pvm
+#   host-deb sha256 refused on the host before any change, then destroyed; a wrong guest sha256 stored
+#   unchecked and refused by the host in bring-up, held at pvm_guest_kernel_refused), host-add (--virt-tier pvm
 #   --install-pvm-kernel to accepting; minutes and reboots), patch-kernel, host-check, vm (pvm-2 noble: SSH,
 #   DNS, egress, apt, serial log), prod-path (fio through ubiblk, download speed, host memory against
 #   vm_overhead_mib), bench (the go/no-go's), lifecycle, host-reboot, oob-reboot, power-cycle (MANUAL),
@@ -1836,11 +1841,15 @@ BYOH_REAL_E2E=1 scripts/byoh/test/real/pvm-e2e.sh all   # settings: the script's
 #   (unset next_entry and reboot: ByohPvmBoot, then pvm retry), delete, billing, teardown (pvm uninstall,
 #   destroy, reboot to a clean stock host). Report: var/pvm-e2e/pvm-e2e-report.txt. UNVERIFIED until run;
 #   its flow runs against a fake world in scripts/byoh/test/pvm-e2e-stubs.sh.
-#   Two things the run leans on: a BYOH control plane runs no bin/monitor (until M9), and only the
-#   monitor's checkup makes HostNexus notice an out-of-band boot (check_boot_id), so oob-reboot,
-#   power-cycle and stock-return set checkup themselves when no monitor runs and say so. Without the
-#   monitor, a host rebooted behind the control plane's back keeps its VMs down until something sets
-#   checkup (UNVERIFIED whether that is acceptable for production; M9).
+#   A BYOH control plane runs no bin/monitor (until M9), so oob-reboot, power-cycle and stock-return
+#   test that the pvm host notices the boot by itself (HostNexus#check_pvm_boot_id, every 5 minutes)
+#   and wait for its recorded boot id; PVM_E2E_SET_CHECKUP=1 sets checkup instead and the report marks
+#   that detection simulated. The report ends with every check a phase skipped (NOT RUN) or simulated.
+#   Teardown expects a non-PVM kernel from an installed stock package: the newest stock kernel after
+#   patch (GRUB_DEFAULT=0 once uninstall unsets saved_entry) or the one the install pinned.
+#   Not covered on hardware by the run (mocked specs and the fake world only, UNVERIFIED): an install
+#   that fails after a change (exit 3, un-armed) and pvm retry or uninstall from that partial state;
+#   an arm that fails (pvm_not_rebooted, pvm retry --reboot-vms); a host-kernel upgrade; Meltdown.
 ```
 
 The go/no-go booted one guest by hand: a raw disk, no network, 2 GiB, the go/no-go's own unit-less

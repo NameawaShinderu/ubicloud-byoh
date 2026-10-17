@@ -329,11 +329,12 @@ class ByohGateChecks
     ByohPvmGuestKernel ByohPvmGuestKernelStale ByohVirtTier ByohKernelReboot LastBootIDDiscrepancy].freeze
 
   # Where a pvm host stands, as key=value lines for pvm-e2e.sh: its
-  # strand, its byoh_pvm_host row, its VMs and guest kernels, and each
-  # open page for it ("page=TYPE summary"; TYPE is other for a page of
-  # another tag). A host that does not exist (any more) prints exists=0
-  # and the pages still open for it, so the script can wait for a destroy
-  # and check that it left none behind.
+  # strand, its byoh_pvm_host row, its VMs and guest kernels (with the
+  # release of each, as guest_release_<sha256>=), and each open page for
+  # it ("page=TYPE summary"; TYPE is other for a page of another tag). A
+  # host that does not exist (any more) prints exists=0 and the pages
+  # still open for it, so the script can wait for a destroy and check
+  # that it left none behind.
   def cmd_pvm_host(argv)
     opts = {}
     parse(argv, "pvm-host --host UBID") { host_option(it, opts) }
@@ -346,11 +347,13 @@ class ByohGateChecks
     end
 
     row = ByohPvmHost[host.id]
+    kernels = ByohPvmGuestKernel.where(vm_host_id: host.id).order(:sha256).all
     {
       exists: 1,
       label: host.strand&.label,
       allocation_state: host.allocation_state,
       virt_tier: host.virt_tier,
+      last_boot_id: host.last_boot_id,
       pvm_state: row&.state,
       host_kver: row&.host_kver,
       stock_kver: row&.stock_kver,
@@ -358,9 +361,12 @@ class ByohGateChecks
       host_deb_sha256: row&.host_deb_sha256,
       last_error: row&.last_error,
       vms: host.vms_dataset.order(:id).all.map(&:ubid).join(","),
-      guest_kernels: ByohPvmGuestKernel.where(vm_host_id: host.id).order(:sha256).all.map { "#{it.sha256}:#{it.state}" }.join(","),
+      guest_kernels: kernels.map { "#{it.sha256}:#{it.state}" }.join(","),
       current_guest_kernel: ByohVirtTiers.pvm_guest_kernel(host)&.sha256,
     }.each { |k, value| @out.puts "#{k}=#{value}" }
+    # The release the host's download read from each guest kernel, which
+    # the guest's uname -r must show.
+    kernels.each { @out.puts "guest_release_#{it.sha256}=#{it.release}" if it.release }
     print_pvm_pages(host.ubid, host.id)
     0
   end

@@ -61,6 +61,17 @@ RSpec.describe "scripts/byoh/test/real/pvm-e2e.sh" do # rubocop:disable RSpec/De
     keys.each { expect(gate).to match(/^ +#{it}: |"#{it}=/) }
   end
 
+  it "reads the per-kernel release key that m2-checks pvm-host prints" do
+    gate = File.read(File.join(root, "lib/byoh_gate_checks.rb"))
+    expect(script).to include('kv "guest_release_$sha"')
+    expect(gate).to include("\"guest_release_\#{it.sha256}=\#{it.release}\"")
+  end
+
+  it "never passes a phase whose checks it skipped" do
+    expect(script).to include('log "== $phase: NOT RUN (UNVERIFIED)', 'log "== summary: no phase failed, but not every check ran')
+    expect(script).not_to match(/info .*NOT RUN/)
+  end
+
   it "names the m2-checks commands it runs" do
     commands = script.scan(/\bchecks ([a-z-]+) --/).flatten.uniq
     expect(commands).to contain_exactly("pvm-host", "pvm-vm", "info")

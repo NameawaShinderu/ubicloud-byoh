@@ -8,14 +8,23 @@
 #
 # Knobs (environment): FAKE_ACCEPT_WRONG_GUEST=1 makes set take a wrong
 # guest sha256; FAKE_NEG_CHANGES_GRUB=1 makes the refused install touch
-# GRUB; FAKE_STOCK_RETURN_STARTS_VM=1 starts the VM on a stock boot;
-# FAKE_DESTROY_LEAVES_PAGES=1 makes a host destroy leave its pages open.
+# GRUB; FAKE_NEG_GUEST_CHANGES_GRUB=1 makes the host's guest kernel
+# refusal touch it; FAKE_STOCK_RETURN_STARTS_VM=1 starts the VM on a
+# stock boot; FAKE_DESTROY_LEAVES_PAGES=1 makes a host destroy leave its
+# pages open; FAKE_NO_SELF_CHECK=1 makes the host strand notice an
+# out-of-band boot only through checkup; FAKE_UNIT_NOT_REWRITTEN=1 makes
+# a start move the VM's guest kernel row but not its unit.
+#
+# The host's stock kernel is STOCK; patch adds NEWER, which GRUB boots
+# once the PVM install is uninstalled (it no longer pins STOCK).
 set -uo pipefail
 
 F=${FAKE:?}
 GOOD_GUEST=84dcf08143ce7e945a770ff1b6d25e0505c1da69d674831b470cabc139598acb
 STOCK=7.0.0-1014-aws
+NEWER=7.0.0-1015-aws
 PVM=6.12.33-pvm
+GUEST2_RELEASE=6.12.34-pvm
 HOST=vh0000000000000000000000ab
 NEG=vh0000000000000000000000cd
 VM=vm0000000000000000000000ef
@@ -27,6 +36,8 @@ has() { [[ -e $F/$1 ]]; }
 page_add() { grep -qx "$1" "$F/pages" 2>/dev/null || echo "$1" >>"$F/pages"; }
 page_del() { [[ -f $F/pages ]] && sed -i "/^$1 /d" "$F/pages"; }
 log() { printf '%s\n' "$*" >>"$F/calls"; }
+# The release the host read from a guest kernel.
+release_of() { if [[ $1 == "$GOOD_GUEST" ]]; then echo "$PVM"; else echo "$GUEST2_RELEASE"; fi; }
 
 init() {
   [[ -e $F/init ]] && return
@@ -50,6 +61,8 @@ host_boot() {
   if [[ $(get next_entry) == ubicloud-pvm ]] && has installed; then
     put kernel "$PVM"
     put next_entry ubicloud-pvm
+  elif has uninstalled; then
+    put kernel "$NEWER"
   else
     put kernel "$STOCK"
     put next_entry ""
@@ -57,14 +70,22 @@ host_boot() {
   rm -f "$F/vm_running"
 }
 
+# The VM's cloud-hypervisor starts from its unit.
+vm_run() {
+  touch "$F/vm_running"
+  put vm_run_sha "$(get vm_unit_sha)"
+  put vmboot $(($(get vmboot) + 1))
+}
+
 # HostNexus after a boot: on its PVM kernel back to work with the VM
 # started; on stock, ByohPvmBoot and no VM.
 host_settle() {
+  put seen_boot "$(get boot)"
   if [[ $(get kernel) == "$PVM" ]]; then
     put label wait
     put alloc accepting
     page_del ByohPvmBoot
-    has vm && touch "$F/vm_running" && put vmboot $(($(get vmboot) + 1))
+    has vm && vm_run
   else
     put label pvm_boot_failed
     put alloc draining
@@ -106,6 +127,7 @@ cmd_admin() {
       if [[ $args == *" --pvm-guest-kernel-sha256 "* ]]; then
         local sha
         sha=$(sed -n 's/.* --pvm-guest-kernel-sha256 \([0-9a-f]*\) .*/\1/p' <<<"$args")
+        [[ $3 != "${FAKE_SCRATCH:-x}" ]] || put scratch_guest "$sha"
         if [[ $args != *--no-verify-download* && $sha != "$GOOD_GUEST" && $sha != "${FAKE_GUEST2:-x}" && ${FAKE_ACCEPT_WRONG_GUEST:-0} == 0 ]]; then
           echo "! guest kernel: sha256 mismatch" && exit 1
         fi
@@ -123,8 +145,17 @@ cmd_admin() {
     "host add")
       local args=" $* "
       if [[ $args == *" --site ${FAKE_SCRATCH:-x} "* ]]; then
-        put neg_label pvm_install_failed
-        [[ ${FAKE_NEG_CHANGES_GRUB:-0} == 0 ]] || put saved_entry "$STOCK_ENTRY"
+        # The guest kernel is refused before patch and the install; a
+        # wrong host .deb only by the install.
+        if [[ $(get scratch_guest) != "$GOOD_GUEST" ]]; then
+          put neg_mode guest
+          put neg_label pvm_guest_kernel_refused
+          [[ ${FAKE_NEG_GUEST_CHANGES_GRUB:-0} == 0 ]] || put saved_entry "$STOCK_ENTRY"
+        else
+          put neg_mode deb
+          put neg_label pvm_install_failed
+          [[ ${FAKE_NEG_CHANGES_GRUB:-0} == 0 ]] || put saved_entry "$STOCK_ENTRY"
+        fi
         touch "$F/neg"
         echo "Registered host $NEG in site ${FAKE_SCRATCH}."
       else
@@ -153,14 +184,26 @@ gone_kv() {
 host_kv() {
   if [[ $1 == "$NEG" ]]; then
     if ! has neg; then gone_kv "$1" && return; fi
-    printf 'exists=1\nlabel=%s\nallocation_state=draining\nvirt_tier=pvm\npvm_state=failed\n' "$(get neg_label)"
-    echo "page=ByohPvmInstall $NEG refused to install the PVM host kernel: sha256 mismatch"
+    if [[ $(get neg_mode) == guest ]]; then
+      printf 'exists=1\nlabel=%s\nallocation_state=unprepared\nvirt_tier=pvm\npvm_state=install_pending\n' "$(get neg_label)"
+      echo "page=ByohPvmGuestKernel $NEG refused the PVM guest kernel $(get scratch_guest): sha256 mismatch"
+    else
+      printf 'exists=1\nlabel=%s\nallocation_state=draining\nvirt_tier=pvm\npvm_state=failed\n' "$(get neg_label)"
+      echo "page=ByohPvmInstall $NEG refused to install the PVM host kernel: sha256 mismatch"
+    fi
     return
   fi
   has host || { gone_kv "$1" && return; }
-  printf 'exists=1\nlabel=%s\nallocation_state=%s\nvirt_tier=pvm\npvm_state=%s\n' "$(get label)" "$(get alloc)" "$(get pvm_state)"
+  # The strand at wait compares the boot id by itself (check_pvm_boot_id).
+  if [[ $(get label) == wait && $(get seen_boot) != "$(get boot)" && ${FAKE_NO_SELF_CHECK:-0} == 0 ]]; then
+    page_add "LastBootIDDiscrepancy Recorded last_boot_id of $HOST differs from the actual boot_id"
+    host_settle
+  fi
+  printf 'exists=1\nlabel=%s\nallocation_state=%s\nvirt_tier=pvm\nlast_boot_id=boot-%s\npvm_state=%s\n' "$(get label)" "$(get alloc)" "$(get seen_boot)" "$(get pvm_state)"
   printf 'host_kver=%s\nstock_kver=%s\nstock_entry=%s\n' "$PVM" "$STOCK" "$STOCK_ENTRY"
   printf 'guest_kernels=%s:ready%s\n' "$GOOD_GUEST" "$(has guest2_ready && echo ",${FAKE_GUEST2}:ready")"
+  echo "guest_release_$GOOD_GUEST=$PVM"
+  has guest2_ready && echo "guest_release_$FAKE_GUEST2=$GUEST2_RELEASE"
   sed 's/^/page=/' "$F/pages"
 }
 
@@ -205,7 +248,9 @@ cmd_bundle() {
         "pvm uninstall")
           host_boot
           rm -f "$F/installed"
-          put kernel "$STOCK"
+          touch "$F/uninstalled"
+          put kernel "$NEWER"
+          put seen_boot "$(get boot)"
           put next_entry ""
           put pvm_state uninstalled
           put label pvm_uninstalled
@@ -243,8 +288,10 @@ cmd_ubi() {
   case "$3" in
     create)
       [[ " $* " != *" -b ubuntu-jammy "* ]] || { echo "! Invalid request: pvm VMs boot ubuntu-noble only (direct kernel boot), not ubuntu-jammy" && exit 1; }
-      touch "$F/vm" "$F/vm_running"
+      touch "$F/vm"
       put vm_sha "$(get guest_pin)"
+      put vm_unit_sha "$(get guest_pin)"
+      vm_run
       put vm_created "$(date -u +%FT%TZ)"
       ;;
     show)
@@ -260,14 +307,14 @@ cmd_ubi() {
       ;;
     stop) rm -f "$F/vm_running" ;;
     start)
-      touch "$F/vm_running"
-      put vmboot $(($(get vmboot) + 1))
       if [[ $(get vm_sha) != "$(get guest_pin)" ]]; then
         put vm_sha "$(get guest_pin)"
+        [[ ${FAKE_UNIT_NOT_REWRITTEN:-0} == 1 ]] || put vm_unit_sha "$(get guest_pin)"
         page_del ByohPvmGuestKernelStale
       fi
+      vm_run
       ;;
-    restart) put vmboot $(($(get vmboot) + 1)) ;;
+    restart) vm_run ;;
     destroy)
       rm -f "$F/vm" "$F/vm_running"
       put vm_deleted "$(date -u +%FT%TZ)"
@@ -302,7 +349,7 @@ cmd_ssh() {
     case "$cmd" in
       true) ;;
       *boot_id) echo "vmboot-$(get vmboot)" ;;
-      "uname -r") echo "$PVM" ;;
+      "uname -r") release_of "$(get vm_run_sha)" ;;
       *MemTotal*) echo 8 ;;
       "sh -s") cat >/dev/null && printf 'BYOH_PVM_BENCH cpu_sha256_1g 1200\nBYOH_PVM_BENCH mem_dd_8g 900\n' ;;
       fio*) echo "8000 7900" ;;
@@ -322,6 +369,8 @@ cmd_ssh() {
     if cmd_ssh "$dest" "${cmd#! }"; then return 1; else return 0; fi
   fi
   case "$cmd" in
+    *MainPID*/proc/*cmdline*) has vm_running && echo "/opt/pvm-guest/$(get vm_run_sha)/vmlinux" ;;
+    "systemctl cat "*"--kernel"*) has vm && echo "/opt/pvm-guest/$(get vm_unit_sha)/vmlinux" ;;
     *boot_id) echo "boot-$(get boot)" ;;
     "uname -r") get kernel && echo ;;
     *"grub-editenv list"*) printf 'saved_entry=%s\nnext_entry=%s\n' "$(get saved_entry)" "$(get next_entry)" ;;
@@ -339,6 +388,7 @@ cmd_ssh() {
     "ls /etc/grub.d"*) echo "00_header 10_linux$(has installed && echo " 42_ubicloud_pvm")" ;;
     *"dpkg-query"*"grep -i pvm"*) has installed && echo "linux-image-$PVM install ok installed" ;;
     *"dpkg-query"*"grep 'pvm.* installed'") has installed ;;
+    *"db:Status-Status"*"linux-image-$STOCK" | *"db:Status-Status"*"linux-image-$NEWER") echo -n installed ;;
     *"dpkg-query"*) echo "linux-image-$STOCK" ;;
     "[ ! -e /etc/grub.d/42_ubicloud_pvm ]") neg has installed ;;
     *journalctl*) get boot && echo ;;

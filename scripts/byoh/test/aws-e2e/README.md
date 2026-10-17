@@ -72,6 +72,15 @@ State (instance ids and addresses) is in `var/aws-e2e/<run>/state`.
    inclusion UNVERIFIED; for testing only, not a recommended production
    pin). `guest-pin-rollout` needs a second guest kernel build
    (`PVM_E2E_GUEST2_URL`, `PVM_E2E_GUEST2_SHA256`) and is reported NOT RUN
-   without one. `scripts/byoh/test/pvm-e2e-stubs.sh` runs the script
-   against a fake world (no host) to check its flow before the real run.
+   without one, as is the second-project grant of `tenancy` without
+   `PVM_E2E_PROJECT2`; the report's last block lists every check that did
+   not run, so a run that skipped any never reads as all green. Leave
+   `bin/monitor` off and `PVM_E2E_SET_CHECKUP` unset: `oob-reboot`,
+   `power-cycle` and `stock-return` then test that the pvm host notices a
+   boot it did not ask for by itself (its wait compares the boot id every
+   5 minutes). `neg-sha` registers the instance twice in a scratch
+   location (a wrong host-deb sha256, then a wrong guest kernel sha256),
+   about 15 minutes each. `scripts/byoh/test/pvm-e2e-stubs.sh` runs the
+   script against a fake world (no host) to check its flow before the
+   real run.
 8. **Teardown**: `down.sh`; nothing of the run is left.

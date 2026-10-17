@@ -23,7 +23,8 @@
 # all and stops at the first that fails; a phase can be rerun on its own):
 #   location           site add (unless it exists), pvm rates, set with the pins
 #   neg-sha            a wrong guest sha256 refused by set; a wrong host-deb
-#                      sha256 refused on the host before any change
+#                      sha256 refused on the host before any change; a wrong
+#                      guest sha256 refused by the host in bring-up
 #   host-add           host add --virt-tier pvm --install-pvm-kernel to accepting
 #   patch-kernel       the stock kernel the install pinned is the one that ran
 #   host-check         PVM kernel, pti=off, GRUB, /dev/kvm, kvm_pvm, unit, probe, holds
@@ -73,6 +74,11 @@
 #   PVM_E2E_WORK         state, keys, logs and the report [var/pvm-e2e]
 #   PVM_E2E_INSTANCE     the instance id, only printed in MANUAL steps
 #   PVM_E2E_PAGE_WAIT    seconds a destroyed host's pages may take to resolve [300]
+#   PVM_E2E_BOOT_WAIT    seconds HostNexus may take to notice a boot it did
+#                        not ask for [1200; its wait checks every 300]
+#   PVM_E2E_SET_CHECKUP=1  set checkup after an out-of-band boot as
+#                        bin/monitor would, instead of testing that the pvm
+#                        host notices it by itself (reported as simulated)
 #   ADMIN                the ubicloud-admin command [sudo ubicloud-admin on a
 #                        packaged control plane, else packaging/bin/ubicloud-admin --dev]
 #   PVM_HOST_DEB_URL, PVM_HOST_DEB_SHA256, PVM_GUEST_KERNEL_URL,
@@ -92,6 +98,16 @@
 # Report: $PVM_E2E_WORK/pvm-e2e-report.txt, one block per phase run.
 # Exit codes: 0 every phase given passed, 1 a phase failed, 2 refused or a
 # usage error.
+#
+# Not covered on hardware by this run, only by mocked specs and the fake
+# world (UNVERIFIED on a real host): an install that fails after it
+# changed the host (exit 3, un-armed) and `pvm retry` or `pvm uninstall`
+# from that partial state; an `arm` that fails (pvm_not_rebooted,
+# `pvm retry --reboot-vms`); a PVM host-kernel upgrade; a Meltdown-affected
+# CPU.
+#
+# The report ends with a summary of every check a phase skipped (NOT
+# RUN) or simulated (PVM_E2E_SET_CHECKUP=1); without it every phase ran.
 #
 # UNVERIFIED: this script has never run against a real host. Only its
 # refusal without BYOH_REAL_E2E=1, its usage errors and its static checks
@@ -189,13 +205,27 @@ HOST_KH=$WORK/host_known_hosts
 # --- output -------------------------------------------------------------
 
 FAILS=0
+PASSES=0
+NOTES=()
 log() { printf '%s\n' "$*" | tee -a "$REPORT"; }
-pass() { log "  PASS  $*"; }
+pass() {
+  log "  PASS  $*"
+  PASSES=$((PASSES + 1))
+}
 fail() {
   log "  FAIL  $*"
   FAILS=$((FAILS + 1))
 }
 info() { log "  info  $*"; }
+# A check the phase could not run here: it never counts as a PASS. A
+# phase whose checks were all skipped is NOT RUN, and the run's summary
+# lists every skip and note.
+skip() {
+  log "  SKIP  $* (NOT RUN, UNVERIFIED)"
+  NOTES+=("NOT RUN: $*")
+}
+# Something a phase's PASS does not prove as the default deployment runs it.
+note() { NOTES+=("$*"); }
 check() { # what command...: PASS when the command succeeds, else FAIL
   local what=$1
   shift
@@ -390,17 +420,47 @@ check_vm_back() {
   wait_until 600 "VM $VM_A answers on SSH" vm_up "$vm"
 }
 
-# What a checkup from bin/monitor does: makes the host strand look at its
-# boot id. A BYOH control plane runs no monitor until M9, so without one
-# the run sets checkup itself (and says so).
-nudge_checkup() {
-  local host=$1
+# How HostNexus notices a boot it did not ask for. bin/monitor's checkup
+# does it where a monitor runs; a BYOH control plane runs none by default
+# (until M9), and there a pvm host's wait compares its boot id itself
+# every 5 minutes (HostNexus#check_pvm_boot_id), which is what this run
+# tests. PVM_E2E_SET_CHECKUP=1 sets checkup as the monitor would instead,
+# and the phase then says that its detection was simulated.
+expect_boot_noticed() {
+  local host=$1 boot
   if pgrep -f 'bin/monitor' >/dev/null 2>&1; then
-    info "bin/monitor runs; it sets checkup on the host"
-  else
-    info "bin/monitor does not run (off on BYOH control planes until M9): setting checkup on $host as its pulse check would"
+    info "bin/monitor runs; its pulse check may set checkup on the host too"
+  elif [[ ${PVM_E2E_SET_CHECKUP:-0} == 1 ]]; then
+    info "PVM_E2E_SET_CHECKUP=1: setting checkup on $host as bin/monitor's pulse check would"
+    note "detection simulated: checkup set by the script, not by the host's own boot id check"
     echo "VmHost[\"$host\"].incr_checkup" | cp_ruby >/dev/null
+  else
+    info "no bin/monitor (the BYOH default): HostNexus#wait on the pvm host compares its boot id itself every 5 minutes"
   fi
+  boot=$(host_boot_id)
+  wait_until "${PVM_E2E_BOOT_WAIT:-1200}" "HostNexus recorded the new boot id $boot" boot_noticed "$host" "$boot"
+}
+boot_noticed() { [[ -n $2 ]] && host_kv "$1" && [[ $(kv last_boot_id) == "$2" ]]; }
+
+# The guest kernel the VM really boots, not only the byoh_vm_guest_kernel
+# row the control plane writes before it rewrites the unit: the --kernel
+# of its unit and of its running cloud-hypervisor, and the guest's
+# uname -r against the release the host read from that kernel.
+vm_inhost() { checks info --vm "$1" >"$WORK/vm-info.kv" </dev/null && kv inhost "$WORK/vm-info.kv"; }
+vm_unit_kernel() { host_ssh "systemctl cat $1.service | sed -n 's/.*--kernel \([^ ]*\).*/\1/p' | head -1"; }
+vm_proc_kernel() {
+  host_ssh "pid=\$(systemctl show -p MainPID --value $1.service); [ \"\${pid:-0}\" -gt 0 ] && tr '\\0' '\\n' </proc/\$pid/cmdline | sed -n '/^--kernel\$/{n;p;q;}'"
+}
+guest_release_is() { [[ -n $2 && $(vm_ssh "$1" uname -r) == "$2" ]]; }
+check_vm_kernel() { # vm sha256 what
+  local vm=$1 sha=$2 what=$3 inhost want release
+  want=/opt/pvm-guest/$sha/vmlinux
+  inhost=$(vm_inhost "$vm")
+  check "$what: its unit boots $want" [ "$(vm_unit_kernel "$inhost")" = "$want" ]
+  check "$what: its running cloud-hypervisor has --kernel $want" [ "$(vm_proc_kernel "$inhost")" = "$want" ]
+  host_kv "$(host_ubid)"
+  release=$(kv "guest_release_$sha")
+  check "$what: the guest runs ${release:-?}, the release the host recorded for that kernel" guest_release_is "$vm" "$release"
 }
 
 # --- phases -----------------------------------------------------------------
@@ -553,6 +613,32 @@ phase_neg_sha() {
   check "no PVM kernel package" sh -c "! grep -q 'pvm' '$WORK/neg-after.txt'"
   check "no 42_ubicloud_pvm" op_ssh "[ ! -e /etc/grub.d/42_ubicloud_pvm ]"
   destroy_host "$host" || return 0
+
+  # A guest kernel the host itself refuses in bring-up: the right host
+  # .deb and a wrong guest sha256 that set stores unchecked. The host
+  # must stop at pvm_guest_kernel_refused, short of accepting, before
+  # patch or the install changes anything.
+  pin_args "$PVM_HOST_DEB_SHA256"
+  PIN_ARGS=("${PIN_ARGS[@]/#$PVM_GUEST_KERNEL_SHA256/$(wrong_sha "$PVM_GUEST_KERNEL_SHA256")}")
+  check "scratch site takes a wrong guest kernel sha256 with --no-verify-download" \
+    cpadmin site set "$SCRATCH" "${PIN_ARGS[@]}" --no-verify-download
+  host_snapshot "$WORK/neg-guest-before.txt" || true
+  out=$(cpadmin host add --site "$SCRATCH" "${ADD_ARGS[@]}" --no-wait 2>&1) || true
+  printf '%s\n' "$out" >>"$REPORT"
+  host=$(grep -oE 'host vh[0-9a-z]{24}' <<<"$out" | tail -1 | cut -d' ' -f2 || true)
+  [[ -n $host ]] || {
+    fail "the second host add into $SCRATCH printed no host ubid"
+    return 0
+  }
+  state_set neg_host "$host"
+  wait_until 7200 "ByohPvmGuestKernel pages the host's refusal of the guest kernel" host_page "$host" ByohPvmGuestKernel "refused the PVM guest kernel" || return 0
+  grep '^page=\|^label=\|^allocation_state=' "$WORK/host.kv" | sed 's/^/  /' | tee -a "$REPORT"
+  check "the host waits at pvm_guest_kernel_refused" [ "$(kv label)" = pvm_guest_kernel_refused ]
+  check "the host does not accept VMs ($(kv allocation_state))" [ "$(kv allocation_state)" != accepting ]
+  host_snapshot "$WORK/neg-guest-after.txt"
+  check "GRUB, the kernel packages and /etc/grub.d are unchanged by the guest refusal" \
+    cmp -s "$WORK/neg-guest-before.txt" "$WORK/neg-guest-after.txt"
+  destroy_host "$host" || return 0
   if out=$(cpadmin site delete "$SCRATCH" 2>&1); then pass "scratch site deleted"; else fail "site delete $SCRATCH: $out"; fi
 }
 
@@ -660,8 +746,9 @@ phase_vm() {
   check "the API shows the guest kernel" grep -q '^  guest-kernel: .*sha256 '"$PVM_GUEST_KERNEL_SHA256" <<<"$show"
   vm_kv "$vm"
   check "family pvm" [ "$(kv family "$WORK/vm.kv")" = pvm ]
-  check "the VM boots the pinned guest kernel" [ "$(kv guest_sha256 "$WORK/vm.kv")" = "$PVM_GUEST_KERNEL_SHA256" ]
+  check "the VM's guest kernel row is the pinned one" [ "$(kv guest_sha256 "$WORK/vm.kv")" = "$PVM_GUEST_KERNEL_SHA256" ]
   info "guest console: $(kv guest_console "$WORK/vm.kv")"
+  check_vm_kernel "$vm" "$PVM_GUEST_KERNEL_SHA256" "the VM boots the pinned guest kernel"
   local serial t0=$SECONDS
   while :; do
     serial=$(ubicli vm "$(vm_ref "$VM_A")" serial-log -r 2>&1 || true)
@@ -785,8 +872,8 @@ phase_oob_reboot() {
   boot=$(host_boot_id)
   host_ssh systemctl reboot || true
   wait_until 1200 "the host rebooted behind the control plane's back" host_rebooted "$boot" || return 0
-  nudge_checkup "$host"
-  wait_until 900 "HostNexus noticed the boot (LastBootIDDiscrepancy)" host_page "$host" LastBootIDDiscrepancy || true
+  expect_boot_noticed "$host" || return 0
+  check "HostNexus paged the out-of-band boot (LastBootIDDiscrepancy)" host_page "$host" LastBootIDDiscrepancy
   check_host_on_pvm "$host"
   check_vm_back
 }
@@ -797,7 +884,7 @@ phase_power_cycle() {
   boot=$(host_boot_id)
   manual "stop the instance ${PVM_E2E_INSTANCE:-of $MAIN_IP} from the console (AWS: aws ec2 stop-instances --instance-ids ${PVM_E2E_INSTANCE:-<id>}; wait for stopped), then start it again"
   wait_until 1800 "the host is back after the power cycle" host_rebooted "$boot" || return 0
-  nudge_checkup "$host"
+  expect_boot_noticed "$host" || return 0
   # D2: the boot that succeeded before the stop armed this one.
   check_host_on_pvm "$host"
   check_vm_back
@@ -808,7 +895,7 @@ phase_tenancy() {
   if out=$(cpadmin site set "$SITE" --visible 2>&1); then fail "set --visible was accepted"; else pass "set --visible is refused: $(tail -1 <<<"$out")"; fi
   if out=$(cpadmin site set "$SITE" --accept pvm:multitenant 2>&1); then fail "--accept pvm:multitenant was accepted"; else pass "--accept pvm:multitenant is refused: $(tail -1 <<<"$out")"; fi
   if [[ -z ${PVM_E2E_PROJECT2:-} ]]; then
-    info "PVM_E2E_PROJECT2 is unset: the grant to a second project is NOT RUN"
+    skip "a grant to a second project is refused (PVM_E2E_PROJECT2 is unset)"
   elif out=$(cpadmin site grant "$SITE" --project "$PVM_E2E_PROJECT2" 2>&1); then
     fail "a grant to a second project was accepted"
   else
@@ -823,7 +910,7 @@ vm_on_kernel() {
 
 phase_guest_pin_rollout() {
   if [[ -z ${PVM_E2E_GUEST2_URL:-} || -z ${PVM_E2E_GUEST2_SHA256:-} ]]; then
-    info "PVM_E2E_GUEST2_URL and PVM_E2E_GUEST2_SHA256 are unset: guest-pin-rollout is NOT RUN (UNVERIFIED)"
+    skip "guest-pin-rollout (PVM_E2E_GUEST2_URL and PVM_E2E_GUEST2_SHA256 are unset)"
     return 0
   fi
   local host vm sha=$PVM_E2E_GUEST2_SHA256 args
@@ -843,12 +930,13 @@ phase_guest_pin_rollout() {
   check "restart" ubicli vm "$(vm_ref "$VM_A")" restart
   wait_until 900 "the guest booted again" vm_rebooted "$vm" "$before" || return 0
   check "a restart keeps the VM's guest kernel" vm_on_kernel "$vm" "$PVM_GUEST_KERNEL_SHA256"
+  check_vm_kernel "$vm" "$PVM_GUEST_KERNEL_SHA256" "after a restart"
   check "stop" ubicli vm "$(vm_ref "$VM_A")" stop
   wait_until 600 "VM $VM_A is stopped" vm_state_is "$VM_A" stopped || return 0
   check "start" ubicli vm "$(vm_ref "$VM_A")" start
   check_vm_back
   check "after stop and start the VM boots the new guest kernel" vm_on_kernel "$vm" "$sha"
-  info "guest kernel now: $(vm_ssh "$vm" uname -r)"
+  check_vm_kernel "$vm" "$sha" "after stop and start"
   wait_until 600 "the stale guest kernel page resolves" host_no_page "$host" ByohPvmGuestKernelStale
 }
 
@@ -879,7 +967,7 @@ phase_stock_return() {
   wait_until 1200 "the host rebooted" host_rebooted "$boot" || return 0
   check "the host booted its stock kernel $stock" [ "$(host_ssh uname -r)" = "$stock" ]
   check "no pti=off on the stock kernel" host_ssh "! grep -qw pti=off /proc/cmdline"
-  nudge_checkup "$host"
+  expect_boot_noticed "$host" || return 0
   wait_until 900 "ByohPvmBoot pages the stock boot" host_page "$host" ByohPvmBoot "booted its stock kernel" || return 0
   check "the host waits at pvm_boot_failed" [ "$(kv label)" = pvm_boot_failed ]
   check "the host does not take VMs ($(kv allocation_state))" [ "$(kv allocation_state)" = draining ]
@@ -926,11 +1014,32 @@ phase_billing() {
   check "billing ran until the delete request" not_before "$last" "$deleted"
 }
 
+# The newest stock kernel version in patch's "after" list of byoh-virt
+# show (the linux-image-<version> packages after the apt full-upgrade).
+newest_after_patch() {
+  sed -n 's/.*kernel packages before patch: .*; after: //p' "$1" | tr ' ' '\n' | sed -n 's/^linux-image-\([0-9].*\)$/\1/p' | grep -v -- '-pvm$' | sort -V | tail -1
+}
+not_pvm_kernel() { [[ -n $1 && $1 != *-pvm ]]; }
+one_of() { # value candidates...
+  local v=$1 c
+  shift
+  for c in "$@"; do [[ -z $v || $v != "$c" ]] || return 0; done
+  return 1
+}
+running_stock_installed() { [[ $(host_ssh "dpkg-query -W -f '\${db:Status-Status}' linux-image-$1" 2>/dev/null) == installed ]]; }
+
 phase_teardown() {
-  local host stock boot
+  local host stock boot newest
   host=$(host_ubid)
   host_kv "$host"
   stock=$(kv stock_kver)
+  # The install pinned the stock kernel that ran when it ran, but patch's
+  # apt full-upgrade may have added a newer one; uninstall unsets
+  # saved_entry (or restores the one it found), and GRUB_DEFAULT=0 boots
+  # the newest stock kernel.
+  tool byoh-virt show --host "$host" >"$WORK/virt-show-teardown.txt" 2>&1 || true
+  newest=$(newest_after_patch "$WORK/virt-show-teardown.txt")
+  info "stock kernel the install pinned: $stock; newest stock kernel after patch: ${newest:-unknown}"
   check "pvm uninstall" tool byoh-virt pvm uninstall --host "$host"
   wait_until 3600 "the host uninstalled its PVM kernel (ByohPvmUninstalled)" host_page "$host" ByohPvmUninstalled || {
     info "by hand, on the stock kernel: cd $RHIZOME && echo '{}' | sudo host/bin/install-pvm-host-kernel uninstall"
@@ -943,7 +1052,11 @@ phase_teardown() {
   host_ssh systemctl reboot || true
   wait_until 1200 "the host rebooted" host_rebooted "$boot" || return 0
   # pvm-go-no-go.sh's recovery-check, and what uninstall restores.
-  check "the stock kernel $stock runs" [ "$(host_ssh uname -r)" = "$stock" ]
+  local running
+  running=$(host_ssh uname -r)
+  check "a stock kernel runs, not a PVM one ($running)" not_pvm_kernel "$running"
+  check "the running kernel is an installed stock package (linux-image-$running)" running_stock_installed "$running"
+  check "it is the newest stock kernel after patch (${newest:-unknown}) or the pinned one ($stock)" one_of "$running" "$newest" "$stock"
   check "no pti=off" host_ssh "! grep -qw pti=off /proc/cmdline"
   check "no next_entry" [ -z "$(grubenv next_entry)" ]
   check "no PVM kernel package" host_ssh "! dpkg-query -W -f '\${Package} \${Status}\n' 'linux-image-*' | grep 'pvm.* installed'"
@@ -956,8 +1069,11 @@ phase_teardown() {
 
 
 log "== pvm-e2e $(date -u +%FT%TZ): site $SITE, host $PVM_E2E_HOST_SSH ($MAIN_IP), phases: ${RUN[*]}"
+SUMMARY=()
 for phase in "${RUN[@]}"; do
   FAILS=0
+  PASSES=0
+  NOTES=()
   log "== $phase $(date -u +%FT%TZ)"
   t0=$SECONDS
   "phase_${phase//-/_}"
@@ -966,6 +1082,20 @@ for phase in "${RUN[@]}"; do
     log "report: $REPORT"
     exit 1
   fi
-  log "== $phase: PASS after $((SECONDS - t0))s"
+  if ((PASSES == 0 && ${#NOTES[@]})); then
+    log "== $phase: NOT RUN (UNVERIFIED) after $((SECONDS - t0))s"
+    SUMMARY+=("$phase: NOT RUN (UNVERIFIED)")
+  elif ((${#NOTES[@]})); then
+    log "== $phase: PASS with ${#NOTES[@]} note(s) after $((SECONDS - t0))s"
+    for n in "${NOTES[@]}"; do SUMMARY+=("$phase: $n"); done
+  else
+    log "== $phase: PASS after $((SECONDS - t0))s"
+  fi
 done
+if ((${#SUMMARY[@]})); then
+  log "== summary: no phase failed, but not every check ran as the default deployment runs it:"
+  for n in "${SUMMARY[@]}"; do log "  $n"; done
+else
+  log "== summary: every phase given passed"
+fi
 log "report: $REPORT"
