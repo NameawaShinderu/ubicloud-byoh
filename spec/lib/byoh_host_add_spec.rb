@@ -626,6 +626,51 @@ RSpec.describe ByohHostAdd do
     it "takes an unknown tier as a usage error" do
       expect(cli(*base, "--virt-tier", "tcg")).to eq [2, "", "! invalid argument: --virt-tier tcg is not one of kvm, auto, container, pvm, emulated\n"]
     end
+
+    describe "with --install-pvm-kernel" do
+      let(:pvm) { [*base, "--virt-tier", "pvm", "--install-pvm-kernel", "--accept-fallback"] }
+
+      before do
+        ship_virt_tiers("container", "pvm")
+        replies["sudo -n bash -s -- preflight"] = [preflight_fixture("no-kvm-pvm"), "", 0]
+        location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm pvm], "acks" => {"pvm" => []}, "pvm_kernel" => pvm_test_pins}))
+      end
+
+      it "shows the install among the changes, and registers the host for it in two phases" do
+        status, out, err = cli(*pvm, "--yes", "--phase", "prepare")
+        expect(status).to eq 0
+        expect(err).to start_with "note: pvm: the control plane installs the PVM host kernel pinned by location byoh-add"
+        expect(out).to include "Virt tier: pvm (pvm (L4, experimental), accepted with --accept-fallback)\nPVM kernel: installed by the control plane (--install-pvm-kernel), sha256 #{"a" * 64}\n"
+        expect(out).to include "  - once registered, install the PVM host kernel the site pins (a third-party build, sha256 #{"a" * 64}) and reboot the host into it once"
+
+        # The flag is one of the arguments prepare and register must share.
+        expect(cli(*base, "--virt-tier", "pvm", "--accept-fallback", "--phase", "register", runner: nil, starter: nil))
+          .to eq [2, "", "! the arguments differ from those the host was prepared with; prepare it again with these\n"]
+        status, _, err = cli(*pvm, "--phase", "register", "--no-wait", runner: nil, starter: nil)
+        expect([status, err]).to eq [0, ""]
+        expect(ByohPvmHost[host.id].values.slice(:state, :install, :lockdown, :meltdown))
+          .to eq(state: "install_pending", install: true, lockdown: "none", meltdown: "Not affected")
+        expect(DB[:byoh_operator_action].where(command: "register-byoh-host").first[:args]["virt"])
+          .to include("install_pvm_kernel" => true, "host_deb_sha256" => "a" * 64, "lockdown" => "none")
+        expect(cli(*pvm, "--no-wait")[0]).to eq 0
+      end
+
+      it "refuses to resume a host registered without the flag as one to install" do
+        ByohPvmHost.create(vm_host_id: registered(["10.99.0.0/29,exposure=internal"]).id, state: "committed", install: false)
+        status, _, err = cli(*pvm, "--no-wait")
+        expect(status).to eq 2
+        expect(err).to include "PVM kernel: registered without --install-pvm-kernel, given it"
+      end
+
+      it "keeps the prepared-arguments digest of every run without the flag" do
+        add = described_class.new(out: StringIO.new, err: StringIO.new)
+        requested = {location:, routed_networks: []}
+        virt = ByohVirtRegistration.new(declared: "auto", accept_fallback: true)
+        old = Digest::SHA256.hexdigest(JSON.generate(requested.merge(location: "byoh-add", virt: ["auto", true, true])))
+        expect(add.send(:args_digest, requested, virt)).to eq old
+        expect(add.send(:args_digest, requested, ByohVirtRegistration.new(declared: "auto", accept_fallback: true, install_pvm_kernel: true))).not_to eq old
+      end
+    end
   end
 
   describe "preflight" do

@@ -210,12 +210,14 @@ class ByohHostPreflight
   # what the operator asked for; services as from .service_states.
   # virt_tier is the tier the host is meant for (ByohVirtTiers); with
   # ladder false the virt fact is left unused (--no-virt-probe) and the
-  # script's own PF3 stands.
+  # script's own PF3 stands. pvm_install: a pvm host whose PVM kernel
+  # the control plane installs (--install-pvm-kernel), so PF3 judges its
+  # stock kernel for the install.
   def evaluate(main_ip:, pools: [], uplink: nil, uplink_ip: nil, location: nil, location_name: nil, boot_images: [], services: nil,
-    virt_tier: ByohVirtTiers::KVM, ladder: true)
+    virt_tier: ByohVirtTiers::KVM, ladder: true, pvm_install: false)
     return self unless readable?
 
-    virt_checks(virt_tier, ladder ? virt_facts : nil, location)
+    virt_checks(virt_tier, ladder ? virt_facts : nil, location, pvm_install)
     route = default_route(uplink_ip)
     addressing(route, main_ip:, pools:, uplink:, explicit_uplink_ip: uplink_ip, location:)
     boot_images_check(boot_images, location:, location_name:)
@@ -279,12 +281,12 @@ class ByohHostPreflight
   end
 
   # The script prints every check, so each one named here exists.
-  def virt_checks(tier, facts, location)
+  def virt_checks(tier, facts, location, pvm_install)
     @virt_tier = tier
     lower = ByohVirtTiers.lower?(tier)
     (lower ? KVM_ONLY_CHECKS : []).each { not_needed(it, tier) }
     if facts
-      ladder_check(tier, facts)
+      ladder_check(tier, facts, pvm_install)
     elsif lower
       not_needed("PF3", tier, "; the host reported no virtualization facts, so Prog::LearnVirt checks the tier at prep")
     end
@@ -301,9 +303,9 @@ class ByohHostPreflight
   # PF3 from the ladder. For kvm, facts the script could not gather (the
   # /dev/kvm ioctls without ruby) leave the script's verdict standing,
   # with the ladder's view beside it.
-  def ladder_check(tier, facts)
+  def ladder_check(tier, facts, pvm_install)
     @virt_verdict = ByohVirtLadder.from_facts(facts)
-    result = ByohVirtLadder.preflight_check(facts, declared_tier: tier)
+    result = ByohVirtLadder.preflight_check(facts, declared_tier: tier, pvm_install:)
     status = result[:status]
     if tier == ByohVirtTiers::KVM
       script = @checks.find { it.id == "PF3" }
@@ -312,6 +314,7 @@ class ByohHostPreflight
     else
       detail = "#{tier}: #{@virt_verdict.summary}"
       detail += "; #{result[:fix]}" if status != "fail" && result[:fix]
+      detail += "; the control plane installs the location's PVM host kernel (--install-pvm-kernel)" if status == "pass" && pvm_install
     end
     detail += "; #{result[:caveats].join("; ")}" unless result[:caveats].empty?
     update_check("PF3", status, detail, (status == "fail") ? result[:fix].to_s : "")

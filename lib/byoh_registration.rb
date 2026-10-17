@@ -229,10 +229,11 @@ class ByohRegistration
   def evaluate_preflight(report, accept_checks:, services:, host_keys:, virt: nil)
     ladder = virt.nil? || virt.probe_enabled
     facts = report.virt_facts if ladder
-    tier = virt ? virt.preflight_tier(facts) : ByohVirtTiers::KVM
+    tier = virt ? virt.preflight_tier(facts, location:) : ByohVirtTiers::KVM
     boot_images_for!(tier)
     report.evaluate(main_ip: @main_ip, pools: entries, uplink: @uplink, uplink_ip: @explicit_uplink_ip, location:,
-      location_name: location.name, boot_images: @default_boot_images, services:, virt_tier: tier, ladder:)
+      location_name: location.name, boot_images: @default_boot_images, services:, virt_tier: tier, ladder:,
+      pvm_install: !!virt&.pvm_install_preflight?(tier))
     report.accept(accept_checks)
     adopt_preflight(host_keys:, uplink_ip: report.uplink_ip, gateway: report.gateway) unless report.blocking?
     report
@@ -282,8 +283,11 @@ class ByohRegistration
   # SSH key. Returns the resulting Strand. Caller is responsible for
   # printing the UBID to the operator. The registration is written to the
   # operator log, a failure outside the failed transaction.
-  # virt: the ByohVirtRegistration::Decision of the virtualization tier,
-  # or nil for kvm without a probe.
+  # virt: the ByohVirtRegistration::Decision of the virtualization tier
+  # (or the ::Recorded one of byoh-host add), or nil for kvm without a
+  # probe. Its record goes to the operator log, which for a pvm host is
+  # also the record of the operator's --install-pvm-kernel
+  # acknowledgement and of the host's lockdown and Meltdown state.
   def register!(virt: nil)
     validate!
     prepare_keypair
@@ -299,6 +303,12 @@ class ByohRegistration
     }
     kwargs[:default_boot_images] = @default_boot_images unless @default_boot_images.empty?
     kwargs[:virt_tier] = virt.tier if virt && ByohVirtTiers.lower?(virt.tier)
+    # A pvm host's PVM kernel: installed by the control plane, or there
+    # already (byoh_pvm_host).
+    if (pvm_install = virt&.pvm_install)
+      kwargs[:pvm_install] = pvm_install
+      kwargs[:pvm_facts] = virt.pvm_facts
+    end
     kwargs[:pinned_host_keys] = @pinned_host_keys if @pinned_host_keys
 
     args = {main_ip: @main_ip, location: location.name, pools: provider_config["routed_networks"], server_identifier: @server_identifier}

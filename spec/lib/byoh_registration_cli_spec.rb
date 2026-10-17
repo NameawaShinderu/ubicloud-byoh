@@ -226,6 +226,50 @@ RSpec.describe ByohRegistrationCli do
     it "refuses an unknown tier before anything else" do
       expect(cli(*required, "--virt-tier", "tcg", "--yes")).to eq [1, "", "! refused: --virt-tier tcg is not one of kvm, auto, container, pvm, emulated\n"]
     end
+
+    describe "with --install-pvm-kernel" do
+      let(:pvm) { [*installed, "--virt-tier", "pvm", "--install-pvm-kernel", "--accept-fallback"] }
+
+      before do
+        ship_virt_tiers("container", "pvm")
+        Location.first(name: "byoh-test").update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm pvm], "acks" => {"pvm" => []}, "pvm_kernel" => pvm_test_pins}))
+      end
+
+      it "registers a stock host as pvm, and records the acknowledgement and its lockdown state" do
+        status, out, err = cli(*pvm, fixture: "no-kvm-pvm")
+        expect(status).to eq 0
+        expect(out).to match(/^pass +PF3 +pvm: none \(L3-L5\) on unknown platform: .*; the control plane installs the location's PVM host kernel \(--install-pvm-kernel\); KVM: none/)
+        expect(out).to match(/^pass +PF3-tier +location byoh-test offers pvm \(L4, experimental\)$/)
+        expect(out).to include "PVM kernel       installed by the control plane (--install-pvm-kernel), sha256 #{"a" * 64}\n"
+        expect(err).to start_with "note: pvm: the control plane installs the PVM host kernel pinned by location byoh-test"
+        vm_host = VmHost.first
+        expect(vm_host.values.slice(:virt_tier, :family)).to eq(virt_tier: "pvm", family: "pvm")
+        expect(ByohPvmHost[vm_host.id].values.slice(:state, :install, :lockdown, :meltdown))
+          .to eq(state: "install_pending", install: true, lockdown: "none", meltdown: "Not affected")
+        expect(DB[:byoh_operator_action].first[:args]["virt"]).to eq("declared" => "pvm", "tier" => "pvm", "probe" => "none", "accepted_fallback" => true,
+          "install_pvm_kernel" => true, "host_deb_sha256" => "a" * 64, "lockdown" => "none", "meltdown" => "Not affected")
+      end
+
+      it "lets auto pick pvm by an install" do
+        status, out, _ = cli(*installed, "--virt-tier", "auto", "--install-pvm-kernel", "--accept-fallback", fixture: "no-kvm-pvm")
+        expect(status).to eq 0
+        expect(out).to include "Virt tier        pvm (pvm (L4, experimental), accepted with --accept-fallback)\n"
+        expect(ByohPvmHost[VmHost.first.id].state).to eq "install_pending"
+      end
+
+      it "fails PF3 on a host with hardware virtualization, before any change" do
+        status, out, err = cli(*pvm, fixture: "no-kvm")
+        expect(status).to eq 1
+        expect(out).to match(/^fail +PF3 +pvm: kvm_blocked \(L2\)/)
+        expect(out).to include "fix: The CPU has vmx: this host has hardware virtualization, so fix KVM instead and register it as kvm."
+        expect(err).to start_with "! preflight failed"
+        expect([VmHost.count, ByohPvmHost.count, DB[:byoh_operator_action].count]).to eq [0, 0, 0]
+      end
+
+      it "takes the flag only with a pvm or auto tier" do
+        expect(cli(*installed, "--install-pvm-kernel")).to eq [1, "", "! refused: --install-pvm-kernel goes with --virt-tier pvm or auto, not kvm\n"]
+      end
+    end
   end
 
   it "downloads ubuntu-noble when no boot image is named" do

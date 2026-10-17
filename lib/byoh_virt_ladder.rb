@@ -309,8 +309,10 @@ module ByohVirtLadder
   #   checks         each KVM check (see .checks)
   #   fix, caveats   the operator's fix text and INFO lines
   # For a declared fallback tier the KVM checks are INFO and the tier's
-  # own readiness decides.
-  def self.preflight_check(facts, declared_tier: "kvm")
+  # own readiness decides. pvm_install: the host is declared pvm with
+  # --install-pvm-kernel, so its stock kernel is judged for the install
+  # (pvm_install_problem) instead of for a loaded kvm_pvm.
+  def self.preflight_check(facts, declared_tier: "kvm", pvm_install: false)
     raise ArgumentError, "unknown tier #{declared_tier.inspect}; expected one of #{DECLARED_TIERS.join(", ")}" unless DECLARED_TIERS.include?(declared_tier)
 
     v = from_facts(facts)
@@ -324,7 +326,11 @@ module ByohVirtLadder
       return result.merge(status:, fix: v.fix, caveats: v.caveats)
     end
 
-    status, fix = fallback_readiness(v, declared_tier)
+    status, fix = if pvm_install && declared_tier == "pvm"
+      (problem = pvm_install_problem(v)) ? ["fail", problem] : ["pass", nil]
+    else
+      fallback_readiness(v, declared_tier)
+    end
     advice = v.fix && "KVM fix, if you would rather run today's VMs: #{v.fix}"
     result.merge(status:, fix:, caveats: ["KVM: #{v.summary}", *advice] + v.caveats)
   end
@@ -344,6 +350,34 @@ module ByohVirtLadder
 
     status = meltdown ? "is \"#{meltdown}\"" : "was not gathered"
     "This CPU's Meltdown status #{status}, not \"Not affected\": PVM's host kernel runs with pti=off, so a guest could read host memory. PVM is refused on such a CPU in every location."
+  end
+
+  # Why the control plane cannot install the PVM host kernel on the host
+  # of verdict v (bin/register-byoh-host --install-pvm-kernel), or nil:
+  # it must run a stock kernel without usable KVM on an x86_64 CPU
+  # without hardware virtualization (ByohVirtTiers.pvm_stock_host?), and
+  # none of PVM's hard refusals may apply. The location's side is
+  # ByohVirtRegistration's.
+  def self.pvm_install_problem(v)
+    facts = v.report["facts"]
+    flags = Array(facts["cpu_flags"]) & %w[vmx svm]
+    problem = if v.tier == "pvm"
+      "This host already runs a PVM kernel (kvm_pvm is loaded); register it as pvm without --install-pvm-kernel."
+    elsif v.tier == "kvm"
+      "This host runs KVM (L1), which is faster and isolates better than PVM; register it as kvm."
+    elsif !ByohVirtTiers::PVM_STOCK_TIERS.include?(v.tier)
+      "The control plane cannot install a PVM kernel on this host: #{v.summary}."
+    elsif facts["arch"] != "x86_64"
+      "PVM is x86_64 only; this host is #{facts["arch"]}."
+    elsif flags.any?
+      "The CPU has #{flags.join(" and ")}: this host has hardware virtualization, so fix KVM instead and register it as kvm."
+    elsif facts["dev_kvm"]
+      "/dev/kvm exists on the stock kernel, so KVM is nearly there; fix it instead and register the host as kvm."
+    else
+      return pvm_refusal(facts)
+    end
+    # The KVM fix, but not for a PVM host, whose fix text is about L1.
+    [problem, (v.fix unless v.tier == "pvm")].compact.join(" ")
   end
 
   def self.fallback_readiness(v, declared)

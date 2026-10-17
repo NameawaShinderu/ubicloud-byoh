@@ -198,9 +198,9 @@ module ByohVirtTiers
   #
   # pvm_install is the byoh_pvm_host state of a PVM host whose kernel the
   # control plane installs: until that kernel first boots, the host runs
-  # its stock kernel, so a probe without hardware virtualization (none,
-  # or pvm_blocked) on x86_64 agrees too. nil for every other host, which
-  # keeps their answers as they were.
+  # its stock kernel, so a stock probe it can install on (pvm_stock_host?)
+  # agrees too. nil for every other host, which keeps their answers as
+  # they were.
   def self.accepts_probe?(tier, verdict, pvm_install: nil)
     return verdict.standard_vms? if tier == KVM
     return false if tier == "pvm" && ByohVirtLadder.pvm_refusal(verdict.report["facts"])
@@ -210,9 +210,32 @@ module ByohVirtTiers
   end
 
   def self.pvm_stock_kernel_ok?(verdict, pvm_install)
+    ByohPvmHost::PRE_BOOT_STATES.include?(pvm_install) && pvm_stock_host?(verdict)
+  end
+
+  # The probe verdicts of a stock kernel that the control plane may
+  # install the PVM host kernel on (bin/register-byoh-host
+  # --install-pvm-kernel): no usable KVM, and kvm_blocked only for what
+  # hardware virtualization cannot fix here (a generic CPU model, or
+  # firmware), since the checks below leave no vmx or svm.
+  PVM_STOCK_TIERS = %w[none pvm_blocked kvm_blocked].freeze
+
+  # Whether the verdict is of such a stock kernel on an x86_64 CPU
+  # without hardware virtualization and without /dev/kvm (rhizome's
+  # install-pvm-host-kernel preflight refuses both, as KVM would serve
+  # the host better). Says nothing of PVM's hard refusals
+  # (ByohVirtLadder.pvm_refusal).
+  def self.pvm_stock_host?(verdict)
     facts = verdict.report["facts"]
-    ByohPvmHost::PRE_BOOT_STATES.include?(pvm_install) && %w[none pvm_blocked].include?(verdict.tier) &&
-      facts["arch"] == "x86_64" && !Array(facts["cpu_flags"]).intersect?(%w[vmx svm])
+    PVM_STOCK_TIERS.include?(verdict.tier) && facts["arch"] == "x86_64" &&
+      !Array(facts["cpu_flags"]).intersect?(%w[vmx svm]) && !facts["dev_kvm"]
+  end
+
+  # Whether the location pins both PVM kernels (ByohPvmPolicy), so that
+  # its hosts can install the host kernel and boot VMs.
+  def self.pvm_pinned?(location)
+    pins = ByohPvmPolicy.pins(policy(location))
+    !!(pins&.dig("host_deb", "sha256") && pins.dig("guest_kernel", "sha256"))
   end
 
   # The root device of each boot image a PVM VM can boot. PVM VMs boot

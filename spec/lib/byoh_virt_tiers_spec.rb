@@ -146,6 +146,21 @@ RSpec.describe ByohVirtTiers do
       expect(described_class.accepts_probe?("container", none, pvm_install: "armed")).to be true
       expect(described_class.accepts_probe?("emulated", none, pvm_install: "armed")).to be false
     end
+
+    it "takes a kvm_blocked stock probe for a PVM install only without hardware virtualization or /dev/kvm" do
+      generic = verdict(cpu_model: "QEMU Virtual CPU version 2.5+", vulnerabilities: {"meltdown" => "Not affected"})
+      expect(generic.tier).to eq "kvm_blocked"
+      expect(described_class.accepts_probe?("pvm", generic, pvm_install: "install_pending")).to be true
+      expect(described_class.accepts_probe?("pvm", generic, pvm_install: nil)).to be false
+      unresponsive = verdict(cpu_model: "QEMU Virtual CPU version 2.5+", dev_kvm: true, kvm_api: "EIO", vulnerabilities: {"meltdown" => "Not affected"})
+      expect([unresponsive.tier, described_class.accepts_probe?("pvm", unresponsive, pvm_install: "armed")]).to eq ["kvm_blocked", false]
+    end
+
+    it "says whether a location pins both PVM kernels" do
+      expect(described_class.pvm_pinned?(location)).to be false
+      offer(location, {"tiers" => %w[kvm pvm], "acks" => {"pvm" => []}, "pvm_kernel" => pvm_test_pins})
+      expect(described_class.pvm_pinned?(location)).to be true
+    end
   end
 
   it "names the root partition of each image PVM VMs boot" do

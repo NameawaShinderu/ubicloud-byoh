@@ -68,6 +68,13 @@
 # tier skips only the KVM checks and installs only that tier's userspace
 # packages. This script never changes kernels, sysctls or GRUB.
 #
+# --tier pvm only checks, read-only, what the control plane's PVM kernel
+# install would refuse and this host can answer without the site's
+# pins (pvm_checks), and creates the kvm group the PVM host's /dev/kvm
+# belongs to. On a stock kernel the control plane installs the site's
+# PVM host kernel after registration (--install-pvm-kernel); on a host
+# whose PVM kernel is loaded already, registration needs no flag.
+#
 # Exit status: 0 the host is prepared and preflight found no failing
 # check (or did not run); 1 a step failed, or preflight found a failing
 # check or could not run; 2 a usage error. The steps are done and marked
@@ -123,6 +130,68 @@ unsafe_path() {
     [[ $p != / ]] || return 0
     p=$(dirname "$p")
   done
+}
+
+# pvm_checks: the read-only checks of a pvm host (docs/byoh/NO_KVM.md
+# section 6.7), the refusals of rhizome's install-pvm-host-kernel
+# preflight that need no PVM kernel pins: x86_64, no hardware
+# virtualization, Secure Boot off, a CPU Meltdown does not affect (the
+# PVM kernel runs with pti=off), GRUB as the boot loader and
+# GRUB_SAVEDEFAULT off. HOST_ROOT (default /) is where /proc, /sys, /dev,
+# /etc and /boot are read from. Prints each finding; returns 1 when
+# any refuses. Sets PVM_KERNEL_LOADED=1 when kvm_pvm is loaded, so a
+# PVM host kernel runs already.
+pvm_checks() {
+  local root=${HOST_ROOT:-} fails=0 meltdown lockdown var sb f
+  PVM_KERNEL_LOADED=0
+  if [ "$(uname -m)" != x86_64 ]; then
+    echo "ERROR: PVM hosts must be x86_64; this is $(uname -m)." >&2
+    fails=1
+  fi
+  if grep -Eqw 'vmx|svm' "$root/proc/cpuinfo" 2>/dev/null; then
+    echo "ERROR: the CPU has the vmx or svm flag: this host has hardware virtualization, so run it as kvm (--tier kvm; bin/byoh-virt probe prints the fix)." >&2
+    fails=1
+  fi
+  if [ -d "$root/sys/module/kvm_pvm" ]; then
+    PVM_KERNEL_LOADED=1
+    echo "  kvm_pvm is loaded: a PVM host kernel runs; register without --install-pvm-kernel"
+  else
+    if [ -e "$root/dev/kvm" ]; then
+      echo "ERROR: /dev/kvm exists on this stock kernel, so KVM works or nearly works here; register the host as kvm (bin/byoh-virt probe prints the fix)." >&2
+      fails=1
+    fi
+    echo "  stock kernel $(uname -r): the control plane installs the site's PVM host kernel after registration (--install-pvm-kernel)"
+  fi
+  for var in "$root"/sys/firmware/efi/efivars/SecureBoot-*; do
+    [ -f "$var" ] || continue
+    sb=$(od -An -tu1 -- "$var" | awk '{ for (i = 1; i <= NF; i++) last = $i } END { print last }')
+    if [ "$sb" = 1 ]; then
+      echo "ERROR: Secure Boot is on, and the PVM kernel and its kvm_pvm module are not signed; turn Secure Boot off." >&2
+      fails=1
+    fi
+  done
+  meltdown=$(cat "$root/sys/devices/system/cpu/vulnerabilities/meltdown" 2>/dev/null || true)
+  if [ "$meltdown" != "Not affected" ]; then
+    echo "ERROR: this CPU's Meltdown status is \"${meltdown:-unknown}\", not \"Not affected\": the PVM kernel runs with pti=off, so a guest could read host memory. PVM is refused on such a CPU." >&2
+    fails=1
+  fi
+  lockdown=$(sed -n 's/.*\[\([a-z]*\)\].*/\1/p' "$root/sys/kernel/security/lockdown" 2>/dev/null || true)
+  if [ -n "$lockdown" ] && [ "$lockdown" != none ]; then
+    echo "  WARNING: kernel lockdown is $lockdown; the unsigned kvm_pvm module does not load under lockdown (remove lockdown= from the kernel command line)."
+  fi
+  if ((!PVM_KERNEL_LOADED)) && [ ! -f "$root/boot/grub/grub.cfg" ]; then
+    echo "ERROR: there is no /boot/grub/grub.cfg: the PVM kernel install needs GRUB as the boot loader." >&2
+    fails=1
+  fi
+  for f in "$root/etc/default/grub" "$root"/etc/default/grub.d/*.cfg; do
+    [ -f "$f" ] || continue
+    if grep -Eq "^GRUB_SAVEDEFAULT=[\"']?true" "$f"; then
+      echo "ERROR: GRUB_SAVEDEFAULT=true in ${f#"$root"} would make a one-time PVM boot the default; remove it." >&2
+      fails=1
+    fi
+  done
+  ((!fails)) || return 1
+  echo "  PVM checks passed: x86_64 without vmx/svm, Secure Boot off, Meltdown not affected"
 }
 
 TIER=kvm
@@ -341,9 +410,13 @@ else
       tier_packages="qemu-system-x86 ovmf"
       ;;
     pvm)
-      if [ ! -d /sys/module/kvm_pvm ]; then
-        echo "ERROR: kvm_pvm is not loaded. This script never changes kernels: boot a PVM host kernel and modprobe kvm_pvm first (docs/byoh/NO_KVM.md)." >&2
-        exit 1
+      # Read-only: this script never changes kernels or GRUB. The
+      # control plane's install refuses again, with the site's pins.
+      pvm_checks || exit 1
+      # The group of the PVM host's /dev/kvm (the install's udev rule).
+      if ! getent group kvm >/dev/null; then
+        sudo groupadd --system kvm
+        echo "  created the kvm group"
       fi
       tier_packages=""
       ;;
@@ -514,8 +587,14 @@ if [ "$TIER" != kvm ]; then
   # A lower tier boots only its own images, and the host downloads the
   # first of them when no --default-boot-image is given.
   echo ""
-  echo "This host was prepared for --tier $TIER: add --virt-tier $TIER --accept-fallback"
+  pvm_install=""
+  [ "$TIER" != pvm ] || [ "${PVM_KERNEL_LOADED:-0}" = 1 ] || pvm_install=" --install-pvm-kernel"
+  echo "This host was prepared for --tier $TIER: add --virt-tier $TIER$pvm_install --accept-fallback"
   echo "to host add (or register-byoh-host), and leave out --default-boot-image."
+  if [ -n "$pvm_install" ]; then
+    echo "The site must offer pvm with its PVM kernel pins first (bin/byoh-location set --virt-tiers ...,pvm"
+    echo "--accept pvm --pvm-host-deb ... --pvm-guest-kernel ...; docs/byoh/NO_KVM.md section 6.7)."
+  fi
 fi
 echo ""
 echo "How the pool addresses reach this host depends on the site"

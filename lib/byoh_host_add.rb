@@ -289,7 +289,8 @@ class ByohHostAdd
     o[:default_boot_images] = nil if o[:default_boot_images].empty?
     ByohHostPreflight.validate_accept!(o[:accept_checks])
     o[:virt] = begin
-      ByohVirtRegistration.new(declared: o[:virt_tier], accept_fallback: o[:accept_fallback], probe: o[:virt_probe] != false)
+      ByohVirtRegistration.new(declared: o[:virt_tier], accept_fallback: o[:accept_fallback], probe: o[:virt_probe] != false,
+        install_pvm_kernel: o[:install_pvm_kernel])
     rescue ByohVirtRegistration::Refused => ex
       raise OptionParser::InvalidArgument, ex.message
     end
@@ -363,7 +364,7 @@ class ByohHostAdd
         keys, cp_ip, decision = host_preflight(ssh, reg, o, services, adding: true)
         print_fingerprints(keys, ssh)
         expected!(o[:expect_host_keys], keys, ssh)
-        confirm!(o, mutation_summary(ssh, o, site))
+        confirm!(o, mutation_summary(ssh, o, site, decision))
 
         key_path = keep_registration_key(site, o[:main_ip], registration_key)
         public_key = read_registration_key(key_path).public_key
@@ -446,6 +447,7 @@ class ByohHostAdd
       unprobed_reason: o[:virt].unprobed_reason(seen), boot_images: reg.default_boot_images)
     decision.notes.each { @err.puts "note: #{it}" }
     @out.puts "Virt tier: #{decision.tier}#{" (#{ByohVirtTiers.fetch(decision.tier).label}, accepted with --accept-fallback)" if ByohVirtTiers.lower?(decision.tier)}"
+    @out.puts "PVM kernel: installed by the control plane (--install-pvm-kernel), sha256 #{decision.host_deb_sha256}" if decision.install_pvm_kernel
     [keys, cp_ip, decision]
   end
 
@@ -501,8 +503,9 @@ class ByohHostAdd
   end
 
   # The confirmation text: what will change, with each storage disk's
-  # size, model and serial.
-  def mutation_summary(ssh, o, site)
+  # size, model and serial, and the PVM kernel install that the
+  # registration starts (decision, the ByohVirtRegistration::Decision).
+  def mutation_summary(ssh, o, site, decision)
     disks = o[:storage_disks].map do |id|
       res = ssh.run("lsblk -dnbPo SIZE,MODEL,SERIAL #{"/dev/disk/by-id/#{id}".shellescape}")
       raise Failure, "no disk /dev/disk/by-id/#{id} on the host; nothing was changed" unless res.success?
@@ -511,7 +514,11 @@ class ByohHostAdd
       "format /dev/disk/by-id/#{id} (#{(info["SIZE"].to_i / 2**30.0).round(1)} GiB, model #{info["MODEL"].to_s.strip}, serial #{info["SERIAL"].to_s.strip}) as ext4 for VM storage, erasing it"
     end
     disk_line = disks.empty? ? nil : disks.join("\n  - ")
-    MUTATIONS.filter_map { |m| (m == "%<disks>s") ? disk_line : format(m, tag: tag(site, o[:main_ip])) }
+    lines = MUTATIONS.filter_map { |m| (m == "%<disks>s") ? disk_line : format(m, tag: tag(site, o[:main_ip])) }
+    return lines unless decision.install_pvm_kernel
+
+    lines << "once registered, install the PVM host kernel the site pins (a third-party build, sha256 #{decision.host_deb_sha256}) " \
+      "and reboot the host into it once; the stock kernel stays the GRUB default (docs/byoh/NO_KVM.md section 6.7)"
   end
 
   def confirm!(o, mutations)
@@ -587,8 +594,12 @@ class ByohHostAdd
 
   # Of the requested settings and the virtualization options, which
   # the register phase must repeat as prepare got them.
+  # --install-pvm-kernel joins them only when given, so every other
+  # prepared host keeps its digest.
   def args_digest(requested, virt)
-    Digest::SHA256.hexdigest(JSON.generate(requested.merge(location: requested[:location].name, virt: [virt.declared, virt.accept_fallback, virt.probe_enabled])))
+    options = [virt.declared, virt.accept_fallback, virt.probe_enabled]
+    options << "install-pvm-kernel" if virt.install_pvm_kernel
+    Digest::SHA256.hexdigest(JSON.generate(requested.merge(location: requested[:location].name, virt: options)))
   end
 
   def write_state(site, main_ip, requested, virt_options, **state)
@@ -691,6 +702,9 @@ class ByohHostAdd
     diff = []
     unless ["auto", host.virt_tier].include?(virt.declared)
       diff << "virt tier: registered #{host.virt_tier}, given #{virt.declared}"
+    end
+    if virt.install_pvm_kernel && ByohPvmHost.where(vm_host_id: host.id, install: true).empty?
+      diff << "PVM kernel: registered without --install-pvm-kernel, given it"
     end
     # Hosts registered before M2 keep legacy entries; compare them as
     # every other reader of the config sees them.

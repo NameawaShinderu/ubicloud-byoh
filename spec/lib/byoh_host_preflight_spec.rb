@@ -242,6 +242,19 @@ RSpec.describe ByohHostPreflight do
       expect(status(preflight, "PF3-tier")).to eq "pass"
     end
 
+    it "judges a stock kernel for a PVM install with --install-pvm-kernel" do
+      location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm pvm], "acks" => {"pvm" => []}, "pvm_kernel" => pvm_test_pins}))
+      ship_virt_tiers("pvm")
+      without = evaluate(from_fixture("no-kvm-pvm"), main_ip: "203.0.113.10", virt_tier: "pvm")
+      expect(check(without, "PF3")).to have_attributes(status: "fail", fix: start_with("This host cannot run pvm"))
+      install = evaluate(from_fixture("no-kvm-pvm"), main_ip: "203.0.113.10", virt_tier: "pvm", pvm_install: true)
+      expect(check(install, "PF3")).to have_attributes(status: "pass", fix: "",
+        detail: start_with("pvm: none (L3-L5) on unknown platform: this VM (amazon) gets no hardware virtualization from its hypervisor; the control plane installs the location's PVM host kernel (--install-pvm-kernel); KVM: "))
+      expect(status(install, "PF3-tier")).to eq "pass"
+      vmx = evaluate(from_fixture("no-kvm"), main_ip: "203.0.113.10", virt_tier: "pvm", pvm_install: true)
+      expect(check(vmx, "PF3")).to have_attributes(status: "fail", fix: start_with("The CPU has vmx: this host has hardware virtualization"))
+    end
+
     it "fails a tier this control plane cannot register, and skips the location check without a location" do
       preflight = evaluate(from_fixture("no-kvm"), main_ip: "203.0.113.10", virt_tier: "pvm")
       expect(check(preflight, "PF3-tier").to_h).to include(status: "fail", detail: "pvm hosts are not available yet (docs/byoh/NO_KVM.md section 11)")

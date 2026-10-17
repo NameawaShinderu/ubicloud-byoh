@@ -66,7 +66,12 @@ RSpec.describe ByohVirtRegistration do
         if expected.is_a?(String)
           decision = decide.call
           expect(decision.tier).to eq expected
-          expect(decision.record).to eq("declared" => declared, "tier" => expected, "probe" => verdict_for(probe)&.tier, "accepted_fallback" => expected != "kvm")
+          record = {"declared" => declared, "tier" => expected, "probe" => verdict_for(probe)&.tier, "accepted_fallback" => expected != "kvm"}
+          # pvm adds what its kernel install needs (none here).
+          meltdown = verdict_for(probe)&.report&.dig("facts", "vulnerabilities", "meltdown")
+          record.merge!("install_pvm_kernel" => false, "lockdown" => nil, "meltdown" => meltdown) if expected == "pvm"
+          expect(decision.record).to eq record
+          expect(decision.pvm_install).to eq((expected == "pvm") ? "committed" : nil)
         else
           expect { decide.call }.to raise_error(described_class::Refused, expected)
         end

@@ -39,7 +39,8 @@ class ByohRegistrationCli
     )
     registration.validate!
     ByohHostPreflight.validate_accept!(options[:accept_checks])
-    virt = ByohVirtRegistration.new(declared: options[:virt_tier], accept_fallback: options[:accept_fallback], probe: options[:virt_probe] != false)
+    virt = ByohVirtRegistration.new(declared: options[:virt_tier], accept_fallback: options[:accept_fallback], probe: options[:virt_probe] != false,
+      install_pvm_kernel: options[:install_pvm_kernel])
     registration.boot_images_for!(virt.declared) unless virt.declared == "auto"
     registration.provider_config
     registration.notes.each { @err.puts "note: #{it}" }
@@ -207,6 +208,7 @@ class ByohRegistrationCli
       @out.puts "BMC              #{bmc["endpoint"]} (protocol=#{bmc["protocol"]}, system_id=#{bmc["system_id"] || "auto"})"
     end
     @out.puts "Virt tier        #{decision.tier}#{" (#{ByohVirtTiers.fetch(decision.tier).label}, accepted with --accept-fallback)" if ByohVirtTiers.lower?(decision.tier)}"
+    @out.puts "PVM kernel       installed by the control plane (--install-pvm-kernel), sha256 #{decision.host_deb_sha256}" if decision.install_pvm_kernel
     @out.puts
   end
 

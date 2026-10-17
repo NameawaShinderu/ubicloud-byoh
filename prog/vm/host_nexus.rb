@@ -5,7 +5,7 @@ class Prog::Vm::HostNexus < Prog::Base
   frame_reader :vhost_block_backend_version, :default_boot_images, :install_os
   frame_accessor :accepting_before_patch
 
-  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false, ipv6_mode: "gua", virt_tier: ByohVirtTiers::KVM, pinned_host_keys: nil)
+  def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false, ipv6_mode: "gua", virt_tier: ByohVirtTiers::KVM, pinned_host_keys: nil, pvm_install: nil, pvm_facts: {})
     DB.transaction do
       unless (location = Location[location_id])
         raise "No existing Location"
@@ -49,6 +49,17 @@ class Prog::Vm::HostNexus < Prog::Base
         raise "Location #{location.name} does not offer kvm hosts"
       end
 
+      # A pvm host's PVM kernel (docs/byoh/NO_KVM.md section 6.7): the
+      # control plane installs the location's pin (install_pending, the
+      # operator's --install-pvm-kernel), or the host runs one already
+      # (committed). A location that offers pvm pins both kernels (its
+      # byoh_virt CHECK).
+      if virt_tier == "pvm"
+        raise "A pvm host is registered with pvm_install install_pending or committed, not #{pvm_install.inspect}" unless %w[install_pending committed].include?(pvm_install)
+      elsif pvm_install
+        raise "Only a pvm host takes pvm_install"
+      end
+
       # Host keys the operator confirmed for a BYOH host. They are stored
       # before the first connection, and BootstrapRhizome verifies even
       # its first root login against them.
@@ -71,6 +82,10 @@ class Prog::Vm::HostNexus < Prog::Base
       sshable_args[:host_keys] = Sequel.pg_array(pinned_host_keys, :text) if pinned_host_keys
       Sshable.create_with_id(id, **sshable_args)
       vmh = VmHost.create_with_id(id, **host_args)
+      if pvm_install
+        ByohPvmHost.create(vm_host_id: id, state: pvm_install, install: pvm_install == "install_pending",
+          lockdown: pvm_facts["lockdown"], meltdown: pvm_facts["meltdown"])
+      end
 
       if [HostProvider::HETZNER_PROVIDER_NAME, *HostProvider::LEASEWEB_PROVIDER_NAMES, HostProvider::GENERIC_PROVIDER_NAME].include?(provider_name)
         effective_server_identifier = server_identifier

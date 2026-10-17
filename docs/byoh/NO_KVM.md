@@ -1237,11 +1237,26 @@ Flags on `bin/register-byoh-host`:
 - `--virt-tier kvm|auto|container|pvm|emulated`. The default is `kvm`, so today's commands behave as
   today on an L1 host; a non-L1 host is refused, now with the fix and a recommended command line.
 - `--accept-fallback`: required whenever the resulting tier is not `kvm`, including through `auto`.
-- `--install-pvm-kernel`: not built (WP7 stopped at the go/no-go script). Since `pvm` is not in
-  `ByohVirtTiers::SHIPPED`, `--virt-tier pvm` is refused with "pvm hosts are not available yet" on
-  every host, probed or not, before the probe's preflight could ask for host work such as
-  `modprobe kvm_pvm`. `auto` on a ready PVM host gets the same refusal. The `pvm` column of the
-  matrix below describes the design after a GO.
+- `--install-pvm-kernel` (built on `pvm-build`, WP6 of the PVM plan): the per-host
+  acknowledgement that the control plane installs the location's pinned PVM host kernel (a
+  third-party build) and reboots the host into it once. It goes only with `--virt-tier pvm` or
+  `auto`, and needs the probe. Until `pvm` joins `ByohVirtTiers::SHIPPED` (WP8), `--virt-tier pvm`
+  is still refused with "pvm hosts are not available yet" on every host, before the probe's
+  preflight could ask for host work. With the flag, a probe of `none`, `pvm_blocked`, or
+  `kvm_blocked` is taken for `pvm` only when all of these hold (`ByohVirtLadder.pvm_install_problem`
+  and `ByohVirtRegistration`):
+  - the CPU is x86_64, without vmx or svm, and there is no `/dev/kvm` on the stock kernel;
+  - none of PVM's hard refusals applies: Secure Boot is off, and Meltdown is "Not affected"
+    (`pvm_refusal`, which fails closed);
+  - the location offers and acknowledges `pvm` and pins both PVM kernels.
+  PF3 judges the stock kernel for the install, and every refusal comes before any change on the
+  host or in the database. A `kvm_blocked` host gets a note that switching KVM on is faster. A
+  lockdown other than `none` gets a note: the PVM entry keeps the stock command line, and the
+  unsigned `kvm_pvm` does not load under lockdown. The flag on a host that already runs a PVM
+  kernel is refused, since it would record an install that never happens. The shell facts of
+  `ubicloud-host` now carry `secure_boot`, `lockdown` and `vulnerabilities`, so a host without
+  ruby is judged too. Before that, `pvm_refusal` refused every such host as "Meltdown status was
+  not gathered".
 - `--no-virt-probe`: skip the pre-registration probe; LearnVirt checks at prep. A lower-tier host
   waits at `verify_virt_tier` until a probe agrees with its tier. A `kvm` host is not held: LearnVirt
   fails open, prep goes on, and LearnVirt pages with the fix if the host cannot run VMs (PrepHost
@@ -1272,8 +1287,19 @@ The registration matrix (probe × declared tier). "ack" means allowed with `--ac
 | `pvm` | refuse (firmware boot is impossible) | → pvm, ack | refuse ("register it as pvm") | ack | refuse |
 | `container` (the data plane is a container) | refuse | refuse | refuse | refuse | refuse |
 
-`auto` never picks `pvm` unless `kvm_pvm` is already loaded: no automatic kernel swap. Every outcome
-(probe tier, declared tier, acks) is recorded in the `byoh_operator_action` args.
+`auto` never picks `pvm` by a kernel install without `--install-pvm-kernel`. With the flag it does
+so only on `none` or `pvm_blocked` (never `kvm_blocked`, where fixing KVM is the answer), and only
+where the install would pass in a location that offers, acknowledges and pins `pvm`. Anywhere else
+`auto` picks exactly what it picks without the flag, and adds the note "--install-pvm-kernel was not
+used: <why>". A spec pins `auto` per probe fixture, and that spec also passes on the commit before
+the flag. Every outcome (probe tier, declared tier, acks) is recorded in the `byoh_operator_action`
+args. For `pvm` the record also carries `install_pvm_kernel` and, for an install, the
+acknowledged `host_deb_sha256`, plus the stock kernel's `lockdown` and the CPU's `meltdown`.
+`HostNexus.assemble(pvm_install:)` writes `byoh_pvm_host` as `install_pending` (an install) or
+`committed` (a host that runs a PVM kernel already), with that lockdown and Meltdown state. kvm,
+container and emulated hosts get no row. `byoh-host add` shows the install among the changes it asks
+to confirm. The flag joins the prepared-arguments digest only when given, so other prepared hosts
+keep theirs.
 
 ### 11.3 Data-plane bootstrap (SHIPPED, WP4)
 
@@ -1292,6 +1318,13 @@ kernels, sysctls or GRUB.
   since WP5). `BYOH_ALLOW_UNSHIPPED_TIER=1` prepares it anyway, with a warning, for lab work only. A
   shipped tier skips only the KVM checks and installs only its userspace packages (`lxc lxcfs uidmap
   xz-utils quota cryptsetup-bin e2fsprogs`; `qemu-system-x86 ovmf`; nothing for pvm).
+- `pvm` (PVM WP6) runs only read-only checks (`pvm_checks`), which are the install refusals that need
+  no pins: x86_64, no vmx or svm, no `/dev/kvm` on a stock kernel, Secure Boot off, Meltdown "Not
+  affected", GRUB present and `GRUB_SAVEDEFAULT` not true. It warns of a lockdown. It creates the
+  `kvm` group and never changes kernels. On a stock kernel it prints `--virt-tier pvm
+  --install-pvm-kernel --accept-fallback` as the next step. Where `kvm_pvm` is loaded already, it
+  prints the flags without `--install-pvm-kernel`. A spec runs `pvm_checks` against fake host
+  trees. On a real host this is UNVERIFIED.
 - Ubuntu's `lxc` package enables `lxc-net` (an `lxcbr0` bridge with its own dnsmasq and NAT rules).
   Container host prep (`HostTier.container_host_setup`, WP5) writes `USE_LXC_BRIDGE="false"` to
   `/etc/default/lxc-net` and disables the unit, so it never runs beside the BYOH nftables and per-VM
@@ -1304,7 +1337,7 @@ before; `auto` refuses `kvm_blocked` and a container, picks kvm, pvm or containe
 refuses the unshipped pvm and container before any `apt-get`; `--tier emulated` is refused before any
 `apt-get`; with `BYOH_ALLOW_UNSHIPPED_TIER=1` the emulated and container paths install their packages
 (stubbed) and print `--virt-tier <tier> --accept-fallback`. (That run predates WP5 and WP6, which ship
-container and emulated; the emulated additions of section 8.1 are UNVERIFIED); `--tier pvm` refuses without `kvm_pvm`;
+container and emulated; the emulated additions of section 8.1 are UNVERIFIED); `--tier pvm` refused without `kvm_pvm` (before PVM WP6, which replaced that with `pvm_checks`);
 `auto` outside a checkout and bad arguments are refused. On a real VM without KVM it is UNVERIFIED.
 
 ### 11.4 Where the registration code lives
