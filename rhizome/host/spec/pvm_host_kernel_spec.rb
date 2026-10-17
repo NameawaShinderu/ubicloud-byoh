@@ -175,7 +175,7 @@ RSpec.describe PvmHostKernel do
       "a stock kernel not from dpkg" => [->(_t, f) { f.packages.clear }, "the running kernel is not from the package linux-image-#{FakePvmHost::STOCK}, so it cannot be held"],
       "an odd kernel version" => [->(_t, f) { f.kernel = "7.0\"x" }, nil],
       "no stock entry" => [->(_t, f) { f.kernel = "7.0.0-9999-custom" }, nil],
-      "an unchecked driver" => [->(_t, f) { File.delete(File.join(f.root, "sys/devices/pci0000:00/0000:00:01.0/0000:00:00.0/driver")) && File.symlink("/sys/bus/drivers/foo_nic", File.join(f.root, "sys/devices/pci0000:00/0000:00:01.0/0000:00:00.0/driver")) }, "cannot check the PVM kernel for the drivers this host's disks and NICs use: foo_nic (no module of that name in #{FakePvmHost::STOCK}); check by hand that the PVM kernel has them, then pass them as unchecked_drivers"],
+      "an unchecked driver" => [->(_t, f) { File.delete(File.join(f.root, "sys/devices/pci0000:00/0000:00:01.0/0000:00:00.0/driver")) && File.symlink("/sys/bus/drivers/foo_nic", File.join(f.root, "sys/devices/pci0000:00/0000:00:01.0/0000:00:00.0/driver")) }, "cannot check the PVM kernel for the drivers this host's disks and NICs use: foo_nic (no module of that name in #{FakePvmHost::STOCK}); check by hand that the PVM kernel has them, then list them with bin/byoh-location set --pvm-unchecked-drivers"],
       "too little space" => [->(_t, f) { f.mount("boot", 200_000) }, "needs about 292 MiB free on /boot (for /boot), has 195 MiB"],
       "too little space, summed per file system" => [->(_t, f) { f.avail_kib["/"] = 2_000_000 }, "needs about 2343 MiB free on / (for /var/lib/ubicloud/pvm and / and /boot), has 1953 MiB"],
     }

@@ -96,6 +96,28 @@ RSpec.describe ByohPvmPolicy do
       expect { described_class.merge(old, {"guest_config" => config, "guest_unchecked" => true}) }
         .to raise_error(described_class::Refused, "pass either --pvm-guest-config or --pvm-guest-unchecked, not both")
     end
+
+    it "keeps the drivers the operator vouches for, and drops them with an empty list" do
+      old = described_class.merge(nil, {"host_deb" => deb, "guest_kernel" => kernel, "unchecked_drivers" => %w[hv_storvsc hv_netvsc hv_storvsc]})
+      expect(old["unchecked_drivers"]).to eq %w[hv_storvsc hv_netvsc]
+      expect(described_class.unchecked_drivers(old)).to eq %w[hv_storvsc hv_netvsc]
+      expect(described_class.merge(old, {"host_deb" => deb.merge("sha256" => "d" * 64)})["unchecked_drivers"]).to eq %w[hv_storvsc hv_netvsc]
+      expect(described_class.merge(old, {"unchecked_drivers" => []})).not_to have_key("unchecked_drivers")
+      expect(described_class.unchecked_drivers(old.except("unchecked_drivers"))).to eq []
+      expect(described_class.unchecked_drivers(nil)).to eq []
+      [["bad name"], ["a", nil], ["x/y"]].each do |list|
+        expect { described_class.merge(old, {"unchecked_drivers" => list}) }
+          .to raise_error(described_class::Refused, "--pvm-unchecked-drivers takes sysfs driver names, such as hv_storvsc,hv_netvsc")
+      end
+    end
+
+    it "says whether a pinned file or the guest config check changed" do
+      old = {"host_deb" => deb, "guest_kernel" => kernel, "guest_unchecked" => false}
+      expect(described_class.files_changed?(old, old.merge("unchecked_drivers" => ["hv_storvsc"]))).to be false
+      expect(described_class.files_changed?(old, old.merge("host_deb" => deb.merge("sha256" => "d" * 64)))).to be true
+      expect(described_class.files_changed?(old, old.merge("guest_unchecked" => true))).to be true
+      expect(described_class.files_changed?(nil, old)).to be true
+    end
   end
 
   describe ".verify" do
@@ -164,5 +186,6 @@ RSpec.describe ByohPvmPolicy do
     ]
     expect(described_class.summary(pins.merge("guest_unchecked" => false, "config_checked" => true, "guest_console" => "hvc0")).last(2)).to eq ["guest kernel config: none pinned", "config checked: yes, console hvc0"]
     expect(described_class.summary(pins.merge("guest_config" => {"url" => "https://e/c", "sha256" => "c" * 64})).last(2)).to eq ["guest kernel config: https://e/c sha256 #{"c" * 64}", "config checked: no"]
+    expect(described_class.summary(pins.merge("unchecked_drivers" => %w[hv_storvsc hv_netvsc])).last).to eq "unchecked host drivers (operator vouched): hv_storvsc hv_netvsc"
   end
 end

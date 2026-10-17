@@ -155,9 +155,11 @@ class PvmHostKernel
   # Read-only, for bin/prep_host.rb (HostTier.check_pvm_host!): why
   # this host cannot be prepared as a pvm host, or nil. On the PVM kernel
   # kvm_pvm must be loaded. On the stock kernel it is preflight without
-  # the driver walk: the drivers the operator vouches for (the policy's
-  # unchecked_drivers) are known only to the control plane, which runs
-  # the full preflight again before install.
+  # the driver walk: prep runs without the location's PVM policy, so it
+  # does not have the drivers the operator vouches for
+  # (bin/byoh-location set --pvm-unchecked-drivers). HostNexus sends
+  # them with the full preflight it runs again before install, and with
+  # install.
   def prep_problem
     kernel = run("uname", "-r").strip
     return nil if kvm_pvm_loaded?
@@ -495,7 +497,7 @@ class PvmHostKernel
     facts["unchecked_drivers"] = drivers & allowed
     return [] if unmapped.empty?
 
-    ["cannot check the PVM kernel for the drivers this host's disks and NICs use: #{unmapped.join(" ")} (no module of that name in #{kernel}); check by hand that the PVM kernel has them, then pass them as unchecked_drivers"]
+    ["cannot check the PVM kernel for the drivers this host's disks and NICs use: #{unmapped.join(" ")} (no module of that name in #{kernel}); check by hand that the PVM kernel has them, then list them with bin/byoh-location set --pvm-unchecked-drivers"]
   end
 
   def container_refusals

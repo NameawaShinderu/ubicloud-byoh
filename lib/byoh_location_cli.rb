@@ -30,6 +30,7 @@ class ByohLocationCli
                [--virt-tiers LIST] [--accept TIER[:OPTION]] [--unaccept TIER[:OPTION]]
                [--pvm-host-deb URL --pvm-host-deb-sha256 HEX] [--pvm-guest-kernel URL --pvm-guest-kernel-sha256 HEX]
                [--pvm-guest-config URL --pvm-guest-config-sha256 HEX | --pvm-guest-unchecked] [--no-verify-download]
+               [--pvm-unchecked-drivers LIST]
       rates    --location NAME --rates-from LOCATION [--multiplier X]
       rates    --location NAME --family FAMILY --from FAMILY --multiplier X
       grant    --location NAME --project UBID
@@ -399,12 +400,15 @@ class ByohLocationCli
     end
     o.on("--pvm-guest-unchecked", "Accept a guest kernel whose config cannot be read (no --pvm-guest-config, no embedded config)") { (opts[:pvm] ||= {})["guest_unchecked"] = true }
     o.on("--no-verify-download", "Store the PVM pins without downloading them first (each host still checks them)") { opts[:verify_download] = it }
+    o.on("--pvm-unchecked-drivers LIST", Array, "Disk and NIC drivers you checked the PVM host kernel has, that its preflight cannot map (\"\" clears)") { (opts[:pvm] ||= {})["unchecked_drivers"] = it }
   end
 
   # The PVM pins after verifying them: every changed file is downloaded
   # and checked against its sha256, and the guest kernel config read,
   # unless --no-verify-download.
   def verified_pins(old_pins, pins, opts)
+    return pins unless ByohPvmPolicy.files_changed?(old_pins, pins)
+
     if opts[:verify_download] == false
       @out.puts "Not downloading the PVM pins (--no-verify-download): each host checks them when it downloads them."
       return ByohPvmPolicy.guest_changed?(old_pins, pins) ? ByohPvmPolicy.unchecked(pins) : pins
@@ -512,7 +516,7 @@ class ByohLocationCli
     return old unless changes
 
     changes.each do |key, pin|
-      next if key == "guest_unchecked"
+      next if key == "guest_unchecked" || key == "unchecked_drivers"
       flag = "--pvm-#{PVM_PIN_FLAGS.key(key)}"
       raise Error, "#{flag} and #{flag}-sha256 go together" unless pin["url"] && pin["sha256"]
     end

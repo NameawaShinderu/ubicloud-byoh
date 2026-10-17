@@ -18,6 +18,10 @@ require "zlib"
 #                    found what PVM VMs need in it
 #   guest_console    the console that config gives the guest: ttyS0 with
 #                    the 8250 serial driver, else hvc0 (virtio console)
+#   unchecked_drivers  the disk and NIC drivers the operator vouches the
+#                    host kernel has, though rhizome's preflight cannot
+#                    map them to a module (built in), or absent;
+#                    HostNexus sends them to its preflight and install
 module ByohPvmPolicy
   class Refused < StandardError; end
 
@@ -28,6 +32,9 @@ module ByohPvmPolicy
   }.freeze
 
   GUEST_KEYS = %w[guest_kernel guest_config guest_unchecked].freeze
+
+  # A sysfs driver name, the rule rhizome's PvmHostKernel applies.
+  DRIVER_FORMAT = /\A[0-9A-Za-z_.:-]+\z/
 
   # What the guest kernel must have built in (=y): it boots with no
   # modules and no initramfs, from an ext4 root on virtio-blk, and reads
@@ -50,12 +57,13 @@ module ByohPvmPolicy
   def self.pins(policy) = policy["pvm_kernel"]
 
   # The pins after the operator's changes: changes maps FILES keys to
-  # {url, sha256}, and may set "guest_unchecked" => true. A new guest
+  # {url, sha256}, and may set "guest_unchecked" => true and
+  # "unchecked_drivers" => a list (empty drops it). A new guest
   # kernel drops the old one's config and unchecked acknowledgement.
   # Raises Refused unless the result pins the host package and the guest
   # kernel.
   def self.merge(old, changes)
-    pins = (old || {}).slice("host_deb", *GUEST_KEYS, "config_checked", "guest_console")
+    pins = (old || {}).slice("host_deb", *GUEST_KEYS, "config_checked", "guest_console", "unchecked_drivers")
     if changes.key?("guest_kernel") && changes["guest_kernel"] != pins["guest_kernel"]
       pins = pins.except("guest_config", "guest_unchecked")
     end
@@ -64,6 +72,10 @@ module ByohPvmPolicy
     pins = pins.except("guest_unchecked") if changes.key?("guest_config")
     pins = pins.except("guest_config") if changes["guest_unchecked"]
     pins = pins.merge(changes)
+    if (drivers = pins["unchecked_drivers"])
+      raise Refused, "--pvm-unchecked-drivers takes sysfs driver names, such as hv_storvsc,hv_netvsc" unless drivers.all? { DRIVER_FORMAT.match?(it) }
+      pins = drivers.empty? ? pins.except("unchecked_drivers") : pins.merge("unchecked_drivers" => drivers.uniq)
+    end
     pins["guest_unchecked"] = false unless pins.key?("guest_config") || pins.key?("guest_unchecked")
     {"host_deb" => "--pvm-host-deb", "guest_kernel" => "--pvm-guest-kernel"}.each do |key, flag|
       raise Refused, "pin the PVM #{FILES[key]}: #{flag} URL #{flag}-sha256 HEX" unless pins[key]
@@ -75,6 +87,14 @@ module ByohPvmPolicy
     end
     pins
   end
+
+  # The drivers the operator vouches for, for rhizome's
+  # install-pvm-host-kernel preflight and install.
+  def self.unchecked_drivers(pins) = pins&.dig("unchecked_drivers") || []
+
+  # Whether a pinned file, or how the guest config is checked, changed:
+  # what verify has to download and check.
+  def self.files_changed?(old, new) = FILES.keys.any? { new[it] != old&.dig(it) } || guest_changed?(old, new)
 
   # Whether a host's guest kernel download must start again: the guest
   # kernel or how its config is checked changed.
@@ -140,6 +160,7 @@ module ByohPvmPolicy
     lines = FILES.filter_map { |key, what| "#{what}: #{pins[key]["url"]} sha256 #{pins[key]["sha256"]}" if pins[key] }
     lines << "guest kernel config: none pinned#{" (accepted unchecked)" if pins["guest_unchecked"]}" unless pins["guest_config"]
     lines << "config checked: #{pins["config_checked"] ? "yes, console #{pins["guest_console"]}" : "no"}"
+    lines << "unchecked host drivers (operator vouched): #{pins["unchecked_drivers"].join(" ")}" if pins["unchecked_drivers"]
     lines
   end
 end

@@ -89,6 +89,13 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(row.reload.state).to eq "install_pending"
     end
 
+    it "sends rhizome's preflight the drivers the location vouches for" do
+      vm_host.update(virt_probe: Sequel.pg_jsonb(record(stock_probe)))
+      location.update(byoh_virt: Sequel.pg_jsonb(location.byoh_virt.to_h.merge("pvm_kernel" => pvm_test_pins.merge("unchecked_drivers" => %w[hv_storvsc hv_netvsc]))))
+      expect_tool("preflight", {"result" => "ok", "refusals" => [], "facts" => {}}, params: {"unchecked_drivers" => %w[hv_storvsc hv_netvsc]})
+      expect { nx.verify_virt_tier }.to hop("setup_storage_backend")
+    end
+
     it "pages a refusal without a list" do
       vm_host.update(virt_probe: Sequel.pg_jsonb(record(stock_probe)))
       expect_tool("preflight", {"result" => "refused", "error" => "another install-pvm-host-kernel run holds the lock"}, exit_code: 2)
@@ -178,6 +185,13 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(row.reload.state).to eq "installing"
       expect(st.stack.first).to include("deadline_target" => "prep_reboot")
       expect(Time.parse(st.stack.first["deadline_at"]) - Time.now).to be_within(60).of(45 * 60)
+    end
+
+    it "sends the install the drivers the location vouches for" do
+      location.update(byoh_virt: Sequel.pg_jsonb(location.byoh_virt.to_h.merge("pvm_kernel" => pvm_test_pins.merge("unchecked_drivers" => ["hv_storvsc"]))))
+      expect(sshable).to receive(:d_check).with(unit).and_return("NotStarted")
+      expect(sshable).to receive(:d_run).with(unit, "sudo", "host/bin/install-pvm-host-kernel", "install", stdin: JSON.generate("host_deb" => pvm_test_pins["host_deb"], "unchecked_drivers" => ["hv_storvsc"]))
+      expect { nx.install_pvm_host_kernel }.to nap(30)
     end
 
     it "waits while it runs" do

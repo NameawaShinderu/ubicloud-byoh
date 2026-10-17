@@ -652,7 +652,7 @@ TIMER
         hop_pvm_install_failed
       end
       row.update(state: "installing", updated_at: Time.now)
-      sshable.d_run(PVM_INSTALL_UNIT, "sudo", PVM_KERNEL_TOOL, "install", stdin: JSON.generate("host_deb" => pin))
+      sshable.d_run(PVM_INSTALL_UNIT, "sudo", PVM_KERNEL_TOOL, "install", stdin: JSON.generate({"host_deb" => pin}.merge(pvm_driver_params)))
     end
 
     nap 30
@@ -890,6 +890,14 @@ TIMER
     JSON.parse(e.stdout)
   end
 
+  # The drivers the location's operator vouches for
+  # (bin/byoh-location set --pvm-unchecked-drivers), for the preflight
+  # and the install; nothing when there are none.
+  def pvm_driver_params
+    drivers = ByohPvmPolicy.unchecked_drivers(ByohPvmPolicy.pins(ByohVirtTiers.policy(vm_host.location)))
+    drivers.empty? ? {} : {"unchecked_drivers" => drivers}
+  end
+
   # What the host's last install-pvm-host-kernel status (or arm, disarm)
   # said of its boot, for bin/byoh-virt show.
   def record_pvm_status(status)
@@ -912,7 +920,7 @@ TIMER
   # fixes goes on by itself.
   def check_pvm_preflight
     when_pvm_uninstall_set? { hop_pvm_uninstall }
-    result = pvm_kernel("preflight")
+    result = pvm_kernel("preflight", pvm_driver_params)
     if result["result"] == "ok"
       resolve_pvm_page("ByohPvmInstall")
       return

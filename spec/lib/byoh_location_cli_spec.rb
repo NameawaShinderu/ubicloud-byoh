@@ -756,6 +756,21 @@ RSpec.describe ByohLocationCli do
         expect(location.reload.byoh_virt).to be_nil
       end
 
+      it "stores the drivers the operator vouches for without downloading anything, and clears them" do
+        expect(cli("set", "--location", location.name, *pin_args)[0]).to eq 0
+        fetched.clear
+        status, output, = cli("set", "--location", location.name, "--pvm-unchecked-drivers", "hv_storvsc,hv_netvsc")
+        expect([status, output]).to eq [0, "Updated location byoh-1.\n#{ByohPvmPolicy::ACK}\n"]
+        expect(fetched).to eq []
+        expect(pins["unchecked_drivers"]).to eq %w[hv_storvsc hv_netvsc]
+        expect(JSON.parse(audit_rows.last[:args].to_json).dig("byoh_virt", "pvm_kernel", "unchecked_drivers")).to eq %w[hv_storvsc hv_netvsc]
+        expect(cli("show", "--location", location.name)[1]).to include "  unchecked host drivers (operator vouched): hv_storvsc hv_netvsc\n"
+        expect(cli("set", "--location", location.name, "--pvm-unchecked-drivers", "bad name")).to eq [1, "", "! --pvm-unchecked-drivers takes sysfs driver names, such as hv_storvsc,hv_netvsc\n"]
+        expect(cli("set", "--location", location.name, "--pvm-unchecked-drivers", "")[0]).to eq 0
+        expect(pins).not_to have_key("unchecked_drivers")
+        expect(fetched).to eq []
+      end
+
       it "refuses a guest kernel that is not an ELF vmlinux, even with a pinned config" do
         files["https://example.com/vmlinux"] = "MZ bzImage".b
         args = [*pin_args, "--pvm-guest-config", "https://example.com/config", "--pvm-guest-config-sha256", sha("https://example.com/config")]

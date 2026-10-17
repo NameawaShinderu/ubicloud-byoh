@@ -805,7 +805,8 @@ bin/byoh-location rates --location <loc> --family pvm --from standard --multipli
 bin/byoh-location set --location <loc> --virt-tiers kvm,pvm --accept pvm \
   --pvm-host-deb <https URL> --pvm-host-deb-sha256 <hex> \
   --pvm-guest-kernel <https URL> --pvm-guest-kernel-sha256 <hex> \
-  [--pvm-guest-config <https URL> --pvm-guest-config-sha256 <hex> | --pvm-guest-unchecked]
+  [--pvm-guest-config <https URL> --pvm-guest-config-sha256 <hex> | --pvm-guest-unchecked] \
+  [--pvm-unchecked-drivers <driver,...>]                       # only for a driver preflight cannot map
 bin/byoh-location grant --location <loc> --project <ubid>     # keep the location hidden (single project)
 # Per host (a stock Ubuntu 24.04 cloud VM without hardware virtualization):
 sudo scripts/byoh/bootstrap-data-plane.sh --tier pvm          # read-only checks; prints the flags
@@ -928,9 +929,13 @@ fact, "detected, not offered".
   - `verify_virt_tier` takes the stock probe (`accepts_probe?` with the `byoh_pvm_host` state), then
     runs rhizome's read-only `install-pvm-host-kernel preflight`. A refusal pages `ByohPvmInstall`
     with each reason and checks again every 5 minutes; the page resolves once preflight passes.
-    The control plane passes no `unchecked_drivers`, so a host whose disk or NIC driver the tool
-    cannot find a module for is refused until a knob for them exists (open; AWS ENA and NVMe have
-    modules, so m6i passes in the specs' terms, UNVERIFIED on the instance).
+    A disk or NIC driver the tool cannot find a module for (a built-in one, such as Hyper-V's
+    `hv_storvsc`) is refused until the operator checks by hand that the PVM host kernel has it and
+    lists it with `bin/byoh-location set --pvm-unchecked-drivers <driver,...>` (`""` clears the
+    list). HostNexus sends the location's list to both the preflight and the install; the install's
+    own driver check still compares every module the stock kernel loads. AWS ENA and NVMe have
+    modules, so m6i passes in the specs' terms, UNVERIFIED on the instance; the knob is UNVERIFIED on
+    any real host.
   - `patch` records the installed `linux-image-*` packages before and after the upgrade in the strand
     frame (`bin/byoh-virt show` prints them), then hops to the install while the state is
     `install_pending`.
