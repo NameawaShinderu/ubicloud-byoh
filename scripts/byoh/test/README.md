@@ -199,7 +199,14 @@ the other cases inherit a working L1 host; `no-kvm`, `kvm64-*`,
 script gathers in shell. `<case>/args` adds preflight arguments:
 `no-kvm-container` (a VM without hardware virtualization, with the
 container tier's commands) runs with `--virt-tier container`, so PF3,
-PF4, PF5 and PF7 are info. `spec/fixtures/byoh/preflight/old-script.txt`
+PF4, PF5 and PF7 are info. `no-kvm-pvm` is a stock AWS m6i-like kernel
+for a PVM install (`--virt-tier pvm`): Meltdown not affected, lockdown
+none and Secure Boot off, which the shell facts report since the PVM
+registration WP (`secure_boot`, `lockdown`, `vulnerabilities`, the keys
+`ByohVirtLadder.pvm_refusal` reads). Its `.txt` was written by running the
+case in an `ubi-q-pf-no-kvm-pvm` container of `ubuntu:24.04` as the script
+does (2026-10-17: all 25 cases plus base pass that way; the guard and the
+live fakehost run were not rerun). `spec/fixtures/byoh/preflight/old-script.txt`
 is `base.txt` without the `virt` fact, written by hand for the specs of a
 script that predates it. Result (2026-10-16): 24 cases plus base, the
 guard and the live run pass.

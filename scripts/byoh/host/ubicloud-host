@@ -280,6 +280,9 @@ VIRT_MODULES=(kvm kvm_intel kvm_amd kvm_pvm)
 VIRT_DMI=(sys_vendor product_name product_version bios_vendor board_vendor chassis_vendor chassis_asset_tag)
 VIRT_COMMANDS=(lxc-start lxcfs newuidmap xz setquota cryptsetup mkfs.ext4 qemu-system-x86_64)
 VIRT_OVMF=(/usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd)
+# What PVM's hard refusals read (ByohVirtLadder.pvm_refusal): the CPU's
+# vulnerabilities, Secure Boot and the kernel lockdown mode.
+VIRT_VULNERABILITIES=(meltdown l1tf mds retbleed spec_rstack_overflow)
 
 virt_probe_rb() {
   [[ -n ${UBICLOUD_VIRT_PROBE:-} ]] && command -v ruby >/dev/null 2>&1 || return 127
@@ -360,6 +363,24 @@ facts_virt() {
     [[ -e $R$f ]] && ovmf=true
   done
   fields+=("\"ovmf\":$ovmf")
+  # Left out without an EFI SecureBoot variable, as the probe leaves it
+  # unknown; its last byte is 1 when Secure Boot is on.
+  for f in "$R"/sys/firmware/efi/efivars/SecureBoot-*; do
+    [[ -f $f ]] || continue
+    value=$(od -An -tu1 -- "$f" | awk '{ for (i = 1; i <= NF; i++) last = $i } END { print last }')
+    if [[ $value == 1 ]]; then fields+=('"secure_boot":true'); else fields+=('"secure_boot":false'); fi
+    break
+  done
+  value=$(rd /sys/kernel/security/lockdown | sed -n 's/.*\[\([a-z]*\)\].*/\1/p')
+  fields+=("\"lockdown\":$(json_str_or_null "$value")")
+  list=()
+  for f in "${VIRT_VULNERABILITIES[@]}"; do
+    list+=("$(json_str "$f"):$(json_str_or_null "$(rd "/sys/devices/system/cpu/vulnerabilities/$f")")")
+  done
+  fields+=("\"vulnerabilities\":{$(
+    IFS=,
+    echo "${list[*]}"
+  )}")
   fact virt "{\"source\":\"shell\",\"facts\":{$(
     IFS=,
     echo "${fields[*]}"

@@ -39,8 +39,9 @@ RSpec.describe "ubicloud-host preflight constants" do
     expect(list.call("VIRT_DMI")).to eq VirtProbe::DMI_FIELDS
     expect(list.call("VIRT_COMMANDS")).to eq [*VirtProbe::CONTAINER_COMMANDS, "qemu-system-x86_64"]
     expect(list.call("VIRT_OVMF")).to eq VirtProbe::OVMF_PATHS.map { |path| "/#{path}" }
+    expect(list.call("VIRT_VULNERABILITIES")).to eq VirtProbe::VULNERABILITIES
     keys = script[/^facts_virt\(\) \{.*?^\}$/m].scan(/\\?"([a-z_0-9]+)\\?":/).flatten.uniq - %w[source facts report bios_lines version]
-    expect(keys).to include("dev_kvm", "cpu_flags", "dmi", "ovmf")
+    expect(keys).to include("dev_kvm", "cpu_flags", "dmi", "ovmf", "secure_boot", "lockdown", "vulnerabilities")
     expect(keys - VirtProbe.facts(root: "/nonexistent", uname: {machine: "x86_64", release: "6.8.0"}).keys).to eq []
   end
 end
