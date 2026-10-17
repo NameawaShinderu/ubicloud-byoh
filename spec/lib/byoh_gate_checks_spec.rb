@@ -484,4 +484,119 @@ RSpec.describe ByohGateChecks do
       expect(out).not_to include "health checks pass"
     end
   end
+
+  describe "pvm-host and pvm-vm" do
+    let(:pvm_host) { create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm", net6: "fd00:9:9:8::/64") }
+
+    before do
+      location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm pvm], "acks" => {"pvm" => []}, "pvm_kernel" => pvm_test_pins}))
+    end
+
+    it "needs a host or VM ubid" do
+      expect(cli("pvm-host")).to eq [1, "", "! --host is required\n"]
+      expect(cli("pvm-host", "--host", "nope")).to eq [1, "", "! no host nope\n"]
+      expect(cli("pvm-vm")).to eq [1, "", "! --vm is required\n"]
+      expect(cli("pvm-vm", "--vm", "nope")).to eq [1, "", "! no VM nope\n"]
+    end
+
+    it "prints exists=0 for a host that is gone" do
+      ubid = pvm_host.ubid
+      pvm_host.destroy
+      expect(cli("pvm-host", "--host", ubid)).to eq [0, "exists=0\n", ""]
+    end
+
+    it "prints a host without a strand or a PVM row" do
+      expect(cli("pvm-host", "--host", pvm_host.ubid)).to eq [0, <<~OUT, ""]
+        exists=1
+        label=
+        allocation_state=accepting
+        virt_tier=pvm
+        pvm_state=
+        host_kver=
+        stock_kver=
+        stock_entry=
+        host_deb_sha256=
+        last_error=
+        vms=
+        guest_kernels=
+        current_guest_kernel=
+      OUT
+    end
+
+    it "prints the host's PVM state, VMs, guest kernels and open pages by type" do
+      Strand.create_with_id(pvm_host, prog: "Vm::HostNexus", label: "pvm_install_failed", stack: [{}])
+      pvm_host.update(allocation_state: "draining")
+      ByohPvmHost.create(vm_host_id: pvm_host.id, state: "failed", install: true, host_kver: "6.12.33-pvm", stock_kver: "7.0.0-1014-aws",
+        stock_entry: "Advanced options for Ubuntu>Ubuntu, with Linux 7.0.0-1014-aws", host_deb_sha256: "a" * 64, last_error: "sha256 mismatch")
+      ByohPvmGuestKernel.create(vm_host_id: pvm_host.id, sha256: "b" * 64, state: "ready", release: "6.12.33-pvm", console: "hvc0", config_checked: true)
+      ByohPvmGuestKernel.create(vm_host_id: pvm_host.id, sha256: "c" * 64, state: "refused")
+      vm = create_vm(vm_host_id: pvm_host.id, location_id: location.id, family: "pvm")
+      Prog::PageNexus.assemble("#{pvm_host.ubid} refused to install the PVM host kernel: sha256 mismatch", ["ByohPvmInstall", pvm_host.ubid], pvm_host.ubid, resource_id: pvm_host.id)
+      Prog::PageNexus.assemble("#{pvm_host.ubid} cannot download", ["ByohPvmGuestKernelFailing", pvm_host.ubid, "c" * 64], pvm_host.ubid, resource_id: pvm_host.id)
+      resolved = Prog::PageNexus.assemble("#{pvm_host.ubid} booted its stock kernel", ["ByohPvmBoot", pvm_host.ubid], pvm_host.ubid, resource_id: pvm_host.id)
+      Page[resolved.id].update(resolved_at: Time.now)
+
+      expect(cli("pvm-host", "--host", pvm_host.ubid)).to eq [0, <<~OUT, ""]
+        exists=1
+        label=pvm_install_failed
+        allocation_state=draining
+        virt_tier=pvm
+        pvm_state=failed
+        host_kver=6.12.33-pvm
+        stock_kver=7.0.0-1014-aws
+        stock_entry=Advanced options for Ubuntu>Ubuntu, with Linux 7.0.0-1014-aws
+        host_deb_sha256=#{"a" * 64}
+        last_error=sha256 mismatch
+        vms=#{vm.ubid}
+        guest_kernels=#{"b" * 64}:ready,#{"c" * 64}:refused
+        current_guest_kernel=#{"b" * 64}
+        page=ByohPvmInstall #{pvm_host.ubid} refused to install the PVM host kernel: sha256 mismatch
+        page=other #{pvm_host.ubid} cannot download
+      OUT
+    end
+
+    it "prints a VM's guest kernel against its host's and its billing records" do
+      ByohPvmGuestKernel.create(vm_host_id: pvm_host.id, sha256: "b" * 64, state: "ready", release: "6.12.33-pvm", console: "hvc0", config_checked: true)
+      vm = create_vm(vm_host_id: pvm_host.id, location_id: location.id, family: "pvm")
+      ByohVmGuestKernel.create(vm_id: vm.id, sha256: "d" * 64, release: "6.12.30-pvm", console: "ttyS0")
+      rate = BillingRate.from_resource_properties("VmVCpu", "standard", "hetzner-fsn1")
+      closed = BillingRecord.create(project_id: vm.project_id, resource_id: vm.id, resource_name: vm.name, amount: 2, billing_rate_id: rate["id"])
+      closed.this.update(span: Sequel.lit("tstzrange('2026-10-01 00:00:00+00', '2026-10-01 01:00:00+00')"))
+      open = BillingRecord.create(project_id: vm.project_id, resource_id: vm.id, resource_name: vm.name, amount: 2, billing_rate_id: rate["id"])
+      open.this.update(span: Sequel.lit("tstzrange('2026-10-02 00:00:00+00', NULL)"))
+
+      expect(cli("pvm-vm", "--vm", vm.ubid)).to eq [0, <<~OUT, ""]
+        exists=1
+        family=pvm
+        state=running
+        host=#{pvm_host.ubid}
+        guest_sha256=#{"d" * 64}
+        guest_release=6.12.30-pvm
+        guest_console=ttyS0
+        host_guest_sha256=#{"b" * 64}
+        billing=VmVCpu standard closed 2026-10-01T00:00:00Z 2026-10-01T01:00:00Z
+        billing=VmVCpu standard open 2026-10-02T00:00:00Z -
+      OUT
+    end
+
+    it "prints a VM without a host or guest kernel, and a deleted VM's billing records" do
+      vm = create_vm(location_id: location.id, family: "pvm")
+      out = cli("pvm-vm", "--vm", vm.ubid)[1]
+      expect(out).to include "host=\nguest_sha256=\n", "host_guest_sha256=\n"
+      placed = create_vm(vm_host_id: pvm_host.id, location_id: location.id, family: "pvm", name: "placed")
+      expect(cli("pvm-vm", "--vm", placed.ubid)[1]).to include "host=#{pvm_host.ubid}\n", "host_guest_sha256=\n"
+
+      rate = BillingRate.from_resource_properties("VmVCpu", "standard", "hetzner-fsn1")
+      record = BillingRecord.create(project_id: vm.project_id, resource_id: vm.id, resource_name: vm.name, amount: 2, billing_rate_id: rate["id"])
+      record.this.update(span: Sequel.lit("tstzrange('2026-10-01 00:00:00+00', '2026-10-01 02:00:00+00')"))
+      ByohVmGuestKernel.create(vm_id: vm.id, sha256: "d" * 64, console: "hvc0")
+      ubid = vm.ubid
+      vm.destroy
+      expect(cli("pvm-vm", "--vm", ubid)).to eq [0, <<~OUT, ""]
+        exists=0
+        guest_kernel_row=0
+        billing=VmVCpu standard closed 2026-10-01T00:00:00Z 2026-10-01T02:00:00Z
+      OUT
+    end
+  end
 end

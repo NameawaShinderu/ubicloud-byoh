@@ -22,9 +22,11 @@ class ByohGateChecks
       snapshot  --host UBID
       compare   --host UBID --snapshot FILE
       health    --host UBID [--since TIME] [--probe]
+      pvm-host  --host UBID
+      pvm-vm    --vm UBID
   USAGE
 
-  COMMANDS = %w[location host vm info snapshot compare health].freeze
+  COMMANDS = %w[location host vm info snapshot compare health pvm-host pvm-vm].freeze
   EXPECTATIONS = %w[public nat none internal waiting].freeze
 
   # The rate types a VM is billed under; a snapshot counts the open
@@ -42,7 +44,7 @@ class ByohGateChecks
     command = argv.shift
     case command
     when *COMMANDS
-      send(:"cmd_#{command}", argv)
+      send(:"cmd_#{command.tr("-", "_")}", argv)
     when nil, "help", "-h", "--help"
       @out.puts USAGE
       0
@@ -320,6 +322,86 @@ class ByohGateChecks
       end
     end
   end
+
+  # The page types the PVM end-to-end run (scripts/byoh/test/real/pvm-e2e.sh)
+  # waits for, each tagged [type, host ubid].
+  PVM_PAGE_TYPES = %w[ByohPvmInstall ByohPvmBoot ByohPvmUpgrade ByohPvmUninstalled ByohPvmHostKernel
+    ByohPvmGuestKernel ByohPvmGuestKernelStale ByohVirtTier ByohKernelReboot LastBootIDDiscrepancy].freeze
+
+  # Where a pvm host stands, as key=value lines for pvm-e2e.sh: its
+  # strand, its byoh_pvm_host row, its VMs and guest kernels, and each
+  # open page for it ("page=TYPE summary"; TYPE is other for a page of
+  # another tag). A host that does not exist (any more) prints exists=0,
+  # so the script can wait for a destroy.
+  def cmd_pvm_host(argv)
+    opts = {}
+    parse(argv, "pvm-host --host UBID") { host_option(it, opts) }
+    key = opts[:host] || raise(Error, "--host is required")
+    raise Error, "no host #{key}" unless key.match?(HOST_UBID)
+    unless (host = VmHost[key])
+      @out.puts "exists=0"
+      return 0
+    end
+
+    row = ByohPvmHost[host.id]
+    {
+      exists: 1,
+      label: host.strand&.label,
+      allocation_state: host.allocation_state,
+      virt_tier: host.virt_tier,
+      pvm_state: row&.state,
+      host_kver: row&.host_kver,
+      stock_kver: row&.stock_kver,
+      stock_entry: row&.stock_entry,
+      host_deb_sha256: row&.host_deb_sha256,
+      last_error: row&.last_error,
+      vms: host.vms_dataset.order(:id).all.map(&:ubid).join(","),
+      guest_kernels: ByohPvmGuestKernel.where(vm_host_id: host.id).order(:sha256).all.map { "#{it.sha256}:#{it.state}" }.join(","),
+      current_guest_kernel: ByohVirtTiers.pvm_guest_kernel(host)&.sha256,
+    }.each { |k, value| @out.puts "#{k}=#{value}" }
+    tags = PVM_PAGE_TYPES.to_h { [Page.generate_tag([it, host.ubid]), it] }
+    Page.active.for_resource(host.id).order(:created_at).all.each do |page|
+      @out.puts "page=#{tags.fetch(page.tag, "other")} #{page.summary}"
+    end
+    0
+  end
+
+  # A pvm VM as key=value lines for pvm-e2e.sh: its state, the guest
+  # kernel it boots (byoh_vm_guest_kernel) against its host's current
+  # one, and every billing record of it ("billing=TYPE FAMILY open|closed
+  # FROM TO"). A VM that was deleted prints exists=0 and its billing
+  # records, which outlive it.
+  def cmd_pvm_vm(argv)
+    opts = {}
+    parse(argv, "pvm-vm --vm UBID") { vm_option(it, opts) }
+    key = opts[:vm] || raise(Error, "--vm is required")
+    id = (UBID.to_uuid(key) if key.match?(VM_UBID)) || raise(Error, "no VM #{key}")
+    if (vm = Vm[id])
+      kernel = ByohVmGuestKernel[vm.id]
+      {
+        exists: 1,
+        family: vm.family,
+        state: vm.display_state,
+        host: vm.vm_host&.ubid,
+        guest_sha256: kernel&.sha256,
+        guest_release: kernel&.release,
+        guest_console: kernel&.console,
+        host_guest_sha256: vm.vm_host && ByohVirtTiers.pvm_guest_kernel(vm.vm_host)&.sha256,
+      }.each { |k, value| @out.puts "#{k}=#{value}" }
+    else
+      @out.puts "exists=0"
+      @out.puts "guest_kernel_row=#{ByohVmGuestKernel.where(vm_id: id).count}"
+    end
+    BillingRecord.where(resource_id: id).order(Sequel.function(:lower, :span), :id).all.each do |record|
+      rate = record.billing_rate
+      span = record.span
+      @out.puts "billing=#{rate["resource_type"]} #{rate["resource_family"]} #{span.unbounded_end? ? "open" : "closed"} #{span.begin.utc.iso8601} #{span.unbounded_end? ? "-" : span.end.utc.iso8601}"
+    end
+    0
+  end
+
+  HOST_UBID = /\Avh[0-9a-z]{24}\z/
+  VM_UBID = /\Avm[0-9a-z]{24}\z/
 
   def snapshot(host)
     host.reload
