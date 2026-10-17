@@ -84,7 +84,7 @@ timer never races a restore, an install or a release switch.
 
 | Command | Does |
 |---|---|
-| `status` | Units, enabled target, monitor state, release and migrations, web answer, env file mode and keys, `pg_hba` trust rules and login superusers, leftover restore databases, backup recipient and age, then `bin/byoh-config-check` (settings, role isolation, partition runway). Exits 1 on any fail |
+| `status` | Units, enabled target, monitor state, release and migrations, web answer, the API host (below), env file mode and keys, `pg_hba` trust rules and login superusers, leftover restore databases, backup recipient and age, then `bin/byoh-config-check` (settings, role isolation, partition runway). Exits 1 on any fail |
 | `smoke` | install.sh step 12 ([INSTALL.md](INSTALL.md) §6) |
 | `backup now\|list\|prune --keep N` | §6 |
 | `restore TS --key-file F [--env-only\|--db-only] [--force] [--no-start]` | §6.3, §6.4 |
@@ -105,6 +105,30 @@ timer never races a restore, an install or a release switch.
 | `warn ... CONTROL_PLANE_OUTBOUND_CIDRS includes 0.0.0.0/0` | Open default; narrow it with `env set`, or wait for M8 |
 | `warn audit_log partitions end 2027-01-01 (N days)` | §8. Becomes a fail 30 days before |
 | `warn postgres: database(s) ubicloud_prev_... are left from restores` | Drop each once checked: `sudo -u postgres dropdb NAME` |
+| `ok api: caddy serves the API at https://api.<host> (HTTP 401 JSON)` | The `ubi` CLI and API clients can use `UBI_URL=https://api.<host>/cli` ([INSTALL.md](INSTALL.md) §3.1) |
+| `warn api: caddy does not serve api.<host> ...` | `--tls provided` with a certificate that does not cover `api.<host>`: reissue it for both names and rerun install.sh |
+| `warn api: ... sets no API_HOST` | Installed before install.sh served the API: rerun install.sh with the same flags |
+| `warn api: no API answer from https://api.<host> ...` (tunnel) | Route the public hostname `api.<host>` to `http://127.0.0.1:3000` in the tunnel |
+| `fail api: https://api.<host> ... answers HTML` | Something serves the web UI under the API name; [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §1 |
+| `skip api: the API is not served (install.sh --no-api)` | By choice |
+
+### 2.1 The API and the `ubi` CLI
+
+The API lives on `api.<host>` (install.sh `--api-host`, `API_HOST` in
+the env file), never on the `--url` host: the app routes only `api.*`
+names to it. Create a personal access token in the web UI (project,
+Tokens), then:
+
+```bash
+export UBI_TOKEN=pat-... UBI_URL=https://api.cloud.example.com/cli
+bin/ubi vm list
+```
+
+Under `--tls none`, over `ssh -L 3000:127.0.0.1:3000`, use
+`UBI_URL=http://api.localhost:3000/cli`. The Terraform provider and the
+SDKs take the API's base URL, `https://api.<host>/`. To stop serving
+the API: install.sh `--no-api --update-env API_HOST`. `env set API_HOST`
+is refused.
 
 ---
 
@@ -151,8 +175,8 @@ the old values until their next start. Refused (exit 2, nothing
 changed), with the reason:
 - the secrets (`CLOVER_COLUMN_ENCRYPTION_KEY`, `CLOVER_SESSION_SECRET`,
   `CLOVER_RUNTIME_TOKEN_SECRET`), whose change breaks data or logins;
-- the keys install.sh owns through a flag (`BASE_URL`, `RACK_ENV`,
-  `MAIL_*`, `SMTP_*`, `IP_FROM_HEADER`): change those with install.sh and
+- the keys install.sh owns through a flag (`BASE_URL`, `API_HOST`,
+  `RACK_ENV`, `MAIL_*`, `SMTP_*`, `IP_FROM_HEADER`): change those with install.sh and
   `--update-env KEY` ([INSTALL.md](INSTALL.md) §4.1);
 - keys that load code (`RUBYOPT`, `GEM_*`, `BUNDLE_*`, `NODE_OPTIONS`, ...),
   `PRY_ALLOW_UNAUDITED`, `GIT_REV`, `PORT=8081`, and the names and values

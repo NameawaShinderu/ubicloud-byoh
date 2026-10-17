@@ -37,7 +37,7 @@ until it is merged into `byoh-driver` and pushed; until then a
 | Clock | NTP-synchronized (`timedatectl`; `--skip-check clock` overrides). TLS, tokens and backup timestamps depend on it |
 | Access | root (`sudo`) |
 | Outbound internet | apt (Ubuntu archive, universe for Caddy), github.com (mise, cloudflared), the Ruby source and Node binaries that mise fetches, rubygems.org, registry.npmjs.org |
-| Ports | `acme` and `provided`: 80 and 443 free (Caddy). `acme` also needs public DNS for the host name. Port 3000 is bound to 127.0.0.1 only |
+| Ports | `acme` and `provided`: 80 and 443 free (Caddy). `acme` also needs public DNS for the host name and for the API host `api.<host>` (§3.1). Port 3000 is bound to 127.0.0.1 only |
 | PostgreSQL | Installed by the script (16, Ubuntu's package). A postgres that already listens on more than `localhost` is switched to `localhost` with a restart (`--skip-check listen` keeps it) |
 | A source | A git checkout of this repository owned by a normal user, or a tarball made with `git archive` |
 | Backup key | An [age](https://age-encryption.org) recipient (`age1...`) whose identity lives **off** the machine. Without one the secrets are not backed up and `ubicloud-admin status` fails |
@@ -106,7 +106,9 @@ caches (`cache/*.cache`) are used as they are; the installer never runs
 | `--version V` | Release name: letters, digits, `.`, `_`, `+`, `-`. Required except with `--stage tools`. A rerun with the same version and rev is a no-op; another version exits 2 (release switch) |
 | `--source-git DIR --ref REF` | Build from commit REF of the checkout DIR |
 | `--source-tarball F --source-rev REV` | Build from a `git archive` tarball; REV is the commit it came from (recorded as `GIT_REV`) |
-| `--url URL` | `BASE_URL`. `acme`, `provided`, `tunnel`: `https://HOST`, no port, no path. `none`: `http://localhost:PORT` with puma's port |
+| `--url URL` | `BASE_URL`. `acme`, `provided`, `tunnel`: `https://HOST`, no port, no path, and HOST must not start with `api.` or `admin.` (the app routes those names to the API and the admin UI). `none`: `http://localhost:PORT` with puma's port |
+| `--api-host HOST` | The name the front serves the API and the `ubi` CLI on (§3.1): default `api.<--url host>`; it must start with `api.`. `API_HOST` in the env file. Not with `--tls none` |
+| `--no-api` | The front serves the web UI only (`API_HOST='none'`). Not with `--tls none` |
 | `--tls acme\|provided\|tunnel\|none` | The front (§3). Required |
 | `--cert F --key F` | `--tls provided` only: PEM certificate (chain) and unencrypted key. Checked for host name, key match and expiry; warns under 30 days |
 | `--cloudflared-token-file F` | `--tls tunnel` on a machine without a `cloudflared.service`: the tunnel token, mode 0600 |
@@ -186,11 +188,43 @@ production and warns in development.
   treat `http://localhost` as secure, which is why `--tls none` insists on
   `localhost`.
 - **Switching fronts** on an installed control plane needs `--update-env
-  TLS_FRONT`, plus `IP_FROM_HEADER` (unless it was unset) and `BASE_URL`
-  (unless the URL stays). The exit-2 message names the exact flags. The
+  TLS_FRONT`, plus `IP_FROM_HEADER` (unless it was unset), `BASE_URL`
+  (unless the URL stays) and `API_HOST` (unless it stays; it is
+  `api.localhost` under `none`). The exit-2 message names the exact flags. The
   new front comes up first, then the old one stops. An existing
   `cloudflared.service` next to `--tls acme|provided` is refused: puma
   would then trust an `X-Real-IP` that tunnel clients choose.
+
+### 3.1 The API host (`api.<host>`)
+
+The app routes a request to the API only when its host starts with
+`api.` (`clover.rb`, `host_routing`); every other name is the web UI. So
+the `ubi` CLI, the Terraform provider and the SDKs need a second name.
+Against the `--url` host, `ubi` gets the web UI's HTML login page (the
+first real AWS run). install.sh serves `--api-host` (default
+`api.<--url host>`) next to the `--url` host:
+
+| `--tls` | What install.sh does for the API host | What you do |
+|---|---|---|
+| `acme` | One Caddy site for both names (`cloud.example.com, api.cloud.example.com`); Caddy gets a certificate for each | A DNS record for `api.<host>` pointing at the machine, like the `--url` host's (an A record, or a CNAME to the `--url` host). `<ip>.sslip.io` names need none: `api.<ip>.sslip.io` resolves to the same address |
+| `provided` | Serves the API host only when the certificate covers it (`openssl x509 -checkhost`: a subjectAltName for `api.<host>`, or `*.<host>`). Otherwise it warns, serves the `--url` host alone and the install goes on | Issue the certificate for both names, plus the DNS record, and run install.sh again with the new `--cert`/`--key` |
+| `tunnel` | Prints the second public hostname to route; the tunnel's routes live in Cloudflare and install.sh never changes them | In the same tunnel, a public hostname `api.<host>` routing to `http://127.0.0.1:3000` (the dashboard adds its DNS record) |
+| `none` | Nothing: puma answers the API for any `Host` that starts with `api.`; `API_HOST` is `api.localhost` | Over `ssh -L 3000:127.0.0.1:3000`, use `UBI_URL=http://api.localhost:3000/cli`. `api.localhost` must resolve to 127.0.0.1 on your machine (systemd-resolved and curl do it; otherwise add `127.0.0.1 api.localhost` to `/etc/hosts`). `curl -H 'Host: api.localhost' http://127.0.0.1:3000/...` works too |
+
+Then, with a personal access token from the web UI (project, Tokens):
+
+```bash
+export UBI_TOKEN=pat-... UBI_URL=https://api.cloud.example.com/cli
+bin/ubi vm list
+```
+
+`ubicloud-admin status` and `smoke` check the API host: `GET /project`
+without a token must be the API's JSON 401, not the web UI's HTML. An
+install from before `--api-host` has no `API_HOST`; a rerun with the same
+flags adds it and serves the API host (Caddy gets the new certificate in
+the background). `--no-api` or another `--api-host` on an installed
+control plane needs `--update-env API_HOST`, like any flag key (§4.1).
+`ADMIN_URL` (the admin UI, `admin.*`) is not served by the front (M3-l).
 
 ---
 
@@ -231,6 +265,7 @@ column unreadable. Restore the env file from the secrets backup first
 | `CLOVER_COLUMN_ENCRYPTION_KEY` | 32 random bytes, base64 | secret | none (required) | Encrypts columns such as every host's SSH private key. Lose it and the hosts are unreachable |
 | `CLOVER_RUNTIME_TOKEN_SECRET` | 64 random bytes, base64 | secret | optional | VM runtime tokens |
 | `BASE_URL` | `--url` | flag | `http://localhost:9292` | Links in mail; the front's host |
+| `API_HOST` | `--api-host`, default `api.<--url host>`; `none` with `--no-api`; `api.localhost` under `--tls none` | flag | not an app setting | The name the front serves the API on (§3.1); read by `ubicloud-admin status` and `smoke`, not by the app |
 | `ADMIN_URL` | `http://admin.localhost:3000` | default | `http://admin.localhost:9292` | The admin UI over HTTPS is deferred (M3-l) |
 | `BIND` | `127.0.0.1` | default | `0.0.0.0` (`puma_config.rb`) | Only the front reaches puma |
 | `PORT` | `3000` | default | `3000` | Must not be 8081, which `bin/production_check` uses |
@@ -329,14 +364,22 @@ sudo ubicloud-admin logs respirate -f
 1. puma answers `/login` on `BIND:PORT` (waits up to 120 s);
 2. the front in `front.conf` runs and answers: Caddy under the `BASE_URL`
    host on 127.0.0.1:443, or `BASE_URL` itself through the tunnel;
-3. `ubicloud-web` and `ubicloud-respirate` are active;
-4. `bin/byoh-config-check` has no `fail`;
-5. with `RACK_ENV=production`, `bin/production_check` passes (a second
+3. the API host (`API_HOST`, §3.1) answers `GET /project` with the
+   API's unauthenticated JSON 401: through Caddy on 127.0.0.1:443 with
+   `curl --resolve` (no DNS or hairpin route needed), through the tunnel
+   under its public name, or from puma with `Host: api.localhost` under
+   `none`. HTML there (the web UI) fails;
+4. `ubicloud-web` and `ubicloud-respirate` are active;
+5. `bin/byoh-config-check` has no `fail`;
+6. with `RACK_ENV=production`, `bin/production_check` passes (a second
    puma on port 8081 answers a login with 401).
 
-Only things that come up in the background warn: an `acme` certificate
-not issued yet (TLS handshake failure) and a tunnel still connecting
-(no answer or 530). A fail exits 1 with everything installed; fix the
+Only things that come up in the background, or that need a step outside
+this machine, warn: an `acme` certificate not issued yet (TLS handshake
+failure, for either name), a tunnel still connecting (no answer or 530),
+an API host the tunnel does not route yet, a `provided` certificate that
+does not cover the API host, and an install from before `API_HOST`.
+`--no-api` is a skip. A fail exits 1 with everything installed; fix the
 cause and run install.sh again (only what changed is redone) or
 `ubicloud-admin smoke`.
 
@@ -403,7 +446,10 @@ Not run, or only approximated in containers:
 
 - Any install on a real machine or VM; a real reboot (the harness uses
   `docker restart`).
-- A Let's Encrypt issuance (`--tls acme`) and a real Cloudflare tunnel.
+- A Let's Encrypt issuance (`--tls acme`), for the `--url` host and for
+  `api.<host>`, and a real Cloudflare tunnel with the `api.<host>` route.
+  The harness covers the rendered Caddyfile for both names and, with
+  `--tls provided`, `bin/ubi` against `https://api.<host>/cli`.
   `ubicloud-cloudflared.service` on a real machine (its credential needs
   `/` to be a shared mount, which systemd sets up at boot outside
   containers).
