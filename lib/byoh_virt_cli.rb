@@ -189,6 +189,7 @@ class ByohVirtCli
       if row.host_deb_sha256
         @out.puts "  host-deb sha256 #{row.host_deb_sha256} (#{(pin == row.host_deb_sha256) ? "the location's pin" : "the location pins #{pin || "none"}"})"
       end
+      @out.puts "  upgrade pending to host-deb sha256 #{row.upgrade_host_deb_sha256}" if row.upgrade_host_deb_sha256
       if row.install && row.state == "committed" && pin && pin != row.host_deb_sha256
         @out.puts "  the location pins another host-deb build: move the host to it with bin/byoh-virt pvm upgrade --host #{host.ubid} --accept-host-deb #{pin}"
       end
@@ -315,7 +316,7 @@ class ByohVirtCli
 
     DB.transaction do
       args = {from_host_deb: row.host_deb_sha256, accept_host_deb: accept}
-      row.update(state: "upgrade_pending", host_deb_sha256: accept, last_error: nil, updated_at: Time.now)
+      row.update(state: "upgrade_pending", upgrade_host_deb_sha256: accept, last_error: nil, updated_at: Time.now)
       host.incr_pvm_upgrade
       ByohOperatorLog.record(command: "virt-pvm-upgrade", target_id: host.id, args:, result: "requested")
     end

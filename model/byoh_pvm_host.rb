@@ -17,21 +17,23 @@ end
 
 # Table: byoh_pvm_host
 # Columns:
-#  vm_host_id      | uuid                     | PRIMARY KEY
-#  state           | text                     | NOT NULL
-#  install         | boolean                  | NOT NULL
-#  host_kver       | text                     |
-#  stock_entry     | text                     |
-#  stock_kver      | text                     |
-#  host_deb_sha256 | text                     |
-#  lockdown        | text                     |
-#  meltdown        | text                     |
-#  last_error      | text                     |
-#  updated_at      | timestamp with time zone | NOT NULL DEFAULT CURRENT_TIMESTAMP
+#  vm_host_id              | uuid                     | PRIMARY KEY
+#  state                   | text                     | NOT NULL
+#  install                 | boolean                  | NOT NULL
+#  host_kver               | text                     |
+#  stock_entry             | text                     |
+#  stock_kver              | text                     |
+#  host_deb_sha256         | text                     |
+#  lockdown                | text                     |
+#  meltdown                | text                     |
+#  last_error              | text                     |
+#  updated_at              | timestamp with time zone | NOT NULL DEFAULT CURRENT_TIMESTAMP
+#  upgrade_host_deb_sha256 | text                     |
 # Indexes:
 #  byoh_pvm_host_pkey | PRIMARY KEY btree (vm_host_id)
 # Check constraints:
-#  byoh_pvm_host_deb_sha256_check | (host_deb_sha256 ~ '^[0-9a-f]{64}$'::text)
-#  byoh_pvm_host_state_check      | (state = ANY (ARRAY['install_pending'::text, 'installing'::text, 'armed'::text, 'committed'::text, 'failed'::text, 'upgrade_pending'::text, 'uninstalled'::text]))
+#  byoh_pvm_host_deb_sha256_check              | (host_deb_sha256 ~ '^[0-9a-f]{64}$'::text)
+#  byoh_pvm_host_state_check                   | (state = ANY (ARRAY['install_pending'::text, 'installing'::text, 'armed'::text, 'committed'::text, 'failed'::text, 'upgrade_pending'::text, 'uninstalled'::text]))
+#  byoh_pvm_host_upgrade_host_deb_sha256_check | (upgrade_host_deb_sha256 ~ '^[0-9a-f]{64}$'::text)
 # Foreign key constraints:
 #  byoh_pvm_host_vm_host_id_fkey | (vm_host_id) REFERENCES vm_host(id) ON DELETE CASCADE

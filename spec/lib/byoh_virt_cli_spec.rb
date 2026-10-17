@@ -315,9 +315,14 @@ RSpec.describe ByohVirtCli do
         status, out, err = cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)
         expect([status, err]).to eq [0, ""]
         expect(out).to eq "Asked host #{pvm_host.ubid} to move to the PVM host kernel of host-deb sha256 #{new_pin}; follow it with bin/byoh-host watch #{pvm_host.ubid}.\n"
-        expect(row.reload.values.slice(:state, :host_deb_sha256)).to eq(state: "upgrade_pending", host_deb_sha256: new_pin)
+        # The running build stays recorded until the upgrade installed the new one.
+        expect(row.reload.values.slice(:state, :host_deb_sha256, :upgrade_host_deb_sha256)).to eq(state: "upgrade_pending", host_deb_sha256: "a" * 64, upgrade_host_deb_sha256: new_pin)
         expect(semaphores).to eq ["pvm_upgrade"]
         expect(actions).to eq [["virt-pvm-upgrade", {"from_host_deb" => "a" * 64, "accept_host_deb" => new_pin}, "requested"]]
+        out = cli("show", "--host", pvm_host.ubid)[1]
+        expect(out).to include "  host-deb sha256 #{"a" * 64} (the location pins #{new_pin})\n  upgrade pending to host-deb sha256 #{new_pin}\n"
+        expect(out).not_to include "move the host to it"
+        expect(cli("pvm", "upgrade", "--host", pvm_host.ubid, "--accept-host-deb", new_pin)[2]).to eq "! host #{pvm_host.ubid}'s PVM kernel is upgrade_pending; pvm upgrade moves only a host that booted its PVM kernel (committed)\n"
       end
 
       it "says that a host drained beforehand stays draining" do

@@ -892,8 +892,11 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
     `bin/byoh-virt show` prints the same line for a committed host. `bin/byoh-virt pvm upgrade --host <vh>
     --accept-host-deb <sha256>` takes only the location's current pin, only on a committed install host
     at `wait`, and refuses while the host has VMs (move it to draining in the admin UI first, so none is
-    placed meanwhile); it records the accepted pin in `byoh_pvm_host.host_deb_sha256`, sets
-    `upgrade_pending` and writes an operator-action row. HostNexus' `pvm_upgrade` (deadline 45 minutes to
+    placed meanwhile); it records the accepted pin in `byoh_pvm_host.upgrade_host_deb_sha256`
+    (`host_deb_sha256` keeps naming the running build until the upgrade installed the new one), sets
+    `upgrade_pending` and writes an operator-action row. A reboot, patch run or out-of-band boot that
+    `wait` handles before `pvm_upgrade` keeps the request: `verify_pvm_boot` leaves the row at
+    `upgrade_pending` and the semaphore set. HostNexus' `pvm_upgrade` (deadline 45 minutes to
     `prep_reboot`) drains an accepting host, waits for any VM placed in between, compares the location's
     pin with the accepted one again, then runs rhizome's `install-pvm-host-kernel upgrade` daemonized. That
     runs on the PVM kernel, installs and holds the new build beside the running one, keeps the stock pin
@@ -901,9 +904,12 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
     new build and arms one boot of it. Success records `armed` and the new kernel, then
     `prep_reboot → reboot → verify_pvm_boot` boot and check it as after an install; the host takes VMs
     again once it is `committed`. A refusal (nothing changed: a wrong sha256, too little space, a pin that
-    moved again) restores the running build's sha256, pages `ByohPvmUpgrade` and returns the host to work
-    on its PVM kernel. A failure after a change (rhizome un-armed the host, which still runs the old PVM
-    kernel but boots stock next) records `failed`, pages `ByohPvmUpgrade` and waits at
+    moved again) is only rhizome's refusal while the host runs the recorded build and state.json still
+    names it; it drops the accepted pin, pages `ByohPvmUpgrade` and returns the host to work on its PVM
+    kernel. Anything else, including the refused rerun of a run that died with the host (state.json still
+    `armed` but on the new build's kver), is a failure: the control plane disarms the host (rhizome
+    already did for a failure it saw), which still runs a PVM kernel but boots stock next, records `failed`
+    with the accepted sha256 (which `pvm retry` installs), pages `ByohPvmUpgrade` and waits at
     `pvm_install_failed`; `pvm retry` then disarms, reboots to stock, uninstalls both builds and installs
     the location's pin, and `pvm uninstall` abandons PVM. A new build that fails to boot returns to the
     **stock** kernel on the next power cycle, not to the previous PVM build (its `pti=off` entry is gone):
