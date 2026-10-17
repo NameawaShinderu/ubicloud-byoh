@@ -53,7 +53,7 @@ RSpec.describe ByohArtifactFetch do
   end
 
   it "refuses what is not https, or a pin that is not a sha256, before fetching" do
-    ["http://example.com/f", "https:///f", "ftp://example.com/f", "not a url", nil].each do |url|
+    ["http://example.com/f", "HTTPS://example.com/f", "Https://example.com/f", "https:///f", "ftp://example.com/f", "not a url", nil].each do |url|
       expect { fetch(url) }.to raise_error(described_class::Refused, "#{url} is not an https URL")
     end
     ["A" * 64, "a" * 63, nil].each do |pin|

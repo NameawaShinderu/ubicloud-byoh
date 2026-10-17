@@ -748,6 +748,7 @@ RSpec.describe ByohLocationCli do
         expect(cli("set", "--location", location.name, "--pvm-guest-config-sha256", "c" * 64)[2]).to eq "! --pvm-guest-config and --pvm-guest-config-sha256 go together\n"
         expect(cli("set", "--location", location.name, *pin_args.first(4))[2]).to eq "! pin the PVM guest kernel: --pvm-guest-kernel URL --pvm-guest-kernel-sha256 HEX\n"
         expect(cli("set", "--location", location.name, *pin_args(deb: "http://example.com/h.deb", deb_sha: "a" * 64))[2]).to eq "! the PVM host kernel package URL http://example.com/h.deb is not https\n"
+        expect(cli("set", "--location", location.name, *pin_args(deb: "HTTPS://example.com/h.deb", deb_sha: "a" * 64), "--no-verify-download")).to eq [1, "", "! the PVM host kernel package URL HTTPS://example.com/h.deb is not https\n"]
         expect(cli("set", "--location", location.name, *pin_args, "--pvm-guest-config", "https://example.com/config", "--pvm-guest-config-sha256", sha("https://example.com/config"), "--pvm-guest-unchecked")[2])
           .to eq "! pass either --pvm-guest-config or --pvm-guest-unchecked, not both\n"
         expect(fetched).to eq []

@@ -26,9 +26,12 @@ class ByohArtifactFetch
     63 => "the file is larger than the cap",
   }.freeze
 
+  # The scheme must be lower case: the location CHECK compares it with
+  # LIKE 'https://_%', which is case sensitive.
   def self.https_url?(url)
-    uri = URI.parse(url.to_s)
-    uri.is_a?(URI::HTTPS) && !uri.host.to_s.empty?
+    url = url.to_s
+    uri = URI.parse(url)
+    url.start_with?("https://") && uri.is_a?(URI::HTTPS) && !uri.host.to_s.empty?
   rescue URI::InvalidURIError
     false
   end
