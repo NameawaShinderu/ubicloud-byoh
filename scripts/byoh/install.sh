@@ -10,6 +10,7 @@
 #     --tls acme|provided|tunnel|none --admin-email ops@example.com \
 #     --source-git ~/ubicloud --ref <commit> \
 #     [--cert F --key F] [--cloudflared-token-file F] \
+#     [--api-host HOST|--no-api] \
 #     [--rack-env production|development] [--mail-from ADDR] \
 #     [--smtp-file F|-] [--billing-rates-dir DIR] \
 #     [--backup-target DIR] [--backup-recipient age1...|--backup-recipient-file F] \
@@ -36,6 +37,14 @@
 #             is; otherwise --cloudflared-token-file F (mode 0600) installs
 #             a pinned cloudflared and ubicloud-cloudflared.service.
 #   none      no front: --url http://localhost:PORT, reached over ssh -L.
+# The API and the ubi CLI: the app routes only hosts that start with
+# "api." to the API (clover.rb), so the front also serves --api-host
+# (default api.<--url host>; UBI_URL=https://api.<host>/cli). acme gets
+# a certificate for both names; provided serves it only when --cert
+# covers it (a warning otherwise); tunnel prints the second public
+# hostname to route. --no-api serves the web UI only. API_HOST in
+# /etc/ubicloud/env records the choice (none for --no-api, api.localhost
+# for --tls none, where puma answers Host api.localhost over ssh -L).
 # The services take the client address from the header the front sets
 # (IP_FROM_HEADER): X-Real-IP for Caddy, CF-Connecting-IP for cloudflared.
 # Changing --tls on an installed control plane needs --update-env
@@ -137,12 +146,18 @@ usage_die() { die "$1" 2; }
 
 STAGE=all
 VERSION="" URL="" URL_PORT="" URL_HOST="" TLS="" ADMIN_EMAIL="" MAIL_FROM_ARG="" RACK_ENV_ARG=""
+# API_HOST: the host the front serves the API on (none: --no-api).
+# API_SERVE is 0 when a --tls provided certificate does not cover it.
+API_ARG="" NO_API=0 API_HOST="" API_SERVE=1
 SRC_TARBALL="" SRC_REV="" SRC_GIT="" SRC_REF=""
 CERT_FILE="" KEY_FILE="" CF_TOKEN_FILE=""
 SMTP_FILE="" BILLING_DIR="" BACKUP_TARGET="" BACKUP_RECIPIENT="" BACKUP_RECIPIENT_FILE=""
 NO_START=0
 EFFECTIVE_PORT=3000
 declare -A SKIP_CHECK=() UPDATE_ENV=()
+
+# A DNS name of two or more labels.
+readonly HOST_RE='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+'
 
 need_arg() { [[ $# -ge 2 && -n $2 ]] || usage_die "$1 needs a value"; }
 
@@ -163,6 +178,8 @@ parse_args() {
       --cert) need_arg "$@"; CERT_FILE=$2; shift ;;
       --key) need_arg "$@"; KEY_FILE=$2; shift ;;
       --cloudflared-token-file) need_arg "$@"; CF_TOKEN_FILE=$2; shift ;;
+      --api-host) need_arg "$@"; API_ARG=$2; shift ;;
+      --no-api) NO_API=1 ;;
       --billing-rates-dir) need_arg "$@"; BILLING_DIR=$2; shift ;;
       --backup-target) need_arg "$@"; BACKUP_TARGET=$2; shift ;;
       --backup-recipient) need_arg "$@"; BACKUP_RECIPIENT=$2; shift ;;
@@ -215,7 +232,7 @@ validate_args() {
   if [[ $STAGE == release ]]; then
     # The settings belong to the control plane, not to a release: a flag
     # here would look applied and never be.
-    [[ -z $URL$TLS$ADMIN_EMAIL$MAIL_FROM_ARG$RACK_ENV_ARG$CERT_FILE$KEY_FILE$CF_TOKEN_FILE$SMTP_FILE$BILLING_DIR$BACKUP_TARGET$BACKUP_RECIPIENT$BACKUP_RECIPIENT_FILE && ${#UPDATE_ENV[@]} == 0 && $NO_START == 0 ]] ||
+    [[ -z $URL$TLS$ADMIN_EMAIL$MAIL_FROM_ARG$RACK_ENV_ARG$CERT_FILE$KEY_FILE$CF_TOKEN_FILE$API_ARG$SMTP_FILE$BILLING_DIR$BACKUP_TARGET$BACKUP_RECIPIENT$BACKUP_RECIPIENT_FILE && ${#UPDATE_ENV[@]} == 0 && $NO_START == 0 && $NO_API == 0 ]] ||
       usage_die "--stage release builds a release and changes no setting, so it takes only --version, the source and --skip-check"
     return 0
   fi
@@ -226,12 +243,32 @@ validate_args() {
       [[ $URL =~ ^http://localhost:([1-9][0-9]{0,4})/?$ ]] ||
         usage_die "--tls none serves plain http on 127.0.0.1 only, so --url must be http://localhost:PORT (such as http://localhost:3000)"
       URL_PORT=${BASH_REMATCH[1]}
+      # No front to serve another name: puma answers the API for any
+      # Host that starts with api., such as api.localhost over ssh -L.
+      [[ -z $API_ARG && $NO_API == 0 ]] ||
+        usage_die "--api-host and --no-api go with a TLS front; under --tls none puma answers the API for Host api.localhost, reached over ssh -L (docs/byoh/INSTALL.md)"
+      API_HOST=api.localhost
       ;;
     acme | provided | tunnel)
       # The front serves the URL's host on 443; puma's port stays local.
-      [[ $URL =~ ^https://([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)/?$ ]] ||
+      [[ $URL =~ ^https://($HOST_RE)/?$ ]] ||
         usage_die "--tls $TLS needs --url https://HOST, a DNS name with no port or path (such as https://cloud.example.com)"
       URL_HOST=${BASH_REMATCH[1],,}
+      # clover.rb routes api.* hosts to the API and admin.* hosts to the
+      # admin UI, so the web UI cannot live on such a name.
+      [[ $URL_HOST != api.* && $URL_HOST != admin.* ]] ||
+        usage_die "--url https://$URL_HOST: the app routes hosts that start with api. to the API and admin. to the admin UI, so the web UI cannot be served there; use the name without it (such as https://cloud.example.com)"
+      if ((NO_API)); then
+        [[ -z $API_ARG ]] || usage_die "give --api-host or --no-api, not both"
+        API_HOST=none
+      else
+        API_HOST=${API_ARG:-api.$URL_HOST}
+        [[ $API_HOST =~ ^($HOST_RE)$ && ${#API_HOST} -le 253 ]] ||
+          usage_die "--api-host must be a DNS name with no scheme, port or path (such as api.cloud.example.com)"
+        API_HOST=${API_HOST,,}
+        [[ $API_HOST == api.* ]] ||
+          usage_die "--api-host $API_HOST must start with api.: the app routes only such hosts to the API (clover.rb)"
+      fi
       ;;
     "") usage_die "--tls is required (acme, provided, tunnel or none)" ;;
     *) usage_die "--tls must be acme, tunnel, provided or none" ;;
@@ -548,6 +585,9 @@ plan_env() {
   want CLOVER_COLUMN_ENCRYPTION_KEY secret ""
   want CLOVER_RUNTIME_TOKEN_SECRET secret ""
   want BASE_URL flag "$URL"
+  # Not read by the app: the host the front serves the API on (none for
+  # --no-api), for ubicloud-admin status and smoke.
+  want API_HOST flag "$API_HOST"
   want ADMIN_URL default "http://admin.localhost:3000"
   want BIND default 127.0.0.1
   want PORT default 3000
@@ -653,10 +693,11 @@ check_settings() {
   fi
   ((${#conflicts[@]} == 0)) && return 0
   # A front switch changes TLS_FRONT, IP_FROM_HEADER (unless it was
-  # unset) and BASE_URL (unless the URL stays): name each one it needs.
+  # unset), BASE_URL (unless the URL stays) and API_HOST (unless it
+  # stays): name each one it needs.
   local switch=""
   for k in "${conflicts[@]}"; do
-    [[ $k != BASE_URL && $k != IP_FROM_HEADER && $k != TLS_FRONT ]] || switch+=" --update-env $k"
+    [[ $k != BASE_URL && $k != API_HOST && $k != IP_FROM_HEADER && $k != TLS_FRONT ]] || switch+=" --update-env $k"
   done
   for k in "${conflicts[@]}"; do
     case $k in
@@ -667,6 +708,9 @@ check_settings() {
         # Set by hand, the header could name one the front does not set,
         # which clients could then choose.
         printf "install.sh: key IP_FROM_HEADER differs; it follows --tls (X-Real-IP for acme and provided, CF-Connecting-IP for tunnel, unset for none), so change it only with the front: pass --update-env IP_FROM_HEADER with --tls\n" >&2
+        ;;
+      API_HOST)
+        printf "install.sh: key API_HOST differs; it follows --url, --api-host, --no-api and --tls (api.localhost for none), so pass the same flags as before, or add --update-env API_HOST to change it\n" >&2
         ;;
       # A flag owns the key: ubicloud-admin env set refuses it, or it is
       # not in the env file at all (BACKUP_*).
@@ -1283,6 +1327,28 @@ check_cert() {
   return 0
 }
 
+# check_api_cert: under --tls provided, caddy serves the API host only
+# when the certificate covers it; a certificate for the --url host alone
+# leaves the API unserved, with a warning, and the install goes on.
+check_api_cert() {
+  [[ $API_HOST != none ]] || return 0
+  if [[ $(openssl x509 -in "$CERT_FILE" -noout -checkhost "$API_HOST" 2>/dev/null </dev/null) == *" does match "* ]]; then
+    API_SERVE=1
+  else
+    API_SERVE=0
+    report warn "front: --cert $CERT_FILE does not cover $API_HOST (subjectAltName), so caddy serves only $URL_HOST and the ubi CLI and API clients cannot reach https://$API_HOST; reissue the certificate for both names (or *.$URL_HOST as well) and run install.sh again, or pass --no-api --update-env API_HOST"
+  fi
+}
+
+# The names caddy serves: the --url host and the API host it may serve.
+caddy_hosts() {
+  if [[ $API_HOST != none ]] && ((API_SERVE)); then
+    printf '%s, %s' "$URL_HOST" "$API_HOST"
+  else
+    printf '%s' "$URL_HOST"
+  fi
+}
+
 has_existing_cloudflared() { [[ ! -e $UNIT_DIR/$CF_UNIT ]] && systemctl cat cloudflared.service >/dev/null 2>&1; }
 
 # A cloudflared.service that install.sh did not write and that runs or
@@ -1306,7 +1372,7 @@ check_front() {
     acme | provided)
       caddyfile_ours_or_stock ||
         usage_die "$CADDYFILE is neither the caddy package's nor one install.sh wrote; --tls $TLS would replace it, so move it away first or use --tls tunnel"
-      [[ $TLS != provided ]] || check_cert
+      [[ $TLS != provided ]] || { check_cert && check_api_cert; }
       # cloudflared passes a client's X-Real-IP through unchanged, so
       # while it forwards to puma, puma must not trust that header. This
       # holds with --no-start too: the next restart applies the env file.
@@ -1436,9 +1502,9 @@ front_caddy() {
   if ! cmp -s "$WORK/Caddyfile" "$CADDYFILE"; then
     install -m 0644 -o root -g root "$WORK/Caddyfile" "$CADDYFILE"
     restart=1
-    report changed "front: $CADDYFILE for $URL_HOST (--tls $TLS)"
+    report changed "front: $CADDYFILE for $(caddy_hosts) (--tls $TLS)"
   else
-    report ok "front: $CADDYFILE for $URL_HOST (--tls $TLS)"
+    report ok "front: $CADDYFILE for $(caddy_hosts) (--tls $TLS)"
   fi
   if [[ $(systemctl is-enabled caddy 2>/dev/null || true) != enabled ]]; then
     systemctl enable -q caddy
@@ -1453,7 +1519,7 @@ front_caddy() {
     report ok "front: caddy active"
   fi
   [[ $TLS != acme ]] ||
-    report notice "front: caddy gets the certificate for $URL_HOST from Let's Encrypt in the background; it needs public DNS for $URL_HOST and ports 80 and 443 open (journalctl -u caddy)"
+    report notice "front: caddy gets the certificates for $(caddy_hosts) from Let's Encrypt in the background; each name needs a public DNS record for this machine (an sslip.io name resolves by itself) and ports 80 and 443 open (journalctl -u caddy)"
 }
 
 wait_for_listener() {
@@ -1478,7 +1544,7 @@ render_caddyfile() {
     tls=""
   fi
   t=${t//@MODE@/"$TLS"}
-  t=${t//@HOST@/"$URL_HOST"}
+  t=${t//@HOST@/"$(caddy_hosts)"}
   t=${t//@PORT@/"$EFFECTIVE_PORT"}
   t=${t//@GLOBAL@/"$global"}
   t=${t//@TLS@/"$tls"}
@@ -1559,6 +1625,9 @@ existing_cloudflared() {
 
 tunnel_ingress_notice() {
   report notice "front: the tunnel's public hostname $URL_HOST must route to http://127.0.0.1:$EFFECTIVE_PORT (Cloudflare dashboard or ingress rules); puma listens on 127.0.0.1 only, so a route to localhost fails where localhost resolves to ::1"
+  # install.sh never changes the tunnel's routes: they live in Cloudflare.
+  [[ $API_HOST == none ]] ||
+    report notice "front: for the ubi CLI and the API, also route the public hostname $API_HOST to http://127.0.0.1:$EFFECTIVE_PORT in the same tunnel; without it https://$API_HOST does not resolve or answers 404"
 }
 
 # --- step 11: backup settings and key custody --------------------------------------------------
@@ -1718,7 +1787,16 @@ main() {
   echo "  sudo ubicloud-admin backup now"
   echo "  sudo ubicloud-admin status"
   echo "  Front:    --tls $TLS"
-  [[ $TLS != none ]] || echo "  --tls none serves 127.0.0.1:3000 only; reach it with ssh -L 3000:127.0.0.1:3000 (browser use UNVERIFIED)"
+  if [[ $TLS == none ]]; then
+    echo "  --tls none serves 127.0.0.1:$EFFECTIVE_PORT only; reach it with ssh -L $EFFECTIVE_PORT:127.0.0.1:$EFFECTIVE_PORT (browser use UNVERIFIED)"
+    echo "  API:      over that tunnel, UBI_URL=http://api.localhost:$EFFECTIVE_PORT/cli (api.localhost must resolve to 127.0.0.1 on your machine)"
+  elif [[ $API_HOST == none ]]; then
+    echo "  API:      not served (--no-api)"
+  elif [[ $TLS == provided ]] && ((API_SERVE == 0)); then
+    echo "  API:      not served: --cert does not cover $API_HOST (warning above)"
+  else
+    echo "  API:      https://$API_HOST (ubi: UBI_URL=https://$API_HOST/cli; it needs a DNS record like $URL_HOST's)"
+  fi
 }
 
 main "$@"
