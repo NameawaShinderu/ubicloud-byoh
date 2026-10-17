@@ -36,7 +36,7 @@ The control plane and the data plane can be on different platforms. The only cou
 | Ubuntu 24.04 LTS, x86_64 | `lsb_release -rs` | Only 24.04 accepts VM slices |
 | KVM | `ls /dev/kvm` | Bare metal: enable VT-x/AMD-V. Guest: nested virtualization plus a CPU model that passes `vmx`/`svm`. Neither possible: a lower tier, `container`, `pvm` or `emulated` (§8.1, [NO_KVM.md](NO_KVM.md)) |
 | 1G hugepages (`kvm` tier) | `grep -c pdpe1gb /proc/cpuinfo` > 0 | Guest: pass the host CPU model |
-| Memory in whole GiB | `sudo dmidecode -t memory \| grep Size:` shows `GB` | On the published `byoh-driver` (17d383a9c), LearnMemory fails "unexpected dmidecode unit". `m2-network` (a0259a997) accepts kB/MB/GB/TB ([platforms/README.md](platforms/README.md) §3) |
+| Memory sizes readable | `sudo dmidecode -t memory \| grep Size:` | LearnMemory accepts kB/MB/GB/TB and rounds down to whole GiB; only an unknown unit fails "unexpected dmidecode unit" (PF6) |
 | Not a hybrid (P+E core) CPU, SMT on | `lscpu` | Preflight fails `PF8-hybrid`. Since M4 a BYOH host with mixed thread counts counts every CPU as a core, so VMs boot; `--accept-check PF8-hybrid` accepts the uneven core speeds ([recipes/homelab.md](recipes/homelab.md) §2). Offline CPUs are left out (PF8 warns) |
 | Outbound internet | `curl -sI https://cloud-images.ubuntu.com` and `curl -sfIL https://cloud-images.ubuntu.com/releases/noble/release-20250502.1/ubuntu-24.04-server-cloudimg-amd64.img` (it redirects to `http://cloud-images-archive.ubuntu.com`, so port 80 too) | PrepHost and boot image downloads fail |
 | One uplink address only | `ip -br -4 addr` shows only the main IP | Pool addresses on the NIC steal VM traffic (C5) |

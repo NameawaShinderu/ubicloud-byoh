@@ -67,21 +67,12 @@ Each guide follows these six steps and links the [SETUP.md](../SETUP.md) section
 
 ## 3. Which branch
 
-Every guide clones `-b byoh-driver`. The published `byoh-fork/byoh-driver` (f775b19f5 and later) carries everything the guides use: `m2-network`, the packaged control plane (`m3-packaging`), M4 (`site add`, `host add`, preflight), the virtualization ladder (`no-kvm`: `bin/byoh-virt`, `--virt-tier`, `container`, `emulated`), the PVM tier (`pvm-build`) and the API host (`api-front`) are all merged into it.
+Every guide clones `-b byoh-driver`, which carries all the code the guides use: the M2 network contract, the packaged control plane, M4 (`site add`, `host add`, preflight), the virtualization ladder (`bin/byoh-virt`, `--virt-tier`, the `container`, `pvm` and `emulated` tiers) and the API host. There is no other branch to pick.
 
-A control plane still on an older `byoh-driver`, such as 17d383a9c (the code of the 2026-10-13 live AWS window), has the M2 operator commands (`bin/byoh-location`, `bin/byoh-pool`, `bin/byoh-host`, `register-byoh-host --location/--pool-file`, the gate) but none of the later work, and lacks these fixes:
-
-| Commit | What it adds | On 17d383a9c instead |
-|---|---|---|
-| a0259a997 | LearnMemory accepts kB/MB/GB/TB sizes and falls back to `MemTotal` | Any DIMM size that is not whole GB fails "unexpected dmidecode unit". Give guests a multiple of 1024 MiB |
-| a092f1b8b | VM setup on a BYOH host refuses a pool IP that is local on the host ("is a local address of this host") | No error: the host answers for the VM and customers get "Permission denied (publickey)". Check that `ip -br -4 addr` shows only the main IP |
-| c73f96ddc | The uplink MAC pin skips NICs named by a VLAN, bond, bridge or VRF | PrepHost can break such a netplan. Keep VLANs and bonds off the data-plane host's uplink (tag on the hypervisor or switch) |
-| 9d85a6e3c | VMs cannot reach `168.63.129.16`, `fd00:ec2::254` and `fd20:ce::254` | Only `169.254.0.0/16` is dropped |
-| 105b6439b | `bootstrap-data-plane.sh` checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` | Run those checks by hand (PLATFORMS PF3, PF4); PrepHost still aborts without KVM |
-| 237202b07, 8a9b271c7 | The control-plane bootstrap writes `BILLING_RATES_EXTRA_DIR` and `BASE_URL`, and knows `UBI_START_MONITOR` and `UBI_BASE_URL` | Add both lines to `.env.rb` by hand (VERIFY.md §1.1, SETUP.md §4) |
-| 71988157c, 3774f5837, 04f4f7ddc, a75747755 | Gate reaches VMs through their namespace; G9 without internet pools; `GATE_EXTERNAL_SSH_VIA`; clearer `verify` warning | The gate jumps to VMs over IPv6, which fails on ULA hosts |
-
-On such a control plane a machine without KVM cannot be a data plane: the probe, `--virt-tier` and the lower tiers do not exist. Upgrade it ([OPERATIONS.md](../OPERATIONS.md) §7, or [MIGRATE_FROM_DEV.md](../MIGRATE_FROM_DEV.md) for a development layout).
+A control plane installed from an older `byoh-driver` (such as 17d383a9c, the code of the 2026-10-13 live AWS window) gets all of this by upgrading: the release switch on a packaged one ([OPERATIONS.md](../OPERATIONS.md) §7), [MIGRATE_FROM_DEV.md](../MIGRATE_FROM_DEV.md) for a development one, then `install_rhizome` on every host. What an upgrade does not change by itself:
+- A development `.env.rb` is never rewritten, so one written by an older bootstrap may lack `BILLING_RATES_EXTRA_DIR` and `BASE_URL`: add them by hand (VERIFY.md §1.1, SETUP.md §4.2).
+- The egress table on a host is written at prep. Run `byoh-host setup-egress-nat --host vh...` to get the current one, which also drops VM traffic to `168.63.129.16`, `fd00:ec2::254` and `fd20:ce::254`.
+- VMs created on older code keep their setup. The check that refuses a pool IP configured on the host ("is a local address of this host") runs only for new VMs: check `ip -br -4 addr` on old hosts.
 
 ---
 

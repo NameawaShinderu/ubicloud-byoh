@@ -172,7 +172,7 @@ git clone -b byoh-driver https://github.com/NameawaShinderu/ubicloud-byoh.git ~/
 bash ~/ubicloud/scripts/byoh/bootstrap-data-plane.sh
 ```
 
-Which branch carries the code this page describes: [README.md](README.md) "Which branch". Step "1b. hardware virtualization" is the KVM test. If it prints `ERROR: /dev/kvm is missing`, stop here (§1.3); on branch `no-kvm`, `--tier auto` prepares the fastest fallback instead. The script also enables root public-key login and installs `ruby-bundler` and `netcat-openbsd`. It does not touch the network.
+Which branch carries the code this page describes: [README.md](README.md) "Which branch". Step "1b. hardware virtualization" is the KVM test. If it prints `ERROR: /dev/kvm is missing`, stop here (§1.3); `--tier auto` prepares the fastest fallback instead. The script also enables root public-key login and installs `ruby-bundler` and `netcat-openbsd`. It does not touch the network.
 
 Then check that the host has only its main IPv4:
 
@@ -377,9 +377,9 @@ Then G12-G15 ([VERIFY.md](../VERIFY.md) §2.5): `g12 g13`, `g15-before`/`g15-aft
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `bootstrap-data-plane.sh` stops: `ERROR: /dev/kvm is missing, so KVM is unavailable.` | The VPS plan exposes no nested virtualization (Hetzner Cloud, Linode, most VPS plans) | Use bare metal or a nested-virt instance type (§1.3), or keep the VPS as control plane or tunnel endpoint. On branch `no-kvm`: `bin/byoh-virt probe` for the provider's fix, or the experimental `container`/`emulated` tiers (§1.3) |
+| `bootstrap-data-plane.sh` stops: `ERROR: /dev/kvm is missing, so KVM is unavailable.` | The VPS plan exposes no nested virtualization (Hetzner Cloud, Linode, most VPS plans) | Use bare metal or a nested-virt instance type (§1.3), or keep the VPS as control plane or tunnel endpoint. `bin/byoh-virt probe` (or PF3) for the provider's fix, or the experimental `container`, `pvm` or `emulated` tiers (§1.3) |
 | `ERROR: the CPU has neither the vmx nor the svm flag.` although `/dev/kvm` exists | The plan or the CPU vendor lacks nested support (DigitalOcean AMD hosts per a feature request, UNVERIFIED) | Pick an Intel plan or another family; on DigitalOcean check `cat /sys/module/kvm_intel/parameters/nested` |
-| `ERROR: the CPU lacks the pdpe1gb flag` | The virtual CPU model hides 1G pages | Pick a newer instance family. For standard VMs there is no workaround until the `flexible` host profile (COMPUTE.md, PLANNED). The `container` and `emulated` tiers (branch `no-kvm`) use no hugepages |
+| `ERROR: the CPU lacks the pdpe1gb flag` | The virtual CPU model hides 1G pages | Pick a newer instance family. For standard VMs there is no workaround until the `flexible` host profile (COMPUTE.md, PLANNED). The `container`, `pvm` and `emulated` tiers do not need `pdpe1gb` (§1.3) |
 | Host and all VMs vanish, then the host comes back rebooted | The provider live-migrated a nested-virt guest, which can panic the kernel (OVH Public Cloud FAQ) | Expected on nested-virt VPS. Use bare metal for real workloads (§1.4). |
 | VM setup fails: "X is a local address of this host, so the host answers for the VM" | The provider's agent, cloud-init or your netplan put the pool IP on the NIC (OVH, Hetzner Cloud and Vultr IP guides all add it) | Remove the address from netplan and the interface, stop the agent from re-adding it, then retry. `ip -br -4 addr` must show only the main IP. |
 | SSH to a VM's public IP gives "Permission denied (publickey)" | As above, on a VM created before M2 | As above, then recreate the VM |
@@ -407,7 +407,7 @@ Common problems that are not specific to these providers are in NETWORKING.md §
   - How each provider delivers extra IPs (routed or on-link).
   - The DigitalOcean anchor-IP mapping.
   - The tunnel recipe.
-  - Branch `no-kvm` on any of these providers: the probe's provider rows (L2-T6) and the `container` and `emulated` tiers on a real VPS (NO_KVM.md §14, L3-T1, L5-T1).
+  - On any of these providers: the probe's provider rows (L2-T6) and the `container`, `pvm` and `emulated` tiers on a real VPS (they ran on AWS only: NO_KVM.md §14, VERIFY.md §7, §8).
 - **Known gaps:**
   - Virtual/separate MACs are not supported.
   - The pools file `uplink` key is stored but never used, so pools on a second interface or `wg0` need operator policy routing.

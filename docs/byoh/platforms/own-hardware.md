@@ -8,7 +8,7 @@ This guide covers BYOH data-plane hosts on machines you own or rent as plain har
 - a colo with BGP;
 - a site with one dynamic IP, or behind CGNAT.
 
-> **Status: UNVERIFIED.** Nothing on this page has been run on owned hardware in this project. The same code was validated end to end only on AWS (m8i nested virtualization, ap-south-1; [VERIFY.md](../VERIFY.md) §5). Everything below is derived from the code at branch `m2-network` and from [NETWORKING.md](../NETWORKING.md) §9.3-§9.6 and [PLATFORMS.md](../PLATFORMS.md). Router and vendor menu paths come from vendor docs and forum posts and are UNVERIFIED here. Record what you find in VERIFY.md §5.
+> **Status: UNVERIFIED.** Nothing on this page has been run on owned hardware in this project. The same code was validated end to end only on AWS (m8i nested virtualization, ap-south-1; [VERIFY.md](../VERIFY.md) §5). Everything below is derived from the code on `byoh-driver` and from [NETWORKING.md](../NETWORKING.md) §9.3-§9.6 and [PLATFORMS.md](../PLATFORMS.md). Router and vendor menu paths come from vendor docs and forum posts and are UNVERIFIED here. Record what you find in VERIFY.md §5.
 
 The driver is the same on every platform. What changes on your own hardware is the firmware settings, the router work that brings pool addresses to the host, and power handling.
 
@@ -465,7 +465,7 @@ ssh -o "ProxyCommand=ssh -i ~/.ssh/byoh_data root@<main IP> ip netns exec <inhos
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `bootstrap-data-plane.sh`: "/dev/kvm is missing" or "neither the vmx nor the svm flag" | VT-x / AMD SVM disabled in the firmware | Enable it (§2.2), power-cycle (a warm reboot may not apply it), rerun the bootstrap. A CPU without VT-x/AMD-V at all (some Atom and very old CPUs) cannot run standard VMs; on branch `no-kvm` it can still run the experimental `container` or `emulated` tier ([NO_KVM.md](../NO_KVM.md)) |
+| `bootstrap-data-plane.sh`: "/dev/kvm is missing" or "neither the vmx nor the svm flag" | VT-x / AMD SVM disabled in the firmware | Enable it (§2.2), power-cycle (a warm reboot may not apply it), rerun the bootstrap. A CPU without VT-x/AMD-V at all (some Atom and very old CPUs) cannot run standard VMs; it can still run the experimental `container`, `pvm` or `emulated` tier ([NO_KVM.md](../NO_KVM.md)) |
 | Bootstrap: "the CPU lacks the pdpe1gb flag" | Very old CPU | Use another machine; a `flexible` profile without hugepages is PLANNED ([COMPUTE.md](../COMPUTE.md)) |
 | Every VM fails with `RuntimeError BUG` in `write_params_json` | Hybrid Intel CPU (P+E cores), or SMT off / CPUs offline, on a host whose CPUs were learned before M4 or that is not in a BYOH location | Re-register the host in a BYOH location on M4 code (a hybrid CPU needs `--accept-check PF8-hybrid`); prep learns the CPUs once, so `move-location` alone does not fix it. Otherwise disable E-cores, enable SMT, remove `nosmt` and re-register (PLATFORMS HW-6, HW-7) |
 | Internet and internal VMs wait for capacity on a host with an NVIDIA GPU | The host is a legacy generic host outside a BYOH location; the allocator excludes GPU hosts from non-GPU VMs there | `bin/byoh-host move-location`; a host in a BYOH location takes non-GPU VMs (M4). The move also starts LearnPci on a host past prep, which drops the GPU rows learned under upstream's rule for GPUs that are not on `vfio-pci`; for a host moved before that, run `bin/byoh-host relearn-pci --host vh...` |

@@ -36,7 +36,7 @@ Use a rented dedicated server when you want public IPv4 per VM with no NAT and n
 | Requirement | Check | Notes for rented servers |
 |---|---|---|
 | Ubuntu 24.04 LTS, x86_64 | `lsb_release -rs` | Install it from the provider's installer or rescue system (§3.1) |
-| KVM | `test -c /dev/kvm`; `grep -Ewc 'vmx\|svm' /proc/cpuinfo` | Native on bare metal. If missing, VT-x/AMD-V is off in the firmware; ask the provider's support. On branch `no-kvm`, `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` from the control plane tells a firmware lock (from the kernel log) from a module that is not loaded ([NO_KVM.md](../NO_KVM.md) §2; UNVERIFIED on rented servers). `bootstrap-data-plane.sh` refuses the host without it |
+| KVM | `test -c /dev/kvm`; `grep -Ewc 'vmx\|svm' /proc/cpuinfo` | Native on bare metal. If missing, VT-x/AMD-V is off in the firmware; ask the provider's support. `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` from the control plane (or `host add` preflight, PF3) tells a firmware lock (from the kernel log) from a module that is not loaded ([NO_KVM.md](../NO_KVM.md) §2; UNVERIFIED on rented servers). `bootstrap-data-plane.sh` refuses the host without it |
 | `pdpe1gb` CPU flag | `grep -qw pdpe1gb /proc/cpuinfo` | Needed for 1G hugepages |
 | Not a hybrid P+E-core CPU; SMT on; all CPUs online | `lscpu -e` | Some rental lines use Intel 12th–14th gen desktop CPUs with P and E cores; every VM then fails with `BUG` (PLATFORMS #5, OPEN). Check `lscpu` before you order or register |
 | RAM ≥ 14 GiB, 16+ recommended | `dmidecode -t memory` | Since M2 LearnMemory accepts kB/MB/GB/TB sizes and falls back to `MemTotal` when there are no entries |
