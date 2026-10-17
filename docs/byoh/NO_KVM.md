@@ -859,7 +859,12 @@ fact, "detected, not offered".
   --pvm-host-deb ... --pvm-guest-kernel ...`); the guest config URL and sha256 are optional. `set`
   downloads every changed pin over https, refuses a sha256 mismatch before it stores anything, and
   reads the guest config (or the config embedded in the vmlinux, `CONFIG_IKCONFIG`); without either it
-  refuses unless `--pvm-guest-unchecked`. Each host downloads the guest vmlinux again and checks its
+  refuses unless `--pvm-guest-unchecked`. `set --no-verify-download` skips all of that: it stores the
+  pins without downloading them and records a changed guest kernel as unchecked (`config_checked`
+  false in the location policy), so the hosts are then the only gate. Each pvm host's download checks
+  the guest kernel's sha256 and config and records its console; a bad pin is refused there, after it
+  is stored, and pages `ByohPvmGuestKernel` on each host. The host `.deb` is checked only by the
+  install. Use it only where the control plane cannot reach the URLs. Each host downloads the guest vmlinux again and checks its
   sha256 (`download-pvm-guest-kernel`), and the host install checks the `.deb`'s. A default pin would
   be allowed only after verifying that (a) the Januscape fix commit is an ancestor of the build's
   commit, and (b) the build is reproducible from virt-pvm source; neither was done. Preferred: the
@@ -1043,7 +1048,9 @@ fact, "detected, not offered".
   committed host runs another kernel than its PVM kernel.
 - **Guest-kernel rollout:** `bin/byoh-location set --pvm-guest-kernel ...` starts the download on every
   pvm host past prep (`Prog::DownloadPvmGuestKernel`), which never blocks a host that already takes
-  VMs. A VM gets the host's current guest kernel when it is created and at its next stop and start;
+  VMs. Setting the same pin again starts nothing. A host that lost its guest kernel gets the
+  location's pin again with `bin/byoh-virt pvm refetch-guest --host vh...`, which keeps a kernel the
+  host still holds intact; its `byoh_pvm_guest_kernel` row stays `ready` meanwhile. A VM gets the host's current guest kernel when it is created and at its next stop and start;
   a restart keeps the kernel it boots. The `wait` label pages `ByohPvmGuestKernelStale` (warning) with
   the VMs still on an older kernel, and is woken by the download and by each VM start, so the page
   opens and resolves within seconds. The host keeps every kernel a VM still boots and garbage-collects

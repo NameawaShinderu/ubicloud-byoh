@@ -39,7 +39,11 @@ class ByohVirtCli
                location's new host-deb pin: it drains, installs the new
                build beside the running one and reboots into it once
                (UNVERIFIED on a real host)
-
+      pvm refetch-guest --host UBID
+               Download the location's PVM guest kernel pin onto a pvm
+               host again, for a host that lost it: the host keeps a
+               kernel it holds intact and downloads one that is missing
+               or damaged
     probe, explain and show exit 0 when the host can run VMs (L1), 3 when
     not; show judges a host registered on a lower tier by that tier's
     prerequisites instead. show exits 0 for a host that was never probed.
@@ -225,9 +229,9 @@ class ByohVirtCli
 
   def cmd_pvm(argv)
     sub = argv.shift
-    raise Error, "usage: bin/byoh-virt pvm retry|uninstall|upgrade --host UBID" unless %w[retry uninstall upgrade].include?(sub)
+    raise Error, "usage: bin/byoh-virt pvm retry|uninstall|upgrade|refetch-guest --host UBID" unless %w[retry uninstall upgrade refetch-guest].include?(sub)
 
-    send(:"pvm_#{sub}", argv)
+    send(:"pvm_#{sub.tr("-", "_")}", argv)
   end
 
   def pvm_retry(argv)
@@ -322,6 +326,32 @@ class ByohVirtCli
     end
     @out.puts "Asked host #{host.ubid} to move to the PVM host kernel of host-deb sha256 #{accept}; follow it with bin/byoh-host watch #{host.ubid}."
     @out.puts "The host is draining; set it to accepting in the admin UI when it should take VMs." if host.allocation_state == "draining"
+    nil
+  end
+
+  # Starts Prog::DownloadPvmGuestKernel for the location's current guest
+  # pin on one pvm host past prep, which is otherwise started only by
+  # bring-up and by a changed pin (bin/byoh-location set): the way back
+  # for a host whose guest kernel was removed. The host's
+  # byoh_pvm_guest_kernel row keeps its state while the download runs.
+  def pvm_refetch_guest(argv)
+    key = nil
+    parse(argv, "pvm refetch-guest --host UBID") { |o| o.on("--host UBID", "VmHost ubid") { key = it } }
+    host, = pvm_host(key)
+    pin = Prog::DownloadPvmGuestKernel.location_pin(host) || raise(Error, "location #{host.location.name} has no PVM guest kernel pin; pin one with bin/byoh-location set")
+    raise Error, "host #{host.ubid} has not reached prep; its bring-up downloads the guest kernel" unless ByohHostCli.past_prep?(host)
+    if (running = Strand.where(prog: "DownloadPvmGuestKernel", exitval: nil).all.find { it.stack.first["subject_id"] == host.id })
+      raise Error, "host #{host.ubid} downloads a PVM guest kernel already (strand #{running.ubid}, at #{running.label}); bin/byoh-virt show --host #{host.ubid} shows when it is ready"
+    end
+
+    sha256 = pin.dig("guest_kernel", "sha256")
+    strand = DB.transaction do
+      st = Strand.create(prog: "DownloadPvmGuestKernel", label: "start", stack: [{subject_id: host.id, pin:}])
+      ByohOperatorLog.record(command: "virt-pvm-refetch-guest", target_id: host.id, args: {sha256:}, result: "started #{st.ubid}")
+      st
+    end
+    @out.puts "Started downloading the PVM guest kernel #{sha256} onto host #{host.ubid} again (strand #{strand.ubid}); the host keeps it if it holds it intact."
+    @out.puts "bin/byoh-virt show --host #{host.ubid} lists the host's guest kernels; a failed download pages ByohPvmGuestKernel or ByohPvmGuestKernelFailing."
     nil
   end
 

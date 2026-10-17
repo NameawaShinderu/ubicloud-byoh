@@ -210,9 +210,9 @@ RSpec.describe ByohVirtCli do
     def actions = DB[:byoh_operator_action].order(:id).select_map([:command, :args, :result]).map { |c, a, r| [c, a.to_h, r] }
 
     it "refuses an unknown subcommand, a missing host and a host of another tier" do
-      expect(cli("pvm")).to eq [1, "", "! usage: bin/byoh-virt pvm retry|uninstall|upgrade --host UBID
+      expect(cli("pvm")).to eq [1, "", "! usage: bin/byoh-virt pvm retry|uninstall|upgrade|refetch-guest --host UBID
 "]
-      expect(cli("pvm", "frob")[2]).to eq "! usage: bin/byoh-virt pvm retry|uninstall|upgrade --host UBID
+      expect(cli("pvm", "frob")[2]).to eq "! usage: bin/byoh-virt pvm retry|uninstall|upgrade|refetch-guest --host UBID
 "
       expect(cli("pvm", "retry")).to eq [1, "", "! --host is required
 "]
@@ -298,6 +298,42 @@ RSpec.describe ByohVirtCli do
         row.update(state: "committed", install: false)
         expect(cli("pvm", "uninstall", "--host", pvm_host.ubid)[2]).to start_with "! the control plane did not install the PVM kernel of host #{pvm_host.ubid}"
         expect(semaphores).to eq []
+        expect(actions).to eq []
+      end
+    end
+
+    describe "refetch-guest" do
+      def downloads = Strand.where(prog: "DownloadPvmGuestKernel").all
+
+      it "starts the download of the location's guest kernel pin and records it" do
+        ByohPvmGuestKernel.create(vm_host_id: pvm_host.id, sha256: "b" * 64, state: "ready")
+        status, out, = cli("pvm", "refetch-guest", "--host", pvm_host.ubid)
+        st = downloads.first
+        expect(status).to eq 0
+        expect(out).to eq "Started downloading the PVM guest kernel #{"b" * 64} onto host #{pvm_host.ubid} again (strand #{st.ubid}); the host keeps it if it holds it intact.\n" \
+          "bin/byoh-virt show --host #{pvm_host.ubid} lists the host's guest kernels; a failed download pages ByohPvmGuestKernel or ByohPvmGuestKernelFailing.\n"
+        expect([st.label, st.stack]).to eq ["start", [{"subject_id" => pvm_host.id, "pin" => pvm_test_pins.slice(*ByohPvmPolicy::GUEST_KEYS)}]]
+        expect(ByohPvmGuestKernel[vm_host_id: pvm_host.id, sha256: "b" * 64].state).to eq "ready"
+        expect(actions).to eq [["virt-pvm-refetch-guest", {"sha256" => "b" * 64}, "started #{st.ubid}"]]
+      end
+
+      it "refuses while a download runs on the host, but not one on another host or one that finished" do
+        other = create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm", net6: "fd00:9:9:7::/64")
+        Strand.create(prog: "DownloadPvmGuestKernel", label: "download", stack: [{"subject_id" => other.id}])
+        Strand.create(prog: "DownloadPvmGuestKernel", label: "record", exitval: Sequel.pg_jsonb_wrap("ready"), stack: [{"subject_id" => pvm_host.id}])
+        expect(cli("pvm", "refetch-guest", "--host", pvm_host.ubid)[0]).to eq 0
+        running = downloads.find { it.stack.first["subject_id"] == pvm_host.id && it.exitval.nil? }
+        expect(cli("pvm", "refetch-guest", "--host", pvm_host.ubid)).to eq [1, "", "! host #{pvm_host.ubid} downloads a PVM guest kernel already (strand #{running.ubid}, at start); bin/byoh-virt show --host #{pvm_host.ubid} shows when it is ready\n"]
+        expect(downloads.size).to eq 3
+      end
+
+      it "refuses a location without a guest pin and a host before prep" do
+        pvm_host.update(allocation_state: "unprepared")
+        strand.update(label: "prep")
+        expect(cli("pvm", "refetch-guest", "--host", pvm_host.ubid)).to eq [1, "", "! host #{pvm_host.ubid} has not reached prep; its bring-up downloads the guest kernel\n"]
+        location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm], "acks" => {}}))
+        expect(cli("pvm", "refetch-guest", "--host", pvm_host.ubid)).to eq [1, "", "! location byoh-v has no PVM guest kernel pin; pin one with bin/byoh-location set\n"]
+        expect(downloads).to eq []
         expect(actions).to eq []
       end
     end
