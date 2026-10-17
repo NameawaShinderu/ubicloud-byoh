@@ -27,8 +27,10 @@ subnet_cidr = "10.98.1.0/24"
 ctrl_plane_instance_type = "t3.medium"
 ctrl_root_size_gb        = 40
 
-# Data plane MUST be a bare-metal type (.metal suffix) for SPDK
-# + cloud-hypervisor to work. Options in ap-south-1:
+# Data plane for the KVM tier: a .metal type, or an 8th-generation
+# Intel type (m8i/c8i/r8i) with data_plane_nested_virtualization = true,
+# such as m8i.2xlarge. A plain m6i/m7i (xlarge or larger) runs only the
+# container or pvm tier (docs/byoh/NO_KVM.md). .metal options in ap-south-1:
 #   c5.metal     96 vCPU, 192 GB RAM, EBS-only storage
 #   m5.metal     96 vCPU, 384 GB RAM, EBS-only storage
 #   m5d.metal    96 vCPU, 384 GB RAM, 4×900 GB NVMe instance store (recommended)

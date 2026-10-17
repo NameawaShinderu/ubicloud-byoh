@@ -48,7 +48,7 @@ Product direction from the user:
 | `origin` | github.com/ubicloud/ubicloud | upstream |
 | `byoh-fork` | github.com/NameawaShinderu/ubicloud-byoh | our fork; push here |
 | local `main` | 43a2241e2 (2026-04-10) | old merge base; stale since the M1 merge |
-| local `byoh-driver` | tracks `byoh-fork/byoh-driver` | contains the M1 merge of origin/main fad16215c (§8), M2 (§8a), M3 (packaging), M4 (`site add`/`host add`), the virtualization ladder with PVM, and the API host; pushed at f775b19f5. The live AWS control plane still runs 17d383a9c (M1 + M2, 2026-10-13) |
+| local `byoh-driver` | tracks `byoh-fork/byoh-driver` | contains the M1 merge of origin/main fad16215c (§8), M2 (§8a), M3 (packaging), M4 (`site add`/`host add`), the virtualization ladder with PVM, and the API host; pushed at f775b19f5. There is no long-lived AWS environment since 2026-10-15; real runs use `scripts/byoh/test/aws-e2e/` |
 | `byoh-fork/dependabot/*` | fae63fb24, a20708ee0 | only Gemfile.lock bumps on top of 06f359de4 |
 | `origin/main` | fad16215c (committed 2026-10-09) | fetched 2026-10-11 |
 
@@ -366,7 +366,7 @@ The operator-facing catalogue is `docs/byoh/TROUBLESHOOTING.md`; keep it consist
 |---|---|
 | Stuck at `bootstrap_rhizome` (BootstrapRhizome) | Root SSH is failing: the key isn't in root's authorized_keys, or there's no route from the control plane to the main IP |
 | PrepHost fails | No outbound internet (cloud-hypervisor and htcat downloads) |
-| LearnMemory "unexpected dmidecode unit" | An unknown unit (kB/MB/GB/TB are accepted since a0259a997). A control plane from before a0259a997, such as the live 17d383a9c, also fails on non-GB DIMM sizes (common in nested VMs) |
+| LearnMemory "unexpected dmidecode unit" | An unknown unit (kB/MB/GB/TB are accepted since a0259a997). A control plane from before a0259a997 also fails on non-GB DIMM sizes (common in nested VMs) |
 | `verify_hugepages` fails | Not enough RAM for 1G hugepages |
 | VM "no space left on any eligible host" | Wrong location (use the host's BYOH location; eu-central-h1 only for a legacy host not yet moved); no activated boot image of that name; no free `ipv4_address`; cores/hugepages; slices mismatch on low-core hosts (scope the fix: `DB[:vm_host].where(id: …).update(accepts_slices: false)`) |
 | VM stuck at `wait_sshable` | The control plane can't reach `<vm ip4>:22`. This is a missing operator L3 route, not a driver bug |
