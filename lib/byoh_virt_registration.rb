@@ -181,7 +181,9 @@ class ByohVirtRegistration
     if ByohVirtTiers.lower?(tier) && !ByohVirtTiers.allows?(location, tier)
       family = ByohVirtTiers.fetch(tier).family
       commands << "bin/byoh-location rates --location #{location.name} --family #{family} --from standard --multiplier <X>"
-      commands << "bin/byoh-location set --location #{location.name} --virt-tiers #{(ByohVirtTiers.tiers(location) | [tier]).join(",")} --accept #{tier}"
+      # A location offers pvm only with both PVM kernel pins (ByohPvmPolicy).
+      pins = (tier == "pvm") ? " --pvm-host-deb URL --pvm-host-deb-sha256 HEX --pvm-guest-kernel URL --pvm-guest-kernel-sha256 HEX" : ""
+      commands << "bin/byoh-location set --location #{location.name} --virt-tiers #{(ByohVirtTiers.tiers(location) | [tier]).join(",")} --accept #{tier}#{pins}"
     end
     fallback = ByohVirtTiers.lower?(tier) ? " --virt-tier auto --accept-fallback" : ""
     commands << "bin/register-byoh-host --location #{location.name} --main-ip #{main_ip} ...#{fallback}"

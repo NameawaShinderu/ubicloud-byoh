@@ -59,6 +59,27 @@ RSpec.describe ByohVirtLadder do
     end
   end
 
+  # Shipping pvm changes bin/byoh-virt probe's text only where pvm is a
+  # fallback or the host's own tier; every other fixture prints exactly
+  # what it printed when only container and emulated were shipped.
+  it "changes only the none, pvm_blocked and pvm texts by shipping pvm" do
+    texts = lambda do
+      VirtProbeFixtures.all.to_h do |name, fixture|
+        Dir.mktmpdir do |root|
+          v = described_class.from_facts(VirtProbe.facts(root: VirtProbeFixtures.materialize(fixture, root)))
+          [name, [v.tier, v.text]]
+        end
+      end
+    end
+    shipped = texts.call
+    ship_virt_tiers("container", "emulated")
+    before = texts.call
+    changed = shipped.reject { |name, (_, text)| before[name][1] == text }
+    expect(changed.values.map(&:first).uniq).to match_array %w[none pvm_blocked pvm]
+    expect(shipped.count { |_, (tier, _)| %w[none pvm_blocked pvm].include?(tier) }).to eq changed.size
+    expect(shipped.size - changed.size).to be >= 15
+  end
+
   it "knows every tier the probe reports" do
     expect(described_class::RUNGS.keys).to match_array(VirtProbe::TIERS)
   end
@@ -149,13 +170,30 @@ RSpec.describe ByohVirtLadder do
     it "tells how to load kvm_pvm" do
       v = verdict(**no_virt, pvm_module_available: true)
       expect([v.tier, v.rung, v.possible, v.recommended]).to eq ["pvm_blocked", "L3-L5", %w[container pvm emulated], "container"]
-      expect(v.fix).to start_with "modprobe kvm_pvm"
+      expect(v.fix).to start_with("modprobe kvm_pvm, and persist it with: echo kvm_pvm > /etc/modules-load.d/kvm-pvm.conf. " \
+        "Then Ubicloud can run PVM VMs here (L4, experimental) once the location offers pvm with its PVM kernel pins (docs/byoh/NO_KVM.md section 6.7). To get L1 instead: ")
+      ship_virt_tiers("container", "emulated")
+      expect(verdict(**no_virt, pvm_module_available: true).fix).to include ". Ubicloud cannot run VMs on PVM hosts yet (L4, docs/byoh/NO_KVM.md). To get L1 instead: "
     end
 
-    it "refuses VMs on a PVM host and names the way to L1" do
+    it "runs VMs on a PVM host, and names the way to L1" do
       v = verdict(cpu_flags: %w[hypervisor], modules: %w[kvm kvm_pvm], virt_vm: "kvm", dmi: {"sys_vendor" => "Hetzner"})
       expect([v.tier, v.rung, v.standard_vms?, v.caveats, v.recommended]).to eq ["pvm", "L4", false, [], "pvm"]
-      expect(v.fix).to include("This is a PVM host").and include("Hetzner dedicated server")
+      expect(v.fix).to start_with("This is a PVM host. Ubicloud runs PVM VMs here (L4, experimental): they boot the location's pinned PVM guest kernel directly, " \
+        "so the location must offer pvm with its PVM kernel pins (docs/byoh/NO_KVM.md section 6.7). To get L1 instead: ").and include("Hetzner dedicated server")
+      expect(v.text).to end_with "recommended: #{described_class::FALLBACK_LABELS["pvm"]}; register it with bin/register-byoh-host --virt-tier auto --accept-fallback " \
+        "once the location offers it (bin/byoh-location set --virt-tiers with --pvm-host-deb and --pvm-guest-kernel pins)"
+    end
+
+    it "refuses VMs on a PVM host while pvm is not shipped" do
+      ship_virt_tiers("container", "emulated")
+      v = verdict(cpu_flags: %w[hypervisor], modules: %w[kvm kvm_pvm], virt_vm: "kvm", dmi: {"sys_vendor" => "Hetzner"})
+      expect(v.fix).to start_with "This is a PVM host. cloud-hypervisor runs, but guests need a PVM-enabled kernel booted directly, and Ubicloud's boot images boot through firmware, so Ubicloud cannot run VMs here yet"
+      expect(v.text).to end_with "; fallbacks cannot be registered yet (docs/byoh/NO_KVM.md section 11)"
+    end
+
+    it "lists items the English way" do
+      expect([[], %w[a], %w[a b], %w[a b c], %w[a b c d]].map { described_class.and_list(it) }).to eq ["", "a", "a and b", "a, b and c", "a, b, c and d"]
     end
 
     it "words the platform fix by whether the platform offers nested virtualization" do
@@ -168,11 +206,12 @@ RSpec.describe ByohVirtLadder do
     end
 
     it "names the fallbacks this control plane can register" do
-      expect(described_class.fallbacks_text).to include("This control plane registers container and emulated hosts, with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers the tier; pvm is not offered yet. See docs/byoh/NO_KVM.md.")
+      expect(described_class.fallbacks_text).to include("This control plane registers container, pvm and emulated hosts, with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers the tier " \
+        "(pvm on a stock kernel only with --install-pvm-kernel, docs/byoh/NO_KVM.md section 6.7). See docs/byoh/NO_KVM.md.")
       ship_virt_tiers
       expect(described_class.fallbacks_text).to include("None of them can be registered yet. See")
-      ship_virt_tiers("container", "pvm", "emulated")
-      expect(described_class.fallbacks_text).to include("container and pvm and emulated hosts, with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers the tier. See")
+      ship_virt_tiers("container", "emulated")
+      expect(described_class.fallbacks_text).to include("This control plane registers container and emulated hosts, with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers the tier; pvm is not offered yet. See docs/byoh/NO_KVM.md.")
     end
 
     it "refuses a container" do

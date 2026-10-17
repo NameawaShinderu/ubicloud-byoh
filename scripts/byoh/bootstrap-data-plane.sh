@@ -90,7 +90,7 @@ set -euo pipefail
 
 # The lower tiers this checkout can register; keep it equal to
 # ByohVirtTiers::SHIPPED (spec/lib/byoh_virt_tiers_spec.rb checks).
-SHIPPED_TIERS="container emulated"
+SHIPPED_TIERS="container pvm emulated"
 
 usage() {
   echo "usage: bootstrap-data-plane.sh [--tier kvm|auto|container|pvm|emulated] [--main-ip IP] [--preflight-script PATH | --no-preflight]" >&2

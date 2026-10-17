@@ -50,10 +50,10 @@ RSpec.describe ByohVirtTiers do
     expect(described_class.family_for("pvm")).to eq "pvm"
   end
 
-  it "ships the container and emulated tiers, and pvm not yet" do
-    expect(described_class.shipped?("kvm")).to be true
-    %w[container emulated].each { expect(described_class.shipped?(it)).to be true }
-    expect(described_class.shipped?("pvm")).to be false
+  it "ships every lower tier" do
+    expect(described_class::SHIPPED).to eq %w[container pvm emulated]
+    %w[kvm container pvm emulated].each { expect(described_class.shipped?(it)).to be true }
+    expect(described_class.shipped?("tcg")).to be false
   end
 
   describe ".policy" do
@@ -209,6 +209,15 @@ RSpec.describe ByohVirtTiers do
       expect(refusal { check(storage_volumes: [{track_written: true}]) }).to eq "container VMs cannot track written blocks"
       offer(location, {"tiers" => %w[kvm emulated], "acks" => {"emulated" => []}})
       expect(refusal { check }).to eq "location byoh-test does not offer container VMs"
+    end
+
+    it "passes a pvm VM of ubuntu-noble and refuses images without a root device" do
+      ship_virt_tiers("container", "pvm", "emulated")
+      offer(location, {"tiers" => %w[kvm pvm], "acks" => {"pvm" => []}, "pvm_kernel" => pvm_test_pins})
+      expect(check("pvm", storage_volumes: [{track_written: true}])).to be_nil
+      %w[ubuntu-jammy ubuntu-noble-container].each do |image|
+        expect(refusal { check("pvm", boot_image: image) }).to eq "pvm VMs boot ubuntu-noble only (direct kernel boot), not #{image}"
+      end
     end
 
     it "refuses a tier without its billing rates" do

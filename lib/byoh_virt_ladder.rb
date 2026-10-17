@@ -78,12 +78,19 @@ module ByohVirtLadder
     registrable = if shipped.empty?
       "None of them can be registered yet."
     else
-      "This control plane registers #{shipped.join(" and ")} hosts, with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers the tier"
+      text = "This control plane registers #{and_list(shipped)} hosts, with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers the tier"
+      # A stock kernel has no kvm_pvm, so auto never picks pvm there
+      # unless the operator asks for the install (ByohVirtRegistration).
+      text += " (pvm on a stock kernel only with --install-pvm-kernel, docs/byoh/NO_KVM.md section 6.7)" if shipped.include?("pvm")
+      text
     end
     registrable += "; #{unshipped.join(" and ")} is not offered yet." unless shipped.empty? || unshipped.empty?
     registrable += "." if !shipped.empty? && unshipped.empty?
     "Without hardware virtualization the fallbacks, fastest first, are: #{FALLBACK_LABELS.values.join(", ")}. #{registrable} See docs/byoh/NO_KVM.md."
   end
+
+  # "a", "a and b", "a, b and c".
+  def self.and_list(items) = (items.size > 2) ? "#{items[0..-2].join(", ")} and #{items.last}" : items.join(" and ")
 
   NESTED_CAVEATS = [
     "nested virtualization: CPU-bound work typically loses 10% or more, and memory- and page-fault-heavy work much more, since every guest page-table change traps to two hypervisors",
@@ -142,7 +149,8 @@ module ByohVirtLadder
         install = ready.include?(recommended) ? "" : " after #{FALLBACK_PACKAGES.fetch(recommended)}"
         install += ", if the host has #{FALLBACK_NEEDS.fetch(recommended)} (not checked)" if unchecked.include?(recommended)
         register = if ByohVirtTiers.shipped?(recommended)
-          "register it with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers it (bin/byoh-location set --virt-tiers)"
+          pins = (recommended == "pvm") ? " with --pvm-host-deb and --pvm-guest-kernel pins" : ""
+          "register it with bin/register-byoh-host --virt-tier auto --accept-fallback once the location offers it (bin/byoh-location set --virt-tiers#{pins})"
         else
           "fallbacks cannot be registered yet (docs/byoh/NO_KVM.md section 11)"
         end
@@ -276,9 +284,19 @@ module ByohVirtLadder
     when "unknown_permission"
       "Probe as root: bin/byoh-virt probe --user root, or a --user with passwordless sudo (the probe runs sudo -n)."
     when "pvm_blocked"
-      "modprobe kvm_pvm, and persist it with: echo kvm_pvm > /etc/modules-load.d/kvm-pvm.conf. Ubicloud cannot run VMs on PVM hosts yet (L4, docs/byoh/NO_KVM.md). To get L1 instead: #{platform_fix}"
+      runs = if ByohVirtTiers.shipped?("pvm")
+        "Then Ubicloud can run PVM VMs here (L4, experimental) once the location offers pvm with its PVM kernel pins (docs/byoh/NO_KVM.md section 6.7)."
+      else
+        "Ubicloud cannot run VMs on PVM hosts yet (L4, docs/byoh/NO_KVM.md)."
+      end
+      "modprobe kvm_pvm, and persist it with: echo kvm_pvm > /etc/modules-load.d/kvm-pvm.conf. #{runs} To get L1 instead: #{platform_fix}"
     when "pvm"
-      "This is a PVM host. cloud-hypervisor runs, but guests need a PVM-enabled kernel booted directly, and Ubicloud's boot images boot through firmware, so Ubicloud cannot run VMs here yet (L4, docs/byoh/NO_KVM.md). To get L1 instead: #{platform_fix}"
+      runs = if ByohVirtTiers.shipped?("pvm")
+        "Ubicloud runs PVM VMs here (L4, experimental): they boot the location's pinned PVM guest kernel directly, so the location must offer pvm with its PVM kernel pins (docs/byoh/NO_KVM.md section 6.7)."
+      else
+        "cloud-hypervisor runs, but guests need a PVM-enabled kernel booted directly, and Ubicloud's boot images boot through firmware, so Ubicloud cannot run VMs here yet (L4, docs/byoh/NO_KVM.md)."
+      end
+      "This is a PVM host. #{runs} To get L1 instead: #{platform_fix}"
     when "none"
       advice = case platform&.nested
       when :yes, :some then "Fixable by changing the instance type or a VM option: #{platform_fix}"

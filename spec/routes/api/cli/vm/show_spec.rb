@@ -59,6 +59,26 @@ RSpec.describe Clover, "cli vm show" do
     expect(cli(%W[vm #{location.display_name}/byoh-vm show])).to include("ip4: 203.0.113.9\nip4-scope: public\nip4-internal: 10.98.1.129\nprivate-ipv4: ")
   end
 
+  it "shows the virtualization tier only for a lower-tier VM, unless asked for" do
+    expect(cli(%W[vm #{@ref} show -f id,virt-tier])).to eq "id: #{@vm.ubid}\nvirt-tier: \n"
+    expect(cli(%W[vm #{@ref} show])).not_to include("virt-tier")
+
+    location = create_byoh_location
+    @project.set_ff_visible_locations([location.name])
+    host = create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm", virt_probe: Sequel.pg_jsonb({"facts" => {"kernel" => "6.12.33-pvm"}}))
+    vm = create_vm(project_id: @project.id, name: "pvm-vm", family: "pvm", location_id: location.id, vm_host_id: host.id)
+    Prog::Vnet::NicNexus.assemble(@project.default_private_subnet(location).id, name: "pvm-vm-nic").subject.update(vm_id: vm.id)
+    description = ByohVirtTiers.fetch("pvm").description
+    ref = "#{location.display_name}/pvm-vm"
+    expect(cli(%W[vm #{ref} show -f virt-tier])).to eq "virt-tier: pvm (experimental) #{description}\n  host-kernel: 6.12.33-pvm\n"
+    ByohVmGuestKernel.create(vm_id: vm.id, sha256: "b" * 64, release: nil, console: "hvc0")
+    expect(cli(%W[vm #{ref} show])).to include("boot-image: ubuntu-jammy\nvirt-tier: pvm (experimental) #{description}\n  host-kernel: 6.12.33-pvm\n  guest-kernel: unknown release sha256 #{"b" * 64} config unchecked\nip6: ")
+    ByohVmGuestKernel[vm.id].update(release: "6.12.33-pvm-guest")
+    ByohPvmGuestKernel.create(vm_host_id: host.id, sha256: "b" * 64, state: "ready", console: "hvc0", config_checked: true)
+    host.update(virt_probe: nil)
+    expect(cli(%W[vm #{ref} show -f virt-tier])).to eq "virt-tier: pvm (experimental) #{description}\n  guest-kernel: 6.12.33-pvm-guest sha256 #{"b" * 64} config checked\n"
+  end
+
   it "-f option controls which fields are shown for VM" do
     expect(cli(%W[vm #{@ref} show -f id,name])).to eq <<~END
       id: #{@vm.ubid}

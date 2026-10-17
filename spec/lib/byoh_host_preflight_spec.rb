@@ -256,6 +256,7 @@ RSpec.describe ByohHostPreflight do
     end
 
     it "fails a tier this control plane cannot register, and skips the location check without a location" do
+      ship_virt_tiers("container", "emulated")
       preflight = evaluate(from_fixture("no-kvm"), main_ip: "203.0.113.10", virt_tier: "pvm")
       expect(check(preflight, "PF3-tier").to_h).to include(status: "fail", detail: "pvm hosts are not available yet (docs/byoh/NO_KVM.md section 11)")
       preflight = from_fixture("no-kvm").evaluate(main_ip: "203.0.113.10", virt_tier: "container")

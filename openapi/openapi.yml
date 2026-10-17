@@ -4260,7 +4260,7 @@ components:
           description: Unix user of the VM
           type: string
         virt_tier:
-          description: The virtualization tier of a VM that is not a standard KVM VM (a system container or an emulated VM, offered only in BYOH locations; docs/byoh/NO_KVM.md). Absent for standard VMs.
+          description: The virtualization tier of a VM that is not a standard KVM VM (a system container, a PVM VM or an emulated VM, offered only in BYOH locations; docs/byoh/NO_KVM.md). Absent for standard VMs.
           type: object
           properties:
             description:
@@ -4269,6 +4269,25 @@ components:
             experimental:
               description: Whether the tier is experimental
               type: boolean
+            guest_kernel:
+              description: The guest kernel a PVM VM boots, once it has started (detailed view only)
+              type: object
+              properties:
+                config_checked:
+                  description: Whether the kernel's config was checked for what PVM VMs need
+                  type: boolean
+                release:
+                  description: The kernel release
+                  type: string
+                  nullable: true
+                sha256:
+                  description: The SHA-256 of the kernel image
+                  type: string
+              additionalProperties: false
+              required:
+                - config_checked
+                - release
+                - sha256
             host_kernel:
               description: The host kernel the VM shares or relies on (system containers and PVM VMs, detailed view only)
               type: string

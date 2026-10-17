@@ -48,8 +48,8 @@ RSpec.describe Prog::Vm::HostNexus do
 
     it "refuses a lower tier that is unknown, not shipped, not offered, outside BYOH or with another family" do
       expect { assemble(virt_tier: "tcg") }.to raise_error(ByohVirtTiers::Refused, /unknown tier "tcg"/)
-      expect { assemble(virt_tier: "pvm") }.to raise_error(RuntimeError, "pvm hosts are not available yet")
       ship_virt_tiers("emulated")
+      expect { assemble(virt_tier: "pvm") }.to raise_error(RuntimeError, "pvm hosts are not available yet")
       expect { assemble(virt_tier: "emulated") }.to raise_error(RuntimeError, "Location byoh-test does not offer emulated hosts")
       offer(%w[emulated])
       expect { assemble(virt_tier: "emulated", family: "premium") }.to raise_error(RuntimeError, "A host of virt tier emulated has family emulated, not premium")

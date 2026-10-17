@@ -893,6 +893,21 @@ RSpec.describe Clover, "vm" do
         expect(rows).not_to have_key("Host Kernel")
       end
 
+      it "shows the guest kernel a PVM VM boots" do
+        host = create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm", net6: "fd00:1:2:3::/64", virt_probe: Sequel.pg_jsonb({"facts" => {"kernel" => "6.12.33-pvm"}}))
+        vm = byoh_vm
+        vm.update(family: "pvm", vm_host_id: host.id)
+        rows = overview_rows(vm)
+        expect(rows["Virtualization"]).to eq "#{ByohVirtTiers.fetch("pvm").description} Experimental."
+        expect(rows["Host Kernel"]).to eq "6.12.33-pvm"
+        expect(rows).not_to have_key("Guest Kernel")
+        ByohVmGuestKernel.create(vm_id: vm.id, sha256: "b" * 64, release: nil, console: "hvc0")
+        expect(overview_rows(vm)["Guest Kernel"]).to eq "unknown release (sha256 bbbbbbbbbbbb), config unchecked"
+        ByohVmGuestKernel[vm.id].update(release: "6.12.33-pvm-guest")
+        ByohPvmGuestKernel.create(vm_host_id: host.id, sha256: "b" * 64, state: "ready", console: "hvc0", config_checked: true)
+        expect(overview_rows(vm)["Guest Kernel"]).to eq "6.12.33-pvm-guest (sha256 bbbbbbbbbbbb), config checked"
+      end
+
       it "offers the IPv4 exposures the location's pools have" do
         vm_host = create_byoh_vm_host(location)
         add_pool(vm_host, "10.98.1.128/31", "nat")

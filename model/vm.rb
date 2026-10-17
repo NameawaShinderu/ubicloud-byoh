@@ -105,6 +105,17 @@ class Vm < Sequel::Model
     vm_host&.virt_probe&.dig("facts", "kernel") if Prog::LearnVirt::KERNEL_TIERS.include?(family)
   end
 
+  # The guest kernel a PVM VM boots (docs/byoh/NO_KVM.md section 6.7):
+  # its release, sha256 and whether its config was checked for what PVM
+  # VMs need when the host downloaded it. nil for every other VM, and for
+  # a PVM VM that has not started yet.
+  def pvm_guest_kernel
+    return unless family == "pvm" && (kernel = ByohVmGuestKernel[id])
+
+    checked = ByohPvmGuestKernel.where(vm_host_id:, sha256: kernel.sha256).get(:config_checked)
+    {release: kernel.release, sha256: kernel.sha256, config_checked: checked == true}
+  end
+
   # The addresses service DNS (load balancers, Postgres) publishes for
   # the VM: its public ones on a BYOH host, and its own elsewhere. An
   # internal address is reachable only from the site, so it gets no

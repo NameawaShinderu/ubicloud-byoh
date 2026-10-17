@@ -4,10 +4,11 @@ class UbiCli
   on("vm").run_on("show") do
     desc "Show details for a virtual machine"
 
-    fields = %w[id name state location size unix-user storage-size-gib boot-image ip6 ip4-enabled ip4 ip4-scope ip4-internal private-ipv4 private-ipv6 subnet maintenance-window-start-at firewalls].freeze.each(&:freeze)
-    # Only VMs on BYOH hosts have these, so other VMs show what they did
-    # before unless the fields are asked for.
-    byoh_fields = %w[ip4-scope ip4-internal].freeze.each(&:freeze)
+    fields = %w[id name state location size unix-user storage-size-gib boot-image virt-tier ip6 ip4-enabled ip4 ip4-scope ip4-internal private-ipv4 private-ipv6 subnet maintenance-window-start-at firewalls].freeze.each(&:freeze)
+    # Only VMs on BYOH hosts have these (virt-tier only lower-tier VMs,
+    # docs/byoh/NO_KVM.md), so other VMs show what they did before unless
+    # the fields are asked for.
+    byoh_fields = %w[virt-tier ip4-scope ip4-internal].freeze.each(&:freeze)
     firewall_fields = %w[id name description location path firewall-rules].freeze.each(&:freeze)
     firewall_rule_fields = %w[id cidr port-range protocol].freeze.each(&:freeze)
 
@@ -54,6 +55,16 @@ class UbiCli
           end
         when :subnet
           body << display_key << ": " << data[key].name << "\n"
+        when :virt_tier
+          if (tier = data[key])
+            body << display_key << ": " << tier[:tier] << " (experimental) " << tier[:description] << "\n"
+            body << "  host-kernel: " << tier[:host_kernel] << "\n" if tier[:host_kernel]
+            if (guest = tier[:guest_kernel])
+              body << "  guest-kernel: " << (guest[:release] || "unknown release") << " sha256 " << guest[:sha256] << " config " << (guest[:config_checked] ? "checked" : "unchecked") << "\n"
+            end
+          else
+            body << display_key << ": \n"
+          end
         else
           body << display_key << ": " << data[key].to_s << "\n"
         end

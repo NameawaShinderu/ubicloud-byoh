@@ -26,8 +26,10 @@ RSpec.describe ByohVirtTiers, "pvm" do
     end
   end
 
-  it "keeps pvm unoffered until the test reports GO" do
-    expect(described_class::SHIPPED).not_to include("pvm")
+  # The go/no-go reported GO on AWS m6i.large (2026-10-16), so pvm ships.
+  it "ships pvm, booting only images with a root device" do
+    expect(described_class::SHIPPED).to include("pvm")
+    expect(described_class.fetch("pvm").boot_images).to eq described_class::PVM_ROOT.keys
   end
 
   # These run the script, which needs bash. The alpine test image has

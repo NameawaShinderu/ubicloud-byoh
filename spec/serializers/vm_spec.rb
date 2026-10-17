@@ -116,6 +116,24 @@ RSpec.describe Serializers::Vm do
       expect(described_class.serialize_internal(container.reload, {detailed: true})[:virt_tier]).to eq(described)
     end
 
+    it "shows the guest kernel a PVM VM boots, and the host kernel, in the detailed view" do
+      location = create_byoh_location(ula48: "fd00:1:2::/48")
+      host = create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm", net6: "fd00:1:2:3::/64", virt_probe: Sequel.pg_jsonb({"facts" => {"kernel" => "6.12.33-pvm"}}))
+      pvm = create_vm(family: "pvm", location_id: location.id, vm_host_id: host.id)
+      described = {tier: "pvm", description: ByohVirtTiers.fetch("pvm").description, experimental: true}
+      # Before its first start the VM has no guest kernel yet.
+      expect(described_class.serialize_internal(pvm, {detailed: true})[:virt_tier]).to eq(described.merge(host_kernel: "6.12.33-pvm"))
+      ByohVmGuestKernel.create(vm_id: pvm.id, sha256: "b" * 64, release: "6.12.33-pvm-guest", console: "hvc0")
+      expect(described_class.serialize_internal(pvm)[:virt_tier]).to eq(described)
+      unchecked = described.merge(host_kernel: "6.12.33-pvm", guest_kernel: {release: "6.12.33-pvm-guest", sha256: "b" * 64, config_checked: false})
+      expect(described_class.serialize_internal(pvm, {detailed: true})[:virt_tier]).to eq(unchecked)
+      ByohPvmGuestKernel.create(vm_host_id: host.id, sha256: "b" * 64, state: "ready", release: "6.12.33-pvm-guest", console: "hvc0", config_checked: true)
+      expect(described_class.serialize_internal(pvm, {detailed: true}).dig(:virt_tier, :guest_kernel, :config_checked)).to be true
+      # Only PVM VMs have one.
+      ByohVmGuestKernel.create(vm_id: vm.id, sha256: "b" * 64, release: nil, console: "hvc0")
+      expect(vm.pvm_guest_kernel).to be_nil
+    end
+
     it "serializes a VM whose user_nic is gone (mid-destroy) without raising" do
       vm.user_nic.update(vm_id: nil)
       vm.reload

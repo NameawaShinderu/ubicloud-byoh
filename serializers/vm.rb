@@ -28,6 +28,9 @@ class Serializers::Vm < Serializers::Base
       if options[:detailed] && (host_kernel = vm.shared_host_kernel)
         base[:virt_tier][:host_kernel] = host_kernel
       end
+      if options[:detailed] && (guest_kernel = vm.pvm_guest_kernel)
+        base[:virt_tier][:guest_kernel] = guest_kernel
+      end
     end
 
     if options[:detailed]

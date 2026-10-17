@@ -166,6 +166,15 @@ RSpec.describe ByohVirtRegistration do
       .to eq ["bin/register-byoh-host --location byoh-test --main-ip x ... --virt-tier auto --accept-fallback"]
   end
 
+  it "names the PVM kernel pins in the commands for a PVM host" do
+    location.update(byoh_virt: nil)
+    expect(described_class.recommended_commands(verdict_for("pvm"), location:, main_ip: "x")).to eq [
+      "bin/byoh-location rates --location byoh-test --family pvm --from standard --multiplier <X>",
+      "bin/byoh-location set --location byoh-test --virt-tiers kvm,pvm --accept pvm --pvm-host-deb URL --pvm-host-deb-sha256 HEX --pvm-guest-kernel URL --pvm-guest-kernel-sha256 HEX",
+      "bin/register-byoh-host --location byoh-test --main-ip x ... --virt-tier auto --accept-fallback",
+    ]
+  end
+
   it "prints no commands for a fallback that is not shipped" do
     ship_virt_tiers
     location.update(byoh_virt: nil)

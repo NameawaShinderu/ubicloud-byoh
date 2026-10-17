@@ -87,7 +87,7 @@ module ByohVirtTiers
   # The lower tiers whose rhizome support exists, so that a location can
   # offer them and hosts can be registered on them. A tier joins this
   # list in the commit that ships it (docs/byoh/NO_KVM.md section 11).
-  SHIPPED = %w[container emulated].freeze
+  SHIPPED = %w[container pvm emulated].freeze
 
   # The tiers whose "multitenant" acknowledgement takes effect: those
   # whose hosts are checked for what sharing needs (docs/byoh/NO_KVM.md
@@ -296,6 +296,9 @@ module ByohVirtTiers
     RATE_TYPES.each { Validation.validate_billing_rate(it, spec.family, location.name) }
     refuse "#{tier} VMs cannot have GPUs" if gpu_count.to_i > 0
     refuse "#{tier} VMs choose their hypervisor from the host" if hypervisor || ch_version
+    # A PVM VM boots the location's guest kernel directly, so its image
+    # needs a known root partition (PVM_ROOT); firmware never runs.
+    refuse "#{tier} VMs boot #{PVM_ROOT.keys.join(", ")} only (direct kernel boot), not #{boot_image}" if tier == "pvm" && !PVM_ROOT.key?(boot_image)
     refuse "#{tier} VMs can only boot #{spec.boot_images.join(", ")}" unless spec.boot_images.include?(boot_image)
     if remote_storage_server_id || storage_volumes.any? { it[:machine_image_version_id] || it[:remote_storage_server_id] }
       refuse "#{tier} VMs cannot use machine images or remote storage"

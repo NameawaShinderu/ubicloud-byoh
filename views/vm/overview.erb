@@ -20,6 +20,9 @@
     if (host_kernel = @vm.shared_host_kernel)
       data << ["Host Kernel", host_kernel]
     end
+    if (guest_kernel = @vm.pvm_guest_kernel)
+      data << ["Guest Kernel", "#{guest_kernel[:release] || "unknown release"} (sha256 #{guest_kernel[:sha256][0, 12]}), config #{guest_kernel[:config_checked] ? "checked" : "unchecked"}"]
+    end
   end
   subnet = @vm.user_nic.private_subnet
   ssh_command = lambda do |address|
