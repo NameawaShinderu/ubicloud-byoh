@@ -294,9 +294,12 @@ class Prog::Vm::HostNexus < Prog::Base
     end
   end
 
-  # A pvm host whose guest kernel download was refused waits here, short
-  # of accepting, with the ByohPvmGuestKernel page open, until a new pin
-  # (bin/byoh-location set starts its download) gives it a ready kernel.
+  # A pvm host whose guest kernel download was refused (or superseded by
+  # a new pin) waits here, short of accepting, with the ByohPvmGuestKernel
+  # page open, until a new pin (bin/byoh-location set starts its
+  # download) gives it a ready kernel. A download that only fails is
+  # never refused: it keeps the host at wait_download_boot_images until
+  # it succeeds.
   label def pvm_guest_kernel_refused
     hop_patch if pvm_guest_kernel_ready?
 

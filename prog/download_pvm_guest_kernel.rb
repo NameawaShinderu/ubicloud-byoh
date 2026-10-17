@@ -11,16 +11,21 @@
 #
 # The frame's pin is the location pin's guest side (ByohPvmPolicy::
 # GUEST_KEYS). A refused pin (a wrong sha256, a config without what PVM
-# VMs need) pages ByohPvmGuestKernel and pops "refused"; a download that
-# fails otherwise is tried MAX_RESTARTS more times first. Once the
-# location's current pin is ready the page resolves, and the host drops
-# the kernels that neither the location nor any of its VMs use.
+# VMs need) pages ByohPvmGuestKernel and pops "refused". A download that
+# fails otherwise (DNS, a refused connection, a stall, an HTTP error) may
+# pass when tried again, so it is never refused: it is tried again every
+# 15 seconds, and after MAX_RESTARTS failures every RETRY_NAP seconds
+# with a ByohPvmGuestKernelFailing page open, until it succeeds or the
+# location pins another kernel ("superseded"). Once the location's
+# current pin is ready the refusal page resolves, and the host drops the
+# kernels that neither the location nor any of its VMs use.
 class Prog::DownloadPvmGuestKernel < Prog::Base
   subject_is :sshable, :vm_host
   frame_reader :pin
   frame_accessor :restarted
 
   MAX_RESTARTS = 10
+  RETRY_NAP = 5 * 60
 
   # The guest side of the location's pin, as the frame takes it, or nil.
   def self.location_pin(vm_host)
@@ -59,14 +64,16 @@ class Prog::DownloadPvmGuestKernel < Prog::Base
         refuse(shown["error"])
       end
 
-      restarted = self.restarted || 0
-      if restarted >= MAX_RESTARTS
-        logs = sshable.d_logs(unit_name, lines: 5).strip
-        sshable.d_clean(unit_name)
-        refuse("the download failed #{MAX_RESTARTS + 1} times; the last log lines: #{logs}")
-      end
+      logs = sshable.d_logs(unit_name, lines: 5).strip
       sshable.d_clean(unit_name)
-      self.restarted = restarted + 1
+      supersede unless pinned_sha == sha256
+
+      restarted = (self.restarted || 0) + 1
+      self.restarted = restarted
+      if restarted > MAX_RESTARTS
+        page_failing(restarted, logs)
+        nap RETRY_NAP
+      end
     end
 
     nap 15
@@ -81,6 +88,7 @@ class Prog::DownloadPvmGuestKernel < Prog::Base
     if pinned_sha == sha256
       Page.from_tag_parts("ByohPvmGuestKernel", vm_host.ubid)&.incr_resolve
     end
+    resolve_failing
     collect_garbage
     pop "ready"
   end
@@ -110,8 +118,34 @@ class Prog::DownloadPvmGuestKernel < Prog::Base
     end
   end
 
+  def failing_tag = ["ByohPvmGuestKernelFailing", vm_host.ubid, sha256]
+
+  def resolve_failing = Page.from_tag_parts(*failing_tag)&.incr_resolve
+
+  def page_failing(failures, logs)
+    location = vm_host.location
+    Prog::PageNexus.assemble("#{vm_host.ubid} cannot download the PVM guest kernel #{sha256} (#{failures} failures)",
+      failing_tag, vm_host.ubid, resource_id: vm_host.id,
+      extra_data: {
+        sha256:, url: pin.dig("guest_kernel", "url"), failures:, last_log_lines: logs,
+        fix: "The download failed for a reason that may pass (DNS, a refused connection, a stall, an HTTP error), not because the pin is wrong. " \
+          "It is tried again every #{RETRY_NAP / 60} minutes and this page resolves once it succeeds; a host in bring-up goes on by itself then. " \
+          "Check that the host reaches the URL over https. To use another kernel, pin it: bin/byoh-location set --location #{location.name} " \
+          "--pvm-guest-kernel URL --pvm-guest-kernel-sha256 HEX (docs/byoh/NO_KVM.md section 6.7), which ends this download.",
+      })
+  end
+
+  # The location pins another kernel now: this download is not needed. A
+  # kernel the host already holds stays recorded, for its VMs.
+  def supersede
+    kernel.destroy unless kernel.state == "ready"
+    resolve_failing
+    pop "superseded"
+  end
+
   def refuse(error)
     kernel.update(state: "refused", updated_at: Time.now)
+    resolve_failing
     location = vm_host.location
     Prog::PageNexus.assemble("#{vm_host.ubid} refused the PVM guest kernel #{sha256}: #{error}",
       ["ByohPvmGuestKernel", vm_host.ubid], vm_host.ubid, resource_id: vm_host.id,
