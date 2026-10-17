@@ -58,7 +58,7 @@ State (instance ids and addresses) is in `var/aws-e2e/<run>/state`.
    control plane, from the repository root, `BYOH_REAL_E2E=1
    scripts/byoh/test/real/pvm-e2e.sh all` with `PVM_E2E_HOST_SSH=ubuntu@<pvme
    private IP>`, the e2e key, a personal access token (`UBI_TOKEN`,
-   `UBI_URL=https://<eip>.sslip.io/cli`) and `PVM_E2E_PROJECT` (the
+   `UBI_URL=https://api.<eip>.sslip.io/cli`; the API lives only on the `api.` name) and `PVM_E2E_PROJECT` (the
    script's header lists every setting). It stops at the first phase that
    fails and resumes from any phase. Its one MANUAL step, `power-cycle`,
    asks for `aws ec2 stop-instances` and `start-instances` of the pvme

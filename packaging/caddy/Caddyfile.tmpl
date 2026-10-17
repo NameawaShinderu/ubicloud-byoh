@@ -8,6 +8,8 @@
 	@GLOBAL@
 }
 
+# The --url host and the API host (install.sh --api-host, default
+# api.<--url host>): clover.rb routes only api.* hosts to the API.
 @HOST@ {
 	@TLS@
 	# puma binds 127.0.0.1 only. X-Real-IP is set, never appended, from

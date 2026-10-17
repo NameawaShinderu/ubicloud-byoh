@@ -68,7 +68,8 @@
 #   PVM_E2E_PROJECT2     ubid of another project, which tenancy must not
 #                        be able to grant (that check is skipped without it)
 #   UBI_TOKEN, UBI_URL   personal access token of PVM_E2E_PROJECT and the
-#                        control plane's CLI endpoint (https://<host>/cli)
+#                        control plane's CLI endpoint (https://api.<host>/cli;
+#                        the web host https://<host>/cli answers HTML)
 #   PVM_E2E_UBI          the ubi command, split on spaces [bin/ubi]
 #   PVM_E2E_UBI_LOCATION the site's name in the API [$PVM_E2E_SITE]
 #   PVM_E2E_WORK         state, keys, logs and the report [var/pvm-e2e]

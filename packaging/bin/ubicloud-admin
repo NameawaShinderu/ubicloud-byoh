@@ -27,12 +27,17 @@
 #   ubicloud-admin release prune --keep N
 #
 # status   Units, settings (bin/byoh-config-check), pg_hba trust rules,
-#          backup recipient and age, release. Exits 1 on any fail.
+#          backup recipient and age, release, and whether the API host
+#          (API_HOST) answers the API (as in smoke). Exits 1 on any fail.
 # smoke    What install.sh runs last (step 12): puma answers on its
 #          address; the front in /etc/ubicloud/front.conf runs (caddy,
 #          or the cloudflared unit) and answers (caddy on 127.0.0.1:443
 #          under the BASE_URL host for acme and provided, BASE_URL itself
-#          for tunnel); web and respirate are active; bin/byoh-config-check
+#          for tunnel); the API host (API_HOST in the env file) answers
+#          the API, an unauthenticated JSON 401, not the web UI's HTML
+#          (through caddy on 127.0.0.1:443, through the tunnel, or puma
+#          with Host api.localhost under --tls none); web and respirate
+#          are active; bin/byoh-config-check
 #          has no fail; and with RACK_ENV=production, bin/production_check
 #          passes (it needs port 8081, so PORT must not be 8081). Only what
 #          comes up in the background warns: an acme certificate caddy
@@ -75,7 +80,7 @@
 # env      Changes /etc/ubicloud/env and restarts the services. Values are
 #          never printed, except by env get --reveal. If web does not
 #          answer after the restart, the old file is put back. Keys that
-#          install.sh owns through a flag (BASE_URL, RACK_ENV, MAIL_*,
+#          install.sh owns through a flag (BASE_URL, API_HOST, RACK_ENV, MAIL_*,
 #          SMTP_*, IP_FROM_HEADER), the secrets and keys that load code
 #          into Ruby (RUBYOPT, GEM_*, BUNDLE_*, ...) are refused.
 # run      TOOL is byoh-location, byoh-pool, byoh-host, register-byoh-host, byoh-virt,
@@ -178,6 +183,7 @@ readonly ENV_FILE=$ETC/env
 readonly BACKUP_CONF=$ETC/backup.conf
 readonly BACKUP_RECIPIENTS=$ETC/backup-recipients
 readonly FRONT_CONF=$ETC/front.conf
+readonly CADDYFILE=/etc/caddy/Caddyfile
 # bin/production_check's puma.
 readonly CHECK_PORT=8081
 readonly LOCK=/run/ubicloud-admin.lock
@@ -397,6 +403,7 @@ cmd_status() {
   code=$(web_code)
   if [[ $code =~ ^[1-5][0-9][0-9]$ ]]; then report ok "web: answers on $(web_addr) (HTTP $code)"; else fail_line "web: no answer on $(web_addr)"; fi
 
+  check_api api 0
   status_env
   status_postgres
   status_backups
@@ -638,6 +645,111 @@ smoke_front() {
   esac
 }
 
+# api_probe SECONDS URL [CURL_OPTION...]: GETs URL until it answers as
+# the API does without a token (401 or 404 with a JSON body), answers
+# HTML, or SECONDS pass. Sets PROBE_CODE, PROBE_TYPE (the content type)
+# and PROBE_RC.
+api_probe() {
+  local end=$((SECONDS + $1)) url=$2 out
+  shift 2
+  while :; do
+    PROBE_RC=0
+    out=$(curl -s -o /dev/null -m 10 -w '%{http_code} %{content_type}' "$@" "$url" 2>/dev/null) || PROBE_RC=$?
+    PROBE_CODE=${out%% *}
+    PROBE_CODE=${PROBE_CODE:-000}
+    PROBE_TYPE=""
+    [[ $out != *" "* ]] || PROBE_TYPE=${out#* }
+    api_json && return 0
+    [[ $PROBE_TYPE != text/html* ]] || return 1
+    ((PROBE_RC == 6 || SECONDS >= end)) && return 1
+    sleep 1
+  done
+}
+
+api_json() { [[ $PROBE_CODE =~ ^40[14]$ && $PROBE_TYPE == application/json* ]]; }
+
+# caddy_serves HOST: HOST is a site address of the Caddyfile.
+caddy_serves() {
+  [[ -r $CADDYFILE ]] || return 1
+  awk -v h="$1" '/^[^[:space:]#{].*\{[[:space:]]*$/ {
+      sub(/[[:space:]]*\{[[:space:]]*$/, ""); n = split($0, a, /[[:space:],]+/)
+      for (i = 1; i <= n; i++) if (a[i] == h) f = 1
+    } END { exit !f }' "$CADDYFILE"
+}
+
+# check_api PREFIX SECONDS: whether the API host answers the API. The
+# app routes only hosts that start with api. to it (clover.rb), so the
+# ubi CLI (UBI_URL=https://api.<host>/cli) and API clients need that
+# name served by the front. GET /project without a token is a JSON 401
+# from the API and the HTML login page from the web UI.
+check_api() {
+  local p=$1 wait=$2 front api how
+  kv_read "$FRONT_CONF"
+  front=${KV[TLS_FRONT]:-none}
+  kv_read "$ENV_FILE"
+  if [[ -z ${KV[API_HOST]+x} ]]; then
+    if [[ $front != none ]]; then
+      warn_line "$p: $ENV_FILE sets no API_HOST (installed before install.sh served the API), so nothing serves https://api.<host> and the ubi CLI gets the web UI or no answer; run install.sh again with the same flags"
+      return
+    fi
+    api=api.localhost
+  else
+    api=${KV[API_HOST]}
+  fi
+  if [[ $api == none ]]; then
+    report skip "$p: the API is not served (install.sh --no-api)"
+    return
+  fi
+  case $front in
+    none)
+      if api_probe "$wait" "http://$(web_addr)/project" -H "Host: $api"; then
+        report ok "$p: puma answers the API for Host $api (HTTP $PROBE_CODE JSON); over ssh -L, UBI_URL=http://$api:$(env_value PORT 3000)/cli"
+      else
+        fail_line "$p: puma does not answer the API for Host $api (HTTP $PROBE_CODE ${PROBE_TYPE:-no body}, curl exit $PROBE_RC; ubicloud-admin logs web)"
+      fi
+      return
+      ;;
+    acme | provided)
+      if ! caddy_serves "$api"; then
+        if [[ $front == provided ]]; then
+          warn_line "$p: caddy does not serve $api, so the ubi CLI and API clients cannot reach https://$api: the --tls provided certificate does not cover it; reissue it for both names and run install.sh again"
+        else
+          warn_line "$p: caddy does not serve $api ($CADDYFILE), so the ubi CLI and API clients cannot reach https://$api; run install.sh again with the same flags"
+        fi
+        return
+      fi
+      # As smoke_front: -k, and --resolve to this machine's caddy, so it
+      # needs no DNS or hairpin route.
+      how="through caddy on 127.0.0.1:443"
+      api_probe "$wait" "https://$api/project" -k --resolve "$api:443:127.0.0.1" && {
+        report ok "$p: caddy serves the API at https://$api (HTTP $PROBE_CODE JSON)"
+        return
+      }
+      if [[ $front == acme && $PROBE_CODE == 000 && $PROBE_RC == 35 ]]; then
+        warn_line "$p: caddy has no certificate for $api yet (curl exit 35, TLS handshake); it gets one from Let's Encrypt in the background, which needs a public DNS record for $api (ubicloud-admin logs caddy)"
+        return
+      fi
+      ;;
+    tunnel)
+      how="through the tunnel"
+      api_probe "$wait" "https://$api/project" && {
+        report ok "$p: https://$api answers the API through the tunnel (HTTP $PROBE_CODE JSON)"
+        return
+      }
+      if [[ $PROBE_TYPE != text/html* ]]; then
+        warn_line "$p: no API answer from https://$api (HTTP $PROBE_CODE, curl exit $PROBE_RC); the tunnel needs a public hostname $api that routes to http://$(web_addr), with its DNS record (ubicloud-admin logs cloudflared)"
+        return
+      fi
+      ;;
+    *) return ;;
+  esac
+  if [[ $PROBE_TYPE == text/html* ]]; then
+    fail_line "$p: https://$api $how answers HTML (HTTP $PROBE_CODE), the web UI, not the API; the ubi CLI gets the login page (docs/byoh/TROUBLESHOOTING.md)"
+  else
+    fail_line "$p: https://$api $how answers HTTP $PROBE_CODE ${PROBE_TYPE:-without a body} (curl exit $PROBE_RC), not the API's JSON 401 (ubicloud-admin logs caddy web)"
+  fi
+}
+
 # bin/production_check boots a second puma with RACK_ENV=production on
 # port 8081 and expects a 401 for a JSON login POST to localhost:8081.
 # BIND=127.0.0.1 keeps that puma on loopback whatever BIND the env file
@@ -681,6 +793,7 @@ cmd_smoke() {
     fail_line "smoke: puma does not answer on $(web_addr) (HTTP $PROBE_CODE)"
   fi
   smoke_front
+  check_api smoke 30
   local u state
   for u in ubicloud-web ubicloud-respirate; do
     state=$(settled_state "$u")
@@ -1281,6 +1394,7 @@ env_refusal() {
     GIT_REV) echo "the release's .release-env sets it" ;;
     IP_FROM_HEADER) echo "it follows the TLS front; change it with install.sh --tls ... --update-env IP_FROM_HEADER" ;;
     BASE_URL) echo "the TLS front serves the host of install.sh --url; change it with install.sh --url URL --update-env BASE_URL" ;;
+    API_HOST) echo "the TLS front serves the API on it; change it with install.sh --api-host HOST (or --no-api) --update-env API_HOST" ;;
     RACK_ENV) echo "install.sh sets it; change it with install.sh --rack-env ENV --update-env RACK_ENV" ;;
     MAIL_FROM) echo "install.sh --mail-from owns it; change it with install.sh --mail-from ADDR --update-env MAIL_FROM" ;;
     MAIL_DRIVER | SMTP_*) echo "install.sh --smtp-file owns the mail settings; change them with install.sh --smtp-file F --update-env $1" ;;
