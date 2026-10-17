@@ -4,10 +4,14 @@ class UbiCli
   on("vm").run_on("show") do
     desc "Show details for a virtual machine"
 
-    fields = %w[id name state location size unix-user storage-size-gib boot-image virt-tier ip6 ip4-enabled ip4 ip4-scope ip4-internal private-ipv4 private-ipv6 subnet maintenance-window-start-at firewalls].freeze.each(&:freeze)
-    # Only VMs on BYOH hosts have these (virt-tier only lower-tier VMs,
-    # docs/byoh/NO_KVM.md), so other VMs show what they did before unless
-    # the fields are asked for.
+    fields = %w[id name state location size unix-user storage-size-gib boot-image ip6 ip4-enabled ip4 ip4-scope ip4-internal private-ipv4 private-ipv6 subnet maintenance-window-start-at firewalls].freeze.each(&:freeze)
+    # Only lower-tier VMs (docs/byoh/NO_KVM.md) have virt-tier. It shows
+    # after boot-image, but the help lists it on a line of its own, so the
+    # "Fields:" text stays as it was.
+    tier_fields = %w[virt-tier].freeze.each(&:freeze)
+    all_fields = fields.dup.insert(fields.index("boot-image") + 1, *tier_fields).freeze
+    # Only VMs on BYOH hosts have these, so other VMs show what they did
+    # before unless the fields are asked for.
     byoh_fields = %w[virt-tier ip4-scope ip4-internal].freeze.each(&:freeze)
     firewall_fields = %w[id name description location path firewall-rules].freeze.each(&:freeze)
     firewall_rule_fields = %w[id cidr port-range protocol].freeze.each(&:freeze)
@@ -18,13 +22,14 @@ class UbiCli
       on("-w", "--firewall-fields=fields", "show specific firewall fields (comma separated)")
     end
     help_option_values("Fields:", fields)
+    help_option_values("Lower-Tier VM Fields:", tier_fields)
     help_option_values("Firewall Rule Fields:", firewall_rule_fields)
     help_option_values("Firewall Fields:", firewall_fields)
 
     run do |opts, cmd|
       data = sdk_object.info
       opts = opts[:vm_show]
-      keys = check_fields(opts[:fields], fields, "vm show -f option", cmd)
+      keys = check_fields(opts[:fields], all_fields, "vm show -f option", cmd)
       keys -= byoh_fields.reject { data.values.key?(it.tr("-", "_").to_sym) } unless opts[:fields]
       firewall_keys = check_fields(opts[:"firewall-fields"], firewall_fields, "vm show -w option", cmd)
       firewall_rule_keys = check_fields(opts[:"rule-fields"], firewall_rule_fields, "vm show -r option", cmd)
