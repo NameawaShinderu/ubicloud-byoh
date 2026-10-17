@@ -929,10 +929,12 @@ RSpec.describe Prog::Vm::HostNexus do
       vm_host.update(allocation_state: "draining")
       Prog::PageNexus.assemble("#{vm_host.ubid} IPv6 DNS egress failing", ["VmHostDnsEgressIpv6", vm_host.id], vm_host.ubid, resource_id: vm_host.id, severity: "warning")
       page = Page.from_tag_parts("VmHostDnsEgressIpv6", vm_host.id)
+      Prog::PageNexus.assemble("#{vm_host.ubid} not a BYOH host", ["ByohVirtTier", vm_host.ubid], vm_host.ubid, resource_id: vm_host.id)
       expect(vm_host).to receive(:destroy)
       expect(sshable).to receive(:destroy)
       expect { nx.destroy }.to exit({"msg" => "vm host deleted"})
-      expect(Semaphore.where(strand_id: page.id, name: "resolve").count).to eq(1)
+      # Only that page: the BYOH page sweep is for generic hosts only.
+      expect(Semaphore.where(name: "resolve").select_map(:strand_id)).to eq [page.id]
     end
   end
 

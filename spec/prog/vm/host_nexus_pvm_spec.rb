@@ -814,6 +814,30 @@ RSpec.describe Prog::Vm::HostNexus do
     end
   end
 
+  describe "#destroy" do
+    def host_page(*tag) = Prog::PageNexus.assemble("#{vm_host.ubid} #{tag.first}", tag, vm_host.ubid, resource_id: vm_host.id)
+
+    it "resolves the host's own BYOH pages, so none is left open for a host that is gone" do
+      vm_host.update(allocation_state: "draining")
+      byoh = [
+        host_page("ByohPvmUninstalled", vm_host.ubid),
+        host_page("ByohPvmInstall", vm_host.ubid),
+        host_page("ByohPvmGuestKernelFailing", vm_host.ubid, "b" * 64),
+        host_page("ByohVirtTier", vm_host.ubid),
+      ].map(&:id)
+      other_host = create_byoh_vm_host(location)
+      others = [
+        host_page("LastBootIDDiscrepancy", vm_host.ubid).id,
+        Prog::PageNexus.assemble("other", ["ByohPvmUninstalled", other_host.ubid], other_host.ubid, resource_id: other_host.id).id,
+      ]
+      expect(nx.vm_host).to receive(:destroy)
+      expect(nx.sshable).to receive(:destroy)
+      expect { nx.destroy }.to exit({"msg" => "vm host deleted"})
+      expect(Semaphore.where(name: "resolve").select_order_map(:strand_id)).to eq byoh.sort
+      expect(others & Semaphore.where(name: "resolve").select_map(:strand_id)).to be_empty
+    end
+  end
+
   describe "#wait" do
     before { vm_host.update(virt_probe: Sequel.pg_jsonb({"probed_at" => Time.now.utc.iso8601})) }
 

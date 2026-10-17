@@ -505,6 +505,20 @@ RSpec.describe ByohGateChecks do
       expect(cli("pvm-host", "--host", ubid)).to eq [0, "exists=0\n", ""]
     end
 
+    it "prints the pages still open for a host that is gone" do
+      ubid = pvm_host.ubid
+      id = pvm_host.id
+      Prog::PageNexus.assemble("#{ubid} had its PVM host kernel uninstalled", ["ByohPvmUninstalled", ubid], ubid, resource_id: id)
+      Prog::PageNexus.assemble("#{ubid} cannot download", ["ByohPvmGuestKernelFailing", ubid, "b" * 64], ubid, resource_id: id)
+      Page.from_tag_parts("ByohPvmGuestKernelFailing", ubid, "b" * 64).update(created_at: Time.now + 1)
+      pvm_host.destroy
+      expect(cli("pvm-host", "--host", ubid)).to eq [0, <<~OUT, ""]
+        exists=0
+        page=ByohPvmUninstalled #{ubid} had its PVM host kernel uninstalled
+        page=other #{ubid} cannot download
+      OUT
+    end
+
     it "prints a host without a strand or a PVM row" do
       expect(cli("pvm-host", "--host", pvm_host.ubid)).to eq [0, <<~OUT, ""]
         exists=1
@@ -533,6 +547,7 @@ RSpec.describe ByohGateChecks do
       vm = create_vm(vm_host_id: pvm_host.id, location_id: location.id, family: "pvm")
       Prog::PageNexus.assemble("#{pvm_host.ubid} refused to install the PVM host kernel: sha256 mismatch", ["ByohPvmInstall", pvm_host.ubid], pvm_host.ubid, resource_id: pvm_host.id)
       Prog::PageNexus.assemble("#{pvm_host.ubid} cannot download", ["ByohPvmGuestKernelFailing", pvm_host.ubid, "c" * 64], pvm_host.ubid, resource_id: pvm_host.id)
+      Page.from_tag_parts("ByohPvmGuestKernelFailing", pvm_host.ubid, "c" * 64).update(created_at: Time.now + 1)
       resolved = Prog::PageNexus.assemble("#{pvm_host.ubid} booted its stock kernel", ["ByohPvmBoot", pvm_host.ubid], pvm_host.ubid, resource_id: pvm_host.id)
       Page[resolved.id].update(resolved_at: Time.now)
 

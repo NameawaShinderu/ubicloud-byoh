@@ -1189,6 +1189,11 @@ TIMER
     %w[VmHostDnsEgressIpv4 VmHostDnsEgressIpv6].each do |tag|
       Page.from_tag_parts(tag, vm_host.id)&.incr_resolve
     end
+    # A BYOH host's own pages (ByohPvm*, ByohVirtTier, ByohKernelReboot,
+    # ...) carry its id as their resource.
+    if vm_host.provider_name == HostProvider::GENERIC_PROVIDER_NAME
+      Page.active.where(resource_id: vm_host.id).where(Sequel.like(:tag, "Byoh%")).each(&:incr_resolve)
+    end
     vm_host.destroy
     sshable.destroy
 

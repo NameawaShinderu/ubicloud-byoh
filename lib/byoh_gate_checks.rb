@@ -331,8 +331,9 @@ class ByohGateChecks
   # Where a pvm host stands, as key=value lines for pvm-e2e.sh: its
   # strand, its byoh_pvm_host row, its VMs and guest kernels, and each
   # open page for it ("page=TYPE summary"; TYPE is other for a page of
-  # another tag). A host that does not exist (any more) prints exists=0,
-  # so the script can wait for a destroy.
+  # another tag). A host that does not exist (any more) prints exists=0
+  # and the pages still open for it, so the script can wait for a destroy
+  # and check that it left none behind.
   def cmd_pvm_host(argv)
     opts = {}
     parse(argv, "pvm-host --host UBID") { host_option(it, opts) }
@@ -340,6 +341,7 @@ class ByohGateChecks
     raise Error, "no host #{key}" unless key.match?(HOST_UBID)
     unless (host = VmHost[key])
       @out.puts "exists=0"
+      print_pvm_pages(key, UBID.to_uuid(key))
       return 0
     end
 
@@ -359,11 +361,15 @@ class ByohGateChecks
       guest_kernels: ByohPvmGuestKernel.where(vm_host_id: host.id).order(:sha256).all.map { "#{it.sha256}:#{it.state}" }.join(","),
       current_guest_kernel: ByohVirtTiers.pvm_guest_kernel(host)&.sha256,
     }.each { |k, value| @out.puts "#{k}=#{value}" }
-    tags = PVM_PAGE_TYPES.to_h { [Page.generate_tag([it, host.ubid]), it] }
-    Page.active.for_resource(host.id).order(:created_at).all.each do |page|
+    print_pvm_pages(host.ubid, host.id)
+    0
+  end
+
+  def print_pvm_pages(ubid, id)
+    tags = PVM_PAGE_TYPES.to_h { [Page.generate_tag([it, ubid]), it] }
+    Page.active.for_resource(id).order(:created_at, :tag).all.each do |page|
       @out.puts "page=#{tags.fetch(page.tag, "other")} #{page.summary}"
     end
-    0
   end
 
   # A pvm VM as key=value lines for pvm-e2e.sh: its state, the guest
