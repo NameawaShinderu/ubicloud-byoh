@@ -783,11 +783,17 @@ class PvmHostKernel
 
   def uninstall_host(state)
     run("systemctl", "disable", BOOT_UNIT_NAME) if File.exist?(path(BOOT_UNIT))
+    grub_files = [GRUB_DROPIN, GRUB_SCRIPT].any? { |rel| File.exist?(path(rel)) }
     OWNED_FILES.each { |rel| rm_if_exists(path(rel)) }
     run("systemctl", "daemon-reload")
     run("grub-editenv", "-", "unset", "next_entry")
     rm_if_exists(path(DEB_FILE))
-    return unless state
+    unless state
+      # grub.cfg still has the pti=off entry and the saved_entry default
+      # until update-grub runs without those files.
+      run("update-grub") if grub_files
+      return
+    end
 
     stock_pkg = state["stock_pkg"]
     if dpkg_status(stock_pkg) == "installed"

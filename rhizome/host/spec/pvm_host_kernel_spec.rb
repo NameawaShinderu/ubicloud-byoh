@@ -566,7 +566,14 @@ RSpec.describe PvmHostKernel do
       fake.log.clear
       expect(kernel.uninstall({})["result"]).to eq "ok"
       described_class::OWNED_FILES.each { |rel| expect(fake.exist?(rel)).to be false }
-      expect(mutating).to eq ["systemctl disable ubicloud-pvm-boot.service", "systemctl daemon-reload", "grub-editenv - unset next_entry"]
+      expect(mutating).to eq ["systemctl disable ubicloud-pvm-boot.service", "systemctl daemon-reload", "grub-editenv - unset next_entry", "update-grub"]
+      expect(fake.read(described_class::GRUB_CFG)).not_to include("ubicloud-pvm", "pti=off", "${saved_entry}")
+    end
+
+    it "leaves grub.cfg alone on a host it never touched" do
+      fake.log.clear
+      expect(kernel.uninstall({})["result"]).to eq "ok"
+      expect(mutating).to eq ["systemctl daemon-reload", "grub-editenv - unset next_entry"]
     end
 
     it "purges a half-installed package and skips one that is gone" do
