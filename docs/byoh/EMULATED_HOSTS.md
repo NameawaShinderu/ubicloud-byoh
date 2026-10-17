@@ -10,10 +10,10 @@
 > model (section 4) and the memory budget (section 6.4) hold as written.
 
 Status: 2026-10-16. This was the DESIGN (revision 2) of 2026-10-15 on branch `qemu-tcg`, from
-`byoh-driver` 9e22d71ec (M0-M3); that work continues on branch `no-kvm`. What shipped: the rhizome side
+`byoh-driver` 9e22d71ec (M0-M3); that work continued on branch `no-kvm`, which is merged into `byoh-driver`. What shipped: the rhizome side
 (section 6.5: the TCG unit, its hardening, `QmpClient`, `EmulatedStop`) and the hookup through the
 tier framework (NO_KVM.md sections 8.1 and 10, WP6), spec-gated. The container gate (section 7 item 2)
-and the live gate L-Q (item 3) have not run: UNVERIFIED. Read the sections marked SUPERSEDED for their
+and the live gate L-Q (item 3) have not run as written: UNVERIFIED. An emulated host and VM did run on AWS in run e2e1 (TCG, CPU 29% and memory 2% of the host, egress, DNS, apt, stop, start, delete, billing; [VERIFY.md](VERIFY.md) §7). Read the sections marked SUPERSEDED for their
 reasoning only; NO_KVM.md is the current design.
 File:line references are to 9e22d71ec. Re-read a file before relying on a line number.
 
@@ -284,7 +284,7 @@ total_hugepages_1g = budget_gib
 used_hugepages_1g  = sum(memory_gib of active VMs)
 ```
 
-- It fails on unparseable meminfo; with "Insufficient memory left for the host OS" if MemAvailable < 2 GiB (the same rule as `verify_hugepages`); with "emulated hosts need N physical cores, one for the host and M for a emulated-2 VM" when one `emulated-2` VM would not fit beside the core kept for the host (as shipped on `no-kvm`: a 2-vCPU host without SMT is refused too, since it could never place a VM); and with "Not enough memory budget for VMs" if `used > total`. It takes `lock!` before updating the columns, like `verify_hugepages`.
+- It fails on unparseable meminfo; with "Insufficient memory left for the host OS" if MemAvailable < 2 GiB (the same rule as `verify_hugepages`); with "emulated hosts need N physical cores, one for the host and M for a emulated-2 VM" when one `emulated-2` VM would not fit beside the core kept for the host (as shipped: a 2-vCPU host without SMT is refused too, since it could never place a VM); and with "Not enough memory budget for VMs" if `used > total`. It takes `lock!` before updating the columns, like `verify_hugepages`.
 - If `HugePages_Total > 0`, it logs "remove the hugepage reservation to reclaim N GiB".
 - `EMULATED_HOST_RESERVE_MIB = 2048`. It differs from COMPUTE.md's Flexible-tier 4 GiB because these hosts run no SPDK and no hugepage pools; a 4 GiB reserve would leave an 8 GiB VPS with no capacity. M5 reconciles the two.
 - `EMULATED_VM_OVERHEAD_MIB` is charged **per VM** (not per core) and covers QEMU (`TB_SIZE_MIB` 256 plus ~90 MiB measured), the per-VM ubiblk backend RSS and the per-VM dnsmasq RSS, plus 15% headroom. **Provisional value: 512.** WP10 measures ubiblk and dnsmasq RSS for `emulated-2` and `emulated-4` and sets the final value. A cross-spec asserts `EMULATED_VM_OVERHEAD_MIB >= QemuTcg::TB_SIZE_MIB + 128 + EmulatedHost::BACKEND_RSS_MIB`, reading the rhizome constants from the rhizome files so the two sides cannot drift.

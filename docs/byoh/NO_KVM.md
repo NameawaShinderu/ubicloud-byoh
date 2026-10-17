@@ -1,17 +1,18 @@
 # The virtualization ladder: fast first, emulation last
 
-Status: 2026-10-17. Branch `no-kvm` (from `byoh-driver` 9e22d71ec plus the QEMU-TCG work): design
-revision 2, build plan WP1-WP8 done (section 15). Branch `pvm-build` (from `byoh-driver` f515eb9e8):
-the L4 PVM tier, built after the L4-T1 GO by the PVM plan's WP1-WP11 (sections 6.7 and 6.8). This
+Status: 2026-10-17. Everything here is on `byoh-driver`. It was built on branch `no-kvm` (design
+revision 2, build plan WP1-WP8, section 15) and branch `pvm-build` (the L4 PVM tier, built after the
+L4-T1 GO by the PVM plan's WP1-WP11, sections 6.7 and 6.8), both merged into `byoh-driver`. This
 document replaces [EMULATED_HOSTS.md](EMULATED_HOSTS.md) as the entry point for hosts without KVM.
 That file stays as the detailed reference for rung L5.
 
 What is offered, in one line per rung: L1 as today; L2 detected and refused with the fix; L3
 `container`, L4 `pvm` and L5 `emulated` registrable, experimental, opt-in per location, project and
-VM size. L4 is **offered, experimental** on `pvm-build` only: its guest boot is VERIFIED by hand on
-AWS (L4-T1, section 14), but the product path (registration, the kernel install, VMs, lifecycle) has
-run only against specs and fakes until the L4-T2 script `scripts/byoh/test/real/pvm-e2e.sh` reports.
-Section 14 lists what has run on real hosts (the e2e1 run of 2026-10-16) and what has not.
+VM size. L3 and L5 ran end to end on AWS in run e2e1 (2026-10-16). L4 is **offered, experimental**:
+its guest boot was VERIFIED by hand on AWS (L4-T1), and its product path (registration, the kernel
+install, VMs, lifecycle) passed the L4-T2 script `scripts/byoh/test/real/pvm-e2e.sh` on AWS in run
+pvm1 (2026-10-17, [VERIFY.md](VERIFY.md) §8), except the guest-kernel pin rollout, which did not run.
+Section 14 lists what has run on real hosts and what has not.
 
 Labels used throughout:
 - **SHIPPED**: code on this branch, covered by the spec gate.
@@ -21,8 +22,8 @@ Labels used throughout:
 - **SOURCE**: read in a cited document, with a confidence (high, medium, low). "From memory" means
   recalled, not checked against a document here.
 - **PLANNED**: specified, not written. After WP8 this covered the PVM build (sections 6.7, 6.8),
-  which `pvm-build` has since built, and the items listed as "not built" in sections 5.5, 10.5 and 10.6.
-- **UNVERIFIED**: not executed anywhere. Every real-infrastructure test in section 14 is UNVERIFIED.
+  which has since been built, and the items listed as "not built" in sections 5.5, 10.5 and 10.6.
+- **UNVERIFIED**: not executed anywhere. A real-infrastructure test of section 14 is UNVERIFIED unless section 14 records its run (e2e1, pvm1).
 
 Rung numbers changed in revision 2: the rungs are now ordered by **measured speed**, so system
 containers are L3 and PVM is L4. The tier ids (`kvm`, `container`, `pvm`, `emulated`) are the stable
@@ -44,9 +45,9 @@ When none of them is possible, the last resort is QEMU's emulator (L5).
 |---|---|---|---|---|---|---|
 | **L1** | `kvm` | `/dev/kvm` works and has the capabilities Cloud Hypervisor needs | Cloud Hypervisor exactly as today (QEMU-KVM for B200/B300 GPUs, unchanged) | ~native on bare metal; nested: CPU-bound ≥90%, page-fault-heavy work much less (section 3; own measurement planned, L1-T2) | Hardware VM | Today's product, SHIPPED; detection v2 SHIPPED (WP3) |
 | **L2** | — | The hardware can virtualize, but KVM is off or hidden (firmware, module, hypervisor CPU model, cloud option) | Nothing until it is fixed | — | — | Detection, per-platform fix, and refusal at registration with a recommended plan SHIPPED (WP4) |
-| **L3** | `container` | Any x86_64 Linux ≥ 5.12 with cgroup v2 | Unprivileged LXC system container in rhizome's per-VM network namespace | **CPU 95-99%, memory bandwidth 91-98%, 3.6-5.4 s to SSH** (VERIFIED, `dir` disk driver only) | Shared kernel: weaker than a VM | SHIPPED (WP5), experimental: `dir` disk VERIFIED end to end in the lab (section 5.5); `crypt-loop`, AppArmor, lxcfs and project quotas UNVERIFIED |
-| **L4** | `pvm` | No hardware virtualization; a PVM host kernel (`kvm_pvm`) | Cloud Hypervisor with direct kernel boot of a PVM guest kernel | **CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32% of the host, 140 s to a login prompt** (VERIFIED by hand on AWS m6i.large, L4-T1, section 14); SOURCE: near single-level KVM (paper) | VM, with a software world switch | **Offered, experimental** (`pvm-build`): the go/no-go GO on AWS (L4-T1, VERIFIED); the tier is built and spec-gated (sections 6.7, 6.8), and its end-to-end run L4-T2 (`pvm-e2e.sh`) PASSED on AWS m6i.2xlarge on 2026-10-17 (VERIFY.md section 8; CPU 97%, memory about 100%, ubiblk random I/O 93% of the host; guest-pin-rollout not run) |
-| **L5** | `emulated` | Anything x86_64 | QEMU TCG (software CPU) | CPU 26-29%, memory bandwidth ~2.5%, 64-96 s to SSH (VERIFIED) | Not a security boundary | SHIPPED (WP6), experimental: control plane spec-gated; the end-to-end lab (`run.sh l5`) and real hosts UNVERIFIED (section 8.1; [EMULATED_HOSTS.md](EMULATED_HOSTS.md)) |
+| **L3** | `container` | Any x86_64 Linux ≥ 5.12 with cgroup v2 | Unprivileged LXC system container in rhizome's per-VM network namespace | **CPU 95-99%, memory bandwidth 91-98%, 3.6-5.4 s to SSH** (VERIFIED, `dir` disk driver only) | Shared kernel: weaker than a VM | SHIPPED (WP5), experimental: `dir` disk VERIFIED end to end in the lab (section 5.5); on AWS t3.xlarge in e2e1 (L3-T1, section 14): CPU 99.8%, memory 99.9% of the host, LUKS2 disk, the generated AppArmor profile; project quotas UNVERIFIED |
+| **L4** | `pvm` | No hardware virtualization; a PVM host kernel (`kvm_pvm`) | Cloud Hypervisor with direct kernel boot of a PVM guest kernel | **CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32% of the host, 140 s to a login prompt** (VERIFIED by hand on AWS m6i.large, L4-T1, section 14); SOURCE: near single-level KVM (paper) | VM, with a software world switch | **Offered, experimental**: the go/no-go GO on AWS (L4-T1, VERIFIED); the tier is built and spec-gated (sections 6.7, 6.8), and its end-to-end run L4-T2 (`pvm-e2e.sh`) PASSED on AWS m6i.2xlarge on 2026-10-17 (VERIFY.md section 8; CPU 97%, memory about 100%, ubiblk random I/O 93% of the host; guest-pin-rollout not run) |
+| **L5** | `emulated` | Anything x86_64 | QEMU TCG (software CPU) | CPU 26-29%, memory bandwidth ~2.5%, 64-96 s to SSH (VERIFIED) | Not a security boundary | SHIPPED (WP6), experimental: ran end to end on AWS t3.xlarge in e2e1 (section 14: CPU 29%, memory 2% of the host, create to running 2 min 16 s); the lab harness `run.sh l5` UNVERIFIED (section 8.1; [EMULATED_HOSTS.md](EMULATED_HOSTS.md)) |
 
 **L3 or L4?** L3 is the speed fallback. L4 is chosen only when the operator needs VM-level isolation
 without hardware virtualization and accepts a custom host kernel. On AWS, GCP and Azure the
@@ -789,15 +790,18 @@ More constraints found by the spike (SOURCE, medium: cocoonstack and virt-pvm do
 - Upstream reports a CH virtio-pmem root-disk issue ([virt-pvm #1][virt-pvm-issue1]); virtio-blk is
   fine, and that is what Ubicloud uses.
 
-### 6.7 Design (offered, experimental: built on `pvm-build` after the L4-T1 GO)
+### 6.7 Design (offered, experimental: built after the L4-T1 GO)
 
 **Status (2026-10-17): L4 is offered, experimental.** L4-T1 reported a GO on AWS m6i.large
-(2026-10-16, section 14), so the PVM plan (WP1-WP11) built the tier on branch `pvm-build`. `pvm` is in
-`ByohVirtTiers::SHIPPED` (and `SHIPPED_TIERS` of `bootstrap-data-plane.sh`). Everything below is
-SHIPPED in the sense of section 0: spec-gated, U1 golden-pinned, and **never run end to end on a
-real host**. The guest boot itself is VERIFIED only by the go/no-go's hand-run boot. L4-T2
-(`scripts/byoh/test/real/pvm-e2e.sh`, section 14) is the test that proves the product path; until it
-reports, every real-host claim in this section is UNVERIFIED. What an operator does:
+(2026-10-16, section 14), so the PVM plan (WP1-WP11) built the tier on branch `pvm-build`, since
+merged into `byoh-driver`. `pvm` is in `ByohVirtTiers::SHIPPED` (and `SHIPPED_TIERS` of
+`bootstrap-data-plane.sh`). Everything below is SHIPPED in the sense of section 0: spec-gated and U1
+golden-pinned. L4-T2 (`scripts/byoh/test/real/pvm-e2e.sh`, section 14) proved the product path on AWS
+m6i.2xlarge in run pvm1 (2026-10-17, [VERIFY.md](VERIFY.md) §8): the pins and their refusals, `host
+add --virt-tier pvm --install-pvm-kernel` to `accepting` in 184 s, a `pvm-2` VM, the benchmarks, the
+lifecycle and host reboots, stock-return, tenancy, delete, billing and uninstall all passed. Not run:
+the guest-pin rollout (no second guest build), a host-kernel upgrade, and the failure paths listed
+under L4-T2 in section 14; those stay UNVERIFIED. What an operator does:
 
 ```bash
 # Once per location: rates, then the tier with its kernel pins (downloaded and checked by set).
@@ -915,7 +919,7 @@ fact, "detected, not offered".
   - It runs `grub-reboot ubicloud-pvm`, then checks that `grub-editenv list` shows
     `next_entry=ubicloud-pvm` **and** the stock `saved_entry`. Only then is the boot **one-shot**. As
     built this is the separate `arm` step, which HostNexus runs before every reboot of the host.
-- **HostNexus walk** (built on `pvm-build`, PVM plan WP7; specs only, UNVERIFIED on a real host). It
+- **HostNexus walk** (PVM plan WP7; the install, the one-shot boot and `verify_pvm_boot` ran on AWS in L4-T2, VERIFY.md §8). It
   differs from the first design above in two ways. GRUB's default is never the PVM kernel (plan D2):
   `saved_entry` stays the stock kernel for good, and `ubicloud-pvm-boot.service`, which runs only on
   the PVM kernel (`ConditionKernelCommandLine=pti=off`), loads `kvm_pvm`, checks `/dev/kvm` and the stock
@@ -1042,7 +1046,7 @@ fact, "detected, not offered".
   kernel updates inside the guest), AppArmor inside the guest, XFS and Btrfs roots, Windows and UEFI,
   GPUs, snapshot, migration, memory hotplug and balloon (untested upstream).
 
-### 6.8 PVM lifecycle (SHIPPED on `pvm-build`, spec-gated; UNVERIFIED on a real host)
+### 6.8 PVM lifecycle (SHIPPED, spec-gated; L4-T2 ran stop, start, reboots, stock-return, `pvm retry` and `pvm uninstall` on AWS; `pvm upgrade` and the guest-pin rollout UNVERIFIED)
 
 - **Watching for CVEs.** The operator who enables `pvm` in a location owns watching virt-pvm (the
   branch, its issues, and kernel CVEs against 6.12) for both kernels. `bin/byoh-location set` prints
@@ -1117,7 +1121,7 @@ beyond the measured 384 MiB, and further timing tuning.
 
 ### 8.1 What WP6 shipped
 
-SHIPPED (spec-gated; nothing of it run on a real host, UNVERIFIED there):
+SHIPPED (spec-gated). On a real host it ran once, on AWS t3.xlarge in e2e1 (section 14, VERIFY.md §7: TCG confirmed, egress, DNS, apt, stop, start, delete, billing family `emulated`); the lab harness `run.sh l5` has not run:
 - **Offered.** `emulated` joins `ByohVirtTiers::SHIPPED` (and `SHIPPED_TIERS` of
   `bootstrap-data-plane.sh`), so `bin/byoh-location set --virt-tiers kvm,emulated --accept emulated`,
   `bin/register-byoh-host --virt-tier emulated --accept-fallback` (or `auto` when no faster fallback is
@@ -1321,7 +1325,7 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
   LearnVirt keeps `virt_probe["reboot_required_since"]`, the first probe that saw
   `/var/run/reboot-required`. On `container` it pages `ByohKernelReboot` (with the kernel release and the fix: drain,
   reboot, `bin/byoh-virt refresh`) once that is 7 days old; a probe without the flag clears it and
-  resolves the page. On `pvm` (`pvm-build`) it pages `ByohPvmHostKernel` instead, for a committed
+  resolves the page. On `pvm` it pages `ByohPvmHostKernel` instead, for a committed
   install host that runs another kernel than its PVM kernel or whose build is not the location's
   host-deb pin (section 6.8); a stock host before its first PVM boot agrees with its tier
   (`accepts_probe?(pvm_install:)`), so it gets no false `ByohVirtTier` page. So that this happens without an operator, HostNexus `wait` starts LearnVirt on a
@@ -1457,7 +1461,7 @@ Flags on `bin/register-byoh-host`:
 - `--virt-tier kvm|auto|container|pvm|emulated`. The default is `kvm`, so today's commands behave as
   today on an L1 host; a non-L1 host is refused, now with the fix and a recommended command line.
 - `--accept-fallback`: required whenever the resulting tier is not `kvm`, including through `auto`.
-- `--install-pvm-kernel` (built on `pvm-build`, WP6 of the PVM plan): the per-host
+- `--install-pvm-kernel` (WP6 of the PVM plan; run on AWS in L4-T2): the per-host
   acknowledgement that the control plane installs the location's pinned PVM host kernel (a
   third-party build) and reboots the host into it once. It goes only with `--virt-tier pvm` or
   `auto`, and needs the probe. (`pvm` joined `ByohVirtTiers::SHIPPED` in the plan's WP8; before
@@ -1598,7 +1602,7 @@ as before WP4. `auto` refuses without a verdict; a declared lower tier is regist
 |---|---|---|---|---|
 | L1 | as today | as today | — | — |
 | L3 `container` | "System container: shared host kernel, near-native speed. Not a VM." | One project per location | `container`; options `container:multitenant` (needs whole-core cpusets or SMT off; refused until that is checked, section 10.6), `container:unencrypted-disk`, `container:nested-userns`, `container:guest-firewall` | Host sysctl checks fail; `dir` driver without `prjquota` (any location) |
-| L4 `pvm` | "PVM: software virtualization (experimental). Weaker isolation than standard VMs; Ubicloud-supplied guest kernel without AppArmor. Linux only." | One project per location: keep the location hidden and `grant` it to that one project (`MULTITENANT_CHECKED` stays empty on `pvm-build`) | `pvm`, with both kernel pins (section 6.7); option `pvm:multitenant` only with SMT off or core scheduling and CPUs "Not affected" for l1tf and mds (refused until that is checked, section 10.6) | Secure Boot on; a Meltdown-affected CPU (any tenancy, section 6.5), at registration, in every probe, and again by rhizome before each VM start (with `pti=off` and `/dev/kvm` 0660 group kvm) |
+| L4 `pvm` | "PVM: software virtualization (experimental). Weaker isolation than standard VMs; Ubicloud-supplied guest kernel without AppArmor. Linux only." | One project per location: keep the location hidden and `grant` it to that one project (`MULTITENANT_CHECKED` stays empty) | `pvm`, with both kernel pins (section 6.7); option `pvm:multitenant` only with SMT off or core scheduling and CPUs "Not affected" for l1tf and mds (refused until that is checked, section 10.6) | Secure Boot on; a Meltdown-affected CPU (any tenancy, section 6.5), at registration, in every probe, and again by rhizome before each VM start (with `pti=off` and `/dev/kvm` 0660 group kvm) |
 | L5 `emulated` | "Emulated: slow, compatibility only. Not a security boundary." | One project per **host** (as shipped: per location, section 10.6; SHIPPED in WP6, section 8.1) | `emulated`; no options, so never shared | The unit's hardening directives missing |
 
 Applies to every lower rung:
@@ -1635,13 +1639,13 @@ Applies to every lower rung:
 | 2 | WP2 | The QEMU-KVM-without-hugepages unit returns to its 9e22d71ec form; goldens for every L1 output | Full gate; `git diff 9e22d71ec` over the golden directories shows only added files | Done, gate green |
 | 3 | WP3 | Detection v2: the probe identifies more causes, prints a recommended plan, `refresh --all` back-fills | L1-T1, L2-T1..T3 (section 14) on at least one cloud | Code done, spec gate green; the real-cloud gate is UNVERIFIED (not run) |
 | 4 | WP4 | `virt_tier` and the location policy; every existing host becomes `kvm` by the column default; registration refuses with the plan | Full gate; goldens unchanged; an upgrade rehearsal on a copy of the live DB | Code done, gate green, goldens unchanged; the rehearsal on a live DB copy is UNVERIFIED (not run) |
-| 5 | WP5 | `container` tier, experimental | The lab harness (dir driver); L3-T1 on a real Ubuntu 24.04 host (crypt-loop, AppArmor, lxcfs, escape probes) before the family is granted outside the operator's own org | Code done, gate green; the lab ran once before its safety rules were tightened (section 5.5); L3-T1 UNVERIFIED |
-| 6 | WP6 | `emulated` tier end to end, experimental (SHIPPED, section 8.1) | The L5 harness (written, not run here: it needs a throwaway VM) and L5-T1 | Code done, gate green; `run.sh l5` and L5-T1 UNVERIFIED |
-| 7 | WP7, then the PVM plan WP1-WP11 on `pvm-build` | PVM: the go/no-go script always; the tier only on a reported GO | L4-T1 GO, then L4-T2 | L4-T1 **GO** on AWS m6i.large (2026-10-16, VERIFIED). The tier is built on `pvm-build` and spec-gated: offered, experimental. L4-T2 (`pvm-e2e.sh`) UNVERIFIED, not run yet |
+| 5 | WP5 | `container` tier, experimental | The lab harness (dir driver); L3-T1 on a real Ubuntu 24.04 host (crypt-loop, AppArmor, lxcfs, escape probes) before the family is granted outside the operator's own org | Code done, gate green; the lab ran once before its safety rules were tightened (section 5.5); L3-T1 passed on AWS in e2e1 (section 14) |
+| 6 | WP6 | `emulated` tier end to end, experimental (SHIPPED, section 8.1) | The L5 harness (written, not run here: it needs a throwaway VM) and L5-T1 | Code done, gate green; L5-T1 passed on AWS in e2e1 (section 14); `run.sh l5` UNVERIFIED |
+| 7 | WP7, then the PVM plan WP1-WP11 on `pvm-build` | PVM: the go/no-go script always; the tier only on a reported GO | L4-T1 GO, then L4-T2 | L4-T1 **GO** on AWS m6i.large (2026-10-16, VERIFIED). The tier is built and spec-gated: offered, experimental. L4-T2 (`pvm-e2e.sh`) **passed** on AWS m6i.2xlarge (2026-10-17, VERIFY.md §8); guest-pin-rollout not run |
 | 8 | WP8 | Docs final: this file, EMULATED_HOSTS, PLATFORMS, the platform guides, TROUBLESHOOTING, COMPUTE, ROADMAP, CLAUDE.md | Every claim labelled; full gate | Done (the gate result is in the WP8 commit message) |
 
 M4 (`byoh-driver` 14c5ddad5) was merged into this branch on 2026-10-16, and PF3 now takes the ladder's
-verdict (section 2.3). Nothing is pushed; ROADMAP.md places the branch.
+verdict (section 2.3). The branch, and `pvm-build` after it, are merged into `byoh-driver`.
 
 Upgrading the live control plane follows the existing window (CLAUDE.md §8): stop the services;
 `pg_dump`; migrate (the `virt_probe` and `virt_tier` columns are additive, and their defaults keep
@@ -1657,8 +1661,12 @@ Rollback: the WP4 migration's `down` refuses while it holds data; run `bin/byoh-
 | L1-T2 | m8i.2xlarge, nested on | kvm; the host reached `accepting` and ran three VMs |
 | L2 on AWS without nested | t3.xlarge, t3.large | `none (L3-L5) on AWS EC2`, with the move-to-C8i/M8i/R8i fix and the fallbacks |
 | L3-T1 | t3.xlarge | pass: CPU 99.8%, memory 99.9% of the host; the guest-side refusals below; LUKS2; uid map; the generated AppArmor profile |
-| L4-T1 | m6i.large | **GO** on CH 46.0 and 53.0: CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32%, login prompt 140 s; recovery-check PASS. The tier was then built on `pvm-build` (section 6.7); its L4-T2 has not run |
+| L4-T1 | m6i.large | **GO** on CH 46.0 and 53.0: CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32%, login prompt 140 s; recovery-check PASS. The tier was then built (section 6.7) |
 | L5 | t3.xlarge | pass: TCG confirmed, CPU 29%, memory 2%, create to running 2 min 16 s |
+
+**Run pvm1 on AWS, 2026-10-17** ([VERIFY.md](VERIFY.md) §8): L4-T2 on an m6i.2xlarge passed every phase
+except guest-pin-rollout (NOT RUN: no second guest kernel build). Guest vs host: CPU 97%, memory about
+100%, 4k random I/O on ubiblk 93%, syscalls 48%, fork+exec 32%; `host add` to `accepting` in 184 s.
 
 The tests below that are not in that table stay UNVERIFIED (GCP, Proxmox, VMware, Hyper-V, bare metal, other VPS).
 
@@ -1828,7 +1836,7 @@ questions this section listed beforehand:
 - `recovery-check` passed after the reboot back to the stock kernel.
 
 ```bash
-# L4-T2 (after the GO, on pvm-build): scripts/byoh/test/real/pvm-e2e.sh on the control plane against one
+# L4-T2 (after the GO; PASSED in run pvm1, see above): scripts/byoh/test/real/pvm-e2e.sh on the control plane against one
 #   throwaway AWS m6i.2xlarge (scripts/byoh/test/aws-e2e role pvme, README phase 7):
 BYOH_REAL_E2E=1 scripts/byoh/test/real/pvm-e2e.sh all   # settings: the script's header
 #   Phases: location (pvm rates, set with the pins), neg-sha (a wrong guest sha256 refused by set; a wrong
@@ -1839,8 +1847,8 @@ BYOH_REAL_E2E=1 scripts/byoh/test/real/pvm-e2e.sh all   # settings: the script's
 #   vm_overhead_mib), bench (the go/no-go's), lifecycle, host-reboot, oob-reboot, power-cycle (MANUAL),
 #   tenancy, guest-pin-rollout (needs a second guest build), refusals (pvm-2 jammy), stock-return
 #   (unset next_entry and reboot: ByohPvmBoot, then pvm retry), delete, billing, teardown (pvm uninstall,
-#   destroy, reboot to a clean stock host). Report: var/pvm-e2e/pvm-e2e-report.txt. UNVERIFIED until run;
-#   its flow runs against a fake world in scripts/byoh/test/pvm-e2e-stubs.sh.
+#   destroy, reboot to a clean stock host). Report: var/pvm-e2e/pvm-e2e-report.txt. Passed in pvm1 except
+#   guest-pin-rollout; its flow runs against a fake world in scripts/byoh/test/pvm-e2e-stubs.sh.
 #   A BYOH control plane runs no bin/monitor (until M9), so oob-reboot, power-cycle and stock-return
 #   test that the pvm host notices the boot by itself (HostNexus#check_pvm_boot_id, every 5 minutes)
 #   and wait for its recorded boot id; PVM_E2E_SET_CHECKUP=1 sets checkup instead and the report marks
@@ -1853,8 +1861,8 @@ BYOH_REAL_E2E=1 scripts/byoh/test/real/pvm-e2e.sh all   # settings: the script's
 ```
 
 The go/no-go booted one guest by hand: a raw disk, no network, 2 GiB, the go/no-go's own unit-less
-CH command. These production paths of a `pvm-*` VM never ran under PVM, so each is UNVERIFIED until
-its L4-T2 phase passes (plan D8):
+CH command. These production paths of a `pvm-*` VM were UNVERIFIED until their L4-T2 phases passed
+in run pvm1 (plan D8, VERIFY.md §8). All passed except the guest pin rollout, which did not run:
 - vhost-user ubiblk as the root disk (prod-path's fio, vm);
 - `shared=on` memfd guest memory, which vhost-user needs (vm);
 - tap networking in the VM's network namespace, DHCP, DNS and egress (vm);
@@ -2051,7 +2059,7 @@ dispositions. Gate: `spec/lib/byoh_virt_platforms_spec.rb` (it reads this file).
 - Harness `run.sh l5`: SSH within 420 s, `query-kvm` false, symlink and chown-race probes, delete twice.
 - Done: the full gate and the harness; the family experimental.
 
-### WP7: PVM, go/no-go first (script DONE; GO 2026-10-16; build DONE on `pvm-build`)
+### WP7: PVM, go/no-go first (script DONE; GO 2026-10-16; build DONE; L4-T2 passed 2026-10-17)
 
 Status 2026-10-15: the "always" part is SHIPPED (the script, `spec/lib/byoh_virt_tiers_pvm_spec.rb`,
 section 14). Status 2026-10-16: L4-T1 reported a GO on AWS m6i.large. Status 2026-10-17: the build
@@ -2068,8 +2076,8 @@ file names this list planned.
   refusals, lifecycle pages. Optional: `run.sh pvm-hostside` (about 140 MB, disk-checked).
 - On NO-GO, or no report: stop after the script and the docs; L4 is "detected, not offered".
 
-**PVM build on `pvm-build`** (from `byoh-driver` f515eb9e8, PVM plan revision 2; each WP ran the full
-gate of this section; nothing of it ran on a real host):
+**PVM build on `pvm-build`** (from `byoh-driver` f515eb9e8, since merged into `byoh-driver`; PVM plan
+revision 2; each WP ran the full gate of this section; L4-T2 later ran it on AWS, section 14):
 
 | WP | What it built | Where it differs from the list above |
 |---|---|---|
@@ -2115,7 +2123,7 @@ AppArmor profile file (section 15, harness; parse-checked only). Accepted deviat
 (slot location, `/vm/<vm>` owner, lxcfs, DoS advice; `io.max` and the multi-tenant checks block
 multi-project container locations) and section 10.6 (per-location tenancy is final). Still not run:
 `run.sh l3` and `run.sh l5` under the tightened rules (the profile needs an administrator to load it,
-or a throwaway VM), WP7's PVM build (which waited for an L4-T1 GO; built since on `pvm-build`, its L4-T2 not run), and every real-host test of section 14 (e2e1 has run some since, section 14).
+or a throwaway VM), WP7's PVM build (which waited for an L4-T1 GO; built since, and its L4-T2 passed in pvm1), and every real-host test of section 14 (e2e1 and pvm1 have run some since, section 14).
 
 ## 16. Sources
 

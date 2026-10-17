@@ -2,10 +2,13 @@
 
 > **Status.** The machine, the pools and the C5 fix were validated with
 > `bin/register-byoh-host` in ap-south-1 (2026-10-11 and 2026-10-13,
-> [VERIFY.md](../VERIFY.md) §5). The `host add` path below has **not**
-> run on AWS (UNVERIFIED): that is the M4 gate G-M4-1 (VERIFY.md §6),
-> scripted in `scripts/byoh/verify/m4-e2.sh`. Terraform was not applied
-> for M4. Never apply in the `company-mumbai` workspace (CLAUDE.md §8a).
+> [VERIFY.md](../VERIFY.md) §5). The `host add` path below **passed** on
+> AWS: the M4 gate G-M4-1 (`scripts/byoh/verify/m4-e2.sh`) in run e2e1,
+> 2026-10-16, on an m8i.2xlarge with nested virtualization, to `accepting`
+> and through the M2 gate (VERIFY.md §6.2, §7). Those instances came from
+> `scripts/byoh/test/aws-e2e/`, not from this module: terraform was not
+> applied for M4. Never apply in the `company-mumbai` workspace
+> (CLAUDE.md §8a).
 
 The full guide is [platforms/aws.md](../platforms/aws.md). This page is
 the short path: terraform makes the machine and `pools.yaml`, then the

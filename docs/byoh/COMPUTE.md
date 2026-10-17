@@ -334,7 +334,7 @@ Notes:
 
 ## 9a. Lower virtualization tiers: the hugepage columns as a memory budget [no-kvm]
 
-True on branch `no-kvm` (milestone MV, [NO_KVM.md](NO_KVM.md)), not on `byoh-driver`. A host registered
+Part of the virtualization ladder (milestone MV, [NO_KVM.md](NO_KVM.md)), merged into `byoh-driver`. A host registered
 on the `container` (L3) or `emulated` (L5) tier has no 1G hugepages for its VMs: system containers use
 ordinary host memory, and QEMU TCG uses a shared memfd. The allocator still books memory in
 `total_hugepages_1g` / `used_hugepages_1g`, so on these hosts the two columns are **overloaded**: they
@@ -355,7 +355,7 @@ provisional (UNVERIFIED on a real host):
 |---|---|---|---|---|---|
 | `container` | 2048 | 128 (lxc monitor, lxcfs share, dnsmasq) | 2 | 28 GiB | 5 GiB |
 | `emulated` | 2048 | 512 (QEMU's 256 MiB translation cache, QEMU itself, ubiblk, dnsmasq; 384 MiB measured, EMULATED_HOSTS.md §6.4) | 2 | 27 GiB | 4 GiB |
-| `pvm` | 2048 | 384 (cloud-hypervisor, ubiblk, dnsmasq, shadow page tables; not measured) | 2 | 27 GiB | 5 GiB, below one `pvm-2` (8 GiB), so such a host never accepts (branch `pvm-build`, NO_KVM.md §6.7) |
+| `pvm` | 2048 | 384 (cloud-hypervisor, ubiblk, dnsmasq, shadow page tables; in L4-T2 a `pvm-2` held 8357 MiB of its 8576 MiB budget, VERIFY.md §8) | 2 | 27 GiB | 5 GiB, below one `pvm-2` (8 GiB), so such a host never accepts (NO_KVM.md §6.7) |
 
 Sizes (`Option::TierVmSizes`, reachable only through the VM create API in a location that offers the
 tier): `container-2/4/8/16` and `pvm-2/4/8/16` with 4 GiB per vCPU like `standard`; `emulated-2/4` with

@@ -260,11 +260,11 @@ Never rename `migrate/20261013_byoh_network_contract.rb` once it has been applie
 
 ## 6. M4 gates (G-M4-1 to G-M4-6)
 
-Milestone M4 ([ROADMAP.md](ROADMAP.md) §3.3) adds `ubicloud-admin site add` and `host add --ssh`, host preflight, and the F4/F5/F6/F9/F10 portability fixes. Its exit gates need real infrastructure, which the build machine does not have. They are **scripted, not run**: each row says what has been checked locally instead. Record runs in §6.2.
+Milestone M4 ([ROADMAP.md](ROADMAP.md) §3.3) adds `ubicloud-admin site add` and `host add --ssh`, host preflight, and the F4/F5/F6/F9/F10 portability fixes. Its exit gates need real infrastructure, which the build machine does not have. They are scripted; G-M4-1 has run on AWS (§7), the others not yet, and each such row says what has been checked locally instead. Record runs in §6.2.
 
 | Gate | What | Script | Pass when | Status |
 |---|---|---|---|---|
-| G-M4-1 | E2 on AWS: a **fresh** terraform workspace (never `company-mumbai`), `install.sh`, then `site add` and `host add --ssh` exactly as [recipes/aws.md](recipes/aws.md) gives them | `scripts/byoh/verify/m4-e2.sh` with `PLATFORM=aws` | `host add` exits 0, the host reaches `accepting`, and the M2 gate steps pass (default `g1 g2 g4 g5`; `GATE_STEPS` for more once VMs exist) | UNVERIFIED, not run |
+| G-M4-1 | E2 on AWS: a **fresh** terraform workspace (never `company-mumbai`), `install.sh`, then `site add` and `host add --ssh` exactly as [recipes/aws.md](recipes/aws.md) gives them | `scripts/byoh/verify/m4-e2.sh` with `PLATFORM=aws` | `host add` exits 0, the host reaches `accepting`, and the M2 gate steps pass (default `g1 g2 g4 g5`; `GATE_STEPS` for more once VMs exist) | **Pass** on AWS, run e2e1 (2026-10-16; §6.2, §7) |
 | G-M4-2 | E2 on Proxmox: one VM built from [recipes/proxmox.md](recipes/proxmox.md), the same three commands | `m4-e2.sh` with `PLATFORM=proxmox` | as G-M4-1 | UNVERIFIED, not run |
 | G-M4-3 | F5 soak on an EBS-backed host (the G-M4-1 host) | `scripts/byoh/verify/m4-f5-soak.sh --host vh... --hours 24 --interval 600`, monitor started by hand | every sample passes: the monitor runs; no `unavailable` label; `accepting`; `checkup` unset; no open non-info page for the host, and none raised since the soak began and resolved again; `perform_health_checks` true over a fresh session; no down reading of the host in the monitor's log since the last sample | UNVERIFIED, not run |
 | G-M4-4 | F5 soak on a virtio host (the G-M4-2 VM) | as G-M4-3 | as G-M4-3 | UNVERIFIED, not run |
@@ -353,11 +353,11 @@ Bugs the run found, each fixed on `aws-e2e` with a spec where code changed:
 9. A stopped container's unit ended `failed`: ExecStop's `lxc-stop` exits 2 after the clean shutdown.
 10. Wording: the tier capacity refusals ("a emulated") and the m4-e2 resume hint.
 
-Still not run on real machines: Proxmox (G-M4-2), the F5 24 h soak (G-M4-3 to 5), a real Cloudflare tunnel, G6/G10/G11, and the PVM tier end to end (L4-T2, `scripts/byoh/test/real/pvm-e2e.sh`): the GO allowed the build, which branch `pvm-build` has since done (spec-gated only; NO_KVM.md §6.7). Open gaps seen but not fixed: a container guest's `nproc` shows the host's CPUs (the cgroup limit holds; lxcfs does not virtualize the count), and `byoh-location rates` prints the development-layout restart hint on a packaged control plane.
+Still not run on real machines: Proxmox (G-M4-2), the F5 24 h soak (G-M4-3 to 5), a real Cloudflare tunnel, G6/G10/G11, and at the time the PVM tier end to end (L4-T2, `scripts/byoh/test/real/pvm-e2e.sh`): the GO allowed the build, and L4-T2 has since passed (run pvm1, §8). Open gaps seen but not fixed: a container guest's `nproc` shows the host's CPUs (the cgroup limit holds; lxcfs does not virtualize the count), and `byoh-location rates` prints the development-layout restart hint on a packaged control plane.
 
 ## 8. Real-infrastructure run pvm1: the L4 PVM tier (AWS ap-south-1, 2026-10-17)
 
-A control plane (t3.large, `install.sh` in production mode with `--tls acme`) and one m6i.2xlarge (Nitro, no VMX, Secure Boot not enforced), created and removed by `scripts/byoh/test/aws-e2e/` (run `pvm1`, about 1.2 hours). Branch `pvm-build`; `scripts/byoh/test/real/pvm-e2e.sh` (L4-T2) with the cocoonstack/pvm v0.1.0 example pins (third party, for testing).
+A control plane (t3.large, `install.sh` in production mode with `--tls acme`) and one m6i.2xlarge (Nitro, no VMX, Secure Boot not enforced), created and removed by `scripts/byoh/test/aws-e2e/` (run `pvm1`, about 1.2 hours). Branch `pvm-build`, since merged into `byoh-driver`; `scripts/byoh/test/real/pvm-e2e.sh` (L4-T2) with the cocoonstack/pvm v0.1.0 example pins (third party, for testing).
 
 | Phase | Result |
 |---|---|

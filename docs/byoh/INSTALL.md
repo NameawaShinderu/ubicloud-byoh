@@ -19,12 +19,15 @@ It is the M3 replacement for the development bootstrap
 
 **Status.** Every step below ran in the container harness
 (`scripts/byoh/test/`, systemd 255 in `ubuntu:24.04` containers; results
-in `scripts/byoh/test/README.md`). It has **not** run on a real machine,
-and the UNVERIFIED list (§9) names what the harness cannot show. There
-is no release tarball yet (E4/M12): the installer builds a release from
-a git checkout or a tarball you made. M3 lives on branch `m3-packaging`
-until it is merged into `byoh-driver` and pushed; until then a
-`byoh-driver` clone has no `install.sh`.
+in `scripts/byoh/test/README.md`), and on real AWS machines
+([VERIFY.md](VERIFY.md) §7, §8): production mode with `--tls acme` and a
+Let's Encrypt certificate (also for the API host), a rerun with
+`--backup-recipient`, `account create` and an HTTPS login, a reboot,
+the release switch three times, and a backup restored and swapped in.
+The UNVERIFIED list (§9) names what has still not run, such as a real
+Cloudflare tunnel. There is no release tarball yet (E4/M12): the
+installer builds a release from a git checkout or a tarball you made.
+`install.sh` is on `byoh-driver`.
 
 ---
 
@@ -147,7 +150,7 @@ production and warns in development.
 
 | `--tls` | Front | Certificate | `IP_FROM_HEADER` | Ports | Status |
 |---|---|---|---|---|---|
-| `acme` | Caddy (Ubuntu universe), `admin off` | Let's Encrypt for the `--url` host, in the background | `X-Real-IP` (set by Caddy from the connection) | 80, 443 | Caddyfile rendered and parsed; a real ACME issuance is **UNVERIFIED** |
+| `acme` | Caddy (Ubuntu universe), `admin off` | Let's Encrypt for the `--url` host, in the background | `X-Real-IP` (set by Caddy from the connection) | 80, 443 | Caddyfile rendered and parsed; real issuance verified on AWS for an `sslip.io` name and its `api.` name ([VERIFY.md](VERIFY.md) §7, §8) |
 | `provided` | Caddy, `auto_https disable_certs` | `--cert`/`--key`, copied to `/etc/ubicloud/tls` (`root:caddy`, key 0640) | `X-Real-IP` | 80, 443 | Harness gate (`tls-provided`): HTTPS login with a self-signed certificate |
 | `tunnel` | cloudflared | Cloudflare's edge | `CF-Connecting-IP` | none inbound | Existing-unit case and own-unit case in the harness; a real tunnel is **UNVERIFIED** |
 | `none` | none | none | unset | none | Lab only: `--url http://localhost:3000`, reached with `ssh -L 3000:127.0.0.1:3000`; browser use is UNVERIFIED |
@@ -340,7 +343,7 @@ sudo ubicloud-admin logs respirate -f
 ```
 
 - `ubicloud-admin run TOOL` runs `byoh-location`, `byoh-pool`,
-  `byoh-host`, `register-byoh-host`, `byoh-config-check`,
+  `byoh-host`, `register-byoh-host`, `byoh-virt`, `byoh-config-check`,
   `production_check`, `create_prod_admin_account` or `m2-checks` (the
   gates' database checks, VERIFY.md) in the release as user `ubicloud`.
   Files named by `--pool-file`, `--ssh-key`, `--registration-key`,
@@ -404,13 +407,13 @@ install.sh sets to keep a BYOH control plane working:
 | Admin UI | A development setting can skip WebAuthn | WebAuthn required, which needs a secure context | Deferred (M3-l) |
 | Load balancer certificates | Self-signed | Need a `DnsZone` (`prog/vnet/cert_nexus.rb`) | Not set up; `--dns-zone` is E5 |
 
-**The E1 canary has not run.** No VM has booted on a control plane in
-production mode yet (a disposable canary host, approved by the user, is
-the gate). Until it has, a deployment that must boot VMs today can use
-`--rack-env development` and switch later with `--rack-env production
---update-env RACK_ENV` (smoke then runs `bin/production_check`). In
-development the sign-up page is open: anyone who reaches the URL can make
-a working account.
+**The E1 canary passed** on AWS ([VERIFY.md](VERIFY.md) §7): in
+production mode, `ubuntu-noble` downloaded with `BOOT_IMAGE_SOURCE=public`
+and three VMs ran about a minute after create. `--rack-env development`
+remains available, and a control plane can switch later with
+`--rack-env production --update-env RACK_ENV` (smoke then runs
+`bin/production_check`). In development the sign-up page is open:
+anyone who reaches the URL can make a working account.
 
 ---
 
@@ -444,16 +447,12 @@ before root writes or runs anything in them.
 
 Not run, or only approximated in containers:
 
-- Any install on a real machine or VM; a real reboot (the harness uses
-  `docker restart`).
-- A Let's Encrypt issuance (`--tls acme`), for the `--url` host and for
-  `api.<host>`, and a real Cloudflare tunnel with the `api.<host>` route.
-  The harness covers the rendered Caddyfile for both names and, with
-  `--tls provided`, `bin/ubi` against `https://api.<host>/cli`.
+- A real Cloudflare tunnel with the `api.<host>` route, and
   `ubicloud-cloudflared.service` on a real machine (its credential needs
   `/` to be a shared mount, which systemd sets up at boot outside
-  containers).
-- A VM boot in production mode (the E1 canary, §7).
+  containers). An install, a reboot, `--tls acme` for both names and a VM
+  boot in production mode have run on AWS ([VERIFY.md](VERIFY.md) §7,
+  §8); `--tls provided` only in the harness.
 - `--tls none` from a browser over `ssh -L`; the admin UI.
 - Sending to a real SMTP server, a real `PRY_AUDIT_BUCKET`.
 - An arm64 machine. Step 1 refuses it with exit 2 (the pinned mise and

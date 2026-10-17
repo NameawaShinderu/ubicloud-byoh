@@ -3,8 +3,11 @@
 A recipe is the platform-specific part of a BYOH deployment, and nothing
 else. Each one produces two things:
 
-1. a **data-plane machine**: Ubuntu 24.04 with KVM, one uplink address,
-   outbound internet, and a login you can `sudo` from;
+1. a **data-plane machine**: Ubuntu 24.04, one uplink address,
+   outbound internet, a login you can `sudo` from, and KVM if at all
+   possible (without it, one of the experimental `container`, `pvm` or
+   `emulated` tiers: [../README.md](../README.md) §2,
+   [QUICKSTART.md](../QUICKSTART.md) §5);
 2. a **`pools.yaml`** that says which addresses VMs get and how they
    reach the machine ([POOL_OPERATIONS.md](../POOL_OPERATIONS.md) §1).
 
@@ -13,7 +16,7 @@ Nothing in the driver reads which recipe you used.
 
 | Recipe | Machine | Pools | Status |
 |---|---|---|---|
-| [aws.md](aws.md) | EC2 nested-virtualization instance from `terraform/aws-byoh` | `fabric` + `nat` (ENI secondary IPs with EIPs), optional `fabric` + `internal` | Register path validated 2026-10; `host add` UNVERIFIED on AWS |
+| [aws.md](aws.md) | EC2 nested-virtualization instance from `terraform/aws-byoh` | `fabric` + `nat` (ENI secondary IPs with EIPs), optional `fabric` + `internal` | Register path validated 2026-10; `host add` passed on AWS (G-M4-1, 2026-10-16) |
 | [proxmox.md](proxmox.md) | A Proxmox VE guest VM (`--cpu host`) | `onlink` + `internal`, `onlink` + `nat` (pfSense 1:1), or `routed` via a static route | UNVERIFIED |
 | [bare-metal.md](bare-metal.md) | A rented or owned physical server | `routed` + `public` (a routed block) | UNVERIFIED |
 | [homelab.md](homelab.md) | A desktop or mini PC behind a home or office router | `onlink` + `internal`, or `routed` via a router static route | UNVERIFIED |
@@ -89,7 +92,7 @@ root login you have already set up ([SETUP.md](../SETUP.md) §8.2).
 |---|---|---|
 | Ubuntu 24.04, x86_64 or aarch64 | LearnOs; only 24.04 takes VM slices | PF1 |
 | A login with passwordless `sudo` (`ubuntu` on cloud images) | `host add` runs preflight and installs its root key through it | `host add` step 2 |
-| `/dev/kvm` from real VT-x/AMD-V or nested virtualization, and a host-passthrough CPU model | No KVM, no standard VMs (only the experimental lower tiers of [NO_KVM.md](../NO_KVM.md), with `--virt-tier` and `--accept-fallback`); a kvm64-class model hides `vmx`/`svm` and the CPU features x86-64-v2 guests need | PF3, never acceptable |
+| `/dev/kvm` from real VT-x/AMD-V or nested virtualization, and a host-passthrough CPU model (`kvm` tier) | No KVM, no standard VMs (only the experimental `container`, `pvm` or `emulated` tiers of [NO_KVM.md](../NO_KVM.md), with `--virt-tier` and `--accept-fallback`, plus `--install-pvm-kernel` for `pvm`); a kvm64-class model hides `vmx`/`svm` and the CPU features x86-64-v2 guests need | PF3, never acceptable |
 | At least 2 online CPUs and about 16 GiB of memory | Hugepages and host CPUs | PF-min-cpu, PF7 |
 | `/var/storage` on ext4 or xfs | btrfs is UNVERIFIED (`PF10-btrfs`), ZFS is refused | PF10 |
 | Exactly one IPv4 default route, and only the main IP on the uplink | Pool addresses on the host's own NIC steal VM traffic (contract C5) | PF17 |
