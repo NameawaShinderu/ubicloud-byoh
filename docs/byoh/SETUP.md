@@ -4,13 +4,13 @@ This is the full runbook for a BYOH deployment with the current (M4) code: a con
 
 | Platform | Status | Where |
 |---|---|---|
-| AWS EC2 (nested virtualization or `.metal`) | Validated (ap-south-1, 2026-10-11 and 2026-10-13) | This page, §12 "AWS-specific (optional)" |
+| AWS EC2 (nested virtualization or `.metal`; without KVM: `container`, `emulated`, `pvm`) | Validated (ap-south-1, 2026-10-11 to 2026-10-17; [VERIFY.md](VERIFY.md) §5, §7, §8) | This page, §12 "AWS-specific (optional)" |
 | Proxmox VE (a VM as the data plane) | UNVERIFIED | [recipes/proxmox.md](recipes/proxmox.md), [SETUP_PROXMOX.md](SETUP_PROXMOX.md) |
 | Rented bare metal, colo, homelab, GCP, Azure, other clouds | UNVERIFIED | §13 "Other platforms", [platforms/](platforms/README.md) and NETWORKING §9 |
 
-**The same three commands on every platform (M4):** `install.sh` once, `ubicloud-admin site add` once per site, `ubicloud-admin host add --ssh` once per host. [recipes/README.md](recipes/README.md) lists them; §6 and §8.1 below explain them. The shortest path is [QUICKSTART.md](QUICKSTART.md). Per-platform guides: [platforms/README.md](platforms/README.md). Problems: [TROUBLESHOOTING.md](TROUBLESHOOTING.md). The design is in [NETWORKING.md](NETWORKING.md); the platform matrix and host requirements are in [PLATFORMS.md](PLATFORMS.md).
+**The same three commands on every platform (M4):** `install.sh` once, `ubicloud-admin site add` once per site, `ubicloud-admin host add --ssh` once per host. [recipes/README.md](recipes/README.md) lists them; §6 and §8.1 below explain them. Start at [README.md](README.md) for the overview and the virtualization options; the shortest path is [QUICKSTART.md](QUICKSTART.md). Per-platform guides: [platforms/README.md](platforms/README.md). Problems: [TROUBLESHOOTING.md](TROUBLESHOOTING.md). The design is in [NETWORKING.md](NETWORKING.md); the platform matrix and host requirements are in [PLATFORMS.md](PLATFORMS.md).
 
-**Two control-plane layouts (M3).** A production control plane is installed with `scripts/byoh/install.sh` ([INSTALL.md](INSTALL.md)) and operated with `sudo ubicloud-admin` ([OPERATIONS.md](OPERATIONS.md)): systemd, database `ubicloud`, settings in `/etc/ubicloud/env`. The development bootstrap (`scripts/byoh/bootstrap-dev-ctrl-plane.sh`: tmux, `clover_test`, `trust`) is for development and labs; the live AWS control plane still runs it until its M3 window ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)). The commands below are written for the development layout (`bundle exec bin/...` in `~/ubicloud`); §4.3 gives the packaged equivalent of each. The packaged layout has run only in the container harness (UNVERIFIED on a real machine).
+**Two control-plane layouts (M3).** A production control plane is installed with `scripts/byoh/install.sh` ([INSTALL.md](INSTALL.md)) and operated with `sudo ubicloud-admin` ([OPERATIONS.md](OPERATIONS.md)): systemd, database `ubicloud`, settings in `/etc/ubicloud/env`. The development bootstrap (`scripts/byoh/bootstrap-dev-ctrl-plane.sh`: tmux, `clover_test`, `trust`) is for development and labs; the live AWS control plane still runs it until its M3 window ([MIGRATE_FROM_DEV.md](MIGRATE_FROM_DEV.md)). The commands below are written for the development layout (`bundle exec bin/...` in `~/ubicloud`); §4.3 gives the packaged equivalent of each. The packaged layout has run on real AWS machines in production mode (VERIFY.md §7, §8).
 
 The previous version of this page was an AWS-console walkthrough written before M2. It passed `--provider generic` (which aborts) and created no location. It is in git history if you need it.
 
@@ -21,7 +21,7 @@ The previous version of this page was an AWS-console walkthrough written before 
 | Role | Runs | Needs |
 |---|---|---|
 | Control plane | Postgres, web (`puma`), `respirate`, optionally `bin/monitor`, the operator CLIs | Ubuntu 24.04; SSH to every data-plane host's management IP (contract C0); users reach its HTTPS front (packaged) or port 3000 (development) |
-| Data plane (VmHost) | rhizome, cloud-hypervisor, vhost-block-backend, the VMs | Ubuntu 24.04 with KVM; root SSH from the control plane; outbound internet; a dedicated machine or VM |
+| Data plane (VmHost) | rhizome, cloud-hypervisor, vhost-block-backend, the VMs (or LXC, a PVM kernel or QEMU on a lower tier, §8.1) | Ubuntu 24.04 with KVM, or a lower virtualization tier; root SSH from the control plane; outbound internet; a dedicated machine or VM |
 | BYOH location | One per site: network profile, billing rates, who can use it | `bin/byoh-location` |
 | Pools | Addresses VMs get, each with a `delivery` and an `exposure` | `pools.yaml`, `bin/byoh-pool` |
 
@@ -34,8 +34,8 @@ The control plane and the data plane can be on different platforms. The only cou
 | Requirement | Check on the host | If missing |
 |---|---|---|
 | Ubuntu 24.04 LTS, x86_64 | `lsb_release -rs` | Only 24.04 accepts VM slices |
-| KVM | `ls /dev/kvm` | Bare metal: enable VT-x/AMD-V. Guest: nested virtualization plus a CPU model that passes `vmx`/`svm` |
-| 1G hugepages | `grep -c pdpe1gb /proc/cpuinfo` > 0 | Guest: pass the host CPU model |
+| KVM | `ls /dev/kvm` | Bare metal: enable VT-x/AMD-V. Guest: nested virtualization plus a CPU model that passes `vmx`/`svm`. Neither possible: a lower tier, `container`, `pvm` or `emulated` (§8.1, [NO_KVM.md](NO_KVM.md)) |
+| 1G hugepages (`kvm` tier) | `grep -c pdpe1gb /proc/cpuinfo` > 0 | Guest: pass the host CPU model |
 | Memory in whole GiB | `sudo dmidecode -t memory \| grep Size:` shows `GB` | On the published `byoh-driver` (17d383a9c), LearnMemory fails "unexpected dmidecode unit". `m2-network` (a0259a997) accepts kB/MB/GB/TB ([platforms/README.md](platforms/README.md) §3) |
 | Not a hybrid (P+E core) CPU, SMT on | `lscpu` | Preflight fails `PF8-hybrid`. Since M4 a BYOH host with mixed thread counts counts every CPU as a core, so VMs boot; `--accept-check PF8-hybrid` accepts the uneven core speeds ([recipes/homelab.md](recipes/homelab.md) §2). Offline CPUs are left out (PF8 warns) |
 | Outbound internet | `curl -sI https://cloud-images.ubuntu.com` and `curl -sfIL https://cloud-images.ubuntu.com/releases/noble/release-20250502.1/ubuntu-24.04-server-cloudimg-amd64.img` (it redirects to `http://cloud-images-archive.ubuntu.com`, so port 80 too) | PrepHost and boot image downloads fail |
@@ -96,7 +96,7 @@ sudo ubicloud-admin account create --email ops@example.com
 sudo ubicloud-admin status
 ```
 
-`--tls acme` is one of four fronts: use `provided` with your own certificate, `tunnel` with a Cloudflare tunnel, or `none` for `ssh -L` only ([INSTALL.md](INSTALL.md) §3). `install.sh` reaches `byoh-driver` when M3 is merged; until then it is on the unpushed branch `m3-packaging`. Flags, TLS fronts, settings and the production-mode differences are in [INSTALL.md](INSTALL.md). `--rack-env production` is the default and sets `BOOT_IMAGE_SOURCE=public`; no VM has booted in production mode yet (the E1 canary, [INSTALL.md](INSTALL.md) §7), so `--rack-env development` is the cautious choice for a first site. Onboard users with `ubicloud-admin account create`: with the default logger mail driver, verification mail lands in the journal.
+`--tls acme` is one of four fronts: use `provided` with your own certificate, `tunnel` with a Cloudflare tunnel, or `none` for `ssh -L` only ([INSTALL.md](INSTALL.md) §3). Each front also serves the API on `api.<host>` for the `ubi` CLI (§9, [INSTALL.md](INSTALL.md) §3.1). Flags, TLS fronts, settings and the production-mode differences are in [INSTALL.md](INSTALL.md). `--rack-env production` is the default and sets `BOOT_IMAGE_SOURCE=public`; VMs booted that way on AWS (the E1 canary, [VERIFY.md](VERIFY.md) §7). Onboard users with `ubicloud-admin account create`: with the default logger mail driver, verification mail lands in the journal.
 
 ### 4.2 Development (`bootstrap-dev-ctrl-plane.sh`, labs only)
 
@@ -234,7 +234,7 @@ routed_networks:
 sudo ubicloud-admin host add --site <site> --ssh <user>@<host main IP> \
   --ssh-key <your login key> --pool-file pools.yaml \
   [--registration-key ~/.ssh/byoh_data] [--storage-disk <by-id>] [--accept-check PF8-hybrid] \
-  [--virt-tier kvm|auto|container|emulated [--accept-fallback]]
+  [--virt-tier kvm|auto|container|pvm|emulated [--accept-fallback] [--install-pvm-kernel]]
 ```
 
 (development: `packaging/bin/ubicloud-admin --dev host add ...` from `~/ubicloud`, without `sudo`.)
@@ -244,7 +244,15 @@ sudo ubicloud-admin host add --site <site> --ssh <user>@<host main IP> \
 3. It installs its registration key for root on a tagged line, and writes `/etc/ssh/sshd_config.d/05-ubicloud-root.conf` only if sshd does not already let root log in with a key. Then it logs in as root with that key, pinned to the host keys (PF2).
 4. It formats each `--storage-disk`, registers the host pinned to the host keys, and follows the bring-up (one reboot) until the host accepts VMs, then runs `pool verify`.
 
-**Without KVM.** PF3 gives the host's rung on the virtualization ladder and the platform's fix ([NO_KVM.md](NO_KVM.md)). To add a host that cannot run KVM on the experimental `container` or `emulated` tier, offer the tier in the site first (`site rates <site> --family <tier> --from standard --multiplier <X>`, `site set <site> --virt-tiers kvm,<tier> --accept <tier>`), then pass `--virt-tier <tier>` (or `auto`) and `--accept-fallback`. Preflight then checks the tier's packages instead of KVM and hugepages, and the host downloads the tier's own image (`ubuntu-noble-container` for `container`) unless `--default-boot-image` names one. `--no-virt-probe` leaves the ladder out of preflight.
+**Choose the virtualization option.** PF3 gives the host's rung on the virtualization ladder and the platform's fix ([NO_KVM.md](NO_KVM.md)). Switch KVM on when the fix allows it; it is the only option with hardware isolation. Otherwise pick one of the experimental, single-project lower tiers ([README.md](README.md) §2 compares speed and isolation; [QUICKSTART.md](QUICKSTART.md) §5 has the commands):
+
+| Tier | Before `host add` | `host add` flags |
+|---|---|---|
+| `container` | On the host: `apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs` (or `bootstrap-data-plane.sh --tier container`). In the site: `site rates <site> --family container --from standard --multiplier <X>`, `site set <site> --virt-tiers kvm,container --accept container` | `--virt-tier container` or `auto`, with `--accept-fallback` |
+| `emulated` | On the host: `apt-get install qemu-system-x86 ovmf`. In the site: as above with `emulated` | `--virt-tier emulated --accept-fallback` |
+| `pvm` | In the site: `site rates <site> --family pvm ...`, then `site set <site> --virt-tiers kvm,pvm --accept pvm` with the kernel pins `--pvm-host-deb`, `--pvm-guest-kernel` and `--pvm-guest-config` (each with its `-sha256`; `--pvm-guest-unchecked` instead of the config pair). Optional read-only check on the host: `bootstrap-data-plane.sh --tier pvm` | `--virt-tier pvm --install-pvm-kernel --accept-fallback` |
+
+`auto` picks `kvm` on a KVM host, else the fallback the probe recommends (container before emulated), which the site must offer; it never installs a PVM kernel without `--install-pvm-kernel`. Preflight checks the tier's needs instead of KVM and hugepages, and the host downloads the tier's own image (`ubuntu-noble-container` for `container`) unless `--default-boot-image` names one. PVM needs an x86_64 CPU without `vmx`/`svm` that Meltdown does not affect, and Secure Boot off; the bring-up installs the pinned host kernel and boots it once, while GRUB's default stays the stock kernel ([NO_KVM.md](NO_KVM.md) §6.7, §6.8). `--no-virt-probe` leaves the ladder out of preflight.
 
 `--main-ip` defaults to the `--ssh` host when that is an IPv4 address; `--uplink-ip` names the uplink when there are several default routes; `--default-boot-image` (repeatable) replaces `ubuntu-noble`. Without `--registration-key` the key is generated and kept only in the database. Exit codes, resume and Ctrl-C: [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.3. `sudo ubicloud-admin host preflight` (same `--site`, `--ssh`, `--ssh-key` and pools) runs step 1 alone.
 
@@ -301,19 +309,21 @@ ssh -i ~/.ssh/byoh_data root@<main IP> ip -br -4 addr                         # 
 2. Add an SSH public key.
 3. Create a VM in the BYOH location (its UI name). With IPv4 enabled, pick **IPv4 Exposure**: `internet` (a `public` or `nat` address) or `internal`.
 
-CLI equivalents, where the path uses the location's display name. By default `ubi` talks to Ubicloud's hosted service, and the API answers only on a host name that starts with `api.`. So first (UNVERIFIED against a BYOH control plane):
+CLI equivalents, where the path uses the location's display name. `bin/ubi` (any machine with Ruby and a clone of this repository) talks to Ubicloud's hosted service by default, and the API answers only on a host name that starts with `api.`:
 
 1. Create a token on the project's **Personal Access Tokens** page (`/project/pj…/token`).
-2. Map an `api.` name to the control plane where you run `ubi`, for example `echo "<control plane IP> api.byoh.internal" | sudo tee -a /etc/hosts`.
-3. `export UBI_TOKEN=pat-... UBI_URL=http://api.byoh.internal:3000/cli`
+2. Packaged: `export UBI_TOKEN=pat-... UBI_URL=https://api.<host>/cli`, the API host install.sh serves ([INSTALL.md](INSTALL.md) §3.1; verified on AWS, VERIFY.md §8).
+3. Development (UNVERIFIED): map an `api.` name to the control plane, for example `echo "<control plane IP> api.byoh.internal" | sudo tee -a /etc/hosts`, then `export UBI_TOKEN=pat-... UBI_URL=http://api.byoh.internal:3000/cli`.
 
 ```bash
 ubi vm <site>/vm1 create -b ubuntu-noble "$(cat ~/.ssh/id_ed25519.pub)"                # internet IPv4
 ubi vm <site>/vm2 create -e internal -b ubuntu-noble "$(cat ~/.ssh/id_ed25519.pub)"    # internal IPv4
 ubi vm <site>/vm3 create -6 -b ubuntu-noble "$(cat ~/.ssh/id_ed25519.pub)"             # no IPv4
+ubi vm <site>/c1 create -s container-2 -b ubuntu-noble-container "$(cat ~/.ssh/id_ed25519.pub)"  # container tier
+ubi vm <site>/p1 create -s pvm-2 -b ubuntu-noble "$(cat ~/.ssh/id_ed25519.pub)"                  # pvm tier
 ```
 
-The VM user is `ubi`.
+The web form offers only the standard sizes, so lower-tier VMs (`container-*`, `pvm-*`, `emulated-*`) are created with `ubi` or the API. The VM user is `ubi`.
 
 ---
 

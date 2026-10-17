@@ -19,6 +19,18 @@ Use Proxmox when you already run a Proxmox VE cluster and want a private or comp
 
 Nested virtualization costs performance. A Proxmox guest suits an internal cloud, labs and staging. For heavy production loads, register bare metal instead.
 
+### 1.1 Without KVM in the guest
+
+Fix KVM first: almost every Proxmox guest without a working `/dev/kvm` has nested virtualization off on the node or a CPU type other than `host`, and `host add` preflight (PF3) reports that as `kvm_blocked` with the `qm set <vmid> --cpu host` fix (§4). Only when the node cannot expose VT-x/AMD-V at all (a node that is itself a cloud VM without nested support, for example) can the guest use one of the experimental, single-project lower tiers ([NO_KVM.md](../NO_KVM.md)):
+
+| Tier | What the guest needs | `host add` flags |
+|---|---|---|
+| `container` | x86_64 Linux 5.12 or newer with cgroup v2, and the LXC packages (`apt-get install lxc lxcfs uidmap xz-utils quota cryptsetup-bin e2fsprogs`) | `--virt-tier auto` or `container`, with `--accept-fallback` |
+| `pvm` | x86_64 without `vmx`/`svm`, a CPU that Meltdown does not affect, Secure Boot off (OVMF guests: check), GRUB | `--virt-tier pvm --install-pvm-kernel --accept-fallback` |
+| `emulated` | `apt-get install qemu-system-x86 ovmf`; demos and CI only | `--virt-tier emulated --accept-fallback` |
+
+Each tier must be offered in the site first (`ubicloud-admin site rates` and `site set --virt-tiers`); [QUICKSTART.md](../QUICKSTART.md) §5 has the commands and [README.md](../README.md) §2 the measured speed and isolation. None of them has run on Proxmox (UNVERIFIED); the measurements are from AWS.
+
 ---
 
 ## 2. Requirements
@@ -112,7 +124,7 @@ Every command below exists on `m2-network` and on the published `byoh-driver` (1
 |---|---|---|
 | `bootstrap-data-plane.sh`: "/dev/kvm is missing" or "neither the vmx nor the svm flag" | Nested virtualization off on the node, or the CPU type is not `host` | Ask the node owner to enable nested virtualization (node reboot); `qm set <vmid> --cpu host`, then `qm shutdown` and `qm start` |
 | `bootstrap-data-plane.sh`: "lacks the pdpe1gb flag" | A named CPU model, such as `kvm64` or the PVE default, hides 1G pages (UNVERIFIED which models do) | `qm set <vmid> --cpu host` |
-| `bin/byoh-virt probe` or registration: `tier: kvm_blocked`, reason "the CPU model is the hypervisor's generic ..." (branch `no-kvm`) | The guest's CPU type is `kvm64`/`qemu64` (the PVE default "Common KVM processor"), even with `+vmx` and a working `/dev/kvm`: it hides features cloud-hypervisor's guests need | `qm set <vmid> --cpu host`, nested on the node, then `qm shutdown` and `qm start`; probe again. M4's preflight PF3 gives the same verdict (PLATFORMS §6.2) |
+| `bin/byoh-virt probe` or registration: `tier: kvm_blocked`, reason "the CPU model is the hypervisor's generic ..." | The guest's CPU type is `kvm64`/`qemu64` (the PVE default "Common KVM processor"), even with `+vmx` and a working `/dev/kvm`: it hides features cloud-hypervisor's guests need | `qm set <vmid> --cpu host`, nested on the node, then `qm shutdown` and `qm start`; probe again. M4's preflight PF3 gives the same verdict (PLATFORMS §6.2) |
 | `verify_hugepages` fails, or few hugepages | Memory too small, or ballooning reclaims it | `qm set <vmid> --memory 32768 --balloon 0`, then `qm shutdown <vmid>` and `qm start <vmid>`: a guest reboot does not apply it |
 | LearnMemory "unexpected dmidecode unit" | Memory not a multiple of 1024 MiB on a build without a0259a997 (the published `byoh-driver`) | Set the memory to a multiple of 1024 MiB (`qm set <vmid> --memory 32768`) and restart from Proxmox (`qm shutdown`, `qm start`). Respirate retries; do not re-register |
 | Every VM fails with `BUG` | Hybrid P+E core node CPU (PLATFORMS HW-6) on a data plane whose CPUs were learned before M4 | Re-register the data plane on M4 code with `--accept-check PF8-hybrid` (a BYOH host then counts every CPU as a core; UNVERIFIED on hybrid hardware), or disable E-cores in the BIOS |
@@ -142,7 +154,7 @@ Common problems (root SSH, boot images, capacity, DNS, the egress deny list) are
 
 The data plane is a guest VM on these hypervisors too. Everything in sections 2-4 applies; only the knobs differ. The common rules:
 
-- **Expose hardware virtualization and 1G pages to the guest.** `bootstrap-data-plane.sh` checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` and refuses the guest if any is missing. That is the quickest test on a new hypervisor. On branch `no-kvm`, `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` from the control plane goes further (KVM capabilities, generic CPU models, `KVM_CREATE_VM`) and names the hypervisor (Proxmox/libvirt as `qemu_kvm`, `vmware`, `hyperv`, `virtualbox`, `xen`) with its fix ([NO_KVM.md](../NO_KVM.md) §4). If the hypervisor cannot expose VT-x at all, the experimental `container` or `emulated` tier is the fallback (NO_KVM.md §1).
+- **Expose hardware virtualization and 1G pages to the guest.** `bootstrap-data-plane.sh` checks `/dev/kvm`, `vmx`/`svm` and `pdpe1gb` and refuses the guest if any is missing. That is the quickest test on a new hypervisor. `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` from the control plane (or `host add` preflight, PF3) goes further (KVM capabilities, generic CPU models, `KVM_CREATE_VM`) and names the hypervisor (Proxmox/libvirt as `qemu_kvm`, `vmware`, `hyperv`, `virtualbox`, `xen`) with its fix ([NO_KVM.md](../NO_KVM.md) §4). If the hypervisor cannot expose VT-x at all, the experimental `container`, `pvm` or `emulated` tier is the fallback (§1.1, NO_KVM.md §1).
 - **Turn off dynamic memory and ballooning.** Most guest memory becomes 1G hugepages.
 - **One NIC, static management IP, no pool addresses on it.** VMs are routed behind the guest's own MAC: the guest answers ARP for `onlink` pool addresses with proxy_arp, and every VM packet leaves with the guest's MAC. So MAC spoofing or promiscuous mode should not be needed (inferred from `rhizome/host/lib/vm_setup.rb`, UNVERIFIED). What can break the path is an **IP** filter on the virtual switch that drops packets whose source is not the guest's own address.
 - **Leave `bin/monitor` off for now.** Virtual disks have no `wwn-`/`nvme-eui` links or SMART; since M4 the checks of a BYOH host allow for that (F5), but no soak has run on any hypervisor (UNVERIFIED).

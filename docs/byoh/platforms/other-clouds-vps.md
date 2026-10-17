@@ -18,7 +18,7 @@ Related pages:
 
 ### 1.1 Two questions decide everything
 
-1. **Does the machine have KVM?** cloud-hypervisor requires `/dev/kvm`, and so do Firecracker, crosvm and QEMU-KVM. On `byoh-driver` there is no fallback; branch `no-kvm` adds experimental, opt-in ones (§1.3). `scripts/byoh/bootstrap-data-plane.sh` refuses a host without `/dev/kvm`, without the `vmx`/`svm` flag or without `pdpe1gb`. PrepHost refuses it again after registration (`rhizome/host/lib/kvm_check.rb`). A VPS qualifies only when the provider exposes nested virtualization. A bare-metal server always qualifies once VT-x/AMD-V is on.
+1. **Does the machine have KVM?** cloud-hypervisor requires `/dev/kvm`, and so do Firecracker, crosvm and QEMU-KVM. Without it there are only experimental, opt-in fallbacks (§1.3, [NO_KVM.md](../NO_KVM.md)). `scripts/byoh/bootstrap-data-plane.sh` (default `--tier kvm`) refuses a host without `/dev/kvm`, without the `vmx`/`svm` flag or without `pdpe1gb`. PrepHost refuses it again after registration (`rhizome/host/lib/kvm_check.rb`). A VPS qualifies only when the provider exposes nested virtualization. A bare-metal server always qualifies once VT-x/AMD-V is on.
 2. **How do extra IPv4 addresses reach the machine?** Rhizome routes every VM behind the host's own MAC address (NETWORKING §9.5):
    - Addresses **routed** to the host's main IP work (`routed`).
    - Addresses that a cloud SDN delivers to the host's NIC work (`fabric`).
@@ -42,7 +42,7 @@ Related pages:
 | **Linode / Akamai compute instances** | Staff replies say nested virtualization is not supported, because it breaks live migration; they point to bare metal instead *(community report, UNVERIFIED here)* | IPv4: not researched. IPv6: a routed /64 or /56 per data center, which needs Network Helper disabled *(provider docs, UNVERIFIED here)* | IPv6 routed /64 → `gua` | **Not possible** as a data plane unless `/dev/kvm` is present | No KVM. A routed IPv6 /64 would fit if KVM were available. |
 | **Hetzner Cloud** | Community reports say Cloud servers expose no KVM *(community report, UNVERIFIED here)* | Floating IPs, assigned to one server at a time and configured as /32 on `eth0` *(provider docs, UNVERIFIED here)* | n/a as data plane; `routed` (WireGuard) as a tunnel endpoint | **Not possible** as a data plane | No KVM. Hetzner dedicated servers (Robot, including the server auction) are the Hetzner data-plane option (NETWORKING §9.5). Hetzner Cloud is still a good **control plane** or **tunnel VPS** (§1.3). |
 | **Scaleway Dedibox / Online** | Native (dedicated servers) | Not researched | probably `routed` + `public` | **UNVERIFIED** | Not researched. Apply the bare-metal rules in NETWORKING §9.5. |
-| **Any VPS without `/dev/kvm`** | none | as the provider allows | as the provider allows | **Not possible** for standard VMs; experimental `container` or `emulated` tier on branch `no-kvm` | §1.3 |
+| **Any VPS without `/dev/kvm`** | none | as the provider allows | as the provider allows | **Not possible** for standard VMs; experimental `container`, `pvm` or `emulated` tier | §1.3 |
 | **OpenVZ, LXC or Docker "VPS"** (a container, not a VM) | none | — | — | **Not possible**, on any branch: the probe refuses a data plane that is itself a container | §1.3 |
 
 "Works with caveats" means the code path exists and matches a shape that was validated elsewhere, but on this provider nothing has been run.
@@ -52,21 +52,21 @@ Related pages:
 A VPS that shows no `/dev/kvm` cannot run standard Ubicloud VMs.
 
 - `bootstrap-data-plane.sh` stops with `ERROR: /dev/kvm is missing, so KVM is unavailable.` (or the `vmx`/`svm` or `pdpe1gb` errors).
-- If you register it anyway, PrepHost fails its KVM check and the host never reaches `accepting`.
+- If you register it anyway on the default `kvm` tier, preflight (PF3) refuses it, and without preflight PrepHost fails its KVM check and the host never reaches `accepting`.
 
-**First, find out why** (branch `no-kvm`): `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` on the
-control plane. It names the provider when it can (the DMI strings for Linode, Vultr and Scaleway are
+**First, find out why:** `ubicloud-admin host preflight` (PF3), or `bin/byoh-virt probe --main-ip <IP> --ssh-key <key>` on the
+control plane (packaged: `sudo ubicloud-admin run byoh-virt probe ...`). It names the provider when it can (the DMI strings for Linode, Vultr and Scaleway are
 guesses, UNVERIFIED), says whether that provider offers nested virtualization, and prints the fix: often
 a different plan or the provider's bare-metal line. Prefer that: every option below is slower or
 isolates less.
 
-**If KVM is impossible there** (branch `no-kvm`, experimental, never chosen silently; [NO_KVM.md](../NO_KVM.md)):
+**If KVM is impossible there** (experimental, opt-in per location, never chosen silently; [NO_KVM.md](../NO_KVM.md); comparison in [README.md](../README.md) §2):
 
 | Tier | What customers get | Speed (lab, VERIFIED) | Isolation | Status |
 |---|---|---|---|---|
-| `container` (L3) | Unprivileged LXC system containers with systemd, SSH and cloud-init, as `container-2..16` sizes | CPU 95-99%, memory bandwidth 91-98% of native, SSH in 3.6-5.4 s | Shared host kernel: not a VM | Registrable; one project per location; real-host checks UNVERIFIED |
-| `pvm` (L4) | Cloud Hypervisor VMs on KVM in software (a PVM host kernel the control plane installs), as `pvm-2..16` sizes, `ubuntu-noble` only | CPU 87%, memory 95-100%, syscalls 47%, fork+exec 32% of the host (AWS m6i.large by hand, L4-T1) | VM, weaker than hardware | Branch `pvm-build`: registrable with `--virt-tier pvm --install-pvm-kernel`; x86_64 CPUs Meltdown does not affect, Secure Boot off, a plain (not md or LVM) `/boot`; one project per location; the product path UNVERIFIED (L4-T2) |
-| `emulated` (L5) | QEMU TCG VMs, as `emulated-2/4` sizes | CPU 26-29%, memory bandwidth about 2.5%, 64-96 s to SSH | Not a security boundary | Registrable; one project per location; real host UNVERIFIED |
+| `container` (L3) | Unprivileged LXC system containers with systemd, SSH and cloud-init, as `container-2..16` sizes | Lab: CPU 95-99%, memory bandwidth 91-98% of native, SSH in 3.6-5.4 s. AWS t3.xlarge: CPU 99.8%, memory 99.9% ([VERIFY.md](../VERIFY.md) §7) | Shared host kernel: not a VM | Registrable; one project per location; run on AWS (VERIFY.md §7), not on a VPS |
+| `pvm` (L4) | Cloud Hypervisor VMs on KVM in software (a PVM host kernel the control plane installs), as `pvm-2..16` sizes, `ubuntu-noble` only | AWS m6i.2xlarge: CPU 97%, memory about 100%, 4k random I/O 93%, syscalls 48%, fork+exec 32% of the host ([VERIFY.md](../VERIFY.md) §8) | VM, weaker than hardware | Registrable with `--virt-tier pvm --install-pvm-kernel --accept-fallback`; x86_64 CPUs Meltdown does not affect, Secure Boot off, a plain (not md or LVM) `/boot`; one project per location; run end to end on AWS (VERIFY.md §8), not on a VPS |
+| `emulated` (L5) | QEMU TCG VMs, as `emulated-2/4` sizes | Lab: CPU 26-29%, memory bandwidth about 2.5%, 64-96 s to SSH. AWS t3.xlarge: CPU 29%, memory 2% (VERIFY.md §7) | Not a security boundary | Registrable; one project per location; run on AWS (VERIFY.md §7), not on a VPS |
 
 The commands, in order (the probe and a refused registration print them with your names filled in):
 
@@ -80,6 +80,8 @@ bin/byoh-location set --location <loc> --virt-tiers kvm,container --accept conta
 bin/register-byoh-host --location <loc> --main-ip <IP> ... --virt-tier auto --accept-fallback --yes
 bin/byoh-location grant --location <loc> --project <ubid>
 ```
+
+On a packaged control plane the same steps are `sudo ubicloud-admin site rates|set|grant <loc> ...` and `sudo ubicloud-admin host add --site <loc> --ssh <user>@<IP> ... --virt-tier auto --accept-fallback`. PVM takes the kernel pins on `site set` and `--virt-tier pvm --install-pvm-kernel --accept-fallback` on `host add`; [QUICKSTART.md](../QUICKSTART.md) §5 has both.
 
 Leave out `--default-boot-image` for a lower tier: the host downloads its tier's image
 (`ubuntu-noble-container` for `container`), and registration refuses an image the tier cannot boot.
