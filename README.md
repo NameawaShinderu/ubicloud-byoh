@@ -12,6 +12,8 @@ Ubicloud provides IaaS cloud features on bare metal providers, such as Hetzner, 
 and AWS Bare Metal. You can set it up yourself on these providers or you can use our
 [managed service](https://console.ubicloud.com).
 
+This fork adds BYOH ("bring your own host"), which runs on any Ubuntu 24.04 machine: start at [docs/byoh/README.md](docs/byoh/README.md).
+
 ## Quick start
 
 ### Managed platform

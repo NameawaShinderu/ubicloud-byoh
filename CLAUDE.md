@@ -21,6 +21,7 @@ Anything marked UNVERIFIED was never executed.
 
 | Doc | What it decides |
 |---|---|
+| `docs/byoh/README.md` | Start-here index: what BYOH is, the six steps to a first VM, the virtualization options (kvm/container/pvm/emulated) with measured speed and status, a one-line map of every doc, and what is verified |
 | `docs/byoh/ROADMAP.md` | Master build order M0–M12, the browser console design, the OpenStack feature map, easy deployment, and open decisions D-1…D-13 |
 | `docs/byoh/NETWORKING.md` | One host network contract for all platforms (`delivery` routed/onlink/fabric × `exposure` public/nat/internal), `host_guard`, `public_ip4`, real locations |
 | `docs/byoh/COMPUTE.md` | Dedicated vs Flexible tiers, custom shapes, overcommit and balloon gates, usage-based placement |
