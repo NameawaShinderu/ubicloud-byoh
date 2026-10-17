@@ -1,0 +1,13 @@
+#!/bin/sh
+# Written by rhizome's install-pvm-host-kernel: the one GRUB entry with pti=off.
+# grub-mkconfig provides the library and sets grub_probe.
+# shellcheck disable=SC1091,SC2154
+set -e
+. /usr/share/grub/grub-mkconfig_lib
+k=/boot/vmlinuz-6.12.33-pvm
+[ -f "$k" ] || exit 0
+echo "menuentry 'Ubuntu, with Linux 6.12.33-pvm (Ubicloud PVM)' --id ubicloud-pvm {"
+prepare_grub_to_access_device "$(${grub_probe} --target=device "$k")" | sed 's/^/  /'
+echo "  linux $(make_system_path_relative_to_its_root "$k") root=UUID=${GRUB_DEVICE_UUID} ro ${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT} pti=off"
+echo "  initrd $(make_system_path_relative_to_its_root /boot/initrd.img-6.12.33-pvm)"
+echo "}"

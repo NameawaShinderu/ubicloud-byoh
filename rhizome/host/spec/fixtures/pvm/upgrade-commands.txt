@@ -1,0 +1,18 @@
+uname -r
+df -Pk /var/lib/ubicloud/pvm
+df -Pk /
+df -Pk /boot
+curl --proto =https --proto-redir =https -fsSL --connect-timeout 10 --speed-limit 1024 --speed-time 60 --max-filesize 536870912 -o /var/lib/ubicloud/pvm/host-kernel.deb https://example.com/new.deb
+dpkg-deb -f /var/lib/ubicloud/pvm/host-kernel.deb Package
+env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y /var/lib/ubicloud/pvm/host-kernel.deb
+apt-mark -o DPkg::Lock::Timeout=300 hold linux-image-6.12.40-pvm
+grub-editenv list
+uname -r
+findmnt -no FSTYPE /
+update-grub
+groupadd -f -r kvm
+systemctl daemon-reload
+systemctl enable ubicloud-pvm-boot.service
+grub-reboot ubicloud-pvm
+grub-editenv list
+grub-editenv list

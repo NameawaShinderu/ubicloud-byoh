@@ -1,0 +1,10 @@
+#!/bin/env ruby
+# frozen_string_literal: true
+
+require_relative "../lib/pvm_host_kernel"
+
+# install-pvm-host-kernel preflight|install|arm|disarm|status|uninstall|upgrade
+# Parameters as JSON on stdin; prints one JSON object. Exit 0 ok, 2
+# refused (nothing changed), 3 failed after a change (the host was
+# un-armed; run uninstall), 1 an unexpected error. See PvmHostKernel.
+exit PvmHostKernel.main(ARGV)

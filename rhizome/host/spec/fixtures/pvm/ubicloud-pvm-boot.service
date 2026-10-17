@@ -1,0 +1,13 @@
+[Unit]
+Description=Ubicloud PVM: load kvm_pvm and arm the next PVM boot
+ConditionKernelCommandLine=pti=off
+After=systemd-udevd.service systemd-modules-load.service local-fs.target
+Wants=systemd-udevd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ubicloud-pvm-boot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Written by rhizome's install-pvm-host-kernel. Each PVM boot that gets
+# this far arms the next one; GRUB's default stays the stock kernel, so
+# a boot that fails or hangs returns to it on the next power cycle.
+set -eu
+fail() { echo "ubicloud-pvm-boot: $*" >&2; exit 1; }
+[ "$(uname -r)" = "6.12.33-pvm" ] || fail "running $(uname -r), not the PVM kernel"
+modprobe kvm_pvm
+udevadm trigger --action=change --sysname-match=kvm
+udevadm settle
+[ -c /dev/kvm ] || fail "/dev/kvm is not a character device"
+[ "$(stat -c '%a %G' /dev/kvm)" = "660 kvm" ] || fail "/dev/kvm is $(stat -c '%a %G' /dev/kvm), not 660 kvm"
+grub-editenv list | grep -qxF "saved_entry=Advanced options for Ubuntu>Ubuntu, with Linux 7.0.0-1014-aws" || fail "saved_entry is not the stock kernel"
+grep -qF "menuentry 'Ubuntu, with Linux 7.0.0-1014-aws'" /boot/grub/grub.cfg || fail "grub.cfg has no entry for the stock kernel"
+[ -f "/boot/vmlinuz-7.0.0-1014-aws" ] || fail "the stock kernel is missing from /boot"
+grub-reboot ubicloud-pvm
