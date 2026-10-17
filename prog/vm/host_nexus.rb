@@ -1158,13 +1158,32 @@ TIMER
       when_pvm_uninstall_set? { hop_pvm_uninstall }
       when_pvm_upgrade_set? { hop_pvm_upgrade }
       check_pvm_guest_kernels
+      check_pvm_boot_id
     end
 
     # A lower-tier host is probed again once a day, for the pages of
     # Prog::LearnVirt (a pending kernel reboot); KVM hosts are not.
     Prog::LearnVirt.assemble(vm_host.id) if ByohVirtTiers.lower?(vm_host.virt_tier) && Prog::LearnVirt.stale?(vm_host)
 
-    nap 6 * 60 * 60
+    nap(pvm_host? ? PVM_BOOT_CHECK_NAP : 6 * 60 * 60)
+  end
+
+  # How often a pvm host at wait compares its boot id (check_pvm_boot_id).
+  PVM_BOOT_CHECK_NAP = 5 * 60
+
+  # Other hosts notice an out-of-band boot only through bin/monitor's
+  # checkup, and a BYOH control plane runs no monitor by default. A pvm
+  # host that came back on its stock kernel would then stay accepting
+  # with its VMs down, and new pvm VMs placed on it would fail to start,
+  # so it compares its boot id itself at every wake of wait (no health
+  # checks, which misfire on virtual disks). A host it cannot reach is
+  # tried again at the next wake.
+  def check_pvm_boot_id
+    return if vm_host.last_boot_id.nil?
+
+    check_boot_id
+  rescue Sshable::SshError, *Sshable::SSH_CONNECTION_ERRORS
+    nil
   end
 
   label def unavailable

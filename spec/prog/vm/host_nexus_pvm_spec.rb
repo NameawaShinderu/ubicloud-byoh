@@ -873,17 +873,17 @@ RSpec.describe Prog::Vm::HostNexus do
       current = create_vm(vm_host_id: vm_host.id, family: "pvm", location_id: location.id, name: "current")
       ByohVmGuestKernel.create(vm_id: old.id, sha256: "c" * 64, console: "hvc0")
       ByohVmGuestKernel.create(vm_id: current.id, sha256: "b" * 64, console: "hvc0")
-      expect { nx.wait }.to nap(6 * 60 * 60)
+      expect { nx.wait }.to nap(described_class::PVM_BOOT_CHECK_NAP)
       expect(stale_page.summary).to eq "#{vm_host.ubid} has 1 pvm VMs on an older guest kernel than #{"b" * 64}"
       expect(stale_page.details.to_h).to include("vms" => [old.ubid], "fix" => start_with("Stop and start each VM"))
 
       ByohVmGuestKernel[old.id].update(sha256: "b" * 64)
-      expect { described_class.new(st).wait }.to nap(6 * 60 * 60)
+      expect { described_class.new(st).wait }.to nap(described_class::PVM_BOOT_CHECK_NAP)
       expect(stale_page.resolve_set?).to be true
     end
 
     it "pages nothing on a host without a ready guest kernel" do
-      expect { nx.wait }.to nap(6 * 60 * 60)
+      expect { nx.wait }.to nap(described_class::PVM_BOOT_CHECK_NAP)
       expect(stale_page).to be_nil
     end
 
@@ -919,6 +919,29 @@ RSpec.describe Prog::Vm::HostNexus do
       expect(sshable).to receive(:_cmd).with("cat /proc/sys/kernel/random/boot_id").and_return("new\n")
       expect { nx.wait }.to hop("verify_pvm_boot")
       expect(vm_host.reload.last_boot_id).to eq "new"
+    end
+
+    # Without bin/monitor nothing sets checkup, so wait compares the
+    # boot id itself on a pvm host.
+    it "checks the PVM boot from wait without a checkup" do
+      expect(sshable).to receive(:_cmd).with("cat /proc/sys/kernel/random/boot_id").and_return("new\n")
+      expect(sshable).not_to receive(:available?)
+      expect { nx.wait }.to hop("verify_pvm_boot")
+      expect(vm_host.reload.last_boot_id).to eq "new"
+      expect(Page.from_tag_parts("LastBootIDDiscrepancy", vm_host.ubid)).not_to be_nil
+    end
+
+    it "naps at wait while the boot id is the recorded one" do
+      expect(sshable).to receive(:_cmd).with("cat /proc/sys/kernel/random/boot_id").and_return("old\n")
+      expect { nx.wait }.to nap(described_class::PVM_BOOT_CHECK_NAP)
+    end
+
+    it "tries again at the next wake when the host does not answer" do
+      expect(sshable).to receive(:_cmd).with("cat /proc/sys/kernel/random/boot_id").and_raise(Errno::ECONNREFUSED)
+      expect { nx.wait }.to nap(described_class::PVM_BOOT_CHECK_NAP)
+      expect(sshable).to receive(:_cmd).with("cat /proc/sys/kernel/random/boot_id").and_raise(Sshable::SshError.new("cat", "", "", 1, nil))
+      expect { nx.wait }.to nap(described_class::PVM_BOOT_CHECK_NAP)
+      expect(vm_host.reload.last_boot_id).to eq "old"
     end
 
     it "checks the PVM boot from unavailable" do

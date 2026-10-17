@@ -78,6 +78,14 @@ RSpec.describe Prog::Vm::HostNexus do
         from.call("unavailable")
         expect(commands).to be_empty
       end
+
+      it "waits 6 hours at wait without a host command (the boot id check is pvm's)" do
+        vm_host.update(allocation_state: "accepting", virt_probe: Sequel.pg_jsonb({"probed_at" => Time.now.utc.iso8601}))
+        st.update(label: "wait")
+        prog = described_class.new(st.reload)
+        allow(prog.sshable).to receive(:_cmd) { |cmd, **kw| respond(cmd, **kw) }
+        expect { prog.wait }.to nap(6 * 60 * 60)
+      end
     end
   end
 end
