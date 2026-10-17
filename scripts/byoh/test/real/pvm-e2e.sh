@@ -766,15 +766,20 @@ phase_vm() {
   check "the VM's guest kernel row is the pinned one" [ "$(kv guest_sha256 "$WORK/vm.kv")" = "$PVM_GUEST_KERNEL_SHA256" ]
   info "guest console: $(kv guest_console "$WORK/vm.kv")"
   check_vm_kernel "$vm" "$PVM_GUEST_KERNEL_SHA256" "the VM boots the pinned guest kernel"
+  # One fresh fetch, then poll for it: -r on every call would start a new
+  # fetch each time and only ever print "Fetching ...". The fetch keeps
+  # the log's last 64 KiB, which a PVM boot outgrows, so the kernel's
+  # timestamped console lines stand for its banner.
   local serial t0=$SECONDS
+  ubicli vm "$(vm_ref "$VM_A")" serial-log -r >/dev/null 2>&1 || true
   while :; do
-    serial=$(ubicli vm "$(vm_ref "$VM_A")" serial-log -r 2>&1 || true)
-    grep -q 'Linux version' <<<"$serial" && grep -q 'login:' <<<"$serial" && break
+    sleep 10
+    serial=$(ubicli vm "$(vm_ref "$VM_A")" serial-log 2>&1 || true)
+    grep -qE '^\[ *[0-9]+\.[0-9]+\] ' <<<"$serial" && grep -q 'login:' <<<"$serial" && break
     ((SECONDS - t0 < 300)) || break
-    sleep 15
   done
   printf '%s\n' "$serial" >"$WORK/serial-log.txt"
-  check "the serial log shows the kernel banner" grep -q 'Linux version' "$WORK/serial-log.txt"
+  check "the serial log shows the guest kernel's console" grep -qE '^\[ *[0-9]+\.[0-9]+\] ' "$WORK/serial-log.txt"
   check "the serial log shows a login prompt" grep -q 'login:' "$WORK/serial-log.txt"
 }
 
