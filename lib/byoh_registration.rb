@@ -316,6 +316,7 @@ class ByohRegistration
     begin
       DB.transaction do
         revalidate!
+        check_pvm_pin!(virt)
         strand = Prog::Vm::HostNexus.assemble(@main_ip, **kwargs)
         ByohOperatorLog.record(command: "register-byoh-host", target_id: strand.id, args:, result: "ok")
         strand
@@ -376,6 +377,23 @@ class ByohRegistration
   end
 
   private
+
+  # A pvm host whose kernel the control plane installs is registered for
+  # the host-deb pin the operator acknowledged (virt.record), which must
+  # still be the location's: bin/byoh-location set may have changed it
+  # since the decision (byoh-host add's prepare phase, or the
+  # confirmation prompt).
+  def check_pvm_pin!(virt)
+    return unless virt&.pvm_install == "install_pending"
+
+    acked = virt.record["host_deb_sha256"]
+    current = ByohPvmPolicy.pins(ByohVirtTiers.policy(Location[location.id]))&.dig("host_deb", "sha256")
+    return if acked == current
+
+    raise ValidationError, "location #{location.name} now pins the PVM host kernel sha256 #{current || "(none)"}, not the #{acked} " \
+      "acknowledged for this host with --install-pvm-kernel; run the registration again to acknowledge the current pin " \
+      "(byoh-host add: prepare again)"
+  end
 
   # Rows another host already holds: the management address and the
   # provider identifier are unique.

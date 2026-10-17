@@ -648,11 +648,29 @@ RSpec.describe ByohHostAdd do
           .to eq [2, "", "! the arguments differ from those the host was prepared with; prepare it again with these\n"]
         status, _, err = cli(*pvm, "--phase", "register", "--no-wait", runner: nil, starter: nil)
         expect([status, err]).to eq [0, ""]
-        expect(ByohPvmHost[host.id].values.slice(:state, :install, :lockdown, :meltdown))
-          .to eq(state: "install_pending", install: true, lockdown: "none", meltdown: "Not affected")
+        expect(ByohPvmHost[host.id].values.slice(:state, :install, :lockdown, :meltdown, :host_deb_sha256))
+          .to eq(state: "install_pending", install: true, lockdown: "none", meltdown: "Not affected", host_deb_sha256: "a" * 64)
         expect(DB[:byoh_operator_action].where(command: "register-byoh-host").first[:args]["virt"])
           .to include("install_pvm_kernel" => true, "host_deb_sha256" => "a" * 64, "lockdown" => "none")
         expect(cli(*pvm, "--no-wait")[0]).to eq 0
+      end
+
+      it "refuses to register a host prepared for a host-deb pin the site no longer has" do
+        expect(cli(*pvm, "--yes", "--phase", "prepare")[0]).to eq 0
+        pins = pvm_test_pins.merge("host_deb" => pvm_test_pins["host_deb"].merge("sha256" => "c" * 64))
+        location.update(byoh_virt: Sequel.pg_jsonb(location.byoh_virt.to_h.merge("pvm_kernel" => pins)))
+        status, _, err = cli(*pvm, "--phase", "register", "--no-wait", runner: nil, starter: nil)
+        expect(status).to eq 1
+        expect(err).to eq "! validation failed: location byoh-add now pins the PVM host kernel sha256 #{"c" * 64}, not the #{"a" * 64} " \
+          "acknowledged for this host with --install-pvm-kernel; run the registration again to acknowledge the current pin (byoh-host add: prepare again)\n"
+        expect([VmHost.count, ByohPvmHost.count]).to eq [0, 0]
+        expect(DB[:byoh_operator_action].where(command: "register-byoh-host").get(:result)).to start_with "error: location byoh-add now pins"
+
+        # A site that stopped offering pvm pins nothing.
+        location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm], "acks" => {}}))
+        expect(cli(*pvm, "--phase", "register", "--no-wait", runner: nil, starter: nil)[1..])
+          .to eq ["", "! validation failed: location byoh-add now pins the PVM host kernel sha256 (none), not the #{"a" * 64} " \
+            "acknowledged for this host with --install-pvm-kernel; run the registration again to acknowledge the current pin (byoh-host add: prepare again)\n"]
       end
 
       it "refuses to resume a host registered without the flag as one to install" do

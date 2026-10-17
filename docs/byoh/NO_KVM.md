@@ -1257,10 +1257,14 @@ Flags on `bin/register-byoh-host`:
   host or in the database. A `kvm_blocked` host gets a note that switching KVM on is faster. A
   lockdown other than `none` gets a note: the PVM entry keeps the stock command line, and the
   unsigned `kvm_pvm` does not load under lockdown. The flag on a host that already runs a PVM
-  kernel is refused, since it would record an install that never happens. The shell facts of
-  `ubicloud-host` now carry `secure_boot`, `lockdown` and `vulnerabilities`, so a host without
-  ruby is judged too. Before that, `pvm_refusal` refused every such host as "Meltdown status was
-  not gathered".
+  kernel is refused, since it would record an install that never happens. The host-deb sha256
+  the operator acknowledged is kept in `byoh_pvm_host.host_deb_sha256`, and registration refuses
+  when the location's pin changed since the decision (between `byoh-host add --phase prepare` and
+  `--phase register`, or at the confirmation prompt) with "run the registration again". The
+  install (WP7) must check the location's pin against that column before it downloads anything.
+  The shell facts of `ubicloud-host` now carry `secure_boot`, `lockdown` and `vulnerabilities`, so
+  a host without ruby is judged too. Before that, `pvm_refusal` refused every such host as
+  "Meltdown status was not gathered".
 - `--no-virt-probe`: skip the pre-registration probe; LearnVirt checks at prep. A lower-tier host
   waits at `verify_virt_tier` until a probe agrees with its tier. A `kvm` host is not held: LearnVirt
   fails open, prep goes on, and LearnVirt pages with the fix if the host cannot run VMs (PrepHost

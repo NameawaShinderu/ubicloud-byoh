@@ -81,7 +81,7 @@ RSpec.describe ByohVirtRegistration, "pvm install" do
     decision = registration("pvm").decide!(verdict(lockdown: "integrity"), location:, main_ip: "x")
     expect(decision.record).to eq("declared" => "pvm", "tier" => "pvm", "probe" => "none", "accepted_fallback" => true,
       "install_pvm_kernel" => true, "host_deb_sha256" => "a" * 64, "lockdown" => "integrity", "meltdown" => "Not affected")
-    expect([decision.pvm_install, decision.pvm_facts]).to eq ["install_pending", {"lockdown" => "integrity", "meltdown" => "Not affected"}]
+    expect([decision.pvm_install, decision.pvm_facts]).to eq ["install_pending", {"lockdown" => "integrity", "meltdown" => "Not affected", "host_deb_sha256" => "a" * 64}]
     recorded = described_class::Recorded.new(tier: "pvm", record: JSON.parse(JSON.generate(decision.record)))
     expect([recorded.pvm_install, recorded.pvm_facts]).to eq [decision.pvm_install, decision.pvm_facts]
     expect(described_class::Recorded.new(tier: "container", record: {"tier" => "container"}).pvm_install).to be_nil
@@ -240,12 +240,12 @@ RSpec.describe ByohVirtRegistration, "pvm install" do
     end
 
     it "keeps the PVM kernel's state for a pvm host" do
-      st = assemble(virt_tier: "pvm", pvm_install: "install_pending", pvm_facts: {"lockdown" => "none", "meltdown" => "Not affected"})
-      expect(ByohPvmHost[st.id].values.slice(:state, :install, :lockdown, :meltdown, :host_kver, :stock_entry))
-        .to eq(state: "install_pending", install: true, lockdown: "none", meltdown: "Not affected", host_kver: nil, stock_entry: nil)
+      st = assemble(virt_tier: "pvm", pvm_install: "install_pending", pvm_facts: {"lockdown" => "none", "meltdown" => "Not affected", "host_deb_sha256" => "a" * 64})
+      expect(ByohPvmHost[st.id].values.slice(:state, :install, :lockdown, :meltdown, :host_deb_sha256, :host_kver, :stock_entry))
+        .to eq(state: "install_pending", install: true, lockdown: "none", meltdown: "Not affected", host_deb_sha256: "a" * 64, host_kver: nil, stock_entry: nil)
       expect(VmHost[st.id].values.slice(:virt_tier, :family)).to eq(virt_tier: "pvm", family: "pvm")
       st = assemble("203.0.113.43", virt_tier: "pvm", pvm_install: "committed")
-      expect(ByohPvmHost[st.id].values.slice(:state, :install, :lockdown)).to eq(state: "committed", install: false, lockdown: nil)
+      expect(ByohPvmHost[st.id].values.slice(:state, :install, :lockdown, :host_deb_sha256)).to eq(state: "committed", install: false, lockdown: nil, host_deb_sha256: nil)
     end
 
     it "refuses a pvm host without a known install state, and the state on other tiers" do

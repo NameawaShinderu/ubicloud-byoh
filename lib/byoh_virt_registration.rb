@@ -39,9 +39,10 @@ class ByohVirtRegistration
     record["install_pvm_kernel"] ? "install_pending" : "committed"
   end
 
-  # What a pvm host's probe at registration found that byoh_pvm_host
-  # keeps: the kernel's lockdown mode and the CPU's Meltdown status.
-  def self.pvm_facts(record) = record.slice("lockdown", "meltdown")
+  # What byoh_pvm_host keeps of a pvm host's registration: the kernel's
+  # lockdown mode and the CPU's Meltdown status the probe found, and the
+  # host-deb sha256 the operator acknowledged installing.
+  def self.pvm_facts(record) = record.slice("lockdown", "meltdown", "host_deb_sha256")
 
   Decision = Data.define(:tier, :declared, :verdict, :notes, :install_pvm_kernel, :host_deb_sha256) do
     # What the operator log records.

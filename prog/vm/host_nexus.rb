@@ -84,7 +84,7 @@ class Prog::Vm::HostNexus < Prog::Base
       vmh = VmHost.create_with_id(id, **host_args)
       if pvm_install
         ByohPvmHost.create(vm_host_id: id, state: pvm_install, install: pvm_install == "install_pending",
-          lockdown: pvm_facts["lockdown"], meltdown: pvm_facts["meltdown"])
+          lockdown: pvm_facts["lockdown"], meltdown: pvm_facts["meltdown"], host_deb_sha256: pvm_facts["host_deb_sha256"])
       end
 
       if [HostProvider::HETZNER_PROVIDER_NAME, *HostProvider::LEASEWEB_PROVIDER_NAMES, HostProvider::GENERIC_PROVIDER_NAME].include?(provider_name)
