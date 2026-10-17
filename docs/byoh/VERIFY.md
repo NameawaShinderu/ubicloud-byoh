@@ -355,3 +355,23 @@ Bugs the run found, each fixed on `aws-e2e` with a spec where code changed:
 
 Still not run on real machines: Proxmox (G-M4-2), the F5 24 h soak (G-M4-3 to 5), a real Cloudflare tunnel, G6/G10/G11, and the PVM tier end to end (L4-T2, `scripts/byoh/test/real/pvm-e2e.sh`): the GO allowed the build, which branch `pvm-build` has since done (spec-gated only; NO_KVM.md §6.7). Open gaps seen but not fixed: a container guest's `nproc` shows the host's CPUs (the cgroup limit holds; lxcfs does not virtualize the count), and `byoh-location rates` prints the development-layout restart hint on a packaged control plane.
 
+## 8. Real-infrastructure run pvm1: the L4 PVM tier (AWS ap-south-1, 2026-10-17)
+
+A control plane (t3.large, `install.sh` in production mode with `--tls acme`) and one m6i.2xlarge (Nitro, no VMX, Secure Boot not enforced), created and removed by `scripts/byoh/test/aws-e2e/` (run `pvm1`, about 1.2 hours). Branch `pvm-build`; `scripts/byoh/test/real/pvm-e2e.sh` (L4-T2) with the cocoonstack/pvm v0.1.0 example pins (third party, for testing).
+
+| Phase | Result |
+|---|---|
+| location, neg-sha | pass: a wrong guest sha256 refused by `site set`; a wrong host-deb sha256 refused on the host with GRUB, the kernel packages and `/etc/grub.d` unchanged; a wrong guest sha256 refused by the host in bring-up |
+| host-add, patch-kernel, host-check | pass: `host add --virt-tier pvm --install-pvm-kernel` to `accepting` in 184 s (install, one-shot PVM boot, verify); `/dev/kvm` and `kvm_pvm`; stock kernel stays the GRUB default |
+| vm | pass: a pvm-2 VM running 20 s after create, SSH 6 s later; DNS, HTTPS egress, apt; guest kernel 6.12.33 (pinned sha); console on hvc0 and the serial log |
+| prod-path, bench | pass. Guest vs host: CPU 97%, memory about 100%, 4k random fio on ubiblk 93%, HTTPS download 82%, syscalls 48%, fork+exec 32%, 512 MiB dd write 32%; the VM held 8357 MiB of its 8576 MiB budget |
+| lifecycle, host-reboot, oob-reboot, power-cycle | pass: stop, start, restart; a HostNexus reboot, a reboot behind the control plane's back and a stop and start of the instance each bring the PVM boot and the VM back, noticed by the host itself |
+| tenancy, refusals | pass: the location stays single-project; a pvm-2 `ubuntu-jammy` VM is refused at create |
+| stock-return | pass: a PVM boot that does not happen pages, leaves the host on stock, and `pvm retry` recovers it |
+| delete, billing, teardown | pass: nothing of the VM left on the host; billing family `pvm`; `pvm uninstall` and destroy return a stock host |
+| guest-pin-rollout | NOT RUN: no second guest kernel build (UNVERIFIED) |
+
+The run found two script bugs, fixed on `pvm-build`: re-registering the same instance needs its leftover `rhizome` user deleted (preflight PF16-rhizome-user refuses it, by design), and `serial-log -r` on every poll never shows a finished fetch.
+
+It also found that a packaged control plane served no API: `clover.rb` routes only `api.*` hosts to the API, and the TLS front served the `--url` host alone, so `ubi` got the HTML login page. `install.sh` now serves `api.<host>` (branch `api-front`, merged into `pvm-build`). Verified on the same control plane after a release switch: a Let's Encrypt certificate for `api.15-206-161-137.sslip.io`, an unauthenticated JSON 401, and `bin/ubi vm list` against `https://api.<host>/cli`.
+
