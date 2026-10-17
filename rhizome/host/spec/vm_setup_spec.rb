@@ -1519,7 +1519,7 @@ NFTABLES_CONF
 
     it "builds a cloud-hypervisor VmSetup from empty params" do
       expect(described_class).to receive(:new).with("test", hugepages: true, hypervisor: "ch", ch_version: nil,
-        firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false, accel: nil, container: nil).and_call_original
+        firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false, accel: nil, container: nil, pvm: nil).and_call_original
       vm_setup = described_class.from_params("test", {})
       expect(vm_setup.emulated?).to be false
     end
@@ -1528,7 +1528,7 @@ NFTABLES_CONF
       params = {"hugepages" => false, "hypervisor" => "qemu", "ch_version" => "46.0", "firmware_version" => "202311",
                 "append_serial_console" => true, "egress_nat4" => {"a" => 1}, "byoh_host" => true, "accel" => "tcg"}
       expect(described_class).to receive(:new).with("test", hugepages: false, hypervisor: "qemu", ch_version: "46.0",
-        firmware_version: "202311", append_serial_console: true, egress_nat4: {"a" => 1}, byoh_host: true, accel: "tcg", container: nil).and_call_original
+        firmware_version: "202311", append_serial_console: true, egress_nat4: {"a" => 1}, byoh_host: true, accel: "tcg", container: nil, pvm: nil).and_call_original
       expect(described_class.from_params("test", params).emulated?).to be true
     end
   end

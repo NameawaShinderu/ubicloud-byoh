@@ -113,9 +113,9 @@ when "reassign-ip6"
 when "restart"
   vm_setup.restart(slice_name, cpu_burst_percent_limit)
 when "start"
-  # Starts a stopped VM. The control plane uses it on emulated hosts
-  # only, so the hardening check runs first; other hosts keep
-  # `systemctl start`.
+  # Starts a stopped VM. The control plane uses it on emulated hosts,
+  # so the hardening check runs first, and on PVM hosts, so the host
+  # checks run first; other hosts keep `systemctl start`.
   vm_setup.start_systemd_unit
 when "net-up"
   # LXC's network hook for a container VM (ContainerSetup#net_up_script).

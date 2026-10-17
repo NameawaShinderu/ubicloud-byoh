@@ -20,6 +20,7 @@ require_relative "container_setup"
 require_relative "container_disk"
 require_relative "container_idmap"
 require_relative "boot_image"
+require_relative "pvm_guest_kernel"
 
 class VmSetup
   Nic = Struct.new(:net6, :net4, :tap, :mac, :private_ipv4_gateway)
@@ -33,10 +34,16 @@ class VmSetup
   # hypervisor "lxc" is a system container on a container host
   # (ContainerSetup); container holds its options ("nested_userns",
   # "guest_firewall").
-  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false, accel: nil, container: nil)
+  #
+  # pvm is set only for VMs on PVM hosts (docs/byoh/NO_KVM.md section
+  # 6.7): {"kernel_sha256", "root"}, the guest kernel (PvmGuestKernel)
+  # cloud-hypervisor boots directly instead of firmware, and the boot
+  # image's root device.
+  def initialize(vm_name, hugepages: true, hypervisor: "ch", ch_version: nil, firmware_version: nil, append_serial_console: false, egress_nat4: nil, byoh_host: false, accel: nil, container: nil, pvm: nil)
     fail "unsupported accel #{accel.inspect}" unless ACCELS.include?(accel)
     fail "accel tcg needs hypervisor qemu, not #{hypervisor}" if accel == "tcg" && hypervisor != "qemu"
     fail "container VMs need hypervisor lxc, not #{hypervisor}" if container && hypervisor != "lxc"
+    check_pvm_params(pvm, hypervisor, hugepages, append_serial_console) if pvm
 
     @vm_name = vm_name
     @hugepages = hugepages
@@ -48,6 +55,7 @@ class VmSetup
     @byoh_host = byoh_host
     @accel = accel
     @container = container
+    @pvm = pvm
   end
 
   # Whether the host masquerades the VM's IPv4 egress (ByohEgressNat). Only
@@ -75,7 +83,8 @@ class VmSetup
       egress_nat4: params.fetch("egress_nat4", nil),
       byoh_host: params.fetch("byoh_host", false),
       accel: params["accel"],
-      container: params["container"])
+      container: params["container"],
+      pvm: params["pvm"])
   end
 
   # Whether the VM runs under QEMU's software translator (an emulated host).
@@ -83,6 +92,85 @@ class VmSetup
 
   # Whether the VM is a system container (a container host).
   def container? = @hypervisor == "lxc"
+
+  # Whether the VM boots a PVM guest kernel on a PVM host.
+  def pvm? = !@pvm.nil?
+
+  PVM_ROOT_FORMAT = %r{\A/dev/vd[a-z][0-9]*\z}
+  PVM_MIN_CH = "46.0"
+  PVM_CONSOLES = %w[ttyS0 hvc0].freeze
+  # What a PVM host must show before any PVM VM starts there. With
+  # pti=off, a CPU that Meltdown affects would let guests read host
+  # memory; registration refuses such CPUs (ByohVirtLadder.pvm_refusal),
+  # and this keeps a moved disk or a changed microcode from slipping by.
+  MELTDOWN = "/sys/devices/system/cpu/vulnerabilities/meltdown"
+  CMDLINE = "/proc/cmdline"
+  KVM_DEVICE = "/dev/kvm"
+
+  private def check_pvm_params(pvm, hypervisor, hugepages, append_serial_console)
+    fail "pvm VMs need hypervisor ch, not #{hypervisor}" unless hypervisor == "ch"
+    fail "pvm VMs run without hugepages" if hugepages
+    # The serial console goes to serial.log through cloud-hypervisor
+    # (build_ch_service), whichever console the guest kernel has.
+    fail "pvm VMs cannot append the serial console to the unit's output" if append_serial_console
+    fail "pvm needs kernel_sha256 as 64 lowercase hex digits" unless PvmGuestKernel::SHA256_FORMAT.match?(pvm["kernel_sha256"].to_s)
+    fail "pvm needs root as a virtio-blk device such as /dev/vda1, not #{pvm["root"].inspect}" unless PVM_ROOT_FORMAT.match?(pvm["root"].to_s)
+  end
+
+  def pvm_kernel_dir = File.join("/", PvmGuestKernel::DIR, @pvm.fetch("kernel_sha256"))
+
+  def pvm_vmlinux = File.join(pvm_kernel_dir, "vmlinux")
+
+  # The console the guest kernel's config gives it (PvmGuestKernel), read
+  # from the meta.json of its download.
+  def pvm_console
+    @pvm_console ||= begin
+      meta_path = File.join(pvm_kernel_dir, "meta.json")
+      meta = begin
+        JSON.parse(File.read(meta_path))
+      rescue Errno::ENOENT, JSON::ParserError
+        fail "the PVM guest kernel #{@pvm["kernel_sha256"]} is not downloaded on this host (#{meta_path}); run download-pvm-guest-kernel"
+      end
+      fail "#{meta_path} is for another kernel" unless meta.is_a?(Hash) && meta["sha256"] == @pvm["kernel_sha256"]
+      console = meta["console"]
+      fail "#{meta_path} has an unknown console #{console.inspect}" unless PVM_CONSOLES.include?(console)
+      console
+    end
+  end
+
+  # Fail before any host state changes when a PVM VM would start on a
+  # host that cannot run it safely: the PVM kernel booted with pti=off on
+  # a CPU Meltdown does not affect, with kvm_pvm's /dev/kvm usable by the
+  # kvm group only, and the guest kernel downloaded.
+  def check_pvm_host
+    if Gem::Version.new(ch_version.version) < Gem::Version.new(PVM_MIN_CH)
+      fail "pvm VMs need cloud-hypervisor #{PVM_MIN_CH} or later, not #{ch_version.version}"
+    end
+    fail "the PVM guest kernel #{pvm_vmlinux} is missing" unless File.file?(pvm_vmlinux)
+    pvm_console
+
+    meltdown = begin
+      File.read(MELTDOWN).strip
+    rescue Errno::ENOENT
+      "unknown (no #{MELTDOWN})"
+    end
+    fail "refusing to start a pvm VM: #{MELTDOWN} says #{meltdown.inspect}, not \"Not affected\"" unless meltdown == "Not affected"
+    fail "refusing to start a pvm VM: the host kernel did not boot with pti=off (#{CMDLINE}); it is not the PVM kernel" unless File.read(CMDLINE).split.include?("pti=off")
+
+    stat = begin
+      File.stat(KVM_DEVICE)
+    rescue Errno::ENOENT
+      fail "refusing to start a pvm VM: #{KVM_DEVICE} is missing; is kvm_pvm loaded?"
+    end
+    group = begin
+      Etc.getgrgid(stat.gid).name
+    rescue ArgumentError
+      stat.gid.to_s
+    end
+    unless stat.chardev? && stat.mode & 0o7777 == 0o660 && group == "kvm"
+      fail "refusing to start a pvm VM: #{KVM_DEVICE} must be a character device of mode 0660 and group kvm, not #{format("%04o", stat.mode & 0o7777)} group #{group}"
+    end
+  end
 
   def container_setup
     @container_setup ||= ContainerSetup.new(@vm_name,
@@ -128,6 +216,9 @@ class VmSetup
     return unless @hypervisor == "ch"
 
     ch_version
+    # A PVM VM boots its guest kernel directly, with no firmware.
+    return check_pvm_host if pvm?
+
     firmware_version
   end
 
@@ -1122,6 +1213,7 @@ DNSMASQ_SERVICE
 
   def start_systemd_unit
     check_emulated_unit if emulated?
+    check_pvm_host if pvm?
     r "systemctl", "start", @vm_name
   end
 
@@ -1178,16 +1270,27 @@ DNSMASQ_SERVICE
         pci_devices.map { |dev| "--device path=/sys/bus/pci/devices/0000:#{dev[0]}/" }.join(" ")
       end
 
+    # A PVM guest kernel without the 8250 serial driver writes its
+    # console to the virtio console (hvc0), which goes to serial.log in
+    # the serial port's place, so the serial log works the same.
     serial_arg, serial_output = if @append_serial_console
       ["--console off --serial tty", "StandardOutput=append:#{vp.serial_log}\nStandardError=journal\n"]
+    elsif pvm? && pvm_console == "hvc0"
+      ["--console file=#{vp.serial_log} --serial off", ""]
     else
       ["--console off --serial file=#{vp.serial_log}", ""]
+    end
+
+    kernel_args = if pvm?
+      ["--kernel #{pvm_vmlinux}", "--cmdline \"console=#{pvm_console} root=#{@pvm.fetch("root")} rw\""]
+    else
+      ["--kernel #{firmware_version.path}"]
     end
 
     exec_start_cmd = [
       "#{ch_version.bin} -v",
       "--api-socket path=#{vp.ch_api_sock}",
-      "--kernel #{firmware_version.path}",
+      *kernel_args,
       disk_args,
       serial_arg,
       "--cpus boot=#{max_vcpus},topology=#{cpu_topology}",

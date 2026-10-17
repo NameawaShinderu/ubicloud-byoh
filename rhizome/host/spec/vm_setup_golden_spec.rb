@@ -93,4 +93,43 @@ RSpec.describe VmSetup do
     writes = install(vm_setup, 4, "2:2:1:1", 8, [ubiblk_volume], nics, [["c1:00.0", "17"]], "system.slice", 0, "ubuntu-noble")
     expect(writes["/etc/systemd/system/vmgold01.service"]).to eq golden("qemu_kvm_nohugepages.service", writes["/etc/systemd/system/vmgold01.service"])
   end
+
+  describe "a PVM VM" do
+    let(:sha) { "ab" * 32 }
+
+    def pvm_setup(console, **kwargs)
+      new_setup(firmware_version: nil, hugepages: false, pvm: {"kernel_sha256" => sha, "root" => "/dev/vda1"}, **kwargs).tap { |vm_setup|
+        allow(vm_setup).to receive(:check_pvm_host)
+        allow(vm_setup).to receive(:pvm_console).and_return(console)
+      }
+    end
+
+    {"hvc0" => "ch_unit_pvm_hvc0.service", "ttyS0" => "ch_unit_pvm_ttys0.service"}.each do |console, fixture|
+      it "boots the guest kernel directly with console #{console}, without firmware or hugepages" do
+        stub_const("CloudHypervisor::Firmware::INSTALLED", {})
+        writes = install(pvm_setup(console), 2, "1:1:1:2", 2, [ubiblk_volume], nics, [], "system.slice", 0, "ubuntu-noble")
+        unit = writes["/etc/systemd/system/vmgold01.service"]
+        expect(unit).to eq golden(fixture, unit)
+        expect(unit).to include("--kernel /opt/pvm-guest/#{sha}/vmlinux \\\n--cmdline \"console=#{console} root=/dev/vda1 rw\"")
+        expect(unit).not_to include("CLOUDHV")
+        # download-pvm-guest-kernel gc keeps the kernel a unit names.
+        expect(unit.scan(PvmGuestKernel::UNIT_REFERENCE).flatten).to eq [sha]
+      end
+    end
+
+    it "keeps refusing a KVM VM on a host without its firmware" do
+      stub_const("CloudHypervisor::Firmware::INSTALLED", {})
+      expect { new_setup.install_systemd_unit(2, "1:1:1:2", 2, [ubiblk_volume], nics, [], "system.slice", 0, "ubuntu-noble") }
+        .to raise_error("no valid cloud hypervisor firmware version")
+    end
+
+    it "refuses to append the serial console to the unit's output" do
+      expect { pvm_setup("hvc0", append_serial_console: true) }.to raise_error("pvm VMs cannot append the serial console to the unit's output")
+    end
+
+    it "leaves every other unit as it was when pvm is nil" do
+      writes = install(new_setup(pvm: nil), 4, "2:2:1:1", 4, [ubiblk_volume, image_volume], nics, [], "standard-gold.slice", 400, "ubuntu-noble")
+      expect(writes["/etc/systemd/system/vmgold01.service"]).to eq golden("ch_unit.service", writes["/etc/systemd/system/vmgold01.service"])
+    end
+  end
 end

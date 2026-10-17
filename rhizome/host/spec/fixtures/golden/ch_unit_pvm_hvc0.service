@@ -1,0 +1,33 @@
+[Unit]
+Description=vmgold01
+After=network.target
+
+After=vmgold01-0-storage.service
+After=vmgold01-dnsmasq.service
+
+Requires=vmgold01-0-storage.service
+Wants=vmgold01-dnsmasq.service
+
+[Service]
+Slice=system.slice
+NetworkNamespacePath=/var/run/netns/vmgold01
+ExecStartPre=/usr/bin/rm -f /vm/vmgold01/ch-api.sock
+
+ExecStart=/opt/cloud-hypervisor/v46.0/cloud-hypervisor -v \
+--api-socket path=/vm/vmgold01/ch-api.sock \
+--kernel /opt/pvm-guest/abababababababababababababababababababababababababababababababab/vmlinux \
+--cmdline "console=hvc0 root=/dev/vda1 rw" \
+--disk vhost_user=true,socket=/var/storage/vmgold01/0/vhost.sock,num_queues=2,queue_size=64 path=/vm/vmgold01/cloudinit.img \
+--console file=/vm/vmgold01/serial.log --serial off \
+--cpus boot=2,topology=1:1:1:2 \
+--memory size=2G,shared=on \
+--net mac=52:54:00:12:34:56,tap=nc5bn8tz4r0,ip=,mask=,num_queues=5
+
+Restart=no
+User=vmgold01
+Group=vmgold01
+
+LimitNOFILE=500000
+
+
+
