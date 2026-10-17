@@ -1278,7 +1278,10 @@ sc_tls_provided() {
   for spec in "--url https://other.test|is not valid for other.test" \
     "--key /root/tls/other-key.pem|is not the key of --cert" "--key /root/tls/missing.pem|is not a file" \
     "--tls none --url http://localhost:3000|go with --tls provided" "--url http://cp.test|needs --url https://HOST" \
-    "--url https://cp.test:8443|needs --url https://HOST"; do
+    "--url https://cp.test:8443|needs --url https://HOST" "--url https://api.cp.test|routes hosts that start with api." \
+    "--api-host web.cp.test|must start with api." "--api-host api.cp.test:443|must be a DNS name" \
+    "--no-api --api-host api.cp.test|give --api-host or --no-api, not both" \
+    "--tls none --url http://localhost:3000 --no-api|go with a TLS front"; do
     read -ra bad <<<"${spec%%|*}"
     rc=0
     install_cp tlsp "${tls[@]}" "${bad[@]}" >"$LOGS/tlsp-usage.log" 2>&1 || rc=$?
@@ -1289,7 +1292,7 @@ sc_tls_provided() {
   done
   dx tlsp test ! -e /etc/ubicloud || fail "tls-provided: a refused run created /etc/ubicloud"
   dx tlsp test ! -e /etc/caddy || fail "tls-provided: a refused run installed caddy"
-  say "tls-provided: a wrong host, a foreign key, a missing key, --cert with none, http and a port exit 2 and change nothing"
+  say "tls-provided: a wrong host, a foreign key, a missing key, --cert with none, http, a port, an api. or admin. --url, a bad --api-host and --api-host or --no-api with none exit 2 and change nothing"
 
   install_cp tlsp "${tls[@]}" >"$LOGS/tlsp-install.log" 2>&1 || fail "tls-provided: install.sh failed, see $LOGS/tlsp-install.log"
   grep -E '^(ok|changed|skip|warn|notice) ' "$LOGS/tlsp-install.log" | tee -a "$LOGS/harness.log" >/dev/null
@@ -1316,6 +1319,22 @@ sc_tls_provided() {
   out=$(dx tlsp ss -Htln | awk '{ print $4 }' | sort | tr '\n' ' ')
   [[ $out != *"0.0.0.0:3000"* && $out != *"*:3000"* ]] || fail "tls-provided: puma listens on every address: $out"
   say "tls-provided: HTTPS with the given certificate, http redirects to https, admin API refused, puma local only"
+
+  # The certificate covers cp.test only: the install warns, still
+  # succeeds, and caddy serves only cp.test; status and smoke say the API
+  # is not served. API_HOST records the API host the front would serve.
+  grep -q '^warn    front: --cert /root/tls/cert.pem does not cover api.cp.test (subjectAltName), so caddy serves only cp.test' "$LOGS/tlsp-install.log" ||
+    fail "tls-provided: no warning for a certificate without api.cp.test: $(grep front "$LOGS/tlsp-install.log")"
+  grep -q '^warn    smoke: caddy does not serve api.cp.test, so the ubi CLI and API clients cannot reach https://api.cp.test: the --tls provided certificate does not cover it' "$LOGS/tlsp-install.log" ||
+    fail "tls-provided: smoke does not report the unserved API: $(grep smoke "$LOGS/tlsp-install.log")"
+  grep -q '^  API:      not served: --cert does not cover api.cp.test' "$LOGS/tlsp-install.log" || fail "tls-provided: the summary does not name the unserved API"
+  dx tlsp grep -qx 'cp.test {' /etc/caddy/Caddyfile || fail "tls-provided: the Caddyfile site is not cp.test alone: $(dx tlsp grep '{$' /etc/caddy/Caddyfile)"
+  dx tlsp grep -qx "API_HOST='api.cp.test'" /etc/ubicloud/env || fail "tls-provided: API_HOST is not api.cp.test"
+  out=$(dx tlsp curl -sk -o /dev/null -w '%{http_code} %{content_type}' --resolve "api.cp.test:443:$ip" https://api.cp.test/project) || true
+  [[ $out == "000 " ]] || fail "tls-provided: caddy answers https://api.cp.test without a certificate for it: $out"
+  rc=$(adm_rc tlsp status)
+  adm_last | grep -q '^warn    api: caddy does not serve api.cp.test' || fail "tls-provided: status does not report the unserved API (exit $rc): $(adm_last | grep api)"
+  say "tls-provided: a certificate without api.cp.test warns, leaves the API unserved (no TLS for that name), and status and smoke say so"
 
   # Files and settings.
   out=$(dx tlsp stat -c '%U:%G %a %n' /etc/ubicloud/tls /etc/ubicloud/tls/cert.pem /etc/ubicloud/tls/key.pem /etc/ubicloud/front.conf | tr '\n' ' ')
@@ -1372,6 +1391,48 @@ sc_tls_provided() {
   [[ $out == "$serial" ]] || fail "tls-provided: caddy serves $out, not the reissued $serial"
   say "tls-provided: a reissued certificate warns at 10 days left, is installed and served, and restarts caddy only"
 
+  # A certificate for both names: the rerun installs it and serves the
+  # API on api.cp.test, where the API (a JSON 401 without a token)
+  # answers and cp.test stays the web UI. bin/ubi of the release then
+  # works with UBI_URL=https://api.cp.test/cli, and against
+  # https://cp.test/cli, as on the first real AWS run, it does not.
+  dx tlsp bash -c 'cd /root/tls && openssl req -x509 -key key.pem -days 365 -subj /CN=cp.test \
+    -addext subjectAltName=DNS:cp.test,DNS:api.cp.test -out cert.pem 2>/dev/null'
+  install_cp tlsp "${tls[@]}" >"$LOGS/tlsp-api.log" 2>&1 || fail "tls-provided: rerun with the API certificate failed, see $LOGS/tlsp-api.log"
+  out=$(grep '^changed ' "$LOGS/tlsp-api.log" | sed 's/ (until .*//' | tr '\n' '|')
+  [[ $out == "changed front: certificate for cp.test in /etc/ubicloud/tls|changed front: /etc/caddy/Caddyfile for cp.test, api.cp.test (--tls provided)|changed front: restarted caddy|" ]] ||
+    fail "tls-provided: the API certificate rerun changed: $out"
+  grep -q 'does not cover' "$LOGS/tlsp-api.log" && fail "tls-provided: a certificate for both names still warns"
+  dx tlsp grep -qx 'cp.test, api.cp.test {' /etc/caddy/Caddyfile || fail "tls-provided: the Caddyfile does not serve both names"
+  grep -q '^ok      smoke: caddy serves the API at https://api.cp.test (HTTP 401 JSON)$' "$LOGS/tlsp-api.log" ||
+    fail "tls-provided: smoke does not see the API: $(grep smoke "$LOGS/tlsp-api.log")"
+  grep -q '^  API:      https://api.cp.test (ubi: UBI_URL=https://api.cp.test/cli' "$LOGS/tlsp-api.log" || fail "tls-provided: the summary does not name the API URL"
+  rc=$(adm_rc tlsp status)
+  adm_last | grep -q '^ok      api: caddy serves the API at https://api.cp.test (HTTP 401 JSON)$' ||
+    fail "tls-provided: status does not see the API (exit $rc): $(adm_last | grep api)"
+  local -a avia=(--cacert /root/tls/cert.pem --resolve "api.cp.test:443:$ip")
+  out=$(dx tlsp curl -s -w ' %{http_code} %{content_type}' "${avia[@]}" https://api.cp.test/project) || true
+  [[ $out == *MissingCredentials*" 401 application/json"* ]] || fail "tls-provided: GET https://api.cp.test/project: $out"
+  out=$(dx tlsp curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "${via[@]}" https://cp.test/project) || true
+  [[ $out == "302 https://cp.test/login" ]] || fail "tls-provided: GET https://cp.test/project is not the web UI: $out"
+  local pat
+  # shellcheck disable=SC2016 # Ruby code
+  pat=$(adm tlsp console -e 'a = Account.first; p = a.projects.first || a.create_project_with_default_policy("api-front")
+    t = ApiKey.create_personal_access_token(a, project: p); SubjectTag.first(project_id: p.id, name: "Admin").add_subject(t.id)
+    puts "pat-#{t.ubid}-#{t.key}"' 2>>"$LOGS/tlsp-pat.log" | grep -E '^pat-' | tail -1) || true
+  [[ -n $pat ]] || fail "tls-provided: no personal access token: $(tail -5 "$LOGS/tlsp-pat.log")"
+  dx tlsp bash -c "cp /etc/hosts /root/hosts.orig && echo '$ip cp.test api.cp.test' >>/etc/hosts"
+  rc=0
+  dx tlsp env UBI_TOKEN="$pat" UBI_URL=https://api.cp.test/cli SSL_CERT_FILE=/root/tls/cert.pem \
+    /opt/ubicloud/tools/bin/ruby /opt/ubicloud/current/bin/ubi vm list >"$LOGS/tlsp-ubi.log" 2>&1 || rc=$?
+  { [[ $rc == 0 ]] && ! grep -qi '<html\|Invalid request' "$LOGS/tlsp-ubi.log"; } ||
+    fail "tls-provided: ubi vm list via https://api.cp.test/cli exited $rc: $(head -5 "$LOGS/tlsp-ubi.log")"
+  rc=0
+  dx tlsp env UBI_TOKEN="$pat" UBI_URL=https://cp.test/cli SSL_CERT_FILE=/root/tls/cert.pem \
+    /opt/ubicloud/tools/bin/ruby /opt/ubicloud/current/bin/ubi vm list >"$LOGS/tlsp-ubi-web.log" 2>&1 || rc=$?
+  dx tlsp cp /root/hosts.orig /etc/hosts
+  say "tls-provided: with a certificate for both names caddy serves the API on api.cp.test (JSON 401 unauthenticated), ubi vm list works with UBI_URL=https://api.cp.test/cli; https://cp.test/cli gave exit $rc: $(head -c 120 "$LOGS/tlsp-ubi-web.log" | tr '\n' ' ')"
+
   # Step 12's front checks (ubicloud-admin smoke). acme with a host caddy
   # has no certificate for: the handshake fails (curl exit 35), which is
   # a certificate not issued yet and only warns. A stopped caddy fails
@@ -1414,18 +1475,40 @@ sc_tls_provided() {
   # The acme Caddyfile: install.sh's own render_caddyfile with --tls
   # acme, parsed by the installed caddy. A real acme run is UNVERIFIED
   # (it needs public DNS and Let's Encrypt).
-  dx tlsp bash -c "set -euo pipefail; CURRENT=/opt/ubicloud/current TLS_DIR=/etc/ubicloud/tls
-    TLS=acme URL_HOST=cp.test EFFECTIVE_PORT=3000 ADMIN_EMAIL=ops@example.test
-    source <(sed -n '/^render_caddyfile() {/,/^}/p' /art/install.sh)
-    render_caddyfile >/root/acme.Caddyfile
-    caddy adapt --adapter caddyfile --config /root/acme.Caddyfile 2>/dev/null" >"$LOGS/tlsp-acme.json" ||
-    fail "tls-provided: the acme Caddyfile does not adapt: $(dx tlsp cat /root/acme.Caddyfile)"
-  out=$(jq -c '[.admin.disabled, ([.. | objects | .email? // empty] | unique),
-    ([.. | objects | .headers?.request? // empty | ((.set // {}) | to_entries[] | "set \(.key)=\(.value[0])"), ((.delete // [])[] | "delete \(.)")] | map(ascii_downcase))]' "$LOGS/tlsp-acme.json" 2>&1)
-  [[ $out == '[true,["ops@example.test"],["set x-real-ip={http.request.remote.host}","delete cf-connecting-ip"]]' ]] ||
-    fail "tls-provided: the acme config is $out"
-  dx tlsp grep -q 'auto_https' /root/acme.Caddyfile && fail "tls-provided: the acme Caddyfile turns off automatic certificates"
-  say "tls-provided: the acme Caddyfile adapts with admin off, the --admin-email ACME account, X-Real-IP set and CF-Connecting-IP dropped"
+  # Rendered with the API host (the default) and with --no-api.
+  local api_host sites
+  for api_host in api.cp.test none; do
+    dx tlsp bash -c "set -euo pipefail; CURRENT=/opt/ubicloud/current TLS_DIR=/etc/ubicloud/tls
+      TLS=acme URL_HOST=cp.test API_HOST=$api_host API_SERVE=1 EFFECTIVE_PORT=3000 ADMIN_EMAIL=ops@example.test
+      source <(sed -n '/^caddy_hosts() {/,/^}/p; /^render_caddyfile() {/,/^}/p' /art/install.sh)
+      render_caddyfile >/root/acme.Caddyfile
+      caddy adapt --adapter caddyfile --config /root/acme.Caddyfile 2>/dev/null" >"$LOGS/tlsp-acme.json" ||
+      fail "tls-provided: the acme Caddyfile ($api_host) does not adapt: $(dx tlsp cat /root/acme.Caddyfile)"
+    out=$(jq -c '[.admin.disabled, ([.. | objects | .email? // empty] | unique),
+      ([.. | objects | .headers?.request? // empty | ((.set // {}) | to_entries[] | "set \(.key)=\(.value[0])"), ((.delete // [])[] | "delete \(.)")] | map(ascii_downcase)),
+      [.apps.http.servers[].routes[].match[]?.host[]?]]' "$LOGS/tlsp-acme.json" 2>&1)
+    sites='["cp.test","api.cp.test"]' want='cp.test, api.cp.test {'
+    [[ $api_host != none ]] || sites='["cp.test"]' want='cp.test {'
+    [[ $out == '[true,["ops@example.test"],["set x-real-ip={http.request.remote.host}","delete cf-connecting-ip"],'"$sites]" ]] ||
+      fail "tls-provided: the acme config ($api_host) is $out"
+    dx tlsp grep -qx "$want" /root/acme.Caddyfile || fail "tls-provided: the acme Caddyfile ($api_host) has no site line '$want'"
+    dx tlsp grep -q 'auto_https' /root/acme.Caddyfile && fail "tls-provided: the acme Caddyfile turns off automatic certificates"
+  done
+  say "tls-provided: the acme Caddyfile adapts with admin off, the --admin-email ACME account, X-Real-IP set, CF-Connecting-IP dropped, and one site for cp.test and api.cp.test (cp.test alone with --no-api)"
+
+  # --no-api: exit 2 until --update-env API_HOST; then caddy serves
+  # cp.test alone and status skips the API.
+  rc=0
+  install_cp tlsp "${tls[@]}" --no-api >"$LOGS/tlsp-noapi.log" 2>&1 || rc=$?
+  { [[ $rc == 2 ]] && grep -q '^install.sh: key API_HOST differs' "$LOGS/tlsp-noapi.log"; } ||
+    fail "tls-provided: --no-api without --update-env exited $rc: $(grep install.sh: "$LOGS/tlsp-noapi.log")"
+  install_cp tlsp "${tls[@]}" --no-api --update-env API_HOST >"$LOGS/tlsp-noapi.log" 2>&1 ||
+    fail "tls-provided: --no-api --update-env API_HOST failed, see $LOGS/tlsp-noapi.log"
+  dx tlsp grep -qx "API_HOST='none'" /etc/ubicloud/env || fail "tls-provided: --no-api did not set API_HOST to none"
+  dx tlsp grep -qx 'cp.test {' /etc/caddy/Caddyfile || fail "tls-provided: --no-api still serves the API host"
+  grep -q '^skip    smoke: the API is not served (install.sh --no-api)$' "$LOGS/tlsp-noapi.log" ||
+    fail "tls-provided: smoke with --no-api: $(grep smoke "$LOGS/tlsp-noapi.log")"
+  say "tls-provided: --no-api needs --update-env API_HOST, then caddy serves cp.test alone and smoke skips the API"
 
   # Back to --tls none: the changed keys exit 2 by name, and with
   # --update-env caddy stops and IP_FROM_HEADER goes.
@@ -1433,13 +1516,13 @@ sc_tls_provided() {
   install_cp tlsp >"$LOGS/tlsp-none.log" 2>&1 || rc=$?
   [[ $rc == 2 ]] || fail "tls-provided: switching to none without --update-env exited $rc"
   out=$(grep -o 'key [A-Z_]* differs' "$LOGS/tlsp-none.log" | sort | tr '\n' ' ')
-  [[ $out == "key BASE_URL differs key IP_FROM_HEADER differs key TLS_FRONT differs " ]] ||
+  [[ $out == "key API_HOST differs key BASE_URL differs key IP_FROM_HEADER differs key TLS_FRONT differs " ]] ||
     fail "tls-provided: switching to none named: $out"
-  grep -qx 'install.sh: key TLS_FRONT differs; the front is --tls provided; to switch it to --tls none (the old one stops once the new one runs), pass --update-env BASE_URL --update-env IP_FROM_HEADER --update-env TLS_FRONT' "$LOGS/tlsp-none.log" ||
+  grep -qx 'install.sh: key TLS_FRONT differs; the front is --tls provided; to switch it to --tls none (the old one stops once the new one runs), pass --update-env BASE_URL --update-env API_HOST --update-env IP_FROM_HEADER --update-env TLS_FRONT' "$LOGS/tlsp-none.log" ||
     fail "tls-provided: the switch message: $(grep TLS_FRONT "$LOGS/tlsp-none.log")"
   grep -q "^install.sh: key IP_FROM_HEADER differs; it follows --tls" "$LOGS/tlsp-none.log" ||
     fail "tls-provided: IP_FROM_HEADER is not tied to --tls: $(grep IP_FROM_HEADER "$LOGS/tlsp-none.log")"
-  install_cp tlsp --update-env BASE_URL --update-env IP_FROM_HEADER --update-env TLS_FRONT >"$LOGS/tlsp-none.log" 2>&1 ||
+  install_cp tlsp --update-env BASE_URL --update-env API_HOST --update-env IP_FROM_HEADER --update-env TLS_FRONT >"$LOGS/tlsp-none.log" 2>&1 ||
     fail "tls-provided: switching to none failed, see $LOGS/tlsp-none.log"
   grep -q '^changed front: stopped and disabled caddy (was --tls provided)$' "$LOGS/tlsp-none.log" ||
     fail "tls-provided: caddy was not stopped: $(grep front "$LOGS/tlsp-none.log")"
@@ -1448,6 +1531,9 @@ sc_tls_provided() {
   wait_for 180 web_up tlsp >/dev/null || fail "tls-provided: web down after the switch to none"
   out=$(login tlsp) || fail "tls-provided: login after the switch failed"
   [[ $out == "302 http://localhost:3000/after-login" ]] || fail "tls-provided: login after the switch: $out"
+  dx tlsp grep -qx "API_HOST='api.localhost'" /etc/ubicloud/env || fail "tls-provided: API_HOST under none is not api.localhost"
+  grep -q '^ok      smoke: puma answers the API for Host api.localhost (HTTP 401 JSON); over ssh -L, UBI_URL=http://api.localhost:3000/cli$' "$LOGS/tlsp-none.log" ||
+    fail "tls-provided: smoke under none does not see the API: $(grep smoke "$LOGS/tlsp-none.log")"
   journal_clean tlsp "$since"
   say "tls-provided: the switch to --tls none needs --update-env, stops caddy and drops IP_FROM_HEADER"
   say "tls-provided: ok"
@@ -1466,6 +1552,16 @@ sc_tunnel() {
   since=$(dx tunnel date '+%F %T')
   src_tarball
   release_rev_to_art tunnel
+  # The release image may predate API_HOST: a rerun adds it like any
+  # missing key (api.localhost under --tls none), which is also how an
+  # installed control plane picks it up.
+  # Its step 12 runs the release's ubicloud-admin, so the working
+  # tree's checks the API host here (adm_tree).
+  install_cp tunnel >"$LOGS/tunnel-apihost.log" 2>&1 || fail "tunnel: rerun under none failed, see $LOGS/tunnel-apihost.log"
+  dx tunnel grep -qx "API_HOST='api.localhost'" /etc/ubicloud/env || fail "tunnel: the rerun under none left no API_HOST='api.localhost'"
+  adm_tree tunnel smoke >"$LOGS/tunnel-apihost-smoke.log" 2>&1 || fail "tunnel: smoke under none failed: $(grep smoke "$LOGS/tunnel-apihost-smoke.log")"
+  grep -q '^ok      smoke: puma answers the API for Host api.localhost (HTTP 401 JSON)' "$LOGS/tunnel-apihost-smoke.log" ||
+    fail "tunnel: smoke under none does not see the API: $(grep smoke "$LOGS/tunnel-apihost-smoke.log")"
   dx tunnel bash -c "cat >/etc/systemd/system/cloudflared.service <<'EOF'
 [Unit]
 Description=cloudflared (harness stand-in)
@@ -1493,9 +1589,9 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
   if [[ $rc != 2 ]] || ! grep -q 'key BASE_URL differs' "$LOGS/tunnel-existing.log"; then
     fail "tunnel: a new URL without --update-env exited $rc"
   fi
-  grep -qx 'install.sh: key TLS_FRONT differs; the front is --tls none; to switch it to --tls tunnel (the old one stops once the new one runs), pass --update-env BASE_URL --update-env TLS_FRONT' "$LOGS/tunnel-existing.log" ||
+  grep -qx 'install.sh: key TLS_FRONT differs; the front is --tls none; to switch it to --tls tunnel (the old one stops once the new one runs), pass --update-env BASE_URL --update-env API_HOST --update-env TLS_FRONT' "$LOGS/tunnel-existing.log" ||
     fail "tunnel: the front switch is not named: $(cat "$LOGS/tunnel-existing.log")"
-  install_cp tunnel "${tun[@]}" --update-env BASE_URL --update-env TLS_FRONT >"$LOGS/tunnel-existing.log" 2>&1 ||
+  install_cp tunnel "${tun[@]}" --update-env BASE_URL --update-env API_HOST --update-env TLS_FRONT >"$LOGS/tunnel-existing.log" 2>&1 ||
     fail "tunnel: install.sh failed, see $LOGS/tunnel-existing.log"
   grep -E '^(ok|changed|skip|warn|notice) ' "$LOGS/tunnel-existing.log" | tee -a "$LOGS/harness.log" >/dev/null
   grep -q 'dummy-live-token' "$LOGS/tunnel-existing.log" && fail "tunnel: install.sh printed the token"
@@ -1512,6 +1608,15 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
     fail "tunnel: no warning about the token on the command line"
   grep -q '^notice  front: the tunnel.s public hostname cp.example.test must route to http://127.0.0.1:3000' "$LOGS/tunnel-existing.log" ||
     fail "tunnel: no ingress reminder"
+  # The API host is a second public hostname the operator routes; it
+  # does not resolve here either.
+  grep -q '^notice  front: for the ubi CLI and the API, also route the public hostname api.cp.example.test to http://127.0.0.1:3000 in the same tunnel' "$LOGS/tunnel-existing.log" ||
+    fail "tunnel: no API ingress reminder"
+  rc=0
+  adm_tree tunnel smoke >"$LOGS/tunnel-api-smoke.log" 2>&1 || rc=$?
+  { [[ $rc == 0 ]] && grep -q '^warn    smoke: no API answer from https://api.cp.example.test (HTTP 000, curl exit 6); the tunnel needs a public hostname api.cp.example.test' "$LOGS/tunnel-api-smoke.log"; } ||
+    fail "tunnel: smoke's API check exited $rc: $(grep smoke "$LOGS/tunnel-api-smoke.log")"
+  dx tunnel grep -qx "API_HOST='api.cp.example.test'" /etc/ubicloud/env || fail "tunnel: API_HOST is not api.cp.example.test"
   [[ $(dx tunnel sha256sum /etc/systemd/system/cloudflared.service) == "$sums" ]] || fail "tunnel: cloudflared.service changed"
   [[ $(main_pid tunnel cloudflared) == "$pid" ]] || fail "tunnel: cloudflared.service was restarted"
   dx tunnel test ! -e /etc/systemd/system/ubicloud-cloudflared.service || fail "tunnel: installed its own unit next to the existing one"
@@ -1690,7 +1795,7 @@ systemctl daemon-reload && systemctl enable -q --now cloudflared"
 
   # --no-start leaves the tunnel running and front.conf as it is; the
   # real switch then needs only --update-env TLS_FRONT, and stops it.
-  install_cp tunnel --no-start --update-env BASE_URL --update-env IP_FROM_HEADER --update-env TLS_FRONT >"$LOGS/tunnel-nostart.log" 2>&1 ||
+  install_cp tunnel --no-start --update-env BASE_URL --update-env API_HOST --update-env IP_FROM_HEADER --update-env TLS_FRONT >"$LOGS/tunnel-nostart.log" 2>&1 ||
     fail "tunnel: --no-start switch failed, see $LOGS/tunnel-nostart.log"
   grep -q '^skip    front: --tls none not set up and --tls tunnel left as it is (--no-start)' "$LOGS/tunnel-nostart.log" ||
     fail "tunnel: --no-start: $(grep front "$LOGS/tunnel-nostart.log")"
@@ -1734,6 +1839,15 @@ adm_rc() {
     adm "$@" 2>&1 || rc=$?
   } </dev/null >>"$LOGS/adm.log"
   echo "$rc"
+}
+
+# adm_tree NAME ARGS...: the working tree's ubicloud-admin, for a
+# container whose release ships an older one (install.sh reinstalls the
+# release's own on every run).
+adm_tree() {
+  local name=ubi-m3-$1
+  shift
+  docker exec -i -w / "$name" bash /art/packaging/bin/ubicloud-admin "$@"
 }
 
 # The output of the last adm_rc.
