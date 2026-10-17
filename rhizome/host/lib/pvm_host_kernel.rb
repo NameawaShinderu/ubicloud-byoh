@@ -87,7 +87,13 @@ class PvmHostKernel
   # initrd in /boot (the go/no-go's figures).
   SPACE_KIB = {WORK_DIR => 600_000, "" => 1_500_000, "boot" => 300_000}.freeze
 
-  GRUB_TOOLS = %w[grub-editenv grub-reboot grub-set-default update-grub curl dpkg-deb].freeze
+  GRUB_TOOLS = %w[grub-editenv grub-probe grub-reboot grub-set-default update-grub curl dpkg-deb].freeze
+
+  # Where GRUB cannot write grubenv while it boots, so `save_env
+  # next_entry` never clears a grub-reboot and every power cycle boots
+  # the PVM kernel again: /etc/grub.d/00_header's check_writable list.
+  GRUB_READ_ONLY_ABSTRACTIONS = %w[diskfilter lvm].freeze
+  GRUB_READ_ONLY_FS = %w[btrfs cpiofs newc odc romfs squash4 tarfs zfs].freeze
   TOOL_DIRS = %w[usr/sbin usr/bin sbin bin].freeze
 
   # sysfs driver names whose module has another name (Xen's netfront and
@@ -491,10 +497,32 @@ class PvmHostKernel
       end
     end
     GRUB_TOOLS.each do |tool|
-      refusals << "#{tool} is missing" unless TOOL_DIRS.any? { |dir| File.executable?(path("#{dir}/#{tool}")) }
+      refusals << "#{tool} is missing" unless tool?(tool)
     end
-    refusals << "there is no /#{GRUB_CFG}: GRUB is not the boot loader" unless File.file?(path(GRUB_CFG))
+    if !File.file?(path(GRUB_CFG))
+      refusals << "there is no /#{GRUB_CFG}: GRUB is not the boot loader"
+    elsif tool?("grub-probe")
+      refusals.concat(grubenv_refusals)
+    end
     refusals
+  end
+
+  def tool?(tool)
+    TOOL_DIRS.any? { |dir| File.executable?(path("#{dir}/#{tool}")) }
+  end
+
+  # The one-shot boot holds only if GRUB clears next_entry when it boots
+  # the PVM kernel; 00_header writes `save_env next_entry` into grub.cfg
+  # whether or not GRUB can write there, so grub.cfg alone does not say.
+  def grubenv_refusals
+    grubdir = "/#{File.dirname(GRUB_CFG)}"
+    why = "GRUB cannot write grubenv there while booting, so it would never clear the one-shot next_entry and every power cycle would boot the PVM kernel again"
+    fs = run("grub-probe", "--target=fs", grubdir, expect: [0, 1]).strip
+    return ["grub-probe cannot tell the file system of #{grubdir}, so a PVM boot may not be one-shot"] if fs.empty?
+    return ["#{grubdir} is on #{fs}: #{why}"] if GRUB_READ_ONLY_FS.include?(fs)
+
+    abstractions = run("grub-probe", "--target=abstraction", grubdir).split & GRUB_READ_ONLY_ABSTRACTIONS
+    abstractions.map { |a| "#{grubdir} is on #{a} (#{(a == "lvm") ? "LVM" : "software RAID"}): #{why}" }
   end
 
   def space_refusals

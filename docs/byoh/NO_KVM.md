@@ -1502,7 +1502,11 @@ What each phase checks (the script's header lists the environment overrides):
   config without `=y` for VFAT, NLS 437 and ISO8859-1, PVM_GUEST, X86_PIE, virtio-blk/net/pci, ext4
   and the 8250 console. Then, in the order of section 6.7: `GRUB_DEFAULT=saved` in a `grub.d` drop-in,
   `grub-set-default` the running stock kernel, and checks that `grub.cfg` boots `${saved_entry}` and
-  can clear `next_entry` (`save_env`), all **before** the `.deb`'s own `update-grub`; holds the stock
+  can clear `next_entry` (`save_env`), all **before** the `.deb`'s own `update-grub`. Preflight also
+  refuses a `/boot/grub` that GRUB cannot write while booting (`grub-probe`: `diskfilter` or `lvm`, or
+  btrfs, zfs, squash4 and the other file systems in `00_header`'s `check_writable`): there
+  `grub.cfg` still has the `save_env` line, but GRUB never clears `next_entry`, so every power cycle
+  would boot the PVM kernel again. Holds the stock
   `linux-image-$(uname -r)` and marks it manual (under the PVM kernel apt protects the running PVM
   kernel instead, so an autoremove could take the stock one and leave `saved_entry` naming nothing;
   `uninstall` restores both marks); installs and `apt-mark hold`s the `.deb`; refuses unless the PVM kernel has a module or built-in for every driver

@@ -42,6 +42,14 @@ RSpec.describe PvmHostKernel do
     expect(source).to include(%(cfg.include?('set default="${saved_entry}"')), %(cfg.include?("save_env next_entry")))
   end
 
+  it "refuses a /boot/grub GRUB cannot write while booting, on the same list" do
+    fs = script[/^    (btrfs \| [^)]*)\)$/, 1].split(" | ")
+    abstractions = script[/^      (diskfilter \| lvm)\)$/, 1].split(" | ")
+    expect(fs).to eq described_class::GRUB_READ_ONLY_FS
+    expect(abstractions).to eq described_class::GRUB_READ_ONLY_ABSTRACTIONS
+    expect(script).to include('grub-probe --target=fs "$BOOT_DIR/grub"', 'grub-probe --target=abstraction "$BOOT_DIR/grub"')
+  end
+
   it "installs the host deb without letting apt remove packages" do
     expect(script).to include('apt-get install -y --no-remove "$ART/$PVM_HOST_DEB"')
     expect(File.read(File.expand_path("../lib/pvm_host_kernel.rb", __dir__))).to include('run(*APT_GET, "install", "-y", "--no-remove", path(DEB_FILE))')

@@ -91,6 +91,28 @@ RSpec.describe ByohVirtTiers, "pvm" do
       end
     end
 
+    it "fails preflight where GRUB cannot clear next_entry while booting" do
+      Dir.mktmpdir do |boot|
+        FileUtils.mkdir_p("#{boot}/grub")
+        File.write("#{boot}/grub/grub.cfg", "save_env next_entry\n")
+        writable = lambda do |fs, abstraction|
+          probe = <<~SH
+            grub-probe() {
+              case $1 in --target=fs) [ -n "$FS" ] || return 1; echo "$FS" ;; --target=abstraction) echo "$ABS" ;; esac
+            }
+          SH
+          run_functions(%w[ok bad grubenv_writable], "FAILS=0\n#{probe}grubenv_writable\necho FAILS=$FAILS", BOOT_DIR: boot, FS: fs, ABS: abstraction)
+        end
+        out, = writable.call("ext2", "")
+        expect(out).to eq "  ok    grubenv writable at boot (#{boot}/grub on ext2)\nFAILS=0\n"
+        why = "GRUB cannot write grubenv there while booting, so a PVM boot would not be one-shot"
+        expect(writable.call("ext2", "diskfilter mdraid1x").first).to eq "  FAIL  #{boot}/grub is on diskfilter: #{why}\nFAILS=1\n"
+        expect(writable.call("ext2", "lvm").first).to eq "  FAIL  #{boot}/grub is on lvm: #{why}\nFAILS=1\n"
+        expect(writable.call("btrfs", "").first).to eq "  FAIL  #{boot}/grub is on btrfs: #{why}\nFAILS=1\n"
+        expect(writable.call("", "").first).to eq "  FAIL  grub-probe cannot tell the file system of #{boot}/grub\nFAILS=1\n"
+      end
+    end
+
     it "measures free space without creating PVM_WORK, summed per file system" do
       Dir.mktmpdir do |dir|
         Dir.mkdir("#{dir}/boot")

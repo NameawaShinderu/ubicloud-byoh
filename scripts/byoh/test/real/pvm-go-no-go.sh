@@ -257,10 +257,11 @@ preflight() {
       bad "GRUB_SAVEDEFAULT=true in $f would make the PVM boot permanent"
     fi
   done
-  for f in grub-editenv grub-reboot grub-set-default update-grub curl; do
+  for f in grub-editenv grub-probe grub-reboot grub-set-default update-grub curl; do
     expect "$f" "missing $f" command -v "$f"
   done
   expect "/boot/grub/grub.cfg" "no /boot/grub/grub.cfg (GRUB is not the boot loader?)" [ -e /boot/grub/grub.cfg ]
+  grubenv_writable
   local melt
   melt=$(cat /sys/devices/system/cpu/vulnerabilities/meltdown 2>/dev/null || echo unknown)
   if [ "$melt" = "Not affected" ]; then
@@ -276,6 +277,34 @@ preflight() {
   # /boot. Summed per file system, since they often share one.
   check_space "$PVM_WORK" 8000000 / 1500000 "$BOOT_DIR" 300000
   [ "$FAILS" = 0 ]
+}
+
+# Whether GRUB can write grubenv while it boots, so that `save_env
+# next_entry` clears the one-shot boot: 00_header's check_writable list.
+# grub.cfg has that save_env line either way.
+grubenv_writable() {
+  command -v grub-probe >/dev/null 2>&1 && [ -e "$BOOT_DIR/grub/grub.cfg" ] || return 0
+  local fs abstraction
+  local why="GRUB cannot write grubenv there while booting, so a PVM boot would not be one-shot"
+  if ! fs=$(grub-probe --target=fs "$BOOT_DIR/grub" 2>/dev/null) || [ -z "$fs" ]; then
+    bad "grub-probe cannot tell the file system of $BOOT_DIR/grub"
+    return 0
+  fi
+  case "$fs" in
+    btrfs | cpiofs | newc | odc | romfs | squash4 | tarfs | zfs)
+      bad "$BOOT_DIR/grub is on $fs: $why"
+      return 0
+      ;;
+  esac
+  for abstraction in $(grub-probe --target=abstraction "$BOOT_DIR/grub"); do
+    case "$abstraction" in
+      diskfilter | lvm)
+        bad "$BOOT_DIR/grub is on $abstraction: $why"
+        return 0
+        ;;
+    esac
+  done
+  ok "grubenv writable at boot ($BOOT_DIR/grub on $fs)"
 }
 
 # The nearest existing directory at or above $1: preflight measures

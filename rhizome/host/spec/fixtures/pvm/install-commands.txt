@@ -1,6 +1,8 @@
 uname -r
 uname -m
 systemd-detect-virt --container
+grub-probe --target=fs /boot/grub
+grub-probe --target=abstraction /boot/grub
 dpkg-query -W -f ${db:Status-Status} linux-image-7.0.0-1014-aws
 df -Pk /var/lib/ubicloud/pvm
 df -Pk /

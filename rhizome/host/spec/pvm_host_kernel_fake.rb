@@ -39,7 +39,7 @@ class FakePvmHost
 
   attr_reader :root, :log, :held, :auto, :packages, :groups, :enabled
   attr_accessor :kernel, :machine, :container, :avail_kib, :fail_on, :before, :noop, :pvm_modules, :pvm_initrd,
-    :rootfs, :device_uuid, :pkg_status
+    :rootfs, :device_uuid, :pkg_status, :grub_fs, :grub_abstraction
 
   # submenu: update-grub puts all but the newest kernel under "Advanced
   # options for Ubuntu" (Ubuntu's default). partuuid: a cloud image with
@@ -68,6 +68,9 @@ class FakePvmHost
     @pvm_modules = MODULES
     @pvm_initrd = true
     @rootfs = "ext4"
+    # What grub-probe says of /boot/grub; a nil file system makes it fail.
+    @grub_fs = "ext2"
+    @grub_abstraction = ""
     @urls = {DEB_URL => DEB_CONTENT}
     build(net, block)
   end
@@ -200,6 +203,8 @@ class FakePvmHost
     in ["grub-set-default", entry] then edit_env { |env| env["saved_entry"] = entry }
     in ["grub-reboot", entry] then edit_env { |env| env["next_entry"] = entry }
     in ["findmnt", "-no", "FSTYPE", "/"] then ["#{@rootfs}\n", 0]
+    in ["grub-probe", "--target=fs", "/boot/grub"] then @grub_fs ? ["#{@grub_fs}\n", 0] : ["", 1]
+    in ["grub-probe", "--target=abstraction", "/boot/grub"] then ["#{@grub_abstraction}\n", 0]
     in ["groupadd", "-f", "-r", group] then mark(@groups, group, true)
     in ["systemctl", "daemon-reload"] then ["", 0]
     in ["systemctl", "enable", unit] then mark(@enabled, unit, true)
@@ -271,7 +276,7 @@ class FakePvmHost
     write("sys/kernel/security/lockdown", "[none] integrity confidentiality\n")
     write("etc/default/grub", "GRUB_DEFAULT=0\nGRUB_TIMEOUT=0\nGRUB_CMDLINE_LINUX_DEFAULT=\"#{CMDLINE_DEFAULT}\"\nGRUB_CMDLINE_LINUX=\"\"\n#{"GRUB_DISABLE_SUBMENU=y\n" unless @submenu}")
     write("etc/default/grub.d/40-force-partuuid.cfg", "GRUB_FORCE_PARTUUID=#{UUID}\n") if @partuuid
-    %w[grub-editenv grub-reboot grub-set-default update-grub].each { |t| write("usr/sbin/#{t}", "", mode: 0o755) }
+    %w[grub-editenv grub-probe grub-reboot grub-set-default update-grub].each { |t| write("usr/sbin/#{t}", "", mode: 0o755) }
     %w[curl dpkg-deb].each { |t| write("usr/bin/#{t}", "", mode: 0o755) }
     install_kernel(@stock, modules: MODULES, initrd: !@partuuid)
     write_grubenv({})
