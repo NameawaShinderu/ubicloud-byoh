@@ -51,7 +51,9 @@
 #                        site does not exist yet; must copy standard rates,
 #                        e.g. "--underlay 10.98.0.0/16 --cp-reach onhost
 #                        --rates-from hetzner-fsn1" (the scratch site of
-#                        neg-sha is created with the same options)
+#                        neg-sha is created with the same options, less
+#                        the ones each location must have its own value
+#                        of: --ula48, --display-name and --ui-name)
 #   PVM_E2E_SCRATCH_SITE location of the neg-sha registration [$PVM_E2E_SITE-neg]
 #   PVM_E2E_HOST_SSH     the operator's login to the host, USER@HOST
 #   PVM_E2E_HOST_KEY     the operator's private key for that login
@@ -70,6 +72,7 @@
 #   PVM_E2E_UBI_LOCATION the site's name in the API [$PVM_E2E_SITE]
 #   PVM_E2E_WORK         state, keys, logs and the report [var/pvm-e2e]
 #   PVM_E2E_INSTANCE     the instance id, only printed in MANUAL steps
+#   PVM_E2E_PAGE_WAIT    seconds a destroyed host's pages may take to resolve [300]
 #   ADMIN                the ubicloud-admin command [sudo ubicloud-admin on a
 #                        packaged control plane, else packaging/bin/ubicloud-admin --dev]
 #   PVM_HOST_DEB_URL, PVM_HOST_DEB_SHA256, PVM_GUEST_KERNEL_URL,
@@ -402,16 +405,32 @@ nudge_checkup() {
 
 # --- phases -----------------------------------------------------------------
 
-ensure_site() { # name
-  if cpadmin site show "$1" >/dev/null 2>&1; then
-    info "site $1 exists"
+ensure_site() { # name [site add options...]
+  local name=$1
+  shift
+  if cpadmin site show "$name" >/dev/null 2>&1; then
+    info "site $name exists"
     return 0
   fi
-  ((${#SITE_ARGS[@]})) || {
-    fail "site $1 does not exist and PVM_E2E_SITE_ARGS is empty"
+  (($#)) || {
+    fail "site $name does not exist and PVM_E2E_SITE_ARGS is empty"
     return 1
   }
-  check "site add $1" cpadmin site add "$1" "${SITE_ARGS[@]}"
+  check "site add $name" cpadmin site add "$name" "$@"
+}
+
+# SITE_ARGS without the options whose value must differ per location
+# (site add refuses a ula48, display name or UI name another one has).
+scratch_site_args() {
+  SCRATCH_ARGS=()
+  local i
+  for ((i = 0; i < ${#SITE_ARGS[@]}; i++)); do
+    case ${SITE_ARGS[i]} in
+      --ula48 | --display-name | --ui-name | --display) i=$((i + 1)) ;;
+      --ula48=* | --display-name=* | --ui-name=* | --display=*) ;;
+      *) SCRATCH_ARGS+=("${SITE_ARGS[i]}") ;;
+    esac
+  done
 }
 
 pin_args() {
@@ -428,7 +447,7 @@ wrong_sha() {
 
 # location: the site offers pvm with the pins (verified by download).
 phase_location() {
-  ensure_site "$SITE" || return 0
+  ensure_site "$SITE" "${SITE_ARGS[@]}" || return 0
   local out
   if out=$(cpadmin site rates "$SITE" --family pvm --from standard --multiplier 1.0 2>&1); then pass "pvm rates from standard"; else fail "pvm rates: $out"; fi
   printf '%s\n' "$out" >>"$REPORT"
@@ -482,8 +501,13 @@ host_add_args() {
 
 destroy_host() { # ubid
   echo "VmHost[\"$1\"].incr_destroy" | cp_ruby >/dev/null
-  wait_until 900 "host $1 is destroyed" host_gone "$1"
+  wait_until 900 "host $1 is destroyed" host_gone "$1" || return 1
+  # The destroy resolves the host's own pages; LastBootIDDiscrepancy is
+  # upstream's, which nothing resolves, and is only shown.
+  grep '^page=LastBootIDDiscrepancy ' "$WORK/host.kv" | sed 's/^/  info  left open (upstream): /' | tee -a "$REPORT" || true
+  wait_until "${PVM_E2E_PAGE_WAIT:-300}" "no page of host $1 is left open" host_no_own_pages "$1" || true
 }
+host_no_own_pages() { host_kv "$1" && awk '/^page=/ && !/^page=LastBootIDDiscrepancy / {n++} END {exit n > 0}' "$WORK/host.kv"; }
 
 # neg-sha: wrong pins are refused, and a wrong host-deb sha256 changes
 # nothing on the host.
@@ -500,7 +524,8 @@ phase_neg_sha() {
   after=$(cpadmin site show "$SITE")
   check "show is unchanged after the refusal" [ "$before" = "$after" ]
 
-  ensure_site "$SCRATCH" || return 0
+  scratch_site_args
+  ensure_site "$SCRATCH" "${SCRATCH_ARGS[@]}" || return 0
   out=$(cpadmin site rates "$SCRATCH" --family pvm --from standard --multiplier 1.0 2>&1) || fail "scratch pvm rates: $out"
   rates_note "$out"
   pin_args "$(wrong_sha "$PVM_HOST_DEB_SHA256")"
@@ -588,8 +613,13 @@ phase_host_check() {
   check "kvm_pvm is loaded" host_ssh "grep -q '^kvm_pvm ' /proc/modules"
   check "$BOOT_UNIT is active" [ "$(host_ssh systemctl show -p ActiveState --value $BOOT_UNIT)" = active ]
   check "$BOOT_UNIT succeeded" [ "$(host_ssh systemctl show -p Result --value $BOOT_UNIT)" = success ]
+  # byoh-virt probe would ssh with the operator's own known_hosts, which
+  # has never seen this host: the run sends the same probe script over
+  # its own connection and has byoh-virt explain the report.
   local probe
-  probe=$(tool byoh-virt probe --main-ip "$MAIN_IP" --ssh-key "$ROOT_KEY" 2>&1 || true)
+  tool byoh-virt script >"$WORK/probe.rb"
+  host_ssh_in ruby - --json <"$WORK/probe.rb" >"$WORK/probe.json" || true
+  probe=$(tool byoh-virt explain <"$WORK/probe.json" 2>&1 || true)
   printf '%s\n' "$probe" >>"$REPORT"
   check "the probe says pvm" grep -q '^tier: pvm' <<<"$probe"
   local holds
@@ -606,10 +636,11 @@ phase_vm() {
   host=$(host_ubid)
   need UBI_TOKEN UBI_URL
   [[ -f $VM_KEY ]] || ssh-keygen -q -t ed25519 -N '' -C "pvm-e2e vm" -f "$VM_KEY" </dev/null
-  state_set mem_before_kib "$(host_ssh awk "'/^MemAvailable:/ {print \$2}'" /proc/meminfo)"
   local ip=(-6)
   [[ -z ${PVM_E2E_POOL_FILE:-} ]] || ip=()
   if [[ -z $(vm_id "$VM_A") ]]; then
+    # Only before the create: a resumed run keeps the reading without the VM.
+    state_set mem_before_kib "$(host_ssh awk "'/^MemAvailable:/ {print \$2}'" /proc/meminfo)"
     state_set vm_a_created "$(date -u +%FT%TZ)"
     check "create $VM_SIZE ubuntu-noble" ubicli vm "$(vm_ref "$VM_A")" create -s "$VM_SIZE" -b ubuntu-noble "${ip[@]}" "$(cat "$VM_KEY.pub")"
   fi
@@ -852,7 +883,9 @@ phase_stock_return() {
   wait_until 900 "ByohPvmBoot pages the stock boot" host_page "$host" ByohPvmBoot "booted its stock kernel" || return 0
   check "the host waits at pvm_boot_failed" [ "$(kv label)" = pvm_boot_failed ]
   check "the host does not take VMs ($(kv allocation_state))" [ "$(kv allocation_state)" = draining ]
-  check "no VM was started (no cloud-hypervisor)" host_ssh "! pgrep -f cloud-hypervisor >/dev/null"
+  # [c]: the remote shell that runs the negation stays pgrep's parent,
+  # and its command line would match the plain pattern.
+  check "no VM was started (no cloud-hypervisor)" host_ssh "! pgrep -f '[c]loud-hypervisor' >/dev/null"
   check "pvm retry" tool byoh-virt pvm retry --host "$host"
   check_host_on_pvm "$host"
   check_vm_back

@@ -47,7 +47,7 @@ run() {
   set +e
   env PATH="$T/bin:$PATH" FAKE="$T/fake" FAKE_WORK="$T/work" FAKE_SCRATCH=byoh-pvm-e2e-neg FAKE_GUEST2=$GUEST2 FAKE_PROJECT2=pj2 \
     BYOH_REAL_E2E=1 PVM_E2E_HOST_SSH=ubuntu@10.0.0.5 PVM_E2E_HOST_KEY="$T/opkey" PVM_E2E_YES=1 \
-    PVM_E2E_SITE_ARGS="--rates-from hetzner-fsn1" PVM_E2E_PROJECT=pj1 PVM_E2E_PROJECT2=pj2 \
+    PVM_E2E_SITE_ARGS="--rates-from hetzner-fsn1 --ula48 fd00:1:2::/48" PVM_E2E_PROJECT=pj1 PVM_E2E_PROJECT2=pj2 \
     UBI_TOKEN=t UBI_URL=http://127.0.0.1:3000/cli PVM_E2E_UBI=ubi ADMIN=admin PVM_E2E_WORK="$T/work" \
     PVM_E2E_GUEST2_URL=https://example.com/vmlinux2 PVM_E2E_GUEST2_SHA256=$GUEST2 \
     "${envs[@]}" timeout 300 scripts/byoh/test/real/pvm-e2e.sh "$@" >"$T/out" 2>&1
@@ -87,6 +87,10 @@ report_has "the stock return pages" "PASS  ByohPvmBoot pages the stock boot"
 report_has "jammy is refused" "PASS  a pvm-2 ubuntu-jammy VM is refused"
 report_has "billing is closed" "PASS  every record is closed"
 report_has "teardown returns to stock" "PASS  the stock kernel 7.0.0-1014-aws runs"
+report_has "the scratch site is added without the main site's ula48" "PASS  site add byoh-pvm-e2e-neg"
+report_has "the host-check probe goes over the run's own connection" "PASS  the probe says pvm"
+report_has "teardown leaves no page of the host open" "PASS  no page of host vh0000000000000000000000ab is left open"
+report_has "upstream's LastBootIDDiscrepancy is only shown" "info  left open (upstream): page=LastBootIDDiscrepancy"
 grep -q 'unhandled' "$T/out" && bad "the fake met a command it does not know: $(grep unhandled "$T/out" | head -3)" || ok "the fake knew every command"
 
 # Failures stop the run with exit 1 at the phase that failed.
@@ -103,6 +107,10 @@ report_has "neg-sha names the change" "FAIL  GRUB (saved_entry, next_entry), the
 run vmstart FAKE_STOCK_RETURN_STARTS_VM=1 -- location neg-sha host-add vm stock-return
 rc_is "a VM started on a stock boot fails stock-return" 1
 report_has "stock-return names it" "FAIL  no VM was started (no cloud-hypervisor)"
+
+run pages FAKE_DESTROY_LEAVES_PAGES=1 PVM_E2E_PAGE_WAIT=0 -- location neg-sha
+rc_is "a destroy that leaves the scratch host's page open fails neg-sha" 1
+report_has "neg-sha names the page" "FAIL  no page of host vh0000000000000000000000cd is left open"
 
 # Without a second guest build the rollout is reported as not run.
 run noguest PVM_E2E_GUEST2_URL= -- location neg-sha host-add vm guest-pin-rollout

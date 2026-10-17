@@ -8,7 +8,8 @@
 #
 # Knobs (environment): FAKE_ACCEPT_WRONG_GUEST=1 makes set take a wrong
 # guest sha256; FAKE_NEG_CHANGES_GRUB=1 makes the refused install touch
-# GRUB; FAKE_STOCK_RETURN_STARTS_VM=1 starts the VM on a stock boot.
+# GRUB; FAKE_STOCK_RETURN_STARTS_VM=1 starts the VM on a stock boot;
+# FAKE_DESTROY_LEAVES_PAGES=1 makes a host destroy leave its pages open.
 set -uo pipefail
 
 F=${FAKE:?}
@@ -86,7 +87,17 @@ cmd_admin() {
         echo "Virt tiers    kvm"
       fi
       ;;
-    "site add") touch "$F/site-$3" && echo "Created location $3" ;;
+    "site add")
+      # site add refuses a ula48 that another location has.
+      local ula
+      ula=$(sed -n 's/.* --ula48[ =]\([^ ]*\).*/\1/p' <<<" $* ")
+      if [[ -n $ula ]]; then
+        local key=ula-${ula//\//_}
+        [[ ! -e $F/$key ]] || { echo "! ula48 $ula is already used by location $(get "$key")" && exit 1; }
+        put "$key" "$3"
+      fi
+      touch "$F/site-$3" && echo "Created location $3"
+      ;;
     "site rates") echo "Wrote 0 rates copied from $3/standard (x1.0) to /x/$3.yml." ;;
     "site set")
       local args=" ${*:4} "
@@ -131,14 +142,22 @@ cmd_admin() {
   esac
 }
 
+# A destroyed host prints exists=0 and the pages left open for it: the
+# destroy resolves the host's own (Byoh*) pages, not upstream's.
+gone_kv() {
+  echo exists=0
+  [[ $1 == "$NEG" ]] || sed 's/^/page=/' "$F/pages"
+  [[ $1 != "$NEG" || ${FAKE_DESTROY_LEAVES_PAGES:-0} == 0 ]] || echo "page=ByohPvmInstall $NEG refused to install the PVM host kernel: sha256 mismatch"
+}
+
 host_kv() {
   if [[ $1 == "$NEG" ]]; then
-    if ! has neg; then echo exists=0 && return; fi
+    if ! has neg; then gone_kv "$1" && return; fi
     printf 'exists=1\nlabel=%s\nallocation_state=draining\nvirt_tier=pvm\npvm_state=failed\n' "$(get neg_label)"
     echo "page=ByohPvmInstall $NEG refused to install the PVM host kernel: sha256 mismatch"
     return
   fi
-  has host || { echo exists=0 && return; }
+  has host || { gone_kv "$1" && return; }
   printf 'exists=1\nlabel=%s\nallocation_state=%s\nvirt_tier=pvm\npvm_state=%s\n' "$(get label)" "$(get alloc)" "$(get pvm_state)"
   printf 'host_kver=%s\nstock_kver=%s\nstock_entry=%s\n' "$PVM" "$STOCK" "$STOCK_ENTRY"
   printf 'guest_kernels=%s:ready%s\n' "$GOOD_GUEST" "$(has guest2_ready && echo ",${FAKE_GUEST2}:ready")"
@@ -172,7 +191,11 @@ cmd_bundle() {
     bin/byoh-virt)
       case "$2 ${3:-}" in
         "show --host") echo "  kernel packages before patch: linux-image-$STOCK; after: linux-image-$STOCK linux-image-7.0.0-1015-aws" ;;
-        "probe --main-ip") echo "tier: pvm (L4, experimental)" && exit 3 ;;
+        "script ") echo "# the probe script" ;;
+        "explain ")
+          grep -q '"fake_report"' || exit 1
+          echo "tier: pvm (L4, experimental)" && exit 3
+          ;;
         "pvm retry")
           put next_entry ubicloud-pvm
           host_boot
@@ -196,7 +219,10 @@ cmd_bundle() {
       log "console $code"
       case "$code" in
         *"\"$NEG\"].incr_destroy") rm -f "$F/neg" ;;
-        *"\"$HOST\"].incr_destroy") rm -f "$F/host" ;;
+        *"\"$HOST\"].incr_destroy")
+          rm -f "$F/host"
+          [[ ${FAKE_DESTROY_LEAVES_PAGES:-0} == 1 ]] || sed -i '/^Byoh/d' "$F/pages"
+          ;;
         *".incr_reboot")
           host_boot
           host_settle
@@ -287,6 +313,11 @@ cmd_ssh() {
     return
   fi
   # ssh hands the remote shell one string; "! CMD" negates CMD there.
+  # That shell then forks pgrep and stays its parent, so pgrep -f of a
+  # plain pattern matches the shell's own command line.
+  if [[ $cmd == "! pgrep -f "* && $cmd != *"'["* ]]; then
+    return 1
+  fi
   if [[ $cmd == "! "* ]]; then
     if cmd_ssh "$dest" "${cmd#! }"; then return 1; else return 0; fi
   fi
@@ -320,7 +351,8 @@ cmd_ssh() {
       if has vm_running; then echo $(($(get mem) - 7000000)); else get mem && echo; fi
       ;;
     "BENCH_DIR="*"sh -s") cat >/dev/null && printf 'BYOH_PVM_BENCH cpu_sha256_1g 1000\nBYOH_PVM_BENCH mem_dd_8g 850\n' ;;
-    "pgrep -f cloud-hypervisor >/dev/null") has vm_running ;;
+    "pgrep -f '[c]loud-hypervisor' >/dev/null") has vm_running ;;
+    "ruby - --json") cat >/dev/null && echo '{"fake_report": true}' ;;
     "systemctl cat "* | "ip netns list"*) has vm ;;
     "[ ! -e /vm/"*) neg has vm ;;
     "[ ! -e /etc/systemd/system/"*) neg has installed ;;
