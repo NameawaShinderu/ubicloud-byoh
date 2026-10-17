@@ -171,6 +171,7 @@ RSpec.describe PvmHostKernel do
       "no grub.cfg" => [->(_t, f) { File.delete(File.join(f.root, "boot/grub/grub.cfg")) }, ["there is no /boot/grub/grub.cfg: GRUB is not the boot loader", "grub.cfg has no entry for the running kernel #{FakePvmHost::STOCK}"]],
       "pti=off" => [->(_t, f) { f.write("proc/cmdline", "ro pti=off\n") }, "the running kernel #{FakePvmHost::STOCK} has pti=off; remove it from GRUB_CMDLINE_LINUX* first"],
       "kvm_pvm loaded" => [->(_t, f) { FileUtils.mkdir_p(File.join(f.root, "sys/module/kvm_pvm")) }, "the running kernel #{FakePvmHost::STOCK} is a PVM kernel; install runs only on the stock kernel"],
+      "a running kernel that ships kvm_pvm" => [->(_t, f) { File.write(File.join(f.root, "lib/modules/#{FakePvmHost::STOCK}/modules.dep"), "kernel/arch/x86/kvm/kvm-pvm.ko.zst: kernel/arch/x86/kvm/kvm.ko.zst\n", mode: "a") }, "the running kernel #{FakePvmHost::STOCK} is a PVM kernel; install runs only on the stock kernel"],
       "a stock kernel not from dpkg" => [->(_t, f) { f.packages.clear }, "the running kernel is not from the package linux-image-#{FakePvmHost::STOCK}, so it cannot be held"],
       "an odd kernel version" => [->(_t, f) { f.kernel = "7.0\"x" }, nil],
       "no stock entry" => [->(_t, f) { f.kernel = "7.0.0-9999-custom" }, nil],
@@ -258,6 +259,14 @@ RSpec.describe PvmHostKernel do
       fake.write(described_class::STATE_FILE, JSON.generate("state" => "armed", "kver" => FakePvmHost::PVM))
       fake.boot(FakePvmHost::PVM)
       expect(kernel.prep_problem).to eq "the PVM kernel #{FakePvmHost::PVM} is running but kvm_pvm is not loaded; see install-pvm-host-kernel status"
+      expect(mutating).to eq []
+    end
+
+    it "refuses a kernel installed by hand that ships kvm_pvm, with no state file" do
+      dep = "lib/modules/#{FakePvmHost::STOCK}/modules.dep"
+      fake.write(dep, fake.read(dep) + "kernel/arch/x86/kvm/kvm-pvm.ko: kernel/arch/x86/kvm/kvm.ko\n")
+      expect(kernel.prep_problem).to eq "the PVM kernel #{FakePvmHost::STOCK} is running but kvm_pvm is not loaded; see install-pvm-host-kernel status"
+      expect(kernel.status({})["running_pvm"]).to be true
       expect(mutating).to eq []
     end
   end

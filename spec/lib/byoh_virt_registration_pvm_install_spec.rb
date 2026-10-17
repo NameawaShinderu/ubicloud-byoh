@@ -27,6 +27,7 @@ RSpec.describe ByohVirtRegistration, "pvm install" do
     "none" => {},
     "pvm_blocked" => {pvm_module_available: true},
     "kvm_blocked (generic CPU)" => {cpu_model: "QEMU Virtual CPU version 2.5+", virt_vm: "kvm", dmi: {"sys_vendor" => "QEMU"}},
+    "kvm_blocked (generic CPU, ships kvm_pvm)" => {cpu_model: "QEMU Virtual CPU version 2.5+", virt_vm: "kvm", dmi: {"sys_vendor" => "QEMU"}, pvm_module_available: true},
     "kvm_blocked (vmx, no module)" => {cpu_flags: %w[vmx pdpe1gb], virt_vm: "none", dmi: {"sys_vendor" => "Dell Inc."}},
     "kvm" => {cpu_flags: %w[vmx pdpe1gb hypervisor], dev_kvm: true, kvm_api: 12, kvm_create_vm: true, kvm_caps_missing: [], modules: %w[kvm kvm_intel]},
     "pvm" => {dev_kvm: true, kvm_api: 12, kvm_create_vm: true, kvm_caps_missing: [], modules: %w[kvm kvm_pvm]},
@@ -39,7 +40,8 @@ RSpec.describe ByohVirtRegistration, "pvm install" do
   # the refusal.
   golden = {
     "none" => ["pvm (install)", "pvm (install)"],
-    "pvm_blocked" => ["pvm (install)", "pvm (install)"],
+    "pvm_blocked" => [/refused \(--install-pvm-kernel\): The running kernel ships kvm_pvm, so it is a PVM kernel already; modprobe kvm_pvm and register the host as pvm without --install-pvm-kernel\.\z/, "container"],
+    "kvm_blocked (generic CPU, ships kvm_pvm)" => [/refused \(--install-pvm-kernel\): The running kernel ships kvm_pvm/, /refused: Give this VM the host's CPU model/],
     "kvm_blocked (generic CPU)" => ["pvm (install)", /refused: Give this VM the host's CPU model/],
     "kvm_blocked (vmx, no module)" => [/refused \(--install-pvm-kernel\): The CPU has vmx: this host has hardware virtualization/, /refused: Load the KVM module/],
     "kvm" => [/refused \(--install-pvm-kernel\): This host runs KVM \(L1\)/, "kvm"],
@@ -135,7 +137,9 @@ RSpec.describe ByohVirtRegistration, "pvm install" do
     note = registration("auto").decide!(verdict(vulnerabilities: {"meltdown" => "Vulnerable"}), location:, main_ip: "x").notes.first
     expect(note).to start_with "--install-pvm-kernel was not used: This CPU's Meltdown status is \"Vulnerable\""
     expect(registration("auto").decide!(verdict(**probes["kvm"]), location:, main_ip: "x").notes.first)
-      .to eq "--install-pvm-kernel was not used: auto installs a PVM kernel only where the probe says none or pvm_blocked, and it says kvm; auto picked as it does without it"
+      .to eq "--install-pvm-kernel was not used: auto installs a PVM kernel only where the probe says none, and it says kvm; auto picked as it does without it"
+    expect(registration("auto").decide!(verdict(**probes["pvm_blocked"]), location:, main_ip: "x").notes.first)
+      .to eq "--install-pvm-kernel was not used: The running kernel ships kvm_pvm, so it is a PVM kernel already; modprobe kvm_pvm and register the host as pvm without --install-pvm-kernel.; auto picked as it does without it"
     ship_virt_tiers("container", "emulated")
     decision = registration("auto").decide!(verdict, location:, main_ip: "x")
     expect([decision.tier, decision.notes.first]).to eq ["container", "--install-pvm-kernel was not used: pvm hosts are not available yet; auto picked as it does without it"]

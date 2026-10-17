@@ -136,7 +136,9 @@ RSpec.describe ByohVirtTiers do
       matrix = [nil, *ByohPvmHost::PRE_BOOT_STATES, "committed", "failed"].to_h do |state|
         [state, [none, blocked].map { described_class.accepts_probe?("pvm", it, pvm_install: state) }]
       end
-      expect(matrix).to eq(nil => [false, false], "install_pending" => [true, true], "installing" => [true, true], "armed" => [true, true], "committed" => [false, false], "failed" => [false, false])
+      # A pvm_blocked probe is of a kernel that ships kvm_pvm: a PVM
+      # kernel, never the stock one.
+      expect(matrix).to eq(nil => [false, false], "install_pending" => [true, false], "installing" => [true, false], "armed" => [true, false], "committed" => [false, false], "failed" => [false, false])
       # The hard refusals, other architectures and hardware virtualization
       # still refuse it, and other tiers ignore the state.
       expect(described_class.accepts_probe?("pvm", verdict(**stock, vulnerabilities: {"meltdown" => "Mitigation: PTI"}), pvm_install: "armed")).to be false
@@ -152,6 +154,8 @@ RSpec.describe ByohVirtTiers do
       expect(generic.tier).to eq "kvm_blocked"
       expect(described_class.accepts_probe?("pvm", generic, pvm_install: "install_pending")).to be true
       expect(described_class.accepts_probe?("pvm", generic, pvm_install: nil)).to be false
+      shipped = verdict(cpu_model: "QEMU Virtual CPU version 2.5+", pvm_module_available: true, vulnerabilities: {"meltdown" => "Not affected"})
+      expect([shipped.tier, described_class.accepts_probe?("pvm", shipped, pvm_install: "install_pending")]).to eq ["kvm_blocked", false]
       unresponsive = verdict(cpu_model: "QEMU Virtual CPU version 2.5+", dev_kvm: true, kvm_api: "EIO", vulnerabilities: {"meltdown" => "Not affected"})
       expect([unresponsive.tier, described_class.accepts_probe?("pvm", unresponsive, pvm_install: "armed")]).to eq ["kvm_blocked", false]
     end

@@ -63,6 +63,22 @@ RSpec.describe "bootstrap-data-plane.sh --tier pvm" do
     expect([ok, out.lines.first, out.lines.last]).to eq [true, "  kvm_pvm is loaded: a PVM host kernel runs; register without --install-pvm-kernel\n", "rc=0 loaded=1\n"]
   end
 
+  it "refuses a PVM kernel whose kvm_pvm is not loaded, with the modprobe instead of an install" do
+    stock_host
+    write("lib/modules/7.0.0-1014-aws/modules.dep", "kernel/fs/ext4/ext4.ko.zst:\nkernel/arch/x86/kvm/kvm-pvm.ko.zst: kernel/arch/x86/kvm/kvm.ko.zst\n")
+    out, ok = pvm_checks
+    expect(ok).to be false
+    expect(out).to include "ERROR: the running kernel 7.0.0-1014-aws ships kvm_pvm but it is not loaded: it is a PVM kernel already, so the control plane does not install one. " \
+      "Run modprobe kvm_pvm, then this script again, and register without --install-pvm-kernel."
+    expect(out).not_to include "--install-pvm-kernel)"
+    write("lib/modules/7.0.0-1014-aws/modules.dep", "kernel/fs/ext4/ext4.ko.zst:\n")
+    expect(pvm_checks).to eq [<<~OUT, true]
+      stock kernel 7.0.0-1014-aws: the control plane installs the site's PVM host kernel after registration (--install-pvm-kernel)
+      PVM checks passed: x86_64 without vmx/svm, Secure Boot off, Meltdown not affected
+    rc=0 loaded=0
+    OUT
+  end
+
   it "refuses each hard refusal, read-only" do
     {
       "ERROR: PVM hosts must be x86_64; this is aarch64." => [-> {}, "aarch64"],

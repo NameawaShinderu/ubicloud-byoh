@@ -17,8 +17,9 @@
 # what #decide! takes, so the host is probed once.
 #
 # PVM (docs/byoh/NO_KVM.md section 6.7): a stock host has no kvm_pvm, so
-# its probe says none (or pvm_blocked, or kvm_blocked without hardware
-# virtualization). --install-pvm-kernel is the operator's per-host
+# its probe says none (or kvm_blocked without hardware virtualization;
+# pvm_blocked is a PVM kernel whose kvm_pvm is not loaded, which is
+# never installed on). --install-pvm-kernel is the operator's per-host
 # acknowledgement that the control plane installs the location's pinned
 # PVM host kernel there and reboots the host into it; only with it is
 # such a host registered as pvm, and the operator log records it with
@@ -191,8 +192,8 @@ class ByohVirtRegistration
   # Whether to register the host as pvm by installing the PVM host kernel
   # (--install-pvm-kernel). Declared pvm: always with the flag, refused
   # with the reason when the host or the location cannot take it. auto:
-  # only on a stock probe (none or pvm_blocked) where the install would
-  # pass; otherwise auto picks as it did without the flag, with a note.
+  # only on a stock probe (none) where the install would pass; otherwise
+  # auto picks as it did without the flag, with a note.
   def install_pvm?(verdict, location)
     return false unless @install_pvm_kernel
 
@@ -207,18 +208,21 @@ class ByohVirtRegistration
   end
 
   # auto with --install-pvm-kernel: pvm on a stock probe without
-  # hardware virtualization (none, or pvm_blocked) whose install would
-  # pass, in a location that pins and acknowledges pvm. Never on
-  # kvm_blocked, whose fix (switching KVM on) is the better answer.
+  # hardware virtualization (none) whose install would pass, in a
+  # location that pins and acknowledges pvm. Never on kvm_blocked, whose
+  # fix (switching KVM on) is the better answer, nor on pvm_blocked, a
+  # PVM kernel whose fix is loading kvm_pvm.
   def auto_install?(verdict, location)
-    @install_pvm_kernel && %w[none pvm_blocked].include?(verdict.tier) && ByohVirtTiers.shipped?("pvm") &&
+    @install_pvm_kernel && verdict.tier == "none" && ByohVirtTiers.shipped?("pvm") &&
       ByohVirtLadder.pvm_install_problem(verdict).nil? && location_problem(location).nil?
   end
 
   # Why auto with --install-pvm-kernel did not pick pvm by an install.
   def auto_install_skipped(verdict, location)
-    if !%w[none pvm_blocked].include?(verdict.tier)
-      "auto installs a PVM kernel only where the probe says none or pvm_blocked, and it says #{verdict.tier}"
+    if verdict.tier == "pvm_blocked"
+      ByohVirtLadder.pvm_install_problem(verdict)
+    elsif verdict.tier != "none"
+      "auto installs a PVM kernel only where the probe says none, and it says #{verdict.tier}"
     elsif !ByohVirtTiers.shipped?("pvm")
       "pvm hosts are not available yet"
     else

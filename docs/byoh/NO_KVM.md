@@ -828,8 +828,8 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
   - It runs `grub-reboot ubicloud-pvm`, then checks that `grub-editenv list` shows
     `next_entry=ubicloud-pvm` **and** the stock `saved_entry`. Only then is the boot **one-shot**.
 - **HostNexus walk.** `prep` buds PrepHost with the pvm step list (without the KVM check when
-  installing) and `Prog::InstallPvmHostKernel`; `wait_prep` accepts a probe of `none`/`pvm_blocked` for
-  such a host; `reboot`; a new `verify_virt_tier` label requires LearnVirt to say `pvm`, `/dev/kvm` 0660
+  installing) and `Prog::InstallPvmHostKernel`; `wait_prep` accepts a probe of `none`/`kvm_blocked` of a
+  stock kernel (one that does not ship `kvm_pvm`) for such a host; `reboot`; a new `verify_virt_tier` label requires LearnVirt to say `pvm`, `/dev/kvm` 0660
   group kvm, API 12 and the capabilities, and only then runs `grub-set-default ubicloud-pvm`. On
   failure it pages "power-cycle the instance from the provider console; it returns to the stock
   kernel". That holds only because the install asserted the stock `saved_entry` before the reboot;
@@ -1036,7 +1036,7 @@ many, so raising on an unknown family would break U1; the CHECK binds hosts to t
 |---|---|---|---|---|---|---|
 | `kvm` | `kvm` | `standard`, `premium`, `burstable` and every upstream family (as today) | CH, or QEMU-KVM for B200/B300 GPUs (`model/metal/vm.rb`, unchanged) | none (golden-pinned command) | yes | no |
 | `container` | `none`, `kvm_blocked`, `pvm_blocked`; `kvm` with a failing capability/`pdpe1gb`/CPU-model check | `container` | LXC | `container` | no | yes |
-| `pvm` | `pvm`; or `none`/`kvm_blocked`/`pvm_blocked` with `--install-pvm-kernel` (re-checked after the reboot) | `pvm` | CH with direct kernel boot | `pvm` | no | yes |
+| `pvm` | `pvm`; or `none`/`kvm_blocked` of a stock kernel with `--install-pvm-kernel` (re-checked after the reboot) | `pvm` | CH with direct kernel boot | `pvm` | no | yes |
 | `emulated` | `none`, `kvm_blocked`, `pvm_blocked`; `kvm` with a failing check | `emulated` | QEMU TCG | `emulated` (the third argument of `rhizome/host/bin/prep_host.rb`, renamed from `tcg` in WP4) | no | yes |
 
 ### 10.3 Sizes and the policy gate
@@ -1242,10 +1242,14 @@ Flags on `bin/register-byoh-host`:
   third-party build) and reboots the host into it once. It goes only with `--virt-tier pvm` or
   `auto`, and needs the probe. Until `pvm` joins `ByohVirtTiers::SHIPPED` (WP8), `--virt-tier pvm`
   is still refused with "pvm hosts are not available yet" on every host, before the probe's
-  preflight could ask for host work. With the flag, a probe of `none`, `pvm_blocked`, or
-  `kvm_blocked` is taken for `pvm` only when all of these hold (`ByohVirtLadder.pvm_install_problem`
+  preflight could ask for host work. With the flag, a probe of `none` or `kvm_blocked` is
+  taken for `pvm` only when all of these hold (`ByohVirtLadder.pvm_install_problem`
   and `ByohVirtRegistration`):
   - the CPU is x86_64, without vmx or svm, and there is no `/dev/kvm` on the stock kernel;
+  - the running kernel does not ship `kvm_pvm` (its `modules.dep` lists no `kvm-pvm.ko`): such a
+    kernel is a PVM one already, and is refused with "modprobe kvm_pvm and register the host as pvm
+    without --install-pvm-kernel". rhizome's install preflight refuses it too, and so does
+    `bootstrap-data-plane.sh --tier pvm`;
   - none of PVM's hard refusals applies: Secure Boot is off, and Meltdown is "Not affected"
     (`pvm_refusal`, which fails closed);
   - the location offers and acknowledges `pvm` and pins both PVM kernels.
@@ -1283,12 +1287,13 @@ The registration matrix (probe × declared tier). "ack" means allowed with `--ac
 | `unknown_permission` | refuse: "re-run the probe as root" | same | same | same | same |
 | `none`, platform nested `yes`/`some`/`ask` | refuse, fix and cost hint | → recommended fallback, ack; fix printed as advice | ack | ack; needs `--install-pvm-kernel` | ack |
 | `none`, platform nested `no` or unknown | refuse; lists the ready fallbacks | → recommended, ack | ack | ack; needs `--install-pvm-kernel` | ack |
-| `pvm_blocked` | refuse | → recommended, ack | ack | ack (`modprobe kvm_pvm` advice) | ack |
+| `pvm_blocked` | refuse | → recommended, ack | ack | ack (`modprobe kvm_pvm` advice); with `--install-pvm-kernel` refused, as the kernel is a PVM one | ack |
 | `pvm` | refuse (firmware boot is impossible) | → pvm, ack | refuse ("register it as pvm") | ack | refuse |
 | `container` (the data plane is a container) | refuse | refuse | refuse | refuse | refuse |
 
 `auto` never picks `pvm` by a kernel install without `--install-pvm-kernel`. With the flag it does
-so only on `none` or `pvm_blocked` (never `kvm_blocked`, where fixing KVM is the answer), and only
+so only on `none` (never `kvm_blocked`, where fixing KVM is the answer, nor `pvm_blocked`, a PVM kernel
+whose fix is `modprobe kvm_pvm`), and only
 where the install would pass in a location that offers, acknowledges and pins `pvm`. Anywhere else
 `auto` picks exactly what it picks without the flag, and adds the note "--install-pvm-kernel was not
 used: <why>". A spec pins `auto` per probe fixture, and that spec also passes on the commit before

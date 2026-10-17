@@ -570,8 +570,10 @@ class PvmHostKernel
     File.directory?(path("sys/module/kvm_pvm"))
   end
 
+  # A PVM kernel: kvm_pvm is loaded, this tool installed it, or it ships
+  # kvm_pvm (one installed by hand, whose module is not loaded yet).
   def running_pvm?(state, kernel)
-    kvm_pvm_loaded? || !!(state && [state["kver"], *state["prev_kvers"]].include?(kernel))
+    kvm_pvm_loaded? || !!(state && [state["kver"], *state["prev_kvers"]].include?(kernel)) || kernel_has_driver?(kernel, "kvm_pvm")
   end
 
   def dpkg_status(pkg)

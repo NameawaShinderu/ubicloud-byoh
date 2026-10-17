@@ -217,17 +217,20 @@ module ByohVirtTiers
   # install the PVM host kernel on (bin/register-byoh-host
   # --install-pvm-kernel): no usable KVM, and kvm_blocked only for what
   # hardware virtualization cannot fix here (a generic CPU model, or
-  # firmware), since the checks below leave no vmx or svm.
-  PVM_STOCK_TIERS = %w[none pvm_blocked kvm_blocked].freeze
+  # firmware), since the checks below leave no vmx or svm. Not
+  # pvm_blocked: the probe says it only of a kernel that ships kvm_pvm,
+  # a PVM kernel already, and an install never runs on one.
+  PVM_STOCK_TIERS = %w[none kvm_blocked].freeze
 
   # Whether the verdict is of such a stock kernel on an x86_64 CPU
   # without hardware virtualization and without /dev/kvm (rhizome's
   # install-pvm-host-kernel preflight refuses both, as KVM would serve
-  # the host better). Says nothing of PVM's hard refusals
-  # (ByohVirtLadder.pvm_refusal).
+  # the host better), whose running kernel does not ship kvm_pvm (a
+  # kvm_blocked probe of a PVM kernel says so only in that fact). Says
+  # nothing of PVM's hard refusals (ByohVirtLadder.pvm_refusal).
   def self.pvm_stock_host?(verdict)
     facts = verdict.report["facts"]
-    PVM_STOCK_TIERS.include?(verdict.tier) && facts["arch"] == "x86_64" &&
+    PVM_STOCK_TIERS.include?(verdict.tier) && facts["arch"] == "x86_64" && !facts["pvm_module_available"] &&
       !Array(facts["cpu_flags"]).intersect?(%w[vmx svm]) && !facts["dev_kvm"]
   end
 

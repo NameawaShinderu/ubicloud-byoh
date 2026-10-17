@@ -363,6 +363,8 @@ module ByohVirtLadder
     flags = Array(facts["cpu_flags"]) & %w[vmx svm]
     problem = if v.tier == "pvm"
       "This host already runs a PVM kernel (kvm_pvm is loaded); register it as pvm without --install-pvm-kernel."
+    elsif facts["pvm_module_available"]
+      "The running kernel ships kvm_pvm, so it is a PVM kernel already; modprobe kvm_pvm and register the host as pvm without --install-pvm-kernel."
     elsif v.tier == "kvm"
       "This host runs KVM (L1), which is faster and isolates better than PVM; register it as kvm."
     elsif !ByohVirtTiers::PVM_STOCK_TIERS.include?(v.tier)
@@ -376,8 +378,9 @@ module ByohVirtLadder
     else
       return pvm_refusal(facts)
     end
-    # The KVM fix, but not for a PVM host, whose fix text is about L1.
-    [problem, (v.fix unless v.tier == "pvm")].compact.join(" ")
+    # The KVM fix, but not for a PVM kernel, whose fix text is about L1
+    # or is the modprobe already named.
+    [problem, (v.fix unless v.tier == "pvm" || facts["pvm_module_available"])].compact.join(" ")
   end
 
   def self.fallback_readiness(v, declared)

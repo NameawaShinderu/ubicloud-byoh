@@ -139,8 +139,9 @@ unsafe_path() {
 # PVM kernel runs with pti=off), GRUB as the boot loader and
 # GRUB_SAVEDEFAULT off. HOST_ROOT (default /) is where /proc, /sys, /dev,
 # /etc and /boot are read from. Prints each finding; returns 1 when
-# any refuses. Sets PVM_KERNEL_LOADED=1 when kvm_pvm is loaded, so a
-# PVM host kernel runs already.
+# any refuses (also a PVM kernel whose kvm_pvm is not loaded, which
+# needs a modprobe, not an install). Sets PVM_KERNEL_LOADED=1 when
+# kvm_pvm is loaded, so a PVM host kernel runs already.
 pvm_checks() {
   local root=${HOST_ROOT:-} fails=0 meltdown lockdown var sb f
   PVM_KERNEL_LOADED=0
@@ -155,6 +156,9 @@ pvm_checks() {
   if [ -d "$root/sys/module/kvm_pvm" ]; then
     PVM_KERNEL_LOADED=1
     echo "  kvm_pvm is loaded: a PVM host kernel runs; register without --install-pvm-kernel"
+  elif grep -Eq '(^|/)kvm-pvm\.ko' "$root/lib/modules/$(uname -r)/modules.dep" 2>/dev/null; then
+    echo "ERROR: the running kernel $(uname -r) ships kvm_pvm but it is not loaded: it is a PVM kernel already, so the control plane does not install one. Run modprobe kvm_pvm, then this script again, and register without --install-pvm-kernel." >&2
+    fails=1
   else
     if [ -e "$root/dev/kvm" ]; then
       echo "ERROR: /dev/kvm exists on this stock kernel, so KVM works or nearly works here; register the host as kvm (bin/byoh-virt probe prints the fix)." >&2
