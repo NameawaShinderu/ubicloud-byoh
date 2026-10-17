@@ -723,7 +723,10 @@ class PvmHostKernel
   end
 
   def step_install_deb(state, _params)
-    run(*APT_GET, "install", "-y", path(DEB_FILE))
+    # --no-remove: apt aborts instead of removing a package the deb
+    # conflicts with, which state.json would not record nor uninstall
+    # put back.
+    run(*APT_GET, "install", "-y", "--no-remove", path(DEB_FILE))
     run(*APT_MARK, "hold", state["pkg"])
     rm_if_exists(path(DEB_FILE))
     %W[boot/vmlinuz-#{state["kver"]} boot/initrd.img-#{state["kver"]}].each do |file|

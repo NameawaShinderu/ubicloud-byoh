@@ -462,7 +462,9 @@ install_phase() {
   apt-mark manual "$stock_pkg"
 
   #    The PVM kernel, held so an apt upgrade never replaces it.
-  apt-get install -y "$ART/$PVM_HOST_DEB"
+  #    --no-remove: abort rather than remove a package the .deb conflicts
+  #    with, which uninstall could not put back.
+  apt-get install -y --no-remove "$ART/$PVM_HOST_DEB"
   apt-mark hold "$pkg"
   [ -f "/boot/vmlinuz-$kver" ] || die "/boot/vmlinuz-$kver is missing after the install"
   [ -f "/boot/initrd.img-$kver" ] || die "/boot/initrd.img-$kver is missing after the install"

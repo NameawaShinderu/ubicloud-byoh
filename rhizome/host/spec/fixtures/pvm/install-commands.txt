@@ -15,7 +15,7 @@ grub-set-default Advanced options for Ubuntu>Ubuntu, with Linux 7.0.0-1014-aws
 grub-editenv list
 apt-mark -o DPkg::Lock::Timeout=300 hold linux-image-7.0.0-1014-aws
 apt-mark -o DPkg::Lock::Timeout=300 manual linux-image-7.0.0-1014-aws
-env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y /var/lib/ubicloud/pvm/host-kernel.deb
+env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y --no-remove /var/lib/ubicloud/pvm/host-kernel.deb
 apt-mark -o DPkg::Lock::Timeout=300 hold linux-image-6.12.33-pvm
 grub-editenv list
 uname -r

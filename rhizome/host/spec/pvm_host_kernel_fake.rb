@@ -192,7 +192,7 @@ class FakePvmHost
     in ["apt-mark", "manual", pkg] then mark(@auto, pkg, false)
     in ["curl", *, "-o", dest, url] then curl(dest, url)
     in ["dpkg-deb", "-f", deb, "Package"] then [read(deb)[/^Package: (.*)$/, 1] + "\n", 0]
-    in ["apt-get", "install", "-y", deb] then apt_install(deb)
+    in ["apt-get", "install", "-y", "--no-remove", deb] then apt_install(deb)
     in ["apt-get", "purge", "-y", pkg] then apt_purge(pkg)
     in ["update-grub"] then update_grub
     in ["grub-editenv", "list"] then [grubenv.map { |k, v| "#{k}=#{v}\n" }.join, 0]
