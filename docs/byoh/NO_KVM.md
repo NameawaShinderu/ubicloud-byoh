@@ -2071,7 +2071,7 @@ gate of this section; nothing of it ran on a real host):
 | WP5 | Direct boot in `VmSetup` (`pvm:` params), the per-start host check, `PVM_ROOT`, image refusals, `record_pvm_guest_kernel` | Goldens `ch_unit_pvm_hvc0.service`, `ch_unit_pvm_ttys0.service`, `params_json_pvm.json` |
 | WP6 | `--install-pvm-kernel` on `register-byoh-host`, `host add` and `bootstrap-data-plane.sh --tier pvm`; the shell facts of `ubicloud-host` | The ack is per host (section 6.7, change 3) |
 | WP7 | The HostNexus walk (`install_pvm_host_kernel`, `verify_pvm_boot`, `pvm_*` labels), `bin/byoh-virt pvm retry\|uninstall`, the watch phases, LearnVirt's `ByohPvmHostKernel` | Install after `patch`, not in `prep`; no `Prog::InstallPvmHostKernel` (HostNexus runs the daemonized tool itself) |
-| WP8 | `pvm` in `SHIPPED`; API, CLI and VM page fields (`virt-tier`, guest kernel) | The `vm show` help gains a "Lower-Tier VM Fields" line |
+| WP8 | `pvm` in `SHIPPED`; API, CLI and VM page fields (`virt-tier`, guest kernel) | `vm show -f` takes `virt-tier`, but no help text lists it, so non-BYOH CLI output is unchanged (U1) |
 | WP9 | `bin/byoh-virt pvm upgrade`, `migrate/20261017_byoh_pvm_upgrade.rb` | Never run with a second build |
 | WP10 | `scripts/byoh/test/real/pvm-e2e.sh` (L4-T2), its fake world `pvm-e2e-stubs.sh`/`pvm-e2e-fake.sh`, the aws-e2e role `pvme` | Not run on a real host |
 | WP11 | These docs: this section, sections 6, 10, 12-14, the AWS guide, the platform chooser, TROUBLESHOOTING, PLATFORMS, ROADMAP, CLAUDE.md | — |

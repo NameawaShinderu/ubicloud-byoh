@@ -6,10 +6,9 @@ class UbiCli
 
     fields = %w[id name state location size unix-user storage-size-gib boot-image ip6 ip4-enabled ip4 ip4-scope ip4-internal private-ipv4 private-ipv6 subnet maintenance-window-start-at firewalls].freeze.each(&:freeze)
     # Only lower-tier VMs (docs/byoh/NO_KVM.md) have virt-tier. It shows
-    # after boot-image, but the help lists it on a line of its own, so the
-    # "Fields:" text stays as it was.
-    tier_fields = %w[virt-tier].freeze.each(&:freeze)
-    all_fields = fields.dup.insert(fields.index("boot-image") + 1, *tier_fields).freeze
+    # after boot-image and -f takes it, but the help does not list it, so
+    # the help of every other user stays as it was (U1).
+    all_fields = fields.dup.insert(fields.index("boot-image") + 1, "virt-tier").freeze
     # Only VMs on BYOH hosts have these, so other VMs show what they did
     # before unless the fields are asked for.
     byoh_fields = %w[virt-tier ip4-scope ip4-internal].freeze.each(&:freeze)
@@ -22,7 +21,6 @@ class UbiCli
       on("-w", "--firewall-fields=fields", "show specific firewall fields (comma separated)")
     end
     help_option_values("Fields:", fields)
-    help_option_values("Lower-Tier VM Fields:", tier_fields)
     help_option_values("Firewall Rule Fields:", firewall_rule_fields)
     help_option_values("Firewall Fields:", firewall_fields)
 
