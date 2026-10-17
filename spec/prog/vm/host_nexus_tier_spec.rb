@@ -107,6 +107,25 @@ RSpec.describe Prog::Vm::HostNexus do
       expect { nx.verify_virt_tier }.to hop("setup_storage_backend")
     end
 
+    context "with a pvm host" do
+      let(:tier) { "pvm" }
+      let(:pvm_probe) { probe(dev_kvm: true, kvm_api: 12, kvm_create_vm: true, kvm_caps_missing: [], modules: %w[kvm kvm_pvm], vulnerabilities: {"meltdown" => "Not affected"}) }
+
+      it "goes on when the host runs Ubuntu 24.04 or later" do
+        vm_host.update(virt_probe: Sequel.pg_jsonb(pvm_probe), os_version: "ubuntu-24.04")
+        expect { nx.verify_virt_tier }.to hop("setup_storage_backend")
+        nx.vm_host.update(os_version: "ubuntu-26.04")
+        expect { nx.verify_virt_tier }.to hop("setup_storage_backend")
+      end
+
+      it "holds a host whose OS gets a cloud-hypervisor older than pvm VMs need" do
+        vm_host.update(virt_probe: Sequel.pg_jsonb(pvm_probe), os_version: "ubuntu-22.04")
+        expect { nx.verify_virt_tier }.to raise_error(RuntimeError, "pvm host runs ubuntu-22.04; pvm VMs need cloud-hypervisor 46.0 or later, which rhizome installs on Ubuntu 24.04 or later only; reinstall the host with Ubuntu 24.04 and register it again")
+        nx.vm_host.update(os_version: nil)
+        expect { nx.verify_virt_tier }.to raise_error(RuntimeError, /\Apvm host runs an unknown OS; /)
+      end
+    end
+
     context "with a tier that keeps its own disks" do
       let(:tier) { "container" }
 

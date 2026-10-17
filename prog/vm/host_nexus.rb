@@ -243,7 +243,9 @@ class Prog::Vm::HostNexus < Prog::Base
   # A lower-tier host goes on only once Prog::LearnVirt found the tier's
   # prerequisites on it; it pages with the fix otherwise. The check is
   # repeated (with the strand's backoff) until bin/byoh-virt refresh
-  # records a probe that agrees. Lower tiers use no 1G hugepages.
+  # records a probe that agrees. Lower tiers use no 1G hugepages. A pvm
+  # host must also run an Ubuntu whose cloud-hypervisor PVM VMs run on
+  # (ByohVirtTiers.pvm_os_ok?); rhizome checks the version again per VM.
   label def verify_virt_tier
     probe = vm_host.virt_probe&.to_h
     fail "#{vm_host.virt_tier} host has no virtualization probe yet; run bin/byoh-virt refresh --host #{vm_host.ubid}" if probe.nil? || probe["error"]
@@ -251,6 +253,9 @@ class Prog::Vm::HostNexus < Prog::Base
     verdict = ByohVirtLadder.verdict(probe)
     unless ByohVirtTiers.accepts_probe?(vm_host.virt_tier, verdict)
       fail "#{vm_host.virt_tier} host does not have the tier's prerequisites (probe: #{verdict.summary}); fix it, then run bin/byoh-virt refresh --host #{vm_host.ubid}"
+    end
+    if pvm_host? && !ByohVirtTiers.pvm_os_ok?(vm_host.os_version)
+      fail "pvm host runs #{vm_host.os_version || "an unknown OS"}; pvm VMs need cloud-hypervisor #{ByohVirtTiers::PVM_MIN_CH} or later, which rhizome installs on Ubuntu #{ByohVirtTiers::PVM_MIN_UBUNTU} or later only; reinstall the host with Ubuntu #{ByohVirtTiers::PVM_MIN_UBUNTU} and register it again"
     end
 
     hop_download_boot_images if ByohVirtTiers.fetch(vm_host.virt_tier).storage == "none"

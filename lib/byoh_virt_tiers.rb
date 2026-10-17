@@ -224,6 +224,18 @@ module ByohVirtTiers
   # (scripts/byoh/test/real/pvm-go-no-go.sh) booted 46.0 and 53.0.
   PVM_MIN_CH = "46.0"
 
+  # The control plane learns a host's OS, not its cloud-hypervisor. PrepHost
+  # downloads 46.0 and 53.0 only on Ubuntu 24.04 or later (rhizome's
+  # CloudHypervisor::Version); older hosts run 35.1, below PVM_MIN_CH.
+  # HostNexus#verify_virt_tier holds a pvm host on an older OS, so the
+  # allocator never places a PVM VM where rhizome would refuse it.
+  PVM_MIN_UBUNTU = "24.04"
+
+  def self.pvm_os_ok?(os_version)
+    version = os_version.to_s[/\Aubuntu-(\d+\.\d+)\z/, 1]
+    !version.nil? && Gem::Version.new(version) >= Gem::Version.new(PVM_MIN_UBUNTU)
+  end
+
   def self.pvm_root(boot_image)
     PVM_ROOT.fetch(boot_image) { raise Refused, "pvm VMs boot #{PVM_ROOT.keys.join(", ")} only (direct kernel boot), not #{boot_image}" }
   end

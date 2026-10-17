@@ -154,6 +154,14 @@ RSpec.describe ByohVirtTiers do
     expect(described_class::PVM_MIN_CH).to eq "46.0"
   end
 
+  it "accepts pvm hosts only on an Ubuntu whose cloud-hypervisor PVM VMs run on" do
+    expect(described_class.pvm_os_ok?("ubuntu-24.04")).to be true
+    expect(described_class.pvm_os_ok?("ubuntu-26.04")).to be true
+    expect(described_class.pvm_os_ok?("ubuntu-22.04")).to be false
+    expect(described_class.pvm_os_ok?("debian-12")).to be false
+    expect(described_class.pvm_os_ok?(nil)).to be false
+  end
+
   describe ".check_vm!" do
     before do
       ship_virt_tiers("container", "emulated")

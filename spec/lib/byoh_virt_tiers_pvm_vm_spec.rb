@@ -47,6 +47,11 @@ RSpec.describe ByohVirtTiers do
 
   it "keeps rhizome's oldest cloud-hypervisor for PVM VMs" do
     expect(File.read("rhizome/host/lib/vm_setup.rb")[/^  PVM_MIN_CH = "([^"]+)"$/, 1]).to eq described_class::PVM_MIN_CH
+    # pvm_os_ok? stands for the host's cloud-hypervisor: rhizome adds
+    # 46.0 (PVM_MIN_CH) only from this Ubuntu major on.
+    ch = File.read("rhizome/host/lib/cloud_hypervisor.rb")
+    gate = Regexp.new("^    if ubuntu_version >= (\\d+)$\\n      SUPPORTED\\[\"#{Regexp.escape(described_class::PVM_MIN_CH)}\"\\]")
+    expect(ch[gate, 1]).to eq described_class::PVM_MIN_UBUNTU.split(".").first
   end
 
   describe "a PVM VM" do
