@@ -51,7 +51,7 @@ RSpec.describe ByohVirtRegistration do
 
   before do
     ship_virt_tiers("container", "pvm", "emulated")
-    location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container pvm emulated], "acks" => {"container" => [], "pvm" => [], "emulated" => []}}))
+    location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container pvm emulated], "acks" => {"container" => [], "pvm" => [], "emulated" => []}, "pvm_kernel" => pvm_test_pins}))
   end
 
   def verdict_for(probe)

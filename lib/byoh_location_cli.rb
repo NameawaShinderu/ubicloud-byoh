@@ -5,6 +5,7 @@ require "fileutils"
 require "json"
 require "optparse"
 require "securerandom"
+require "tmpdir"
 require "yaml"
 
 # bin/byoh-location: creates and manages the Location of a BYOH site, its
@@ -27,6 +28,8 @@ class ByohLocationCli
       show     --location NAME
       set      --location NAME [--ui-name TEXT] [--[no-]visible] [--unset KEY] [profile options]
                [--virt-tiers LIST] [--accept TIER[:OPTION]] [--unaccept TIER[:OPTION]]
+               [--pvm-host-deb URL --pvm-host-deb-sha256 HEX] [--pvm-guest-kernel URL --pvm-guest-kernel-sha256 HEX]
+               [--pvm-guest-config URL --pvm-guest-config-sha256 HEX | --pvm-guest-unchecked] [--no-verify-download]
       rates    --location NAME --rates-from LOCATION [--multiplier X]
       rates    --location NAME --family FAMILY --from FAMILY --multiplier X
       grant    --location NAME --project UBID
@@ -76,11 +79,15 @@ class ByohLocationCli
   # Commands that name one location, which they also take alone.
   LOCATION_COMMANDS = %w[show set rates grant revoke delete].freeze
 
-  def initialize(out: $stdout, err: $stderr, random: SecureRandom, restart_note: (ENV["UBICLOUD_ADMIN_RESTARTS"] == "1") ? ADMIN_RESTART_NOTE : RESTART_NOTE)
+  # The PVM kernel pin options: the pin each sets, and what it names.
+  PVM_PIN_FLAGS = {"host-deb" => "host_deb", "guest-kernel" => "guest_kernel", "guest-config" => "guest_config"}.freeze
+
+  def initialize(out: $stdout, err: $stderr, random: SecureRandom, restart_note: (ENV["UBICLOUD_ADMIN_RESTARTS"] == "1") ? ADMIN_RESTART_NOTE : RESTART_NOTE, fetcher: ByohArtifactFetch.new)
     @out = out
     @err = err
     @random = random
     @restart_note = restart_note
+    @fetcher = fetcher
   end
 
   # Returns the process exit status.
@@ -106,7 +113,7 @@ class ByohLocationCli
       raise Error, "unknown command #{command}\n#{USAGE}"
     end
     0
-  rescue Error, OptionParser::ParseError => e
+  rescue Error, OptionParser::ParseError, ByohPvmPolicy::Refused, ByohArtifactFetch::Refused => e
     @err.puts "! #{e.message}"
     e.is_a?(UsageError) ? 2 : 1
   end
@@ -217,6 +224,10 @@ class ByohLocationCli
     @out.puts "Rate file     #{rate_file(location) || "(BILLING_RATES_EXTRA_DIR is unset)"}"
     @out.puts "Rates         #{missing.empty? ? "complete" : "missing #{missing.map { it.join("/") }.join(", ")}"}"
     @out.puts "Virt tiers    #{virt_summary(location)}"
+    if (pins = ByohPvmPolicy.pins(ByohVirtTiers.policy(location)))
+      @out.puts "PVM pins"
+      ByohPvmPolicy.summary(pins).each { @out.puts "  #{it}" }
+    end
     @out.puts "Profile"
     @out.puts JSON.pretty_generate(location.byoh_network.to_h)
     print_warnings
@@ -234,6 +245,7 @@ class ByohLocationCli
       profile_options(o, profile)
     end
     location = find_location(opts)
+    old_pins = ByohPvmPolicy.pins(ByohVirtTiers.policy(location))
     new_virt = virt_policy(location, opts)
 
     unknown = opts[:unset] - (ByohNetworkProfile::KEYS - ["ula48"])
@@ -251,6 +263,11 @@ class ByohLocationCli
     check_profile!(new_profile, location)
     require_rates!(location.name, "stays hidden") if opts[:visible]
     check_tenancy!(location, new_virt || ByohVirtTiers.policy(location), visible: opts[:visible].nil? ? location.visible : opts[:visible])
+    # Last, so that nothing is downloaded for a change refused anyway, and
+    # before anything is stored.
+    new_pins = new_virt ? ByohPvmPolicy.pins(new_virt) : old_pins
+    pins_changed = new_pins != old_pins
+    new_virt["pvm_kernel"] = verified_pins(old_pins, new_pins, opts) if pins_changed
 
     changes = {}
     changes[:ui_name] = opts[:ui_name] if opts[:ui_name]
@@ -260,17 +277,16 @@ class ByohLocationCli
     # reach every host now: VM setup keeps a table that is already loaded.
     # A host before prep gets the new settings from prep.
     egress_changed = ByohNetworkProfile.new(old_profile).egress_nat4_params != ByohNetworkProfile.new(new_profile).egress_nat4_params
-    strands = DB.transaction do
+    pvm_args = {verify_download: opts[:verify_download] != false, ack: ByohPvmPolicy::ACK} if pins_changed
+    strands, downloads = DB.transaction do
       location.update(changes) unless changes.empty?
-      audit("set", location, {ui_name: opts[:ui_name], byoh_network: new_profile, byoh_virt: new_virt}.compact)
-      next [] unless egress_changed
-
-      VmHost.where(location_id: location.id).order(:id).all.select { ByohHostCli.past_prep?(it) }.map do |host|
-        [host, Strand.create(prog: "SetupByohEgressNat", label: "start", stack: [{subject_id: host.id}])]
-      end
+      audit("set", location, {ui_name: opts[:ui_name], byoh_network: new_profile, byoh_virt: new_virt, pvm_pins: pvm_args}.compact)
+      [egress_changed ? start_on_hosts(location, "SetupByohEgressNat") : [], pvm_downloads(location, old_pins, pins_changed && new_virt["pvm_kernel"])]
     end
     @out.puts "Updated location #{location.name}."
     strands.each { |host, strand| @out.puts "Started #{strand.ubid} to install the new egress NAT settings on host #{host.ubid}." }
+    downloads.each { |host, strand| @out.puts "Started #{strand.ubid} to download the new PVM guest kernel on host #{host.ubid}; its VMs boot it from their next stop and start." }
+    @out.puts ByohPvmPolicy::ACK if pins_changed
     update_visibility(location, opts[:visible]) unless opts[:visible].nil?
     print_warnings
   end
@@ -371,14 +387,63 @@ class ByohLocationCli
     o.on("--virt-tiers LIST", Array, "Tiers hosts and VMs of the location may use: #{ByohVirtTiers::IDS.join(", ")} (default kvm)") { opts[:virt_tiers] = it }
     o.on("--accept TIER[:OPTION]", "Acknowledge a lower tier, or one of its options such as container:multitenant (repeatable)") { (opts[:accept] ||= []) << it }
     o.on("--unaccept TIER[:OPTION]", "Withdraw an acknowledgement (repeatable)") { (opts[:unaccept] ||= []) << it }
+    o.separator ""
+    o.separator "PVM kernel pins (pvm needs them; https URLs with their sha256, third-party builds you choose):"
+    # An exact option name wins over a prefix of a longer one, so
+    # --pvm-host-deb stays apart from --pvm-host-deb-sha256.
+    PVM_PIN_FLAGS.each do |flag, key|
+      what = ByohPvmPolicy::FILES[key]
+      o.on("--pvm-#{flag} URL", "https URL of the PVM #{what}") { ((opts[:pvm] ||= {})[key] ||= {})["url"] = it }
+      o.on("--pvm-#{flag}-sha256 HEX", "sha256 of the PVM #{what}") { ((opts[:pvm] ||= {})[key] ||= {})["sha256"] = it }
+    end
+    o.on("--pvm-guest-unchecked", "Accept a guest kernel whose config cannot be read (no --pvm-guest-config, no embedded config)") { (opts[:pvm] ||= {})["guest_unchecked"] = true }
+    o.on("--no-verify-download", "Store the PVM pins without downloading them first (each host still checks them)") { opts[:verify_download] = it }
+  end
+
+  # The PVM pins after verifying them: every changed file is downloaded
+  # and checked against its sha256, and the guest kernel config read,
+  # unless --no-verify-download.
+  def verified_pins(old_pins, pins, opts)
+    if opts[:verify_download] == false
+      @out.puts "Not downloading the PVM pins (--no-verify-download): each host checks them when it downloads them."
+      return ByohPvmPolicy.guest_changed?(old_pins, pins) ? ByohPvmPolicy.unchecked(pins) : pins
+    end
+
+    verified = Dir.mktmpdir("byoh-pvm-pins-") { ByohPvmPolicy.verify(old_pins, pins, fetcher: @fetcher, dir: it) }
+    @out.puts "Downloaded the changed PVM pins; each matches its sha256."
+    if ByohPvmPolicy.guest_changed?(old_pins, pins)
+      @out.puts(verified["config_checked"] ? "The guest kernel config has what PVM VMs need; their console is #{verified["guest_console"]}." : "The guest kernel config was not checked (--pvm-guest-unchecked).")
+    end
+    verified
+  end
+
+  # Starts prog on every host of the location past prep (a host before
+  # prep gets the location's settings from prep).
+  def start_on_hosts(location, prog, hosts = VmHost.where(location_id: location.id), &stack)
+    stack ||= ->(host) { {subject_id: host.id} }
+    hosts.order(:id).all.select { ByohHostCli.past_prep?(it) }.map do |host|
+      [host, Strand.create(prog:, label: "start", stack: [stack.call(host)])]
+    end
+  end
+
+  # A new guest kernel pin starts its download on every pvm host of the
+  # location past prep (Prog::DownloadPvmGuestKernel). A new host kernel
+  # package starts nothing: hosts keep the kernel they were installed
+  # with.
+  def pvm_downloads(location, old_pins, new_pins)
+    return [] unless new_pins && ByohPvmPolicy.guest_changed?(old_pins, new_pins)
+
+    start_on_hosts(location, "DownloadPvmGuestKernel", VmHost.where(location_id: location.id, virt_tier: "pvm")) do |host|
+      {subject_id: host.id, pin: new_pins.slice(*ByohPvmPolicy::GUEST_KEYS)}
+    end
   end
 
   # The location's new byoh_virt policy, or nil when the options do not
   # change it. Refuses a policy that offers a tier without its
-  # acknowledgement, its rates or its rhizome support, or that drops a
-  # tier hosts are registered on.
+  # acknowledgement, its rates, its rhizome support or (pvm) its kernel
+  # pins, or that drops a tier hosts are registered on.
   def virt_policy(location, opts)
-    return unless opts[:virt_tiers] || opts[:accept] || opts[:unaccept]
+    return unless opts[:virt_tiers] || opts[:accept] || opts[:unaccept] || opts[:pvm]
 
     old = ByohVirtTiers.policy(location)
     tiers = opts[:virt_tiers]&.uniq || old["tiers"]
@@ -400,11 +465,15 @@ class ByohLocationCli
       option ? acks[tier]&.delete(option) : acks.delete(tier)
     end
 
+    pins = pvm_pins(ByohPvmPolicy.pins(old), opts[:pvm])
     tiers.each do |tier|
       next unless ByohVirtTiers.lower?(tier)
 
       raise Error, "#{tier} is not available yet: this control plane's rhizome cannot run #{tier} hosts (docs/byoh/NO_KVM.md section 11)" unless ByohVirtTiers.shipped?(tier)
       raise Error, "#{tier} must be acknowledged: add --accept #{tier} (#{ByohVirtTiers.fetch(tier).description})" unless acks.key?(tier)
+      if tier == "pvm" && !pins
+        raise Error, "pvm needs its kernel pins: add --pvm-host-deb URL --pvm-host-deb-sha256 HEX --pvm-guest-kernel URL --pvm-guest-kernel-sha256 HEX (docs/byoh/NO_KVM.md section 6.7)"
+      end
       family = ByohVirtTiers.fetch(tier).family
       missing = ByohVirtTiers::RATE_TYPES.reject { |type| BillingRate.load_rates(BillingRate.rate_globs).any? { it["resource_type"] == type && it["resource_family"] == family && it["location"] == location.name } }
       raise Error, "#{tier} has no #{missing.join(" and ")} rate in #{location.name}; run: bin/byoh-location rates --location #{location.name} --family #{family} --from standard --multiplier X" unless missing.empty?
@@ -414,7 +483,20 @@ class ByohLocationCli
       raise Error, "#{tier} has #{hosts} hosts in #{location.name}; destroy them before dropping the tier" unless hosts.zero?
     end
 
-    {"tiers" => tiers, "acks" => acks}
+    {"tiers" => tiers, "acks" => acks, "pvm_kernel" => pins}.compact
+  end
+
+  # The PVM pins after the pin options (ByohPvmPolicy.merge), or the old
+  # ones without any.
+  def pvm_pins(old, changes)
+    return old unless changes
+
+    changes.each do |key, pin|
+      next if key == "guest_unchecked"
+      flag = "--pvm-#{PVM_PIN_FLAGS.key(key)}"
+      raise Error, "#{flag} and #{flag}-sha256 go together" unless pin["url"] && pin["sha256"]
+    end
+    ByohPvmPolicy.merge(old, changes)
   end
 
   def parse_ack(item)

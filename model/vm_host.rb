@@ -661,6 +661,8 @@ end
 #  address               | address_routed_to_host_id_fkey        | (routed_to_host_id) REFERENCES vm_host(id)
 #  assigned_host_address | assigned_host_address_host_id_fkey    | (host_id) REFERENCES vm_host(id)
 #  boot_image            | boot_image_vm_host_id_fkey            | (vm_host_id) REFERENCES vm_host(id)
+#  byoh_pvm_guest_kernel | byoh_pvm_guest_kernel_vm_host_id_fkey | (vm_host_id) REFERENCES vm_host(id) ON DELETE CASCADE
+#  byoh_pvm_host         | byoh_pvm_host_vm_host_id_fkey         | (vm_host_id) REFERENCES vm_host(id) ON DELETE CASCADE
 #  gpu_partition         | gpu_partition_vm_host_id_fkey         | (vm_host_id) REFERENCES vm_host(id)
 #  host_provider         | host_provider_id_fkey                 | (id) REFERENCES vm_host(id)
 #  pci_device            | pci_device_vm_host_id_fkey            | (vm_host_id) REFERENCES vm_host(id)

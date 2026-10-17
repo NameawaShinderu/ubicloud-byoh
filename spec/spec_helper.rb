@@ -333,6 +333,16 @@ RSpec.configure do |config|
       allow(ByohVirtTiers).to receive(:shipped?) { |tier| tier == ByohVirtTiers::KVM || tiers.include?(tier) }
     end
 
+    # PVM kernel pins (location.byoh_virt["pvm_kernel"]) for a location
+    # that offers pvm; nothing downloads them in specs.
+    def pvm_test_pins
+      {
+        "host_deb" => {"url" => "https://example.com/pvm/linux-image-pvm.deb", "sha256" => "a" * 64},
+        "guest_kernel" => {"url" => "https://example.com/pvm/vmlinux", "sha256" => "b" * 64},
+        "guest_unchecked" => false, "config_checked" => true, "guest_console" => "hvc0",
+      }
+    end
+
     # Lets the given tiers be shared between projects, as the WP that
     # adds each tier's host checks will (ByohVirtTiers::MULTITENANT_CHECKED).
     def check_virt_multitenant(*tiers)

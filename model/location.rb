@@ -136,7 +136,11 @@ end
 #  location_project_id_display_name_uidx | UNIQUE btree (project_id, display_name)
 #  location_project_id_ui_name_uidx      | UNIQUE btree (project_id, ui_name)
 # Check constraints:
-#  location_byoh_virt_check | (byoh_virt IS NULL OR COALESCE(jsonb_typeof(byoh_virt -> 'tiers'::text) = 'array'::text, false) AND (byoh_virt -> 'tiers'::text) <@ '["kvm", "container", "pvm", "emulated"]'::jsonb AND COALESCE(jsonb_typeof(byoh_virt -> 'acks'::text) = 'object'::text, false) AND (NOT (byoh_virt -> 'tiers'::text) ? 'container'::text OR (byoh_virt -> 'acks'::text) ? 'container'::text) AND (NOT (byoh_virt -> 'tiers'::text) ? 'pvm'::text OR (byoh_virt -> 'acks'::text) ? 'pvm'::text) AND (NOT (byoh_virt -> 'tiers'::text) ? 'emulated'::text OR (byoh_virt -> 'acks'::text) ? 'emulated'::text))
+#  location_byoh_virt_check | (byoh_virt IS NULL OR COALESCE(jsonb_typeof(byoh_virt -> 'tiers'::text) = 'array'::text, false) AND (byoh_virt -> 'tiers'::text) <@ '["kvm", "container", "pvm", "emulated"]'::jsonb AND COALESCE(jsonb_typeof(byoh_virt -> 'acks'::text) = 'object'::text, false) AND (NOT (byoh_virt -> 'tiers'::text) ? 'container'::text OR (byoh_virt -> 'acks'::text) ? 'container'::text) AND (NOT (byoh_virt -> 'tiers'::text) ? 'pvm'::text OR (byoh_virt -> 'acks'::text) ? 'pvm'::text) AND (NOT (byoh_virt -> 'tiers'::text) ? 'emulated'::text OR (byoh_virt -> 'acks'::text) ? 'emulated'::text) AND (NOT (byoh_virt -> 'tiers'::text) ? 'pvm'::text OR byoh_virt ? 'pvm_kernel'::text) AND (NOT byoh_virt ? 'pvm_kernel'::text OR COALESCE((byoh_virt #>> '{pvm_kernel,host_deb,url}'::text[]) ~~ 'https://_%'::text, false) AND COALESCE((byoh_virt #>> '{pvm_kernel,host_deb,sha256}'::text[]) ~ '^[0-9a-f]{64}$'::text, false) AND COALESCE((byoh_virt #>> '{pvm_kernel,guest_kernel,url}'::text[]) ~~ 'https://_%'::text, false) AND COALESCE((byoh_virt #>> '{pvm_kernel,guest_kernel,sha256}'::text[]) ~ '^[0-9a-f]{64}$'::text, false) AND
+#    CASE
+#        WHEN (byoh_virt -> 'pvm_kernel'::text) ? 'guest_config'::text THEN COALESCE((byoh_virt #>> '{pvm_kernel,guest_config,url}'::text[]) ~~ 'https://_%'::text, false) AND COALESCE((byoh_virt #>> '{pvm_kernel,guest_config,sha256}'::text[]) ~ '^[0-9a-f]{64}$'::text, false)
+#        ELSE COALESCE(jsonb_typeof(byoh_virt #> '{pvm_kernel,guest_unchecked}'::text[]) = 'boolean'::text, false)
+#    END))
 # Foreign key constraints:
 #  location_project_id_fkey | (project_id) REFERENCES project(id)
 #  location_provider_fkey   | (provider) REFERENCES provider(name)

@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
 require_relative "../model/spec_helper"
+require "tmpdir"
 require_relative "../../rhizome/host/lib/virt_probe"
+require_relative "../../rhizome/host/spec/virt_probe_fixtures"
 
 RSpec.describe ByohVirtTiers do
   let(:location) { create_byoh_location(ula48: "fd00:1:2::/48") }
@@ -102,6 +104,54 @@ RSpec.describe ByohVirtTiers do
       expect(described_class.accepts_probe?("pvm", verdict(**pvm))).to be false
       expect(described_class.accepts_probe?("pvm", verdict(**pvm, vulnerabilities: {"meltdown" => "Not affected"}, secure_boot: true))).to be false
     end
+
+    # What every caller got before pvm_install existed, pinned per fixture
+    # machine: without it, nothing changes.
+    golden = {
+      "amd_svm_disabled_by_bios" => [], "amd_svm_disabled_log_unread" => [], "aws_m7i" => %w[container],
+      "aws_m8i_nested" => %w[kvm], "aws_m8i_nested_off" => [], "aws_metal_module" => [], "aws_xen_t2" => %w[emulated],
+      "bare_metal_kvm" => %w[kvm], "bare_metal_no_flags" => [], "bare_metal_vmx_firmware_off" => [], "dev_kvm_eacces" => [],
+      "docker_container" => [], "gcp_e2" => [], "hetzner_cloud" => %w[container emulated], "hidden_hypervisor_bit" => [],
+      "intel_module_not_loaded" => [], "kvm_create_vm_refused" => [], "kvm_missing_capability" => [], "old_kernel_cgroup1" => [],
+      "proxmox_host_cpu_no_pdpe1gb" => [], "proxmox_kvm64" => [], "proxmox_kvm64_vmx_nested" => [], "pvm_host" => [],
+      "pvm_kernel_not_loaded" => %w[container], "shell_facts_without_dev_kvm" => [],
+    }
+
+    it "answers every fixture machine as before without a PVM install" do
+      results = VirtProbeFixtures.all.to_h do |name, fixture|
+        Dir.mktmpdir do |root|
+          v = ByohVirtLadder.parse(JSON.generate(VirtProbe.report(VirtProbe.facts(root: VirtProbeFixtures.materialize(fixture, root)))))
+          expect(described_class::IDS.select { described_class.accepts_probe?(it, v, pvm_install: nil) }).to eq described_class::IDS.select { described_class.accepts_probe?(it, v) }
+          [name, described_class::IDS.select { described_class.accepts_probe?(it, v) }]
+        end
+      end
+      expect(results).to eq golden
+    end
+
+    it "takes a stock-kernel probe for a PVM host only before its PVM kernel first boots" do
+      stock = {cpu_flags: %w[hypervisor], virt_vm: "amazon", vulnerabilities: {"meltdown" => "Not affected"}}
+      none = verdict(**stock)
+      blocked = verdict(**stock, pvm_module_available: true)
+      expect([none.tier, blocked.tier]).to eq %w[none pvm_blocked]
+      matrix = [nil, *ByohPvmHost::PRE_BOOT_STATES, "committed", "failed"].to_h do |state|
+        [state, [none, blocked].map { described_class.accepts_probe?("pvm", it, pvm_install: state) }]
+      end
+      expect(matrix).to eq(nil => [false, false], "install_pending" => [true, true], "installing" => [true, true], "armed" => [true, true], "committed" => [false, false], "failed" => [false, false])
+      # The hard refusals, other architectures and hardware virtualization
+      # still refuse it, and other tiers ignore the state.
+      expect(described_class.accepts_probe?("pvm", verdict(**stock, vulnerabilities: {"meltdown" => "Mitigation: PTI"}), pvm_install: "armed")).to be false
+      expect(described_class.accepts_probe?("pvm", verdict(**stock, arch: "aarch64"), pvm_install: "armed")).to be false
+      expect(described_class.accepts_probe?("pvm", verdict(**stock, cpu_flags: %w[hypervisor svm]), pvm_install: "armed")).to be false
+      expect(described_class.accepts_probe?("pvm", verdict(**stock, cpu_flags: %w[vmx]), pvm_install: "armed")).to be false
+      expect(described_class.accepts_probe?("container", none, pvm_install: "armed")).to be true
+      expect(described_class.accepts_probe?("emulated", none, pvm_install: "armed")).to be false
+    end
+  end
+
+  it "names the root partition of each image PVM VMs boot" do
+    expect(described_class.pvm_root("ubuntu-noble")).to eq "/dev/vda1"
+    expect { described_class.pvm_root("ubuntu-jammy") }.to raise_error(described_class::Refused, "pvm VMs boot ubuntu-noble only (direct kernel boot), not ubuntu-jammy")
+    expect(described_class::PVM_MIN_CH).to eq "46.0"
   end
 
   describe ".check_vm!" do

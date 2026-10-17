@@ -2,16 +2,19 @@
 
 require "stringio"
 require "tmpdir"
+require "zlib"
+require "digest"
 
 RSpec.describe ByohLocationCli do
   let(:random) { class_double(SecureRandom) }
   let(:dir) { Dir.mktmpdir }
+  let(:fetcher) { instance_double(ByohArtifactFetch) }
 
   # Runs one command; returns its exit status, stdout and stderr.
   def cli(*argv)
     out = StringIO.new
     err = StringIO.new
-    status = described_class.new(out:, err:, random:).run(argv)
+    status = described_class.new(out:, err:, random:, fetcher:).run(argv)
     [status, out.string, err.string]
   end
 
@@ -662,6 +665,154 @@ RSpec.describe ByohLocationCli do
         location.update(visible: true, byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm container], "acks" => {"container" => []}}))
         expect(cli("grant", "--location", location.name, "--project", Project.create(name: "p").ubid)[2])
           .to start_with "! location byoh-1 offers container to one project only, and is visible to every project"
+      end
+    end
+
+    describe "PVM kernel pins" do
+      # What cocoonstack/pvm v0.1.0's guest config has: the virtio
+      # console, no 8250 serial driver.
+      let(:config) { ByohPvmPolicy::REQUIRED_GUEST_CONFIG.map { "CONFIG_#{it}=y\n" }.join + "CONFIG_VIRTIO_CONSOLE=y\n" }
+      let(:vmlinux) { "\x7FELF".b + "IKCFG_ST".b + Zlib.gzip(config) + "IKCFG_ED".b }
+      let(:files) { {"https://example.com/h.deb" => "host kernel package", "https://example.com/vmlinux" => vmlinux, "https://example.com/config" => config} }
+      let(:fetched) { [] }
+      let(:curl) { {} }
+      let(:fetcher) do
+        ByohArtifactFetch.new(max_bytes: 1 << 20, runner: lambda { |*argv|
+          fetched << argv.last
+          code, out = curl[argv.last]
+          File.binwrite(argv[argv.index("-o") + 1], files.fetch(argv.last)) unless code
+          [out.to_s, instance_double(Process::Status, success?: code.nil?, exitstatus: code || 0)]
+        })
+      end
+
+      def sha(url) = Digest::SHA256.hexdigest(files.fetch(url))
+
+      def pin_args(deb: "https://example.com/h.deb", kernel: "https://example.com/vmlinux", deb_sha: sha(deb), kernel_sha: sha(kernel))
+        ["--pvm-host-deb", deb, "--pvm-host-deb-sha256", deb_sha, "--pvm-guest-kernel", kernel, "--pvm-guest-kernel-sha256", kernel_sha]
+      end
+
+      def pins
+        location.reload.byoh_virt&.[]("pvm_kernel")
+      end
+
+      it "verifies the pins by downloading them before storing anything" do
+        status, output, = cli("set", "--location", location.name, *pin_args)
+        expect(status).to eq 0
+        expect(fetched).to eq ["https://example.com/h.deb", "https://example.com/vmlinux"]
+        expect(output).to eq "Downloaded the changed PVM pins; each matches its sha256.\n" \
+          "The guest kernel config has what PVM VMs need; their console is hvc0.\n" \
+          "Updated location byoh-1.\n#{ByohPvmPolicy::ACK}\n"
+        expected = {
+          "host_deb" => {"url" => "https://example.com/h.deb", "sha256" => sha("https://example.com/h.deb")},
+          "guest_kernel" => {"url" => "https://example.com/vmlinux", "sha256" => sha("https://example.com/vmlinux")},
+          "guest_unchecked" => false, "config_checked" => true, "guest_console" => "hvc0",
+        }
+        expect(location.reload.byoh_virt.to_h).to eq("tiers" => ["kvm"], "acks" => {}, "pvm_kernel" => expected)
+        expect(JSON.parse(audit_rows.last[:args].to_json).slice("byoh_virt", "pvm_pins")).to eq("byoh_virt" => {"tiers" => ["kvm"], "acks" => {}, "pvm_kernel" => expected}, "pvm_pins" => {"verify_download" => true, "ack" => ByohPvmPolicy::ACK})
+        expect(cli("show", "--location", location.name)[1]).to include "Virt tiers    kvm\nPVM pins\n  host kernel package: https://example.com/h.deb sha256 #{expected["host_deb"]["sha256"]}\n" \
+          "  guest kernel: https://example.com/vmlinux sha256 #{expected["guest_kernel"]["sha256"]}\n  guest kernel config: none pinned\n  config checked: yes, console hvc0\nProfile\n"
+
+        # The same pins again change nothing and download nothing; other
+        # policy changes keep them.
+        fetched.clear
+        expect(cli("set", "--location", location.name, *pin_args)[1]).to eq "Updated location byoh-1.\n"
+        expect(fetched).to eq []
+        ship_virt_tiers("emulated")
+        write_rates(dir, "byoh-1", full_rates("byoh-1") + tier_rates("emulated"))
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,emulated", "--accept", "emulated")[0]).to eq 0
+        expect(pins).to eq expected
+        expect(audit_rows.last[:args]).not_to have_key("pvm_pins")
+      end
+
+      it "refuses a wrong sha256, an http redirect or an oversized file, changing nothing" do
+        refusals = {
+          ["--pvm-guest-kernel-sha256", "b" * 64] => "! https://example.com/vmlinux has sha256 #{sha("https://example.com/vmlinux")}, not the pinned #{"b" * 64}\n",
+        }
+        refusals.each do |(flag, value), message|
+          args = pin_args
+          args[args.index(flag) + 1] = value
+          expect(cli("set", "--location", location.name, *args)).to eq [1, "", message]
+        end
+        curl["https://example.com/h.deb"] = [1, "curl: (1) Protocol \"http\" not supported"]
+        expect(cli("set", "--location", location.name, *pin_args)[2]).to include "(curl exit 1; an http:// URL or redirect is refused, only https is fetched)"
+        curl.clear
+        files["https://example.com/h.deb"] = "x" * ((1 << 20) + 1)
+        expect(cli("set", "--location", location.name, *pin_args)[2]).to eq "! https://example.com/h.deb is larger than the 1048576-byte cap\n"
+        expect(location.reload.byoh_virt).to be_nil
+        expect(audit_rows).to eq []
+        expect(Dir.glob(File.join(Dir.tmpdir, "byoh-pvm-pins-*"))).to eq []
+      end
+
+      it "refuses incomplete or unsafe pins before downloading" do
+        expect(cli("set", "--location", location.name, "--pvm-host-deb", "https://example.com/h.deb")[2]).to eq "! --pvm-host-deb and --pvm-host-deb-sha256 go together\n"
+        expect(cli("set", "--location", location.name, "--pvm-guest-config-sha256", "c" * 64)[2]).to eq "! --pvm-guest-config and --pvm-guest-config-sha256 go together\n"
+        expect(cli("set", "--location", location.name, *pin_args.first(4))[2]).to eq "! pin the PVM guest kernel: --pvm-guest-kernel URL --pvm-guest-kernel-sha256 HEX\n"
+        expect(cli("set", "--location", location.name, *pin_args(deb: "http://example.com/h.deb", deb_sha: "a" * 64))[2]).to eq "! the PVM host kernel package URL http://example.com/h.deb is not https\n"
+        expect(cli("set", "--location", location.name, *pin_args, "--pvm-guest-config", "https://example.com/config", "--pvm-guest-config-sha256", sha("https://example.com/config"), "--pvm-guest-unchecked")[2])
+          .to eq "! pass either --pvm-guest-config or --pvm-guest-unchecked, not both\n"
+        expect(fetched).to eq []
+        expect(location.reload.byoh_virt).to be_nil
+      end
+
+      it "takes a guest kernel without a readable config only when accepted unchecked" do
+        files["https://example.com/vmlinux"] = "\x7FELF no config".b
+        expect(cli("set", "--location", location.name, *pin_args)[2]).to start_with "! the guest kernel has no embedded config (CONFIG_IKCONFIG)"
+        expect(location.reload.byoh_virt).to be_nil
+        status, output, = cli("set", "--location", location.name, *pin_args, "--pvm-guest-unchecked")
+        expect([status, output]).to eq [0, "Downloaded the changed PVM pins; each matches its sha256.\nThe guest kernel config was not checked (--pvm-guest-unchecked).\nUpdated location byoh-1.\n#{ByohPvmPolicy::ACK}\n"]
+        expect(pins).to include("guest_unchecked" => true, "config_checked" => false)
+
+        # A pinned config replaces the acknowledgement.
+        fetched.clear
+        expect(cli("set", "--location", location.name, "--pvm-guest-config", "https://example.com/config", "--pvm-guest-config-sha256", sha("https://example.com/config"))[0]).to eq 0
+        expect(fetched).to eq ["https://example.com/config"]
+        expect(pins).to include("guest_config" => {"url" => "https://example.com/config", "sha256" => sha("https://example.com/config")}, "config_checked" => true, "guest_console" => "hvc0")
+        expect(pins).not_to have_key("guest_unchecked")
+      end
+
+      it "stores the pins unverified with --no-verify-download, and records that" do
+        status, output, = cli("set", "--location", location.name, *pin_args(deb_sha: "a" * 64, kernel_sha: "b" * 64), "--no-verify-download")
+        expect(status).to eq 0
+        expect(output).to start_with "Not downloading the PVM pins (--no-verify-download): each host checks them when it downloads them.\nUpdated location byoh-1.\n"
+        expect(fetched).to eq []
+        expect(pins).to include("host_deb" => {"url" => "https://example.com/h.deb", "sha256" => "a" * 64}, "guest_unchecked" => false, "config_checked" => false)
+        expect(audit_rows.last[:args]["pvm_pins"]).to eq("verify_download" => false, "ack" => ByohPvmPolicy::ACK)
+        # A host package alone leaves the guest side as it was.
+        expect(cli("set", "--location", location.name, "--pvm-host-deb", "https://example.com/h2.deb", "--pvm-host-deb-sha256", "d" * 64, "--no-verify-download")[0]).to eq 0
+        expect(pins).to include("host_deb" => {"url" => "https://example.com/h2.deb", "sha256" => "d" * 64}, "config_checked" => false)
+      end
+
+      it "offers pvm only with its pins" do
+        ship_virt_tiers("pvm")
+        write_rates(dir, "byoh-1", full_rates("byoh-1") + tier_rates("pvm"))
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,pvm", "--accept", "pvm")[2])
+          .to eq "! pvm needs its kernel pins: add --pvm-host-deb URL --pvm-host-deb-sha256 HEX --pvm-guest-kernel URL --pvm-guest-kernel-sha256 HEX (docs/byoh/NO_KVM.md section 6.7)\n"
+        expect(location.reload.byoh_virt).to be_nil
+        expect(cli("set", "--location", location.name, "--virt-tiers", "kvm,pvm", "--accept", "pvm", *pin_args)[0]).to eq 0
+        expect(location.reload.byoh_virt.to_h).to include("tiers" => %w[kvm pvm], "acks" => {"pvm" => []})
+        expect(cli("show", "--location", location.name)[1]).to include "Virt tiers    kvm, pvm (L4, experimental)\nPVM pins\n"
+      end
+
+      it "starts the new guest kernel's download on the pvm hosts past prep only" do
+        expect(cli("set", "--location", location.name, *pin_args)[0]).to eq 0
+        pvm = create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm")
+        early = create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm", allocation_state: "unprepared")
+        Strand.create_with_id(early, prog: "Vm::HostNexus", label: "bootstrap_rhizome")
+        create_byoh_vm_host(location, virt_tier: "emulated", family: "emulated")
+        create_byoh_vm_host(location)
+
+        # A new host kernel package starts nothing.
+        files["https://example.com/h2.deb"] = "newer package"
+        expect(cli("set", "--location", location.name, "--pvm-host-deb", "https://example.com/h2.deb", "--pvm-host-deb-sha256", sha("https://example.com/h2.deb"))[1])
+          .to eq "Downloaded the changed PVM pins; each matches its sha256.\nUpdated location byoh-1.\n#{ByohPvmPolicy::ACK}\n"
+        expect(Strand.where(prog: "DownloadPvmGuestKernel").count).to eq 0
+
+        files["https://example.com/vmlinux2"] = vmlinux + "newer".b
+        output = cli("set", "--location", location.name, "--pvm-guest-kernel", "https://example.com/vmlinux2", "--pvm-guest-kernel-sha256", sha("https://example.com/vmlinux2"))[1]
+        strand = Strand.first(prog: "DownloadPvmGuestKernel")
+        expect(Strand.where(prog: "DownloadPvmGuestKernel").count).to eq 1
+        expect(strand.stack).to eq [{"subject_id" => pvm.id, "pin" => {"guest_kernel" => {"url" => "https://example.com/vmlinux2", "sha256" => sha("https://example.com/vmlinux2")}, "guest_unchecked" => false}}]
+        expect(output).to include "Started #{strand.ubid} to download the new PVM guest kernel on host #{pvm.ubid}; its VMs boot it from their next stop and start.\n"
       end
     end
 

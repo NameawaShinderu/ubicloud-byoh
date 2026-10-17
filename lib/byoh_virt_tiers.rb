@@ -195,11 +195,37 @@ module ByohVirtTiers
   # tier's prerequisites in place (VirtProbe.fallbacks "ready"), and a PVM
   # host none of PVM's hard refusals (ByohVirtLadder.pvm_refusal).
   # Agreement is a safety check, never an authorization.
-  def self.accepts_probe?(tier, verdict)
+  #
+  # pvm_install is the byoh_pvm_host state of a PVM host whose kernel the
+  # control plane installs: until that kernel first boots, the host runs
+  # its stock kernel, so a probe without hardware virtualization (none,
+  # or pvm_blocked) on x86_64 agrees too. nil for every other host, which
+  # keeps their answers as they were.
+  def self.accepts_probe?(tier, verdict, pvm_install: nil)
     return verdict.standard_vms? if tier == KVM
     return false if tier == "pvm" && ByohVirtLadder.pvm_refusal(verdict.report["facts"])
+    return true if tier == "pvm" && pvm_stock_kernel_ok?(verdict, pvm_install)
 
     verdict.ready.include?(tier)
+  end
+
+  def self.pvm_stock_kernel_ok?(verdict, pvm_install)
+    facts = verdict.report["facts"]
+    ByohPvmHost::PRE_BOOT_STATES.include?(pvm_install) && %w[none pvm_blocked].include?(verdict.tier) &&
+      facts["arch"] == "x86_64" && !Array(facts["cpu_flags"]).intersect?(%w[vmx svm])
+  end
+
+  # The root device of each boot image a PVM VM can boot. PVM VMs boot
+  # the location's guest kernel directly (no firmware, no initramfs), so
+  # the kernel command line names the image's root partition.
+  PVM_ROOT = {"ubuntu-noble" => "/dev/vda1"}.freeze
+
+  # The oldest cloud-hypervisor a PVM VM runs on: the go/no-go test
+  # (scripts/byoh/test/real/pvm-go-no-go.sh) booted 46.0 and 53.0.
+  PVM_MIN_CH = "46.0"
+
+  def self.pvm_root(boot_image)
+    PVM_ROOT.fetch(boot_image) { raise Refused, "pvm VMs boot #{PVM_ROOT.keys.join(", ")} only (direct kernel boot), not #{boot_image}" }
   end
 
   def self.refuse(message)
