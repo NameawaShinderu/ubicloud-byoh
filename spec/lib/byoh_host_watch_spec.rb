@@ -100,6 +100,31 @@ RSpec.describe ByohHostWatch do
     expect(out.string).to include "host Vm::HostNexus.patch\n"
   end
 
+  # Every HostNexus label is part of a bring-up phase, or a label a host
+  # reaches only once it accepts VMs or leaves the bring-up; a new label
+  # must be put in one or the other.
+  it "has a phase for every HostNexus label of a bring-up" do
+    outside = %w[configure_metrics wait unavailable prep_graceful_reboot destroy pvm_uninstall pvm_uninstalled]
+    labels = Prog::Vm::HostNexus.labels.map(&:to_s)
+    expect(labels - outside - described_class::PHASE_OF.keys).to eq []
+    expect(described_class::PHASE_OF.keys - labels).to eq []
+    expect(described_class::PHASE_OF.keys & outside).to eq []
+    expect(described_class::PHASE_OF.values_at("install_pvm_host_kernel", "pvm_install_failed", "pvm_retry")).to eq ["pvm install"] * 3
+    expect(described_class::PHASE_OF.values_at("verify_pvm_boot", "pvm_boot_failed", "verify_tier_capacity", "verify_virt_tier", "pvm_guest_kernel_refused")).to eq ["reboot", "reboot", "reboot", "bootstrap", "boot image download"]
+  end
+
+  it "gives a PVM host kernel install its own limit" do
+    strand.update(label: "pvm_install_failed")
+    expect(watch.run).to eq :timeout
+    expect(now[0]).to eq 2705
+    expect(out.string).to include "has been in its pvm install phase (at Vm::HostNexus.pvm_install_failed) for 2705 s, over its 2700 s limit"
+  end
+
+  it "stops at once on a host whose PVM kernel is being uninstalled" do
+    strand.update(label: "pvm_uninstall")
+    expect(watch.run).to eq :not_bringup
+  end
+
   it "stops at once on a host outside the bring-up that is not accepting" do
     strand.update(label: "wait")
     host.update(allocation_state: "draining")

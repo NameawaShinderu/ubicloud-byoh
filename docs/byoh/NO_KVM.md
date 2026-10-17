@@ -827,15 +827,69 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
   - It ships a udev rule `KERNEL=="kvm", GROUP="kvm", MODE="0660"`.
   - It runs `grub-reboot ubicloud-pvm`, then checks that `grub-editenv list` shows
     `next_entry=ubicloud-pvm` **and** the stock `saved_entry`. Only then is the boot **one-shot**.
-- **HostNexus walk.** `prep` buds PrepHost with the pvm step list (without the KVM check when
-  installing) and `Prog::InstallPvmHostKernel`; `wait_prep` accepts a probe of `none`/`kvm_blocked` of a
-  stock kernel (one that does not ship `kvm_pvm`) for such a host; `reboot`; a new `verify_virt_tier` label requires LearnVirt to say `pvm`, `/dev/kvm` 0660
-  group kvm, API 12 and the capabilities, and only then runs `grub-set-default ubicloud-pvm`. On
-  failure it pages "power-cycle the instance from the provider console; it returns to the stock
-  kernel". That holds only because the install asserted the stock `saved_entry` before the reboot;
-  a host whose assertion failed never reboots. Back on the stock kernel, prep checks that
-  `/proc/cmdline` lacks `pti=off`. The per-host ack and the `lockdown` state are recorded in
-  `byoh_operator_action`.
+- **HostNexus walk** (built on `pvm-build`, PVM plan WP7; specs only, UNVERIFIED on a real host). It
+  differs from the first design above in two ways. GRUB's default is never the PVM kernel (plan D2):
+  `saved_entry` stays the stock kernel for good, and `ubicloud-pvm-boot.service`, which runs only on
+  the PVM kernel (`ConditionKernelCommandLine=pti=off`), loads `kvm_pvm`, checks `/dev/kvm` and the stock
+  entry, and only then arms the next boot with `grub-reboot`. So "commit" is a database state, not a
+  GRUB write, and a boot that fails or hangs returns to stock on the next power cycle, also on a
+  committed host. And the install runs after `patch`, so it pins the stock kernel the host runs after
+  the apt full-upgrade. The walk of a host registered with `--install-pvm-kernel`:
+  `wait_prep → verify_virt_tier → setup_storage_backend → download_boot_images →
+  wait_download_boot_images → patch → install_pvm_host_kernel → prep_reboot → reboot →
+  verify_pvm_boot → verify_tier_capacity → start_slices → start_vms`.
+  - `verify_virt_tier` takes the stock probe (`accepts_probe?` with the `byoh_pvm_host` state), then
+    runs rhizome's read-only `install-pvm-host-kernel preflight`. A refusal pages `ByohPvmInstall`
+    with each reason and checks again every 5 minutes; the page resolves once preflight passes.
+    The control plane passes no `unchecked_drivers`, so a host whose disk or NIC driver the tool
+    cannot find a module for is refused until a knob for them exists (open; AWS ENA and NVMe have
+    modules, so m6i passes in the specs' terms, UNVERIFIED on the instance).
+  - `patch` records the installed `linux-image-*` packages before and after the upgrade in the strand
+    frame (`bin/byoh-virt show` prints them), then hops to the install while the state is
+    `install_pending`.
+  - `install_pvm_host_kernel` (deadline 45 minutes to `prep_reboot`) first compares the location's
+    host-deb pin with `byoh_pvm_host.host_deb_sha256`, the build the operator acknowledged; a
+    different pin is refused before anything runs on the host, with the fix
+    `bin/byoh-virt pvm retry --host <vh> --accept-host-deb <sha256>`. The install itself runs
+    daemonized (`d_run`, checked every 30 s), so no strand run comes near respirate's ~91 s limit.
+    Success records `armed`, the PVM and stock kernels and the stock entry. A refusal (nothing changed)
+    or a failure (rhizome already un-armed the host) records `failed`, pages `ByohPvmInstall` with the
+    tool's result and the last log lines, and waits at `pvm_install_failed`.
+  - `prep_reboot` arms one PVM boot before every reboot of an install host (`install-pvm-host-kernel
+    arm`, which also checks that the stock entry still boots). A host that cannot be armed is not
+    rebooted: it pages `ByohPvmBoot`, stops taking VMs and waits at `pvm_boot_failed`.
+  - `verify_pvm_boot` runs after `reboot` and after an out-of-band reboot (`check_boot_id` from `wait`
+    and `unavailable`). It records a fresh probe and requires all of: the probe says `pvm` with none of
+    PVM's hard refusals, KVM API 12, the running kernel is the installed PVM kernel, the boot unit is
+    active and succeeded (it waits up to 5 minutes for a unit that has not run yet, since SSH comes up
+    before `multi-user.target`), and `/dev/kvm` is a 0660 character device of group `kvm`. Then the
+    state is `committed` and the VMs start. On any refusal it runs `disarm` first, pages `ByohPvmBoot`
+    ("booted its stock kernel ..." when the host came back on stock, with the serial-console and
+    power-cycle advice), drains an accepting host, never starts VMs, and waits at `pvm_boot_failed`.
+    A host whose PVM kernel was installed before registration (`committed`, no install) gets the probe
+    checks only and is never armed or disarmed.
+  - Operator actions, each an operator-action row and a semaphore (`pvm_retry`, `pvm_uninstall`) that
+    HostNexus acts on only on pvm hosts: `bin/byoh-virt pvm retry --host <vh>` installs again after a
+    failed install (uninstalling first what a failed one left), or arms one more PVM boot and reboots
+    after a failed boot. It refuses elsewhere. `bin/byoh-virt pvm uninstall --host <vh>` refuses while
+    the host has VMs; HostNexus disarms and reboots a host on its PVM kernel to stock first, runs the
+    daemonized `uninstall`, records `uninstalled`, pages `ByohPvmUninstalled` ("destroy and register it
+    again as kvm, container or emulated") and stays at `pvm_uninstalled`.
+  - LearnVirt passes the install state, so a host on its stock kernel before the PVM boot gets no
+    false `ByohVirtTier` page. On pvm the `ByohKernelReboot` page is replaced by `ByohPvmHostKernel`
+    (warning): a committed host runs another kernel than its PVM kernel, or its PVM kernel is not the
+    location's current host-deb pin. Moving a host to a new pin is plan WP9 (not built). Container
+    keeps `ByohKernelReboot` unchanged.
+  - `wait` pages `ByohPvmGuestKernelStale` (warning) with the VMs whose guest kernel is not the host's
+    current one; the fix is to stop and start each (section 6.8).
+  - `bin/byoh-host watch` knows the new labels: phase "pvm install" (45 minutes) for
+    `install_pvm_host_kernel`, `pvm_install_failed` and `pvm_retry`; `verify_pvm_boot` and
+    `pvm_boot_failed` in "reboot". `pvm_uninstall` ends a bring-up. A spec fails when a HostNexus label
+    is in neither the phases nor the list of labels outside a bring-up.
+  - U1: a golden walk (`spec/prog/vm/host_nexus_walk_golden_spec.rb`) runs kvm, container and emulated
+    hosts from `patch` to `start_vms` and through an out-of-band reboot with every host command in
+    order; it passes unchanged on the commit before WP7. The prep, the per-host ack and the `lockdown`
+    record are WP4 and WP6.
 - **Capacity.** No hugepages on PVM (shadow paging; this also avoids the `pdpe1gb` requirement); a
   nohugepages-style CH unit; the budget comes from `verify_tier_capacity` (section 10.4).
 - **Direct boot.** `--kernel <vmlinux>` and `--cmdline root=<PVM_ROOT[image]> rw console=ttyS0`. The

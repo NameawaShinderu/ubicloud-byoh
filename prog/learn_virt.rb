@@ -19,11 +19,18 @@
 # holds a lower-tier host at verify_virt_tier until a probe agrees.
 #
 # On a lower-tier host the probe also runs once a day from HostNexus#wait
-# (stale?), and on a tier whose guests rely on the host kernel
-# (KERNEL_TIERS: containers share it, PVM guests run on its kvm_pvm) a
-# pending reboot (/var/run/reboot-required) that lasts REBOOT_GRACE pages
-# ByohKernelReboot, since every tenant shares that unpatched kernel. The
-# page resolves once the flag clears.
+# (stale?). On a tier whose guests rely on the host kernel (KERNEL_TIERS)
+# it records since when a reboot is pending (/var/run/reboot-required).
+# Containers share the host kernel, so one that waits REBOOT_GRACE pages
+# ByohKernelReboot: every tenant shares that unpatched kernel, and the page
+# resolves once the flag clears. A pvm host runs a held PVM kernel that no
+# apt upgrade replaces, so instead a host whose control plane installed
+# PVM kernel is not the one it runs, or not the location's host-deb pin,
+# pages ByohPvmHostKernel.
+#
+# A pvm host whose PVM kernel the control plane installs probes as its
+# stock kernel until that kernel first boots, which agrees with its tier
+# (ByohVirtTiers.accepts_probe? with its byoh_pvm_host state).
 class Prog::LearnVirt < Prog::Base
   subject_is :sshable, :vm_host
 
@@ -54,13 +61,15 @@ class Prog::LearnVirt < Prog::Base
     end
 
     tier = vm_host.virt_tier
-    record = verdict.record.merge(probed_at)
-    if KERNEL_TIERS.include?(tier)
-      since = record["reboot_required_since"] = reboot_required_since(verdict)
-      check_kernel_reboot(since, verdict)
+    record = self.class.record(vm_host, verdict)
+    if tier == "pvm"
+      check_pvm_host_kernel(verdict)
+    elsif KERNEL_TIERS.include?(tier)
+      check_kernel_reboot(record["reboot_required_since"], verdict)
     end
     vm_host.update(virt_probe: Sequel.pg_jsonb(record))
-    if ByohVirtTiers.accepts_probe?(tier, verdict)
+    pvm_install = (tier == "pvm") ? ByohPvmHost[vm_host.id]&.state : nil
+    if ByohVirtTiers.accepts_probe?(tier, verdict, pvm_install:)
       Page.from_tag_parts("ByohVirtTier", vm_host.ubid)&.incr_resolve
     elsif ByohVirtTiers.lower?(tier)
       fix = if verdict.standard_vms?
@@ -76,17 +85,55 @@ class Prog::LearnVirt < Prog::Base
     pop "virt tier #{verdict.tier}"
   end
 
-  # What a lower-tier host records of when it was probed (stale?); a KVM
-  # host's record stays as it was.
+  # What vm_host.virt_probe records of verdict: a lower-tier host also
+  # when it was probed (stale?), and on a KERNEL_TIERS host when it was
+  # first seen waiting for a reboot, kept across probes. A KVM host's
+  # record stays as it was. HostNexus#verify_pvm_boot records its probe
+  # the same way.
+  def self.record(vm_host, verdict)
+    record = verdict.record
+    return record unless ByohVirtTiers.lower?(vm_host.virt_tier)
+
+    record = record.merge("probed_at" => Time.now.utc.iso8601)
+    if KERNEL_TIERS.include?(vm_host.virt_tier)
+      record["reboot_required_since"] = if verdict.report.dig("facts", "reboot_required")
+        vm_host.virt_probe&.[]("reboot_required_since") || Time.now.utc.iso8601
+      end
+    end
+    record
+  end
+
+  # What a failed probe records of when it ran.
   def probed_at
     ByohVirtTiers.lower?(vm_host.virt_tier) ? {"probed_at" => Time.now.utc.iso8601} : {}
   end
 
-  # When the host was first seen waiting for a reboot, kept across probes.
-  def reboot_required_since(verdict)
-    return unless verdict.report.dig("facts", "reboot_required")
+  # A pvm host whose PVM kernel the control plane installed and
+  # committed must run that kernel, built from the location's host-deb
+  # pin. A new pin is not rolled out by itself (docs/byoh/NO_KVM.md
+  # section 6.8): the page says so until the host is moved to it.
+  def check_pvm_host_kernel(verdict)
+    row = ByohPvmHost[vm_host.id]
+    pin = ByohPvmPolicy.pins(ByohVirtTiers.policy(vm_host.location))&.dig("host_deb", "sha256")
+    kernel = verdict.report.dig("facts", "kernel")
+    problem = if row&.install && row.state == "committed"
+      if kernel != row.host_kver
+        "runs kernel #{kernel}, not its PVM kernel #{row.host_kver}"
+      elsif pin != row.host_deb_sha256
+        "runs the PVM host kernel #{row.host_kver} (host-deb sha256 #{row.host_deb_sha256}), but location #{vm_host.location.name} pins #{pin ? "sha256 #{pin}" : "no host kernel"}"
+      end
+    end
+    tag = ["ByohPvmHostKernel", vm_host.ubid]
+    unless problem
+      Page.from_tag_parts(*tag)&.incr_resolve
+      return
+    end
 
-    vm_host.virt_probe&.[]("reboot_required_since") || Time.now.utc.iso8601
+    Prog::PageNexus.assemble("#{vm_host.ubid} #{problem}", tag, vm_host.ubid, resource_id: vm_host.id, severity: "warning",
+      extra_data: {kernel:, pvm_kernel: row.host_kver, host_deb_sha256: row.host_deb_sha256, pinned_sha256: pin,
+                   fix: "A PVM host kernel is never replaced in place, and moving a host to a new host-deb pin (bin/byoh-virt pvm upgrade, WP9) is not built yet. " \
+                     "Keep the host on its kernel, or drain it, destroy it and register it again (--install-pvm-kernel installs the current pin). " \
+                     "A host that runs another kernel booted outside the control plane; see bin/byoh-virt show --host #{vm_host.ubid}."})
   end
 
   def check_kernel_reboot(since, verdict)

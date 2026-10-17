@@ -193,4 +193,163 @@ RSpec.describe ByohVirtCli do
       expect(cli("refresh", "--host", host.reload.ubid)[0]).to eq 0
     end
   end
+
+  describe "pvm" do
+    let(:pvm_host) { create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm", net6: "fd00:9:9:8::/64") }
+    let(:row) { ByohPvmHost.create(vm_host_id: pvm_host.id, state: "failed", install: true, host_deb_sha256: "a" * 64, lockdown: "none", meltdown: "Not affected", last_error: "apt-get failed") }
+    let(:strand) { Strand.create_with_id(pvm_host, prog: "Vm::HostNexus", label: "pvm_install_failed", stack: [{}]) }
+
+    before do
+      location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm pvm], "acks" => {"pvm" => []}, "pvm_kernel" => pvm_test_pins}))
+      row
+      strand
+    end
+
+    def semaphores = Semaphore.where(strand_id: pvm_host.id).select_order_map(:name)
+
+    def actions = DB[:byoh_operator_action].order(:id).select_map([:command, :args, :result]).map { |c, a, r| [c, a.to_h, r] }
+
+    it "refuses an unknown subcommand, a missing host and a host of another tier" do
+      expect(cli("pvm")).to eq [1, "", "! usage: bin/byoh-virt pvm retry|uninstall --host UBID
+"]
+      expect(cli("pvm", "frob")[2]).to eq "! usage: bin/byoh-virt pvm retry|uninstall --host UBID
+"
+      expect(cli("pvm", "retry")).to eq [1, "", "! --host is required
+"]
+      expect(cli("pvm", "uninstall", "--host", host.ubid)).to eq [1, "", "! host #{host.ubid} is a kvm host, not pvm
+"]
+      row.destroy
+      expect(cli("pvm", "retry", "--host", pvm_host.ubid)).to eq [1, "", "! host #{pvm_host.ubid} has no PVM kernel record
+"]
+    end
+
+    describe "retry" do
+      it "asks the host to install again and records it" do
+        status, out, = cli("pvm", "retry", "--host", pvm_host.ubid)
+        expect(status).to eq 0
+        expect(out).to eq "Asked host #{pvm_host.ubid} to install the PVM host kernel again; follow it with bin/byoh-host watch #{pvm_host.ubid}.\n"
+        expect(semaphores).to eq ["pvm_retry"]
+        expect(actions).to eq [["virt-pvm-retry", {"from" => "pvm_install_failed"}, "requested"]]
+      end
+
+      it "asks a host whose PVM boot failed to boot it once more" do
+        strand.update(label: "pvm_boot_failed")
+        row.update(state: "armed")
+        create_vm(vm_host_id: pvm_host.id, family: "pvm", location_id: location.id)
+        status, out, = cli("pvm", "retry", "--host", pvm_host.ubid)
+        expect([status, out]).to eq [0, "Asked host #{pvm_host.ubid} to arm one more PVM kernel boot and reboot it; follow it with bin/byoh-host watch #{pvm_host.ubid}.\n"]
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid, "--accept-host-deb", "a" * 64)[2]).to eq "! --accept-host-deb is for a failed install; this host's PVM kernel is installed\n"
+      end
+
+      it "refuses a host where nothing failed" do
+        strand.update(label: "wait")
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid)).to eq [1, "", "! host #{pvm_host.ubid} is at wait; pvm retry acts only where a PVM kernel install or boot failed (pvm_install_failed, pvm_boot_failed)\n"]
+        expect(semaphores).to eq []
+      end
+
+      it "takes the location's new host-deb pin only when the operator accepts it" do
+        location.update(byoh_virt: Sequel.pg_jsonb(location.byoh_virt.to_h.merge("pvm_kernel" => pvm_test_pins.merge("host_deb" => {"url" => "https://example.com/new.deb", "sha256" => "c" * 64}))))
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid)[2]).to eq "! location byoh-v pins host-deb sha256 #{"c" * 64}, but this host acknowledged #{"a" * 64}; check the new build, then pvm retry --host #{pvm_host.ubid} --accept-host-deb #{"c" * 64}\n"
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid, "--accept-host-deb", "a" * 64)[2]).to eq "! location byoh-v pins host-deb sha256 #{"c" * 64}, not #{"a" * 64}\n"
+        expect(semaphores).to eq []
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid, "--accept-host-deb", "c" * 64)[0]).to eq 0
+        expect(row.reload.host_deb_sha256).to eq "c" * 64
+        expect(actions).to eq [["virt-pvm-retry", {"from" => "pvm_install_failed", "accept_host_deb" => "c" * 64}, "requested"]]
+      end
+
+      it "names a location that pins no host kernel" do
+        location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm], "acks" => {}}))
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid)[2]).to end_with "then pvm retry --host #{pvm_host.ubid} --accept-host-deb SHA256\n"
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid, "--accept-host-deb", "c" * 64)[2]).to eq "! location byoh-v pins host-deb sha256 none, not #{"c" * 64}\n"
+      end
+    end
+
+    describe "uninstall" do
+      it "asks the host to uninstall its PVM kernel and records it" do
+        status, out, = cli("pvm", "uninstall", "--host", pvm_host.ubid)
+        expect(status).to eq 0
+        expect(out).to start_with "Asked host #{pvm_host.ubid} to uninstall its PVM host kernel"
+        expect(semaphores).to eq ["pvm_uninstall"]
+        expect(actions).to eq [["virt-pvm-uninstall", {"from" => "pvm_install_failed"}, "requested"]]
+      end
+
+      it "refuses while the host has VMs, at a label it cannot start from, or when there is nothing to uninstall" do
+        vm = create_vm(vm_host_id: pvm_host.id, family: "pvm", location_id: location.id)
+        expect(cli("pvm", "uninstall", "--host", pvm_host.ubid)[2]).to eq "! host #{pvm_host.ubid} has 1 VMs; delete them first (an uninstall leaves the host unable to run them)\n"
+        vm.destroy
+        strand.update(label: "reboot")
+        expect(cli("pvm", "uninstall", "--host", pvm_host.ubid)[2]).to eq "! host #{pvm_host.ubid} is at reboot; pvm uninstall starts only at verify_virt_tier, pvm_install_failed, pvm_boot_failed, wait\n"
+        row.update(state: "uninstalled")
+        expect(cli("pvm", "uninstall", "--host", pvm_host.ubid)[2]).to eq "! host #{pvm_host.ubid} has its PVM kernel uninstalled already\n"
+        row.update(state: "committed", install: false)
+        expect(cli("pvm", "uninstall", "--host", pvm_host.ubid)[2]).to start_with "! the control plane did not install the PVM kernel of host #{pvm_host.ubid}"
+        expect(semaphores).to eq []
+        expect(actions).to eq []
+      end
+    end
+
+    describe "show" do
+      it "shows the PVM host kernel, the host's last word on its boot and the guest kernels" do
+        row.update(state: "committed", host_kver: "6.12.33-pvm", stock_kver: "7.0.0-1014-aws", stock_entry: "Advanced options for Ubuntu>Ubuntu, with Linux 7.0.0-1014-aws", last_error: nil)
+        strand.update(label: "wait", stack: [{
+          "pvm_status" => {"at" => "2026-10-17T00:00:00Z", "kernel" => "6.12.33-pvm", "grubenv" => {"saved_entry" => "S", "next_entry" => "ubicloud-pvm"},
+                           "boot_unit" => {"ActiveState" => "active", "Result" => "success"}},
+          "pvm_patch_kernels" => {"before" => ["linux-image-7.0.0-1014-aws"]},
+        }])
+        ByohPvmGuestKernel.create(vm_host_id: pvm_host.id, sha256: "b" * 64, state: "ready", release: "6.12.33-pvm", console: "hvc0", config_checked: true)
+        ByohPvmGuestKernel.create(vm_host_id: pvm_host.id, sha256: "c" * 64, state: "refused")
+        ByohPvmGuestKernel.create(vm_host_id: pvm_host.id, sha256: "d" * 64, state: "ready", release: "6.12.40-pvm", console: "ttyS0", config_checked: false)
+        status, out, err = cli("show", "--host", pvm_host.ubid)
+        expect([status, err]).to eq [0, ""]
+        expect(out.lines).to eq <<~OUT.lines
+          host #{pvm_host.ubid} was never probed; run bin/byoh-virt refresh --host #{pvm_host.ubid}
+          PVM host kernel: committed, installed by the control plane
+            PVM kernel 6.12.33-pvm, stock kernel 7.0.0-1014-aws (GRUB default 'Advanced options for Ubuntu>Ubuntu, with Linux 7.0.0-1014-aws')
+            host-deb sha256 #{"a" * 64} (the location's pin)
+            lockdown none, Meltdown Not affected
+            at 2026-10-17T00:00:00Z: kernel 6.12.33-pvm, grubenv next_entry=ubicloud-pvm saved_entry=S
+            boot unit Result=success ActiveState=active
+            kernel packages before patch: linux-image-7.0.0-1014-aws; after: (patch running)
+          PVM guest kernels:
+            #{"b" * 64} ready 6.12.33-pvm, console hvc0, config checked, the location's pin
+            #{"c" * 64} refused
+            #{"d" * 64} ready 6.12.40-pvm, console ttyS0, config unchecked
+        OUT
+      end
+
+      it "shows a failed install, a stale pin, and what is not recorded" do
+        location.update(byoh_virt: Sequel.pg_jsonb(location.byoh_virt.to_h.merge("pvm_kernel" => pvm_test_pins.merge("host_deb" => {"url" => "https://example.com/new.deb", "sha256" => "c" * 64}))))
+        strand.update(stack: [{"pvm_status" => {"at" => "t"}, "pvm_patch_kernels" => {"before" => ["a"], "after" => ["a", "b"]}}])
+        pvm_host.update(virt_probe: Sequel.pg_jsonb(ByohVirtLadder.parse(no_virt).record))
+        status, out, = cli("show", "--host", pvm_host.ubid)
+        expect(status).to eq 3
+        expect(out).to include(
+          "registered tier: pvm, the probe disagrees; see the ByohVirtTier page\nPVM host kernel: failed, installed by the control plane\n",
+          "  PVM kernel -, stock kernel - (GRUB default -)\n",
+          "  host-deb sha256 #{"a" * 64} (the location pins #{"c" * 64})\n",
+          "  last error: apt-get failed\n",
+          "  at t: kernel -, grubenv \n",
+          "  kernel packages before patch: a; after: a b\n",
+          "  waiting for bin/byoh-virt pvm retry or pvm uninstall (pvm_install_failed)\n",
+          "PVM guest kernels: none\n",
+        )
+
+        row.update(host_deb_sha256: nil, lockdown: nil, meltdown: nil)
+        strand.update(stack: [{"pvm_patch_kernels" => {}}])
+        out = cli("show", "--host", pvm_host.ubid)[1]
+        expect(out).to include("  lockdown -, Meltdown -\n", "  kernel packages before patch: ; after: (patch running)\n")
+        expect(out).not_to include("host-deb sha256", "  at ")
+
+        row.update(state: "committed", install: false)
+        expect(cli("show", "--host", pvm_host.ubid)[1]).to include "PVM host kernel: committed, installed before registration\n"
+
+        strand.destroy
+        expect(cli("pvm", "retry", "--host", pvm_host.ubid)[2]).to start_with "! host #{pvm_host.ubid} is at no strand; pvm retry acts only"
+        row.update(install: true)
+        expect(cli("pvm", "uninstall", "--host", pvm_host.ubid)[2]).to start_with "! host #{pvm_host.ubid} is at no strand; pvm uninstall starts only"
+        row.destroy
+        expect(cli("show", "--host", pvm_host.ubid)[1]).to end_with "PVM host kernel: not recorded\nPVM guest kernels: none\n"
+      end
+    end
+  end
 end

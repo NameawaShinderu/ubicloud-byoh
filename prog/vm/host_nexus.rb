@@ -3,7 +3,7 @@
 class Prog::Vm::HostNexus < Prog::Base
   subject_is :sshable, :vm_host
   frame_reader :vhost_block_backend_version, :default_boot_images, :install_os
-  frame_accessor :accepting_before_patch
+  frame_accessor :accepting_before_patch, :pvm_patch_kernels, :pvm_status, :pvm_reinstall, :pvm_drained, :pvm_boot_waits
 
   def self.assemble(sshable_hostname, location_id: Location::HETZNER_FSN1_ID, family: "standard", net6: nil, ndp_needed: false, provider_name: nil, server_identifier: nil, provider_config: nil, ssh_private_key: nil, vhost_block_backend_version: Config.vhost_block_backend_version, default_boot_images: [], install_os: false, ipv6_mode: "gua", virt_tier: ByohVirtTiers::KVM, pinned_host_keys: nil, pvm_install: nil, pvm_facts: {})
     DB.transaction do
@@ -266,12 +266,14 @@ class Prog::Vm::HostNexus < Prog::Base
     fail "#{vm_host.virt_tier} host has no virtualization probe yet; run bin/byoh-virt refresh --host #{vm_host.ubid}" if probe.nil? || probe["error"]
 
     verdict = ByohVirtLadder.verdict(probe)
-    unless ByohVirtTiers.accepts_probe?(vm_host.virt_tier, verdict)
+    pvm_install = pvm_row&.state if pvm_host?
+    unless ByohVirtTiers.accepts_probe?(vm_host.virt_tier, verdict, pvm_install:)
       fail "#{vm_host.virt_tier} host does not have the tier's prerequisites (probe: #{verdict.summary}); fix it, then run bin/byoh-virt refresh --host #{vm_host.ubid}"
     end
     if pvm_host? && !ByohVirtTiers.pvm_os_ok?(vm_host.os_version)
       fail "pvm host runs #{vm_host.os_version || "an unknown OS"}; pvm VMs need cloud-hypervisor #{ByohVirtTiers::PVM_MIN_CH} or later, which rhizome installs on Ubuntu #{ByohVirtTiers::PVM_MIN_UBUNTU} or later only; reinstall the host with Ubuntu #{ByohVirtTiers::PVM_MIN_UBUNTU} and register it again"
     end
+    check_pvm_preflight if pvm_install == "install_pending"
 
     hop_download_boot_images if ByohVirtTiers.fetch(vm_host.virt_tier).storage == "none"
     hop_setup_storage_backend
@@ -328,10 +330,20 @@ class Prog::Vm::HostNexus < Prog::Base
 
   def pvm_host? = vm_host.virt_tier == "pvm"
 
+  # The byoh_pvm_host row of a pvm host, or nil.
+  def pvm_row = ByohPvmHost[vm_host.id]
+
+  # Whether the control plane installs this pvm host's PVM kernel
+  # (rhizome's install-pvm-host-kernel). A host that ran a PVM kernel
+  # already at registration (committed, install false) gets none of the
+  # install's steps.
+  def pvm_managed? = pvm_host? && !!pvm_row&.install
+
   # Whether the host holds a guest kernel PVM VMs can boot.
   def pvm_guest_kernel_ready? = !ByohPvmGuestKernel.where(vm_host_id: vm_host.id, state: "ready").empty?
 
   label def prep_reboot
+    arm_pvm_boot if pvm_managed? && !pvm_uninstall_set?
     register_deadline("wait", 15 * 60)
     boot_id = get_boot_id
     vm_host.update(last_boot_id: boot_id)
@@ -359,6 +371,7 @@ class Prog::Vm::HostNexus < Prog::Base
 
     vm_host.update(last_boot_id: new_boot_id)
     hop_verify_spdk unless vm_host.spdk_installations_dataset.empty?
+    hop_verify_pvm_boot if pvm_host?
     hop_verify_tier_capacity if ByohVirtTiers.lower?(vm_host.virt_tier)
     hop_verify_hugepages
   end
@@ -575,12 +588,396 @@ TIMER
     case sshable.d_check("apply_patches")
     when "Succeeded"
       sshable.d_clean("apply_patches")
+      if pvm_host?
+        record_pvm_patch_kernels("after")
+        hop_install_pvm_host_kernel if pvm_row&.state == "install_pending"
+      end
       hop_prep_reboot
     when "Failed", "NotStarted"
+      record_pvm_patch_kernels("before") if pvm_host?
       sshable.d_run("apply_patches", "sudo", "bash", "-c", "apt update && apt full-upgrade -y")
     end
 
     nap 60
+  end
+
+  # The PVM host kernel of a pvm host whose control plane installs it
+  # (docs/byoh/NO_KVM.md section 6.7, rhizome's install-pvm-host-kernel).
+  # GRUB's default stays the stock kernel for good: the install, and
+  # prep_reboot before every reboot, arm one boot of the PVM kernel, and on
+  # it ubicloud-pvm-boot.service arms the next one once kvm_pvm gave a
+  # usable /dev/kvm. A boot that fails or hangs returns to the stock
+  # kernel on the next power cycle. verify_pvm_boot checks every boot,
+  # and takes the PVM kernel out of the boot path (disarm) before it
+  # pages on any refusal; the host then waits for bin/byoh-virt pvm retry
+  # or pvm uninstall (the pvm_retry and pvm_uninstall semaphores).
+  PVM_KERNEL_TOOL = "host/bin/install-pvm-host-kernel"
+  PVM_INSTALL_UNIT = "install_pvm_host_kernel"
+  PVM_UNINSTALL_UNIT = "uninstall_pvm_host_kernel"
+
+  # The states of the host's state.json in which nothing of an install
+  # is on the host: none, a refused install, or an uninstall.
+  PVM_HOST_UNCHANGED = [nil, "refused", "uninstalled"].freeze
+
+  # The patch run of an install host runs first (wait_download_boot_images
+  # hops to patch), so the install pins the stock kernel the host runs
+  # after it. It runs as a daemon: fetching and installing the package
+  # takes minutes, far over a strand run's limit.
+  label def install_pvm_host_kernel
+    register_deadline("prep_reboot", 45 * 60)
+    row = pvm_row
+    case sshable.d_check(PVM_INSTALL_UNIT)
+    when "Succeeded"
+      status = pvm_kernel("status")
+      sshable.d_clean(PVM_INSTALL_UNIT)
+      state = status["state"]
+      row.update(state: "armed", host_kver: state["kver"], stock_entry: state["stock_entry"], stock_kver: state["stock_kver"], last_error: nil, updated_at: Time.now)
+      record_pvm_status(status)
+      resolve_pvm_page("ByohPvmInstall")
+      hop_prep_reboot
+    when "Failed"
+      status = pvm_kernel("status")
+      logs = sshable.d_logs(PVM_INSTALL_UNIT, lines: 20).strip
+      sshable.d_clean(PVM_INSTALL_UNIT)
+      record_pvm_status(status)
+      pvm_install_failed!(status, logs)
+    when "NotStarted"
+      pin = ByohPvmPolicy.pins(ByohVirtTiers.policy(vm_host.location))&.dig("host_deb")
+      unless pin && pin["sha256"] == row.host_deb_sha256
+        error = "location #{vm_host.location.name} pins #{pin ? "host-deb sha256 #{pin["sha256"]}" : "no PVM host kernel"}, but the operator acknowledged sha256 #{row.host_deb_sha256} for this host"
+        row.update(state: "failed", last_error: error, updated_at: Time.now)
+        pvm_page("ByohPvmInstall", "did not install the PVM host kernel: #{error}", error:,
+          fix: "Nothing was changed on the host. Check the build the location pins now, then bin/byoh-virt pvm retry --host #{vm_host.ubid} --accept-host-deb #{pin ? pin["sha256"] : "SHA256"}; or pin the acknowledged build again with bin/byoh-location set.")
+        hop_pvm_install_failed
+      end
+      row.update(state: "installing", updated_at: Time.now)
+      sshable.d_run(PVM_INSTALL_UNIT, "sudo", PVM_KERNEL_TOOL, "install", stdin: JSON.generate("host_deb" => pin))
+    end
+
+    nap 30
+  end
+
+  # An install that failed or was refused waits here, with its page
+  # open, for the operator: bin/byoh-virt pvm retry or pvm uninstall.
+  label def pvm_install_failed
+    unregister_deadline(deadline_target) if deadline_at
+    when_pvm_uninstall_set? { hop_pvm_uninstall }
+    when_pvm_retry_set? do
+      decr_pvm_retry
+      hop_pvm_retry
+    end
+
+    nap 6 * 60 * 60
+  end
+
+  # Installs again after pvm retry: at once when the failed install
+  # changed nothing on the host, after an uninstall otherwise.
+  label def pvm_retry
+    status = pvm_kernel("status")
+    record_pvm_status(status)
+    if PVM_HOST_UNCHANGED.include?(status.dig("state", "state"))
+      pvm_row.update(state: "install_pending", last_error: nil, updated_at: Time.now)
+      hop_install_pvm_host_kernel
+    end
+
+    self.pvm_reinstall = true
+    hop_pvm_uninstall
+  end
+
+  # Checks each boot of a pvm host: after prep_reboot's reboot and after
+  # an out-of-band one (check_boot_id). The host must run its PVM kernel
+  # with kvm_pvm giving a usable /dev/kvm, and the probe must agree with
+  # the tier, before its VMs start. A host rebooted for an uninstall
+  # (pvm_uninstall) goes back to it instead.
+  label def verify_pvm_boot
+    hop_pvm_uninstall if pvm_uninstall_set?
+
+    row = pvm_row
+    verdict = ByohVirtLadder.parse(sshable.cmd("sudo host/bin/virt-probe --json"))
+    vm_host.update(virt_probe: Sequel.pg_jsonb(Prog::LearnVirt.record(vm_host, verdict)))
+    status = pvm_kernel("status") if row&.install
+    record_pvm_status(status) if status
+    # SSH comes up before multi-user.target, so the boot unit may not
+    # have run yet on a PVM kernel that boots fine.
+    if status && pvm_boot_unit_pending?(status) && (pvm_boot_waits || 0) < PVM_BOOT_WAITS
+      self.pvm_boot_waits = (pvm_boot_waits || 0) + 1
+      nap 10
+    end
+    delete_from_stack("pvm_boot_waits")
+
+    problems = pvm_boot_problems(verdict, status, row)
+    if problems.empty?
+      row&.update(state: "committed", host_kver: status ? status["kernel"] : row.host_kver, last_error: nil, updated_at: Time.now)
+      resolve_pvm_page("ByohPvmBoot")
+      Page.from_tag_parts("ByohVirtTier", vm_host.ubid)&.incr_resolve
+      undrain_pvm_host
+      hop_verify_tier_capacity
+    end
+
+    record_pvm_status(pvm_kernel("disarm").merge("kernel" => status["kernel"])) if status
+    row&.update(last_error: problems.join("; "), updated_at: Time.now)
+    drain_pvm_host
+    stock = status && !status["running_pvm"] && !status["pti_off"]
+    pvm_page("ByohPvmBoot", stock ? "booted its stock kernel #{status["kernel"]}, not the PVM kernel #{row.host_kver}" : "cannot run pvm VMs after its boot: #{problems.join("; ")}",
+      problems:, kernel: status&.dig("kernel"), fix: pvm_boot_fix(row, stock))
+    hop_pvm_boot_failed
+  end
+
+  # A pvm host whose PVM kernel boot failed waits here, with its VMs
+  # stopped and its page open, for the operator: pvm retry arms one more
+  # PVM boot and reboots the host; pvm uninstall abandons PVM.
+  label def pvm_boot_failed
+    unregister_deadline(deadline_target) if deadline_at
+    when_pvm_uninstall_set? { hop_pvm_uninstall }
+    when_pvm_retry_set? do
+      decr_pvm_retry
+      hop_prep_reboot
+    end
+
+    nap 6 * 60 * 60
+  end
+
+  # Takes the PVM kernel off the host (bin/byoh-virt pvm uninstall, which
+  # refuses while the host has VMs, or pvm retry after a failed install
+  # that changed the host). uninstall runs only on the stock kernel, so a
+  # host on its PVM kernel is disarmed and rebooted first; the
+  # pvm_uninstall semaphore stays set across that reboot.
+  label def pvm_uninstall
+    register_deadline("pvm_uninstalled", 45 * 60) unless pvm_reinstall
+    unless vm_host.vms_dataset.empty?
+      Clog.emit("pvm uninstall waits for the host's VMs to be deleted", {pvm_uninstall_waits: {vm_host_ubid: vm_host.ubid, vms: vm_host.vms_dataset.count}})
+      nap 60
+    end
+    vm_host.update(allocation_state: "draining") if vm_host.allocation_state == "accepting"
+
+    case sshable.d_check(PVM_UNINSTALL_UNIT)
+    when "Succeeded"
+      sshable.d_clean(PVM_UNINSTALL_UNIT)
+      decr_pvm_uninstall
+      record_pvm_status(pvm_kernel("status"))
+      if pvm_reinstall
+        delete_from_stack("pvm_reinstall")
+        pvm_row.update(state: "install_pending", last_error: nil, updated_at: Time.now)
+        hop_install_pvm_host_kernel
+      end
+      pvm_row.update(state: "uninstalled", last_error: nil, updated_at: Time.now)
+      %w[ByohPvmInstall ByohPvmBoot ByohPvmHostKernel].each { resolve_pvm_page(it) }
+      Prog::PageNexus.assemble("#{vm_host.ubid} had its PVM host kernel uninstalled and cannot run VMs", ["ByohPvmUninstalled", vm_host.ubid], vm_host.ubid,
+        resource_id: vm_host.id, severity: "info",
+        extra_data: {fix: "The host runs its stock kernel again. Destroy the host and register it again as kvm, container or emulated (bin/byoh-virt probe says which it can run)."})
+      hop_pvm_uninstalled
+    when "Failed"
+      logs = sshable.d_logs(PVM_UNINSTALL_UNIT, lines: 20).strip
+      sshable.d_clean(PVM_UNINSTALL_UNIT)
+      decr_pvm_uninstall
+      delete_from_stack("pvm_reinstall")
+      status = pvm_kernel("status")
+      record_pvm_status(status)
+      error = status.dig("state", "last_result", "error") || last_json(logs)&.dig("error") || "see the log lines"
+      pvm_row.update(state: "failed", last_error: "uninstall: #{error}", updated_at: Time.now)
+      pvm_page("ByohPvmInstall", "could not uninstall its PVM host kernel: #{error}", error:, last_log_lines: logs,
+        fix: "Fix the cause on the host (install-pvm-host-kernel status shows what is left), then bin/byoh-virt pvm uninstall --host #{vm_host.ubid} again.")
+      hop_pvm_install_failed
+    when "NotStarted"
+      status = pvm_kernel("status")
+      if status["running_pvm"] || status["pti_off"]
+        record_pvm_status(pvm_kernel("disarm").merge("kernel" => status["kernel"]))
+        hop_prep_reboot
+      end
+      sshable.d_run(PVM_UNINSTALL_UNIT, "sudo", PVM_KERNEL_TOOL, "uninstall", stdin: "{}")
+    end
+
+    nap 30
+  end
+
+  # A host whose PVM kernel was uninstalled runs no VMs; its page says to
+  # destroy it and register it again on another tier.
+  label def pvm_uninstalled
+    nap 6 * 60 * 60
+  end
+
+  # Runs one install-pvm-host-kernel subcommand: its JSON result, also
+  # for a refusal (exit 2) or a failure (exit 3).
+  def pvm_kernel(command, params = {})
+    sshable.cmd_json("sudo host/bin/install-pvm-host-kernel :command", command:, stdin: JSON.generate(params))
+  rescue Sshable::SshError => e
+    raise unless [2, 3].include?(e.exit_code)
+
+    JSON.parse(e.stdout)
+  end
+
+  # What the host's last install-pvm-host-kernel status (or arm, disarm)
+  # said of its boot, for bin/byoh-virt show.
+  def record_pvm_status(status)
+    self.pvm_status = status.slice("kernel", "running_pvm", "pti_off", "grubenv", "dev_kvm", "boot_unit").merge("at" => Time.now.utc.iso8601)
+  end
+
+  # The installed kernel packages before and after a pvm host's patch
+  # run: an apt full-upgrade may add a stock kernel, which the install
+  # does not pin (it pins the running one) and a later boot may pick.
+  def record_pvm_patch_kernels(phase)
+    lines = sshable.cmd("dpkg-query -W -f :format :pattern", format: '${Package} ${db:Status-Status}\n', pattern: "linux-image-[0-9]*")
+    installed = lines.lines.filter_map { |line| line.split[0] if line.split[1] == "installed" }.sort
+    kernels = (phase == "after") ? (pvm_patch_kernels || {}) : {}
+    self.pvm_patch_kernels = kernels.merge(phase => installed)
+  end
+
+  # Read-only, before the walk goes on: why the host cannot take the PVM
+  # host kernel, from rhizome's own preflight. A refusal pages with the
+  # reasons and checks again every 5 minutes, so a host the operator
+  # fixes goes on by itself.
+  def check_pvm_preflight
+    when_pvm_uninstall_set? { hop_pvm_uninstall }
+    result = pvm_kernel("preflight")
+    if result["result"] == "ok"
+      resolve_pvm_page("ByohPvmInstall")
+      return
+    end
+
+    refusals = result["refusals"] || [result["error"]]
+    pvm_page("ByohPvmInstall", "cannot take the PVM host kernel: #{refusals.join("; ")}", refusals:, facts: result["facts"],
+      fix: "Nothing was changed on the host. Fix what each refusal names; this check runs again every 5 minutes and the bring-up goes on once it passes. " \
+        "To give up on PVM: bin/byoh-virt pvm uninstall --host #{vm_host.ubid}, then destroy the host and register it again on another tier.")
+    nap 5 * 60
+  end
+
+  # Pages an install that failed or was refused, from the host's state:
+  # nothing of it on the host (exit 2), or a partial one that rhizome
+  # took out of the boot path (exit 3).
+  def pvm_install_failed!(status, logs)
+    state = status["state"] || {}
+    result = last_json(logs) || {}
+    unchanged = PVM_HOST_UNCHANGED.include?(state["state"])
+    error = (result["refusals"] || [result["error"] || state.dig("last_result", "error") || "see the log lines"]).join("; ")
+    pvm_row.update(state: "failed", last_error: error, updated_at: Time.now)
+    fix = if unchanged
+      "The install was refused before any change on the host. Fix the cause, then bin/byoh-virt pvm retry --host #{vm_host.ubid}; to give up on PVM, bin/byoh-virt pvm uninstall --host #{vm_host.ubid}."
+    else
+      "The install failed after step #{state["steps"]&.last || "none"}; rhizome already un-armed the host, which boots its stock kernel. " \
+        "bin/byoh-virt pvm retry --host #{vm_host.ubid} uninstalls what is there and installs again; bin/byoh-virt pvm uninstall --host #{vm_host.ubid} abandons PVM."
+    end
+    pvm_page("ByohPvmInstall", "#{unchanged ? "refused" : "failed"} to install the PVM host kernel: #{error}", error:, step: result["step"], last_log_lines: logs, fix:)
+    hop_pvm_install_failed
+  end
+
+  # The last JSON object in a daemon's log lines: the tool's result.
+  def last_json(logs)
+    logs.lines.reverse_each do |line|
+      text = line[/\{.*\}/]
+      next unless text
+
+      begin
+        return JSON.parse(text)
+      rescue JSON::ParserError
+        next
+      end
+    end
+    nil
+  end
+
+  # Before every reboot of an install host: arm one boot of the PVM
+  # kernel, which also checks that the stock entry still boots. A host
+  # that cannot be armed is not rebooted.
+  def arm_pvm_boot
+    result = pvm_kernel("arm")
+    record_pvm_status(result.merge("kernel" => pvm_status&.dig("kernel")))
+    return if result["result"] == "ok"
+
+    error = result["error"]
+    pvm_row.update(last_error: "arm: #{error}", updated_at: Time.now)
+    drain_pvm_host
+    pvm_page("ByohPvmBoot", "was not rebooted: its PVM kernel boot could not be armed: #{error}", error:,
+      fix: "The host was not rebooted, so VMs it runs keep running, but it takes no new ones and boots the stock kernel next. " \
+        "Fix the cause (install-pvm-host-kernel status on the host), then bin/byoh-virt pvm retry --host #{vm_host.ubid}, which arms the boot again and reboots the host.")
+    hop_pvm_boot_failed
+  end
+
+  # A pvm host that cannot boot its PVM kernel takes no new VMs; the
+  # frame remembers that the host accepted VMs before, so the boot that
+  # works again (verify_pvm_boot) returns it to accepting.
+  def drain_pvm_host
+    return unless vm_host.allocation_state == "accepting"
+
+    vm_host.update(allocation_state: "draining")
+    self.pvm_drained = true
+  end
+
+  def undrain_pvm_host
+    return unless pvm_drained
+
+    vm_host.update(allocation_state: "accepting")
+    delete_from_stack("pvm_drained")
+  end
+
+  # Why a pvm host cannot run pvm VMs after its boot.
+  def pvm_boot_problems(verdict, status, row)
+    facts = verdict.report["facts"]
+    problems = []
+    # A pvm probe has the tier's prerequisites (VirtProbe.fallbacks), so
+    # it agrees with the tier unless one of PVM's hard refusals applies.
+    if verdict.tier != "pvm"
+      problems << "the probe says #{verdict.summary}, not pvm"
+    elsif (refusal = ByohVirtLadder.pvm_refusal(facts))
+      problems << refusal
+    end
+    problems << "the KVM API is #{facts["kvm_api"].inspect}, not 12" unless facts["kvm_api"] == 12
+    return problems unless status
+
+    problems << "the running kernel is #{status["kernel"]}, not the PVM kernel #{row.host_kver}" unless status["kernel"] == row.host_kver
+    unit = status["boot_unit"] || {}
+    problems << "#{PVM_BOOT_UNIT} is #{unit["ActiveState"]} (#{unit["Result"]}), not active" unless unit["ActiveState"] == "active" && unit["Result"] == "success"
+    kvm = status["dev_kvm"] || {}
+    problems << "/dev/kvm is #{kvm["chardev"] ? "#{kvm["mode"]} #{kvm["group"]}" : "missing"}, not 660 kvm" unless kvm == {"chardev" => true, "mode" => "660", "group" => "kvm"}
+    problems
+  end
+
+  PVM_BOOT_UNIT = "ubicloud-pvm-boot.service"
+
+  # How many times verify_pvm_boot waits 10 seconds for the boot unit.
+  PVM_BOOT_WAITS = 30
+
+  # Whether the boot unit is still to run on the PVM kernel: it is
+  # starting, or not started yet (its condition, pti=off, holds).
+  def pvm_boot_unit_pending?(status)
+    unit = status["boot_unit"] || {}
+    status["running_pvm"] && status["pti_off"] && (unit["ActiveState"] == "activating" || (unit["ActiveState"] == "inactive" && unit["Result"] == "success"))
+  end
+
+  def pvm_boot_fix(row, stock)
+    if row.nil? || !row.install
+      return "The host's PVM kernel was installed outside the control plane. Make kvm_pvm load at boot with a usable /dev/kvm (0660, group kvm), reboot the host, then bin/byoh-virt pvm retry --host #{vm_host.ubid}."
+    end
+
+    head = if stock
+      "The host booted the stock kernel #{row.stock_kver}: its PVM kernel boot failed or hung, and GRUB fell back. Keep the serial console log of that boot (from the provider console), then run install-pvm-host-kernel status on the host."
+    else
+      "The host was taken out of the PVM boot path (disarm), so it boots the stock kernel #{row.stock_kver} next. Run install-pvm-host-kernel status on the host for the boot unit and /dev/kvm."
+    end
+    "#{head} Its VMs were not started. bin/byoh-virt pvm retry --host #{vm_host.ubid} arms one more PVM boot and reboots the host; bin/byoh-virt pvm uninstall --host #{vm_host.ubid} abandons PVM (delete its VMs first). " \
+      "A host that does not come back: power-cycle it from the provider console; it boots the stock kernel."
+  end
+
+  def pvm_page(type, summary, **extra_data)
+    Prog::PageNexus.assemble("#{vm_host.ubid} #{summary}", [type, vm_host.ubid], vm_host.ubid, resource_id: vm_host.id, extra_data:)
+  end
+
+  def resolve_pvm_page(type) = Page.from_tag_parts(type, vm_host.ubid)&.incr_resolve
+
+  # A new guest kernel pin applies to a VM at its next stop and start
+  # (docs/byoh/NO_KVM.md section 6.8): the page lists the VMs that still
+  # boot another kernel than the host's current one.
+  def check_pvm_guest_kernels
+    tag = ["ByohPvmGuestKernelStale", vm_host.ubid]
+    current = ByohVirtTiers.pvm_guest_kernel(vm_host)
+    vms = current ? Vm.where(vm_host_id: vm_host.id, id: ByohVmGuestKernel.exclude(sha256: current.sha256).select(:vm_id)).order(:id).all.map(&:ubid) : []
+    if vms.empty?
+      Page.from_tag_parts(*tag)&.incr_resolve
+      return
+    end
+
+    Prog::PageNexus.assemble("#{vm_host.ubid} has #{vms.size} pvm VMs on an older guest kernel than #{current.sha256}", tag, vm_host.ubid,
+      resource_id: vm_host.id, severity: "warning",
+      extra_data: {vms:, sha256: current.sha256, fix: "Stop and start each VM (a restart keeps its kernel); it then boots the host's current guest kernel."})
   end
 
   label def wait
@@ -615,6 +1012,11 @@ TIMER
       end
 
       nap 60
+    end
+
+    if pvm_host?
+      when_pvm_uninstall_set? { hop_pvm_uninstall }
+      check_pvm_guest_kernels
     end
 
     # A lower-tier host is probed again once a day, for the pages of
@@ -687,6 +1089,9 @@ TIMER
 
     Prog::PageNexus.assemble("Recorded last_boot_id of #{vm_host.ubid} differs from the actual boot_id; treating as an out-of-band reboot and restarting its VMs", ["LastBootIDDiscrepancy", vm_host.ubid], vm_host.ubid, resource_id: vm_host.id, severity: "info")
     vm_host.update(last_boot_id: boot_id)
+    # A pvm host may have come back on its stock kernel (a boot that
+    # failed or hung returns there), where its VMs cannot run.
+    hop_verify_pvm_boot if pvm_host?
     hop_start_slices
   end
 

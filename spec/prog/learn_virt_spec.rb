@@ -114,6 +114,79 @@ RSpec.describe Prog::LearnVirt do
     end
   end
 
+  describe "on a pvm host" do
+    let(:location) { create_byoh_location }
+    let(:vm_host) { create_byoh_vm_host(location, virt_tier: "pvm", family: "pvm") }
+    let(:stock) { {cpu_flags: %w[hypervisor pdpe1gb], dev_kvm: false, kvm_api: nil, modules: [], virt_vm: "amazon", kernel: "7.0.0-1014-aws", vulnerabilities: {"meltdown" => "Not affected"}} }
+    let(:pvm) { {cpu_flags: %w[hypervisor pdpe1gb], dev_kvm: true, kvm_api: 12, kvm_create_vm: true, kvm_caps_missing: [], modules: %w[kvm kvm_pvm], pvm_module_available: true, virt_vm: "amazon", kernel: "6.12.33-pvm", vulnerabilities: {"meltdown" => "Not affected"}} }
+
+    before { location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm pvm], "acks" => {"pvm" => []}, "pvm_kernel" => pvm_test_pins})) }
+
+    def kernel_page = Page.from_tag_parts("ByohPvmHostKernel", vm_host.ubid)
+
+    def committed(**) = ByohPvmHost.create(vm_host_id: vm_host.id, state: "committed", install: true, host_kver: "6.12.33-pvm", host_deb_sha256: "a" * 64, **)
+
+    it "agrees with the stock kernel of a host whose PVM kernel it installs, until that kernel boots" do
+      ByohPvmHost.create(vm_host_id: vm_host.id, state: "install_pending", install: true)
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**stock))
+      expect { lv.start }.to exit({"msg" => "virt tier none"})
+      expect(Page.count).to eq 0
+      ByohPvmHost[vm_host.id].update(state: "committed")
+      again = described_class.new(described_class.assemble(vm_host.id))
+      expect(again.sshable).to receive(:_cmd).and_return(probe_output(**stock))
+      expect { again.start }.to exit({"msg" => "virt tier none"})
+      expect(Page.from_tag_parts("ByohVirtTier", vm_host.ubid).summary).to start_with "#{vm_host.ubid} is registered as pvm but the probe disagrees"
+    end
+
+    it "pages a committed host that runs another kernel than its PVM kernel" do
+      committed
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**stock))
+      expect { lv.start }.to exit({"msg" => "virt tier none"})
+      expect(kernel_page.summary).to eq "#{vm_host.ubid} runs kernel 7.0.0-1014-aws, not its PVM kernel 6.12.33-pvm"
+      expect(kernel_page.severity).to eq "warning"
+    end
+
+    it "pages a host whose PVM kernel is not the location's host-deb pin, and resolves it once it is" do
+      committed(host_deb_sha256: "c" * 64)
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**pvm))
+      expect { lv.start }.to exit({"msg" => "virt tier pvm"})
+      expect(kernel_page.summary).to eq "#{vm_host.ubid} runs the PVM host kernel 6.12.33-pvm (host-deb sha256 #{"c" * 64}), but location byoh-test pins sha256 #{"a" * 64}"
+      expect(kernel_page.details.to_h).to include("pinned_sha256" => "a" * 64, "fix" => start_with("A PVM host kernel is never replaced in place"))
+      expect(Page.from_tag_parts("ByohVirtTier", vm_host.ubid)).to be_nil
+
+      ByohPvmHost[vm_host.id].update(host_deb_sha256: "a" * 64)
+      again = described_class.new(described_class.assemble(vm_host.id))
+      expect(again.sshable).to receive(:_cmd).and_return(probe_output(**pvm))
+      expect { again.start }.to exit({"msg" => "virt tier pvm"})
+      expect(kernel_page.resolve_set?).to be true
+    end
+
+    it "names a location that pins no host kernel" do
+      committed
+      location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm], "acks" => {}}))
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**pvm))
+      expect { lv.start }.to exit({"msg" => "virt tier pvm"})
+      expect(kernel_page.summary).to end_with "but location byoh-test pins no host kernel"
+    end
+
+    it "judges a pvm host without a PVM kernel record by its probe alone" do
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**stock))
+      expect { lv.start }.to exit({"msg" => "virt tier none"})
+      expect(Page.from_tag_parts("ByohVirtTier", vm_host.ubid)).not_to be_nil
+      expect(kernel_page).to be_nil
+    end
+
+    it "pages nothing for a PVM kernel installed before registration, nor for a pending reboot" do
+      ByohPvmHost.create(vm_host_id: vm_host.id, state: "committed", install: false)
+      since = (Time.now - 8 * 24 * 60 * 60).utc.iso8601
+      vm_host.update(virt_probe: Sequel.pg_jsonb({"reboot_required_since" => since}))
+      expect(lv.sshable).to receive(:_cmd).and_return(probe_output(**pvm, reboot_required: true))
+      expect { lv.start }.to exit({"msg" => "virt tier pvm"})
+      expect(vm_host.reload.virt_probe["reboot_required_since"]).to eq since
+      expect(Page.count).to eq 0
+    end
+  end
+
   it "is stale without a probe time or after a day" do
     expect(described_class.stale?(vm_host)).to be true
     vm_host.update(virt_probe: Sequel.pg_jsonb({"probed_at" => (Time.now - 25 * 60 * 60).utc.iso8601}))
