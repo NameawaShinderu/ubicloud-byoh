@@ -874,7 +874,10 @@ when cloud-init then did not run, and plain GO with measurements when it did). I
     after a failed boot. It refuses elsewhere. `bin/byoh-virt pvm uninstall --host <vh>` refuses while
     the host has VMs; HostNexus disarms and reboots a host on its PVM kernel to stock first, runs the
     daemonized `uninstall`, records `uninstalled`, pages `ByohPvmUninstalled` ("destroy and register it
-    again as kvm, container or emulated") and stays at `pvm_uninstalled`.
+    again as kvm, container or emulated") and stays at `pvm_uninstalled`. A stock kernel with `pti=off`
+    on its own command line is not rebooted again (no reboot clears it, and rhizome's uninstall refuses
+    it): HostNexus disarms, pages `ByohPvmInstall` with the fix (remove `pti=off` from
+    `GRUB_CMDLINE_LINUX*`, `update-grub`, reboot, uninstall again) and waits at `pvm_install_failed`.
   - LearnVirt passes the install state, so a host on its stock kernel before the PVM boot gets no
     false `ByohVirtTier` page. On pvm the `ByohKernelReboot` page is replaced by `ByohPvmHostKernel`
     (warning): a committed host runs another kernel than its PVM kernel, or its PVM kernel is not the

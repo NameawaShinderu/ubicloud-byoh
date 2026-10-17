@@ -524,11 +524,20 @@ RSpec.describe Prog::Vm::HostNexus do
       expect { nx.pvm_uninstall }.to nap(30)
     end
 
-    it "also runs it on a host whose stock kernel still has pti=off" do
+    it "pages instead of rebooting a host whose stock kernel has pti=off, which no reboot clears" do
+      refresh_frame(nx, new_values: {"pvm_reinstall" => true})
       expect(sshable).to receive(:d_check).with(unit).and_return("NotStarted")
       expect_tool("status", stock_status(pti_off: true))
-      expect_tool("disarm", {"result" => "ok"})
-      expect { nx.pvm_uninstall }.to hop("prep_reboot")
+      expect_tool("disarm", {"result" => "ok", "grubenv" => {"saved_entry" => stock_entry}})
+      expect(sshable).not_to receive(:d_run)
+      expect { nx.pvm_uninstall }.to hop("pvm_install_failed")
+      expect(vm_host.pvm_uninstall_set?(cached: false)).to be false
+      expect(st.stack.first.key?("pvm_reinstall")).to be false
+      expect(st.stack.first["pvm_status"]).to include("kernel" => stock, "grubenv" => {"saved_entry" => stock_entry})
+      expect(row.reload.values.slice(:state, :last_error)).to eq(state: "failed", last_error: "uninstall: the stock kernel #{stock} has pti=off on its command line")
+      expect(page("ByohPvmInstall").summary).to eq "#{vm_host.ubid} could not uninstall its PVM host kernel: the stock kernel #{stock} has pti=off on its command line"
+      expect(page("ByohPvmInstall").details["fix"]).to eq "Nothing was uninstalled. Remove pti=off from GRUB_CMDLINE_LINUX* (/etc/default/grub and /etc/default/grub.d), run update-grub and reboot the host, " \
+        "then bin/byoh-virt pvm uninstall --host #{vm_host.ubid} again."
     end
 
     it "waits while it runs" do

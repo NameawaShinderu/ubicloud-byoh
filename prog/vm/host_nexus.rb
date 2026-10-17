@@ -780,14 +780,31 @@ TIMER
       hop_pvm_install_failed
     when "NotStarted"
       status = pvm_kernel("status")
-      if status["running_pvm"] || status["pti_off"]
+      if status["running_pvm"]
         record_pvm_status(pvm_kernel("disarm").merge("kernel" => status["kernel"]))
         hop_prep_reboot
       end
+      pvm_uninstall_refused!(status) if status["pti_off"]
       sshable.d_run(PVM_UNINSTALL_UNIT, "sudo", PVM_KERNEL_TOOL, "uninstall", stdin: "{}")
     end
 
     nap 30
+  end
+
+  # The stock kernel has pti=off on its own command line, which every
+  # boot keeps, so another reboot cannot help and rhizome's uninstall
+  # refuses: page the fix and wait for the operator, disarmed, at
+  # pvm_install_failed.
+  def pvm_uninstall_refused!(status)
+    record_pvm_status(pvm_kernel("disarm").merge("kernel" => status["kernel"]))
+    decr_pvm_uninstall
+    delete_from_stack("pvm_reinstall")
+    error = "the stock kernel #{status["kernel"]} has pti=off on its command line"
+    pvm_row.update(state: "failed", last_error: "uninstall: #{error}", updated_at: Time.now)
+    pvm_page("ByohPvmInstall", "could not uninstall its PVM host kernel: #{error}", error:,
+      fix: "Nothing was uninstalled. Remove pti=off from GRUB_CMDLINE_LINUX* (/etc/default/grub and /etc/default/grub.d), run update-grub and reboot the host, " \
+        "then bin/byoh-virt pvm uninstall --host #{vm_host.ubid} again.")
+    hop_pvm_install_failed
   end
 
   # A host whose PVM kernel was uninstalled runs no VMs; its page says to
