@@ -117,6 +117,93 @@ RSpec.describe Prog::Vm::HostNexus do
     end
   end
 
+  describe "#download_boot_images" do
+    before { refresh_frame(nx, new_values: {"default_boot_images" => ["ubuntu-noble"]}) }
+
+    def children = Strand.where(parent_id: st.id).order(:prog).all.map { [it.prog, it.stack.first] }
+
+    (ByohVirtTiers::TIERS.keys - ["pvm"]).each do |each_tier|
+      context "with a #{each_tier} host" do
+        let(:tier) { each_tier }
+
+        it "downloads the boot images only" do
+          expect { nx.download_boot_images }.to hop("wait_download_boot_images")
+          expect(children).to eq [["DownloadBootImage", {"subject_id" => vm_host.id, "image_name" => "ubuntu-noble"}]]
+        end
+      end
+    end
+
+    context "with a pvm host" do
+      let(:tier) { "pvm" }
+
+      it "downloads the location's guest kernel pin too" do
+        location.update(byoh_virt: Sequel.pg_jsonb({"tiers" => %w[kvm pvm], "acks" => {"pvm" => []}, "pvm_kernel" => pvm_test_pins}))
+        expect { nx.download_boot_images }.to hop("wait_download_boot_images")
+        expect(children).to eq [
+          ["DownloadBootImage", {"subject_id" => vm_host.id, "image_name" => "ubuntu-noble"}],
+          ["DownloadPvmGuestKernel", {"subject_id" => vm_host.id, "pin" => {"guest_kernel" => pvm_test_pins["guest_kernel"], "guest_unchecked" => false}}],
+        ]
+      end
+
+      it "fails in a location without a guest kernel pin" do
+        expect { nx.download_boot_images }.to raise_error(RuntimeError, "location byoh-test has no PVM guest kernel pin; pin one with bin/byoh-location set")
+      end
+    end
+  end
+
+  describe "#wait_download_boot_images" do
+    before { st.update(label: "wait_download_boot_images") }
+
+    ByohVirtTiers::TIERS.each_key do |each_tier|
+      context "with a #{each_tier} host" do
+        let(:tier) { each_tier }
+
+        it "waits for the downloads" do
+          Strand.create(parent_id: st.id, prog: "DownloadBootImage", label: "start", lease: Time.now + 10)
+          expect { nx.wait_download_boot_images }.to nap(120)
+        end
+      end
+    end
+
+    (ByohVirtTiers::TIERS.keys - ["pvm"]).each do |each_tier|
+      context "with a #{each_tier} host" do
+        let(:tier) { each_tier }
+
+        it "patches the host next, as a kvm host does" do
+          expect { nx.wait_download_boot_images }.to hop("patch")
+        end
+      end
+    end
+
+    context "with a pvm host" do
+      let(:tier) { "pvm" }
+
+      it "patches the host next once it holds a ready guest kernel" do
+        Strand.create(parent_id: st.id, prog: "DownloadPvmGuestKernel", label: "record", exitval: {"msg" => "ready"})
+        ByohPvmGuestKernel.create(vm_host_id: vm_host.id, sha256: "b" * 64, state: "ready", console: "hvc0")
+        expect { nx.wait_download_boot_images }.to hop("patch")
+        expect(Strand.where(parent_id: st.id).count).to eq 0
+      end
+
+      it "stops short of accepting when the guest kernel download was refused" do
+        Strand.create(parent_id: st.id, prog: "DownloadPvmGuestKernel", label: "download", exitval: {"msg" => "refused"})
+        ByohPvmGuestKernel.create(vm_host_id: vm_host.id, sha256: "b" * 64, state: "refused")
+        expect { nx.wait_download_boot_images }.to hop("pvm_guest_kernel_refused")
+      end
+    end
+  end
+
+  describe "#pvm_guest_kernel_refused" do
+    let(:tier) { "pvm" }
+
+    it "waits for a ready guest kernel, then patches the host" do
+      ByohPvmGuestKernel.create(vm_host_id: vm_host.id, sha256: "b" * 64, state: "refused")
+      expect { nx.pvm_guest_kernel_refused }.to nap(60)
+      ByohPvmGuestKernel.create(vm_host_id: vm_host.id, sha256: "c" * 64, state: "ready", console: "ttyS0")
+      expect { nx.pvm_guest_kernel_refused }.to hop("patch")
+    end
+  end
+
   describe "#reboot" do
     it "checks the tier's capacity instead of hugepages" do
       vm_host.update(last_boot_id: "old")

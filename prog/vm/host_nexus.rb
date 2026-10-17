@@ -279,13 +279,34 @@ class Prog::Vm::HostNexus < Prog::Base
         "image_name" => image_name,
       }
     }
+    if pvm_host?
+      pin = Prog::DownloadPvmGuestKernel.location_pin(vm_host) || fail("location #{vm_host.location.name} has no PVM guest kernel pin; pin one with bin/byoh-location set")
+      bud Prog::DownloadPvmGuestKernel, {"pin" => pin}
+    end
 
     hop_wait_download_boot_images
   end
 
   label def wait_download_boot_images
-    reap(:patch)
+    reap do
+      hop_pvm_guest_kernel_refused if pvm_host? && !pvm_guest_kernel_ready?
+      hop_patch
+    end
   end
+
+  # A pvm host whose guest kernel download was refused waits here, short
+  # of accepting, with the ByohPvmGuestKernel page open, until a new pin
+  # (bin/byoh-location set starts its download) gives it a ready kernel.
+  label def pvm_guest_kernel_refused
+    hop_patch if pvm_guest_kernel_ready?
+
+    nap 60
+  end
+
+  def pvm_host? = vm_host.virt_tier == "pvm"
+
+  # Whether the host holds a guest kernel PVM VMs can boot.
+  def pvm_guest_kernel_ready? = !ByohPvmGuestKernel.where(vm_host_id: vm_host.id, state: "ready").empty?
 
   label def prep_reboot
     register_deadline("wait", 15 * 60)

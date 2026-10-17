@@ -27,10 +27,12 @@ class ByohHostWatch
   # full-upgrade) on the way to prep_reboot, under the download's
   # deadline. A host of a lower virtualization tier passes
   # verify_virt_tier in place of setup_hugepages, and verify_tier_capacity
-  # in place of verify_hugepages (docs/byoh/NO_KVM.md).
+  # in place of verify_hugepages (docs/byoh/NO_KVM.md); a pvm host whose
+  # guest kernel download was refused waits at pvm_guest_kernel_refused
+  # under the download's deadline.
   PHASES = {
     "bootstrap" => [600, %w[start install_host_os setup_ssh_keys bootstrap_rhizome check_ip_reachability prep wait_prep setup_hugepages verify_virt_tier setup_storage_backend]],
-    "boot image download" => [4 * 60 * 60, %w[download_boot_images wait_download_boot_images patch]],
+    "boot image download" => [4 * 60 * 60, %w[download_boot_images wait_download_boot_images pvm_guest_kernel_refused patch]],
     "reboot" => [15 * 60, %w[prep_reboot reboot verify_spdk verify_hugepages verify_tier_capacity start_slices start_vms]],
     "hardware reset" => [20 * 60, %w[prep_hardware_reset hardware_reset]],
   }.freeze
